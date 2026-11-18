@@ -1,0 +1,7 @@
+; Morning Star harness layout for this repository.
+; Values mirror the resolved layout so candidate-chain drift cannot move them.
+[config]
+harness_dir=.mstar
+knowledge_dir=.agents/knowledge
+specs_dir=.agents/specs
+adr_dir=.agents/adr
