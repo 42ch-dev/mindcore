@@ -355,6 +355,8 @@ pub async fn run_story(label: &str) {
         read_carrier(&wren, "ke_wren_cognition").await,
         "read the empty carrier",
     );
+    // The supplied assessment time is bound once, so the projection must return this exact value.
+    let doubt_assessed_at = "2026-11-19T18:05:00Z";
     let doubt = append_cognition_record(
         &carrier,
         belief_record(
@@ -362,7 +364,7 @@ pub async fn run_story(label: &str) {
             "Unknown",
             "Testimony",
             &hearsay.record_id,
-            "2026-11-19T18:05:00Z",
+            doubt_assessed_at,
         ),
     )
     .expect("append the doubt record");
@@ -424,6 +426,8 @@ pub async fn run_story(label: &str) {
     );
     let revision_before = carrier.revision.expect("the carrier holds a revision");
     assert_eq!(revision_before, 2);
+    // Same binding rule as the doubt: the projection must return this exact value.
+    let revision_assessed_at = "2026-11-19T19:35:00Z";
     let reconsidered = append_cognition_record(
         &carrier,
         belief_record(
@@ -431,7 +435,7 @@ pub async fn run_story(label: &str) {
             "False",
             "Perception",
             &observed.record_id,
-            "2026-11-19T19:35:00Z",
+            revision_assessed_at,
         ),
     )
     .expect("append the observation record");
@@ -475,12 +479,25 @@ pub async fn run_story(label: &str) {
         "appending the revision must preserve the first record"
     );
 
-    let assessed_at = timestamp(
+    // Value preservation: the projection must return the `assessed_at` supplied above, not a
+    // store-assigned or recomputed time. Expected values are the bound inputs themselves.
+    assert_eq!(
+        assessments[0]["assessed_at"],
+        json!(doubt_assessed_at),
+        "the doubt projection returns the supplied assessed_at"
+    );
+    assert_eq!(
+        assessments[1]["assessed_at"],
+        json!(revision_assessed_at),
+        "the revision projection returns the supplied assessed_at"
+    );
+
+    let revision_assessed = timestamp(
         assessments[1]["assessed_at"]
             .as_str()
             .expect("the revision carries its assessment time"),
     );
-    let doubt_assessed_at = timestamp(
+    let doubt_assessed = timestamp(
         assessments[0]["assessed_at"]
             .as_str()
             .expect("the doubt carries its assessment time"),
@@ -488,13 +505,13 @@ pub async fn run_story(label: &str) {
     // Story times only: the store-assigned `recorded_at` is wall-clock, so comparing against it
     // would fail as soon as real time passes the story's fixed instant.
     assert!(
-        assessed_at >= observation.observed_at,
-        "the revision was assessed at {assessed_at}, before the observation it cites (observed at {})",
+        revision_assessed >= observation.observed_at,
+        "the revision was assessed at {revision_assessed}, before the observation it cites (observed at {})",
         observation.observed_at
     );
     assert!(
-        assessed_at >= doubt_assessed_at,
-        "the revision was assessed at {assessed_at}, before the judgment it revises ({doubt_assessed_at})"
+        revision_assessed >= doubt_assessed,
+        "the revision was assessed at {revision_assessed}, before the judgment it revises ({doubt_assessed})"
     );
 
     let personal_after_revision = expect_ok(
