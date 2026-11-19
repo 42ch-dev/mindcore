@@ -8,7 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-mindcore-core = { path = "../mindcore-core" }
+mindcore-base = { path = "../mindcore-base" }
 spoke-schemas.workspace = true
 spoke-operations.workspace = true
 serde_json.workspace = true

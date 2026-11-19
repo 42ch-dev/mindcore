@@ -6,7 +6,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 
 ## Current state
 
-- `mindcore-core` holds the transport-independent types and rules: ids (`MindId`, `SpaceId`, `ContextId`, `SubjectId`), `TrustedScope` (adapter-supplied caller plus space, never persisted), memory types and the `MemoryStore` trait, the knowledge scope and adoption-anchor helper, and the cognition carrier helpers with `MindState` derivation. It performs no I/O.
+- `mindcore-base` holds the transport-independent types and rules: ids (`MindId`, `SpaceId`, `ContextId`, `SubjectId`), `TrustedScope` (adapter-supplied caller plus space, never persisted), memory types and the `MemoryStore` trait, the knowledge scope and adoption-anchor helper, and the cognition carrier helpers with `MindState` derivation. It performs no I/O.
 - `mindcore-sqlite` implements `MindStore`: each opened store owns its own single-connection SQLx pool, runs the embedded migrator once (applying any pending migrations, currently 0001_init.sql), and sets WAL, foreign keys and a five-second busy timeout on that file. `MemoryStore` and the per-collection `ScopedKnowledgeStore` (implementing the pinned `KnowledgeEntryPort`) are implemented there.
 - A `Mind` is a stable logical actor identity (Creator, Character); it is not a caller, a database file, a collection or a wire type. A caller is identified by `TrustedScope` and is never part of persisted mental state. Reading a shared collection changes no personal record.
 - Memory: `capture` creates a candidate, `retain` produces the record, `recall` reads records only. `capture` is idempotent by candidate id; `retain` is idempotent by request id and refuses a second distinct request for the same candidate. Records keep the candidate's original placement (`space`, `subject`, `context`) and recall orders by `recorded_at ASC, record_id ASC`.
@@ -25,7 +25,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 
 ## Where it lives
 
-- `crates/mindcore-core/src/{ids,boundary,memory,knowledge,cognition}.rs`
+- `crates/mindcore-base/src/{ids,boundary,memory,knowledge,cognition}.rs`
 - `crates/mindcore-sqlite/src/{store,memory,knowledge,cognition}.rs`
 - `crates/mindcore-sqlite/migrations/0001_init.sql`
 - Tests: `crates/mindcore-sqlite/tests/{memory,knowledge,cognition,embedded_mind}.rs`; runnable scenario: `crates/mindcore-sqlite/examples/iteration_01.rs`

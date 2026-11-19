@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use mindcore_core::ids::{ContextId, SpaceId, SubjectId};
-use mindcore_core::memory::{MemoryCandidate, MemoryError, MemoryStore, RecallQuery};
+use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
+use mindcore_base::memory::{MemoryCandidate, MemoryError, MemoryStore, RecallQuery};
 use mindcore_sqlite::MindStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;

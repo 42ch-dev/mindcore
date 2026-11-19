@@ -13,7 +13,7 @@ library you embed.
 
 | Crate | Responsibility |
 | --- | --- |
-| `mindcore-core` | Storage-agnostic domain core: ids and trusted boundary, memory types and the `MemoryStore` trait, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. |
+| `mindcore-base` | Storage-agnostic domain core: ids and trusted boundary, memory types and the `MemoryStore` trait, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. |
 | `mindcore-sqlite` | SQLite (SQLx) backend: one connection pool, one migration, WAL and a busy timeout; implements `MemoryStore` and the scoped `KnowledgeEntryPort`, and guards the cognition module at the single persistence boundary. |
 
 ## Checks
