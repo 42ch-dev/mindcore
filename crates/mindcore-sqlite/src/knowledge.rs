@@ -17,9 +17,8 @@ use crate::store::MindStore;
 /// cannot read or write another collection's entries. `owner` and extension metadata travel inside
 /// the payload and never select rows.
 ///
-/// `put` assigns the revision (`1` on create, stored + 1 on update), stamps `updated_at` with the
-/// write instant, and stamps an absent `created_at` on create. The SQL columns keep the store's own
-/// timestamps; a payload without `created_at` therefore reads back without one.
+/// `put` persists the submitted payload unchanged except for the assigned `revision` (`1` on create,
+/// stored + 1 on update); the SQL timestamp columns carry the store's own write bookkeeping.
 pub struct ScopedKnowledgeStore {
     pool: SqlitePool,
     scope: KnowledgeScope,
@@ -179,11 +178,8 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
             },
         };
 
+        // Store bookkeeping stays in the SQL timestamp columns; the payload keeps the caller's.
         let now = Utc::now();
-        if stored.is_none() && entry.created_at.is_none() {
-            entry.created_at = Some(now);
-        }
-        entry.updated_at = Some(now.into());
         entry.revision = Some(revision);
 
         let payload = match encode(&entry) {

@@ -163,6 +163,36 @@ async fn conditional_update_bumps_revision() {
 }
 
 #[tokio::test]
+async fn submitted_timestamps_are_persisted_verbatim() {
+    let path = database_path("timestamps");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    let mut submitted = entry_with("ke_gate", "closed after dusk");
+    submitted.created_at = Some(
+        "2026-01-02T03:04:05.123456789Z"
+            .parse()
+            .expect("valid RFC 3339"),
+    );
+    submitted.updated_at = Some("2026-02-03T04:05:06Z".parse().expect("valid RFC 3339"));
+
+    let created = expect_ok(port.put_knowledge_entry(submitted, None).await, "create");
+    let created_json = as_json(&created);
+    assert_eq!(created_json["revision"], json!(1));
+    assert_eq!(
+        created_json["created_at"],
+        json!("2026-01-02T03:04:05.123456789Z")
+    );
+    assert_eq!(created_json["updated_at"], json!("2026-02-03T04:05:06Z"));
+
+    let fetched = expect_ok(port.get_knowledge_entry("ke_gate").await, "get");
+    assert_eq!(as_json(&fetched), created_json);
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn stale_update_is_refused_without_change() {
     let path = database_path("stale");
     let store = MindStore::open(&path).await.expect("open store");
@@ -194,6 +224,12 @@ async fn stale_update_is_refused_without_change() {
     assert_eq!(
         expect_reject(absent, "update of absent entry"),
         SpokeRejectCode::StoredRevisionStale
+    );
+    // A refusal must leave no row behind.
+    let absent_get = port.get_knowledge_entry("ke_missing").await;
+    assert_eq!(
+        expect_reject(absent_get, "get of absent entry"),
+        SpokeRejectCode::KnowledgeEntryNotFound
     );
 
     let fetched = expect_ok(port.get_knowledge_entry("ke_gate").await, "get");
@@ -230,6 +266,45 @@ async fn entries_survive_reopen() {
     assert_eq!(as_json(&fetched), as_json(&written));
     reopened.close().await;
 
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn cross_handle_cas_lets_exactly_one_writer_win() {
+    let path = database_path("cross-handle");
+    let left_store = MindStore::open(&path).await.expect("open left store");
+    let right_store = MindStore::open(&path).await.expect("open right store");
+    let left = left_store.knowledge(KnowledgeScope::new("wren"));
+    let right = right_store.knowledge(KnowledgeScope::new("wren"));
+
+    expect_ok(
+        left.put_knowledge_entry(entry_with("ke_gate", "closed after dusk"), None)
+            .await,
+        "create",
+    );
+
+    let (left_result, right_result) = tokio::join!(
+        left.put_knowledge_entry(entry_with("ke_gate", "left writer"), Some(1)),
+        right.put_knowledge_entry(entry_with("ke_gate", "right writer"), Some(1)),
+    );
+    let winner = match (left_result, right_result) {
+        (SpokeResult::Ok(entry), SpokeResult::Reject(reject))
+        | (SpokeResult::Reject(reject), SpokeResult::Ok(entry)) => {
+            assert_eq!(reject.code, SpokeRejectCode::StoredRevisionStale);
+            entry
+        }
+        _ => panic!("exactly one concurrent put must win"),
+    };
+    assert_eq!(winner.revision, Some(2));
+
+    // Both handles must see the winner's payload and revision, never the loser's.
+    for port in [&left, &right] {
+        let fetched = expect_ok(port.get_knowledge_entry("ke_gate").await, "get");
+        assert_eq!(as_json(&fetched), as_json(&winner));
+    }
+
+    left_store.close().await;
+    right_store.close().await;
     remove_database(&path);
 }
 
