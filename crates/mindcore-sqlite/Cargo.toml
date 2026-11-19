@@ -1,0 +1,22 @@
+[package]
+name = "mindcore-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+mindcore-core = { path = "../mindcore-core" }
+spoke-schemas.workspace = true
+spoke-operations.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
