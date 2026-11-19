@@ -10,109 +10,51 @@
 //! the task — the fixture guard and the observable surface Mindcore does serve
 //! across close/reopen — green.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use chrono::Utc;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
 use mindcore_base::memory::{MemoryCandidate, MemoryError, MemoryStore, RecallQuery};
 use mindcore_sqlite::MindStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use tempfile::TempDir;
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Harness-owned fixture root plus a path guard: the only sanctioned database
-/// is a fresh file directly inside this root; anything else is refused before
-/// a connection opens.
+/// Harness-owned fixture root plus a path check: the only sanctioned database
+/// is `parity-fixture.db` directly inside a private `TempDir`. Because the
+/// root is a unique temporary directory the harness itself created, no path
+/// walking is needed — the only adversarial state is the leaf itself.
 struct Fixture {
+    _tmp: TempDir,
     root: PathBuf,
 }
 
 impl Fixture {
-    /// Exclusive create: refuses to adopt a pre-existing directory, so `Drop`
-    /// can only ever remove a root this harness itself created.
-    fn open(root: PathBuf) -> std::io::Result<Self> {
-        std::fs::create_dir(&root)?;
-        // `/var` is a symlink to `/private/var` on macOS; canonicalize once so
-        // the guard compares canonical parents against a canonical root.
-        let root = root.canonicalize()?;
-        Ok(Self { root })
-    }
-
     fn fresh() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before the epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "mindcore-parity-{}-{nanos}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        Self::open(root).expect("fresh fixture root")
+        let tmp = TempDir::new().expect("temp fixture root");
+        let root = tmp.path().to_path_buf();
+        Self { _tmp: tmp, root }
     }
 
     fn db_path(&self) -> PathBuf {
-        let candidate = self.root.join("parity-fixture.db");
-        Self::guard(&self.root, &candidate)
-            .unwrap_or_else(|reason| panic!("fixture guard refused its own path: {reason}"));
-        candidate
+        let leaf = self.root.join("parity-fixture.db");
+        Self::guard(&leaf).unwrap_or_else(|reason| panic!("fixture leaf refused: {reason}"));
+        leaf
     }
 
-    fn guard(root: &Path, path: &Path) -> Result<(), String> {
-        // `symlink_metadata` inspects the final component itself, so a file,
-        // directory or symlink — including a dangling link that `exists()`
-        // would report as absent — is refused before a connection opens.
-        if path.symlink_metadata().is_ok() {
-            return Err(format!("{} already exists", path.display()));
+    /// Leaf-only check: `symlink_metadata` on the leaf must be `NotFound`.
+    /// Anything else — an existing file, directory, or symlink, or a metadata
+    /// failure that isn't `NotFound` — refuses the path before a connection
+    /// opens. That suffices because the parent is a private `TempDir` the
+    /// harness controls: a caller cannot plant a `..` or symlink ancestor in
+    /// its name, and no other process owns the root.
+    fn guard(path: &Path) -> Result<(), String> {
+        match path.symlink_metadata() {
+            Ok(_) => Err(format!("{} already exists", path.display())),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot stat {}: {e}", path.display())),
         }
-        // Fail closed, component by component. The path must literally start
-        // with the fixture root's components — so `..`, `.` and foreign
-        // prefixes refuse — and every existing element between the root and
-        // the final component must be a directory: a regular file
-        // (`root/file/x`) or a symlink (`root/alias/x` where alias -> root)
-        // cannot be walked through, and neither can a symlinked tail.
-        let mut tail = path.components();
-        for expected in root.components() {
-            match tail.next() {
-                Some(actual) if actual == expected => {}
-                _ => {
-                    return Err(format!(
-                        "{} resolves outside the fixture workspace",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        let mut probe = root.to_path_buf();
-        for component in tail {
-            match component {
-                std::path::Component::Normal(name) => probe.push(name),
-                _ => {
-                    return Err(format!("{} contains a non-path component", path.display()));
-                }
-            }
-            match probe.symlink_metadata() {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(format!("{} crosses a symlink", probe.display()));
-                }
-                Ok(meta) if !meta.is_dir() => {
-                    return Err(format!("{} is not a directory", probe.display()));
-                }
-                Ok(_) => {}
-                // Beyond the last existing component nothing can mislead the
-                // open: a missing tail is created under a verified prefix.
-                Err(_) => break,
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -127,63 +69,36 @@ fn candidate(candidate_id: &str, context: &str, content: &str) -> MemoryCandidat
     }
 }
 
+/// The guard only inspects the leaf: with a private `TempDir` root the
+/// harness owns the parent, so no ancestor/`..`/symlink-component state can
+/// exist. Anything present at the leaf — file, directory, or symlink,
+/// dangling included — refuses.
 #[test]
-fn fixture_guard_refuses_foreign_paths() {
+fn fixture_guard_refuses_existing_leaf() {
     let fixture = Fixture::fresh();
-    let root = &fixture.root;
-    // Nested paths inside the workspace are allowed; `..` and foreign roots
-    // are refused.
-    assert!(Fixture::guard(root, &root.join("nested").join("x.db")).is_ok());
-    assert!(Fixture::guard(root, &root.join("..").join("x.db")).is_err());
-    assert!(Fixture::guard(root, Path::new("/tmp/foreign-parity.db")).is_err());
-    let existing = fixture.db_path();
-    std::fs::write(&existing, b"").unwrap();
-    assert!(Fixture::guard(root, &existing).is_err());
+    let leaf = fixture.root.join("parity-fixture.db");
+    assert!(Fixture::guard(&leaf).is_ok());
+    std::fs::write(&leaf, b"").unwrap();
+    assert!(Fixture::guard(&leaf).is_err());
+    std::fs::remove_file(&leaf).unwrap();
+    std::fs::create_dir(&leaf).unwrap();
+    assert!(Fixture::guard(&leaf).is_err());
 }
 
 #[test]
 fn fixture_guard_refuses_dangling_symlink() {
     let fixture = Fixture::fresh();
     let foreign = std::env::temp_dir().join("mindcore-parity-foreign-target.db");
-    let link = fixture.root.join("parity-link.db");
+    let link = fixture.db_path();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&foreign, &link).expect("symlink");
     #[cfg(windows)]
     std::os::windows::fs::symlink_file(&foreign, &link).expect("symlink");
-    // The target does not exist: `Path::exists()` reports false, so the old
-    // guard passed this path. `symlink_metadata` sees the link itself.
+    // The target does not exist: `Path::exists()` reports false, so a
+    // metadata-only-on-real-target check would pass this. `symlink_metadata`
+    // sees the link itself.
     assert!(!link.exists());
-    assert!(Fixture::guard(&fixture.root, &link).is_err());
-}
-
-#[test]
-fn fixture_guard_refuses_alias_dotdot_and_file_components() {
-    let fixture = Fixture::fresh();
-    // `alias -> root`: `root/alias/child/../absent.db` lexically stays inside,
-    // but a prefix-only check misses that `alias` is a symlink, and the `..`
-    // then escapes by resolution.
-    let alias = fixture.root.join("alias");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&fixture.root, &alias).expect("alias symlink");
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&fixture.root, &alias).expect("alias symlink");
-    assert!(Fixture::guard(
-        &fixture.root,
-        &alias.join("child").join("..").join("absent.db")
-    )
-    .is_err());
-    // A regular file is not a directory: `root/file/absent.db` cannot be a
-    // fixture path even though its components stay under the root.
-    let file = fixture.root.join("file");
-    std::fs::write(&file, b"").unwrap();
-    assert!(Fixture::guard(&fixture.root, &file.join("absent.db")).is_err());
-}
-
-#[test]
-fn fixture_root_refuses_to_adopt_existing_directory() {
-    let preexisting = Fixture::fresh();
-    let claimed = Fixture::open(preexisting.root.clone());
-    assert!(claimed.is_err(), "adopting a pre-existing root must fail");
+    assert!(Fixture::guard(&link).is_err());
 }
 
 /// True only for a real SQLite lock refusal (`SQLITE_BUSY` or
