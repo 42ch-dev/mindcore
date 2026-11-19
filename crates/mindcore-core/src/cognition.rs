@@ -21,6 +21,12 @@ const COGNITION_MODULE: &str = "cognition";
 /// Projection policy identity: the last record in carrier order wins within one group.
 const CURRENT_VIEW_POLICY: (&str, &str) = ("mindcore_append_order", "1");
 
+/// Realm of every holder reference a carrier can hold: the Mindcore project namespace.
+/// A carrier's records are stored with the `KnowledgeEntry` they belong to, so one fixed realm
+/// suffices for every holder Mindcore can persist today.
+/// shortcut: single fixed realm; revisit when cross-authority import or multi-realm storage lands.
+pub const CARRIER_NAMESPACE: &str = "mindcore";
+
 #[derive(Debug, thiserror::Error)]
 pub enum MindError {
     #[error("cognition module rejected: {0}")]
@@ -41,6 +47,11 @@ pub struct MindStateView {
 }
 
 /// Carrier invariants for one stored record: `current` view, and held by the carrier entry.
+/// Compared fields: `record.view` must be `"current"`, and `record.holder` must be the complete
+/// reference `{kind: "knowledge_entry", namespace: CARRIER_NAMESPACE, id: carrier_entry_id}` —
+/// the carrier is always a `KnowledgeEntry` stored in the Mindcore realm, and the pinned schema
+/// guarantees all three fields on every validated record's holder reference. Nothing else on the
+/// record (target, assessor, timestamps) is checked here.
 /// Returns the violation message when the record cannot live in `carrier_entry_id`'s carrier.
 pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Option<String> {
     let record_id = record
@@ -52,14 +63,26 @@ pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Optio
             "record {record_id} is not placed in the current view"
         ));
     }
-    let holder = record
-        .get("holder")
-        .and_then(|holder| holder.get("id"))
-        .and_then(Value::as_str);
-    if holder != Some(carrier_entry_id) {
+    let holder = record.get("holder").and_then(Value::as_object);
+    let holder_field = |field: &str| {
+        holder
+            .and_then(|holder| holder.get(field))
+            .and_then(Value::as_str)
+    };
+    let expected = (
+        Some("knowledge_entry"),
+        Some(CARRIER_NAMESPACE),
+        Some(carrier_entry_id),
+    );
+    let actual = (
+        holder_field("kind"),
+        holder_field("namespace"),
+        holder_field("id"),
+    );
+    if actual != expected {
         return Some(format!(
-            "record {record_id} names holder {} but the carrier entry is {carrier_entry_id}",
-            holder.unwrap_or("(none)")
+            "record {record_id} names holder {:?}/{:?}/{:?} but the carrier entry is knowledge_entry/{CARRIER_NAMESPACE}/{carrier_entry_id:?}",
+            actual.0, actual.1, actual.2
         ));
     }
     None
@@ -71,11 +94,11 @@ pub fn append_cognition_record(
     carrier: &KnowledgeEntry,
     record: Value,
 ) -> Result<KnowledgeEntry, MindError> {
-    reject_record(&record)?;
     let record_id = record
         .get("record_id")
         .and_then(Value::as_str)
-        .expect("a validated record carries a non-empty record_id");
+        .ok_or_else(|| MindError::RecordInvalid("record has no usable record_id".to_string()))?;
+    reject_record(&record)?;
     if let Some(violation) = carrier_record_violation(&record, &carrier.entry_id) {
         return Err(MindError::RecordInvalid(violation));
     }
