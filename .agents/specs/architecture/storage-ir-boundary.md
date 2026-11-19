@@ -1,7 +1,7 @@
 # Architecture: storage-independent IR boundary
 
 Status: implemented — `crates/mindcore-base/src/ir.rs`
-Source: iteration `v02-embed` (package spec `specs/ir-contract.md`)
+Source: plan `v02-embed-seam` (iteration `v02-embed`).
 
 ## Scope
 
@@ -20,7 +20,7 @@ The IR exposes independently usable domain identity, placement, revision, state 
 | IR | Wire document and required distinctions |
 |---|---|
 | `MemoryCandidateIr` | `MemoryCandidate`: pending vs consumed, candidate/space/subject identity, capture placement, proposed content, provenance and classification, all timestamps/revision, and consumed disposition/digest when present. |
-| `MemoryRecordIr` | `RetainedRecord`: live vs tombstoned, record/space/subject/kind, scope, content or tombstone, provenance/import reference, all timestamps/revision. Do not infer a standalone local candidate id from the retained-record id. |
+| `MemoryRecordIr` | `RetainedRecord`: live vs tombstoned, record/space/subject/kind, scope, content or tombstone, provenance, and all timestamps/revision. SPOKE v0.16.1 permits the optional `import_ref` only on live records; tombstoned records reject it. Do not infer a standalone local candidate id from the retained-record id. |
 | `ReviewReceiptIr` | `MemoryReceipt`: receipt, requester, space and operation identity, optional idempotency key, payload digest and timestamps. Pending carries neither result nor error nor completion time; committed carries its opaque content-free result; failed carries its error, not a result. This is distinct from the three-column local `review_receipts` row. |
 | `KnowledgeEntryIr` | `KnowledgeEntry`: entry identity/type/name/status, complete body, source anchor, revision, ownership/disclosure, timestamps, extensions and all modules. Cognition records inside `modules.cognition.records` keep their complete assessments, references, provenance/evidence, timestamps and extensions in carrier order; `world_facts` is preserved separately. The derived `MindState` is never persisted. |
 
