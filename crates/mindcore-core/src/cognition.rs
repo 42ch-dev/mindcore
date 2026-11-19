@@ -22,9 +22,8 @@ const COGNITION_MODULE: &str = "cognition";
 const CURRENT_VIEW_POLICY: (&str, &str) = ("mindcore_append_order", "1");
 
 /// Realm of every holder reference a carrier can hold: the Mindcore project namespace.
-/// A carrier's records are always stored next to the `KnowledgeEntry` they belong to and the
-/// comparison never crosses stores, so one fixed realm identifies every holder Mindcore can
-/// persist today.
+/// A carrier's records are stored with the `KnowledgeEntry` they belong to, so one fixed realm
+/// suffices for every holder Mindcore can persist today.
 /// shortcut: single fixed realm; revisit when cross-authority import or multi-realm storage lands.
 pub const CARRIER_NAMESPACE: &str = "mindcore";
 
