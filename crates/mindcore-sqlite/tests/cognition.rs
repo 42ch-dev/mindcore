@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mindcore_core::cognition::{
-    append_cognition_record, derive_mind_state, mind_state_value, MindError,
+    append_cognition_record, derive_mind_state, mind_state_value, MindError, CARRIER_NAMESPACE,
 };
 use mindcore_core::knowledge::KnowledgeScope;
 use mindcore_sqlite::cognition::{read_carrier, write_carrier};
@@ -78,7 +78,12 @@ fn carrier(entry_id: &str, revision: Option<u64>) -> KnowledgeEntry {
 }
 
 fn reference(kind: &str, id: &str) -> Value {
-    json!({"kind": kind, "id": id, "namespace": "mindcore"})
+    json!({"kind": kind, "id": id, "namespace": CARRIER_NAMESPACE})
+}
+
+// A holder reference in another realm: same shape, different namespace.
+fn foreign_reference(kind: &str, id: &str) -> Value {
+    json!({"kind": kind, "id": id, "namespace": "other_realm"})
 }
 
 // One current-view belief record about the adopted north-gate proposition.
@@ -405,8 +410,9 @@ async fn carrier_write_rejects_foreign_holder_without_touching_row() {
     );
     store.close().await;
 }
-// A caller-supplied record without record_id must get a typed rejection, not a panic, at the
-// same public boundary that checks every other record shape.
+// A caller-supplied record with a missing or non-string record_id must get the pinned public
+// diagnostic, not a panic or the wire validator's generic message, at the same public boundary
+// that checks every other record shape.
 #[test]
 fn record_without_record_id_returns_typed_rejection() {
     let mut no_id = belief("cog_no_id", 0.4);
@@ -414,12 +420,64 @@ fn record_without_record_id_returns_typed_rejection() {
         .as_object_mut()
         .expect("record object")
         .remove("record_id");
+    let mut non_string = belief("cog_typed_id", 0.4);
+    non_string["record_id"] = json!(7);
 
-    match append_cognition_record(&carrier("ke_wren", Some(1)), no_id) {
-        Err(MindError::RecordInvalid(_)) => {}
-        Err(error) => panic!("a record without record_id must be RecordInvalid, got {error}"),
-        Ok(_) => panic!("a record without record_id must be rejected, not appended"),
+    for broken in [no_id, non_string] {
+        match append_cognition_record(&carrier("ke_wren", Some(1)), broken) {
+            Err(MindError::RecordInvalid(message)) => {
+                assert_eq!(message, "record has no usable record_id")
+            }
+            Err(error) => {
+                panic!("a record without a usable record_id must be RecordInvalid, got {error}")
+            }
+            Ok(_) => panic!("a record without a usable record_id must be rejected, not appended"),
+        }
     }
+}
+
+// A record held by the right kind and id but in another realm passes the pinned module
+// validator, so only the full holder tuple can refuse it at the persistence boundary.
+#[tokio::test]
+async fn carrier_write_rejects_foreign_holder_namespace_without_touching_row() {
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    let before = expect_ok(read_carrier(&port, "ke_wren").await, "read carrier");
+
+    let mut foreign = belief("cog_foreign_realm", 0.4);
+    foreign["holder"] = foreign_reference("knowledge_entry", "ke_wren");
+    let attempted = with_module(
+        "ke_wren",
+        Some(1),
+        json!({"records": [foreign], "world_facts": [], "extensions": {}}),
+    );
+    expect_ok(
+        validate_cognition_module(&module_of(&attempted)),
+        "module shape",
+    );
+
+    match port.put_knowledge_entry(attempted, Some(1)).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        SpokeResult::Ok(entry) => panic!("foreign realm holder was persisted: {entry:?}"),
+    }
+
+    let after = expect_ok(read_carrier(&port, "ke_wren").await, "reread carrier");
+    assert_eq!(after.revision, Some(1));
+    assert_eq!(
+        serde_json::to_value(&after).expect("entry serializes"),
+        serde_json::to_value(&before).expect("entry serializes"),
+        "the refused write must leave the previous payload unchanged"
+    );
+    store.close().await;
 }
 
 // A record held by a different kind of entity but the same raw id passes the pinned module
@@ -536,6 +594,22 @@ fn derive_rejects_carrier_records_that_violate_the_contract() {
         panic!("a foreign holder must be CarrierInvalid on derive")
     };
     assert!(message.contains("cog_foreign"), "got {message}");
+
+    let mut foreign_realm = belief("cog_foreign_realm", 0.4);
+    foreign_realm["holder"] = foreign_reference("knowledge_entry", "ke_wren");
+    let foreign_realm_carrier = with_module(
+        "ke_wren",
+        Some(1),
+        json!({"records": [foreign_realm], "world_facts": [], "extensions": {}}),
+    );
+    expect_ok(
+        validate_cognition_module(&module_of(&foreign_realm_carrier)),
+        "foreign realm module shape",
+    );
+    let Err(MindError::CarrierInvalid(message)) = derive_mind_state(&foreign_realm_carrier) else {
+        panic!("a holder in another realm must be CarrierInvalid on derive")
+    };
+    assert!(message.contains("cog_foreign_realm"), "got {message}");
 }
 
 #[test]

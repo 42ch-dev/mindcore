@@ -21,6 +21,13 @@ const COGNITION_MODULE: &str = "cognition";
 /// Projection policy identity: the last record in carrier order wins within one group.
 const CURRENT_VIEW_POLICY: (&str, &str) = ("mindcore_append_order", "1");
 
+/// Realm of every holder reference a carrier can hold: the Mindcore project namespace.
+/// A carrier's records are always stored next to the `KnowledgeEntry` they belong to and the
+/// comparison never crosses stores, so one fixed realm identifies every holder Mindcore can
+/// persist today.
+/// shortcut: single fixed realm; revisit when cross-authority import or multi-realm storage lands.
+pub const CARRIER_NAMESPACE: &str = "mindcore";
+
 #[derive(Debug, thiserror::Error)]
 pub enum MindError {
     #[error("cognition module rejected: {0}")]
@@ -41,11 +48,10 @@ pub struct MindStateView {
 }
 
 /// Carrier invariants for one stored record: `current` view, and held by the carrier entry.
-/// Compared fields: `record.view` must be `"current"`, `record.holder.id` must equal
-/// `carrier_entry_id`, and `record.holder.kind` must be `"knowledge_entry"` — the carrier is
-/// always a `KnowledgeEntry`, and the pinned schema guarantees both fields on every validated
-/// record's holder reference. `holder.namespace` is not compared: the carrier identity this
-/// function is given is `entry_id` alone and carries no namespace realm. Nothing else on the
+/// Compared fields: `record.view` must be `"current"`, and `record.holder` must be the complete
+/// reference `{kind: "knowledge_entry", namespace: CARRIER_NAMESPACE, id: carrier_entry_id}` —
+/// the carrier is always a `KnowledgeEntry` stored in the Mindcore realm, and the pinned schema
+/// guarantees all three fields on every validated record's holder reference. Nothing else on the
 /// record (target, assessor, timestamps) is checked here.
 /// Returns the violation message when the record cannot live in `carrier_entry_id`'s carrier.
 pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Option<String> {
@@ -59,15 +65,25 @@ pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Optio
         ));
     }
     let holder = record.get("holder").and_then(Value::as_object);
-    let holder_id = holder
-        .and_then(|holder| holder.get("id"))
-        .and_then(Value::as_str);
-    let holder_kind = holder
-        .and_then(|holder| holder.get("kind"))
-        .and_then(Value::as_str);
-    if holder_id != Some(carrier_entry_id) || holder_kind != Some("knowledge_entry") {
+    let holder_field = |field: &str| {
+        holder
+            .and_then(|holder| holder.get(field))
+            .and_then(Value::as_str)
+    };
+    let expected = (
+        Some("knowledge_entry"),
+        Some(CARRIER_NAMESPACE),
+        Some(carrier_entry_id),
+    );
+    let actual = (
+        holder_field("kind"),
+        holder_field("namespace"),
+        holder_field("id"),
+    );
+    if actual != expected {
         return Some(format!(
-            "record {record_id} names holder {holder_kind:?}/{holder_id:?} but the carrier entry is knowledge_entry/{carrier_entry_id:?}"
+            "record {record_id} names holder {:?}/{:?}/{:?} but the carrier entry is knowledge_entry/{CARRIER_NAMESPACE}/{carrier_entry_id:?}",
+            actual.0, actual.1, actual.2
         ));
     }
     None
