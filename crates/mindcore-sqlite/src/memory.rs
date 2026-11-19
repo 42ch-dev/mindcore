@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{FromRow, Sqlite, SqlitePool};
 
-use mindcore_core::ids::{ContextId, SpaceId, SubjectId};
-use mindcore_core::memory::{MemoryCandidate, MemoryError, MemoryRecord, MemoryStore, RecallQuery};
+use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
+use mindcore_base::memory::{MemoryCandidate, MemoryError, MemoryRecord, MemoryStore, RecallQuery};
 
 use crate::store::MindStore;
 

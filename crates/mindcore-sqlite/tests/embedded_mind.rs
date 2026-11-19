@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use mindcore_core::boundary::{CallerId, TrustedScope};
-use mindcore_core::cognition::{
+use mindcore_base::boundary::{CallerId, TrustedScope};
+use mindcore_base::cognition::{
     append_cognition_record, derive_mind_state, mind_state_value, MindError,
 };
-use mindcore_core::ids::{ContextId, SpaceId, SubjectId};
-use mindcore_core::knowledge::{adoption_anchor, KnowledgeScope};
-use mindcore_core::memory::{MemoryCandidate, MemoryStore, RecallQuery};
+use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
+use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
+use mindcore_base::memory::{MemoryCandidate, MemoryStore, RecallQuery};
 use mindcore_sqlite::cognition::{read_carrier, write_carrier};
 use mindcore_sqlite::MindStore;
 use serde_json::{json, Map, Value};

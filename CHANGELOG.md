@@ -2,4 +2,4 @@
 
 ## [Unreleased]
 
-- Initial workspace for `mindcore-core` and `mindcore-sqlite`.
+- Initial workspace for `mindcore-base` and `mindcore-sqlite`.

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mindcore_core::knowledge::{adoption_anchor, KnowledgeScope};
+use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
 use mindcore_sqlite::MindStore;
 use serde_json::{json, Map, Value};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
