@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/mindcore-core", "crates/mindcore-sqlite"]
+default-members = ["crates/mindcore-core", "crates/mindcore-sqlite"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["42ch-dev"]
+repository = "https://github.com/42ch-dev/mindcore"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+thiserror = "2"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+spoke-schemas = "=0.16.1"
+spoke-operations = "=0.16.1"
