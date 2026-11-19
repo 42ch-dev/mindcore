@@ -41,6 +41,12 @@ pub struct MindStateView {
 }
 
 /// Carrier invariants for one stored record: `current` view, and held by the carrier entry.
+/// Compared fields: `record.view` must be `"current"`, `record.holder.id` must equal
+/// `carrier_entry_id`, and `record.holder.kind` must be `"knowledge_entry"` — the carrier is
+/// always a `KnowledgeEntry`, and the pinned schema guarantees both fields on every validated
+/// record's holder reference. `holder.namespace` is not compared: the carrier identity this
+/// function is given is `entry_id` alone and carries no namespace realm. Nothing else on the
+/// record (target, assessor, timestamps) is checked here.
 /// Returns the violation message when the record cannot live in `carrier_entry_id`'s carrier.
 pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Option<String> {
     let record_id = record
@@ -52,14 +58,16 @@ pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Optio
             "record {record_id} is not placed in the current view"
         ));
     }
-    let holder = record
-        .get("holder")
+    let holder = record.get("holder").and_then(Value::as_object);
+    let holder_id = holder
         .and_then(|holder| holder.get("id"))
         .and_then(Value::as_str);
-    if holder != Some(carrier_entry_id) {
+    let holder_kind = holder
+        .and_then(|holder| holder.get("kind"))
+        .and_then(Value::as_str);
+    if holder_id != Some(carrier_entry_id) || holder_kind != Some("knowledge_entry") {
         return Some(format!(
-            "record {record_id} names holder {} but the carrier entry is {carrier_entry_id}",
-            holder.unwrap_or("(none)")
+            "record {record_id} names holder {holder_kind:?}/{holder_id:?} but the carrier entry is knowledge_entry/{carrier_entry_id:?}"
         ));
     }
     None
@@ -71,11 +79,11 @@ pub fn append_cognition_record(
     carrier: &KnowledgeEntry,
     record: Value,
 ) -> Result<KnowledgeEntry, MindError> {
-    reject_record(&record)?;
     let record_id = record
         .get("record_id")
         .and_then(Value::as_str)
-        .expect("a validated record carries a non-empty record_id");
+        .ok_or_else(|| MindError::RecordInvalid("record has no usable record_id".to_string()))?;
+    reject_record(&record)?;
     if let Some(violation) = carrier_record_violation(&record, &carrier.entry_id) {
         return Err(MindError::RecordInvalid(violation));
     }

@@ -16,7 +16,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 
 ## Invariants
 
-- Exactly one migrator and one writer per database file; the store never opens a second pool for the same file and never runs its migrator against a Nexus database.
+- Each opened `MindStore` owns one pool and runs one migrator against the database file it was opened on; the caller owns the obligation to open only one store per database file.
 - A mutating operation takes the SQLite write reservation (`BEGIN IMMEDIATE`) before reading claim or revision state.
 - A candidate is not recallable before review; a rejected write changes neither payload nor revision.
 - An entry is resolvable only through a port bound to its own collection, even when two collections hold the same raw `entry_id`; no API accepts a caller-supplied collection, `owner` or `viewpoint` as a selector.

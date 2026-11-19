@@ -1,4 +1,4 @@
-# Cognition carrier on the holder's KnowledgeEntry
+# ADR: Cognition carrier on the holder's KnowledgeEntry
 
 Status: implemented — one carrier keeps a single authoritative current judgment without a second store
 Date: 2026-11-19
