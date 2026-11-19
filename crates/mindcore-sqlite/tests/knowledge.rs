@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
 use serde_json::{json, Map, Value};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
@@ -323,32 +323,64 @@ async fn cross_handle_cas_lets_exactly_one_writer_win() {
     remove_database(&path);
 }
 
+/// Structural proof that `put` holds SQLite's write reservation before the claim read.
+///
+/// The port under test runs on a one-connection pool with `busy_timeout` zero, and a second
+/// connection holds `BEGIN IMMEDIATE` — SQLite's write reservation — without writing. Any `put`
+/// that asks for the reservation at `BEGIN` fails there, never reaching the revision read; a put
+/// that deferred it (`BEGIN DEFERRED`) instead fails *inside* the write with a different message,
+/// so the begin-boundary failure mode itself is the assertion. Not proven: the internal lock
+/// sequence during `BEGIN IMMEDIATE` — only that the reservation is requested at begin, blocking
+/// reads, and that a refused put leaves no row.
 #[tokio::test]
-async fn put_waits_for_a_write_reservation_held_elsewhere() {
+async fn put_takes_the_write_reservation_before_the_claim_read() {
     let path = database_path("reservation");
     let store = MindStore::open(&path).await.expect("open store");
-    let port = store.knowledge(KnowledgeScope::new("wren"));
+    // The tested port never waits: contention must fail at begin, not after a timeout.
+    let port = ScopedKnowledgeStore::new(
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .busy_timeout(Duration::ZERO),
+            )
+            .await
+            .expect("open zero-timeout port pool"),
+        KnowledgeScope::new("wren"),
+    );
 
-    // A held write reservation that writes nothing: only a put that takes SQLite's reservation
-    // before reading can be blocked here, so a deferred `BEGIN` fails this test.
+    // A held write reservation that writes nothing: the put below can only fail at `BEGIN
+    // IMMEDIATE` if the reservation is taken before the claim read.
     let holder = second_connection(&path).await;
     let reservation = holder
         .begin_with("BEGIN IMMEDIATE")
         .await
         .expect("hold the write reservation");
 
-    let mut pending =
-        Box::pin(port.put_knowledge_entry(entry_with("ke_gate", "closed after dusk"), None));
-    match tokio::time::timeout(Duration::from_millis(200), &mut pending).await {
-        Err(_) => {}
-        Ok(SpokeResult::Ok(entry)) => panic!(
-            "put finished while another connection held the write reservation: revision {:?}",
-            entry.revision
-        ),
-        Ok(SpokeResult::Reject(reject)) => {
-            panic!("put failed instead of waiting for the write reservation: {reject:?}")
+    let reject = match port
+        .put_knowledge_entry(entry_with("ke_gate", "closed after dusk"), None)
+        .await
+    {
+        SpokeResult::Ok(entry) => {
+            panic!("put wrote while another connection held the write reservation: {entry:?}")
         }
-    }
+        SpokeResult::Reject(reject) => reject,
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert!(
+        reject.message.contains("knowledge write could not begin"),
+        "the put must fail at BEGIN, not at the later write: {}",
+        reject.message
+    );
+    assert!(
+        reject.message.contains("locked"),
+        "the begin failure must carry SQLite's lock condition: {}",
+        reject.message
+    );
+
+    // The refused put wrote no row: the collection is still empty.
+    assert!(expect_ok(port.list_entries().await, "list after refused put").is_empty());
 
     reservation
         .rollback()
@@ -356,7 +388,11 @@ async fn put_waits_for_a_write_reservation_held_elsewhere() {
         .expect("release the write reservation");
     holder.close().await;
 
-    let created = expect_ok(pending.await, "create once the reservation is released");
+    let created = expect_ok(
+        port.put_knowledge_entry(entry_with("ke_gate", "closed after dusk"), None)
+            .await,
+        "create once the reservation is released",
+    );
     assert_eq!(created.revision, Some(1));
     let fetched = expect_ok(port.get_knowledge_entry("ke_gate").await, "get");
     assert_eq!(as_json(&fetched), as_json(&created));
