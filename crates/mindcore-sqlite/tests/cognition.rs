@@ -362,6 +362,122 @@ async fn carrier_write_rejects_malformed_module_without_touching_row() {
     store.close().await;
 }
 
+// A record with a foreign holder passes the pinned module validator, so only the carrier identity
+// check can refuse it at the persistence boundary.
+#[tokio::test]
+async fn carrier_write_rejects_foreign_holder_without_touching_row() {
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    let before = expect_ok(read_carrier(&port, "ke_wren").await, "read carrier");
+
+    let mut foreign = belief("cog_foreign", 0.4);
+    foreign["holder"] = reference("knowledge_entry", "ke_studio");
+    let attempted = with_module(
+        "ke_wren",
+        Some(1),
+        json!({"records": [foreign], "world_facts": [], "extensions": {}}),
+    );
+    expect_ok(
+        validate_cognition_module(&module_of(&attempted)),
+        "module shape",
+    );
+
+    match port.put_knowledge_entry(attempted, Some(1)).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        SpokeResult::Ok(entry) => panic!("foreign holder was persisted: {entry:?}"),
+    }
+
+    let after = expect_ok(read_carrier(&port, "ke_wren").await, "reread carrier");
+    assert_eq!(after.revision, Some(1));
+    assert_eq!(
+        serde_json::to_value(&after).expect("entry serializes"),
+        serde_json::to_value(&before).expect("entry serializes"),
+        "the refused write must leave the previous payload unchanged"
+    );
+    store.close().await;
+}
+
+#[tokio::test]
+async fn carrier_write_rejects_recorded_at_record_without_touching_row() {
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    let before = expect_ok(read_carrier(&port, "ke_wren").await, "read carrier");
+
+    let mut recorded = belief("cog_recorded", 0.4);
+    recorded["view"] = json!("recorded_at");
+    let attempted = with_module(
+        "ke_wren",
+        Some(1),
+        json!({"records": [recorded], "world_facts": [], "extensions": {}}),
+    );
+
+    match port.put_knowledge_entry(attempted, Some(1)).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        SpokeResult::Ok(entry) => panic!("recorded_at record was persisted: {entry:?}"),
+    }
+
+    let after = expect_ok(read_carrier(&port, "ke_wren").await, "reread carrier");
+    assert_eq!(after.revision, Some(1));
+    assert_eq!(
+        serde_json::to_value(&after).expect("entry serializes"),
+        serde_json::to_value(&before).expect("entry serializes"),
+        "the refused write must leave the previous payload unchanged"
+    );
+    store.close().await;
+}
+
+#[test]
+fn derive_rejects_carrier_records_that_violate_the_contract() {
+    let mut recorded = belief("cog_recorded", 0.4);
+    recorded["view"] = json!("recorded_at");
+    let recorded_carrier = with_module(
+        "ke_wren",
+        Some(1),
+        json!({"records": [recorded], "world_facts": [], "extensions": {}}),
+    );
+    assert!(
+        matches!(
+            derive_mind_state(&recorded_carrier),
+            Err(MindError::CarrierInvalid(_))
+        ),
+        "a non-current record must be CarrierInvalid on derive"
+    );
+
+    let mut foreign = belief("cog_foreign", 0.4);
+    foreign["holder"] = reference("knowledge_entry", "ke_studio");
+    let foreign_carrier = with_module(
+        "ke_wren",
+        Some(1),
+        json!({"records": [foreign], "world_facts": [], "extensions": {}}),
+    );
+    expect_ok(
+        validate_cognition_module(&module_of(&foreign_carrier)),
+        "foreign holder module shape",
+    );
+    let Err(MindError::CarrierInvalid(message)) = derive_mind_state(&foreign_carrier) else {
+        panic!("a foreign holder must be CarrierInvalid on derive")
+    };
+    assert!(message.contains("cog_foreign"), "got {message}");
+}
+
 #[test]
 fn records_without_revision_are_rejected() {
     let entry = append_cognition_record(&carrier("ke_wren", None), belief("cog_hearsay", 0.4))

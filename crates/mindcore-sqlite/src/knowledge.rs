@@ -5,6 +5,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use sqlx::SqlitePool;
 
+use mindcore_core::cognition::carrier_record_violation;
 use mindcore_core::knowledge::KnowledgeScope;
 use spoke_operations::{
     spoke_reject, validate_cognition_module, KnowledgeEntryPort, SpokeRejectCode, SpokeResult,
@@ -157,6 +158,15 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
         if let Some(module) = cognition_module(&entry) {
             if let SpokeResult::Reject(reject) = validate_cognition_module(&module) {
                 return SpokeResult::Reject(reject);
+            }
+            // The module validator carries no entry identity; the carrier contract also requires
+            // every stored record to be held by this entry.
+            if let Some(records) = module.get("records").and_then(Value::as_array) {
+                for record in records {
+                    if let Some(violation) = carrier_record_violation(record, &entry.entry_id) {
+                        return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
+                    }
+                }
             }
         }
         // Hold SQLite's write reservation across the read and the write: the revision comparison and

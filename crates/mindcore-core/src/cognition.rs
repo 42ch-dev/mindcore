@@ -40,6 +40,31 @@ pub struct MindStateView {
     pub records: Vec<Value>,
 }
 
+/// Carrier invariants for one stored record: `current` view, and held by the carrier entry.
+/// Returns the violation message when the record cannot live in `carrier_entry_id`'s carrier.
+pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Option<String> {
+    let record_id = record
+        .get("record_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if record.get("view").and_then(Value::as_str) != Some("current") {
+        return Some(format!(
+            "record {record_id} is not placed in the current view"
+        ));
+    }
+    let holder = record
+        .get("holder")
+        .and_then(|holder| holder.get("id"))
+        .and_then(Value::as_str);
+    if holder != Some(carrier_entry_id) {
+        return Some(format!(
+            "record {record_id} names holder {} but the carrier entry is {carrier_entry_id}",
+            holder.unwrap_or("(none)")
+        ));
+    }
+    None
+}
+
 /// Appends one current-view record to the carrier's `modules.cognition.records`, preserving order.
 /// Rejects a duplicate record_id and any record that fails SPOKE validation.
 pub fn append_cognition_record(
@@ -51,10 +76,8 @@ pub fn append_cognition_record(
         .get("record_id")
         .and_then(Value::as_str)
         .expect("a validated record carries a non-empty record_id");
-    if record.get("view").and_then(Value::as_str) != Some("current") {
-        return Err(MindError::RecordInvalid(format!(
-            "record {record_id} is not placed in the current view"
-        )));
+    if let Some(violation) = carrier_record_violation(&record, &carrier.entry_id) {
+        return Err(MindError::RecordInvalid(violation));
     }
 
     let mut next = carrier.clone();
@@ -104,6 +127,14 @@ pub fn derive_mind_state(carrier: &KnowledgeEntry) -> Result<MindStateView, Mind
         Some(records) if !records.is_empty() => records.clone(),
         _ => return Err(MindError::NoRecords),
     };
+    for record in &records {
+        if let Some(violation) = carrier_record_violation(record, &carrier.entry_id) {
+            return Err(MindError::CarrierInvalid(format!(
+                "carrier {}: {violation}",
+                carrier.entry_id
+            )));
+        }
+    }
     let carrier_revision = carrier.revision.ok_or_else(|| {
         MindError::CarrierInvalid(format!(
             "carrier {} holds records but no assigned revision",
