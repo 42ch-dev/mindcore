@@ -27,25 +27,35 @@ use spoke_schemas::KnowledgeEntry;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn database_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before the epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "mindcore-iteration-01-{}-{nanos}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ))
+/// Scoped temp directory holding one SQLite database; dropping it removes the database
+/// together with its `-wal`/`-shm` siblings, including when an assertion panics.
+struct TempDb {
+    dir: PathBuf,
 }
 
-// WAL leaves siblings next to the database; a rerun must start from an empty store.
-fn remove_database(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    for suffix in ["-wal", "-shm"] {
-        let mut sibling = path.as_os_str().to_os_string();
-        sibling.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(sibling));
+impl TempDb {
+    fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mindcore-iteration-01-{}-{nanos}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create scoped temp dir");
+        Self { dir }
+    }
+
+    fn database_path(&self) -> PathBuf {
+        self.dir.join("mindcore.db")
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -102,11 +112,12 @@ fn belief_record(
     truth: &str,
     acquisition: &str,
     evidence_record_id: &str,
+    assessed_at: &str,
 ) -> Value {
     json!({
-        "assessed_at": "2026-11-19T18:05:00Z",
+        "assessed_at": assessed_at,
         "assessment_context": {"context_id": "ctx_dusk_at_the_gate"},
-        "assessor": reference("knowledge_entry", "ke_wren"),
+        "assessor": reference("knowledge_entry", "ke_wren_cognition"),
         "assessor_role": "holder_self_report",
         "basis": {
             "acquisition": acquisition,
@@ -115,7 +126,7 @@ fn belief_record(
         },
         "effective_at": "2026-11-19T18:00:00Z",
         "extensions": {},
-        "holder": reference("knowledge_entry", "ke_wren"),
+        "holder": reference("knowledge_entry", "ke_wren_cognition"),
         "kind": "belief",
         "order": 1,
         "q": {
@@ -155,6 +166,20 @@ fn record_ids(records: &[Value]) -> Vec<&str> {
         .collect()
 }
 
+// The envelope holder and every assessment's holder/assessor must name one entry.
+fn assert_holder_consistency(value: &Value) {
+    let holder = &value["holder_entry_id"];
+    for item in value["cognition"]["items"]
+        .as_array()
+        .expect("projection items")
+    {
+        for assessment in item["assessments"].as_array().expect("assessment group") {
+            assert_eq!(&assessment["holder"]["id"], holder, "assessment holder");
+            assert_eq!(&assessment["assessor"]["id"], holder, "assessment assessor");
+        }
+    }
+}
+
 fn recall_in(scope: &TrustedScope, context: Option<&str>) -> RecallQuery {
     RecallQuery {
         space: scope.space().clone(),
@@ -183,7 +208,8 @@ fn step(number: u8, text: &str) {
 
 #[tokio::main]
 async fn main() {
-    let path = database_path();
+    let temp = TempDb::new();
+    let path = temp.database_path();
     let store = MindStore::open(&path).await.expect("open store");
 
     // Setup: three collections, two trusted scopes, one shared fixture entry.
@@ -330,7 +356,13 @@ async fn main() {
     );
     let doubt = append_cognition_record(
         &carrier,
-        belief_record("cog_hearsay", "Unknown", "Testimony", &hearsay.record_id),
+        belief_record(
+            "cog_hearsay",
+            "Unknown",
+            "Testimony",
+            &hearsay.record_id,
+            "2026-11-19T18:05:00Z",
+        ),
     )
     .expect("append the doubt record");
     let carrier = expect_ok(
@@ -344,6 +376,8 @@ async fn main() {
     let doubt_value =
         mind_state_value(&doubt_view, "ms_wren_story").expect("render the doubt mind state");
     expect_ok(validate_mind_state(&doubt_value), "doubt mind state");
+    assert_eq!(doubt_value["holder_entry_id"], json!(carrier.entry_id));
+    assert_holder_consistency(&doubt_value);
     let doubt_record = &doubt_view.records[0];
     assert_eq!(doubt_record["truth"], json!("Unknown"));
     assert_eq!(doubt_record["basis"]["acquisition"], json!("Testimony"));
@@ -367,7 +401,7 @@ async fn main() {
         observed_at: timestamp("2026-11-19T19:30:00Z"),
     };
     store
-        .capture(observation)
+        .capture(observation.clone())
         .await
         .expect("capture the observation");
     let observed = store
@@ -391,7 +425,13 @@ async fn main() {
     assert_eq!(revision_before, 2);
     let reconsidered = append_cognition_record(
         &carrier,
-        belief_record("cog_observed", "False", "Perception", &observed.record_id),
+        belief_record(
+            "cog_observed",
+            "False",
+            "Perception",
+            &observed.record_id,
+            "2026-11-19T19:35:00Z",
+        ),
     )
     .expect("append the observation record");
     let carrier = expect_ok(
@@ -426,6 +466,24 @@ async fn main() {
     assert_eq!(
         assessments[1]["basis"]["evidence"][0]["id"],
         json!(observed.record_id)
+    );
+    assert_eq!(revised_value["holder_entry_id"], json!(carrier.entry_id));
+    assert_holder_consistency(&revised_value);
+    assert_eq!(
+        &revised_view.records[0], doubt_record,
+        "appending the revision must preserve the first record"
+    );
+
+    let assessed_at = timestamp(
+        assessments[1]["assessed_at"]
+            .as_str()
+            .expect("the revision carries its assessment time"),
+    );
+    assert!(
+        assessed_at >= observed.recorded_at && assessed_at >= observation.observed_at,
+        "the revision was assessed at {assessed_at}, before its evidence (recorded at {}, observed at {})",
+        observed.recorded_at,
+        observation.observed_at
     );
 
     let personal_after_revision = expect_ok(
@@ -524,7 +582,10 @@ async fn main() {
     assert!(expect_ok(studio.list_entries().await, "list studio after reopen").is_empty());
     step(
         7,
-        "reopen: derived state equals the pre-close state (holder ke_wren, revision 3, records cog_hearsay, cog_observed); studio empty",
+        &format!(
+            "reopen: derived state equals the pre-close state (holder {}, revision 3, records cog_hearsay, cog_observed); studio empty",
+            reopened_view.holder_entry_id
+        ),
     );
 
     // S8: scope and revision refusals leave both collections exactly as they were.
@@ -621,6 +682,5 @@ async fn main() {
     );
 
     store.close().await;
-    remove_database(&path);
     println!("story complete: steps 1-8 asserted, exit 0");
 }

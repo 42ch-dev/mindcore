@@ -15,7 +15,7 @@ use mindcore_sqlite::MindStore;
 use serde_json::{json, Value};
 use spoke_operations::{
     validate_cognition_module, validate_cognition_record, validate_mind_state, KnowledgeEntryPort,
-    SpokeResult,
+    SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{
     KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryModulesKey,
@@ -313,6 +313,46 @@ fn malformed_module_is_rejected_by_append_and_derive() {
         panic!("malformed module must be CarrierInvalid on derive")
     };
     assert!(message.contains("module"), "got {message}");
+}
+
+#[tokio::test]
+async fn carrier_write_rejects_malformed_module_without_touching_row() {
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    let created = expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    assert_eq!(created.revision, Some(1));
+    let before = expect_ok(read_carrier(&port, "ke_wren").await, "read carrier");
+
+    let broken = with_module(
+        "ke_wren",
+        Some(1),
+        json!({
+            "records": [{"kind": "belief", "record_id": "cog_broken"}],
+            "world_facts": [],
+            "extensions": {},
+        }),
+    );
+    match write_carrier(&port, broken, 1).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        SpokeResult::Ok(entry) => panic!("malformed module was persisted: {entry:?}"),
+    }
+
+    let after = expect_ok(read_carrier(&port, "ke_wren").await, "reread carrier");
+    assert_eq!(after.revision, Some(1));
+    assert_eq!(
+        serde_json::to_value(&after).expect("entry serializes"),
+        serde_json::to_value(&before).expect("entry serializes"),
+        "the refused write must leave the previous payload unchanged"
+    );
+    store.close().await;
 }
 
 #[test]
