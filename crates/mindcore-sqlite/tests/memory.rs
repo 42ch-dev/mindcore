@@ -233,6 +233,47 @@ async fn capture_with_a_changed_field_conflicts_without_replacing() {
     remove_database(&path);
 }
 
+// Year 10000 is a valid instant that the store writes with an expanded year and cannot parse back.
+// It must be refused before the row exists, or the candidate id would be occupied but unreadable.
+#[tokio::test]
+async fn capture_of_an_unrepresentable_timestamp_writes_nothing() {
+    let path = database_path("unrepresentable");
+    let store = MindStore::open(&path).await.expect("open store");
+
+    let mut unreadable = candidate_in("cnd_year_10000", "wren", "wren", "tavern");
+    unreadable.observed_at = observed_at(253_402_300_800);
+    let refused = store.capture(unreadable).await;
+    assert!(
+        matches!(refused, Err(MemoryError::UnrepresentableTimestamp)),
+        "unexpected outcome: {refused:?}"
+    );
+
+    assert_eq!(
+        store.candidate("cnd_year_10000").await.expect("candidate"),
+        None
+    );
+    let retained = store.retain("cnd_year_10000", "req-unreadable").await;
+    assert!(matches!(retained, Err(MemoryError::CandidateNotFound(_))));
+    assert!(store
+        .recall(&recall_in("wren", "wren", None))
+        .await
+        .expect("recall")
+        .is_empty());
+
+    let repaired = candidate_in("cnd_year_10000", "wren", "wren", "tavern");
+    store
+        .capture(repaired.clone())
+        .await
+        .expect("capture with a readable timestamp");
+    assert_eq!(
+        store.candidate("cnd_year_10000").await.expect("candidate"),
+        Some(repaired)
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
 #[tokio::test]
 async fn reused_request_for_another_candidate_creates_no_record() {
     let path = database_path("request-reuse");

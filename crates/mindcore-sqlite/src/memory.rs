@@ -24,6 +24,14 @@ fn decode_timestamp(text: &str) -> Result<DateTime<Utc>, MemoryError> {
         .map_err(|error| MemoryError::Store(Box::new(error)))
 }
 
+// Chrono writes years outside 0000..=9999 with a signed expanded year ("+10000-…") that the strict
+// parser cannot read, so prove the encoded text decodes back before a row claims the candidate id.
+fn encode_readable_timestamp(at: DateTime<Utc>) -> Result<String, MemoryError> {
+    let text = encode_timestamp(at);
+    decode_timestamp(&text).map_err(|_| MemoryError::UnrepresentableTimestamp)?;
+    Ok(text)
+}
+
 #[derive(FromRow)]
 struct CandidateRow {
     candidate_id: String,
@@ -114,6 +122,7 @@ async fn capture_candidate(
     pool: &SqlitePool,
     candidate: MemoryCandidate,
 ) -> Result<(), MemoryError> {
+    let observed_at = encode_readable_timestamp(candidate.observed_at)?;
     let inserted = sqlx::query(
         "INSERT INTO memory_candidates (candidate_id, space_id, subject_id, context_id, content, observed_at)
          VALUES (?, ?, ?, ?, ?, ?)
@@ -124,7 +133,7 @@ async fn capture_candidate(
     .bind(candidate.subject.as_str())
     .bind(candidate.context.as_str())
     .bind(&candidate.content)
-    .bind(encode_timestamp(candidate.observed_at))
+    .bind(observed_at)
     .execute(pool)
     .await
     .map_err(store_error)?

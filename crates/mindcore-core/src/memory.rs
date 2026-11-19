@@ -43,6 +43,8 @@ pub enum MemoryError {
     CandidateAlreadyReviewed,
     #[error("id reused for a different operation or payload")]
     IdempotencyConflict,
+    #[error("observed_at has no four-digit RFC 3339 form the store can read back")]
+    UnrepresentableTimestamp,
     #[error(transparent)]
     Store(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
@@ -51,6 +53,10 @@ pub enum MemoryError {
 ///
 /// `capture` is idempotent by `candidate_id`: an equal payload returns `Ok(())` without a write, a
 /// conflicting payload returns [`MemoryError::IdempotencyConflict`].
+///
+/// `capture` first proves `observed_at` survives the store's own timestamp encoding: a value it
+/// cannot decode back, such as a year outside `0000..=9999`, returns
+/// [`MemoryError::UnrepresentableTimestamp`] and writes no row, so the `candidate_id` stays unused.
 ///
 /// `retain` checks the receipt and the candidate, inserts the record and writes the receipt in one
 /// transaction that holds SQLite's write reservation from its first read, so concurrent handles on
