@@ -1,0 +1,15 @@
+{
+  "collection": "village-facts",
+  "entries": [
+    {
+      "schema_version": 1,
+      "entry_id": "ke_shared_north_gate",
+      "canonical_name": "North gate is closed at night",
+      "entry_type": "location",
+      "status": "confirmed",
+      "body": { "summary": "The village north gate is closed after dusk." },
+      "owner": "ke_fixture_record_office",
+      "extensions": {}
+    }
+  ]
+}

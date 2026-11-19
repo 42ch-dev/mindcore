@@ -2,4 +2,5 @@
 
 pub mod boundary;
 pub mod ids;
+pub mod knowledge;
 pub mod memory;
