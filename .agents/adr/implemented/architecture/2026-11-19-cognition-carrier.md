@@ -19,6 +19,6 @@ Store current judgment as SPOKE `modules.cognition` records on the holder's `Kno
 
 ## Consequences
 
-- The projection group and the holder entry must name one identity; derivation copies the carrier id, so the assessment holder/assessor must equal it.
+- The projection group and the holder entry must name one identity; derivation copies the carrier id, so the assessment holder/assessor must equal it. The accepted holder is the complete tuple `{kind: "knowledge_entry", namespace: CARRIER_NAMESPACE ("mindcore"), id: <carrier entry id>}` — the fixed project realm `mindcore-core::cognition::CARRIER_NAMESPACE` names every realm Mindcore can persist today.
 - Appending rewrites the whole record list inside the write transaction; cost grows with history. A bounded history or per-record rows is the upgrade path, tracked as a residual.
 - Scenario assertions must compare story times to story times, not to the store clock, or they become time bombs.
