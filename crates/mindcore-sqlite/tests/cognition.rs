@@ -340,6 +340,13 @@ async fn carrier_write_rejects_malformed_module_without_touching_row() {
             "extensions": {},
         }),
     );
+    // The port is the single validation point: a direct put of a malformed module at the correct
+    // base revision must be refused before any row is written.
+    match port.put_knowledge_entry(broken.clone(), Some(1)).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        SpokeResult::Ok(entry) => panic!("malformed module was persisted: {entry:?}"),
+    }
+    // The carrier helper delegates to that same check.
     match write_carrier(&port, broken, 1).await {
         SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
         SpokeResult::Ok(entry) => panic!("malformed module was persisted: {entry:?}"),

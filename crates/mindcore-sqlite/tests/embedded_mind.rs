@@ -450,11 +450,21 @@ async fn first_mind_story() {
             .as_str()
             .expect("the revision carries its assessment time"),
     );
+    let doubt_assessed_at = timestamp(
+        assessments[0]["assessed_at"]
+            .as_str()
+            .expect("the doubt carries its assessment time"),
+    );
+    // Story times only: the store-assigned `recorded_at` is wall-clock, so comparing against it
+    // would fail as soon as real time passes the story's fixed instant.
     assert!(
-        assessed_at >= observed.recorded_at && assessed_at >= observation.observed_at,
-        "the revision was assessed at {assessed_at}, before its evidence (recorded at {}, observed at {})",
-        observed.recorded_at,
+        assessed_at >= observation.observed_at,
+        "the revision was assessed at {assessed_at}, before the observation it cites (observed at {})",
         observation.observed_at
+    );
+    assert!(
+        assessed_at >= doubt_assessed_at,
+        "the revision was assessed at {assessed_at}, before the judgment it revises ({doubt_assessed_at})"
     );
 
     let personal_after_revision = expect_ok(
