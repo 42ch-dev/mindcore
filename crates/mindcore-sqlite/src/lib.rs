@@ -1,1 +1,1 @@
-//! SQLite (SQLx) backend that implements the mindcore-core storage traits.
+//! Planned SQLite (SQLx) backend that will implement the mindcore-core storage traits over one local database file.
