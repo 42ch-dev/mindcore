@@ -189,13 +189,13 @@ async fn first_mind_story() {
 
     let (shared_collection, shared_entries) = shared_fixture();
     assert_eq!(shared_collection, "village-facts");
-    assert_eq!(shared_entries.len(), 1);
-    let shared_entry_id = shared_entries[0].entry_id.clone();
-    assert_eq!(shared_entry_id, "ke_shared_north_gate");
+    let shared_entry = shared_entries
+        .into_iter()
+        .find(|candidate| candidate.entry_id == "ke_shared_north_gate")
+        .expect("the fixture carries the shared north gate entry");
+    let shared_entry_id = shared_entry.entry_id.clone();
     let shared_seeded = expect_ok(
-        facts
-            .put_knowledge_entry(shared_entries[0].clone(), None)
-            .await,
+        facts.put_knowledge_entry(shared_entry, None).await,
         "seed the shared fixture entry",
     );
     assert_eq!(shared_seeded.revision, Some(1));
@@ -256,12 +256,20 @@ async fn first_mind_story() {
         "write the personal entry",
     );
     assert_eq!(adopted.revision, Some(1));
+    let personal_reread = expect_ok(
+        wren.get_knowledge_entry("ke_wren_north_gate").await,
+        "read the personal entry back",
+    );
+    assert_eq!(json_of(&personal_reread), json_of(&adopted));
+    let anchor = personal_reread
+        .source_anchor
+        .as_ref()
+        .expect("the personal entry carries its adoption anchor");
+    assert_eq!(anchor.source_id, format!("shared:{shared_entry_id}"));
     assert_eq!(
-        adopted
-            .source_anchor
-            .as_ref()
-            .map(|anchor| anchor.source_id.as_str()),
-        Some("shared:ke_shared_north_gate")
+        serde_json::to_value(anchor).expect("anchor serializes")["extensions"]["mindcore_adoption"]
+            ["basis"],
+        json!("hearsay")
     );
 
     let hearsay = store
@@ -337,6 +345,14 @@ async fn first_mind_story() {
         .retain("cnd_wren_gate", "req-wren-gate")
         .await
         .expect("retain the observation");
+    assert_eq!(observed.context.as_str(), "gate");
+    assert_eq!(
+        store
+            .recall(&recall_in(&wren_scope, Some("gate")))
+            .await
+            .expect("recall the gate"),
+        vec![observed.clone()]
+    );
 
     let carrier = expect_ok(
         read_carrier(&wren, "ke_wren_cognition").await,
@@ -399,9 +415,9 @@ async fn first_mind_story() {
         facts.get_knowledge_entry(&shared_entry_id).await,
         "read the shared entry before its update",
     );
+    let changed_summary = "The village north gate is closed after dusk and guarded at night.";
     let mut shared_update = shared_before_update.clone();
-    shared_update.body.summary =
-        Some("The village north gate is closed after dusk and guarded at night.".to_string());
+    shared_update.body.summary = Some(changed_summary.to_string());
     let shared_updated = expect_ok(
         facts.put_knowledge_entry(shared_update, Some(1)).await,
         "update the shared entry",
@@ -412,6 +428,12 @@ async fn first_mind_story() {
         "read the shared entry after its update",
     );
     assert_eq!(json_of(&shared_reread), json_of(&shared_updated));
+    assert_eq!(
+        shared_reread.body.summary.as_deref(),
+        Some(changed_summary),
+        "the reread carries the requested shared content"
+    );
+    assert_ne!(json_of(&shared_reread), json_of(&shared_before_update));
 
     let personal_after_shared = expect_ok(
         wren.get_knowledge_entry("ke_wren_north_gate").await,
@@ -425,10 +447,16 @@ async fn first_mind_story() {
     let view_after_shared =
         derive_mind_state(&carrier_after_shared).expect("derive after the shared change");
     assert_eq!(
-        record_ids(&view_after_shared.records),
-        vec!["cog_hearsay", "cog_observed"]
+        view_after_shared.records, revised_view.records,
+        "derived records are unchanged by the shared update"
     );
     assert_eq!(view_after_shared.carrier_revision, 3);
+    let view_after_shared_value = mind_state_value(&view_after_shared, "ms_wren_story")
+        .expect("render the mind state after the shared change");
+    assert_eq!(
+        view_after_shared_value, revised_value,
+        "the rendered projection is unchanged by the shared update"
+    );
 
     // S7: the file, not the process, holds the mind.
     let expected_value =
