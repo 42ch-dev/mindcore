@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
-use mindcore_base::memory::{MemoryCandidate, MemoryStore, RecallQuery};
+use mindcore_base::memory::{MemoryCandidate, MemoryError, MemoryStore, RecallQuery};
 use mindcore_sqlite::MindStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
@@ -30,6 +30,16 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Exclusive create: refuses to adopt a pre-existing directory, so `Drop`
+    /// can only ever remove a root this harness itself created.
+    fn open(root: PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir(&root)?;
+        // `/var` is a symlink to `/private/var` on macOS; canonicalize once so
+        // the guard compares canonical parents against a canonical root.
+        let root = root.canonicalize()?;
+        Ok(Self { root })
+    }
+
     fn fresh() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -40,11 +50,7 @@ impl Fixture {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&root).expect("fixture root");
-        // `/var` is a symlink to `/private/var` on macOS; canonicalize once so
-        // the guard compares canonical parents against a canonical root.
-        let root = root.canonicalize().expect("canonical fixture root");
-        Self { root }
+        Self::open(root).expect("fresh fixture root")
     }
 
     fn db_path(&self) -> PathBuf {
@@ -55,20 +61,39 @@ impl Fixture {
     }
 
     fn guard(root: &Path, path: &Path) -> Result<(), String> {
-        if path.exists() {
+        // `symlink_metadata` inspects the final component itself, so a file,
+        // directory or symlink — including a dangling link that `exists()`
+        // would report as absent — is refused before a connection opens.
+        if path.symlink_metadata().is_ok() {
             return Err(format!("{} already exists", path.display()));
         }
-        let parent = path
-            .parent()
-            .and_then(|p| p.canonicalize().ok())
-            .ok_or_else(|| format!("{} has no resolvable parent", path.display()))?;
-        if parent != root {
-            return Err(format!(
-                "{} resolves outside the fixture workspace",
-                path.display()
-            ));
+        // Walk up from the path: any existing symlink component is refused,
+        // and the walk ends in one of two verdicts — reaching the fixture root
+        // (inside) or canonicalizing an ancestor that sits outside it.
+        let mut cursor = path.parent();
+        while let Some(dir) = cursor {
+            match dir.symlink_metadata() {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(format!("{} crosses a symlink", dir.display()));
+                }
+                Ok(_) => {
+                    if let Ok(real) = dir.canonicalize() {
+                        if real == root {
+                            return Ok(());
+                        }
+                        if !real.starts_with(root) {
+                            return Err(format!(
+                                "{} resolves outside the fixture workspace",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            cursor = dir.parent();
         }
-        Ok(())
+        Err(format!("{} has no resolvable parent", path.display()))
     }
 }
 
@@ -93,12 +118,51 @@ fn candidate(candidate_id: &str, context: &str, content: &str) -> MemoryCandidat
 fn fixture_guard_refuses_foreign_paths() {
     let fixture = Fixture::fresh();
     let root = &fixture.root;
-    assert!(Fixture::guard(root, &root.join("nested").join("x.db")).is_err());
+    // Nested paths inside the workspace are allowed; `..` and foreign roots
+    // are refused.
+    assert!(Fixture::guard(root, &root.join("nested").join("x.db")).is_ok());
     assert!(Fixture::guard(root, &root.join("..").join("x.db")).is_err());
     assert!(Fixture::guard(root, Path::new("/tmp/foreign-parity.db")).is_err());
     let existing = fixture.db_path();
     std::fs::write(&existing, b"").unwrap();
     assert!(Fixture::guard(root, &existing).is_err());
+}
+
+#[test]
+fn fixture_guard_refuses_dangling_symlink() {
+    let fixture = Fixture::fresh();
+    let foreign = std::env::temp_dir().join("mindcore-parity-foreign-target.db");
+    let link = fixture.root.join("parity-link.db");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&foreign, &link).expect("symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&foreign, &link).expect("symlink");
+    // The target does not exist: `Path::exists()` reports false, so the old
+    // guard passed this path. `symlink_metadata` sees the link itself.
+    assert!(!link.exists());
+    assert!(Fixture::guard(&fixture.root, &link).is_err());
+}
+
+#[test]
+fn fixture_root_refuses_to_adopt_existing_directory() {
+    let preexisting = Fixture::fresh();
+    let claimed = Fixture::open(preexisting.root.clone());
+    assert!(claimed.is_err(), "adopting a pre-existing root must fail");
+}
+
+/// True only for a real SQLite lock refusal (`SQLITE_BUSY` or
+/// `SQLITE_BUSY_TIMEOUT`), never for a pool-acquisition timeout.
+fn is_sqlite_lock(error: &MemoryError) -> bool {
+    let MemoryError::Store(inner) = error else {
+        return false;
+    };
+    let Some(sqlx::Error::Database(db)) = inner.downcast_ref::<sqlx::Error>() else {
+        return false;
+    };
+    if let Some(code) = db.code().and_then(|c| c.parse::<i64>().ok()) {
+        return code & 0xFF == 5 || code & 0xFF == 6;
+    }
+    db.message().contains("database is locked")
 }
 
 /// The observable surface Mindcore serves for the baseline's read-side rows:
@@ -148,9 +212,10 @@ async fn mindcore_surface_observables_and_reopen() {
 }
 
 /// The transaction seam: `MemoryStore::retain` is the only effect path and it
-/// stages on a transaction it opens itself. A caller holding `BEGIN IMMEDIATE`
-/// on the file blocks it outright — Mindcore can never borrow the caller's
-/// transaction, so a caller rollback cannot cover Mindcore's rows.
+/// stages on a transaction it opens itself. While a caller holds
+/// `BEGIN IMMEDIATE` on the file, `retain`'s own begin is refused with a real
+/// SQLite lock error, and nothing the attempt tried to write exists after the
+/// caller rolls back.
 #[tokio::test]
 async fn mindstore_blocked_by_caller_held_transaction() {
     let fixture = Fixture::fresh();
@@ -176,8 +241,9 @@ async fn mindstore_blocked_by_caller_held_transaction() {
 
     // `retain` cannot stage on the caller's transaction: it takes `&self` and
     // begins another `BEGIN IMMEDIATE` on the Mindcore pool
-    // (src/memory.rs:163-166), which busy-waits behind the caller until its
-    // timeout refuses it.
+    // (src/memory.rs:163-166), which busy-waits behind the caller until SQLite
+    // refuses it. The refusal must be the lock class itself, not a pool
+    // acquisition timeout.
     let retained =
         tokio::time::timeout(Duration::from_secs(8), store.retain("cand_b", "req_2")).await;
     let error = match retained {
@@ -186,8 +252,27 @@ async fn mindstore_blocked_by_caller_held_transaction() {
         Err(elapsed) => panic!("mindcore retain did not settle: {elapsed}"),
     };
     assert!(
-        error.to_string().contains("locked") || error.to_string().contains("timed out"),
-        "expected a lock refusal, got {error}"
+        is_sqlite_lock(&error),
+        "expected a SQLite lock refusal (SQLITE_BUSY/BUSY_TIMEOUT), got {error}"
     );
     caller_tx.rollback().await.expect("caller rollback");
+
+    // The blocked attempt left nothing behind, and the caller's rollback could
+    // not touch the earlier capture: Mindcore's commits are durable outside
+    // the caller's transaction boundary.
+    let candidates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_candidates")
+        .fetch_one(&caller_pool)
+        .await
+        .expect("candidate count");
+    assert_eq!(candidates, 1);
+    let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_records")
+        .fetch_one(&caller_pool)
+        .await
+        .expect("record count");
+    assert_eq!(records, 0);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_receipts")
+        .fetch_one(&caller_pool)
+        .await
+        .expect("receipt count");
+    assert_eq!(receipts, 0);
 }
