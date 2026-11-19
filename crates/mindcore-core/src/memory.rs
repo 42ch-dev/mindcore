@@ -53,13 +53,15 @@ pub enum MemoryError {
 /// conflicting payload returns [`MemoryError::IdempotencyConflict`].
 ///
 /// `retain` checks the receipt and the candidate, inserts the record and writes the receipt in one
-/// transaction. Repeating the same `(request_id, candidate_id)` returns the original record;
+/// transaction that holds SQLite's write reservation from its first read, so concurrent handles on
+/// one file serialize. Repeating the same `(request_id, candidate_id)` returns the original record;
 /// reusing the request for a different candidate returns [`MemoryError::IdempotencyConflict`]; a
 /// different request for an already retained candidate returns
 /// [`MemoryError::CandidateAlreadyReviewed`].
 ///
-/// `recall` returns only retained records, filtered by `space` and `subject`; a candidate that was
-/// never retained is not recallable.
+/// `recall` returns only retained records, filtered by `space`, `subject` and the optional
+/// `context` (`None` recalls every context), ordered by `recorded_at ASC, record_id ASC`; a
+/// candidate that was never retained is not recallable.
 #[async_trait::async_trait]
 pub trait MemoryStore {
     async fn capture(&self, candidate: MemoryCandidate) -> Result<(), MemoryError>;

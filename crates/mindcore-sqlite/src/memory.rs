@@ -149,7 +149,12 @@ async fn retain_candidate(
     candidate_id: &str,
     request_id: &str,
 ) -> Result<MemoryRecord, MemoryError> {
-    let mut transaction = pool.begin().await.map_err(store_error)?;
+    // Take the write reservation up front: two handles on one file must not both read "no receipt"
+    // and then lose the lock upgrade. Losers wait on busy_timeout and see the committed winner.
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(store_error)?;
 
     let receipt: Option<(String, String)> =
         sqlx::query_as("SELECT candidate_id, record_id FROM review_receipts WHERE request_id = ?")
