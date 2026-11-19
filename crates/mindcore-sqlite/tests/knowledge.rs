@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mindcore_core::knowledge::{adoption_anchor, KnowledgeScope};
 use mindcore_sqlite::MindStore;
@@ -15,6 +15,8 @@ use spoke_schemas::knowledge_entry::{
 };
 use spoke_schemas::source_anchor::ExtensionKey as AnchorExtensionKey;
 use spoke_schemas::KnowledgeEntry;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -38,6 +40,19 @@ fn remove_database(path: &Path) {
         sibling.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(sibling));
     }
+}
+
+// A second pool on the same file, so a test can hold SQLite's write reservation without writing.
+async fn second_connection(path: &Path) -> SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .busy_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("open second connection")
 }
 
 fn entry_with(entry_id: &str, summary: &str) -> KnowledgeEntry {
@@ -305,6 +320,48 @@ async fn cross_handle_cas_lets_exactly_one_writer_win() {
 
     left_store.close().await;
     right_store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn put_waits_for_a_write_reservation_held_elsewhere() {
+    let path = database_path("reservation");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    // A held write reservation that writes nothing: only a put that takes SQLite's reservation
+    // before reading can be blocked here, so a deferred `BEGIN` fails this test.
+    let holder = second_connection(&path).await;
+    let reservation = holder
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("hold the write reservation");
+
+    let mut pending =
+        Box::pin(port.put_knowledge_entry(entry_with("ke_gate", "closed after dusk"), None));
+    match tokio::time::timeout(Duration::from_millis(200), &mut pending).await {
+        Err(_) => {}
+        Ok(SpokeResult::Ok(entry)) => panic!(
+            "put finished while another connection held the write reservation: revision {:?}",
+            entry.revision
+        ),
+        Ok(SpokeResult::Reject(reject)) => {
+            panic!("put failed instead of waiting for the write reservation: {reject:?}")
+        }
+    }
+
+    reservation
+        .rollback()
+        .await
+        .expect("release the write reservation");
+    holder.close().await;
+
+    let created = expect_ok(pending.await, "create once the reservation is released");
+    assert_eq!(created.revision, Some(1));
+    let fetched = expect_ok(port.get_knowledge_entry("ke_gate").await, "get");
+    assert_eq!(as_json(&fetched), as_json(&created));
+
+    store.close().await;
     remove_database(&path);
 }
 
