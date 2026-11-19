@@ -1,5 +1,5 @@
 ---
-module: mindcore-core
+module: mindcore-base
 date: 2026-11-19
 problem_type: design_pattern
 category: design-patterns

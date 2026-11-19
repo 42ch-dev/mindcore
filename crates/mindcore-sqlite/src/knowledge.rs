@@ -5,8 +5,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use sqlx::SqlitePool;
 
-use mindcore_core::cognition::carrier_record_violation;
-use mindcore_core::knowledge::KnowledgeScope;
+use mindcore_base::cognition::carrier_record_violation;
+use mindcore_base::knowledge::KnowledgeScope;
 use spoke_operations::{
     spoke_reject, validate_cognition_module, KnowledgeEntryPort, SpokeRejectCode, SpokeResult,
 };

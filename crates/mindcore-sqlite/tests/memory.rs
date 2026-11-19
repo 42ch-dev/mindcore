@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use mindcore_core::ids::{ContextId, SpaceId, SubjectId};
-use mindcore_core::memory::{MemoryCandidate, MemoryError, MemoryStore, RecallQuery};
+use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
+use mindcore_base::memory::{MemoryCandidate, MemoryError, MemoryStore, RecallQuery};
 use mindcore_sqlite::MindStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -58,13 +58,15 @@ fn recall_in(space: &str, subject: &str, context: Option<&str>) -> RecallQuery {
     }
 }
 
-// Fixture state the public API cannot produce: fixed timestamps and a receipt without its record.
+// Fixture state the public API cannot produce: fixed timestamps. Foreign keys are enforced here
+// too, so this writer cannot create a receipt whose candidate or record is missing.
 async fn fixture_writer(path: &Path) -> SqlitePool {
     SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
             SqliteConnectOptions::new()
                 .filename(path)
+                .foreign_keys(true)
                 .busy_timeout(Duration::from_secs(5)),
         )
         .await
@@ -318,28 +320,75 @@ async fn retain_of_an_unknown_candidate_is_not_found() {
 }
 
 #[tokio::test]
-async fn receipt_without_its_record_is_a_store_error() {
-    let path = database_path("orphan-receipt");
+async fn receipt_with_a_missing_candidate_is_refused() {
+    let path = database_path("receipt-missing-candidate");
     let store = MindStore::open(&path).await.expect("open store");
 
-    // review_receipts.record_id has no foreign key, so this state is reachable.
+    // A real record for the other FK: only the candidate reference is missing.
+    store
+        .capture(candidate_in("cnd_lone", "wren", "wren", "tavern"))
+        .await
+        .expect("capture");
+    let record = store.retain("cnd_lone", "req-lone").await.expect("retain");
+
     let writer = fixture_writer(&path).await;
-    sqlx::query(
+    let error = sqlx::query(
         "INSERT INTO review_receipts (request_id, candidate_id, record_id) VALUES (?, ?, ?)",
     )
-    .bind("req-orphan")
-    .bind("cnd_orphan")
-    .bind("rec_cnd_orphan")
+    .bind("req-orphan-candidate")
+    .bind("cnd_missing")
+    .bind(&record.record_id)
     .execute(&writer)
     .await
-    .expect("insert receipt");
+    .expect_err("a receipt must reference an existing candidate");
     writer.close().await;
-
-    let refused = store.retain("cnd_orphan", "req-orphan").await;
     assert!(
-        matches!(refused, Err(MemoryError::Store(_))),
-        "unexpected outcome: {refused:?}"
+        error
+            .as_database_error()
+            .is_some_and(|database| database.is_foreign_key_violation()),
+        "expected a foreign-key violation, got: {error}"
     );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn receipt_with_a_missing_record_is_refused() {
+    let path = database_path("receipt-missing-record");
+    let store = MindStore::open(&path).await.expect("open store");
+
+    // A real candidate for the other FK; its record reference below points nowhere.
+    store
+        .capture(candidate_in("cnd_lone", "wren", "wren", "tavern"))
+        .await
+        .expect("capture");
+
+    let writer = fixture_writer(&path).await;
+    let error = sqlx::query(
+        "INSERT INTO review_receipts (request_id, candidate_id, record_id) VALUES (?, ?, ?)",
+    )
+    .bind("req-orphan-record")
+    .bind("cnd_lone")
+    .bind("rec_missing")
+    .execute(&writer)
+    .await
+    .expect_err("a receipt must reference an existing record");
+    writer.close().await;
+    assert!(
+        error
+            .as_database_error()
+            .is_some_and(|database| database.is_foreign_key_violation()),
+        "expected a foreign-key violation, got: {error}"
+    );
+
+    // The refusals leave the store usable: the same candidate still retains and replays.
+    let retained = store.retain("cnd_lone", "req-lone").await.expect("retain");
+    let replayed = store
+        .retain("cnd_lone", "req-lone")
+        .await
+        .expect("replay the same review request");
+    assert_eq!(replayed, retained);
 
     store.close().await;
     remove_database(&path);

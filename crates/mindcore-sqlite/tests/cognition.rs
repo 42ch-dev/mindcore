@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mindcore_core::cognition::{
+use mindcore_base::cognition::{
     append_cognition_record, derive_mind_state, mind_state_value, MindError, CARRIER_NAMESPACE,
 };
-use mindcore_core::knowledge::KnowledgeScope;
+use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_sqlite::cognition::{read_carrier, write_carrier};
 use mindcore_sqlite::MindStore;
 use serde_json::{json, Value};

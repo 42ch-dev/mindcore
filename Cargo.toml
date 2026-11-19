@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/mindcore-core", "crates/mindcore-sqlite"]
-default-members = ["crates/mindcore-core", "crates/mindcore-sqlite"]
+members = ["crates/mindcore-base", "crates/mindcore-sqlite"]
+default-members = ["crates/mindcore-base", "crates/mindcore-sqlite"]
 
 [workspace.package]
 version = "0.1.0"
