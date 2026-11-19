@@ -6,7 +6,10 @@ use serde_json::{Map, Value};
 use sqlx::SqlitePool;
 
 use mindcore_core::knowledge::KnowledgeScope;
-use spoke_operations::{spoke_reject, KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    spoke_reject, validate_cognition_module, KnowledgeEntryPort, SpokeRejectCode, SpokeResult,
+};
+use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
 use spoke_schemas::KnowledgeEntry;
 
 use crate::store::MindStore;
@@ -19,6 +22,8 @@ use crate::store::MindStore;
 ///
 /// `put` persists the submitted payload unchanged except for the assigned `revision` (`1` on create,
 /// stored + 1 on update); the SQL timestamp columns carry the store's own write bookkeeping.
+/// A present `modules.cognition` is gated here, so no caller can commit a module that the next
+/// derivation would reject.
 pub struct ScopedKnowledgeStore {
     pool: SqlitePool,
     scope: KnowledgeScope,
@@ -88,6 +93,14 @@ fn encode_timestamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+fn cognition_module(entry: &KnowledgeEntry) -> Option<Value> {
+    let key: KnowledgeEntryModulesKey = "cognition".parse().expect("valid module namespace");
+    match entry.modules.get(&key)? {
+        KnowledgeEntryModulesValue::Object(module) => Some(Value::Object(module.clone())),
+        KnowledgeEntryModulesValue::Array(items) => Some(Value::Array(items.clone())),
+    }
+}
+
 fn stale<T>(
     collection: &str,
     entry_id: &str,
@@ -139,6 +152,13 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
         expected_base_revision: Option<u64>,
     ) -> SpokeResult<KnowledgeEntry> {
         let collection = self.scope.collection.as_str();
+        // Single persistence boundary: gate the carrier module before a transaction can reserve a
+        // write, so a refusal leaves the stored row untouched.
+        if let Some(module) = cognition_module(&entry) {
+            if let SpokeResult::Reject(reject) = validate_cognition_module(&module) {
+                return SpokeResult::Reject(reject);
+            }
+        }
         // Hold SQLite's write reservation across the read and the write: the revision comparison and
         // the put must not interleave with another handle on the same file.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
