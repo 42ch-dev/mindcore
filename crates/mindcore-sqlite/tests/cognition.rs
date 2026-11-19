@@ -14,7 +14,8 @@ use mindcore_sqlite::cognition::{read_carrier, write_carrier};
 use mindcore_sqlite::MindStore;
 use serde_json::{json, Value};
 use spoke_operations::{
-    validate_cognition_module, validate_mind_state, KnowledgeEntryPort, SpokeResult,
+    validate_cognition_module, validate_cognition_record, validate_mind_state, KnowledgeEntryPort,
+    SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{
     KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryModulesKey,
@@ -24,16 +25,36 @@ use spoke_schemas::KnowledgeEntry;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn database_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before the epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "mindcore-cognition-{}-{nanos}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ))
+/// Scoped temp directory holding one SQLite database; dropping it removes the database
+/// together with its `-wal`/`-shm` siblings, including when an assertion panics.
+struct TempDb {
+    dir: PathBuf,
+}
+
+impl TempDb {
+    fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mindcore-cognition-{}-{nanos}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create scoped temp dir");
+        Self { dir }
+    }
+
+    fn database_path(&self) -> PathBuf {
+        self.dir.join("mindcore.db")
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 fn carrier(entry_id: &str, revision: Option<u64>) -> KnowledgeEntry {
@@ -92,6 +113,20 @@ fn belief(record_id: &str, q: f64) -> Value {
     })
 }
 
+fn with_module(entry_id: &str, revision: Option<u64>, module: Value) -> KnowledgeEntry {
+    let mut entry = carrier(entry_id, revision);
+    entry.modules.insert(
+        KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key"),
+        KnowledgeEntryModulesValue::from(
+            module
+                .as_object()
+                .expect("module fixture must be an object")
+                .clone(),
+        ),
+    );
+    entry
+}
+
 fn module_of(entry: &KnowledgeEntry) -> Value {
     serde_json::to_value(&entry.modules).expect("modules serialize")["cognition"].clone()
 }
@@ -112,8 +147,10 @@ fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
 
 #[tokio::test]
 async fn append_creates_module_and_validates() {
-    let path = database_path();
-    let store = MindStore::open(&path).await.expect("open store");
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
     let port = store.knowledge(KnowledgeScope::new("wren"));
 
     expect_ok(
@@ -149,15 +186,10 @@ fn derive_requires_records() {
         Err(MindError::NoRecords)
     ));
 
-    let mut empty = carrier("ke_wren", Some(1));
-    empty.modules.insert(
-        KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key"),
-        KnowledgeEntryModulesValue::from(
-            json!({"records": [], "world_facts": [], "extensions": {}})
-                .as_object()
-                .expect("module object")
-                .clone(),
-        ),
+    let empty = with_module(
+        "ke_wren",
+        Some(1),
+        json!({"records": [], "world_facts": [], "extensions": {}}),
     );
     assert!(matches!(
         derive_mind_state(&empty),
@@ -205,6 +237,10 @@ fn mind_state_value_passes_validation() {
     );
     assert_eq!(items[0]["selection"]["selected_record_id"], "cog_observed");
     assert_eq!(
+        items[0]["selection"]["input_record_ids"],
+        json!(["cog_hearsay", "cog_observed"])
+    );
+    assert_eq!(
         items[0]["selection"]["policy"]["policy_id"],
         "mindcore_append_order"
     );
@@ -217,4 +253,76 @@ fn append_does_not_change_revision() {
     let output =
         append_cognition_record(&input, belief("cog_hearsay", 0.4)).expect("append record");
     assert_eq!(output.revision, input.revision);
+}
+
+#[test]
+fn invalid_record_is_rejected_and_carrier_unchanged() {
+    let input = append_cognition_record(&carrier("ke_wren", Some(1)), belief("cog_hearsay", 0.4))
+        .expect("append valid record");
+    let before = module_of(&input);
+
+    let mut invalid = belief("cog_bad_order", 0.5);
+    invalid["order"] = json!(4);
+    match append_cognition_record(&input, invalid) {
+        Err(MindError::RecordInvalid(message)) => {
+            assert!(message.contains("wire-shape"), "got {message}")
+        }
+        other => panic!("invalid record must be RecordInvalid, got {other:?}"),
+    }
+    assert_eq!(module_of(&input), before);
+}
+
+#[test]
+fn non_current_record_is_rejected() {
+    let mut recorded = belief("cog_recorded", 0.4);
+    recorded["view"] = json!("recorded_at");
+    // The pinned record validator is placement-agnostic, so only the current-view
+    // rule can reject this record at append time.
+    expect_ok(
+        validate_cognition_record(&recorded),
+        "recorded_at fixture is a valid placed record",
+    );
+
+    match append_cognition_record(&carrier("ke_wren", Some(1)), recorded) {
+        Err(MindError::RecordInvalid(message)) => {
+            assert!(message.contains("cog_recorded"), "got {message}")
+        }
+        other => panic!("non-current record must be RecordInvalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn malformed_module_is_rejected_by_append_and_derive() {
+    let broken = with_module(
+        "ke_wren",
+        Some(1),
+        json!({
+            "records": [{"kind": "belief", "record_id": "cog_broken"}],
+            "world_facts": [],
+            "extensions": {},
+        }),
+    );
+
+    match append_cognition_record(&broken, belief("cog_hearsay", 0.4)) {
+        Err(MindError::CarrierInvalid(message)) => {
+            assert!(message.contains("module"), "got {message}")
+        }
+        other => panic!("malformed module must be CarrierInvalid on append, got {other:?}"),
+    }
+    let Err(MindError::CarrierInvalid(message)) = derive_mind_state(&broken) else {
+        panic!("malformed module must be CarrierInvalid on derive")
+    };
+    assert!(message.contains("module"), "got {message}");
+}
+
+#[test]
+fn records_without_revision_are_rejected() {
+    let entry = append_cognition_record(&carrier("ke_wren", None), belief("cog_hearsay", 0.4))
+        .expect("append record to unrevisioned carrier");
+    assert_eq!(entry.revision, None);
+
+    let Err(MindError::CarrierInvalid(message)) = derive_mind_state(&entry) else {
+        panic!("records without a revision must be CarrierInvalid")
+    };
+    assert!(message.contains("revision"), "got {message}");
 }
