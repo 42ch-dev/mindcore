@@ -67,33 +67,46 @@ impl Fixture {
         if path.symlink_metadata().is_ok() {
             return Err(format!("{} already exists", path.display()));
         }
-        // Walk up from the path: any existing symlink component is refused,
-        // and the walk ends in one of two verdicts — reaching the fixture root
-        // (inside) or canonicalizing an ancestor that sits outside it.
-        let mut cursor = path.parent();
-        while let Some(dir) = cursor {
-            match dir.symlink_metadata() {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(format!("{} crosses a symlink", dir.display()));
+        // Fail closed, component by component. The path must literally start
+        // with the fixture root's components — so `..`, `.` and foreign
+        // prefixes refuse — and every existing element between the root and
+        // the final component must be a directory: a regular file
+        // (`root/file/x`) or a symlink (`root/alias/x` where alias -> root)
+        // cannot be walked through, and neither can a symlinked tail.
+        let mut tail = path.components();
+        for expected in root.components() {
+            match tail.next() {
+                Some(actual) if actual == expected => {}
+                _ => {
+                    return Err(format!(
+                        "{} resolves outside the fixture workspace",
+                        path.display()
+                    ));
                 }
-                Ok(_) => {
-                    if let Ok(real) = dir.canonicalize() {
-                        if real == root {
-                            return Ok(());
-                        }
-                        if !real.starts_with(root) {
-                            return Err(format!(
-                                "{} resolves outside the fixture workspace",
-                                path.display()
-                            ));
-                        }
-                    }
-                }
-                Err(_) => {}
             }
-            cursor = dir.parent();
         }
-        Err(format!("{} has no resolvable parent", path.display()))
+        let mut probe = root.to_path_buf();
+        for component in tail {
+            match component {
+                std::path::Component::Normal(name) => probe.push(name),
+                _ => {
+                    return Err(format!("{} contains a non-path component", path.display()));
+                }
+            }
+            match probe.symlink_metadata() {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(format!("{} crosses a symlink", probe.display()));
+                }
+                Ok(meta) if !meta.is_dir() => {
+                    return Err(format!("{} is not a directory", probe.display()));
+                }
+                Ok(_) => {}
+                // Beyond the last existing component nothing can mislead the
+                // open: a missing tail is created under a verified prefix.
+                Err(_) => break,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -144,6 +157,29 @@ fn fixture_guard_refuses_dangling_symlink() {
 }
 
 #[test]
+fn fixture_guard_refuses_alias_dotdot_and_file_components() {
+    let fixture = Fixture::fresh();
+    // `alias -> root`: `root/alias/child/../absent.db` lexically stays inside,
+    // but a prefix-only check misses that `alias` is a symlink, and the `..`
+    // then escapes by resolution.
+    let alias = fixture.root.join("alias");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&fixture.root, &alias).expect("alias symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&fixture.root, &alias).expect("alias symlink");
+    assert!(Fixture::guard(
+        &fixture.root,
+        &alias.join("child").join("..").join("absent.db")
+    )
+    .is_err());
+    // A regular file is not a directory: `root/file/absent.db` cannot be a
+    // fixture path even though its components stay under the root.
+    let file = fixture.root.join("file");
+    std::fs::write(&file, b"").unwrap();
+    assert!(Fixture::guard(&fixture.root, &file.join("absent.db")).is_err());
+}
+
+#[test]
 fn fixture_root_refuses_to_adopt_existing_directory() {
     let preexisting = Fixture::fresh();
     let claimed = Fixture::open(preexisting.root.clone());
@@ -159,10 +195,9 @@ fn is_sqlite_lock(error: &MemoryError) -> bool {
     let Some(sqlx::Error::Database(db)) = inner.downcast_ref::<sqlx::Error>() else {
         return false;
     };
-    if let Some(code) = db.code().and_then(|c| c.parse::<i64>().ok()) {
-        return code & 0xFF == 5 || code & 0xFF == 6;
-    }
-    db.message().contains("database is locked")
+    db.code()
+        .and_then(|c| c.parse::<i64>().ok())
+        .is_some_and(|code| code & 0xFF == 5 || code & 0xFF == 6)
 }
 
 /// The observable surface Mindcore serves for the baseline's read-side rows:
@@ -257,22 +292,26 @@ async fn mindstore_blocked_by_caller_held_transaction() {
     );
     caller_tx.rollback().await.expect("caller rollback");
 
-    // The blocked attempt left nothing behind, and the caller's rollback could
-    // not touch the earlier capture: Mindcore's commits are durable outside
-    // the caller's transaction boundary.
-    let candidates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_candidates")
-        .fetch_one(&caller_pool)
-        .await
-        .expect("candidate count");
-    assert_eq!(candidates, 1);
-    let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_records")
-        .fetch_one(&caller_pool)
-        .await
-        .expect("record count");
-    assert_eq!(records, 0);
-    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_receipts")
-        .fetch_one(&caller_pool)
-        .await
-        .expect("receipt count");
-    assert_eq!(receipts, 0);
+    // Named, not counted: the blocked attempt's own identities are absent
+    // after the caller's rollback, while the earlier capture — committed
+    // before the caller began, outside its boundary — is untouched.
+    let cand_b: Option<String> = sqlx::query_scalar(
+        "SELECT candidate_id FROM memory_candidates WHERE candidate_id = 'cand_b'",
+    )
+    .fetch_optional(&caller_pool)
+    .await
+    .expect("cand_b lookup");
+    assert!(cand_b.is_some(), "capture was committed before the lock");
+    let rec_from_b: Option<String> =
+        sqlx::query_scalar("SELECT record_id FROM memory_records WHERE candidate_id = 'cand_b'")
+            .fetch_optional(&caller_pool)
+            .await
+            .expect("rec_b lookup");
+    assert!(rec_from_b.is_none(), "blocked retain left no record");
+    let receipt_2: Option<String> =
+        sqlx::query_scalar("SELECT record_id FROM review_receipts WHERE request_id = 'req_2'")
+            .fetch_optional(&caller_pool)
+            .await
+            .expect("req_2 lookup");
+    assert!(receipt_2.is_none(), "blocked retain left no receipt");
 }
