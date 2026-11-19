@@ -1,1 +1,6 @@
-//! Planned SQLite (SQLx) backend that will implement the mindcore-core storage traits over one local database file.
+//! SQLite (SQLx) backend implementing the mindcore-core storage traits over one local database file.
+
+mod memory;
+mod store;
+
+pub use store::MindStore;
