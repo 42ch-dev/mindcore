@@ -212,7 +212,13 @@ impl MemoryWorkflowBinding {
                 .await
             {
                 SpokeResult::Ok(body) => settled = Some(body),
-                SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+                SpokeResult::Reject(reject) => {
+                    return Err(unresolved(
+                        &receipts,
+                        "settlement",
+                        format!("{}: {}", reject.code, reject.message),
+                    ))
+                }
             }
         }
         transaction
@@ -742,10 +748,17 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .await
             .map_err(|error| uncertain_commit("cognition settlement", error))?;
         let view = derive_mind_state(&committed).map_err(|error| {
-            internal(format!(
-                "committed carrier {} derives no MindState: {error}",
-                committed.entry_id
-            ))
+            SpiError::Settlement(
+                Reject::uncertain(format!(
+                    "committed carrier {} at revision {} derives no MindState: {error}; the \
+                     append is durable, resolve it instead of retrying",
+                    committed.entry_id,
+                    committed
+                        .revision
+                        .map_or_else(|| "unassigned".to_string(), |revision| revision.to_string())
+                ))
+                .into_spoke(),
+            )
         })?;
         Ok(view.carrier_revision)
     }

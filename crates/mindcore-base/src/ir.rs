@@ -706,21 +706,9 @@ pub trait MemoryRepository: Send + Sync {
         receipt_id: &str,
     ) -> Result<Option<MemoryJournalRow>, Self::Error>;
 
-    /// Every unsettled durable intent of one subject in one space, oldest `created_at`
-    /// first. The unsettled set is exactly the non-`applied` lifecycle states
-    /// (`pending`, `deferred`, `quarantined`); read paths withhold subject content while
-    /// any of them exists.
-    async fn list_unsettled_intents(
-        &self,
-        tx: &mut Self::Tx<'_>,
-        space: &SpaceId,
-        subject: &SubjectId,
-    ) -> Result<Vec<MemoryJournalRow>, Self::Error>;
-
     /// Whether any non-`applied` durable intent of the subject exists in the
-    /// space. An existence probe over the same literal predicate as
-    /// `list_unsettled_intents`: no payload column is selected or decoded, so
-    /// an unreadable `targets_json`/`result_json` cannot mask the withhold.
+    /// space. No payload column is selected or decoded, so an unreadable
+    /// `targets_json`/`result_json` cannot mask the withhold.
     async fn has_unsettled_intent(
         &self,
         tx: &mut Self::Tx<'_>,
