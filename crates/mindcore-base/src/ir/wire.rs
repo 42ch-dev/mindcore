@@ -401,13 +401,16 @@ fn modules_from_wire(value: Value) -> Result<KnowledgeModules, WireError> {
 
 fn cognition_from_wire(value: Value) -> Result<CognitionModule, WireError> {
     const NAME: &str = "knowledge_entry.modules.cognition";
-    check_cognition(NAME, spoke_operations::validate_cognition_module(&value))?;
-    let mut fields = Fields::new(NAME, value)?;
+    // Decode (and rule-check) members first so this module's extensions follow the same
+    // shared rule as every other extensions site; the pinned SPOKE gate stays as the
+    // whole-shape validation of records, facts and unknown members.
+    let mut fields = Fields::new(NAME, value.clone())?;
     let module = CognitionModule {
         records: fields.read("records", array)?,
         world_facts: fields.read("world_facts", array)?,
-        extensions: fields.read("extensions", as_object)?,
+        extensions: fields.read("extensions", extensions)?,
     };
+    check_cognition(NAME, spoke_operations::validate_cognition_module(&value))?;
     Ok(module)
 }
 

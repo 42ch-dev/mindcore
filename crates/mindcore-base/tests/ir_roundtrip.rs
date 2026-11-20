@@ -425,3 +425,67 @@ fn rejects_null_for_typed_optionals_and_nonpositive_version() {
         assert!(knowledge_entry_from_wire(entry).is_err());
     }
 }
+
+// I-000024: `modules.cognition.extensions` routes through the same namespace-keyed
+// extension-map rule as every other extensions site. A bare object read would admit all
+// three invalid shapes below, so these fixtures go red if the shared check is removed.
+#[test]
+fn cognition_module_extensions_share_the_extension_rule() {
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!({"Vendor.Key": {"note": 1}});
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::InvalidField { .. })
+    ));
+
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!({"vendor": "not-an-object"});
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::InvalidField { .. })
+    ));
+
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!([{"vendor": {}}]);
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::InvalidField { .. })
+    ));
+
+    // A schema-valid opaque map still round-trips untouched.
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!({
+        "module_vendor": {"nested": [null, {"k": false}, 0]},
+        "other-ns": {}
+    });
+    let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
+    let cognition = ir.modules.as_ref().unwrap().cognition.as_ref().unwrap();
+    assert_eq!(cognition.extensions["module_vendor"]["nested"][2], json!(0));
+    assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+}
+
+// I-000025: `modules` is a namespace-keyed object; object-or-array applies to the
+// individual namespace values, never to the container itself.
+#[test]
+fn modules_is_an_object_with_object_or_array_values() {
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!([{"vendor": {}}]);
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::ExpectedObject("knowledge_entry.modules"))
+    ));
+
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({
+        "object_ns": {"opaque": [null, {"Deep!": ""}]},
+        "array_ns": [true, ["z", "a"], null]
+    });
+    let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
+    let modules = ir.modules.as_ref().unwrap();
+    assert_eq!(modules.other["array_ns"], json!([true, ["z", "a"], null]));
+    assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+}
