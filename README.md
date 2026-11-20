@@ -16,6 +16,13 @@ library you embed.
 | `mindcore-base` | Storage-agnostic domain core: ids and trusted boundary, memory types and the `MemoryStore` trait, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. |
 | `mindcore-sqlite` | SQLite (SQLx) backend: one connection pool, one migration, WAL and a busy timeout; implements `MemoryStore` and the scoped `KnowledgeEntryPort`, and guards the cognition module at the single persistence boundary. |
 
+## Storage compatibility
+
+Pre-release migrations are mutable: the schema in `crates/mindcore-sqlite/migrations/` is edited in
+place between commits, and nothing is published yet. A database file created by an earlier commit
+therefore fails `MindStore::open` with a migration checksum mismatch — delete the file and let `open`
+recreate it. There is no upgrade path until the first release.
+
 ## Checks
 
 Requires a stable Rust toolchain.

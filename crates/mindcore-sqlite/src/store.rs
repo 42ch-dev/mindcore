@@ -20,6 +20,10 @@ impl MindStore {
     /// still return `SQLITE_BUSY` sooner — the handler is not consulted for every case, such as a
     /// write whose WAL read snapshot another connection's commit already invalidated. The
     /// timeout is a cap, not a wait guarantee.
+    ///
+    /// Pre-release migrations are mutable: the schema files change in place between commits, so a
+    /// database file created by an earlier commit fails this call with a checksum mismatch and
+    /// must be deleted and recreated. Nothing is published yet; there is no upgrade path.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
