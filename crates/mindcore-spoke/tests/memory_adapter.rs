@@ -4151,6 +4151,152 @@ async fn corrupt_unsettled_payload_still_refuses_unreconciled() {
     tx.rollback().await.expect("rollback");
 }
 
+/// §5.2/D-10 (F-001): a by-ID record read whose stored `content_json` cannot
+/// decode still answers the terminal `UNRECONCILED` while an intent is
+/// unsettled — the withhold probe precedes content selection. Once the intent
+/// settles the same read decodes the row and surfaces a retryable storage
+/// failure, proving the payload would have been decoded had it been reached.
+#[tokio::test]
+async fn corrupt_record_content_still_refuses_unreconciled() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["records_read"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_corrupt", "a withheld record", NOW).await;
+    tx.commit().await.expect("commit seeds");
+
+    // `content_json` is `NOT NULL` but unconstrained: stored non-JSON must not
+    // mask the withhold behind the decode failure an early full-row read hit.
+    sqlx::query(
+        "UPDATE memory_records SET content_json = 'not json' \
+                 WHERE record_id = 'rec_corrupt'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("corrupt content");
+    harness
+        .seed_intent("rct_corrupt_rec", SPACE, SUBJECT, "pending")
+        .await;
+
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "record_id": "rec_corrupt" }),
+        )
+        .await;
+    assert_unreconciled("memory.records.get", &result, SUBJECT);
+    tx.rollback().await.expect("rollback");
+
+    // Settled, the read reaches the payload: an undecodable row is a storage
+    // failure, so the earlier refusal proves the probe ran before selection.
+    sqlx::query(
+        "UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_rec'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("apply intent");
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "record_id": "rec_corrupt" }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::InternalError,
+        "memory.records.get must surface the undecodable row"
+    );
+    assert_eq!(retry_class(refusal), "retryable");
+    tx.rollback().await.expect("rollback");
+}
+
+/// §5.2/D-10 (F-001): a by-ID candidate read whose stored `content_json`
+/// cannot decode still answers the terminal `UNRECONCILED` while an intent is
+/// unsettled — the withhold probe precedes content selection. Once the intent
+/// settles the same read decodes the row and surfaces a retryable storage
+/// failure, proving the payload would have been decoded had it been reached.
+#[tokio::test]
+async fn corrupt_candidate_content_still_refuses_unreconciled() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture", "review"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    let captured = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a withheld candidate" },
+                    "idempotency_key": "cap-corrupt-content"
+                }),
+            )
+            .await,
+    );
+    let candidate_id = captured["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit seeds");
+
+    // `content_json` is unconstrained text: stored non-JSON must not mask the
+    // withhold behind the decode failure an early full-row read hit.
+    sqlx::query("UPDATE memory_candidates SET content_json = 'not json' WHERE candidate_id = ?")
+        .bind(candidate_id.as_str())
+        .execute(&harness.pool)
+        .await
+        .expect("corrupt content");
+    harness
+        .seed_intent("rct_corrupt_cnd", SPACE, SUBJECT, "pending")
+        .await;
+
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_candidate(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "candidate_id": candidate_id }),
+        )
+        .await;
+    assert_unreconciled("memory.candidates.get", &result, SUBJECT);
+    tx.rollback().await.expect("rollback");
+
+    // Settled, the read reaches the payload: an undecodable row is a storage
+    // failure, so the earlier refusal proves the probe ran before selection.
+    sqlx::query(
+        "UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_cnd'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("apply intent");
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_candidate(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "candidate_id": candidate_id }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::InternalError,
+        "memory.candidates.get must surface the undecodable row"
+    );
+    assert_eq!(retry_class(refusal), "retryable");
+    tx.rollback().await.expect("rollback");
+}
+
 /// I-000050 wins over withholding: a nonexistent id, an uncovered row and a
 /// tombstone under a non-admin read all answer the same `NOT_FOUND` without
 /// `subject_id` — the journal is never probed for them.
