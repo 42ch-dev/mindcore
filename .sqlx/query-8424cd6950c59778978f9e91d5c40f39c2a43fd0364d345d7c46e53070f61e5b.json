@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "ALTER TABLE memory_reflections RENAME TO memory_reflections_broken",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "8424cd6950c59778978f9e91d5c40f39c2a43fd0364d345d7c46e53070f61e5b"
+}

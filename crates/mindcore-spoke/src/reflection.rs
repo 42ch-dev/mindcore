@@ -24,7 +24,7 @@ use crate::admission::{self, Admission, Coverage};
 use crate::content::read_selection;
 use crate::policy;
 use crate::project;
-use crate::reject::{settle, AResult, Reject};
+use crate::reject::{settle, unsettled, AResult, Reject};
 use crate::wire;
 use crate::{
     mint, principal_id, recorded_failure, MemoryAdapter, MemoryStage, ReflectionEffect,
@@ -425,7 +425,11 @@ impl MemoryAdapter {
         tx: &mut Tx<'_>,
         effect: ReflectionEffect,
     ) -> SpokeResult<Value> {
-        settle(self.complete_reflection_body(tx, &effect).await)
+        settle(
+            self.complete_reflection_body(tx, &effect)
+                .await
+                .map_err(unsettled),
+        )
     }
 
     async fn complete_reflection_body(

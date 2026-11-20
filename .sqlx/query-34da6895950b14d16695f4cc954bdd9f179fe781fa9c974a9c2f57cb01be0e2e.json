@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "ALTER TABLE memory_journal RENAME TO memory_journal_broken",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "34da6895950b14d16695f4cc954bdd9f179fe781fa9c974a9c2f57cb01be0e2e"
+}

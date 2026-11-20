@@ -1,0 +1,110 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, updated_at FROM memory_profiles WHERE space_id = ? AND subject_id = ? AND (json_array_length(?) = 0 OR profile_kind IN (SELECT value FROM json_each(?))) ORDER BY profile_kind",
+  "describe": {
+    "columns": [
+      {
+        "name": "space_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "subject_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "profile_kind",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "profile_kind"
+          }
+        }
+      },
+      {
+        "name": "document_json",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "document_json"
+          }
+        }
+      },
+      {
+        "name": "updated_by",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "name": "revision",
+        "ordinal": 5,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_profiles",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "623f7dcc482d41e03b577e7fcc04f0e7093472ffa68728382bd8bc4fe2bdbcf0"
+}

@@ -94,6 +94,19 @@ impl From<SqliteRepositoryError> for Reject {
     }
 }
 
+/// Reclassify a phase-2 reject whose effect phase already committed: a stored
+/// publication or out-of-transaction composition is durable, so a pre-commit
+/// storage failure leaves an unsettled receipt the caller must resolve — the
+/// `OUTCOME_UNCERTAIN` boundary, not the retryable pre-commit assertion.
+/// Anything already honest (terminal, uncertain) passes through.
+pub(crate) fn unsettled(reject: Reject) -> Reject {
+    if reject.code == SpokeRejectCode::InternalError {
+        Reject::uncertain(reject.message)
+    } else {
+        reject
+    }
+}
+
 impl From<WireError> for Reject {
     fn from(error: WireError) -> Self {
         Self::invalid(error.to_string())

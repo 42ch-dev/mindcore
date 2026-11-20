@@ -9,8 +9,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Number, Value};
-use sqlx::sqlite::SqliteRow;
-use sqlx::{AssertSqlSafe, Row, Sqlite};
+use sqlx::Sqlite;
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
@@ -85,16 +84,6 @@ fn wire_object<'a>(value: &'a mut Value, what: &str) -> &'a mut Map<String, Valu
 type Tx<'a> = sqlx::Transaction<'a, Sqlite>;
 type RepoResult<T> = Result<T, SqliteRepositoryError>;
 
-/// Reads one persisted column, mapping a missing column or decode/type failure to
-/// `InvalidRow` instead of the panicking `Row::get`.
-fn column<'a, T>(row: &'a SqliteRow, name: &'static str) -> RepoResult<T>
-where
-    T: sqlx::Decode<'a, Sqlite> + sqlx::Type<Sqlite>,
-{
-    row.try_get::<T, _>(name)
-        .map_err(|error| invalid_row(format_args!("column {name}: {error}")))
-}
-
 /// Maps a macro-query fetch failure back to the borrowed path's contract: a stored
 /// column that cannot decode is an `InvalidRow`, everything else stays a drive error.
 fn decode_row(error: sqlx::Error) -> SqliteRepositoryError {
@@ -107,10 +96,6 @@ fn decode_row(error: sqlx::Error) -> SqliteRepositoryError {
 }
 
 // ── Candidate ───────────────────────────────────────────────────────────────
-
-const CANDIDATE_COLUMNS: &str = "candidate_id, space_id, subject_id, capture_visibility, \
-     capture_context_id, kind, content_json, provenance_json, classification_json, status, \
-     consumed_by_json, content_digest, occurred_at, expires_at, revision, created_at";
 
 /// A `memory_candidates` row; `Option` mirrors stored nullability so `query_as!`
 /// compile-time decoding and the dynamic-list decode share one shape.
@@ -131,29 +116,6 @@ struct CandidateRow {
     expires_at: Option<String>,
     revision: i64,
     created_at: String,
-}
-
-/// Decodes the same shape by name for the dynamic-list path; missing columns and
-/// decode/type failures map to `InvalidRow` like a `query_as!` fetch error.
-fn candidate_row(row: &SqliteRow) -> RepoResult<CandidateRow> {
-    Ok(CandidateRow {
-        candidate_id: column(row, "candidate_id")?,
-        space_id: column(row, "space_id")?,
-        subject_id: column(row, "subject_id")?,
-        capture_visibility: column(row, "capture_visibility")?,
-        capture_context_id: column(row, "capture_context_id")?,
-        kind: column(row, "kind")?,
-        content_json: column(row, "content_json")?,
-        provenance_json: column(row, "provenance_json")?,
-        classification_json: column(row, "classification_json")?,
-        status: column(row, "status")?,
-        consumed_by_json: column(row, "consumed_by_json")?,
-        content_digest: column(row, "content_digest")?,
-        occurred_at: column(row, "occurred_at")?,
-        expires_at: column(row, "expires_at")?,
-        revision: column(row, "revision")?,
-        created_at: column(row, "created_at")?,
-    })
 }
 
 fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
@@ -388,10 +350,6 @@ fn placement_columns(scope: &Placement) -> (&'static str, Option<String>) {
 
 // ── Record ──────────────────────────────────────────────────────────────────
 
-const RECORD_COLUMNS: &str = "record_id, space_id, subject_id, kind, content_json, \
-     scope_visibility, scope_context_id, provenance_json, import_ref_json, occurred_at, \
-     tombstone_json, revision, created_at, updated_at";
-
 struct RecordRow {
     record_id: String,
     space_id: String,
@@ -407,25 +365,6 @@ struct RecordRow {
     revision: i64,
     created_at: String,
     updated_at: String,
-}
-
-fn record_row(row: &SqliteRow) -> RepoResult<RecordRow> {
-    Ok(RecordRow {
-        record_id: column(row, "record_id")?,
-        space_id: column(row, "space_id")?,
-        subject_id: column(row, "subject_id")?,
-        kind: column(row, "kind")?,
-        content_json: column(row, "content_json")?,
-        scope_visibility: column(row, "scope_visibility")?,
-        scope_context_id: column(row, "scope_context_id")?,
-        provenance_json: column(row, "provenance_json")?,
-        import_ref_json: column(row, "import_ref_json")?,
-        occurred_at: column(row, "occurred_at")?,
-        tombstone_json: column(row, "tombstone_json")?,
-        revision: column(row, "revision")?,
-        created_at: column(row, "created_at")?,
-        updated_at: column(row, "updated_at")?,
-    })
 }
 
 fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
@@ -787,22 +726,50 @@ struct GrantRow {
     created_at: String,
 }
 
-fn profile_row(row: &SqliteRow) -> RepoResult<MemoryProfileRow> {
+/// A `memory_profiles` row; `list_profiles` decodes through the macro's
+/// unchecked UTF-8 contract like every other compile-checked path.
+struct ProfileRow {
+    space_id: String,
+    subject_id: String,
+    profile_kind: String,
+    document_json: String,
+    updated_by: String,
+    revision: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+fn profile_ir(row: &ProfileRow) -> RepoResult<MemoryProfileRow> {
     Ok(MemoryProfileRow {
-        space_id: SpaceId::new(column::<String>(row, "space_id")?),
-        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
-        profile_kind: column(row, "profile_kind")?,
-        document: from_json(&column::<String>(row, "document_json")?, "profile document")?,
-        updated_by: CallerId::new(column::<String>(row, "updated_by")?),
-        revision: column::<i64>(row, "revision")?.into(),
-        created_at: column(row, "created_at")?,
-        updated_at: column(row, "updated_at")?,
+        space_id: SpaceId::new(row.space_id.clone()),
+        subject_id: SubjectId::new(row.subject_id.clone()),
+        profile_kind: row.profile_kind.clone(),
+        document: from_json(&row.document_json, "profile document")?,
+        updated_by: CallerId::new(row.updated_by.clone()),
+        revision: row.revision.into(),
+        created_at: row.created_at.clone(),
+        updated_at: row.updated_at.clone(),
         extensions: Map::new(),
     })
 }
 
-const PROFILE_COLUMNS: &str = "space_id, subject_id, profile_kind, document_json, updated_by, \
-     revision, created_at, updated_at";
+/// The admitted-placement predicate as fixed flags plus the context id list
+/// serialized for `json_each`: `(all, shared_only, contexts_json)` — an empty
+/// list matches no context, so `SubjectAll` and `SharedOnly` carry `"[]"`.
+fn placement_predicate(placement: &PlacementSelection) -> RepoResult<(bool, bool, String)> {
+    match placement {
+        PlacementSelection::SubjectAll => Ok((true, false, "[]".to_string())),
+        PlacementSelection::SharedOnly => Ok((false, true, "[]".to_string())),
+        PlacementSelection::SelectedContexts {
+            context_ids,
+            include_shared,
+        } => Ok((
+            false,
+            *include_shared,
+            to_json(&json!(context_ids), "placement contexts")?,
+        )),
+    }
+}
 
 fn reflection_row(row: ReflectionRow) -> RepoResult<MemoryReflectionRow> {
     let filter = row
@@ -963,95 +930,6 @@ struct JournalRow {
     result_json: Option<String>,
     created_at: String,
     updated_at: String,
-}
-
-// ── Selection predicate ─────────────────────────────────────────────────────
-
-/// The SQL predicate of a record page plus its binds, in placeholder order; mirrors the
-/// pinned schema's admitted-placement filter before any paging.
-fn record_predicate(
-    space: &SpaceId,
-    subject: &str,
-    selection: &RecordSelection,
-) -> (String, Vec<String>) {
-    let mut sql = String::from(" WHERE space_id = ? AND subject_id = ?");
-    let mut binds = vec![space.as_str().to_string(), subject.to_string()];
-    if !selection.include_tombstoned {
-        sql.push_str(" AND tombstone_json IS NULL");
-    }
-    if !selection.kinds.is_empty() {
-        sql.push_str(" AND kind IN (");
-        placeholders(&mut sql, selection.kinds.len());
-        binds.extend(selection.kinds.iter().cloned());
-        sql.push(')');
-    }
-    placement_clause(
-        &mut sql,
-        &mut binds,
-        &selection.placement,
-        "scope_visibility",
-        "scope_context_id",
-    );
-    if let Some(filter) = &selection.provenance_filter {
-        if filter.is_empty() {
-            sql.push_str(" AND 0");
-        } else {
-            sql.push_str(
-                " AND EXISTS (SELECT 1 FROM \
-                 json_each(json_extract(provenance_json, '$.source_context_ids')) AS source \
-                 WHERE source.value IN (",
-            );
-            placeholders(&mut sql, filter.len());
-            binds.extend(filter.iter().cloned());
-            sql.push_str("))");
-        }
-    }
-    (sql, binds)
-}
-
-/// The shared admitted-placement SQL fragment plus its binds, appended to `sql`/`binds`.
-/// `visibility_column`/`context_column` name the row family's placement columns.
-fn placement_clause(
-    sql: &mut String,
-    binds: &mut Vec<String>,
-    placement: &PlacementSelection,
-    visibility_column: &str,
-    context_column: &str,
-) {
-    match placement {
-        PlacementSelection::SubjectAll => {}
-        PlacementSelection::SharedOnly => {
-            sql.push_str(&format!(" AND {visibility_column} = 'shared'"));
-        }
-        PlacementSelection::SelectedContexts {
-            context_ids,
-            include_shared,
-        } => {
-            if context_ids.is_empty() && !include_shared {
-                sql.push_str(" AND 0");
-            } else if context_ids.is_empty() {
-                sql.push_str(&format!(" AND {visibility_column} = 'shared'"));
-            } else {
-                sql.push_str(" AND (");
-                if *include_shared {
-                    sql.push_str(&format!("{visibility_column} = 'shared' OR "));
-                }
-                sql.push_str(&format!("{context_column} IN ("));
-                placeholders(sql, context_ids.len());
-                binds.extend(context_ids.iter().map(|id| id.as_str().to_string()));
-                sql.push_str("))");
-            }
-        }
-    }
-}
-
-fn placeholders(sql: &mut String, count: usize) {
-    for index in 0..count {
-        if index > 0 {
-            sql.push(',');
-        }
-        sql.push('?');
-    }
 }
 
 /// The borrowed-transaction repository. Zero-sized: the caller's transaction is the seam.
@@ -1455,33 +1333,35 @@ impl MemoryRepository for SqliteMemoryRepository {
         subject: &str,
         selection: &CandidateSelection,
     ) -> RepoResult<Vec<MemoryCandidateIr>> {
-        let mut where_sql = String::from(" WHERE space_id = ? AND subject_id = ?");
-        let mut binds = vec![space.as_str().to_string(), subject.to_string()];
-        placement_clause(
-            &mut where_sql,
-            &mut binds,
-            &selection.placement,
-            "capture_visibility",
-            "capture_context_id",
-        );
-        if let Some(status) = &selection.status {
-            where_sql.push_str(" AND status = ?");
-            binds.push(status.clone());
-        }
-        let sql = AssertSqlSafe(format!(
-            "SELECT {CANDIDATE_COLUMNS} FROM memory_candidates{where_sql} \
-             ORDER BY created_at, candidate_id"
-        ));
-        let mut query = sqlx::query(sql);
-        for bind in &binds {
-            query = query.bind(bind);
-        }
-        query
-            .fetch_all(&mut **tx)
-            .await?
-            .iter()
-            .map(|row| candidate_row(row).and_then(|row| candidate_ir(&row)))
-            .collect()
+        let (all, shared_only, contexts) = placement_predicate(&selection.placement)?;
+        // One fixed statement covers the admitted-placement superset plus the
+        // optional status: the flags and the json_each list are parameters, so
+        // prepare checks this read like every point query.
+        sqlx::query_as!(
+            CandidateRow,
+            "SELECT candidate_id, space_id, subject_id, capture_visibility, \
+             capture_context_id, kind, content_json, provenance_json, classification_json, status, \
+             consumed_by_json, content_digest, occurred_at, expires_at, revision, created_at \
+             FROM memory_candidates \
+             WHERE space_id = ? AND subject_id = ? \
+             AND (? OR (? AND capture_visibility = 'shared') \
+                  OR capture_context_id IN (SELECT value FROM json_each(?))) \
+             AND (? IS NULL OR status = ?) \
+             ORDER BY created_at, candidate_id",
+            space.as_str(),
+            subject,
+            all,
+            shared_only,
+            contexts,
+            selection.status,
+            selection.status,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .iter()
+        .map(candidate_ir)
+        .collect()
     }
 
     async fn update_candidate(
@@ -1545,21 +1425,46 @@ impl MemoryRepository for SqliteMemoryRepository {
         subject: &str,
         selection: &RecordSelection,
     ) -> RepoResult<Vec<MemoryRecordIr>> {
-        let (where_sql, binds) = record_predicate(space, subject, selection);
-        let sql = AssertSqlSafe(format!(
-            "SELECT {RECORD_COLUMNS} FROM memory_records{where_sql} \
-             ORDER BY created_at DESC, record_id"
-        ));
-        let mut query = sqlx::query(sql);
-        for bind in &binds {
-            query = query.bind(bind);
-        }
-        query
-            .fetch_all(&mut **tx)
-            .await?
-            .iter()
-            .map(|row| record_row(row).and_then(|row| record_ir(&row)))
-            .collect()
+        let (all, shared_only, contexts) = placement_predicate(&selection.placement)?;
+        let kinds = to_json(&json!(selection.kinds), "record kinds")?;
+        let provenance = to_json(&json!(selection.provenance_filter), "provenance filter")?;
+        // The variable-width kind/provenance lists arrive as json_each
+        // parameters instead of spliced placeholders: an empty kind list
+        // selects every kind, an absent provenance filter selects every row
+        // and an empty one selects none — the same predicate, now checked.
+        sqlx::query_as!(
+            RecordRow,
+            "SELECT record_id, space_id, subject_id, kind, content_json, \
+             scope_visibility, scope_context_id, provenance_json, import_ref_json, occurred_at, \
+             tombstone_json, revision, created_at, updated_at \
+             FROM memory_records \
+             WHERE space_id = ? AND subject_id = ? \
+             AND (? OR tombstone_json IS NULL) \
+             AND (json_array_length(?) = 0 \
+                  OR kind IN (SELECT value FROM json_each(?))) \
+             AND (? OR (? AND scope_visibility = 'shared') \
+                  OR scope_context_id IN (SELECT value FROM json_each(?))) \
+             AND (? OR EXISTS (SELECT 1 FROM \
+                  json_each(json_extract(provenance_json, '$.source_context_ids')) AS source \
+                  JOIN json_each(?) AS f ON f.value = source.value)) \
+             ORDER BY created_at DESC, record_id",
+            space.as_str(),
+            subject,
+            selection.include_tombstoned,
+            kinds,
+            kinds,
+            all,
+            shared_only,
+            contexts,
+            selection.provenance_filter.is_none(),
+            provenance,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .iter()
+        .map(record_ir)
+        .collect()
     }
 
     async fn insert_record(&self, tx: &mut Self::Tx<'_>, row: &MemoryRecordIr) -> RepoResult<()> {
@@ -1670,28 +1575,26 @@ impl MemoryRepository for SqliteMemoryRepository {
         subject: &str,
         kinds: &[String],
     ) -> RepoResult<Vec<MemoryProfileRow>> {
-        let mut where_sql = String::from(" WHERE space_id = ? AND subject_id = ?");
-        let mut binds = vec![space.as_str().to_string(), subject.to_string()];
-        if !kinds.is_empty() {
-            where_sql.push_str(" AND profile_kind IN (");
-            placeholders(&mut where_sql, kinds.len());
-            binds.extend(kinds.iter().cloned());
-            where_sql.push(')');
-        }
-        let sql = AssertSqlSafe(format!(
-            "SELECT {PROFILE_COLUMNS} FROM memory_profiles{where_sql} \
-             ORDER BY profile_kind"
-        ));
-        let mut query = sqlx::query(sql);
-        for bind in &binds {
-            query = query.bind(bind);
-        }
-        query
-            .fetch_all(&mut **tx)
-            .await?
-            .iter()
-            .map(profile_row)
-            .collect()
+        let kinds = to_json(&json!(kinds), "profile kinds")?;
+        sqlx::query_as!(
+            ProfileRow,
+            "SELECT space_id, subject_id, profile_kind, document_json, updated_by, \
+             revision, created_at, updated_at FROM memory_profiles \
+             WHERE space_id = ? AND subject_id = ? \
+             AND (json_array_length(?) = 0 \
+                  OR profile_kind IN (SELECT value FROM json_each(?))) \
+             ORDER BY profile_kind",
+            space.as_str(),
+            subject,
+            kinds,
+            kinds,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .iter()
+        .map(profile_ir)
+        .collect()
     }
 
     async fn insert_profile(

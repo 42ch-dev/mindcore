@@ -961,7 +961,7 @@ async fn tombstoned_record_with_null_reason_and_import_ref_reads() {
 }
 
 /// C-4: a persisted column that cannot decode (non-UTF-8 bytes in a TEXT column)
-/// fails `InvalidRow`, never panics on `Row::get`.
+/// fails `InvalidRow` on the point read and the list read alike — never panics.
 #[tokio::test]
 async fn malformed_persisted_column_returns_invalid_row() {
     let dir = TempDir::new().unwrap();
@@ -976,15 +976,30 @@ async fn malformed_persisted_column_returns_invalid_row() {
         .await
         .unwrap();
 
-    let outcome = repo
+    let point = repo
         .record(&mut tx, &SpaceId::new("spc_workshop"), "rec_1")
         .await;
     assert!(
         matches!(
-            outcome,
+            point,
             Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
         ),
-        "undecodable column must fail InvalidRow, got {outcome:?}"
+        "undecodable column must fail InvalidRow, got {point:?}"
+    );
+    let list = repo
+        .list_records(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            &Default::default(),
+        )
+        .await;
+    assert!(
+        matches!(
+            list,
+            Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
+        ),
+        "undecodable column must fail InvalidRow on the list read too, got {list:?}"
     );
     tx.rollback().await.unwrap();
     pool.close().await;
@@ -1025,6 +1040,47 @@ async fn malformed_selection_with_none_filter_fails_invalid_row() {
         ),
         "malformed selection with None filter must fail InvalidRow, got {outcome:?}"
     );
+    tx.rollback().await.unwrap();
+    pool.close().await;
+}
+/// QC1-01: the fixture is non-STRICT, so a persisted BLOB of valid UTF-8 JSON
+/// must decode identically on the point read and the list read — both compile-
+/// checked paths share the macro's unchecked UTF-8 contract. `X'80'` stays
+/// `InvalidRow` on both.
+#[tokio::test]
+async fn utf8_blob_column_decodes_identically_on_point_and_list_reads() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    repo.insert_record(&mut tx, &live_record()).await.unwrap();
+    sqlx::query!(
+        "UPDATE memory_records SET content_json = CAST(? AS BLOB) WHERE record_id = 'rec_1'",
+        r#"{"text":"Harbor closes at dusk","structured":{"rank":1}}"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let point = repo
+        .record(&mut tx, &SpaceId::new("spc_workshop"), "rec_1")
+        .await;
+    let list = repo
+        .list_records(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            &Default::default(),
+        )
+        .await;
+    assert_eq!(
+        point.is_ok(),
+        list.is_ok(),
+        "point and list reads must agree on a UTF-8 BLOB: {point:?} vs {list:?}"
+    );
+    assert_eq!(list.unwrap().len(), 1);
     tx.rollback().await.unwrap();
     pool.close().await;
 }

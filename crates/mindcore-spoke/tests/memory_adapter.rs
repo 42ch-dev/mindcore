@@ -113,6 +113,44 @@ impl Harness {
             .await
             .expect("count")
     }
+
+    /// The durable publication targets one journaled intent still owes.
+    async fn targets(&self, tx: &mut Transaction<'_, Sqlite>, receipt_id: &str) -> Vec<Value> {
+        let raw: String = sqlx::query_scalar!(
+            "SELECT targets_json FROM memory_journal WHERE receipt_id = ?",
+            receipt_id,
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("intent");
+        serde_json::from_str(&raw).expect("targets json")
+    }
+
+    /// Publication confirmation: every owed target's landed bytes equal the
+    /// content the intent declared. The caller settles only when this holds.
+    async fn confirm(&self, targets: &[Value]) -> bool {
+        let root = self._dir.path();
+        targets.iter().all(|target| {
+            std::fs::read_to_string(root.join(target["path"].as_str().expect("target path")))
+                .map(|landed| landed == target["content"].as_str().expect("content"))
+                .unwrap_or(false)
+        })
+    }
+
+    /// The caller's publication phase: write every owed file target under the
+    /// scratch root, then confirm each landed byte-for-byte.
+    async fn publish(&self, targets: &[Value]) -> bool {
+        let root = self._dir.path();
+        for target in targets {
+            let path = root.join(target["path"].as_str().expect("target path"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("target directory");
+            }
+            std::fs::write(&path, target["content"].as_str().expect("content"))
+                .expect("write target");
+        }
+        self.confirm(targets).await
+    }
 }
 
 fn principal(id: &str) -> Principal {
@@ -1197,6 +1235,12 @@ async fn stale_record_revision_rejects_without_a_second_write() {
         other => panic!("expected a journal pending stage, got {other:?}"),
     };
     tx.commit().await.expect("commit");
+    // The caller publishes the intent's file targets before settling.
+    let mut tx = harness.begin().await;
+    let targets = harness.targets(&mut tx, &receipt_id).await;
+    tx.rollback().await.expect("rollback");
+    assert!(harness.publish(&targets).await, "publication must confirm");
+
     let mut tx = harness.begin().await;
     let body = adapter
         .settle_journal(&mut tx, &SpaceId::new(SPACE), &receipt_id)
@@ -1423,6 +1467,14 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
     assert_eq!(retry_class(refusal), "uncertain");
     tx.rollback().await.expect("rollback");
 
+    // The caller's publication phase: every owed file target must land before
+    // settlement — until then the intent keeps its targets.
+    let mut tx = harness.begin().await;
+    let targets = harness.targets(&mut tx, &receipt_id).await;
+    assert!(!targets.is_empty(), "the staged intent owes file targets");
+    tx.rollback().await.expect("rollback");
+    assert!(harness.publish(&targets).await, "publication must confirm");
+
     // After confirmed publication the caller settles in a fresh transaction.
     let mut tx2 = harness.begin().await;
     let settled = adapter
@@ -1433,6 +1485,8 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
         SpokeResult::Reject(reject) => panic!("settle rejected: {reject:?}"),
     };
     assert_eq!(body["status"], "committed");
+    // Settlement scrubs the owed targets the publication already covered.
+    assert!(harness.targets(&mut tx2, &receipt_id).await.is_empty());
     tx2.commit().await.expect("commit settle");
 
     let applied = sqlx::query!(
@@ -1826,4 +1880,272 @@ async fn staging_storage_failure_rolls_back_the_partial_write() {
     assert_eq!(harness.count_pool("memory_records").await, 0);
     assert_eq!(harness.count_pool("memory_receipts").await, 0);
     assert_eq!(harness.count_pool("memory_journal").await, 0);
+}
+
+/// §5.2/F-001(b): a failed publication attempt leaves the intent pending with
+/// its targets — the caller must not settle, the poll answers
+/// `OUTCOME_UNCERTAIN`, and the settle retried after republish scrubs them.
+#[tokio::test]
+async fn partial_publish_recovery_keeps_intent_pending_until_republish() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(
+            PRINCIPAL,
+            &["capture", "review", "records_write", "records_read"],
+        )
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    // Stage a capture, then dismiss it: the journaled intent owes the consumed
+    // candidate's file target.
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a capture whose publish attempt tears" },
+                    "idempotency_key": "cap-partial"
+                }),
+            )
+            .await,
+    );
+    let candidate_id = body["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit capture");
+
+    let mut tx1 = harness.begin().await;
+    let stage = adapter
+        .dismiss_candidate(
+            &mut tx1,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "candidate_id": candidate_id,
+                "expected_revision": 1,
+                "idempotency_key": "rev-partial"
+            }),
+        )
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    tx1.commit().await.expect("commit stage");
+
+    // A torn write: the target file exists but holds truncated bytes, so the
+    // publication attempt fails confirmation and the caller must not settle.
+    let mut tx = harness.begin().await;
+    let targets = harness.targets(&mut tx, &receipt_id).await;
+    tx.rollback().await.expect("rollback");
+    assert!(!targets.is_empty(), "the staged intent owes file targets");
+    assert!(harness.publish(&targets).await, "publication writes land");
+    let torn = harness
+        ._dir
+        .path()
+        .join(targets[0]["path"].as_str().expect("target path"));
+    std::fs::write(&torn, "torn").expect("simulate torn write");
+    assert!(
+        !harness.confirm(&targets).await,
+        "torn bytes fail confirmation"
+    );
+
+    // Unsettled: the poll answers OUTCOME_UNCERTAIN and the intent keeps its
+    // owed targets until settlement scrubs them.
+    let mut tx = harness.begin().await;
+    assert_eq!(
+        harness.targets(&mut tx, &receipt_id).await.len(),
+        targets.len()
+    );
+    let poll = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+        )
+        .await;
+    let refusal = reject(&poll);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+    tx.rollback().await.expect("rollback");
+
+    // Recovery: republishing lands every owed target, then the settle in a
+    // fresh transaction commits the receipt and scrubs the intent's targets.
+    assert!(harness.publish(&targets).await, "republish must confirm");
+    let mut tx2 = harness.begin().await;
+    let settled = adapter
+        .settle_journal(&mut tx2, &SpaceId::new(SPACE), &receipt_id)
+        .await;
+    let body = match settled {
+        SpokeResult::Ok(body) => body,
+        SpokeResult::Reject(reject) => panic!("settle rejected: {reject:?}"),
+    };
+    assert_eq!(body["status"], "committed");
+    assert!(harness.targets(&mut tx2, &receipt_id).await.is_empty());
+    tx2.commit().await.expect("commit settle");
+}
+
+/// §5.2/F-002: a storage failure inside the settlement transaction — after
+/// publication already committed — is an unsettled effect, reported as
+/// `OUTCOME_UNCERTAIN`/`uncertain`, never the retryable pre-commit class.
+#[tokio::test]
+async fn settle_journal_storage_failure_reports_uncertain() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["records_write", "records_read"])
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx1 = harness.begin().await;
+    let stage = adapter
+        .create_record(
+            &mut tx1,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "kind": "fact",
+                "scope": { "visibility": "shared" },
+                "content": { "text": "a journaled record" },
+                "idempotency_key": "rec-fault-settle"
+            }),
+        )
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    tx1.commit().await.expect("commit stage");
+
+    let mut tx = harness.begin().await;
+    let targets = harness.targets(&mut tx, &receipt_id).await;
+    tx.rollback().await.expect("rollback");
+    assert!(harness.publish(&targets).await, "publication must confirm");
+
+    // The journal table is gone when transaction 2 reads the intent: the
+    // published effect is durable, the settlement outcome unknown — uncertain,
+    // and the caller's rollback restores the table with the intent pending.
+    let mut tx2 = harness.begin().await;
+    sqlx::query!("ALTER TABLE memory_journal RENAME TO memory_journal_broken")
+        .execute(&mut *tx2)
+        .await
+        .expect("force storage failure");
+    let settled = adapter
+        .settle_journal(&mut tx2, &SpaceId::new(SPACE), &receipt_id)
+        .await;
+    let refusal = reject(&settled);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+    tx2.rollback()
+        .await
+        .expect("rollback erases nothing further");
+
+    let state: String = sqlx::query_scalar!(
+        "SELECT state FROM memory_journal WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("intent");
+    assert_eq!(state, "pending");
+}
+
+/// §7.27/F-002: the same mapping holds for reflection completion — a storage
+/// failure after out-of-transaction composition is an unsettled effect, not a
+/// retryable pre-commit reject.
+#[tokio::test]
+async fn complete_reflection_storage_failure_reports_uncertain() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
+        .await;
+    sqlx::query!(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_1', ?, ?, 'fact', '{\"text\":\"a live basis record\"}', 'shared', NULL, \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        NOW,
+        NOW,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("seed record");
+    sqlx::query!(
+        "INSERT INTO memory_profiles \
+         (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
+          updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        r#"{"body":"a real personality","format":"markdown"}"#,
+        NOW,
+        NOW,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("seed profile");
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let state = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" } }),
+            )
+            .await,
+    );
+    let digest = state["state_digest"].as_str().expect("digest").to_string();
+    let staged = adapter
+        .generate_reflection(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "expected_state_digest": digest,
+                    "idempotency_key": "gen-fault" }),
+        )
+        .await;
+    let work = match staged {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("expected a reflection pending stage, got {other:?}"),
+    };
+    tx.commit().await.expect("commit lease");
+
+    // Composition happened; the envelope insert then hits a missing table in
+    // transaction 2 — an unsettled effect the caller must resolve.
+    let effect = work.compose();
+    let receipt_id = effect.receipt_id.clone();
+    let mut tx2 = harness.begin().await;
+    sqlx::query!("ALTER TABLE memory_reflections RENAME TO memory_reflections_broken")
+        .execute(&mut *tx2)
+        .await
+        .expect("force storage failure");
+    let completed = adapter.complete_reflection(&mut tx2, effect).await;
+    let refusal = reject(&completed);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+    tx2.rollback().await.expect("rollback restores the table");
+
+    let status: String = sqlx::query_scalar!(
+        "SELECT status FROM memory_receipts WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("receipt");
+    assert_eq!(status, "pending");
 }

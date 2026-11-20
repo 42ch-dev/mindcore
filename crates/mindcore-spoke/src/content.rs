@@ -40,7 +40,7 @@ use crate::admission::{self, Admission, Coverage, Scope};
 use crate::effects;
 use crate::policy;
 use crate::project;
-use crate::reject::{settle, AResult, Reject};
+use crate::reject::{settle, unsettled, AResult, Reject};
 use crate::wire;
 use crate::{bump, mint, principal_id, recorded_failure, MemoryAdapter, MemoryStage, Tx};
 
@@ -1905,7 +1905,11 @@ impl MemoryAdapter {
         space: &SpaceId,
         receipt_id: &str,
     ) -> SpokeResult<Value> {
-        settle(self.settle_journal_body(tx, space, receipt_id).await)
+        settle(
+            self.settle_journal_body(tx, space, receipt_id)
+                .await
+                .map_err(unsettled),
+        )
     }
 
     async fn settle_journal_body(
