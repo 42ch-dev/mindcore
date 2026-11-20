@@ -1,4 +1,4 @@
-//! SPOKE 0.16.1 structural mapping. Decode the original JSON, not a generated DTO:
+//! SPOKE 0.17.0 structural mapping. Decode the original JSON, not a generated DTO:
 //! deserialization defaults can erase presence, and typed timestamps can change spelling.
 //! Encoders consume valid IR values. Protocol version admission and operation-specific validation
 //! remain the adapter's responsibility.

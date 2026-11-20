@@ -1,4 +1,4 @@
-//! SPOKE 0.16.1 memory protocol adapter over the borrowed-transaction
+//! SPOKE 0.17.0 memory protocol adapter over the borrowed-transaction
 //! [`MemoryRepository`](mindcore_base::ir::MemoryRepository).
 //!
 //! The adapter owns every protocol rule — wire validation, the wire↔IR
