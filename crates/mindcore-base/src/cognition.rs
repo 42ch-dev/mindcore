@@ -102,6 +102,10 @@ pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Optio
 
 /// Appends one current-view record to the carrier's `modules.cognition.records`, preserving order.
 /// Rejects a duplicate record_id and any record that fails SPOKE validation.
+///
+/// This is the in-memory DTO append. Persistence goes through the per-record storage append
+/// (`mindcore_sqlite::append_cognition`), which inserts one row and never re-encodes earlier
+/// records.
 pub fn append_cognition_record(
     carrier: &KnowledgeEntry,
     record: Value,

@@ -138,6 +138,38 @@ where
     }
 }
 
+/// The holder's current judgment: the record row its head points at, one indexed
+/// lookup over two primary keys regardless of history size; none while it holds
+/// no records.
+pub async fn read_current_record<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+) -> SpokeResult<Option<Value>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let payload: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT r.payload FROM cognition_records AS r \
+         JOIN knowledge_entries AS k \
+           ON k.collection = r.collection AND k.entry_id = r.entry_id \
+          AND k.cognition_head_seq = r.append_seq \
+         WHERE k.collection = ? AND k.entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(executor)
+    .await;
+    match payload {
+        Ok(Some(payload)) => match serde_json::from_str(&payload) {
+            Ok(record) => SpokeResult::Ok(Some(record)),
+            Err(error) => internal(format!("stored cognition record is not JSON: {error}")),
+        },
+        Ok(None) => SpokeResult::Ok(None),
+        Err(error) => internal(format!("cognition record could not be read: {error}")),
+    }
+}
+
 fn is_unique_violation(error: &sqlx::Error) -> bool {
     error
         .as_database_error()

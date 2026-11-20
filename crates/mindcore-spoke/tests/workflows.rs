@@ -2008,6 +2008,23 @@ async fn stored_carrier(harness: &Harness) -> (i64, Value) {
     )
 }
 
+/// The carrier's committed record rows in `append_seq` order: the rows are the
+/// storage authority, the payload keeps only the module envelope.
+async fn committed_records(harness: &Harness) -> Vec<Value> {
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload FROM cognition_records \
+         WHERE collection = 'wren' AND entry_id = ? ORDER BY append_seq ASC",
+    )
+    .bind(CARRIER)
+    .fetch_all(&harness.pool)
+    .await
+    .expect("committed records");
+    payloads
+        .iter()
+        .map(|payload| serde_json::from_str(payload).expect("record payload"))
+        .collect()
+}
+
 /// A harness holding one subject record and the admitted carrier entry.
 async fn deliberate_harness() -> Harness {
     let harness = Harness::open().await;
@@ -2060,9 +2077,9 @@ async fn deliberate_commits_a_cognition_record_onto_the_carrier() {
     assert_eq!(mind_state_version, 2);
     let (revision, payload) = stored_carrier(&harness).await;
     assert_eq!(revision, 2);
-    let records = payload["modules"]["cognition"]["records"]
-        .as_array()
-        .expect("cognition records");
+    // The payload keeps only the module envelope; the committed record lives in its own row.
+    assert_eq!(payload["modules"]["cognition"]["records"], json!([]));
+    let records = committed_records(&harness).await;
     assert_eq!(records.len(), 1);
     let stored = &records[0];
     assert_eq!(stored["holder"], cognition_reference(CARRIER));
@@ -2133,15 +2150,9 @@ async fn a_cited_record_that_moved_during_reasoning_is_retried() {
         2,
         "one retry over a fresh snapshot"
     );
-    let (revision, payload) = stored_carrier(&harness).await;
+    let (revision, _payload) = stored_carrier(&harness).await;
     assert_eq!(revision, 2);
-    assert_eq!(
-        payload["modules"]["cognition"]["records"]
-            .as_array()
-            .expect("records")
-            .len(),
-        1
-    );
+    assert_eq!(committed_records(&harness).await.len(), 1);
 }
 
 #[tokio::test]

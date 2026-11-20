@@ -8,7 +8,7 @@ mod store;
 pub mod cognition;
 
 pub use knowledge::{
-    list_entries_in, read_carrier_header, read_entry, write_entry, CarrierHeader,
+    append_cognition, list_entries_in, read_carrier_header, read_entry, write_entry, CarrierHeader,
     ScopedKnowledgeStore,
 };
 pub use repository::{SqliteMemoryRepository, SqliteRepositoryError};
