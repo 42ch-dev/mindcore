@@ -1287,3 +1287,120 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
         "the retired identity fills its partition again"
     );
 }
+
+/// Retiring the identity whose query slot is warm clears that slot: the next recall under it
+/// re-embeds its query instead of reusing a vector its deleted rows no longer back. A different
+/// identity's warm slot outlives a retirement that names another identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_a_warm_identity_forces_its_next_query_embed() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let embedder = Arc::new(RotatingEmbedder::new(
+        axes_identity("1"),
+        axes_identity("2"),
+    ));
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders {
+                embedder: Some(embedder.clone()),
+                ..MindProviders::default()
+            },
+            None,
+        ),
+    );
+    let session = connect(&surface, &[RECALL_CONTEXT]).await;
+
+    // Two recalls under identity 1 leave its query slot warm: the second embeds nothing.
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under identity 1",
+    );
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "second recall under identity 1",
+    );
+    let warm = embedder.embedded().len();
+    assert_eq!(
+        vector_rows(&pool, "1").await,
+        2,
+        "identity 1 stores one row per live record"
+    );
+
+    // Retiring the identity that owns the cached slot empties the slot with its partition.
+    let deleted = expect_ok(
+        surface.retire_embedding_identity(&axes_identity("1")).await,
+        "retire the warm identity 1",
+    );
+    assert_eq!(deleted, 2, "retirement reports the rows it deleted");
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under the retired identity 1",
+    );
+    let mut reembedded = embedder.embedded()[warm..].to_vec();
+    reembedded.sort();
+    assert_eq!(
+        reembedded,
+        [
+            "north gate",
+            "the market opens at dawn",
+            "the north gate is closed",
+        ],
+        "the retired identity re-embeds its query instead of reusing the cleared slot"
+    );
+
+    // Identity 2 installs a warm slot of its own; retiring identity 1 leaves it warm.
+    embedder.rotate();
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under identity 2",
+    );
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "second recall under identity 2",
+    );
+    let warm = embedder.embedded().len();
+    let deleted = expect_ok(
+        surface.retire_embedding_identity(&axes_identity("1")).await,
+        "retire identity 1 while identity 2's slot is warm",
+    );
+    assert_eq!(
+        deleted, 2,
+        "the refilled identity 1 partition is retired again"
+    );
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under identity 2 after retiring identity 1",
+    );
+    assert_eq!(
+        embedder.embedded().len(),
+        warm,
+        "another identity's query slot survives the retirement"
+    );
+    assert_eq!(
+        vector_rows(&pool, "2").await,
+        2,
+        "another identity's rows survive the retirement"
+    );
+}
