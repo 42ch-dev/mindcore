@@ -2093,6 +2093,8 @@ name = "mindcore-spi"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
+ "futures-timer",
  "serde",
  "serde_json",
  "spoke-operations",
@@ -2105,8 +2107,10 @@ dependencies = [
 name = "mindcore-spoke"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "mindcore-base",
+ "mindcore-spi",
  "mindcore-sqlite",
  "serde",
  "serde_json",
@@ -2124,6 +2128,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ed25519-dalek 2.2.0",
+ "log",
  "mindcore-base",
  "mindcore-spoke",
  "serde_json",
@@ -2134,6 +2139,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -19,10 +19,10 @@ use mindcore_base::ir::wire::{
     memory_record_to_wire, review_receipt_from_wire, review_receipt_to_wire, WireVersion,
 };
 use mindcore_base::ir::{
-    CandidateSelection, CandidateState, MemoryCandidateIr, MemoryGrantRow, MemoryJournalRow,
-    MemoryProfileRow, MemoryProviderMetaRow, MemoryRecordIr, MemoryReflectionRow, MemoryRepository,
-    MemorySpaceRow, MemorySubjectRow, Placement, PlacementSelection, ReceiptKey, ReceiptLease,
-    ReceiptRead, RecordSelection, ReviewReceiptIr,
+    CandidateSelection, CandidateState, MemoryCandidateHead, MemoryCandidateIr, MemoryGrantRow,
+    MemoryJournalRow, MemoryProfileRow, MemoryProviderMetaRow, MemoryRecordHead, MemoryRecordIr,
+    MemoryReflectionRow, MemoryRepository, MemorySpaceRow, MemorySubjectRow, Placement,
+    PlacementSelection, ReceiptKey, ReceiptLease, ReceiptRead, RecordSelection, ReviewReceiptIr,
 };
 use mindcore_base::memory::RecallQuery;
 
@@ -98,6 +98,18 @@ fn decode_row(error: sqlx::Error) -> SqliteRepositoryError {
 
 // ── Candidate ───────────────────────────────────────────────────────────────
 
+/// The `Placement` one candidate/record visibility column pair encodes, shared
+/// by the head lookups and the full-row decoders.
+fn placement_of(visibility: &str, context_id: Option<String>, what: &str) -> RepoResult<Placement> {
+    match visibility {
+        "shared" => Ok(Placement::Shared),
+        "context" => context_id
+            .map(Placement::Context)
+            .ok_or_else(|| invalid_row(format_args!("{what} placement has no context id"))),
+        other => Err(invalid_row(format_args!("{what} visibility {other}"))),
+    }
+}
+
 /// A `memory_candidates` row; `Option` mirrors stored nullability so `query_as!`
 /// compile-time decoding and the dynamic-list decode share one shape.
 struct CandidateRow {
@@ -119,20 +131,27 @@ struct CandidateRow {
     created_at: String,
 }
 
-fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
-    let status = &row.status;
+fn candidate_ir(row: CandidateRow) -> RepoResult<MemoryCandidateIr> {
+    let status = row.status;
     let mut proposed = Map::new();
     // A consumed row with an empty stored kind has no representable proposal;
     // the consumed codec accepts `proposed` absent.
     if !row.kind.is_empty() {
-        proposed.insert("kind".into(), row.kind.clone().into());
+        proposed.insert("kind".into(), row.kind.into());
     }
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert("candidate_id".into(), row.candidate_id.clone().into());
-    wire.insert("space_id".into(), row.space_id.clone().into());
-    wire.insert("subject_id".into(), row.subject_id.clone().into());
-    wire.insert("capture_scope".into(), placement_wire(row)?);
+    wire.insert("candidate_id".into(), row.candidate_id.into());
+    wire.insert("space_id".into(), row.space_id.into());
+    wire.insert("subject_id".into(), row.subject_id.into());
+    wire.insert(
+        "capture_scope".into(),
+        placement_wire_value(
+            row.capture_visibility.as_str(),
+            row.capture_context_id,
+            "capture",
+        )?,
+    );
     wire.insert(
         "classification".into(),
         from_json(&row.classification_json, "classification")?,
@@ -141,23 +160,21 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
         "provenance".into(),
         from_json(&row.provenance_json, "provenance")?,
     );
-    wire.insert("created_at".into(), row.created_at.clone().into());
+    wire.insert("created_at".into(), row.created_at.into());
     wire.insert("revision".into(), row.revision.into());
     wire.insert("extensions".into(), Map::new().into());
-    wire.insert("status".into(), status.clone().into());
-    if let Some(occurred_at) = &row.occurred_at {
-        wire.insert("occurred_at".into(), occurred_at.clone().into());
+    if let Some(occurred_at) = row.occurred_at {
+        wire.insert("occurred_at".into(), occurred_at.into());
     }
     match status.as_str() {
         "pending" => {
             let content = row
                 .content_json
-                .clone()
                 .ok_or_else(|| invalid_row("pending candidate has no content_json"))
                 .and_then(|raw| from_json(&raw, "candidate content"))?;
             proposed.insert("content".into(), content);
-            if let Some(expires_at) = &row.expires_at {
-                wire.insert("expires_at".into(), expires_at.clone().into());
+            if let Some(expires_at) = row.expires_at {
+                wire.insert("expires_at".into(), expires_at.into());
             }
         }
         "consumed" => {
@@ -165,7 +182,6 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
                 "consumed_by".into(),
                 from_json(
                     &row.consumed_by_json
-                        .clone()
                         .ok_or_else(|| invalid_row("consumed candidate has no consumed_by"))?,
                     "candidate outcome",
                 )?,
@@ -173,13 +189,13 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
             wire.insert(
                 "content_digest".into(),
                 row.content_digest
-                    .clone()
                     .ok_or_else(|| invalid_row("consumed candidate has no content_digest"))?
                     .into(),
             );
         }
         other => return Err(invalid_row(format_args!("candidate status {other}"))),
     }
+    wire.insert("status".into(), status.into());
     if !proposed.is_empty() {
         wire.insert("proposed".into(), proposed.into());
     }
@@ -187,15 +203,18 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
     Ok(ir)
 }
 
-fn placement_wire(row: &CandidateRow) -> RepoResult<Value> {
-    match row.capture_visibility.as_str() {
-        "shared" => Ok(json!({"visibility": "shared"})),
-        "context" => Ok(json!({
+/// The wire `placement` document one stored visibility/context pair encodes.
+fn placement_wire_value(
+    visibility: &str,
+    context_id: Option<String>,
+    what: &str,
+) -> RepoResult<Value> {
+    match placement_of(visibility, context_id, what)? {
+        Placement::Shared => Ok(json!({"visibility": "shared"})),
+        Placement::Context(context_id) => Ok(json!({
             "visibility": "context",
-            "context_id": row.capture_context_id.clone()
-                .ok_or_else(|| invalid_row("context placement has no context id"))?,
+            "context_id": context_id,
         })),
-        other => Err(invalid_row(format_args!("capture visibility {other}"))),
     }
 }
 
@@ -284,6 +303,44 @@ fn candidate_columns(candidate: &MemoryCandidateIr) -> RepoResult<CandidateColum
     }
 }
 
+struct CandidateHeadRow {
+    subject_id: String,
+    capture_visibility: String,
+    capture_context_id: Option<String>,
+}
+
+/// The subject and capture placement only: `content_json` and the other
+/// payload columns stay unselected so admission and the withheld probe precede
+/// any content decode.
+async fn candidate_head_by_key(
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    id: &str,
+) -> RepoResult<Option<MemoryCandidateHead>> {
+    sqlx::query_as!(
+        CandidateHeadRow,
+        "SELECT subject_id, capture_visibility, capture_context_id \
+         FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+        space.as_str(),
+        id,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(decode_row)?
+    .map(|row| {
+        placement_of(
+            row.capture_visibility.as_str(),
+            row.capture_context_id,
+            "candidate capture",
+        )
+        .map(|capture_scope| MemoryCandidateHead {
+            subject_id: row.subject_id,
+            capture_scope,
+        })
+    })
+    .transpose()
+}
+
 async fn candidate_by_key(
     tx: &mut Tx<'_>,
     space: &SpaceId,
@@ -301,7 +358,6 @@ async fn candidate_by_key(
     .fetch_optional(&mut **tx)
     .await
     .map_err(decode_row)?
-    .as_ref()
     .map(candidate_ir)
     .transpose()
 }
@@ -372,29 +428,19 @@ struct RecordRow {
     updated_at: String,
 }
 
-fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
-    let mut scope = Map::new();
-    match row.scope_visibility.as_str() {
-        "shared" => scope.insert("visibility".into(), "shared".into()),
-        "context" => {
-            scope.insert("visibility".into(), "context".into());
-            scope.insert(
-                "context_id".into(),
-                row.scope_context_id
-                    .clone()
-                    .ok_or_else(|| invalid_row("context scope has no context id"))?
-                    .into(),
-            )
-        }
-        other => return Err(invalid_row(format_args!("scope visibility {other}"))),
-    };
+fn record_ir(row: RecordRow) -> RepoResult<MemoryRecordIr> {
+    let scope = placement_wire_value(
+        row.scope_visibility.as_str(),
+        row.scope_context_id,
+        "record scope",
+    )?;
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert("record_id".into(), row.record_id.clone().into());
-    wire.insert("space_id".into(), row.space_id.clone().into());
-    wire.insert("subject_id".into(), row.subject_id.clone().into());
-    wire.insert("kind".into(), row.kind.clone().into());
-    wire.insert("scope".into(), scope.into());
+    wire.insert("record_id".into(), row.record_id.into());
+    wire.insert("space_id".into(), row.space_id.into());
+    wire.insert("subject_id".into(), row.subject_id.into());
+    wire.insert("kind".into(), row.kind.into());
+    wire.insert("scope".into(), scope);
     wire.insert(
         "content".into(),
         from_json(&row.content_json, "record content")?,
@@ -406,25 +452,25 @@ fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
     // Pinned projection: the tombstone marks the row dead; a surviving
     // `import_ref_json` (the native delete leaves it) is dropped, and an explicit
     // JSON null `reason` normalizes to the wire's optional-member shape.
-    if let Some(raw) = &row.tombstone_json {
-        let mut tombstone = from_json(raw, "record tombstone")?;
+    if let Some(raw) = row.tombstone_json {
+        let mut tombstone = from_json(&raw, "record tombstone")?;
         if let Some(object) = tombstone.as_object_mut() {
             if object.get("reason") == Some(&Value::Null) {
                 object.remove("reason");
             }
         }
         wire.insert("tombstone".into(), tombstone);
-    } else if let Some(import_ref) = &row.import_ref_json {
+    } else if let Some(import_ref) = row.import_ref_json {
         wire.insert(
             "import_ref".into(),
-            from_json(import_ref, "record import ref")?,
+            from_json(&import_ref, "record import ref")?,
         );
     }
-    if let Some(occurred_at) = &row.occurred_at {
-        wire.insert("occurred_at".into(), occurred_at.clone().into());
+    if let Some(occurred_at) = row.occurred_at {
+        wire.insert("occurred_at".into(), occurred_at.into());
     }
-    wire.insert("created_at".into(), row.created_at.clone().into());
-    wire.insert("updated_at".into(), row.updated_at.clone().into());
+    wire.insert("created_at".into(), row.created_at.into());
+    wire.insert("updated_at".into(), row.updated_at.into());
     wire.insert("revision".into(), row.revision.into());
     wire.insert("extensions".into(), Map::new().into());
     let (_, ir) = memory_record_from_wire(wire.into()).map_err(invalid_row)?;
@@ -433,6 +479,7 @@ fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
 
 struct RecordColumns {
     content: String,
+    provenance: String,
     tombstone: Option<String>,
     import_ref: Option<String>,
 }
@@ -445,6 +492,10 @@ fn record_columns(record: &MemoryRecordIr) -> RepoResult<RecordColumns> {
             &object.remove("content").unwrap_or_default(),
             "record content",
         )?,
+        provenance: to_json(
+            &object.remove("provenance").unwrap_or_default(),
+            "record provenance",
+        )?,
         tombstone: object
             .remove("tombstone")
             .map(|value| to_json(&value, "record tombstone"))
@@ -454,6 +505,46 @@ fn record_columns(record: &MemoryRecordIr) -> RepoResult<RecordColumns> {
             .map(|value| to_json(&value, "record import ref"))
             .transpose()?,
     })
+}
+
+struct RecordHeadRow {
+    subject_id: String,
+    scope_visibility: String,
+    scope_context_id: Option<String>,
+    tombstone_json: Option<String>,
+}
+
+/// The subject, scope and tombstone marker only: `content_json` and the other
+/// payload columns stay unselected so admission and the withheld probe precede
+/// any content decode.
+async fn record_head_by_key(
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    id: &str,
+) -> RepoResult<Option<MemoryRecordHead>> {
+    sqlx::query_as!(
+        RecordHeadRow,
+        "SELECT subject_id, scope_visibility, scope_context_id, tombstone_json \
+         FROM memory_records WHERE space_id = ? AND record_id = ?",
+        space.as_str(),
+        id,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(decode_row)?
+    .map(|row| {
+        placement_of(
+            row.scope_visibility.as_str(),
+            row.scope_context_id,
+            "record scope",
+        )
+        .map(|scope| MemoryRecordHead {
+            subject_id: row.subject_id,
+            scope,
+            tombstoned: row.tombstone_json.is_some(),
+        })
+    })
+    .transpose()
 }
 
 async fn record_by_key(
@@ -473,7 +564,6 @@ async fn record_by_key(
     .fetch_optional(&mut **tx)
     .await
     .map_err(decode_row)?
-    .as_ref()
     .map(record_ir)
     .transpose()
 }
@@ -494,13 +584,7 @@ async fn insert_record_row(tx: &mut Tx<'_>, record: &MemoryRecordIr) -> RepoResu
         &columns.content,
         visibility,
         context_id,
-        to_json(
-            &memory_record_to_wire(version(), record.clone())
-                .get("provenance")
-                .cloned()
-                .unwrap_or_default(),
-            "record provenance",
-        )?,
+        &columns.provenance,
         &columns.import_ref,
         &record.occurred_at,
         &columns.tombstone,
@@ -530,31 +614,31 @@ struct ReceiptRow {
     completed_at: Option<String>,
 }
 
-fn receipt_wire(row: &ReceiptRow) -> RepoResult<Value> {
+fn receipt_wire(row: ReceiptRow) -> RepoResult<Value> {
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert("receipt_id".into(), row.receipt_id.clone().into());
-    wire.insert("space_id".into(), row.space_id.clone().into());
+    wire.insert("receipt_id".into(), row.receipt_id.into());
+    wire.insert("space_id".into(), row.space_id.into());
     wire.insert(
         "requester_principal_id".into(),
-        row.requester_principal_id.clone().into(),
+        row.requester_principal_id.into(),
     );
-    wire.insert("op".into(), row.op.clone().into());
-    if let Some(key) = &row.idempotency_key {
-        wire.insert("idempotency_key".into(), key.clone().into());
+    wire.insert("op".into(), row.op.into());
+    if let Some(key) = row.idempotency_key {
+        wire.insert("idempotency_key".into(), key.into());
     }
-    wire.insert("payload_digest".into(), row.payload_digest.clone().into());
-    wire.insert("created_at".into(), row.created_at.clone().into());
+    wire.insert("payload_digest".into(), row.payload_digest.into());
+    wire.insert("created_at".into(), row.created_at.into());
     wire.insert("extensions".into(), Map::new().into());
-    wire.insert("status".into(), row.status.clone().into());
-    if let Some(completed_at) = &row.completed_at {
-        wire.insert("completed_at".into(), completed_at.clone().into());
+    wire.insert("status".into(), row.status.into());
+    if let Some(completed_at) = row.completed_at {
+        wire.insert("completed_at".into(), completed_at.into());
     }
-    if let Some(result) = &row.result_json {
-        wire.insert("result".into(), from_json(result, "receipt result")?);
+    if let Some(result) = row.result_json {
+        wire.insert("result".into(), from_json(&result, "receipt result")?);
     }
-    if let Some(error) = &row.error_json {
-        wire.insert("error".into(), from_json(error, "receipt error")?);
+    if let Some(error) = row.error_json {
+        wire.insert("error".into(), from_json(&error, "receipt error")?);
     }
     Ok(wire.into())
 }
@@ -562,14 +646,14 @@ fn receipt_wire(row: &ReceiptRow) -> RepoResult<Value> {
 /// Decodes one receipt row: a settled row whose payload columns were reclaimed by
 /// retention reports `Evicted` (digest + last status survive), anything else must
 /// decode as a full retained receipt.
-fn receipt_read(row: &ReceiptRow) -> RepoResult<ReceiptRead> {
+fn receipt_read(row: ReceiptRow) -> RepoResult<ReceiptRead> {
     let evicted = row.result_json.is_none() && row.error_json.is_none() && row.status != "pending";
     if evicted {
         return Ok(ReceiptRead::Evicted {
-            requester: row.requester_principal_id.clone(),
-            operation: row.op.clone(),
-            status: row.status.clone(),
-            payload_digest: row.payload_digest.clone(),
+            requester: row.requester_principal_id,
+            operation: row.op,
+            status: row.status,
+            payload_digest: row.payload_digest,
         });
     }
     let wire = receipt_wire(row)?;
@@ -745,16 +829,17 @@ struct ProfileRow {
     updated_at: String,
 }
 
-fn profile_ir(row: &ProfileRow) -> RepoResult<MemoryProfileRow> {
+fn profile_ir(row: ProfileRow) -> RepoResult<MemoryProfileRow> {
+    let document = from_json(&row.document_json, "profile document")?;
     Ok(MemoryProfileRow {
-        space_id: SpaceId::new(row.space_id.clone()),
-        subject_id: SubjectId::new(row.subject_id.clone()),
-        profile_kind: row.profile_kind.clone(),
-        document: from_json(&row.document_json, "profile document")?,
-        updated_by: CallerId::new(row.updated_by.clone()),
+        space_id: SpaceId::new(row.space_id),
+        subject_id: SubjectId::new(row.subject_id),
+        profile_kind: row.profile_kind,
+        document,
+        updated_by: CallerId::new(row.updated_by),
         revision: row.revision.into(),
-        created_at: row.created_at.clone(),
-        updated_at: row.updated_at.clone(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
         extensions: Map::new(),
     })
 }
@@ -951,6 +1036,15 @@ impl MemoryRepository for SqliteMemoryRepository {
     type Tx<'a> = sqlx::Transaction<'a, Sqlite>;
     type Error = SqliteRepositoryError;
 
+    async fn candidate_head(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> RepoResult<Option<MemoryCandidateHead>> {
+        candidate_head_by_key(tx, space, id).await
+    }
+
     async fn candidate(
         &self,
         tx: &mut Self::Tx<'_>,
@@ -977,6 +1071,15 @@ impl MemoryRepository for SqliteMemoryRepository {
         record_by_key(tx, space, id).await
     }
 
+    async fn record_head(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> RepoResult<Option<MemoryRecordHead>> {
+        record_head_by_key(tx, space, id).await
+    }
+
     async fn review_receipt(
         &self,
         tx: &mut Self::Tx<'_>,
@@ -997,7 +1100,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_optional(&mut **tx)
         .await
         .map_err(decode_row)?
-        .as_ref()
         .map(receipt_read)
         .transpose()
     }
@@ -1042,7 +1144,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(record_ir)
         .collect()
     }
@@ -1245,6 +1347,31 @@ impl MemoryRepository for SqliteMemoryRepository {
         .collect()
     }
 
+    async fn principal_grants(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        principal: &str,
+    ) -> RepoResult<Vec<MemoryGrantRow>> {
+        sqlx::query_as!(
+            GrantRow,
+            // The existing-space filter keeps an orphan grant (no space row,
+            // unconstrained payload) out of the decode: no listing can show it.
+            "SELECT grant_id, space_id, subject_id, principal_id, \
+             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+             revision, created_at FROM memory_grants \
+             WHERE principal_id = ? \
+             AND space_id IN (SELECT space_id FROM memory_spaces) \
+             ORDER BY space_id, grant_id",
+            principal,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .into_iter()
+        .map(grant_row)
+        .collect()
+    }
+
     async fn grant(
         &self,
         tx: &mut Self::Tx<'_>,
@@ -1370,7 +1497,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(candidate_ir)
         .collect()
     }
@@ -1473,7 +1600,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(record_ir)
         .collect()
     }
@@ -1490,11 +1617,6 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> RepoResult<bool> {
         let columns = record_columns(row)?;
         let (visibility, context_id) = placement_columns(&row.scope);
-        let mut wire = memory_record_to_wire(version(), row.clone());
-        let provenance = wire
-            .as_object_mut()
-            .and_then(|wire| wire.remove("provenance"))
-            .unwrap_or_default();
         let updated = sqlx::query!(
             "UPDATE memory_records SET subject_id = ?, kind = ?, content_json = ?, \
              scope_visibility = ?, scope_context_id = ?, provenance_json = ?, \
@@ -1506,7 +1628,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             &columns.content,
             visibility,
             &context_id,
-            to_json(&provenance, "record provenance")?,
+            &columns.provenance,
             &columns.import_ref,
             &row.occurred_at,
             &columns.tombstone,
@@ -1539,7 +1661,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_optional(&mut **tx)
         .await
         .map_err(decode_row)?
-        .as_ref()
         .map(receipt_read)
         .transpose()
     }
@@ -1657,7 +1778,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(profile_ir)
         .collect()
     }
@@ -1826,6 +1947,29 @@ impl MemoryRepository for SqliteMemoryRepository {
         .transpose()
     }
 
+    async fn has_unsettled_intent(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        subject: &SubjectId,
+    ) -> RepoResult<bool> {
+        // Existence only: the literal `state <> 'applied'` predicate matches the
+        // partial index `idx_memory_journal_unsettled` and no payload column is
+        // selected, so an unreadable `targets_json`/`result_json` cannot mask
+        // the withhold.
+        Ok(sqlx::query_scalar!(
+            "SELECT 1 FROM memory_journal \
+             WHERE space_id = ? AND subject_id = ? AND state <> 'applied' \
+             LIMIT 1",
+            space.as_str(),
+            subject.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .is_some())
+    }
+
     async fn insert_journal_intent(
         &self,
         tx: &mut Self::Tx<'_>,
@@ -1968,7 +2112,7 @@ mod tests {
     fn pending_candidate_content_refusal_is_defensive_reader_contract() {
         for content in [None, Some("null")] {
             assert!(matches!(
-                candidate_ir(&pending_row(content)),
+                candidate_ir(pending_row(content)),
                 Err(SqliteRepositoryError::InvalidRow(_))
             ));
         }

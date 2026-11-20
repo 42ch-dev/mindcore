@@ -134,6 +134,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no reflect grant covering the selection"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let basis = self
             .basis(
                 tx,
@@ -225,6 +227,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no reflect grant covering the selection"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let visible = self
             .visible_reflections(
                 tx,

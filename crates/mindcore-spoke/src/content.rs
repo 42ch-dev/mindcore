@@ -196,6 +196,22 @@ impl MemoryAdapter {
         principal: &Principal,
         request: Value,
     ) -> SpokeResult<MemoryStage> {
+        settle(
+            self.capture_body(tx, principal, request)
+                .await
+                .map(|captured| captured.0),
+        )
+    }
+
+    /// §7.11 capture that also reports whether the dedup namespace already held
+    /// this key's receipt: the ids are then the recorded ones, so nothing was
+    /// captured now.
+    pub async fn capture_with_replay(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        request: Value,
+    ) -> SpokeResult<(MemoryStage, bool)> {
         settle(self.capture_body(tx, principal, request).await)
     }
 
@@ -204,7 +220,7 @@ impl MemoryAdapter {
         tx: &mut Tx<'_>,
         principal: &Principal,
         raw: Value,
-    ) -> AResult<MemoryStage> {
+    ) -> AResult<(MemoryStage, bool)> {
         let request: MemoryCaptureRequest = wire::decode(&raw, "memory.capture request")?;
         validated(validate_memory_capture(
             &request,
@@ -236,7 +252,7 @@ impl MemoryAdapter {
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay::<MemoryCaptureResponse>(&receipt);
+            return Self::replay::<MemoryCaptureResponse>(&receipt).map(|stage| (stage, true));
         }
         admission::gate(&self.repository, tx, &admission).await?;
         let content = content_wire(
@@ -289,6 +305,7 @@ impl MemoryAdapter {
         let receipt = admission::committed_receipt(&op, &mint("rct"), result);
         self.repository.insert_receipt(tx, &receipt, None).await?;
         Self::ready::<MemoryCaptureResponse>(project::receipt_body(&receipt))
+            .map(|stage| (stage, false))
     }
 
     // ── §7.12/§7.13 candidate reads ────────────────────────────────────
@@ -344,6 +361,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no review grant on subject {subject_id}"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
         // §7.7: `archived` hides the subject from the default listing; a
@@ -430,28 +449,34 @@ impl MemoryAdapter {
         let space = SpaceId::new(request.space_id.to_string());
         let candidate_id = request.candidate_id.to_string();
         admission::space(&self.repository, tx, &space).await?;
-        let Some(candidate) =
-            admission::candidate(&self.repository, tx, &space, candidate_id.as_str()).await?
+        // Metadata first: the row's own subject and placement admit and conceal
+        // before any payload column is selected.
+        let Some(head) =
+            admission::candidate_head(&self.repository, tx, &space, candidate_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("candidate {candidate_id}")));
         };
         let rows = admission::grants(&self.repository, tx, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
-        let subject_id = candidate.subject_id.to_string();
+        let subject_id = head.subject_id.as_str();
         if !admission::covered(
             &wire_grants,
             principal_id,
             space.as_str(),
             Utc::now(),
-            &admission::candidate_requirement(
-                "review",
-                subject_id.as_str(),
-                &candidate.capture_scope,
-            ),
+            &admission::candidate_requirement("review", subject_id, &head.capture_scope),
         ) {
             // §7.13: incomplete coverage hides the row exactly as an absent id.
             return Err(Reject::not_found(format!("candidate {candidate_id}")));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id).await?;
+        // Only an admitted, settled read selects and decodes the candidate's
+        // content.
+        let Some(candidate) =
+            admission::candidate(&self.repository, tx, &space, candidate_id.as_str()).await?
+        else {
+            return Err(Reject::not_found(format!("candidate {candidate_id}")));
+        };
         Self::ready::<MemoryCandidatesGetResponse>(
             json!({ "candidate": project::candidate_body(&candidate) }),
         )
@@ -692,27 +717,29 @@ impl MemoryAdapter {
         let rows = admission::grants(&self.repository, tx, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let now = Utc::now();
-        let Some(record) =
-            admission::record(&self.repository, tx, &space, record_id.as_str()).await?
+        // Metadata first: the row's own subject, scope and tombstone admit and
+        // conceal before any payload column is selected.
+        let Some(head) =
+            admission::record_head(&self.repository, tx, &space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
-        let subject_id = record.subject_id.to_string();
-        let scope = Scope::from(&record.scope);
+        let subject_id = head.subject_id.as_str();
+        let scope = Scope::from(&head.scope);
         let reads = admission::covered(
             &wire_grants,
             principal_id,
             space.as_str(),
             now,
-            &scope.requirement("records_read", subject_id.as_str()),
+            &scope.requirement("records_read", subject_id),
         ) || admission::covered(
             &wire_grants,
             principal_id,
             space.as_str(),
             now,
-            &scope.requirement("recall", subject_id.as_str()),
+            &scope.requirement("recall", subject_id),
         );
-        let tombstoned = matches!(record.state, RecordState::Tombstoned { .. });
+        let tombstoned = head.tombstoned;
         let admin = admission::covered(
             &wire_grants,
             principal_id,
@@ -720,7 +747,7 @@ impl MemoryAdapter {
             now,
             &GrantRequirement {
                 capability: "admin",
-                subject_id: Some(subject_id.as_str()),
+                subject_id: Some(subject_id),
                 context_ids: Vec::new(),
                 reads_shared: false,
                 subject_all: false,
@@ -731,6 +758,14 @@ impl MemoryAdapter {
         if !reads || (tombstoned && !admin) {
             return Err(Reject::not_found(format!("record {record_id}")));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id).await?;
+        // Only an admitted, settled read selects and decodes the record's
+        // content.
+        let Some(record) =
+            admission::record(&self.repository, tx, &space, record_id.as_str()).await?
+        else {
+            return Err(Reject::not_found(format!("record {record_id}")));
+        };
         Self::ready::<MemoryRecordsGetResponse>(json!({ "record": project::record_body(&record) }))
     }
 
@@ -808,6 +843,8 @@ impl MemoryAdapter {
                 "include_tombstoned requires an admin grant on the subject",
             ));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
         let selection = RecordSelection {
@@ -1331,6 +1368,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no recall grant covering the selection"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
         // §7.7: `archived` excludes the subject's records from recall.
@@ -1485,6 +1524,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no profile-visible grant on subject {subject_id}"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let kinds: Vec<String> = request.profile_kinds.clone();
         let profiles = self
             .repository

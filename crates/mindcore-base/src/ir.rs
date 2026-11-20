@@ -63,6 +63,15 @@ pub enum Placement {
     Context(String),
 }
 
+/// The candidate facts a by-ID read admits on: subject, capture placement.
+/// Metadata-only by design — by-ID reads admit and withhold before any
+/// `content_json` is selected or decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryCandidateHead {
+    pub subject_id: String,
+    pub capture_scope: Placement,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryContent {
     pub text: String,
@@ -113,6 +122,16 @@ pub struct ImportReference {
     pub import_id: String,
     pub source_record_id: String,
     pub source_revision: Number,
+}
+
+/// The record facts a by-ID read admits on: subject, scope and whether the row
+/// is tombstoned. Metadata-only by design — by-ID reads admit and withhold
+/// before any `content_json` is selected or decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRecordHead {
+    pub subject_id: String,
+    pub scope: Placement,
+    pub tombstoned: bool,
 }
 
 /// Operation receipt, not the local `MemoryStore` review row.
@@ -387,6 +406,15 @@ pub trait MemoryRepository: Send + Sync {
         Self: 'a;
     type Error: std::error::Error + Send + Sync;
 
+    /// The admission metadata of one candidate row, without selecting or
+    /// decoding its payload columns; by-ID reads conceal and withhold on it.
+    async fn candidate_head(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> Result<Option<MemoryCandidateHead>, Self::Error>;
+
     async fn candidate(
         &self,
         tx: &mut Self::Tx<'_>,
@@ -406,6 +434,15 @@ pub trait MemoryRepository: Send + Sync {
         space: &SpaceId,
         id: &str,
     ) -> Result<Option<MemoryRecordIr>, Self::Error>;
+
+    /// The admission metadata of one record row, without selecting or decoding
+    /// its payload columns; by-ID reads conceal and withhold on it.
+    async fn record_head(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> Result<Option<MemoryRecordHead>, Self::Error>;
 
     /// Dedup-namespace lookup keyed by space, requester, op and idempotency key;
     /// the same retained/evicted distinction as `receipt`, so the caller can tell
@@ -483,6 +520,25 @@ pub trait MemoryRepository: Send + Sync {
         space: &SpaceId,
         principal_filter: Option<&str>,
     ) -> Result<Vec<MemoryGrantRow>, Self::Error>;
+
+    /// Every grant of one principal in a space that exists, so a caller that
+    /// filters spaces by grant reads them in one query whatever the space count.
+    /// The default walks the spaces and their grants in turn; a storage that
+    /// batches overrides it.
+    async fn principal_grants(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        principal: &str,
+    ) -> Result<Vec<MemoryGrantRow>, Self::Error> {
+        let mut grants = Vec::new();
+        for space in self.list_spaces(tx).await? {
+            grants.extend(
+                self.list_grants(tx, &space.space_id, Some(principal))
+                    .await?,
+            );
+        }
+        Ok(grants)
+    }
 
     async fn grant(
         &self,
@@ -650,6 +706,15 @@ pub trait MemoryRepository: Send + Sync {
         receipt_id: &str,
     ) -> Result<Option<MemoryJournalRow>, Self::Error>;
 
+    /// Whether any non-`applied` durable intent of the subject exists in the
+    /// space. No payload column is selected or decoded, so an unreadable
+    /// `targets_json`/`result_json` cannot mask the withhold.
+    async fn has_unsettled_intent(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        subject: &SubjectId,
+    ) -> Result<bool, Self::Error>;
     async fn insert_journal_intent(
         &self,
         tx: &mut Self::Tx<'_>,

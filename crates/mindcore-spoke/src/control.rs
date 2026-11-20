@@ -1,5 +1,7 @@
 //! C0–C9: self-description, space lifecycle, subjects and grants.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Number, Value};
 use spoke_operations::{
@@ -89,18 +91,27 @@ impl MemoryAdapter {
         }
         let principal_id = principal_id(principal);
         let now = Utc::now();
-        let mut visible = Vec::new();
+        // One grant read for every space: the visible filter is the principal's
+        // live grant, so per-space reads would scale with the space count.
+        let mut grants_by_space: HashMap<String, Vec<MemoryGrantRow>> = HashMap::new();
+        for grant in self.repository.principal_grants(tx, principal_id).await? {
+            grants_by_space
+                .entry(grant.space_id.as_str().to_string())
+                .or_default()
+                .push(grant);
+        }
+        let rows = self.repository.list_spaces(tx).await?;
+        let mut visible = Vec::with_capacity(rows.len());
         let mut grant_revisions = Vec::new();
-        for row in self.repository.list_spaces(tx).await? {
-            let grants = self
-                .repository
-                .list_grants(tx, &row.space_id, Some(principal_id))
-                .await?;
+        for row in rows {
+            let Some(grants) = grants_by_space.remove(row.space_id.as_str()) else {
+                continue;
+            };
             if grants.iter().any(|grant| admission::live_grant(grant, now)) {
                 grant_revisions.extend(
-                    grants.iter().map(|grant| {
-                        (grant.grant_id.clone(), grant.revision.as_i64().unwrap_or(0))
-                    }),
+                    grants
+                        .into_iter()
+                        .map(|grant| (grant.grant_id, grant.revision.as_i64().unwrap_or(0))),
                 );
                 visible.push(row);
             }

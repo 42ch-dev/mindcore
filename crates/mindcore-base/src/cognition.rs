@@ -152,6 +152,14 @@ pub fn append_cognition_record(
     Ok(next)
 }
 
+/// The carrier's current-view cognition records in carrier order, or none
+/// when the entry holds no cognition module.
+pub fn carrier_records(carrier: &KnowledgeEntry) -> Vec<Value> {
+    module_value(carrier)
+        .and_then(|module| module.get("records").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
 /// Derives the holder view from the carrier without persisting anything.
 pub fn derive_mind_state(carrier: &KnowledgeEntry) -> Result<MindStateView, MindError> {
     let Some(module) = module_value(carrier) else {

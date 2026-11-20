@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT subject_id, capture_visibility, capture_context_id FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "subject_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "capture_visibility",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "capture_visibility"
+          }
+        }
+      },
+      {
+        "name": "capture_context_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "capture_context_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "d25d99f57e548c4d506995b0ba2d9829172e0fbe5e9a96b9ce2d6390ac7d0add"
+}

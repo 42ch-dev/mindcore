@@ -151,6 +151,69 @@ impl Harness {
         }
         self.confirm(targets).await
     }
+
+    /// One durable journal intent row, as the caller's commit leaves it behind.
+    async fn seed_intent(&self, receipt_id: &str, space: &str, subject: &str, state: &str) {
+        sqlx::query(
+            "INSERT INTO memory_journal \
+             (seq, receipt_id, space_id, subject_id, requester_principal_id, op, idempotency_key, \
+              state, targets_json, result_json, created_at, updated_at) \
+             VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_journal), \
+              ?, ?, ?, ?, 'memory.records.create', 'op-key', ?, '[]', NULL, ?, ?)",
+        )
+        .bind(receipt_id)
+        .bind(space)
+        .bind(subject)
+        .bind(PRINCIPAL)
+        .bind(state)
+        .bind(NOW)
+        .bind(NOW)
+        .execute(&self.pool)
+        .await
+        .expect("seed intent");
+    }
+
+    /// One receipt row in any lifecycle state, for `memory.receipts.get` polling.
+    async fn seed_receipt(&self, receipt_id: &str, requester: &str, status: &str) {
+        let (result, error, completed) = match status {
+            "committed" => (Some(json!({}).to_string()), None, Some(NOW)),
+            "failed" => (
+                None,
+                Some(
+                    json!({
+                        "code": "INTERNAL_ERROR",
+                        "message": "a recorded failure",
+                        "details": {"retry_class": "terminal"},
+                        "extensions": {},
+                    })
+                    .to_string(),
+                ),
+                Some(NOW),
+            ),
+            "pending" => (None, None, None),
+            other => panic!("unexpected receipt status {other}"),
+        };
+        sqlx::query(
+            "INSERT INTO memory_receipts \
+             (receipt_id, space_id, requester_principal_id, op, idempotency_key, \
+              payload_digest, status, result_json, error_json, created_at, completed_at) \
+             VALUES (?, ?, ?, 'memory.records.create', ?, \
+              'deadbeef0000000000000000000000000000000000000000000000000000cafe', \
+              ?, ?, ?, ?, ?)",
+        )
+        .bind(receipt_id)
+        .bind(SPACE)
+        .bind(requester)
+        .bind(format!("{receipt_id}-key"))
+        .bind(status)
+        .bind(result)
+        .bind(error)
+        .bind(NOW)
+        .bind(completed)
+        .execute(&self.pool)
+        .await
+        .expect("seed receipt");
+    }
 }
 
 fn principal(id: &str) -> Principal {
@@ -3810,5 +3873,718 @@ async fn recall_byte_budget_charges_content_cognition() {
     assert_eq!(records[0]["record_id"], "rec_small");
     assert_eq!(third["truncated"], false);
     assert_eq!(third["next_cursor"], Value::Null);
+    tx.rollback().await.expect("rollback");
+}
+
+// ── §5.2/D-10 withheld reads (I-000043) ──────────────────────────────
+
+/// The exact refusal every guarded read leaves while the subject has an
+/// unsettled intent: the closed vocabulary's `INTERNAL_ERROR` carrying only
+/// `reason`/`subject_id` beyond the universal `retry_class`.
+fn assert_unreconciled(op: &str, result: &SpokeResult<MemoryStage>, subject_id: &str) {
+    let refusal = reject(result);
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::InternalError,
+        "{op} must refuse the withheld read"
+    );
+    assert_eq!(retry_class(refusal), "terminal", "{op}");
+    let details = refusal.details.as_ref().expect("details");
+    assert_eq!(details["reason"], json!("UNRECONCILED"), "{op}");
+    assert_eq!(details["subject_id"], json!(subject_id), "{op}");
+    for key in details.keys() {
+        assert!(
+            matches!(key.as_str(), "retry_class" | "reason" | "subject_id"),
+            "{op} leaks {key} beyond the withhold details"
+        );
+    }
+}
+
+/// One authorized call for each read the withheld rule guards. The request
+/// shapes are the smallest valid envelopes; coverage is seeded per test.
+async fn guarded_reads(
+    adapter: &MemoryAdapter,
+    tx: &mut Transaction<'_, Sqlite>,
+    space: &str,
+    subject: &str,
+    candidate_id: &str,
+) -> Vec<(&'static str, SpokeResult<MemoryStage>)> {
+    let principal = principal(PRINCIPAL);
+    vec![
+        (
+            "memory.records.get",
+            adapter
+                .get_record(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "record_id": "rec_held" }),
+                )
+                .await,
+        ),
+        (
+            "memory.records.list",
+            adapter
+                .list_records(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "subject_id": subject,
+                            "selection": { "mode": "subject_all" } }),
+                )
+                .await,
+        ),
+        (
+            "memory.recall",
+            adapter
+                .recall(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "subject_id": subject,
+                            "selection": { "mode": "subject_all" },
+                            "budget": { "max_items": 4 } }),
+                )
+                .await,
+        ),
+        (
+            "memory.candidates.get",
+            adapter
+                .get_candidate(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "candidate_id": candidate_id }),
+                )
+                .await,
+        ),
+        (
+            "memory.candidates.list",
+            adapter
+                .list_candidates(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "subject_id": subject }),
+                )
+                .await,
+        ),
+        (
+            "memory.profile.get",
+            adapter
+                .get_profile(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "subject_id": subject,
+                            "profile_kinds": ["personality"] }),
+                )
+                .await,
+        ),
+        (
+            "memory.reflections.state",
+            adapter
+                .get_reflection_state(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "subject_id": subject,
+                            "selection": { "mode": "subject_all" } }),
+                )
+                .await,
+        ),
+        (
+            "memory.reflections.list",
+            adapter
+                .list_reflections(
+                    tx,
+                    &principal,
+                    json!({ "space_id": space, "subject_id": subject }),
+                )
+                .await,
+        ),
+    ]
+}
+
+/// §5.2/D-10: every guarded content read refuses `UNRECONCILED` while the
+/// subject carries an unsettled intent — `pending`, `deferred` or
+/// `quarantined` — and serves again once it settles. An unsettled intent for
+/// another subject or space never withholds this subject's reads.
+#[tokio::test]
+async fn unsettled_intent_withholds_guarded_reads() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(
+            PRINCIPAL,
+            &["capture", "review", "records_read", "recall", "reflect"],
+        )
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    // Baseline coverage: one visible record and one visible candidate.
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_held", "a withheld record", NOW).await;
+    let captured = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a withheld candidate" },
+                    "idempotency_key": "cap-withheld"
+                }),
+            )
+            .await,
+    );
+    let candidate_id = captured["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit seeds");
+
+    // Every guarded read serves while no intent is unsettled.
+    let mut tx = harness.begin().await;
+    for (op, result) in guarded_reads(&adapter, &mut tx, SPACE, SUBJECT, &candidate_id).await {
+        assert!(
+            matches!(result, SpokeResult::Ok(_)),
+            "{op} must serve before any unsettled intent, got {result:?}"
+        );
+    }
+    tx.rollback().await.expect("rollback");
+
+    // Any non-applied lifecycle state withholds, not only `pending`.
+    for (index, state) in ["pending", "deferred", "quarantined"].iter().enumerate() {
+        harness
+            .seed_intent(&format!("rct_withheld_{index}"), SPACE, SUBJECT, state)
+            .await;
+        let mut tx = harness.begin().await;
+        for (op, result) in guarded_reads(&adapter, &mut tx, SPACE, SUBJECT, &candidate_id).await {
+            assert_unreconciled(op, &result, SUBJECT);
+        }
+        tx.rollback().await.expect("rollback");
+        // Settlement releases the reads; the next state is seeded fresh.
+        sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = ?")
+            .bind(format!("rct_withheld_{index}"))
+            .execute(&harness.pool)
+            .await
+            .expect("apply intent");
+    }
+
+    // Intents for another subject or space never withhold this subject.
+    harness
+        .seed_intent("rct_other_subject", SPACE, "s_2", "pending")
+        .await;
+    harness
+        .seed_intent("rct_other_space", "sp_2", SUBJECT, "pending")
+        .await;
+    let mut tx = harness.begin().await;
+    for (op, result) in guarded_reads(&adapter, &mut tx, SPACE, SUBJECT, &candidate_id).await {
+        assert!(
+            matches!(result, SpokeResult::Ok(_)),
+            "{op} must ignore an intent for another subject or space, got {result:?}"
+        );
+    }
+    tx.rollback().await.expect("rollback");
+
+    // Reopened for this subject, reads refuse again.
+    harness
+        .seed_intent("rct_reopened", SPACE, SUBJECT, "pending")
+        .await;
+    let mut tx = harness.begin().await;
+    for (op, result) in guarded_reads(&adapter, &mut tx, SPACE, SUBJECT, &candidate_id).await {
+        assert_unreconciled(op, &result, SUBJECT);
+    }
+    tx.rollback().await.expect("rollback");
+}
+
+/// An unsettled intent whose `targets_json` cannot decode still withholds:
+/// admission probes existence, so every guarded by-ID read answers the
+/// terminal `UNRECONCILED` rather than a retryable storage failure — and the
+/// refusal precedes any content selection or projection.
+#[tokio::test]
+async fn corrupt_unsettled_payload_still_refuses_unreconciled() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(
+            PRINCIPAL,
+            &["capture", "review", "records_read", "recall", "reflect"],
+        )
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_held", "a withheld record", NOW).await;
+    let captured = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a withheld candidate" },
+                    "idempotency_key": "cap-corrupt"
+                }),
+            )
+            .await,
+    );
+    let candidate_id = captured["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit seeds");
+
+    // `targets_json` is `NOT NULL` but unconstrained: a stored non-array value
+    // must not mask the withhold behind a retryable decode failure.
+    harness
+        .seed_intent("rct_corrupt", SPACE, SUBJECT, "pending")
+        .await;
+    sqlx::query(
+        "UPDATE memory_journal SET targets_json = '{\"not\":\"array\"}' \
+                 WHERE receipt_id = 'rct_corrupt'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("corrupt targets");
+
+    let mut tx = harness.begin().await;
+    for (op, result) in guarded_reads(&adapter, &mut tx, SPACE, SUBJECT, &candidate_id).await {
+        assert_unreconciled(op, &result, SUBJECT);
+    }
+    tx.rollback().await.expect("rollback");
+}
+
+/// §5.2/D-10 (F-001): a by-ID record read whose stored `content_json` cannot
+/// decode still answers the terminal `UNRECONCILED` while an intent is
+/// unsettled — the withhold probe precedes content selection. Once the intent
+/// settles the same read decodes the row and surfaces a retryable storage
+/// failure, proving the payload would have been decoded had it been reached.
+#[tokio::test]
+async fn corrupt_record_content_still_refuses_unreconciled() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["records_read"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_corrupt", "a withheld record", NOW).await;
+    tx.commit().await.expect("commit seeds");
+
+    // `content_json` is `NOT NULL` but unconstrained: stored non-JSON must not
+    // mask the withhold behind the decode failure an early full-row read hit.
+    sqlx::query(
+        "UPDATE memory_records SET content_json = 'not json' \
+                 WHERE record_id = 'rec_corrupt'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("corrupt content");
+    harness
+        .seed_intent("rct_corrupt_rec", SPACE, SUBJECT, "pending")
+        .await;
+
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "record_id": "rec_corrupt" }),
+        )
+        .await;
+    assert_unreconciled("memory.records.get", &result, SUBJECT);
+    tx.rollback().await.expect("rollback");
+
+    // Settled, the read reaches the payload: an undecodable row is a storage
+    // failure, so the earlier refusal proves the probe ran before selection.
+    sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_rec'")
+        .execute(&harness.pool)
+        .await
+        .expect("apply intent");
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "record_id": "rec_corrupt" }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::InternalError,
+        "memory.records.get must surface the undecodable row"
+    );
+    assert_eq!(retry_class(refusal), "retryable");
+    tx.rollback().await.expect("rollback");
+}
+
+/// §5.2/D-10 (F-001): a by-ID candidate read whose stored `content_json`
+/// cannot decode still answers the terminal `UNRECONCILED` while an intent is
+/// unsettled — the withhold probe precedes content selection. Once the intent
+/// settles the same read decodes the row and surfaces a retryable storage
+/// failure, proving the payload would have been decoded had it been reached.
+#[tokio::test]
+async fn corrupt_candidate_content_still_refuses_unreconciled() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture", "review"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    let captured = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a withheld candidate" },
+                    "idempotency_key": "cap-corrupt-content"
+                }),
+            )
+            .await,
+    );
+    let candidate_id = captured["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit seeds");
+
+    // `content_json` is unconstrained text: stored non-JSON must not mask the
+    // withhold behind the decode failure an early full-row read hit.
+    sqlx::query("UPDATE memory_candidates SET content_json = 'not json' WHERE candidate_id = ?")
+        .bind(candidate_id.as_str())
+        .execute(&harness.pool)
+        .await
+        .expect("corrupt content");
+    harness
+        .seed_intent("rct_corrupt_cnd", SPACE, SUBJECT, "pending")
+        .await;
+
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_candidate(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "candidate_id": candidate_id }),
+        )
+        .await;
+    assert_unreconciled("memory.candidates.get", &result, SUBJECT);
+    tx.rollback().await.expect("rollback");
+
+    // Settled, the read reaches the payload: an undecodable row is a storage
+    // failure, so the earlier refusal proves the probe ran before selection.
+    sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_cnd'")
+        .execute(&harness.pool)
+        .await
+        .expect("apply intent");
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .get_candidate(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "candidate_id": candidate_id }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::InternalError,
+        "memory.candidates.get must surface the undecodable row"
+    );
+    assert_eq!(retry_class(refusal), "retryable");
+    tx.rollback().await.expect("rollback");
+}
+
+/// I-000050 wins over withholding: a nonexistent id, an uncovered row and a
+/// tombstone under a non-admin read all answer the same `NOT_FOUND` without
+/// `subject_id` — the journal is never probed for them.
+#[tokio::test]
+async fn concealment_and_authorization_precede_the_withhold_probe() {
+    let harness = Harness::open().await;
+    // A context-restricted grant with shared access: it covers shared rows but
+    // never rows scoped to another context.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_ctx', ?, NULL, ?, ?, '[\"c_other\"]', 1, NULL, NULL, 1, ?)",
+    )
+    .bind(SPACE)
+    .bind(PRINCIPAL)
+    .bind(serde_json::to_string(&["records_read"]).expect("capabilities"))
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed grant");
+    // A second unrestricted grant writes the private candidate; it carries no
+    // review capability, so it still never covers the by-id read.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_cap', ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(SPACE)
+    .bind(PRINCIPAL)
+    .bind(serde_json::to_string(&["capture"]).expect("capabilities"))
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed capture grant");
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    // An uncovered record: context-scoped under a context the grant lacks.
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_private', ?, ?, 'fact', '{\"text\":\"private\"}', 'context', 'c_private', \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&mut *tx)
+    .await
+    .expect("seed private record");
+    // A tombstone under the same coverage, visible to admin only.
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_gone', ?, ?, 'fact', '{\"text\":\"\"}', 'shared', NULL, \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, '{\"deleted_at\":\"2026-11-20T09:30:00.000Z\",\"deleted_by\":\"p_admin\"}', 2, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&mut *tx)
+    .await
+    .expect("seed tombstone");
+    // An uncovered candidate: captured into a context the read grant lacks.
+    let captured = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "context", "context_id": "c_private" },
+                    "content": { "text": "a private candidate" },
+                    "idempotency_key": "cap-private"
+                }),
+            )
+            .await,
+    );
+    let private_candidate = captured["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit seeds");
+
+    // Withhold the subject: concealment must still answer first.
+    harness
+        .seed_intent("rct_pending", SPACE, SUBJECT, "pending")
+        .await;
+    let mut tx = harness.begin().await;
+    for (label, result) in [
+        (
+            "absent record id",
+            adapter
+                .get_record(
+                    &mut tx,
+                    &principal(PRINCIPAL),
+                    json!({ "space_id": SPACE, "record_id": "rec_absent" }),
+                )
+                .await,
+        ),
+        (
+            "uncovered record",
+            adapter
+                .get_record(
+                    &mut tx,
+                    &principal(PRINCIPAL),
+                    json!({ "space_id": SPACE, "record_id": "rec_private" }),
+                )
+                .await,
+        ),
+        (
+            "non-admin tombstone",
+            adapter
+                .get_record(
+                    &mut tx,
+                    &principal(PRINCIPAL),
+                    json!({ "space_id": SPACE, "record_id": "rec_gone" }),
+                )
+                .await,
+        ),
+        (
+            "absent candidate id",
+            adapter
+                .get_candidate(
+                    &mut tx,
+                    &principal(PRINCIPAL),
+                    json!({ "space_id": SPACE, "candidate_id": "cnd_absent" }),
+                )
+                .await,
+        ),
+        (
+            "uncovered candidate",
+            adapter
+                .get_candidate(
+                    &mut tx,
+                    &principal(PRINCIPAL),
+                    json!({ "space_id": SPACE, "candidate_id": private_candidate }),
+                )
+                .await,
+        ),
+    ] {
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::NotFound, "{label}");
+        assert_eq!(retry_class(refusal), "terminal", "{label}");
+        assert!(
+            refusal
+                .details
+                .as_ref()
+                .and_then(|details| details.get("subject_id"))
+                .is_none(),
+            "{label} must not name a subject"
+        );
+    }
+
+    // A request-subject read without coverage still answers `NOT_AUTHORIZED`
+    // before the journal is probed.
+    let records = adapter
+        .list_records(
+            &mut tx,
+            &principal("p_nothing"),
+            json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" } }),
+        )
+        .await;
+    let refusal = reject(&records);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(refusal), "terminal");
+    tx.rollback().await.expect("rollback");
+}
+
+/// `memory.receipts.get` is never withheld: a pending intent for the same
+/// subject leaves every receipt's own answer — `OUTCOME_UNCERTAIN` while the
+/// receipt itself is pending, the committed or failed envelope once settled.
+#[tokio::test]
+async fn receipts_poll_serves_regardless_of_unsettled_intents() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["capture", "records_read"])
+        .await;
+    harness.seed_grant(STRANGER, &["records_read"]).await;
+    harness
+        .seed_receipt("rct_mine_pending", PRINCIPAL, "pending")
+        .await;
+    harness
+        .seed_receipt("rct_mine_failed", PRINCIPAL, "failed")
+        .await;
+    // `rct_theirs` is polled for its `NOT_AUTHORIZED` before any projection.
+    harness
+        .seed_receipt("rct_theirs", STRANGER, "committed")
+        .await;
+    // The unsettled intent belongs to this subject; it must not change any
+    // receipt result.
+    harness
+        .seed_intent("rct_intent", SPACE, SUBJECT, "pending")
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    // The committed receipt carries the real per-op result shape — capture
+    // commits its receipt directly in the caller's transaction.
+    let mut tx = harness.begin().await;
+    let committed_body = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a captured note" },
+                    "idempotency_key": "cap-receipt"
+                }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit capture");
+    let committed_receipt = committed_body["receipt_id"]
+        .as_str()
+        .expect("receipt id")
+        .to_string();
+
+    let mut tx = harness.begin().await;
+    let pending = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "receipt_id": "rct_mine_pending" }),
+        )
+        .await;
+    let refusal = reject(&pending);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+
+    let committed = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "receipt_id": committed_receipt }),
+            )
+            .await,
+    );
+    assert_eq!(committed["receipt"]["status"], "committed");
+    assert_eq!(
+        committed["receipt"]["result"], committed_body["result"],
+        "committed poll must serve the recorded result"
+    );
+
+    let failed = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "receipt_id": "rct_mine_failed" }),
+            )
+            .await,
+    );
+    assert_eq!(failed["receipt"]["status"], "failed");
+    assert_eq!(
+        failed["receipt"]["error"],
+        json!({
+            "code": "INTERNAL_ERROR",
+            "message": "a recorded failure",
+            "details": {"retry_class": "terminal"},
+            "extensions": {},
+        }),
+        "failed poll must serve the recorded error envelope"
+    );
+
+    // Another requester's receipt stays `NOT_AUTHORIZED`, not withheld.
+    let theirs = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "receipt_id": "rct_theirs" }),
+        )
+        .await;
+    let refusal = reject(&theirs);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(refusal), "terminal");
     tx.rollback().await.expect("rollback");
 }

@@ -178,6 +178,44 @@ async fn conditional_update_bumps_revision() {
 }
 
 #[tokio::test]
+async fn update_keeps_the_stored_creation_instant_in_the_payload() {
+    let path = database_path("created-at");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    let mut submitted = entry_with("ke_gate", "closed after dusk");
+    submitted.created_at = Some(
+        "2026-01-02T03:04:05.123456789Z"
+            .parse()
+            .expect("valid RFC 3339"),
+    );
+    expect_ok(port.put_knowledge_entry(submitted, None).await, "create");
+
+    // The update submits a fresher creation instant. The row column keeps the
+    // original, so the committed payload must carry that original too.
+    let mut update = entry_with("ke_gate", "closed from dusk to dawn");
+    update.created_at = Some("2026-03-04T05:06:07Z".parse().expect("valid RFC 3339"));
+    let updated = expect_ok(port.put_knowledge_entry(update, Some(1)).await, "update");
+
+    let connection = second_connection(&path).await;
+    let stored: String = sqlx::query_scalar(
+        "SELECT created_at FROM knowledge_entries \
+         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .fetch_one(&connection)
+    .await
+    .expect("stored creation instant");
+    assert_eq!(
+        as_json(&updated)["created_at"],
+        json!(stored),
+        "the payload and the row column agree on created_at"
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn submitted_timestamps_are_persisted_verbatim() {
     let path = database_path("timestamps");
     let store = MindStore::open(&path).await.expect("open store");

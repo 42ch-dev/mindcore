@@ -10,8 +10,9 @@ use sqlx::{Sqlite, Transaction};
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::{
-    MemoryCandidateIr, MemoryGrantRow, MemoryRecordIr, MemoryRepository, MemorySpaceRow,
-    MemorySubjectRow, Placement, ReceiptKey, ReceiptRead, ReviewReceiptIr,
+    MemoryCandidateHead, MemoryCandidateIr, MemoryGrantRow, MemoryRecordHead, MemoryRecordIr,
+    MemoryRepository, MemorySpaceRow, MemorySubjectRow, Placement, ReceiptKey, ReceiptRead,
+    ReviewReceiptIr,
 };
 use mindcore_sqlite::SqliteMemoryRepository;
 use spoke_operations::SpokeResult;
@@ -229,6 +230,17 @@ pub(crate) async fn subject(
     Ok(repository.subject(tx, space, subject_id).await?)
 }
 
+/// The metadata-only admission row a by-ID read conceals and withholds on;
+/// the full candidate is selected only once the read may serve it.
+pub(crate) async fn candidate_head(
+    repository: &SqliteMemoryRepository,
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    candidate_id: &str,
+) -> AResult<Option<MemoryCandidateHead>> {
+    Ok(repository.candidate_head(tx, space, candidate_id).await?)
+}
+
 pub(crate) async fn candidate(
     repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
@@ -236,6 +248,17 @@ pub(crate) async fn candidate(
     candidate_id: &str,
 ) -> AResult<Option<MemoryCandidateIr>> {
     Ok(repository.candidate(tx, space, candidate_id).await?)
+}
+
+/// The metadata-only admission row a by-ID read conceals and withholds on;
+/// the full record is selected only once the read may serve it.
+pub(crate) async fn record_head(
+    repository: &SqliteMemoryRepository,
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    record_id: &str,
+) -> AResult<Option<MemoryRecordHead>> {
+    Ok(repository.record_head(tx, space, record_id).await?)
 }
 
 pub(crate) async fn record(

@@ -16,6 +16,22 @@ library you embed.
 | `mindcore-base` | Storage-agnostic domain core: ids and trusted boundary, memory types and the `MemoryStore` trait, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. |
 | `mindcore-sqlite` | SQLite (SQLx) backend: one connection pool, one migration, WAL and a busy timeout; implements `MemoryStore` and the scoped `KnowledgeEntryPort`, and guards the cognition module at the single persistence boundary. |
 
+## Storage compatibility
+
+Pre-release migrations are mutable: the schema in `crates/mindcore-sqlite/migrations/` is edited in
+place between commits, and nothing is published yet. There is no upgrade path until the first
+release.
+
+Whether an existing database file still opens depends on the migrations it already applied, not on
+the commit that created it. `MindStore::open` runs the embedded migrations and compares them with the
+rows recorded in `_sqlx_migrations`:
+
+- A database whose applied migrations still match the embedded files byte for byte opens normally,
+  including one created by an earlier commit. Cross-commit compatibility is unsupported and
+  untested: a database from an earlier commit has not been validated against the current schema.
+- A database that applied a migration whose file has since changed is refused with a migration
+  checksum mismatch. Recreate the file, or move it aside first if you want to keep it.
+
 ## Checks
 
 Requires a stable Rust toolchain.

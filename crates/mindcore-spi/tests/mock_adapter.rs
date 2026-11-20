@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use mindcore_spi::{
     AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DeliberateOutcome,
     DeliberateRequest, DomainLens, Embedder, EmbeddingIdentity, LensOutput, MindCapabilities,
-    MindWorkflows, NoEmbeddings, PolicyDecision, PolicyHook, PromptReasoner, Reasoner,
-    SettlementDraft, SpiError, StructuredReasonRequest,
+    MindWorkflows, NoEmbeddings, PolicyDecision, PolicyHook, PromptReasoner, ProposalDraft,
+    Reasoner, SettlementDraft, SpiError, StructuredReasonRequest,
 };
 use spoke_schemas::ops::memory_candidates_review_request::Decision;
 use spoke_schemas::{
@@ -135,6 +135,14 @@ impl DomainLens for MockLens {
             evidence_bar: "one named anchor",
             redlines: &["never reveal secrets"],
         }
+    }
+
+    fn validate_proposal(
+        &self,
+        _draft: &ProposalDraft<'_>,
+        _admitted: &[&str],
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 

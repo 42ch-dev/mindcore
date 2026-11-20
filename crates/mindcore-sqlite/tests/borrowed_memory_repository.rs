@@ -10,9 +10,9 @@ use tempfile::TempDir;
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
 use mindcore_base::ir::{
-    CandidateState, Classification, Consumption, MemoryCandidateIr, MemoryContent, MemoryRecordIr,
-    MemoryRepository, Placement, Provenance, ReceiptRead, ReceiptState, RecordState,
-    ReviewReceiptIr,
+    CandidateState, Classification, Consumption, MemoryCandidateIr, MemoryContent,
+    MemoryJournalRow, MemoryRecordIr, MemoryRepository, Placement, Provenance, ReceiptRead,
+    ReceiptState, RecordState, ReviewReceiptIr,
 };
 use mindcore_sqlite::SqliteMemoryRepository;
 
@@ -1476,6 +1476,132 @@ async fn absent_include_shared_and_null_filter_decode() {
             .await,
         Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
     ));
+    tx.rollback().await.unwrap();
+    pool.close().await;
+}
+
+/// `has_unsettled_intent` probes exactly the non-`applied` intents of the subject in
+/// the space — `pending`, `deferred` and `quarantined`; `applied` rows and intents of
+/// another subject or space stay out.
+#[tokio::test]
+async fn has_unsettled_intent_covers_non_applied_states() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let intent = |receipt_id: &str, space: &str, subject: &str, state: &str, created: &str| {
+        MemoryJournalRow {
+            seq: 0,
+            receipt_id: receipt_id.into(),
+            space_id: SpaceId::new(space),
+            subject_id: SubjectId::new(subject),
+            requester: CallerId::new("prn_mira"),
+            operation: "memory.records.create".into(),
+            idempotency_key: Some(receipt_id.into()),
+            state: state.into(),
+            targets: vec![
+                json!({"path": "spc_workshop/sub_mira/records/rec_1.md", "digest": DIGEST}),
+            ],
+            result: None,
+            created_at: created.into(),
+            updated_at: created.into(),
+        }
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    let rows = [
+        intent(
+            "rcp_pending",
+            "spc_workshop",
+            "sub_mira",
+            "pending",
+            "2026-11-20T09:21:00.000Z",
+        ),
+        intent(
+            "rcp_applied",
+            "spc_workshop",
+            "sub_mira",
+            "applied",
+            "2026-11-20T09:21:30.000Z",
+        ),
+        intent(
+            "rcp_deferred",
+            "spc_workshop",
+            "sub_mira",
+            "deferred",
+            "2026-11-20T09:22:00.000Z",
+        ),
+        intent(
+            "rcp_quarantined",
+            "spc_workshop",
+            "sub_mira",
+            "quarantined",
+            "2026-11-20T09:23:00.000Z",
+        ),
+        intent(
+            "rcp_other_subj",
+            "spc_workshop",
+            "sub_ava",
+            "pending",
+            "2026-11-20T09:21:00.000Z",
+        ),
+        intent(
+            "rcp_other_space",
+            "spc_attic",
+            "sub_mira",
+            "pending",
+            "2026-11-20T09:21:00.000Z",
+        ),
+    ];
+    for row in &rows {
+        repo.insert_journal_intent(&mut tx, row).await.unwrap();
+    }
+
+    let space = SpaceId::new("spc_workshop");
+    let subject = SubjectId::new("sub_mira");
+    // The existence probe decodes no payload column: it holds while one of the
+    // three unsettled states exists for this subject, and never otherwise.
+    assert!(repo
+        .has_unsettled_intent(&mut tx, &space, &subject)
+        .await
+        .unwrap());
+    for state in ["pending", "deferred", "quarantined"] {
+        sqlx::query(
+            "UPDATE memory_journal SET state = 'applied' \
+             WHERE space_id = 'spc_workshop' AND subject_id = 'sub_mira' AND state <> 'applied'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        assert!(!repo
+            .has_unsettled_intent(&mut tx, &space, &subject)
+            .await
+            .unwrap());
+        sqlx::query("UPDATE memory_journal SET state = ? WHERE receipt_id = ?")
+            .bind(state)
+            .bind(format!("rcp_{state}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert!(repo
+            .has_unsettled_intent(&mut tx, &space, &subject)
+            .await
+            .unwrap());
+    }
+    sqlx::query(
+        "UPDATE memory_journal SET state = 'applied' \
+         WHERE space_id = 'spc_workshop' AND subject_id = 'sub_mira' AND state <> 'applied'",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // A subject with no intents at all probes false rather than erroring.
+    assert!(!repo
+        .has_unsettled_intent(&mut tx, &space, &SubjectId::new("sub_ava_new"))
+        .await
+        .unwrap());
     tx.rollback().await.unwrap();
     pool.close().await;
 }

@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 FROM memory_journal WHERE space_id = ? AND subject_id = ? AND state <> 'applied' LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "1",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b111f925b02e861b046e614ca1e5a0197b8b5f4d80616fbea2facf5513641d87"
+}
