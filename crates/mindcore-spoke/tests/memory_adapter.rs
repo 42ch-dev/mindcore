@@ -1755,10 +1755,11 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
 }
 
 /// §5.2: a storage failure mid-staging surfaces as a retryable internal
-/// reject — never a receipt or success — and the caller's rollback leaves
-/// every staged row behind.
+/// reject — never a receipt or success — and the caller's rollback erases
+/// the partial write: the record was inserted, the intent insert failed,
+/// so no record, receipt or intent survives.
 #[tokio::test]
-async fn staging_storage_failure_is_no_receipt_or_success() {
+async fn staging_storage_failure_rolls_back_the_partial_write() {
     let harness = Harness::open().await;
     harness
         .seed_grant(PRINCIPAL, &["records_write", "records_read"])
@@ -1766,16 +1767,12 @@ async fn staging_storage_failure_is_no_receipt_or_success() {
     let adapter = MemoryAdapter::new(true);
     let mut tx = harness.begin().await;
 
-    // The record and the intent stage, then the receipt insert finds the
-    // receipts table gone: nothing may be converted into a success.
-    sqlx::query("CREATE TEMP TABLE memory_receipts_backup AS SELECT * FROM memory_receipts")
+    // Failing the journal table inside the caller's transaction makes the
+    // intent insert fail AFTER the record insert: a genuine partial write.
+    sqlx::query("DROP TABLE memory_journal")
         .execute(&mut *tx)
         .await
-        .expect("backup");
-    sqlx::query("DROP TABLE memory_receipts")
-        .execute(&mut *tx)
-        .await
-        .expect("drop receipts");
+        .expect("drop journal");
     let result = adapter
         .create_record(
             &mut tx,
@@ -1785,7 +1782,7 @@ async fn staging_storage_failure_is_no_receipt_or_success() {
                 "subject_id": SUBJECT,
                 "kind": "fact",
                 "scope": { "visibility": "shared" },
-                "content": { "text": "a record whose receipt staging fails" },
+                "content": { "text": "a record whose intent staging fails" },
                 "idempotency_key": "rec-fault"
             }),
         )
@@ -1793,6 +1790,8 @@ async fn staging_storage_failure_is_no_receipt_or_success() {
     let refusal = reject(&result);
     assert_eq!(refusal.code, SpokeRejectCode::InternalError);
     assert_eq!(retry_class(refusal), "retryable");
+    // The partial write was real: the record sat inside this transaction.
+    assert_eq!(harness.count(&mut tx, "memory_records").await, 1);
     tx.rollback().await.expect("rollback erases the stage");
 
     assert_eq!(harness.count_pool("memory_records").await, 0);
