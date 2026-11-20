@@ -85,6 +85,16 @@ fn wire_object<'a>(value: &'a mut Value, what: &str) -> &'a mut Map<String, Valu
 type Tx<'a> = sqlx::Transaction<'a, Sqlite>;
 type RepoResult<T> = Result<T, SqliteRepositoryError>;
 
+/// Reads one persisted column, mapping a missing column or decode/type failure to
+/// `InvalidRow` instead of the panicking `Row::get`.
+fn column<'a, T>(row: &'a SqliteRow, name: &'static str) -> RepoResult<T>
+where
+    T: sqlx::Decode<'a, Sqlite> + sqlx::Type<Sqlite>,
+{
+    row.try_get::<T, _>(name)
+        .map_err(|error| invalid_row(format_args!("column {name}: {error}")))
+}
+
 // ── Candidate ───────────────────────────────────────────────────────────────
 
 const CANDIDATE_COLUMNS: &str = "candidate_id, space_id, subject_id, capture_visibility, \
@@ -92,55 +102,59 @@ const CANDIDATE_COLUMNS: &str = "candidate_id, space_id, subject_id, capture_vis
      consumed_by_json, content_digest, occurred_at, expires_at, revision, created_at";
 
 fn candidate_ir(row: &SqliteRow) -> RepoResult<MemoryCandidateIr> {
-    let status: String = row.get("status");
+    let status: String = column(row, "status")?;
     let mut proposed = Map::new();
-    proposed.insert("kind".into(), row.get::<String, _>("kind").into());
+    // A consumed row with an empty stored kind has no representable proposal;
+    // the consumed codec accepts `proposed` absent.
+    let kind: String = column(row, "kind")?;
+    if !kind.is_empty() {
+        proposed.insert("kind".into(), kind.into());
+    }
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
     wire.insert(
         "candidate_id".into(),
-        row.get::<String, _>("candidate_id").into(),
+        column::<String>(row, "candidate_id")?.into(),
     );
-    wire.insert("space_id".into(), row.get::<String, _>("space_id").into());
+    wire.insert("space_id".into(), column::<String>(row, "space_id")?.into());
     wire.insert(
         "subject_id".into(),
-        row.get::<String, _>("subject_id").into(),
+        column::<String>(row, "subject_id")?.into(),
     );
-    wire.insert("capture_scope".into(), placement_wire(&row)?);
+    wire.insert("capture_scope".into(), placement_wire(row)?);
     wire.insert(
         "classification".into(),
         from_json(
-            &row.get::<String, _>("classification_json"),
+            &column::<String>(row, "classification_json")?,
             "classification",
         )?,
     );
     wire.insert(
         "provenance".into(),
-        from_json(&row.get::<String, _>("provenance_json"), "provenance")?,
+        from_json(&column::<String>(row, "provenance_json")?, "provenance")?,
     );
     wire.insert(
         "created_at".into(),
-        row.get::<String, _>("created_at").into(),
+        column::<String>(row, "created_at")?.into(),
     );
-    wire.insert("revision".into(), row.get::<i64, _>("revision").into());
+    wire.insert("revision".into(), column::<i64>(row, "revision")?.into());
     wire.insert("extensions".into(), Map::new().into());
     wire.insert("status".into(), status.clone().into());
-    if let Some(occurred_at) = row.get::<Option<String>, _>("occurred_at") {
+    if let Some(occurred_at) = column::<Option<String>>(row, "occurred_at")? {
         wire.insert("occurred_at".into(), occurred_at.into());
     }
     match status.as_str() {
         "pending" => {
-            let content: Option<String> = row.get("content_json");
-            let content = content
+            let content = column::<Option<String>>(row, "content_json")?
                 .ok_or_else(|| invalid_row("pending candidate has no content_json"))
                 .and_then(|raw| from_json(&raw, "candidate content"))?;
             proposed.insert("content".into(), content);
-            if let Some(expires_at) = row.get::<Option<String>, _>("expires_at") {
+            if let Some(expires_at) = column::<Option<String>>(row, "expires_at")? {
                 wire.insert("expires_at".into(), expires_at.into());
             }
         }
         "consumed" => {
-            let raw: Option<String> = row.get("consumed_by_json");
+            let raw = column::<Option<String>>(row, "consumed_by_json")?;
             wire.insert(
                 "consumed_by".into(),
                 from_json(
@@ -150,25 +164,27 @@ fn candidate_ir(row: &SqliteRow) -> RepoResult<MemoryCandidateIr> {
             );
             wire.insert(
                 "content_digest".into(),
-                row.get::<Option<String>, _>("content_digest")
+                column::<Option<String>>(row, "content_digest")?
                     .ok_or_else(|| invalid_row("consumed candidate has no content_digest"))?
                     .into(),
             );
         }
         other => return Err(invalid_row(format_args!("candidate status {other}"))),
     }
-    wire.insert("proposed".into(), proposed.into());
+    if !proposed.is_empty() {
+        wire.insert("proposed".into(), proposed.into());
+    }
     let (_, ir) = memory_candidate_from_wire(wire.into()).map_err(invalid_row)?;
     Ok(ir)
 }
 
 fn placement_wire(row: &SqliteRow) -> RepoResult<Value> {
-    let visibility: String = row.get("capture_visibility");
+    let visibility: String = column(row, "capture_visibility")?;
     match visibility.as_str() {
         "shared" => Ok(json!({"visibility": "shared"})),
         "context" => Ok(json!({
             "visibility": "context",
-            "context_id": row.get::<Option<String>, _>("capture_context_id")
+            "context_id": column::<Option<String>>(row, "capture_context_id")?
                 .ok_or_else(|| invalid_row("context placement has no context id"))?,
         })),
         other => Err(invalid_row(format_args!("capture visibility {other}"))),
@@ -176,7 +192,9 @@ fn placement_wire(row: &SqliteRow) -> RepoResult<Value> {
 }
 
 struct CandidateColumns {
-    kind: String,
+    // `None` when the row has no representable kind (a consumed candidate whose
+    // IR dropped `proposed_kind`): writes keep the stored kind instead.
+    kind: Option<String>,
     content: Option<String>,
     provenance: String,
     classification: String,
@@ -200,9 +218,11 @@ fn candidate_columns(candidate: &MemoryCandidateIr) -> RepoResult<CandidateColum
                 .take()
                 .ok_or_else(|| invalid_row("pending candidate wire misses proposed"))?;
             Ok(CandidateColumns {
-                kind: kind
-                    .and_then(|kind| kind.as_str().map(str::to_string))
-                    .unwrap_or_default(),
+                kind: Some(
+                    kind.and_then(|kind| kind.as_str().map(str::to_string))
+                        .filter(|kind| !kind.is_empty())
+                        .ok_or_else(|| invalid_row("pending candidate kind is empty"))?,
+                ),
                 content: Some(to_json(
                     &content.unwrap_or(Value::Null),
                     "candidate content",
@@ -228,7 +248,7 @@ fn candidate_columns(candidate: &MemoryCandidateIr) -> RepoResult<CandidateColum
             content_digest,
             ..
         } => {
-            let kind = proposed_kind.clone().unwrap_or_default();
+            let kind = proposed_kind.clone();
             Ok(CandidateColumns {
                 kind,
                 content: None,
@@ -272,6 +292,14 @@ async fn candidate_by_key(
 
 async fn insert_candidate_row(tx: &mut Tx<'_>, candidate: &MemoryCandidateIr) -> RepoResult<()> {
     let columns = candidate_columns(candidate)?;
+    // C-2 policy: the `kind` column is `NOT NULL` and must decode back to a non-empty
+    // `proposed.kind`. A consume update without `proposed_kind` therefore preserves the
+    // stored kind; a fresh row has nothing to preserve and is rejected instead of
+    // writing an empty string it could never read back.
+    let kind = columns
+        .kind
+        .clone()
+        .ok_or_else(|| invalid_row("candidate has no kind to persist"))?;
     let (visibility, context_id) = placement_columns(&candidate.capture_scope);
     sqlx::query(
         "INSERT INTO memory_candidates \
@@ -285,7 +313,7 @@ async fn insert_candidate_row(tx: &mut Tx<'_>, candidate: &MemoryCandidateIr) ->
     .bind(&candidate.subject_id)
     .bind(visibility)
     .bind(context_id)
-    .bind(&columns.kind)
+    .bind(&kind)
     .bind(&columns.content)
     .bind(&columns.provenance)
     .bind(&columns.classification)
@@ -317,14 +345,14 @@ const RECORD_COLUMNS: &str = "record_id, space_id, subject_id, kind, content_jso
 
 fn record_ir(row: &SqliteRow) -> RepoResult<MemoryRecordIr> {
     let mut scope = Map::new();
-    let visibility: String = row.get("scope_visibility");
+    let visibility: String = column(row, "scope_visibility")?;
     match visibility.as_str() {
         "shared" => scope.insert("visibility".into(), "shared".into()),
         "context" => {
             scope.insert("visibility".into(), "context".into());
             scope.insert(
                 "context_id".into(),
-                row.get::<Option<String>, _>("scope_context_id")
+                column::<Option<String>>(row, "scope_context_id")?
                     .ok_or_else(|| invalid_row("context scope has no context id"))?
                     .into(),
             )
@@ -333,49 +361,57 @@ fn record_ir(row: &SqliteRow) -> RepoResult<MemoryRecordIr> {
     };
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert("record_id".into(), row.get::<String, _>("record_id").into());
-    wire.insert("space_id".into(), row.get::<String, _>("space_id").into());
+    wire.insert(
+        "record_id".into(),
+        column::<String>(row, "record_id")?.into(),
+    );
+    wire.insert("space_id".into(), column::<String>(row, "space_id")?.into());
     wire.insert(
         "subject_id".into(),
-        row.get::<String, _>("subject_id").into(),
+        column::<String>(row, "subject_id")?.into(),
     );
-    wire.insert("kind".into(), row.get::<String, _>("kind").into());
+    wire.insert("kind".into(), column::<String>(row, "kind")?.into());
     wire.insert("scope".into(), scope.into());
     wire.insert(
         "content".into(),
-        from_json(&row.get::<String, _>("content_json"), "record content")?,
+        from_json(&column::<String>(row, "content_json")?, "record content")?,
     );
     wire.insert(
         "provenance".into(),
         from_json(
-            &row.get::<String, _>("provenance_json"),
+            &column::<String>(row, "provenance_json")?,
             "record provenance",
         )?,
     );
-    if let Some(import_ref) = row.get::<Option<String>, _>("import_ref_json") {
+    // Pinned projection: the tombstone marks the row dead; a surviving
+    // `import_ref_json` (the native delete leaves it) is dropped, and an explicit
+    // JSON null `reason` normalizes to the wire's optional-member shape.
+    if let Some(raw) = column::<Option<String>>(row, "tombstone_json")? {
+        let mut tombstone = from_json(&raw, "record tombstone")?;
+        if let Some(object) = tombstone.as_object_mut() {
+            if object.get("reason") == Some(&Value::Null) {
+                object.remove("reason");
+            }
+        }
+        wire.insert("tombstone".into(), tombstone);
+    } else if let Some(import_ref) = column::<Option<String>>(row, "import_ref_json")? {
         wire.insert(
             "import_ref".into(),
             from_json(&import_ref, "record import ref")?,
         );
     }
-    if let Some(tombstone) = row.get::<Option<String>, _>("tombstone_json") {
-        wire.insert(
-            "tombstone".into(),
-            from_json(&tombstone, "record tombstone")?,
-        );
-    }
-    if let Some(occurred_at) = row.get::<Option<String>, _>("occurred_at") {
+    if let Some(occurred_at) = column::<Option<String>>(row, "occurred_at")? {
         wire.insert("occurred_at".into(), occurred_at.into());
     }
     wire.insert(
         "created_at".into(),
-        row.get::<String, _>("created_at").into(),
+        column::<String>(row, "created_at")?.into(),
     );
     wire.insert(
         "updated_at".into(),
-        row.get::<String, _>("updated_at").into(),
+        column::<String>(row, "updated_at")?.into(),
     );
-    wire.insert("revision".into(), row.get::<i64, _>("revision").into());
+    wire.insert("revision".into(), column::<i64>(row, "revision")?.into());
     wire.insert("extensions".into(), Map::new().into());
     let (_, ir) = memory_record_from_wire(wire.into()).map_err(invalid_row)?;
     Ok(ir)
@@ -471,44 +507,58 @@ fn receipt_wire(row: &SqliteRow) -> RepoResult<Value> {
     wire.insert("schema_version".into(), 1.into());
     wire.insert(
         "receipt_id".into(),
-        row.get::<String, _>("receipt_id").into(),
+        column::<String>(row, "receipt_id")?.into(),
     );
-    wire.insert("space_id".into(), row.get::<String, _>("space_id").into());
+    wire.insert("space_id".into(), column::<String>(row, "space_id")?.into());
     wire.insert(
         "requester_principal_id".into(),
-        row.get::<String, _>("requester_principal_id").into(),
+        column::<String>(row, "requester_principal_id")?.into(),
     );
-    wire.insert("op".into(), row.get::<String, _>("op").into());
-    if let Some(key) = row.get::<Option<String>, _>("idempotency_key") {
+    wire.insert("op".into(), column::<String>(row, "op")?.into());
+    if let Some(key) = column::<Option<String>>(row, "idempotency_key")? {
         wire.insert("idempotency_key".into(), key.into());
     }
     wire.insert(
         "payload_digest".into(),
-        row.get::<String, _>("payload_digest").into(),
+        column::<String>(row, "payload_digest")?.into(),
     );
     wire.insert(
         "created_at".into(),
-        row.get::<String, _>("created_at").into(),
+        column::<String>(row, "created_at")?.into(),
     );
     wire.insert("extensions".into(), Map::new().into());
-    let status: String = row.get("status");
+    let status: String = column(row, "status")?;
     wire.insert("status".into(), status.into());
-    if let Some(completed_at) = row.get::<Option<String>, _>("completed_at") {
+    if let Some(completed_at) = column::<Option<String>>(row, "completed_at")? {
         wire.insert("completed_at".into(), completed_at.into());
     }
-    if let Some(result) = row.get::<Option<String>, _>("result_json") {
+    if let Some(result) = column::<Option<String>>(row, "result_json")? {
         wire.insert("result".into(), from_json(&result, "receipt result")?);
     }
-    if let Some(error) = row.get::<Option<String>, _>("error_json") {
+    if let Some(error) = column::<Option<String>>(row, "error_json")? {
         wire.insert("error".into(), from_json(&error, "receipt error")?);
     }
     Ok(wire.into())
 }
 
-fn receipt_ir(row: &SqliteRow) -> RepoResult<ReviewReceiptIr> {
+/// Decodes one receipt row: a settled row whose payload columns were reclaimed by
+/// retention reports `Evicted` (digest + last status survive), anything else must
+/// decode as a full retained receipt.
+fn receipt_read(row: &SqliteRow) -> RepoResult<ReceiptRead> {
+    let evicted = column::<Option<String>>(row, "result_json")?.is_none()
+        && column::<Option<String>>(row, "error_json")?.is_none()
+        && column::<String>(row, "status")? != "pending";
+    if evicted {
+        return Ok(ReceiptRead::Evicted {
+            requester: column(row, "requester_principal_id")?,
+            operation: column(row, "op")?,
+            status: column(row, "status")?,
+            payload_digest: column(row, "payload_digest")?,
+        });
+    }
     let wire = receipt_wire(row)?;
     let (_, ir) = review_receipt_from_wire(wire).map_err(invalid_row)?;
-    Ok(ir)
+    Ok(ReceiptRead::Retained(ir))
 }
 
 struct ReceiptColumns {
@@ -575,20 +625,19 @@ async fn insert_receipt_row(
 
 // ── Row families ────────────────────────────────────────────────────────────
 
-fn space_row(row: &SqliteRow) -> MemorySpaceRow {
-    MemorySpaceRow {
-        space_id: SpaceId::new(row.get::<String, _>("space_id")),
-        display_name: row.get("display_name"),
-        authority_host_id: row.get("authority_host_id"),
-        authority_generation: row.get("authority_generation"),
-        status: row.get("status"),
-        revision: row.get::<i64, _>("revision").into(),
-        created_at: row.get("created_at"),
-        pending_receipts: row
-            .get::<i64, _>("pending_receipts")
+fn space_row(row: &SqliteRow) -> RepoResult<MemorySpaceRow> {
+    Ok(MemorySpaceRow {
+        space_id: SpaceId::new(column::<String>(row, "space_id")?),
+        display_name: column(row, "display_name")?,
+        authority_host_id: column(row, "authority_host_id")?,
+        authority_generation: column(row, "authority_generation")?,
+        status: column(row, "status")?,
+        revision: column::<i64>(row, "revision")?.into(),
+        created_at: column(row, "created_at")?,
+        pending_receipts: column::<i64>(row, "pending_receipts")?
             .try_into()
             .unwrap_or(u64::MAX),
-    }
+    })
 }
 
 const SPACE_COLUMNS: &str = "s.space_id, s.display_name, s.authority_host_id, \
@@ -598,24 +647,23 @@ const SPACE_COLUMNS: &str = "s.space_id, s.display_name, s.authority_host_id, \
 
 fn subject_row(row: &SqliteRow) -> RepoResult<MemorySubjectRow> {
     let kind = match (
-        row.get::<Option<String>, _>("kind_ns"),
-        row.get::<Option<String>, _>("kind_id"),
+        column::<Option<String>>(row, "kind_ns")?,
+        column::<Option<String>>(row, "kind_id")?,
     ) {
         (Some(namespace), Some(kind)) => Some((namespace, kind)),
         (None, None) => None,
         _ => return Err(invalid_row("subject kind pair is half set")),
     };
-    let fenced: Vec<String> =
-        serde_json::from_str(&row.get::<String, _>("fenced_contexts_json"))
-            .map_err(|error| invalid_row(format_args!("fenced_contexts_json: {error}")))?;
+    let fenced: Vec<String> = serde_json::from_str(&column::<String>(row, "fenced_contexts_json")?)
+        .map_err(|error| invalid_row(format_args!("fenced_contexts_json: {error}")))?;
     Ok(MemorySubjectRow {
-        space_id: SpaceId::new(row.get::<String, _>("space_id")),
-        subject_id: SubjectId::new(row.get::<String, _>("subject_id")),
+        space_id: SpaceId::new(column::<String>(row, "space_id")?),
+        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
         kind,
-        status: row.get("status"),
+        status: column(row, "status")?,
         fenced_contexts: fenced.into_iter().map(ContextId::new).collect(),
-        revision: row.get::<i64, _>("revision").into(),
-        created_at: row.get("created_at"),
+        revision: column::<i64>(row, "revision")?.into(),
+        created_at: column(row, "created_at")?,
         extensions: Map::new(),
     })
 }
@@ -625,24 +673,23 @@ const SUBJECT_COLUMNS: &str = "space_id, subject_id, kind_ns, kind_id, status, \
 
 fn grant_row(row: &SqliteRow) -> RepoResult<MemoryGrantRow> {
     let capabilities: Vec<String> =
-        serde_json::from_str(&row.get::<String, _>("capabilities_json"))
+        serde_json::from_str(&column::<String>(row, "capabilities_json")?)
             .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
-    let contexts: Vec<String> = serde_json::from_str(&row.get::<String, _>("context_ids_json"))
-        .map_err(|error| invalid_row(format_args!("context_ids_json: {error}")))?;
+    let contexts: Vec<String> =
+        serde_json::from_str(&column::<String>(row, "context_ids_json")?)
+            .map_err(|error| invalid_row(format_args!("context_ids_json: {error}")))?;
     Ok(MemoryGrantRow {
-        grant_id: row.get("grant_id"),
-        space_id: SpaceId::new(row.get::<String, _>("space_id")),
-        subject_id: row
-            .get::<Option<String>, _>("subject_id")
-            .map(SubjectId::new),
-        principal_id: CallerId::new(row.get::<String, _>("principal_id")),
+        grant_id: column(row, "grant_id")?,
+        space_id: SpaceId::new(column::<String>(row, "space_id")?),
+        subject_id: column::<Option<String>>(row, "subject_id")?.map(SubjectId::new),
+        principal_id: CallerId::new(column::<String>(row, "principal_id")?),
         capabilities,
         context_ids: contexts.into_iter().map(ContextId::new).collect(),
-        shared_access: row.get::<i64, _>("shared_access") != 0,
-        expires_at: row.get("expires_at"),
-        revoked_at: row.get("revoked_at"),
-        revision: row.get::<i64, _>("revision").into(),
-        created_at: row.get("created_at"),
+        shared_access: column::<i64>(row, "shared_access")? != 0,
+        expires_at: column(row, "expires_at")?,
+        revoked_at: column(row, "revoked_at")?,
+        revision: column::<i64>(row, "revision")?.into(),
+        created_at: column(row, "created_at")?,
         extensions: Map::new(),
     })
 }
@@ -653,14 +700,14 @@ const GRANT_COLUMNS: &str = "grant_id, space_id, subject_id, principal_id, \
 
 fn profile_row(row: &SqliteRow) -> RepoResult<MemoryProfileRow> {
     Ok(MemoryProfileRow {
-        space_id: SpaceId::new(row.get::<String, _>("space_id")),
-        subject_id: SubjectId::new(row.get::<String, _>("subject_id")),
-        profile_kind: row.get("profile_kind"),
-        document: from_json(&row.get::<String, _>("document_json"), "profile document")?,
-        updated_by: CallerId::new(row.get::<String, _>("updated_by")),
-        revision: row.get::<i64, _>("revision").into(),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
+        space_id: SpaceId::new(column::<String>(row, "space_id")?),
+        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
+        profile_kind: column(row, "profile_kind")?,
+        document: from_json(&column::<String>(row, "document_json")?, "profile document")?,
+        updated_by: CallerId::new(column::<String>(row, "updated_by")?),
+        revision: column::<i64>(row, "revision")?.into(),
+        created_at: column(row, "created_at")?,
+        updated_at: column(row, "updated_at")?,
         extensions: Map::new(),
     })
 }
@@ -669,52 +716,50 @@ const PROFILE_COLUMNS: &str = "space_id, subject_id, profile_kind, document_json
      revision, created_at, updated_at";
 
 fn reflection_row(row: &SqliteRow) -> RepoResult<MemoryReflectionRow> {
-    let filter = row
-        .get::<Option<String>, _>("filter_json")
+    let filter = column::<Option<String>>(row, "filter_json")?
         .map(|raw| from_json(&raw, "reflection filter"))
         .transpose()?;
-    let cognition_filter = row
-        .get::<Option<String>, _>("cognition_filter_json")
+    let cognition_filter = column::<Option<String>>(row, "cognition_filter_json")?
         .map(|raw| from_json(&raw, "reflection cognition filter"))
         .transpose()?;
     let extensions = match from_json(
-        &row.get::<String, _>("extensions_json"),
+        &column::<String>(row, "extensions_json")?,
         "reflection extensions",
     )? {
         Value::Object(map) => map,
         _ => return Err(invalid_row("reflection extensions is not an object")),
     };
     let cost = match (
-        row.get::<Option<String>, _>("cost_unit_kind"),
-        row.get::<Option<f64>, _>("cost_units"),
+        column::<Option<String>>(row, "cost_unit_kind")?,
+        column::<Option<f64>>(row, "cost_units")?,
     ) {
         (Some(unit_kind), Some(units)) => Some((unit_kind, units)),
         (None, None) => None,
         _ => return Err(invalid_row("reflection cost pair is half set")),
     };
     Ok(MemoryReflectionRow {
-        seq: row.get("seq"),
-        reflection_id: row.get("reflection_id"),
-        space_id: SpaceId::new(row.get::<String, _>("space_id")),
-        subject_id: SubjectId::new(row.get::<String, _>("subject_id")),
-        requester: CallerId::new(row.get::<String, _>("requester_principal_id")),
+        seq: column(row, "seq")?,
+        reflection_id: column(row, "reflection_id")?,
+        space_id: SpaceId::new(column::<String>(row, "space_id")?),
+        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
+        requester: CallerId::new(column::<String>(row, "requester_principal_id")?),
         selection: from_json(
-            &row.get::<String, _>("selection_json"),
+            &column::<String>(row, "selection_json")?,
             "reflection selection",
         )?,
         filter,
         cognition_filter,
-        basis: from_json(&row.get::<String, _>("basis_json"), "reflection basis")?,
-        engine_policy_version: row.get("engine_policy_version"),
-        model: row.get("model"),
-        schema_version: row.get("schema_version"),
-        revision: row.get::<i64, _>("revision").into(),
+        basis: from_json(&column::<String>(row, "basis_json")?, "reflection basis")?,
+        engine_policy_version: column(row, "engine_policy_version")?,
+        model: column(row, "model")?,
+        schema_version: column(row, "schema_version")?,
+        revision: column::<i64>(row, "revision")?.into(),
         extensions,
-        created_at: row.get("created_at"),
-        body_text: row.get("body_text"),
-        body_format: row.get("body_format"),
+        created_at: column(row, "created_at")?,
+        body_text: column(row, "body_text")?,
+        body_format: column(row, "body_format")?,
         cost,
-        stale_cache: row.get::<i64, _>("stale_cache") != 0,
+        stale_cache: column::<i64>(row, "stale_cache")? != 0,
     })
 }
 
@@ -783,25 +828,24 @@ fn selection_covers(pinned: &PlacementSelection, requested: &PlacementSelection)
 }
 
 fn journal_row(row: &SqliteRow) -> RepoResult<MemoryJournalRow> {
-    let targets: Vec<Value> = serde_json::from_str(&row.get::<String, _>("targets_json"))
+    let targets: Vec<Value> = serde_json::from_str(&column::<String>(row, "targets_json")?)
         .map_err(|error| invalid_row(format_args!("targets_json: {error}")))?;
-    let result = row
-        .get::<Option<String>, _>("result_json")
+    let result = column::<Option<String>>(row, "result_json")?
         .map(|raw| from_json(&raw, "journal result"))
         .transpose()?;
     Ok(MemoryJournalRow {
-        seq: row.get("seq"),
-        receipt_id: row.get("receipt_id"),
-        space_id: SpaceId::new(row.get::<String, _>("space_id")),
-        subject_id: SubjectId::new(row.get::<String, _>("subject_id")),
-        requester: CallerId::new(row.get::<String, _>("requester_principal_id")),
-        operation: row.get("op"),
-        idempotency_key: row.get("idempotency_key"),
-        state: row.get("state"),
+        seq: column(row, "seq")?,
+        receipt_id: column(row, "receipt_id")?,
+        space_id: SpaceId::new(column::<String>(row, "space_id")?),
+        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
+        requester: CallerId::new(column::<String>(row, "requester_principal_id")?),
+        operation: column(row, "op")?,
+        idempotency_key: column(row, "idempotency_key")?,
+        state: column(row, "state")?,
         targets,
         result,
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
+        created_at: column(row, "created_at")?,
+        updated_at: column(row, "updated_at")?,
     })
 }
 
@@ -935,7 +979,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         &self,
         tx: &mut Self::Tx<'_>,
         key: &ReceiptKey,
-    ) -> RepoResult<Option<ReviewReceiptIr>> {
+    ) -> RepoResult<Option<ReceiptRead>> {
         let sql = AssertSqlSafe(format!(
             "SELECT {RECEIPT_COLUMNS} FROM memory_receipts \
              WHERE space_id = ? AND requester_principal_id = ? AND op = ? \
@@ -948,7 +992,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             .bind(&key.idempotency_key)
             .fetch_optional(&mut **tx)
             .await?
-            .map(|row| receipt_ir(&row))
+            .map(|row| receipt_read(&row))
             .transpose()
     }
 
@@ -1006,23 +1050,24 @@ impl MemoryRepository for SqliteMemoryRepository {
         let sql = AssertSqlSafe(format!(
             "SELECT {SPACE_COLUMNS} FROM memory_spaces s WHERE s.space_id = ?"
         ));
-        Ok(sqlx::query(sql)
+        sqlx::query(sql)
             .bind(space.as_str())
             .fetch_optional(&mut **tx)
             .await?
-            .map(|row| space_row(&row)))
+            .map(|row| space_row(&row))
+            .transpose()
     }
 
     async fn list_spaces(&self, tx: &mut Self::Tx<'_>) -> RepoResult<Vec<MemorySpaceRow>> {
         let sql = AssertSqlSafe(format!(
             "SELECT {SPACE_COLUMNS} FROM memory_spaces s ORDER BY s.space_id"
         ));
-        Ok(sqlx::query(sql)
+        sqlx::query(sql)
             .fetch_all(&mut **tx)
             .await?
             .iter()
             .map(space_row)
-            .collect())
+            .collect()
     }
 
     async fn update_space(
@@ -1313,6 +1358,24 @@ impl MemoryRepository for SqliteMemoryRepository {
         observed_revision: &Number,
     ) -> RepoResult<bool> {
         let columns = candidate_columns(row)?;
+        // A consume without `proposed_kind` keeps the stored kind (C-2 policy in
+        // `insert_candidate_row`); a miss means the guarded update cannot match.
+        let kind = match &columns.kind {
+            Some(kind) => kind.clone(),
+            None => {
+                let Some(stored) = sqlx::query_scalar::<_, String>(
+                    "SELECT kind FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+                )
+                .bind(&row.space_id)
+                .bind(&row.candidate_id)
+                .fetch_optional(&mut **tx)
+                .await?
+                else {
+                    return Ok(false);
+                };
+                stored
+            }
+        };
         let (visibility, context_id) = placement_columns(&row.capture_scope);
         let updated = sqlx::query(
             "UPDATE memory_candidates SET subject_id = ?, capture_visibility = ?, \
@@ -1324,7 +1387,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(&row.subject_id)
         .bind(visibility)
         .bind(&context_id)
-        .bind(&columns.kind)
+        .bind(&kind)
         .bind(&columns.content)
         .bind(&columns.provenance)
         .bind(&columns.classification)
@@ -1427,18 +1490,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         else {
             return Ok(None);
         };
-        // A settled row with no payload columns had its body evicted by retention.
-        let evicted = row.get::<Option<String>, _>("result_json").is_none()
-            && row.get::<Option<String>, _>("error_json").is_none()
-            && row.get::<String, _>("status") != "pending";
-        if evicted {
-            return Ok(Some(ReceiptRead::Evicted {
-                requester: row.get("requester_principal_id"),
-                operation: row.get("op"),
-                status: row.get("status"),
-            }));
-        }
-        receipt_ir(&row).map(|ir| Some(ReceiptRead::Retained(ir)))
+        receipt_read(&row).map(Some)
     }
 
     async fn insert_receipt(
@@ -1580,8 +1632,9 @@ impl MemoryRepository for SqliteMemoryRepository {
         let mut reflections = Vec::with_capacity(rows.len());
         for row in &rows {
             let reflection = reflection_row(row)?;
+            // The pinned selection is validated on every read, filter or not.
+            let pinned = pinned_selection(&reflection.selection)?;
             if let Some(scope) = selection {
-                let pinned = pinned_selection(&reflection.selection)?;
                 if !selection_covers(&pinned, scope) {
                     continue;
                 }

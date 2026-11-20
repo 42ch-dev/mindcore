@@ -301,11 +301,13 @@ pub struct ReceiptLease {
 pub enum ReceiptRead {
     /// Payload columns intact; the row decodes to its full IR.
     Retained(ReviewReceiptIr),
-    /// `result`/`error` evicted after the dedup window; identity and last status remain.
+    /// `result`/`error` evicted after the dedup window; identity, the payload digest
+    /// and last status remain, so a replay can tell expiry from a payload conflict.
     Evicted {
         requester: String,
         operation: String,
         status: String,
+        payload_digest: String,
     },
 }
 
@@ -410,11 +412,14 @@ pub trait MemoryRepository: Send + Sync {
         id: &str,
     ) -> Result<Option<MemoryRecordIr>, Self::Error>;
 
+    /// Dedup-namespace lookup keyed by space, requester, op and idempotency key;
+    /// the same retained/evicted distinction as `receipt`, so the caller can tell
+    /// an expired receipt from a payload conflict.
     async fn review_receipt(
         &self,
         tx: &mut Self::Tx<'_>,
         key: &ReceiptKey,
-    ) -> Result<Option<ReviewReceiptIr>, Self::Error>;
+    ) -> Result<Option<ReceiptRead>, Self::Error>;
 
     async fn insert_review(
         &self,
