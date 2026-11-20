@@ -24,7 +24,8 @@ impl MindStore {
     /// Pre-release migrations are mutable: the schema files change in place between commits, so
     /// there is no upgrade path until the first release. An applied migration whose file has since
     /// changed is refused here with a checksum mismatch; a database whose applied migrations still
-    /// match the embedded files opens normally, whatever commit created it.
+    /// match the embedded files opens normally, whatever commit created it — cross-commit
+    /// compatibility is unsupported and untested.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)

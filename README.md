@@ -27,7 +27,8 @@ the commit that created it. `MindStore::open` runs the embedded migrations and c
 rows recorded in `_sqlx_migrations`:
 
 - A database whose applied migrations still match the embedded files byte for byte opens normally,
-  including one created by an earlier commit.
+  including one created by an earlier commit. Cross-commit compatibility is unsupported and
+  untested: a database from an earlier commit has not been validated against the current schema.
 - A database that applied a migration whose file has since changed is refused with a migration
   checksum mismatch. Recreate the file, or move it aside first if you want to keep it.
 
