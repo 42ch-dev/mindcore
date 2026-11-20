@@ -851,6 +851,11 @@ async fn append_rejects_a_stale_revision_without_touching_rows() {
     assert_eq!(assigned, 2);
     tx.commit().await.expect("commit");
 
+    // Complete pre-rejection snapshot: the rejected transaction is compared against
+    // these bytes record-by-record, not by record ids alone.
+    let committed =
+        expect_ok(read_records(&pool, "wren", "ke_wren").await, "committed records");
+
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
     match append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_newer", 0.5)).await {
         SpokeResult::Reject(reject) => {
@@ -874,9 +879,9 @@ async fn append_rejects_a_stale_revision_without_touching_rows() {
                 "in-transaction records",
             );
             assert_eq!(
-                module_keys(&records),
-                vec!["cog_hearsay"],
-                "the rejected record must not be visible inside the transaction"
+                serde_json::to_string(&records).expect("in-transaction records serialize"),
+                serde_json::to_string(&committed).expect("committed records serialize"),
+                "a stale rejection that rewrote the committed cog_hearsay payload would diverge here",
             );
         }
         SpokeResult::Ok(_) => panic!("a stale expected revision must not append"),
@@ -916,6 +921,11 @@ async fn append_rejects_a_duplicate_id_at_the_current_revision() {
     assert_eq!(assigned, 2);
     tx.commit().await.expect("commit");
 
+    // Complete pre-rejection snapshot: the rejected transaction is compared against
+    // these bytes record-by-record, not by record ids alone.
+    let committed =
+        expect_ok(read_records(&pool, "wren", "ke_wren").await, "committed records");
+
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
     match append_cognition(&mut tx, "wren", "ke_wren", 2, &belief("cog_hearsay", 0.9)).await {
         SpokeResult::Reject(reject) => {
@@ -940,9 +950,9 @@ async fn append_rejects_a_duplicate_id_at_the_current_revision() {
                 "in-transaction records",
             );
             assert_eq!(
-                module_keys(&records),
-                vec!["cog_hearsay"],
-                "the duplicate must not add a second row inside the transaction"
+                serde_json::to_string(&records).expect("in-transaction records serialize"),
+                serde_json::to_string(&committed).expect("committed records serialize"),
+                "the duplicate must not add a row or alter any committed field inside the transaction",
             );
             let current = expect_ok(
                 read_current_record(&mut *tx, "wren", "ke_wren").await,
