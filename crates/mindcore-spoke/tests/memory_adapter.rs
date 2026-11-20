@@ -4192,12 +4192,10 @@ async fn corrupt_record_content_still_refuses_unreconciled() {
 
     // Settled, the read reaches the payload: an undecodable row is a storage
     // failure, so the earlier refusal proves the probe ran before selection.
-    sqlx::query(
-        "UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_rec'",
-    )
-    .execute(&harness.pool)
-    .await
-    .expect("apply intent");
+    sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_rec'")
+        .execute(&harness.pool)
+        .await
+        .expect("apply intent");
     let mut tx = harness.begin().await;
     let result = adapter
         .get_record(
@@ -4273,12 +4271,10 @@ async fn corrupt_candidate_content_still_refuses_unreconciled() {
 
     // Settled, the read reaches the payload: an undecodable row is a storage
     // failure, so the earlier refusal proves the probe ran before selection.
-    sqlx::query(
-        "UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_cnd'",
-    )
-    .execute(&harness.pool)
-    .await
-    .expect("apply intent");
+    sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_cnd'")
+        .execute(&harness.pool)
+        .await
+        .expect("apply intent");
     let mut tx = harness.begin().await;
     let result = adapter
         .get_candidate(
