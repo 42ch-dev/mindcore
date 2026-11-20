@@ -14,7 +14,7 @@ use mindcore_spi::{
     CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest, DeliberateSnapshot,
     DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings,
     PageVectors, PolicyDecision, PolicyHook, ProposalDraft, Reasoner, RecallSnapshot,
-    Recommendation, SettledRecord, SettlementDraft, SpiError, SpiMindWorkflows,
+    Recommendation, SettledRecord, SettledRevision, SettlementDraft, SpiError, SpiMindWorkflows,
     StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
@@ -209,7 +209,7 @@ impl WorkflowBinding for StubBinding {
         _principal: &Principal,
         _request: &MemoryCandidatesReviewRequest,
         _cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         unserved()
     }
 
@@ -220,7 +220,7 @@ impl WorkflowBinding for StubBinding {
         _update: &MemoryRecordsUpdateRequest,
         _dismiss: &MemoryCandidatesDismissRequest,
         _cited: &[CitedRecord],
-    ) -> Result<(), SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         unserved()
     }
 
@@ -330,7 +330,7 @@ impl WorkflowBinding for RefusingBinding {
         _principal: &Principal,
         _request: &MemoryCandidatesReviewRequest,
         _cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         unserved()
     }
 
@@ -341,7 +341,7 @@ impl WorkflowBinding for RefusingBinding {
         _update: &MemoryRecordsUpdateRequest,
         _dismiss: &MemoryCandidatesDismissRequest,
         _cited: &[CitedRecord],
-    ) -> Result<(), SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         unserved()
     }
 
@@ -1133,6 +1133,8 @@ struct Recorded {
     update_keys: Arc<Mutex<Vec<String>>>,
     /// Candidate reads served so far.
     snapshots: Arc<AtomicUsize>,
+    /// Every vector the warm asked this binding to fill, with its revision.
+    fills: Arc<Mutex<Vec<(String, u64)>>>,
 }
 
 /// One captured candidate over a fixed page, with every submitted settlement
@@ -1145,6 +1147,8 @@ struct AbsorbDouble {
     settled_update: Option<String>,
     /// Captures served so far: the first commits the receipt, later ones replay it.
     captures: AtomicUsize,
+    /// The live projection the post-settlement warm reads, when a test drives one.
+    live: Option<SettledRecord>,
 }
 
 #[async_trait]
@@ -1206,11 +1210,15 @@ impl WorkflowBinding for AbsorbDouble {
         _principal: &Principal,
         request: &MemoryCandidatesReviewRequest,
         cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         let mut object = serde_json::to_value(request).expect("review request");
         object["cited"] = cited_json(cited);
         self.recorded.reviews.lock().expect("reviews").push(object);
-        Ok(vec!["rec_new".to_string()])
+        // The review mints fresh records, so its settlement commits revision 1.
+        Ok(vec![SettledRevision {
+            record_id: "rec_new".to_string(),
+            revision: 1,
+        }])
     }
 
     async fn update_candidate(
@@ -1220,13 +1228,25 @@ impl WorkflowBinding for AbsorbDouble {
         update: &MemoryRecordsUpdateRequest,
         dismiss: &MemoryCandidatesDismissRequest,
         cited: &[CitedRecord],
-    ) -> Result<(), SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
+        let rendered = serde_json::to_value(update).expect("update request");
         self.recorded.updates.lock().expect("updates").push(json!({
-            "update": serde_json::to_value(update).expect("update request"),
+            "update": rendered,
             "dismiss": serde_json::to_value(dismiss).expect("dismiss request"),
             "cited": cited_json(cited),
         }));
-        Ok(())
+        // The update CAS-writes `expected_revision + 1`, so that is what the
+        // settlement committed.
+        Ok(vec![SettledRevision {
+            record_id: rendered["record_id"]
+                .as_str()
+                .expect("update record id")
+                .to_string(),
+            revision: rendered["expected_revision"]
+                .as_u64()
+                .expect("update expected revision")
+                + 1,
+        }])
     }
 
     async fn settled_record(
@@ -1235,18 +1255,23 @@ impl WorkflowBinding for AbsorbDouble {
         _space_id: &str,
         _record_id: &str,
     ) -> Result<Option<SettledRecord>, SpiError> {
-        unserved()
+        Ok(self.live.clone())
     }
 
     async fn fill_record_vector(
         &self,
         _principal: &Principal,
         _space_id: &str,
-        _record: &SettledRecord,
+        record: &SettledRecord,
         _identity: &EmbeddingIdentity,
         _vector: &[f32],
     ) -> Result<(), SpiError> {
-        unserved()
+        self.recorded
+            .fills
+            .lock()
+            .expect("fills")
+            .push((record.record_id.clone(), record.revision));
+        Ok(())
     }
 
     async fn recorded_update(
@@ -1399,9 +1424,24 @@ fn absorb_at(
         recorded: recorded.clone(),
         settled_update: settled_update.map(str::to_string),
         captures: AtomicUsize::new(captures),
+        live: None,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     (SpiMindWorkflows::new(double), recorded, seen)
+}
+
+/// An absorb double whose post-settlement warm reads `live`.
+fn absorb_with_live(live: SettledRecord) -> (SpiMindWorkflows, Recorded) {
+    let recorded = Recorded::default();
+    let double = AbsorbDouble {
+        candidate: pending_candidate(),
+        page: page(),
+        recorded: recorded.clone(),
+        settled_update: None,
+        captures: AtomicUsize::new(0),
+        live: Some(live),
+    };
+    (SpiMindWorkflows::new(double), recorded)
 }
 
 #[tokio::test]
@@ -1443,6 +1483,95 @@ async fn promote_settles_through_one_review() {
         json!([{ "record_id": "rec_gate", "revision": 3 }])
     );
     assert!(recorded.updates.lock().expect("updates").is_empty());
+}
+
+/// The warm embeds the record whose live read still serves the revision the
+/// settlement committed, and fills exactly that revision.
+#[tokio::test]
+async fn the_warm_embeds_the_settled_revision() {
+    let (workflows, recorded) = absorb_with_live(SettledRecord {
+        record_id: "rec_new".to_string(),
+        revision: 1,
+        text: "the north gate is closed at dusk".to_string(),
+    });
+    let embedder = planted_embedder();
+    let policy = RecordingPolicy {
+        decision: PolicyDecision::AutoSettle,
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let caps = MindCapabilities {
+        reasoner: Some(&FixedVerdict(
+            json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        )),
+        policy_hook: Some(&policy),
+        embedder: Some(&embedder),
+    };
+
+    let outcomes = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("absorb");
+
+    assert_eq!(
+        outcomes,
+        vec![AbsorbCandidateOutcome::Settled {
+            candidate_id: "cnd_1".to_string(),
+            record_ids: vec!["rec_new".to_string()],
+        }]
+    );
+    assert_eq!(
+        embedder.embedded(),
+        vec!["the north gate is closed at dusk".to_string()]
+    );
+    assert_eq!(
+        *recorded.fills.lock().expect("fills"),
+        vec![("rec_new".to_string(), 1)]
+    );
+}
+
+/// A live read that already serves a later revision is not the settled work:
+/// its text belongs to a mutation the settlement never made.
+#[tokio::test]
+async fn a_record_that_moved_before_the_live_read_warms_nothing() {
+    let (workflows, recorded) = absorb_with_live(SettledRecord {
+        record_id: "rec_new".to_string(),
+        revision: 2,
+        text: "the north gate is closed for the night".to_string(),
+    });
+    let embedder = planted_embedder();
+    let policy = RecordingPolicy {
+        decision: PolicyDecision::AutoSettle,
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let caps = MindCapabilities {
+        reasoner: Some(&FixedVerdict(
+            json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        )),
+        policy_hook: Some(&policy),
+        embedder: Some(&embedder),
+    };
+
+    let outcomes = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("absorb");
+
+    assert_eq!(
+        outcomes,
+        vec![AbsorbCandidateOutcome::Settled {
+            candidate_id: "cnd_1".to_string(),
+            record_ids: vec!["rec_new".to_string()],
+        }],
+        "the settled Memory outcome is unchanged"
+    );
+    assert!(
+        embedder.embedded().is_empty(),
+        "obsolete settled work makes no provider call"
+    );
+    assert!(
+        recorded.fills.lock().expect("fills").is_empty(),
+        "and fills no row"
+    );
 }
 
 #[tokio::test]
@@ -2006,7 +2135,7 @@ impl WorkflowBinding for DeliberateDouble {
         _principal: &Principal,
         _request: &MemoryCandidatesReviewRequest,
         _cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         unserved()
     }
 
@@ -2017,7 +2146,7 @@ impl WorkflowBinding for DeliberateDouble {
         _update: &MemoryRecordsUpdateRequest,
         _dismiss: &MemoryCandidatesDismissRequest,
         _cited: &[CitedRecord],
-    ) -> Result<(), SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         unserved()
     }
 

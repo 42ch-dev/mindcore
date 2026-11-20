@@ -124,8 +124,8 @@ impl Embedder for BoundaryEmbedder {
                     "INSERT INTO memory_journal \
                      (seq, receipt_id, space_id, subject_id, requester_principal_id, op, \
                       idempotency_key, state, targets_json, result_json, created_at, updated_at) \
-                     VALUES (1, 'rct_pending', ?, ?, ?, 'memory.records.update', 'key', 'pending', \
-                             '[]', NULL, ?, ?)",
+                     VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_journal), 'rct_pending', \
+                             ?, ?, ?, 'memory.records.update', 'key', 'pending', '[]', NULL, ?, ?)",
                 )
                 .bind(SPACE)
                 .bind(SUBJECT)
@@ -2775,6 +2775,45 @@ async fn a_revision_moved_during_the_warm_keeps_no_row() {
     assert!(
         harness.vector_rows().await.is_empty(),
         "obsolete work cannot overwrite a newer vector"
+    );
+}
+
+#[tokio::test]
+async fn a_subject_withheld_during_the_warm_keeps_no_row() {
+    let harness = granted_harness().await;
+    // The provider stages an unsettled intent while it runs, so the subject is
+    // withheld from the settlement's live read onwards — before the fill.
+    let embedder = harness.embedder(SideEffect::PendingIntent);
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm_withheld",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled {
+        candidate_id,
+        record_ids,
+    }] = outcomes.as_slice()
+    else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        embedder.embedded(),
+        vec!["the north gate is closed at dusk".to_string()],
+        "the provider ran after the settlement's live read served the record"
+    );
+    assert_eq!(
+        harness.stored_record(&record_ids[0]).await,
+        Some((1, "the north gate is closed at dusk".to_string())),
+        "the already-settled Memory effect stays successful"
+    );
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a subject withheld before the fill gains no vector row"
     );
 }
 

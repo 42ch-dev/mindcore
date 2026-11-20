@@ -125,7 +125,8 @@ pub trait WorkflowBinding: Send + Sync {
     ) -> Result<AbsorbSnapshot, SpiError>;
 
     /// Submit one review decision over `cited`, publish its targets and settle
-    /// its receipt; returns the record ids the review created.
+    /// its receipt; returns the records the review created, each with the
+    /// revision the settlement committed.
     ///
     /// Every cited record is revalidated in the same staging transaction: one
     /// that changed, disappeared, became withheld or lost its admission
@@ -135,10 +136,11 @@ pub trait WorkflowBinding: Send + Sync {
         principal: &Principal,
         request: &MemoryCandidatesReviewRequest,
         cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError>;
+    ) -> Result<Vec<SettledRevision>, SpiError>;
 
     /// Stage `memory.records.update` and `memory.candidates.dismiss` in one
-    /// transaction, publish both intents' targets and settle both receipts.
+    /// transaction, publish both intents' targets and settle both receipts;
+    /// returns the updated record with the revision the settlement committed.
     ///
     /// `cited` is revalidated in that same staging transaction first.
     async fn update_candidate(
@@ -148,7 +150,7 @@ pub trait WorkflowBinding: Send + Sync {
         update: &MemoryRecordsUpdateRequest,
         dismiss: &MemoryCandidatesDismissRequest,
         cited: &[CitedRecord],
-    ) -> Result<(), SpiError>;
+    ) -> Result<Vec<SettledRevision>, SpiError>;
 
     /// The record id this caller's update leg already settled under
     /// `idempotency_key`.
@@ -291,6 +293,20 @@ pub struct SettledRecord {
     pub revision: u64,
     /// The live `record_text` a warmed vector must embed.
     pub text: String,
+}
+
+/// One record a settlement just committed: the id it named and the revision it
+/// left behind.
+///
+/// A settlement reports this pair, not only the id, so the warm can tell work
+/// that is still the settled revision from work a later writer already made
+/// obsolete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRevision {
+    /// The record id the settlement named.
+    pub record_id: String,
+    /// The revision the settlement committed for that record.
+    pub revision: u64,
 }
 
 /// One record an absorb decision cited, with the revision the prompted page
@@ -522,15 +538,17 @@ impl SpiMindWorkflows {
                     .await?;
                 match verdict {
                     PolicyDecision::AutoSettle => {
-                        let record_ids = self
+                        let settled = self
                             .binding
                             .review_candidate(principal, &review, &cited)
                             .await?;
-                        self.warm_settled(principal, &space, &record_ids, caps)
-                            .await;
+                        self.warm_settled(principal, &space, &settled, caps).await;
                         Ok(AbsorbCandidateOutcome::Settled {
                             candidate_id,
-                            record_ids,
+                            record_ids: settled
+                                .into_iter()
+                                .map(|record| record.record_id)
+                                .collect(),
                         })
                     }
                     PolicyDecision::RequireHumanReview { .. } => {
@@ -618,19 +636,17 @@ impl SpiMindWorkflows {
                     .await?;
                 match verdict {
                     PolicyDecision::AutoSettle => {
-                        self.binding
+                        let settled = self
+                            .binding
                             .update_candidate(principal, &space, &update, &dismiss, &cited)
                             .await?;
-                        self.warm_settled(
-                            principal,
-                            &space,
-                            std::slice::from_ref(&record_id),
-                            caps,
-                        )
-                        .await;
+                        self.warm_settled(principal, &space, &settled, caps).await;
                         Ok(AbsorbCandidateOutcome::Settled {
                             candidate_id,
-                            record_ids: vec![record_id],
+                            record_ids: settled
+                                .into_iter()
+                                .map(|record| record.record_id)
+                                .collect(),
                         })
                     }
                     PolicyDecision::RequireHumanReview { .. } => {
@@ -664,7 +680,7 @@ impl SpiMindWorkflows {
         &self,
         principal: &Principal,
         space: &str,
-        record_ids: &[String],
+        settled: &[SettledRevision],
         caps: &MindCapabilities<'_>,
     ) {
         let Some(embedder) = caps.embedder else {
@@ -673,30 +689,37 @@ impl SpiMindWorkflows {
         let Some(identity) = embedder.identity() else {
             return;
         };
-        for record_id in record_ids {
+        for settled in settled {
             let _ = self
-                .warm_record(principal, space, record_id, embedder, identity)
+                .warm_record(principal, space, settled, embedder, identity)
                 .await;
         }
     }
 
     /// Warm one settled record: the live read, one provider call outside every
     /// transaction, then a fill that rechecks the revision and withholding.
+    ///
+    /// The live read must still serve the revision the settlement committed. A
+    /// record that moved since makes the settled work obsolete: its text was
+    /// never this revision's, so nothing is embedded and no row is written.
     async fn warm_record(
         &self,
         principal: &Principal,
         space: &str,
-        record_id: &str,
+        settled: &SettledRevision,
         embedder: &dyn Embedder,
         identity: &EmbeddingIdentity,
     ) -> Result<(), SpiError> {
         let Some(record) = self
             .binding
-            .settled_record(principal, space, record_id)
+            .settled_record(principal, space, &settled.record_id)
             .await?
         else {
             return Ok(());
         };
+        if record.revision != settled.revision {
+            return Ok(());
+        }
         let mut vectors = checked_vectors(
             embedder
                 .embed_batch(std::slice::from_ref(&record.text))

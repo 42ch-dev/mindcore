@@ -25,8 +25,8 @@ use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRea
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
     AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, EmbeddingIdentity, PageVectors, RecallSnapshot, SettledRecord, SpiError,
-    WorkflowBinding,
+    DeliberateSnapshot, EmbeddingIdentity, PageVectors, RecallSnapshot, SettledRecord,
+    SettledRevision, SpiError, WorkflowBinding,
 };
 use mindcore_sqlite::{
     append_cognition, list_entries_in, read_carrier_header, read_entry, vectors,
@@ -119,6 +119,53 @@ impl MemoryWorkflowBinding {
             })?
             .map(|intent| intent.targets)
             .ok_or_else(|| internal(format!("receipt {receipt_id} has no journaled intent")))
+    }
+
+    /// The records one staged intent committed, each at the revision its
+    /// staging wrote.
+    ///
+    /// Read on the staging transaction that wrote those rows: it holds the only
+    /// writable handle, so no later commit can move a revision between the
+    /// write and this read. Only a record projection names a record
+    /// (`effects::record_target`), so a candidate-only intent yields nothing.
+    async fn staged_revisions(
+        &self,
+        transaction: &mut Tx<'_>,
+        space: &SpaceId,
+        targets: &[Value],
+    ) -> Result<Vec<SettledRevision>, SpiError> {
+        let mut settled = Vec::new();
+        for target in targets {
+            let Some(record_id) = target
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| path.strip_prefix("records/"))
+                .and_then(|path| path.strip_suffix(".md"))
+            else {
+                continue;
+            };
+            let Some(record) = SqliteMemoryRepository
+                .record(transaction, space, record_id)
+                .await
+                .map_err(|error| {
+                    internal(format!(
+                        "staged record {record_id} could not be read: {error}"
+                    ))
+                })?
+            else {
+                continue;
+            };
+            let Some(revision) = record.revision.as_u64() else {
+                return Err(internal(format!(
+                    "staged record {record_id} carries no integer revision"
+                )));
+            };
+            settled.push(SettledRevision {
+                record_id: record_id.to_string(),
+                revision,
+            });
+        }
+        Ok(settled)
     }
 
     /// The host publisher, or the typed refusal a settlement leg owes before it
@@ -603,7 +650,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         principal: &Principal,
         request: &MemoryCandidatesReviewRequest,
         cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         let publisher = self.publisher()?;
         let space = SpaceId::new(request.space_id.to_string());
         let mut transaction = self.pool.begin().await.map_err(|error| {
@@ -621,14 +668,16 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let targets = self
             .intent_targets(&mut transaction, &space, &receipt_id)
             .await?;
+        let settled = self
+            .staged_revisions(&mut transaction, &space, &targets)
+            .await?;
         transaction.commit().await.map_err(|error| {
             uncertain_commit(&format!("review staging for receipt {receipt_id}"), error)
         })?;
-        let body = self
-            .settle_staged(publisher, &space, &[(receipt_id, targets)])
+        self.settle_staged(publisher, &space, &[(receipt_id, targets)])
             .await?
             .ok_or_else(|| internal("the settled review carries no receipt".to_string()))?;
-        record_ids(&body)
+        Ok(settled)
     }
 
     async fn update_candidate(
@@ -638,7 +687,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         update: &MemoryRecordsUpdateRequest,
         dismiss: &MemoryCandidatesDismissRequest,
         cited: &[CitedRecord],
-    ) -> Result<(), SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         let publisher = self.publisher()?;
         let space = SpaceId::new(space_id.to_string());
         let mut transaction = self.pool.begin().await.map_err(|error| {
@@ -659,10 +708,17 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .await,
         )?;
         let mut intents = Vec::with_capacity(2);
+        let mut settled = Vec::new();
         for receipt_id in [&update_receipt, &dismiss_receipt] {
             let targets = self
                 .intent_targets(&mut transaction, &space, receipt_id)
                 .await?;
+            // The dismissal leg names no record, so only the update leg's own
+            // projection yields a revision here.
+            settled.extend(
+                self.staged_revisions(&mut transaction, &space, &targets)
+                    .await?,
+            );
             intents.push((receipt_id.clone(), targets));
         }
         // Both effects are in this one staging transaction: a refusal above
@@ -674,7 +730,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             )
         })?;
         let _ = self.settle_staged(publisher, &space, &intents).await?;
-        Ok(())
+        Ok(settled)
     }
 
     async fn settled_record(
@@ -1031,20 +1087,6 @@ async fn replayed_lifecycle(
         CandidateState::Pending { .. } => CandidateLifecycle::Pending,
         CandidateState::Consumed { .. } => CandidateLifecycle::Consumed,
     })
-}
-
-fn record_ids(body: &Value) -> Result<Vec<String>, SpiError> {
-    let ids = body
-        .pointer("/result/record_ids")
-        .and_then(Value::as_array)
-        .ok_or_else(|| internal("the settled review carries no record_ids".to_string()))?;
-    ids.iter()
-        .map(|id| {
-            id.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| internal("a settled record id is not a string".to_string()))
-        })
-        .collect()
 }
 
 fn decode_records(body: Value) -> Result<Vec<RetainedRecord>, SpiError> {

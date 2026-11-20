@@ -28,10 +28,12 @@
   applies to a database created before it; the table starts empty.
 - `mindcore-spi` / `mindcore-spoke`: a confirmed absorb settlement warms the retained vector of each
   fresh or updated record when the host supplies an embedder with a stable serving identity. The
-  provider call runs outside the settlement transaction, and the fill rechecks the committed
-  revision and withholding, so work that outlived its record writes nothing. A failed warm is a
-  cache miss, never a failed, rolled-back or replayed Memory mutation; no embedder, no serving
-  identity and an idempotent replay write nothing.
+  settlement reports the revision it committed for every record it names, and the warm embeds only a
+  record whose live read still serves that revision — one a later writer moved before the read is
+  obsolete work and makes no provider call and no row. The provider call runs outside the settlement
+  transaction, and the fill rechecks the live revision and withholding, so work that outlived its
+  record writes nothing. A failed warm is a cache miss, never a failed, rolled-back or replayed Memory
+  mutation; no embedder, no serving identity and an idempotent replay write nothing.
 - `mindcore-spi` / `mindcore-spoke`: recall now reuses the retained vectors. The page is authorized
   first, the query vector is resolved from one validated process-local slot keyed by principal, space,
   subject, exact query and serving identity, and the stored record vectors come from one snapshot that
