@@ -1993,7 +1993,7 @@ impl MemoryAdapter {
                 completed_at: settled_at,
                 result,
             },
-            ..receipt
+            ..*receipt
         };
         if !self
             .repository

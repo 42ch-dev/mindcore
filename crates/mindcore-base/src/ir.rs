@@ -248,9 +248,10 @@ pub struct MemoryGrantRow {
 
 /// The adapter-resolved placement scope of a read: which placements the admitted set may
 /// cover. Paging, ranking and authorization stay outside the repository.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PlacementSelection {
     /// Every placement of the subject.
+    #[default]
     SubjectAll,
     /// Shared rows only.
     SharedOnly,
@@ -259,12 +260,6 @@ pub enum PlacementSelection {
         context_ids: Vec<ContextId>,
         include_shared: bool,
     },
-}
-
-impl Default for PlacementSelection {
-    fn default() -> Self {
-        Self::SubjectAll
-    }
 }
 
 /// The adapter-resolved record-list predicate: placement scope plus the optional
@@ -300,7 +295,7 @@ pub struct ReceiptLease {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReceiptRead {
     /// Payload columns intact; the row decodes to its full IR.
-    Retained(ReviewReceiptIr),
+    Retained(Box<ReviewReceiptIr>),
     /// `result`/`error` evicted after the dedup window; identity, the payload digest
     /// and last status remain, so a replay can tell expiry from a payload conflict.
     Evicted {
