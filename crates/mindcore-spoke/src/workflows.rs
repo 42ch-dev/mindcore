@@ -598,6 +598,10 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 "update receipt transaction could not commit: {error}"
             ))
         })?;
+        // Retention: capture and update receipts are rows of one table under
+        // one aged policy, and this crate has no per-op retention branch; the
+        // capture receipt is minted first, so a replay is refused there before
+        // an aged-out update receipt could be read here.
         let Some(ReceiptRead::Retained(receipt)) = receipt else {
             return Ok(None);
         };
