@@ -313,7 +313,12 @@ impl MemoryAdapter {
             .get("selection")
             .cloned()
             .ok_or_else(|| Reject::invalid("selection is required"))?;
-        let filter_json = object.get("filter").cloned();
+        // A request `filter: null` stages as absent — the persisted row must not
+        // carry a literal null the readers would later treat as malformed.
+        let filter_json = object
+            .get("filter")
+            .filter(|value| !value.is_null())
+            .cloned();
         let expected_state_digest = wire::required(object, "expected_state_digest")?.to_string();
         if !is_state_digest(expected_state_digest.as_str()) {
             return Err(Reject::invalid(
