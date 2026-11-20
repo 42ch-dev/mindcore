@@ -508,9 +508,10 @@ impl MemoryAdapter {
             },
             ..*receipt
         };
-        // The CAS carries the lease identity: only the owner the receipt was
-        // leased to may settle it, so a cross-owner or re-settled row refuses
-        // here and the caller's rollback removes the envelope with it.
+        // The CAS carries the lease identity: while the lease is live only the owner it was
+        // leased to may settle; past expiry the pending row is taken over, so a crashed
+        // generation unwedges. A re-settled or live wrong-owner row still refuses here and
+        // the caller's rollback removes the envelope with it.
         if !self
             .repository
             .update_receipt(tx, &settled, "pending", Some(effect.owner_id.as_str()))

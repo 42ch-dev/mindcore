@@ -290,7 +290,8 @@ async fn candidate_insert_and_guarded_consume() {
     pool.close().await;
 }
 
-/// Leased pending receipt staged, then settled by the same owner; an owner mismatch fails.
+/// Leased pending receipt staged, then settled by the same owner; a different owner is
+/// refused while the lease is still live.
 #[tokio::test]
 async fn leased_receipt_settle_guarded_by_owner() {
     let dir = TempDir::new().unwrap();
@@ -309,9 +310,10 @@ async fn leased_receipt_settle_guarded_by_owner() {
         state: ReceiptState::Pending,
         extensions: Map::new(),
     };
+    // A lease that stays live for the test's lifetime keeps the wrong-owner guard intact.
     let lease = mindcore_base::ir::ReceiptLease {
         owner_id: "instance-1".into(),
-        expires_at: "2026-11-20T10:00:00Z".into(),
+        expires_at: "9999-01-01T00:00:00.000Z".into(),
     };
 
     let mut tx = pool.begin().await.unwrap();
@@ -326,7 +328,7 @@ async fn leased_receipt_settle_guarded_by_owner() {
         },
         ..pending.clone()
     };
-    // Wrong owner cannot settle.
+    // Wrong owner cannot settle while the lease is live.
     assert!(!repo
         .update_receipt(&mut tx, &settled, "pending", Some("instance-2"))
         .await
@@ -345,6 +347,134 @@ async fn leased_receipt_settle_guarded_by_owner() {
         ReceiptRead::Retained(receipt) => {
             assert!(matches!(receipt.state, ReceiptState::Committed { .. }))
         }
+        ReceiptRead::Evicted { .. } => panic!("receipt body must be retained"),
+    }
+    tx.commit().await.unwrap();
+    pool.close().await;
+}
+
+/// §7.0.3 liveness: a crashed generation leaves a pending receipt under its lease; past the
+/// lease instant a different owner takes it over and settles.
+#[tokio::test]
+async fn expired_lease_pending_receipt_taken_over() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let pending = ReviewReceiptIr {
+        receipt_id: "rcp_gen_crash".into(),
+        space_id: "spc_workshop".into(),
+        requester: "prn_mira".into(),
+        operation: "memory.reflections.generate".into(),
+        idempotency_key: Some("gen-crash".into()),
+        payload_digest: DIGEST.into(),
+        created_at: TIME.into(),
+        state: ReceiptState::Pending,
+        extensions: Map::new(),
+    };
+    // The crashed owner leased this receipt long enough ago that its lease is expired.
+    let lease = mindcore_base::ir::ReceiptLease {
+        owner_id: "instance-crashed".into(),
+        expires_at: "2020-01-01T00:00:00.000Z".into(),
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    repo.insert_receipt(&mut tx, &pending, Some(&lease))
+        .await
+        .unwrap();
+
+    let settled = ReviewReceiptIr {
+        state: ReceiptState::Committed {
+            completed_at: LATER.into(),
+            result: json!({"reflection_id": "rfl_2", "cost": {"unit_kind": "reflection", "units": 1.0}}),
+        },
+        ..pending.clone()
+    };
+    // A different owner settles the abandoned pending row after lease expiry.
+    assert!(repo
+        .update_receipt(&mut tx, &settled, "pending", Some("instance-2"))
+        .await
+        .unwrap());
+    match repo
+        .receipt(&mut tx, &SpaceId::new("spc_workshop"), "rcp_gen_crash")
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        ReceiptRead::Retained(receipt) => {
+            assert!(matches!(receipt.state, ReceiptState::Committed { .. }))
+        }
+        ReceiptRead::Evicted { .. } => panic!("receipt body must be retained"),
+    }
+    tx.commit().await.unwrap();
+    pool.close().await;
+}
+
+/// A settled row is never taken over: even past lease expiry the recorded outcome stands.
+#[tokio::test]
+async fn settled_receipt_not_taken_over_past_expiry() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let pending = ReviewReceiptIr {
+        receipt_id: "rcp_gen_done".into(),
+        space_id: "spc_workshop".into(),
+        requester: "prn_mira".into(),
+        operation: "memory.reflections.generate".into(),
+        idempotency_key: Some("gen-done".into()),
+        payload_digest: DIGEST.into(),
+        created_at: TIME.into(),
+        state: ReceiptState::Pending,
+        extensions: Map::new(),
+    };
+    let lease = mindcore_base::ir::ReceiptLease {
+        owner_id: "instance-1".into(),
+        expires_at: "2020-01-01T00:00:00.000Z".into(),
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    repo.insert_receipt(&mut tx, &pending, Some(&lease))
+        .await
+        .unwrap();
+    let settled = ReviewReceiptIr {
+        state: ReceiptState::Committed {
+            completed_at: LATER.into(),
+            result: json!({"reflection_id": "rfl_1", "cost": {"unit_kind": "reflection", "units": 1.0}}),
+        },
+        ..pending.clone()
+    };
+    assert!(repo
+        .update_receipt(&mut tx, &settled, "pending", Some("instance-1"))
+        .await
+        .unwrap());
+
+    // Past expiry another owner still cannot rewrite the committed receipt.
+    let forged = ReviewReceiptIr {
+        state: ReceiptState::Committed {
+            completed_at: LATER.into(),
+            result: json!({"reflection_id": "rfl_forged", "cost": {"unit_kind": "reflection", "units": 1.0}}),
+        },
+        ..pending.clone()
+    };
+    assert!(!repo
+        .update_receipt(&mut tx, &forged, "committed", Some("instance-2"))
+        .await
+        .unwrap());
+    match repo
+        .receipt(&mut tx, &SpaceId::new("spc_workshop"), "rcp_gen_done")
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        ReceiptRead::Retained(receipt) => match receipt.state {
+            ReceiptState::Committed { ref result, .. } => {
+                assert_eq!(result["reflection_id"], "rfl_1")
+            }
+            _ => panic!("receipt must stay committed"),
+        },
         ReceiptRead::Evicted { .. } => panic!("receipt body must be retained"),
     }
     tx.commit().await.unwrap();

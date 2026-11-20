@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_receipts SET status = ?, result_json = ?, error_json = ?, completed_at = ? WHERE receipt_id = ? AND space_id = ? AND status = ? AND (owner_id IS ? OR (status = 'pending' AND lease_expires_at < ?))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "9d59f99ccaf1341226aacae8dbf71e160c33c284298116bb67a14bb5db136984"
+}

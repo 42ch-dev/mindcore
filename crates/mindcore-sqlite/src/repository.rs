@@ -8,6 +8,7 @@
 //! `task-1-schema-map.md` §3 D-1).
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::{json, Map, Number, Value};
 use sqlx::Sqlite;
 
@@ -1550,10 +1551,17 @@ impl MemoryRepository for SqliteMemoryRepository {
         observed_owner: Option<&str>,
     ) -> RepoResult<bool> {
         let columns = receipt_columns(row)?;
+        // §7.0.3 lease takeover: a pending row whose lease instant passed is settled by any
+        // owner, so a crashed generation cannot wedge its idempotency key; only pending rows
+        // are taken over — a settled row keeps its recorded outcome. Stamps keep the same
+        // `%Y-%m-%dT%H:%M:%S%.3fZ` spelling `policy::timestamp` writes, so text order is
+        // instant order.
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let updated = sqlx::query!(
             "UPDATE memory_receipts SET status = ?, result_json = ?, error_json = ?, \
              completed_at = ? \
-             WHERE receipt_id = ? AND space_id = ? AND status = ? AND owner_id IS ?",
+             WHERE receipt_id = ? AND space_id = ? AND status = ? \
+             AND (owner_id IS ? OR (status = 'pending' AND lease_expires_at < ?))",
             columns.status,
             &columns.result,
             &columns.error,
@@ -1562,6 +1570,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             &row.space_id,
             observed_state,
             observed_owner,
+            &now,
         )
         .execute(&mut **tx)
         .await?;

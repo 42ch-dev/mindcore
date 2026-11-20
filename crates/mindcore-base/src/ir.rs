@@ -563,7 +563,9 @@ pub trait MemoryRepository: Send + Sync {
     ) -> Result<(), Self::Error>;
 
     /// Replaces a receipt's status/payload guarded by its previously observed status and
-    /// owner; `observed_owner: None` matches an unleased (`NULL`) owner, never a wildcard.
+    /// owner; `observed_owner: None` matches an unleased (`NULL`) owner, never a wildcard. A
+    /// still-pending row whose lease instant passed is taken over by any owner (§7.0.3), so a
+    /// crashed generation cannot wedge its idempotency key; settled rows are never taken over.
     async fn update_receipt(
         &self,
         tx: &mut Self::Tx<'_>,
