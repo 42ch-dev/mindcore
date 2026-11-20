@@ -19,10 +19,10 @@ use mindcore_base::ir::wire::{
     memory_record_to_wire, review_receipt_from_wire, review_receipt_to_wire, WireVersion,
 };
 use mindcore_base::ir::{
-    CandidateSelection, CandidateState, MemoryCandidateIr, MemoryGrantRow, MemoryJournalRow,
-    MemoryProfileRow, MemoryProviderMetaRow, MemoryRecordIr, MemoryReflectionRow, MemoryRepository,
-    MemorySpaceRow, MemorySubjectRow, Placement, PlacementSelection, ReceiptKey, ReceiptLease,
-    ReceiptRead, RecordSelection, ReviewReceiptIr,
+    CandidateSelection, CandidateState, MemoryCandidateHead, MemoryCandidateIr, MemoryGrantRow,
+    MemoryJournalRow, MemoryProfileRow, MemoryProviderMetaRow, MemoryRecordHead, MemoryRecordIr,
+    MemoryReflectionRow, MemoryRepository, MemorySpaceRow, MemorySubjectRow, Placement,
+    PlacementSelection, ReceiptKey, ReceiptLease, ReceiptRead, RecordSelection, ReviewReceiptIr,
 };
 use mindcore_base::memory::RecallQuery;
 
@@ -98,6 +98,22 @@ fn decode_row(error: sqlx::Error) -> SqliteRepositoryError {
 
 // ── Candidate ───────────────────────────────────────────────────────────────
 
+/// The `Placement` one candidate/record visibility column pair encodes, shared
+/// by the head lookups and the full-row decoders.
+fn placement_of(
+    visibility: &str,
+    context_id: Option<&String>,
+    what: &str,
+) -> RepoResult<Placement> {
+    match visibility {
+        "shared" => Ok(Placement::Shared),
+        "context" => context_id
+            .map(|id| Placement::Context(id.clone()))
+            .ok_or_else(|| invalid_row(format_args!("{what} placement has no context id"))),
+        other => Err(invalid_row(format_args!("{what} visibility {other}"))),
+    }
+}
+
 /// A `memory_candidates` row; `Option` mirrors stored nullability so `query_as!`
 /// compile-time decoding and the dynamic-list decode share one shape.
 struct CandidateRow {
@@ -132,7 +148,14 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
     wire.insert("candidate_id".into(), row.candidate_id.clone().into());
     wire.insert("space_id".into(), row.space_id.clone().into());
     wire.insert("subject_id".into(), row.subject_id.clone().into());
-    wire.insert("capture_scope".into(), placement_wire(row)?);
+    wire.insert(
+        "capture_scope".into(),
+        placement_wire_value(
+            row.capture_visibility.as_str(),
+            row.capture_context_id.as_ref(),
+            "capture",
+        )?,
+    );
     wire.insert(
         "classification".into(),
         from_json(&row.classification_json, "classification")?,
@@ -187,15 +210,18 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
     Ok(ir)
 }
 
-fn placement_wire(row: &CandidateRow) -> RepoResult<Value> {
-    match row.capture_visibility.as_str() {
-        "shared" => Ok(json!({"visibility": "shared"})),
-        "context" => Ok(json!({
+/// The wire `placement` document one stored visibility/context pair encodes.
+fn placement_wire_value(
+    visibility: &str,
+    context_id: Option<&String>,
+    what: &str,
+) -> RepoResult<Value> {
+    match placement_of(visibility, context_id, what)? {
+        Placement::Shared => Ok(json!({"visibility": "shared"})),
+        Placement::Context(context_id) => Ok(json!({
             "visibility": "context",
-            "context_id": row.capture_context_id.clone()
-                .ok_or_else(|| invalid_row("context placement has no context id"))?,
+            "context_id": context_id,
         })),
-        other => Err(invalid_row(format_args!("capture visibility {other}"))),
     }
 }
 
@@ -282,6 +308,44 @@ fn candidate_columns(candidate: &MemoryCandidateIr) -> RepoResult<CandidateColum
             })
         }
     }
+}
+
+struct CandidateHeadRow {
+    subject_id: String,
+    capture_visibility: String,
+    capture_context_id: Option<String>,
+}
+
+/// The subject and capture placement only: `content_json` and the other
+/// payload columns stay unselected so admission and the withheld probe precede
+/// any content decode.
+async fn candidate_head_by_key(
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    id: &str,
+) -> RepoResult<Option<MemoryCandidateHead>> {
+    sqlx::query_as!(
+        CandidateHeadRow,
+        "SELECT subject_id, capture_visibility, capture_context_id \
+         FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+        space.as_str(),
+        id,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(decode_row)?
+    .map(|row| {
+        placement_of(
+            row.capture_visibility.as_str(),
+            row.capture_context_id.as_ref(),
+            "candidate capture",
+        )
+        .map(|capture_scope| MemoryCandidateHead {
+            subject_id: row.subject_id,
+            capture_scope,
+        })
+    })
+    .transpose()
 }
 
 async fn candidate_by_key(
@@ -373,28 +437,18 @@ struct RecordRow {
 }
 
 fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
-    let mut scope = Map::new();
-    match row.scope_visibility.as_str() {
-        "shared" => scope.insert("visibility".into(), "shared".into()),
-        "context" => {
-            scope.insert("visibility".into(), "context".into());
-            scope.insert(
-                "context_id".into(),
-                row.scope_context_id
-                    .clone()
-                    .ok_or_else(|| invalid_row("context scope has no context id"))?
-                    .into(),
-            )
-        }
-        other => return Err(invalid_row(format_args!("scope visibility {other}"))),
-    };
+    let scope = placement_wire_value(
+        row.scope_visibility.as_str(),
+        row.scope_context_id.as_ref(),
+        "record scope",
+    )?;
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
     wire.insert("record_id".into(), row.record_id.clone().into());
     wire.insert("space_id".into(), row.space_id.clone().into());
     wire.insert("subject_id".into(), row.subject_id.clone().into());
     wire.insert("kind".into(), row.kind.clone().into());
-    wire.insert("scope".into(), scope.into());
+    wire.insert("scope".into(), scope);
     wire.insert(
         "content".into(),
         from_json(&row.content_json, "record content")?,
@@ -454,6 +508,46 @@ fn record_columns(record: &MemoryRecordIr) -> RepoResult<RecordColumns> {
             .map(|value| to_json(&value, "record import ref"))
             .transpose()?,
     })
+}
+
+struct RecordHeadRow {
+    subject_id: String,
+    scope_visibility: String,
+    scope_context_id: Option<String>,
+    tombstone_json: Option<String>,
+}
+
+/// The subject, scope and tombstone marker only: `content_json` and the other
+/// payload columns stay unselected so admission and the withheld probe precede
+/// any content decode.
+async fn record_head_by_key(
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    id: &str,
+) -> RepoResult<Option<MemoryRecordHead>> {
+    sqlx::query_as!(
+        RecordHeadRow,
+        "SELECT subject_id, scope_visibility, scope_context_id, tombstone_json \
+         FROM memory_records WHERE space_id = ? AND record_id = ?",
+        space.as_str(),
+        id,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(decode_row)?
+    .map(|row| {
+        placement_of(
+            row.scope_visibility.as_str(),
+            row.scope_context_id.as_ref(),
+            "record scope",
+        )
+        .map(|scope| MemoryRecordHead {
+            subject_id: row.subject_id,
+            scope,
+            tombstoned: row.tombstone_json.is_some(),
+        })
+    })
+    .transpose()
 }
 
 async fn record_by_key(
@@ -951,6 +1045,15 @@ impl MemoryRepository for SqliteMemoryRepository {
     type Tx<'a> = sqlx::Transaction<'a, Sqlite>;
     type Error = SqliteRepositoryError;
 
+    async fn candidate_head(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> RepoResult<Option<MemoryCandidateHead>> {
+        candidate_head_by_key(tx, space, id).await
+    }
+
     async fn candidate(
         &self,
         tx: &mut Self::Tx<'_>,
@@ -975,6 +1078,15 @@ impl MemoryRepository for SqliteMemoryRepository {
         id: &str,
     ) -> RepoResult<Option<MemoryRecordIr>> {
         record_by_key(tx, space, id).await
+    }
+
+    async fn record_head(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> RepoResult<Option<MemoryRecordHead>> {
+        record_head_by_key(tx, space, id).await
     }
 
     async fn review_receipt(
@@ -1824,6 +1936,55 @@ impl MemoryRepository for SqliteMemoryRepository {
         .map_err(decode_row)?
         .map(journal_row)
         .transpose()
+    }
+
+    async fn list_unsettled_intents(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        subject: &SubjectId,
+    ) -> RepoResult<Vec<MemoryJournalRow>> {
+        // The literal `state <> 'applied'` predicate matches the partial index
+        // `idx_memory_journal_unsettled (space_id, subject_id, created_at)`.
+        sqlx::query_as!(
+            JournalRow,
+            "SELECT seq AS \"seq!\", receipt_id, space_id, subject_id, requester_principal_id, \
+             op, idempotency_key, state, targets_json, result_json, created_at, updated_at \
+             FROM memory_journal \
+             WHERE space_id = ? AND subject_id = ? AND state <> 'applied' \
+             ORDER BY created_at",
+            space.as_str(),
+            subject.as_str(),
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .into_iter()
+        .map(journal_row)
+        .collect()
+    }
+
+    async fn has_unsettled_intent(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        subject: &SubjectId,
+    ) -> RepoResult<bool> {
+        // Existence only: the literal `state <> 'applied'` predicate matches the
+        // partial index `idx_memory_journal_unsettled` and no payload column is
+        // selected, so an unreadable `targets_json`/`result_json` cannot mask
+        // the withhold.
+        Ok(sqlx::query_scalar!(
+            "SELECT 1 FROM memory_journal \
+             WHERE space_id = ? AND subject_id = ? AND state <> 'applied' \
+             LIMIT 1",
+            space.as_str(),
+            subject.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .is_some())
     }
 
     async fn insert_journal_intent(

@@ -201,6 +201,28 @@ fn staged(result: SpokeResult<MemoryStage>, op: &str) -> Option<String> {
     }
 }
 
+/// Settle one staged journaled intent inside the same transaction — the
+/// shape a reconciled production caller takes: `settle_journal` marks the
+/// intent `applied` and the receipt `committed`, so the withheld-read guard
+/// (`UNRECONCILED`) finds no unsettled intent when a later guarded subject
+/// read runs in this fixture.
+async fn settle(
+    adapter: &MemoryAdapter,
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    receipt_id: &str,
+    op: &str,
+) {
+    match adapter
+        .settle_journal(tx, &pending_space(), receipt_id)
+        .await
+    {
+        SpokeResult::Ok(body) => {
+            assert_eq!(body["status"], "committed", "{op} settlement");
+        }
+        other => panic!("{op} settlement failed: {other:?}"),
+    }
+}
+
 /// The guard only inspects the leaf: with a private `TempDir` root the
 /// harness owns the parent, so no ancestor/`..`/symlink-component state can
 /// exist. Anything present at the leaf — file, directory, or symlink,
@@ -465,8 +487,8 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["candidate"]["status"], "pending");
 
-    // D4 review cand_a to promote — a journaled effect: pending receipt,
-    // intent and file targets are staged, not committed.
+    // D4 review cand_a to promote — a journaled effect: receipt and intent
+    // are staged, then settled in-tx so later guarded reads reconcile.
     let review_receipt = staged(
         adapter
             .review_candidate(
@@ -484,9 +506,10 @@ async fn every_selector_takes_the_caller_transaction() {
         "candidates.review",
     )
     .expect("review is journaled");
+    settle(&adapter, &mut tx, &review_receipt, "candidates.review").await;
 
-    // D5 dismiss cand_b — also journaled.
-    staged(
+    // D5 dismiss cand_b — also journaled and settled in-tx.
+    let dismiss_receipt = staged(
         adapter
             .dismiss_candidate(
                 &mut tx,
@@ -502,6 +525,13 @@ async fn every_selector_takes_the_caller_transaction() {
             .await,
         "candidates.dismiss",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &dismiss_receipt.expect("dismiss is journaled"),
+        "candidates.dismiss",
+    )
+    .await;
 
     // The review's promoted record, visible inside the caller transaction.
     let ra: String = sqlx::query_scalar("SELECT record_id FROM memory_records")
@@ -509,7 +539,7 @@ async fn every_selector_takes_the_caller_transaction() {
         .await
         .expect("promoted record staged");
 
-    // D6 create an authored record — journaled.
+    // D6 create an authored record — journaled and settled in-tx.
     let create_receipt = staged(
         adapter
             .create_record(
@@ -528,6 +558,7 @@ async fn every_selector_takes_the_caller_transaction() {
         "records.create",
     )
     .expect("create is journaled");
+    settle(&adapter, &mut tx, &create_receipt, "records.create").await;
     let rn: String =
         sqlx::query_scalar("SELECT record_id FROM memory_records WHERE record_id != ?1")
             .bind(&ra)
@@ -583,11 +614,18 @@ async fn every_selector_takes_the_caller_transaction() {
         "records.update",
     );
     assert!(update_receipt.is_some(), "record update is journaled");
+    settle(
+        &adapter,
+        &mut tx,
+        &update_receipt.unwrap(),
+        "records.update",
+    )
+    .await;
 
     // D10 promote moves the record into context scope ctx-b — the baseline's
     // scope-change case: the row's scope and revision update inside the
-    // caller's transaction and the change is journaled (pending receipt +
-    // intent staged, not committed).
+    // caller's transaction and the change is journaled (receipt + intent
+    // staged, then settled in-tx so later guarded reads reconcile).
     let promote_receipt = staged(
         adapter
             .promote_record(
@@ -608,6 +646,13 @@ async fn every_selector_takes_the_caller_transaction() {
         promote_receipt.is_some(),
         "scope-change promote is journaled"
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &promote_receipt.unwrap(),
+        "records.promote",
+    )
+    .await;
     let (scope_visibility, scope_context_id, promote_rev): (String, Option<String>, i64) =
         sqlx::query_as(
             "SELECT scope_visibility, scope_context_id, revision \
@@ -622,7 +667,7 @@ async fn every_selector_takes_the_caller_transaction() {
     assert_eq!(promote_rev, 3);
 
     // D11 delete at the live revision (update bumped to 2, promote to 3).
-    staged(
+    let delete_receipt = staged(
         adapter
             .delete_record(
                 &mut tx,
@@ -637,6 +682,13 @@ async fn every_selector_takes_the_caller_transaction() {
             .await,
         "records.delete",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &delete_receipt.expect("delete is journaled"),
+        "records.delete",
+    )
+    .await;
 
     // D12 recall the subject's remaining rows.
     ready(
@@ -656,7 +708,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
 
     // D13 update the personality profile — journaled.
-    staged(
+    let profile_receipt = staged(
         adapter
             .update_profile(
                 &mut tx,
@@ -673,6 +725,13 @@ async fn every_selector_takes_the_caller_transaction() {
             .await,
         "profile.update",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &profile_receipt.expect("profile update is journaled"),
+        "profile.update",
+    )
+    .await;
 
     // D14 read the profile back.
     let body = ready(
@@ -1602,7 +1661,7 @@ async fn reflection_lease_completes_in_second_transaction() {
     let admin = principal(PRINCIPAL);
 
     let mut tx = harness.begin().await;
-    staged(
+    let profile_receipt = staged(
         adapter
             .update_profile(
                 &mut tx,
@@ -1619,7 +1678,14 @@ async fn reflection_lease_completes_in_second_transaction() {
             .await,
         "profile.update",
     );
-    staged(
+    settle(
+        &adapter,
+        &mut tx,
+        &profile_receipt.expect("profile update is journaled"),
+        "profile.update",
+    )
+    .await;
+    let create_receipt = staged(
         adapter
             .create_record(
                 &mut tx,
@@ -1636,6 +1702,13 @@ async fn reflection_lease_completes_in_second_transaction() {
             .await,
         "records.create",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &create_receipt.expect("create is journaled"),
+        "records.create",
+    )
+    .await;
     let body = ready(
         adapter
             .get_reflection_state(
@@ -1829,6 +1902,7 @@ async fn restricted_caller_candidate_visibility() {
         "candidates.review",
     )
     .expect("review is journaled");
+    settle(&adapter, &mut tx, &receipt_id, "candidates.review").await;
     let body = ready(
         adapter
             .get_candidate(
@@ -1859,7 +1933,7 @@ async fn restricted_caller_candidate_visibility() {
 /// Baseline D10: `records.promote` INTO shared scope — the context-scoped
 /// record lands in `shared` at the bumped revision, its provenance survives
 /// the move, and list membership flips: shared gains the row, ctx-a loses
-/// it. The change is journaled (pending receipt + intent staged in-tx).
+/// it. The change is journaled (receipt + intent staged and settled in-tx).
 #[tokio::test]
 async fn promotion_into_shared_scope() {
     let harness = Harness::open().await;
@@ -1868,7 +1942,7 @@ async fn promotion_into_shared_scope() {
     let mut tx = harness.begin().await;
 
     // Baseline carrier: a record authored into context scope ctx-a.
-    staged(
+    let create_receipt = staged(
         adapter
             .create_record(
                 &mut tx,
@@ -1886,6 +1960,13 @@ async fn promotion_into_shared_scope() {
             .await,
         "records.create",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &create_receipt.expect("create is journaled"),
+        "records.create",
+    )
+    .await;
     let rn: String = sqlx::query_scalar("SELECT record_id FROM memory_records")
         .fetch_one(&mut *tx)
         .await
@@ -1930,7 +2011,7 @@ async fn promotion_into_shared_scope() {
     assert!(body["records"].as_array().expect("records").is_empty());
 
     // Promote into shared scope; the row updates in the caller's tx.
-    staged(
+    let promote_receipt = staged(
         adapter
             .promote_record(
                 &mut tx,
@@ -1947,6 +2028,7 @@ async fn promotion_into_shared_scope() {
         "records.promote",
     )
     .expect("promote is journaled");
+    settle(&adapter, &mut tx, &promote_receipt, "records.promote").await;
     let (visibility, context_id, revision, provenance_after): (
         String,
         Option<String>,
@@ -2225,7 +2307,7 @@ async fn recall_pagination_d12() {
         ("d12-create-b", "the northern gate closes at dusk"),
         ("d12-create-del", "an unrelated southern record"),
     ] {
-        staged(
+        let create_receipt = staged(
             adapter
                 .create_record(
                     &mut tx,
@@ -2243,6 +2325,13 @@ async fn recall_pagination_d12() {
                 .await,
             "records.create",
         );
+        settle(
+            &adapter,
+            &mut tx,
+            &create_receipt.expect("create is journaled"),
+            "records.create",
+        )
+        .await;
         records.push(
             sqlx::query_scalar::<_, String>(
                 "SELECT record_id FROM memory_records WHERE content_json LIKE ?1",
@@ -2256,7 +2345,7 @@ async fn recall_pagination_d12() {
     let [r1, r2, r_del] = records.as_slice() else {
         unreachable!()
     };
-    staged(
+    let delete_receipt = staged(
         adapter
             .delete_record(
                 &mut tx,
@@ -2271,6 +2360,13 @@ async fn recall_pagination_d12() {
             .await,
         "records.delete",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &delete_receipt.expect("delete is journaled"),
+        "records.delete",
+    )
+    .await;
 
     // The tombstone is real: the row still exists in `memory_records` with a
     // tombstone marker, so its absence from recall pages proves recall
@@ -2392,7 +2488,7 @@ async fn reflection_pagination_f3() {
 
     // Transaction 1: profile + basis record + first generation lease.
     let mut tx = harness.begin().await;
-    staged(
+    let profile_receipt = staged(
         adapter
             .update_profile(
                 &mut tx,
@@ -2409,7 +2505,14 @@ async fn reflection_pagination_f3() {
             .await,
         "profile.update",
     );
-    staged(
+    settle(
+        &adapter,
+        &mut tx,
+        &profile_receipt.expect("profile update is journaled"),
+        "profile.update",
+    )
+    .await;
+    let create_receipt = staged(
         adapter
             .create_record(
                 &mut tx,
@@ -2426,6 +2529,13 @@ async fn reflection_pagination_f3() {
             .await,
         "records.create",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &create_receipt.expect("create is journaled"),
+        "records.create",
+    )
+    .await;
     let record_id: String = sqlx::query_scalar("SELECT record_id FROM memory_records")
         .fetch_one(&mut *tx)
         .await
@@ -2481,7 +2591,7 @@ async fn reflection_pagination_f3() {
     // Transaction 3: update the basis record, re-read the state digest and
     // stage the second generation.
     let mut tx = harness.begin().await;
-    staged(
+    let update_receipt = staged(
         adapter
             .update_record(
                 &mut tx,
@@ -2497,6 +2607,13 @@ async fn reflection_pagination_f3() {
             .await,
         "records.update",
     );
+    settle(
+        &adapter,
+        &mut tx,
+        &update_receipt.expect("update is journaled"),
+        "records.update",
+    )
+    .await;
     let digest = ready(
         adapter
             .get_reflection_state(

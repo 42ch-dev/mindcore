@@ -1,0 +1,158 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT seq AS \"seq!\", receipt_id, space_id, subject_id, requester_principal_id, op, idempotency_key, state, targets_json, result_json, created_at, updated_at FROM memory_journal WHERE space_id = ? AND subject_id = ? AND state <> 'applied' ORDER BY created_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq!",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "name": "receipt_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "receipt_id"
+          }
+        }
+      },
+      {
+        "name": "space_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "subject_id",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "requester_principal_id",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "requester_principal_id"
+          }
+        }
+      },
+      {
+        "name": "op",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "op"
+          }
+        }
+      },
+      {
+        "name": "idempotency_key",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "idempotency_key"
+          }
+        }
+      },
+      {
+        "name": "state",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "name": "targets_json",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "targets_json"
+          }
+        }
+      },
+      {
+        "name": "result_json",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "result_json"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 10,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 11,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "483583a83a8c44d468699beb3172636f7d729f618ed9632d49920ed64659e9ea"
+}

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT subject_id, scope_visibility, scope_context_id, tombstone_json FROM memory_records WHERE space_id = ? AND record_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "subject_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "scope_visibility",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "scope_visibility"
+          }
+        }
+      },
+      {
+        "name": "scope_context_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "scope_context_id"
+          }
+        }
+      },
+      {
+        "name": "tombstone_json",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "tombstone_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "a478e087b857feceaae2b3344031a88bef63641669fdceb60ff90df1d6fd5b24"
+}
