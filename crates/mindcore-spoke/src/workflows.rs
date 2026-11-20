@@ -360,6 +360,11 @@ impl MemoryWorkflowBinding {
     /// Fill the pack's knowledge slot: any caller holding a live
     /// [`KNOWLEDGE_READ`] grant in the request's space reads the bound
     /// collection, whichever caller the carrier write is bound to.
+    ///
+    /// Best effort: the slot never decides whether the recall is authorized, so
+    /// a caller without that grant reads its memory records with an empty slot
+    /// exactly as it would with no collection bound. Storage and list failures
+    /// are not authorization, and still fail the call.
     async fn knowledge_slot(
         &self,
         tx: &mut Tx<'_>,
@@ -369,13 +374,17 @@ impl MemoryWorkflowBinding {
         if self.knowledge.is_none() {
             return Ok(Vec::new());
         }
-        let collection = self
+        let granted = match self
             .granted_collection(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
-            .await?
-            .scope
-            .collection
-            .as_str();
-        match list_entries_in(tx, collection).await {
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(SpiError::Settlement(reject)) if reject.code == SpokeRejectCode::NotAuthorized => {
+                return Ok(Vec::new())
+            }
+            Err(error) => return Err(error),
+        };
+        match list_entries_in(tx, granted.scope.collection.as_str()).await {
             SpokeResult::Ok(entries) => Ok(entries),
             SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
         }

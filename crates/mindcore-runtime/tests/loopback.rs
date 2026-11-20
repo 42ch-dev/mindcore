@@ -526,6 +526,36 @@ fn deliberate_arguments() -> Value {
     })
 }
 
+/// The record ids one recall pack carries, sorted: the pack promises no order of its own.
+fn packed_record_ids(result: &Value) -> Vec<&str> {
+    let mut ids: Vec<&str> = result["records"]
+        .as_array()
+        .expect("the pack carries a records array")
+        .iter()
+        .map(|record| {
+            record["record_id"]
+                .as_str()
+                .expect("a packed record carries its id")
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The knowledge entry ids one recall pack carries, in pack order.
+fn packed_knowledge_ids(result: &Value) -> Vec<&str> {
+    result["knowledge"]
+        .as_array()
+        .expect("the pack carries a knowledge array")
+        .iter()
+        .map(|entry| {
+            entry["entry_id"]
+                .as_str()
+                .expect("a knowledge entry carries its id")
+        })
+        .collect()
+}
+
 fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
     match result {
         SpokeResult::Ok(value) => value,
@@ -606,18 +636,7 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
         "the served recall_context tool",
     );
 
-    let mut ids: Vec<&str> = result["records"]
-        .as_array()
-        .expect("the pack carries a records array")
-        .iter()
-        .map(|record| {
-            record["record_id"]
-                .as_str()
-                .expect("a packed record carries its id")
-        })
-        .collect();
-    ids.sort_unstable();
-    assert_eq!(ids, ["rec_market", "rec_north_gate"]);
+    assert_eq!(packed_record_ids(&result), ["rec_market", "rec_north_gate"]);
     assert!(
         result["tokens_used"]
             .as_u64()
@@ -673,40 +692,21 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
         "recall by a peer that is not the route's caller",
     );
 
-    let mut ids: Vec<&str> = result["records"]
-        .as_array()
-        .expect("the pack carries a records array")
-        .iter()
-        .map(|record| {
-            record["record_id"]
-                .as_str()
-                .expect("a packed record carries its id")
-        })
-        .collect();
-    ids.sort_unstable();
-    assert_eq!(ids, ["rec_market", "rec_north_gate"]);
-    let entries: Vec<&str> = result["knowledge"]
-        .as_array()
-        .expect("the pack carries a knowledge array")
-        .iter()
-        .map(|entry| {
-            entry["entry_id"]
-                .as_str()
-                .expect("a knowledge entry carries its id")
-        })
-        .collect();
+    assert_eq!(packed_record_ids(&result), ["rec_market", "rec_north_gate"]);
     assert_eq!(
-        entries,
+        packed_knowledge_ids(&result),
         [CARRIER],
         "the peer's own knowledge_read grant fills the slot"
     );
 }
 
-/// The route's caller without `knowledge_read` is refused the slot even though it holds the
-/// memory grant: recall authority is the caller's own knowledge grant, never the route's name.
+/// A configured route never narrows recall's authorization: the route's caller keeps the memory
+/// grant but loses `knowledge_read`, and still reads its records — the slot is best effort and
+/// degrades to empty exactly as it does with no collection bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_route_caller_without_knowledge_read_is_refused_the_slot() {
+async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
     let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
     fixture.revoke("grt_knowledge").await;
     let (_dir, serve) = fixture.serve();
     let surface = surface(
@@ -718,19 +718,30 @@ async fn the_route_caller_without_knowledge_read_is_refused_the_slot() {
             Some(PRINCIPAL),
         ),
     );
+    assert!(
+        capabilities(&surface).contains(&DELIBERATE),
+        "the carrier route is wired: {:?}",
+        capabilities(&surface)
+    );
 
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
-    let reject = expect_reject(
+    let result = expect_ok(
         session
             .adapter
             .invoke_tool(RECALL_CONTEXT, recall_arguments())
             .await,
         "recall by the route's caller without a knowledge grant",
     );
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
-    assert!(
-        reject.message.contains("knowledge_read"),
-        "the refusal names the missing read grant: {reject:?}"
+
+    assert_eq!(
+        packed_record_ids(&result),
+        ["rec_market", "rec_north_gate"],
+        "the caller's memory records are served: {result}"
+    );
+    assert_eq!(
+        result["knowledge"],
+        json!([]),
+        "a caller without knowledge_read gets an empty slot, never a refused recall"
     );
 }
 
@@ -785,6 +796,62 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     assert_eq!(
         revision, 1,
         "a no_change verdict leaves the carrier untouched"
+    );
+}
+
+/// The carrier write keeps its one-caller authority: a peer holding `recall` and both knowledge
+/// grants in the space is still refused the route's carrier, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    fixture
+        .grant(
+            "grt_route_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["recall", "knowledge_read", "knowledge_write"],
+        )
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders {
+            reasoner: Some(Arc::new(NoChangeReasoner)),
+            ..MindProviders::default()
+        },
+        Some(PRINCIPAL),
+    );
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
+
+    let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let reject = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate by a peer that is not the route's caller",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        reject
+            .message
+            .contains("is not admitted to knowledge collection"),
+        "the refusal is the carrier's one-caller rule: {reject:?}"
+    );
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind(CARRIER)
+    .fetch_one(&pool)
+    .await
+    .expect("read the carrier revision");
+    assert_eq!(
+        revision, 1,
+        "a refused carrier write leaves the entry untouched"
     );
 }
 

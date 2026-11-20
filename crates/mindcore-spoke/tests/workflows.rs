@@ -730,9 +730,10 @@ async fn changed_revision_during_provider_work_refuses_the_pack() {
 }
 
 #[tokio::test]
-async fn memory_grant_alone_does_not_admit_knowledge() {
+async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
     let harness = Harness::open().await;
-    // `recall` is a memory capability; it admits no knowledge read.
+    // `recall` is a memory capability; it admits no knowledge read, so the slot stays empty
+    // while the memory pack the grant does authorize is released.
     harness.grant(&["recall"]).await;
     harness
         .record(
@@ -744,7 +745,7 @@ async fn memory_grant_alone_does_not_admit_knowledge() {
     harness.entry("wren", "ke_gate", "closed after dusk").await;
     let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
 
-    let error = workflows
+    let pack = workflows
         .recall_context(
             &principal(),
             &request(None, 10),
@@ -755,12 +756,13 @@ async fn memory_grant_alone_does_not_admit_knowledge() {
             },
         )
         .await
-        .expect_err("a memory grant must not release the bound collection");
+        .expect("the memory grant still releases its pack");
 
-    let SpiError::Settlement(reject) = error else {
-        panic!("expected a settlement refusal, got {error:?}");
-    };
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(record_ids(&pack), ["rec_a"]);
+    assert!(
+        pack.knowledge.is_empty(),
+        "a memory grant never fills the knowledge slot"
+    );
 }
 
 #[tokio::test]
@@ -802,8 +804,11 @@ async fn another_granted_principal_reads_the_bound_collection() {
     assert_eq!(entries, ["ke_gate"]);
 }
 
+/// Recall re-derives the knowledge grant over its own transaction and compares both reads: a
+/// revocation during provider work empties the slot, so the pack is retried against a snapshot
+/// that no longer includes it — never released against a slot whose authority just vanished.
 #[tokio::test]
-async fn revoked_knowledge_admission_during_provider_work_refuses_the_pack() {
+async fn revoked_knowledge_admission_during_provider_work_is_a_revision_conflict() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
@@ -828,12 +833,21 @@ async fn revoked_knowledge_admission_during_provider_work_refuses_the_pack() {
             },
         )
         .await
-        .expect_err("a revoked knowledge admission must not release a pack");
+        .expect_err("a revoked knowledge admission must not release the slot it filled");
 
     let SpiError::Settlement(reject) = error else {
         panic!("expected a settlement refusal, got {error:?}");
     };
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str),
+        Some("retryable"),
+        "the retried call reads an empty slot rather than the revoked one"
+    );
 }
 
 // ---------- absorb over the real adapter ----------
