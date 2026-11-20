@@ -92,7 +92,6 @@ fn belief_record() -> CognitionRecord {
 
 struct MockEmbedder {
     identity: EmbeddingIdentity,
-    calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -102,7 +101,6 @@ impl Embedder for MockEmbedder {
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(texts
             .iter()
             .map(|text| vec![text.len() as f32; self.identity.dim])
@@ -191,7 +189,6 @@ impl MindWorkflows for MockWorkflows {
 
 #[test]
 fn external_impls_bind_to_every_capability_trait() {
-    let calls = Arc::new(AtomicUsize::new(0));
     let embedder = MockEmbedder {
         identity: EmbeddingIdentity {
             provider_id: "mock-host".to_string(),
@@ -199,7 +196,6 @@ fn external_impls_bind_to_every_capability_trait() {
             model_version: "v1".to_string(),
             dim: 4,
         },
-        calls,
     };
     let reasoner =
         PromptReasoner::new(|_prompt: String| async { Ok(r#"{"ok": true}"#.to_string()) });
@@ -222,13 +218,14 @@ fn external_impls_bind_to_every_capability_trait() {
         workflows_dyn,
     );
 
-    // The borrowed capability bundle accepts the injected implementors.
-    let caps = MindCapabilities {
+    // The bundle accepting the injected implementors is the compile-time
+    // proof; asserting on `Some(x).is_some()` would pin the literal, not the
+    // contract.
+    let _caps = MindCapabilities {
         embedder: Some(embedder_dyn),
         reasoner: Some(reasoner_dyn),
         policy_hook: Some(policy_dyn),
     };
-    assert!(caps.embedder.is_some() && caps.reasoner.is_some() && caps.policy_hook.is_some());
 }
 
 // ---------- shipped code assertions ----------
@@ -242,7 +239,6 @@ fn embedding_identity_compares_all_four_fields() {
             model_version: "v1".to_string(),
             dim: 3,
         },
-        calls: Arc::new(AtomicUsize::new(0)),
     };
     let baseline = embedder.identity().expect("serving identity").clone();
     for variant in [
