@@ -13,6 +13,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - Knowledge: an entry is created with `expected_base_revision = None` only when absent, updated with `Some(revision)` only when the stored revision equals it, and the adapter assigns `1` or `stored + 1` into both the column and the payload. Every write binds the collection fixed when the port instance was constructed; refusals leave the row untouched.
 - Cognition: current judgment lives on the holder's `KnowledgeEntry` under `modules.cognition` (`{records, world_facts, extensions}`); each append validates the incoming record as `view = "current"`, rejects duplicate record ids and leaves `revision` untouched. A stored record is accepted only when its holder is exactly `{kind: "knowledge_entry", namespace: "mindcore", id: <carrier entry id>}` — checked at `put_knowledge_entry` before the write reservation and again in `derive_mind_state`. `MindState` is derived from the carrier's authorized revision and is never persisted.
 - A present `modules.cognition` module is validated at the single persistence boundary (`put_knowledge_entry`) before the write reservation, so no path can commit an invalid carrier.
+- A present `order` on a stored cognition record must be written as a JSON integer representation: the pinned `BeliefOrder` type reads `i64` only, so `1.0` (or any non-integer number) is refused at the same carrier boundary — append and `put_knowledge_entry` share this rule, and the generic IR codec is not narrowed.
 
 ## Invariants
 
@@ -21,12 +22,14 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - A candidate is not recallable before review; a rejected write changes neither payload nor revision.
 - An entry is resolvable only through a port bound to its own collection, even when two collections hold the same raw `entry_id`; no API accepts a caller-supplied collection, `owner` or `viewpoint` as a selector.
 - Only an explicit carrier update changes the current judgment; adoption, a shared-content change and a read never do. Appending preserves the previously committed records byte-for-byte.
-- Stored timestamps are fixed-width RFC 3339 UTC; a value that cannot be read back is refused before insert.
+- Legacy `MemoryStore` capture and retain write timestamps as fixed-width RFC 3339 UTC, and `capture` refuses a caller timestamp it cannot read back before insert.
+- `ScopedKnowledgeStore` keeps the caller's timestamp values in the `KnowledgeEntry` payload without that memory round-trip refusal; the store encodes only its separate SQL bookkeeping columns. Raw timestamp spelling is not a guarantee of the typed knowledge port — wire fidelity belongs to the IR codec (`storage-ir-boundary.md`).
 
 ## Where it lives
 
 - `crates/mindcore-base/src/{ids,boundary,memory,knowledge,cognition}.rs`
 - `crates/mindcore-sqlite/src/{store,memory,knowledge,cognition}.rs`
+- Decision: [standalone embedded SQLite store](../../adr/implemented/architecture/2026-11-20-embedded-sqlite-storage.md)
 - `crates/mindcore-sqlite/migrations/0001_init.sql`
 - Tests: `crates/mindcore-sqlite/tests/{memory,knowledge,cognition,embedded_mind}.rs`; runnable scenario: `crates/mindcore-sqlite/examples/iteration_01.rs`
 - Fixture: `fixtures/iteration-01/shared-collection.json`

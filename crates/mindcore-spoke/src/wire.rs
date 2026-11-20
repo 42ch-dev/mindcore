@@ -3,7 +3,7 @@
 //! the original `Value`, never from the DTO's re-serialization.
 
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::admission::Scope;
 use crate::reject::{AResult, Reject};
@@ -17,6 +17,19 @@ pub(crate) fn object<'a>(value: &'a Value, what: &str) -> AResult<&'a Map<String
     value
         .as_object()
         .ok_or_else(|| Reject::invalid(format!("{what} must be an object")))
+}
+
+/// I-000055: a served operation refuses raw `cognition_filter` member presence
+/// — including a literal `null` — before typed decoding erases it and before
+/// any repository access (Nexus conformance `cognition_filter_unsupported`).
+pub(crate) fn reject_cognition_filter(raw: &Value) -> AResult<()> {
+    match raw.as_object() {
+        Some(object) if object.contains_key("cognition_filter") => Err(Reject::invalid(
+            "this provider does not serve cognition-filtered requests",
+        )
+        .detail("field", json!("cognition_filter"))),
+        _ => Ok(()),
+    }
 }
 
 /// A required non-empty string member.

@@ -751,6 +751,7 @@ impl MemoryAdapter {
         principal: &Principal,
         raw: Value,
     ) -> AResult<MemoryStage> {
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryRecordsListRequest = wire::decode(&raw, "memory.records.list request")?;
         validated(validate_memory_records_list(
             &request,
@@ -928,13 +929,27 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryRecordsUpdateResponse>(&receipt);
         }
-        admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) =
             admission::record(&self.repository, tx, &op.space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
+        // §7.7/MEM-R024: the fresh-effect gate binds the persisted subject and
+        // the record's own placement before any tombstone/revision check or
+        // effect, so a fenced subject or fenced context refuses without a write.
+        let record_scope = Scope::from(&current.scope);
+        let gated = Admission {
+            operation: op.operation,
+            space: &op.space,
+            principal: principal_id,
+            coverage: admission.coverage,
+            issuance: None,
+            subject_gate: Some(subject_id.as_str()),
+            placement_gate: Some(&record_scope),
+            freeze_gated: true,
+        };
+        admission::gate(&self.repository, tx, &gated).await?;
         if matches!(current.state, RecordState::Tombstoned { .. }) {
             return Err(Reject::terminal(
                 SpokeRejectCode::InvalidStatusTransition,
@@ -1176,13 +1191,37 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryRecordsDeleteResponse>(&receipt);
         }
-        admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) =
             admission::record(&self.repository, tx, &op.space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
+        // §7.7/MEM-R024: the fresh-effect gate binds the persisted subject and
+        // the record's own placement before any tombstone/revision check or
+        // effect, so a fenced subject or fenced context refuses without a write.
+        // Mindcore's selected policy applies the placement fence to delete too;
+        // SPOKE does not mandate it for erasure.
+        let record_scope = Scope::from(&current.scope);
+        let gated = Admission {
+            operation: op.operation,
+            space: &op.space,
+            principal: principal_id,
+            coverage: admission.coverage,
+            issuance: None,
+            subject_gate: Some(subject_id.as_str()),
+            placement_gate: Some(&record_scope),
+            freeze_gated: true,
+        };
+        admission::gate(&self.repository, tx, &gated).await?;
+        // §7.19: deleting a tombstone mirrors records.update: a fresh key gets
+        // INVALID_STATUS_TRANSITION; only the same key replays the old outcome.
+        if matches!(current.state, RecordState::Tombstoned { .. }) {
+            return Err(Reject::terminal(
+                SpokeRejectCode::InvalidStatusTransition,
+                format!("record {record_id} is tombstoned"),
+            ));
+        }
         if current.revision != expected_revision {
             return Err(Reject::terminal(
                 SpokeRejectCode::RevisionConflict,
@@ -1231,10 +1270,11 @@ impl MemoryAdapter {
                     .unwrap_or_default(),
             )?),
         )?;
+        // §7.19: the committed receipt's result is the pinned delete outcome,
+        // so a same-key replay decodes as a CommittedReceipt.
         let result = json!({
             "record_id": record_id,
-            "revision": updated.revision,
-            "scope": placement_wire(&Scope::from(&updated.scope)),
+            "tombstoned": true,
         });
         let receipt_id = mint("rct");
         self.stage_journal(
@@ -1265,6 +1305,7 @@ impl MemoryAdapter {
         principal: &Principal,
         raw: Value,
     ) -> AResult<MemoryStage> {
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryRecallRequest = wire::decode(&raw, "memory.recall request")?;
         validated(validate_memory_recall(
             &request,
@@ -1364,29 +1405,39 @@ impl MemoryAdapter {
             .unwrap_or(ranked.len())
             .min(ranked.len());
         let remaining = &ranked[start..];
-        let sizes: Vec<(String, usize)> = remaining
-            .iter()
-            .map(|(_, record)| (record.record_id.clone(), record_body_size(record)))
-            .collect();
-        let budget = policy::apply_budget(
-            &sizes,
-            request.budget.max_items.get(),
-            request.budget.max_bytes.map(|bound| bound.get()),
-        );
-        let mut bodies = Vec::with_capacity(budget.kept.len());
-        for index in &budget.kept {
-            let Some((_, record)) = remaining.get(*index) else {
-                return Err(Reject::internal(
-                    "recall budget selected an out-of-range item",
-                ));
-            };
-            bodies.push(project::record_body(record));
+        // §9.3/I-000061: walk the remaining candidates once, projecting each
+        // body only as the budget reaches it and charging the emitted
+        // `Content` object's UTF-8 bytes only when `max_bytes` is set. An
+        // oversized first candidate is kept whole (and named once via
+        // `overflow_record_id`); a later overflow defers to the page the
+        // next cursor reaches — the deferred item is not consumed here.
+        let max_items = request.budget.max_items.get();
+        let max_bytes = request.budget.max_bytes.map(|bound| bound.get());
+        let mut bodies = Vec::new();
+        let mut bytes = 0u64;
+        let mut overflow_record_id = None;
+        for (_, record) in remaining {
+            if bodies.len() as u64 >= max_items {
+                overflow_record_id = Some(record.record_id.clone());
+                break;
+            }
+            let body = project::record_body(record);
+            if let Some(budget) = max_bytes {
+                let size = u64::try_from(body["content"].to_string().len()).unwrap_or(u64::MAX);
+                if bytes.saturating_add(size) > budget {
+                    overflow_record_id = Some(record.record_id.clone());
+                    if bodies.is_empty() {
+                        bodies.push(body);
+                    }
+                    break;
+                }
+                bytes = bytes.saturating_add(size);
+            }
+            bodies.push(body);
         }
-        // The page cut is single-sourced in `apply_budget`: `consumed` counts
-        // kept records plus one skipped oversized first candidate, so a
-        // byte-capped page still advances (or ends, when the skipped record
-        // was the last one — `truncated: false`, `overflow_record_id` set).
-        let consumed = start + budget.consumed;
+        // The page cut: `bodies` are the kept candidates this page disposed of —
+        // a deferred overflow is not consumed, so the next cursor reaches it.
+        let consumed = start + bodies.len();
         let truncated = consumed < ranked.len();
         let next_cursor = truncated
             .then(|| policy::encode_cursor(principal_id, &scope, consumed as u64, &marker));
@@ -1394,7 +1445,7 @@ impl MemoryAdapter {
             "records": bodies,
             "total_authorized": total,
             "truncated": truncated,
-            "overflow_record_id": budget.overflow_record_id,
+            "overflow_record_id": overflow_record_id,
             "next_cursor": next_cursor,
             "engine_policy_version": policy::ENGINE_POLICY_VERSION,
         }))
@@ -2032,20 +2083,5 @@ fn record_text(record: &MemoryRecordIr) -> String {
     match &record.state {
         RecordState::Live { content, .. } => content.text.clone(),
         RecordState::Tombstoned { .. } => String::new(),
-    }
-}
-
-/// The size the recall byte budget charges for one record body.
-fn record_body_size(record: &MemoryRecordIr) -> usize {
-    match &record.state {
-        RecordState::Live { content, .. } => {
-            content.text.len()
-                + content
-                    .structured
-                    .as_ref()
-                    .map(|value| value.to_string().len())
-                    .unwrap_or(0)
-        }
-        RecordState::Tombstoned { .. } => 0,
     }
 }

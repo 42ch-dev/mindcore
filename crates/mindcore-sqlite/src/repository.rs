@@ -778,10 +778,13 @@ fn placement_predicate(placement: &PlacementSelection) -> RepoResult<(bool, bool
 }
 
 fn reflection_row(row: ReflectionRow) -> RepoResult<MemoryReflectionRow> {
+    // A stored JSON null reads as absent: a persisted `null` filter is not a
+    // malformed filter and must not poison the row.
     let filter = row
         .filter_json
         .map(|raw| from_json(&raw, "reflection filter"))
-        .transpose()?;
+        .transpose()?
+        .filter(|value| !value.is_null());
     let cognition_filter = row
         .cognition_filter_json
         .map(|raw| from_json(&raw, "reflection cognition filter"))
@@ -859,10 +862,12 @@ fn pinned_selection(selection: &Value) -> RepoResult<PlacementSelection> {
                         .ok_or_else(|| invalid_row("selected_contexts entry is not a string"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let include_shared = selection
-                .get("include_shared")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| invalid_row("selected_contexts misses include_shared bool"))?;
+            let include_shared = match selection.get("include_shared") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| invalid_row("selected_contexts include_shared is not a bool"))?,
+            };
             Ok(PlacementSelection::SelectedContexts {
                 context_ids: ids,
                 include_shared,
@@ -1556,17 +1561,12 @@ impl MemoryRepository for SqliteMemoryRepository {
         observed_owner: Option<&str>,
     ) -> RepoResult<bool> {
         let columns = receipt_columns(row)?;
-        // §7.0.3 lease takeover: a pending row whose lease instant passed is settled by any
-        // owner, so a crashed generation cannot wedge its idempotency key; only pending rows
-        // are taken over — a settled row keeps its recorded outcome. Stamps keep the same
-        // `%Y-%m-%dT%H:%M:%S%.3fZ` spelling `policy::timestamp` writes, so text order is
-        // instant order.
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        // Owner matching is exact: only the persisted lease owner settles a pending row,
+        // and a `NULL` observed owner matches an unleased (`NULL`) owner exactly.
         let updated = sqlx::query!(
             "UPDATE memory_receipts SET status = ?, result_json = ?, error_json = ?, \
              completed_at = ? \
-             WHERE receipt_id = ? AND space_id = ? AND status = ? \
-             AND (owner_id IS ? OR (status = 'pending' AND lease_expires_at < ?))",
+             WHERE receipt_id = ? AND space_id = ? AND status = ? AND owner_id IS ?",
             columns.status,
             &columns.result,
             &columns.error,
@@ -1575,11 +1575,44 @@ impl MemoryRepository for SqliteMemoryRepository {
             &row.space_id,
             observed_state,
             observed_owner,
-            &now,
         )
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
+    }
+
+    async fn claim_receipt_lease(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+        owner_id: &str,
+        lease_seconds: i64,
+    ) -> RepoResult<bool> {
+        // §7.0.3 lease takeover: the claim stamps a fresh owner and expiry, guarded by the
+        // persisted lease instant already having passed, so a lost claim races a live or
+        // re-leased row rather than overwriting it. The expiry is measured from the claim
+        // instant — never the request instant — so the stamped lease always outlives this
+        // transaction's own probe. Stamps keep the same `%Y-%m-%dT%H:%M:%S%.3fZ` spelling
+        // `policy::timestamp` writes, so text order is instant order.
+        let now = Utc::now();
+        let expires_at = (now + chrono::Duration::seconds(lease_seconds))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let claimed = sqlx::query!(
+            "UPDATE memory_receipts SET owner_id = ?, lease_expires_at = ? \
+             WHERE receipt_id = ? AND space_id = ? AND status = 'pending' \
+             AND lease_expires_at <= ?",
+            owner_id,
+            &expires_at,
+            id,
+            space.as_str(),
+            &now,
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(claimed.rows_affected() == 1)
     }
 
     async fn receipt_lease(

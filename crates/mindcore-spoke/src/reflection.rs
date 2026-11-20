@@ -115,6 +115,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.state"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsStateRequest =
             wire::decode(&raw, "memory.reflections.state request")?;
         validated(validate_memory_reflections_state(&request))?;
@@ -196,6 +197,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.list"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsListRequest =
             wire::decode(&raw, "memory.reflections.list request")?;
         validated(validate_memory_reflections_list(
@@ -301,6 +303,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.generate"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsGenerateRequest =
             wire::decode(&raw, "memory.reflections.generate request")?;
         validated(validate_memory_reflections_generate(&request))?;
@@ -313,7 +316,12 @@ impl MemoryAdapter {
             .get("selection")
             .cloned()
             .ok_or_else(|| Reject::invalid("selection is required"))?;
-        let filter_json = object.get("filter").cloned();
+        // A request `filter: null` stages as absent — the persisted row must not
+        // carry a literal null the readers would later treat as malformed.
+        let filter_json = object
+            .get("filter")
+            .filter(|value| !value.is_null())
+            .cloned();
         let expected_state_digest = wire::required(object, "expected_state_digest")?.to_string();
         if !is_state_digest(expected_state_digest.as_str()) {
             return Err(Reject::invalid(
@@ -343,7 +351,7 @@ impl MemoryAdapter {
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
         // A probed receipt settles the key outright, except a pending row whose lease
-        // already lapsed: that retry takes it over below instead of answering uncertain
+        // already lapsed: that retry claims it below instead of answering uncertain
         // forever.
         let take_over = match admission::probe(&self.repository, tx, &op).await? {
             Some(receipt)
@@ -406,10 +414,41 @@ impl MemoryAdapter {
         });
         // §7.0.3: transaction 1 publishes the pending receipt and its lease; the
         // caller commits, composes, and completes in transaction 2. A retry that
-        // found the abandoned pending row keeps its receipt id and takes it over
-        // under a fresh owner — the lapsed lease makes the settle CAS admit it.
+        // found the abandoned pending row keeps its receipt id and re-leases it in
+        // this same transaction, so the returned work's owner is the persisted one.
         let (receipt_id, owner_id) = match take_over {
-            Some(receipt_id) => (receipt_id, mint("own")),
+            Some(receipt_id) => {
+                let owner_id = mint("own");
+                // The lease is stamped at claim time inside the repository, not at
+                // `op.now` — the staging tx may sit on its basis work for longer
+                // than the lease itself.
+                let claimed = self
+                    .repository
+                    .claim_receipt_lease(
+                        tx,
+                        &op.space,
+                        receipt_id.as_str(),
+                        owner_id.as_str(),
+                        GENERATION_LEASE_SECONDS,
+                    )
+                    .await?;
+                if !claimed {
+                    // The abandoned row raced: the loser follows the same
+                    // replay/uncertainty contract as a live pending probe, never
+                    // a fresh attempt or work item.
+                    match admission::probe(&self.repository, tx, &op).await? {
+                        Some(receipt) => {
+                            return Self::replay::<MemoryReflectionsGenerateResponse>(&receipt)
+                        }
+                        None => {
+                            return Err(Reject::uncertain(format!(
+                                "receipt {receipt_id} is still pending"
+                            )))
+                        }
+                    }
+                }
+                (receipt_id, owner_id)
+            }
             None => {
                 let receipt_id = mint("rct");
                 let lease = ReceiptLease {
@@ -440,12 +479,12 @@ impl MemoryAdapter {
     // ── §7.27 generate completion (transaction 2) ──────────────────────
 
     /// Complete a leased generation in a fresh caller transaction: insert
-    /// the envelope and settle the pending receipt when that receipt is
-    /// still pending under the composed effect's owner — or pending past
-    /// its lease, which any owner takes over to unwedge a crashed run.
-    /// A live lease under another owner, or a settled row, rolls the
-    /// envelope back with the settlement, and the completion is returned
-    /// only after this transaction commits.
+    /// the envelope and settle the pending receipt only while that receipt
+    /// is still pending under the composed effect's owner — the owner a
+    /// successful lease claim persisted (a lapsed lease alone no longer
+    /// admits any owner). A live or re-leased row under another owner, or
+    /// a settled row, rolls the envelope back with the settlement, and the
+    /// completion is returned only after this transaction commits.
     pub async fn complete_reflection(
         &self,
         tx: &mut Tx<'_>,
@@ -534,9 +573,9 @@ impl MemoryAdapter {
             },
             ..*receipt
         };
-        // The CAS carries the lease identity: while the lease is live only the owner it was
-        // leased to may settle; past expiry the pending row is taken over, so a crashed
-        // generation unwedges. A re-settled or live wrong-owner row still refuses here and
+        // The CAS carries the lease identity exactly: only the owner the pending row is
+        // leased to may settle — expiry no longer admits a bypass, so a takeover must have
+        // persisted its own lease first. A re-settled or wrong-owner row refuses here and
         // the caller's rollback removes the envelope with it.
         if !self
             .repository

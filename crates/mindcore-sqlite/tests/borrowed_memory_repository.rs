@@ -354,7 +354,7 @@ async fn leased_receipt_settle_guarded_by_owner() {
 }
 
 /// §7.0.3 liveness: a crashed generation leaves a pending receipt under its lease; past the
-/// lease instant a different owner takes it over and settles.
+/// lease instant a different owner claims it, and only the persisted new owner settles.
 #[tokio::test]
 async fn expired_lease_pending_receipt_taken_over() {
     let dir = TempDir::new().unwrap();
@@ -384,6 +384,51 @@ async fn expired_lease_pending_receipt_taken_over() {
         .await
         .unwrap();
 
+    // A different owner claims the abandoned pending row: the CAS persists the new
+    // owner and expiry inside this caller-owned transaction. The expiry is measured
+    // from the claim instant (30s lease), not from when the transaction began.
+    let claim_start = chrono::Utc::now();
+    assert!(repo
+        .claim_receipt_lease(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "rcp_gen_crash",
+            "instance-2",
+            30
+        )
+        .await
+        .unwrap());
+    let claim_end = chrono::Utc::now();
+    // The stamped lease is in the future: a takeover stamped from the request
+    // instant could already be expired and re-leasable on the very next retry.
+    let stamped = repo
+        .receipt_lease(&mut tx, &SpaceId::new("spc_workshop"), "rcp_gen_crash")
+        .await
+        .unwrap()
+        .expect("claimed row carries a lease");
+    let stamped_at = chrono::DateTime::parse_from_rfc3339(&stamped).expect("lease stamp");
+    // The stamp is millisecond-truncated, so its instant can sit a millisecond
+    // below the full-precision claim start.
+    let earliest = claim_start + chrono::Duration::seconds(30) - chrono::Duration::milliseconds(1);
+    let latest = claim_end + chrono::Duration::seconds(30);
+    assert!(
+        stamped_at >= earliest && stamped_at <= latest,
+        "stamped lease {stamped} must sit inside the measured claim interval +30s \
+         ({earliest}..={latest})"
+    );
+    // The claim is lost when the row no longer qualifies — already re-leased here, so the
+    // second claimant gets no work and the crashed owner still cannot settle.
+    assert!(!repo
+        .claim_receipt_lease(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "rcp_gen_crash",
+            "instance-3",
+            30
+        )
+        .await
+        .unwrap());
+
     let settled = ReviewReceiptIr {
         state: ReceiptState::Committed {
             completed_at: LATER.into(),
@@ -391,7 +436,15 @@ async fn expired_lease_pending_receipt_taken_over() {
         },
         ..pending.clone()
     };
-    // A different owner settles the abandoned pending row after lease expiry.
+    // Neither the crashed nor the losing owner can settle: owner matching is exact, and
+    // the expiry bypass is gone.
+    for stale_owner in ["instance-crashed", "instance-3"] {
+        assert!(!repo
+            .update_receipt(&mut tx, &settled, "pending", Some(stale_owner))
+            .await
+            .unwrap());
+    }
+    // The persisted takeover owner settles.
     assert!(repo
         .update_receipt(&mut tx, &settled, "pending", Some("instance-2"))
         .await
@@ -814,7 +867,7 @@ async fn malformed_reflection_selections_fail_invalid_row() {
     for selection in [
         json!({"mode": "everywhere"}),
         json!({"mode": "selected_contexts", "context_ids": ["ctx_a", 3], "include_shared": false}),
-        json!({"mode": "selected_contexts", "context_ids": ["ctx_a"]}),
+        json!({"mode": "selected_contexts", "context_ids": ["ctx_a"], "include_shared": 1}),
     ] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("settlement.db");
@@ -1328,6 +1381,98 @@ async fn persisted_candidate_extension_values_are_opaque() {
     repo.insert_candidate(&mut tx, &bad).await.unwrap();
     assert!(matches!(
         repo.candidate(&mut tx, &SpaceId::new("spc_workshop"), "cand_2")
+            .await,
+        Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
+    ));
+    tx.rollback().await.unwrap();
+    pool.close().await;
+}
+
+/// I-000053/I-000054: a persisted `selected_contexts` row that omits
+/// `include_shared` decodes as `false` — and so hides shared rows — while a
+/// present non-boolean still fails `InvalidRow`; a stored literal `null`
+/// filter reads as absent rather than poisoning the row.
+#[tokio::test]
+async fn absent_include_shared_and_null_filter_decode() {
+    use mindcore_base::ir::PlacementSelection;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+    let mut tx = pool.begin().await.unwrap();
+
+    // Legacy row: `include_shared` omitted entirely, `filter_json` holds the
+    // literal text 'null'.
+    sqlx::query(
+        "INSERT INTO memory_reflections \
+         (seq, reflection_id, space_id, subject_id, requester_principal_id, \
+          selection_json, filter_json, basis_json, engine_policy_version, \
+          schema_version, revision, extensions_json, created_at, body_text, \
+          body_format, stale_cache) \
+         VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
+           'rfl_legacy', 'spc_workshop', 'sub_mira', 'prn_mira', ?, 'null', \
+           '{\"digest\":\"d\"}', 'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
+    )
+    .bind("{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"]}")
+    .bind(TIME)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // The omitted flag defaults to false: a requested selection that covers
+    // the pinned context does not widen into shared visibility.
+    let rows = repo
+        .list_reflections(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            Some(&PlacementSelection::SelectedContexts {
+                context_ids: vec![ContextId::new("ctx_a")],
+                include_shared: true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reflection_id, "rfl_legacy");
+    assert_eq!(rows[0].filter, None);
+    // A request pinning the same context with `include_shared: false` still
+    // covers the row: the stored flag decodes as `false` (had it decoded as
+    // `true`, this request would see nothing — unlike `SharedOnly`, which
+    // rejects a pinned selected-contexts row either way).
+    let covered = repo
+        .list_reflections(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            Some(&PlacementSelection::SelectedContexts {
+                context_ids: vec![ContextId::new("ctx_a")],
+                include_shared: false,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(covered.len(), 1);
+
+    // A present non-boolean `include_shared` still fails strict decode.
+    sqlx::query(
+        "INSERT INTO memory_reflections \
+         (seq, reflection_id, space_id, subject_id, requester_principal_id, \
+          selection_json, basis_json, engine_policy_version, schema_version, \
+          revision, extensions_json, created_at, body_text, body_format, \
+          stale_cache) \
+         VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
+           'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, \
+           '{\"digest\":\"d\"}', 'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
+    )
+    .bind("{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"],\"include_shared\":\"yes\"}")
+    .bind(TIME)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert!(matches!(
+        repo.list_reflections(&mut tx, &SpaceId::new("spc_workshop"), "sub_mira", None)
             .await,
         Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
     ));
