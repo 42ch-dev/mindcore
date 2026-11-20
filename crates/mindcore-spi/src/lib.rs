@@ -6,10 +6,18 @@
 //! crates plus serde/async infrastructure: no `mindcore-*` storage crate,
 //! no Nexus, no network or model SDK enters the contract surface.
 //!
-//! [`MindWorkflows`]' methods are contracts for the next workflow tranche;
-//! this crate ships no production workflow implementation. [`PromptReasoner`]
-//! is the only included bridge: it adapts a text-prompt executor closure (the
-//! Nexus `PromptExecutor` seam, bound by the caller) to [`Reasoner`].
+//! [`SpiMindWorkflows`] implements `recall_context`, `absorb` and `deliberate`
+//! over a DTO-only [`WorkflowBinding`].
+//! [`PromptReasoner`] is the only included capability bridge: it adapts a
+//! text-prompt executor closure (the Nexus `PromptExecutor` seam, bound by the
+//! caller) to [`Reasoner`].
+
+pub mod workflows;
+
+pub use workflows::{
+    AbsorbSnapshot, CaptureOutcome, CitedRecord, DeliberateSnapshot, RecallSnapshot,
+    SpiMindWorkflows, WorkflowBinding,
+};
 
 use std::future::Future;
 
@@ -21,7 +29,7 @@ use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::ops::memory_candidates_review_request::Decision;
 use spoke_schemas::{
     CognitionRecord, KnowledgeEntry, MemoryCandidate, MemoryCaptureRequest, MemoryRecallRequest,
-    Principal, RetainedRecord,
+    MemoryRecordsUpdateRequest, Principal, RetainedRecord,
 };
 
 /// Everything a capability call or workflow can surface, in typed form.
@@ -208,6 +216,15 @@ pub enum SettlementDraft<'a> {
         /// The proposed review decision.
         proposed: &'a Decision,
     },
+    /// A pending candidate that would replace one record's content in place.
+    /// The wire review decision has no update action, so the workflow
+    /// composes `memory.records.update` with `memory.candidates.dismiss`.
+    CandidateUpdate {
+        /// The captured pending candidate.
+        candidate: &'a MemoryCandidate,
+        /// The typed update the draft would submit.
+        proposed: &'a MemoryRecordsUpdateRequest,
+    },
     /// A proposed cognition record; review returns a proposal without
     /// claiming persistence.
     Cognition {
@@ -223,7 +240,11 @@ pub enum SettlementDraft<'a> {
 /// candidate `pending` with no review write; [`Reject`] submits the same
 /// review operation with `action: "drop"` and the reason as rationale.
 /// Settle/drop still require current grants, CAS and a receipt on the
-/// caller's transaction — refusals propagate, never a second write route.
+/// caller's transaction, and revalidate every record the decision cited —
+/// refusals propagate, never a second write route.
+/// For a candidate update draft, [`AutoSettle`] composes
+/// `memory.records.update` with `memory.candidates.dismiss`; the other two
+/// verdicts resolve exactly as they do for a review draft.
 /// For a cognition draft, rejection surfaces as [`SpiError::PolicyRejected`].
 ///
 /// [`AutoSettle`]: Self::AutoSettle
@@ -291,6 +312,52 @@ pub struct LensOutput<'a> {
     pub redlines: &'a [&'a str],
 }
 
+/// The structured recommendation of one deliberation verdict, separated from
+/// its descriptive prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recommendation {
+    /// The verdict records nothing.
+    None,
+    /// The verdict promotes one record whose `target_kind` names what it
+    /// promotes (for example an observation, a belief or an ADR).
+    Promote {
+        /// What the promoted record is, in the lens's own vocabulary.
+        target_kind: String,
+    },
+}
+
+/// One proposal a workflow validated against its authorized snapshot, handed
+/// to [`DomainLens::validate_proposal`] before policy or any write.
+///
+/// It carries what the workflow would settle — never raw reasoner text, a
+/// storage handle or an unfiltered evidence set. Every id it cites already
+/// passed the workflow's reference check against the admitted snapshot.
+#[derive(Debug, Clone, Copy)]
+pub enum ProposalDraft<'a> {
+    /// One validated absorb decision over the prompted record page.
+    Absorb {
+        /// The decision: `promote`, `update` or `dismiss`.
+        action: &'a str,
+        /// The record an `update` decision replaces.
+        target_record_id: Option<&'a str>,
+        /// The validated dismissal rationale; `Some` exactly for a `dismiss`,
+        /// so a lens can key a redline on what the dismissal claims.
+        rationale: Option<&'a str>,
+        /// The page ids the decision cites.
+        cited_ids: &'a [&'a str],
+    },
+    /// One validated deliberation verdict.
+    Cognition {
+        /// The structured recommendation.
+        recommendation: &'a Recommendation,
+        /// The stamped record a promotion would append; `None` when the
+        /// recommendation is [`Recommendation::None`].
+        record: Option<&'a CognitionRecord>,
+        /// The supplied evidence ids and visible record ids the verdict cites.
+        cited_ids: &'a [&'a str],
+    },
+}
+
 /// Domain lens: declarative prompt fragments keyed by task kind.
 ///
 /// `None` in place of a lens means the fixed skeleton alone is used.
@@ -298,6 +365,15 @@ pub struct LensOutput<'a> {
 pub trait DomainLens: Send + Sync {
     /// Fragments for one cognitive task kind.
     fn describe(&self, task_kind: CognitiveTaskKind) -> LensOutput<'_>;
+
+    /// Refuse a proposal this domain will not settle, or accept it.
+    ///
+    /// Runs after the workflow's schema and reference validation and before
+    /// the policy hook or any write, in both `absorb` and `deliberate`. A
+    /// refusal surfaces as [`SpiError::PolicyRejected`] and settles nothing;
+    /// `admitted` is the exact reference set the snapshot authorized.
+    fn validate_proposal(&self, draft: &ProposalDraft<'_>, admitted: &[&str])
+        -> Result<(), String>;
 }
 
 /// Capabilities injected into one workflow call.
@@ -372,7 +448,10 @@ pub struct DeliberateRequest<'a> {
     pub target: &'a CognitionTarget,
     /// Evidence admitted for this deliberation.
     pub evidence: &'a [Evidence<'a>],
-    /// Elapsed-time budget; overrun surfaces [`SpiError::DeadlineExceeded`].
+    /// Elapsed-time budget for the whole call. It bounds the reasoner and
+    /// policy executions, not only the boundaries between phases: one still
+    /// running at expiry is dropped and overrun surfaces
+    /// [`SpiError::DeadlineExceeded`] without starting a write.
     pub timeout: std::time::Duration,
 }
 
@@ -396,11 +475,16 @@ pub enum DeliberateOutcome {
         /// The unsettled cognition record draft.
         draft: CognitionRecord,
     },
+    /// The verdict recommended no record, so nothing was written.
+    NoChange {
+        /// The validated structured verdict.
+        verdict: Value,
+    },
 }
 
-/// The MIND workflow surface. Contracts only — the implementation lands in
-/// the workflow tranche above this crate. `principal` is caller-supplied
-/// trusted context, never parsed from request JSON.
+/// The MIND workflow surface, implemented by [`SpiMindWorkflows`] over a
+/// [`WorkflowBinding`]. `principal` is caller-supplied trusted context, never
+/// parsed from request JSON.
 #[async_trait]
 pub trait MindWorkflows: Send + Sync {
     /// Pack an authorized context pack under a token budget.

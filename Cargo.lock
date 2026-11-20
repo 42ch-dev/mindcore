@@ -2093,6 +2093,8 @@ name = "mindcore-spi"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
+ "futures-timer",
  "serde",
  "serde_json",
  "spoke-operations",
@@ -2105,8 +2107,10 @@ dependencies = [
 name = "mindcore-spoke"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "mindcore-base",
+ "mindcore-spi",
  "mindcore-sqlite",
  "serde",
  "serde_json",

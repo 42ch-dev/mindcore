@@ -196,6 +196,22 @@ impl MemoryAdapter {
         principal: &Principal,
         request: Value,
     ) -> SpokeResult<MemoryStage> {
+        settle(
+            self.capture_body(tx, principal, request)
+                .await
+                .map(|captured| captured.0),
+        )
+    }
+
+    /// §7.11 capture that also reports whether the dedup namespace already held
+    /// this key's receipt: the ids are then the recorded ones, so nothing was
+    /// captured now.
+    pub async fn capture_with_replay(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        request: Value,
+    ) -> SpokeResult<(MemoryStage, bool)> {
         settle(self.capture_body(tx, principal, request).await)
     }
 
@@ -204,7 +220,7 @@ impl MemoryAdapter {
         tx: &mut Tx<'_>,
         principal: &Principal,
         raw: Value,
-    ) -> AResult<MemoryStage> {
+    ) -> AResult<(MemoryStage, bool)> {
         let request: MemoryCaptureRequest = wire::decode(&raw, "memory.capture request")?;
         validated(validate_memory_capture(
             &request,
@@ -236,7 +252,7 @@ impl MemoryAdapter {
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay::<MemoryCaptureResponse>(&receipt);
+            return Self::replay::<MemoryCaptureResponse>(&receipt).map(|stage| (stage, true));
         }
         admission::gate(&self.repository, tx, &admission).await?;
         let content = content_wire(
@@ -289,6 +305,7 @@ impl MemoryAdapter {
         let receipt = admission::committed_receipt(&op, &mint("rct"), result);
         self.repository.insert_receipt(tx, &receipt, None).await?;
         Self::ready::<MemoryCaptureResponse>(project::receipt_body(&receipt))
+            .map(|stage| (stage, false))
     }
 
     // ── §7.12/§7.13 candidate reads ────────────────────────────────────
