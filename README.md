@@ -19,9 +19,17 @@ library you embed.
 ## Storage compatibility
 
 Pre-release migrations are mutable: the schema in `crates/mindcore-sqlite/migrations/` is edited in
-place between commits, and nothing is published yet. A database file created by an earlier commit
-therefore fails `MindStore::open` with a migration checksum mismatch — delete the file and let `open`
-recreate it. There is no upgrade path until the first release.
+place between commits, and nothing is published yet. There is no upgrade path until the first
+release.
+
+Whether an existing database file still opens depends on the migrations it already applied, not on
+the commit that created it. `MindStore::open` runs the embedded migrations and compares them with the
+rows recorded in `_sqlx_migrations`:
+
+- A database whose applied migrations still match the embedded files byte for byte opens normally,
+  including one created by an earlier commit.
+- A database that applied a migration whose file has since changed is refused with a migration
+  checksum mismatch. Recreate the file, or move it aside first if you want to keep it.
 
 ## Checks
 

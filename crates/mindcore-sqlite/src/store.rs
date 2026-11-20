@@ -21,9 +21,10 @@ impl MindStore {
     /// write whose WAL read snapshot another connection's commit already invalidated. The
     /// timeout is a cap, not a wait guarantee.
     ///
-    /// Pre-release migrations are mutable: the schema files change in place between commits, so a
-    /// database file created by an earlier commit fails this call with a checksum mismatch and
-    /// must be deleted and recreated. Nothing is published yet; there is no upgrade path.
+    /// Pre-release migrations are mutable: the schema files change in place between commits, so
+    /// there is no upgrade path until the first release. An applied migration whose file has since
+    /// changed is refused here with a checksum mismatch; a database whose applied migrations still
+    /// match the embedded files opens normally, whatever commit created it.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
