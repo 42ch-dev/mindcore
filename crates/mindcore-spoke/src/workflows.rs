@@ -21,7 +21,9 @@ use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::{MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_spi::{AbsorbSnapshot, CitedRecord, RecallSnapshot, SpiError, WorkflowBinding};
+use mindcore_spi::{
+    AbsorbSnapshot, CaptureOutcome, CitedRecord, RecallSnapshot, SpiError, WorkflowBinding,
+};
 use mindcore_sqlite::{list_entries_in, SqliteMemoryRepository};
 
 use crate::admission;
@@ -299,22 +301,32 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         &self,
         principal: &Principal,
         request: &MemoryCaptureRequest,
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<CaptureOutcome, SpiError> {
         let mut transaction =
             self.pool.begin().await.map_err(|error| {
                 internal(format!("capture transaction could not begin: {error}"))
             })?;
-        let body = ready(
-            self.adapter
-                .capture(&mut transaction, principal, render(request, "capture")?)
-                .await,
-            "memory.capture",
-        )?;
+        let (body, replayed) = match self
+            .adapter
+            .capture_with_replay(&mut transaction, principal, render(request, "capture")?)
+            .await
+        {
+            SpokeResult::Ok((MemoryStage::Ready(body), replayed)) => (body, replayed),
+            SpokeResult::Ok((other, _)) => {
+                return Err(internal(format!(
+                    "memory.capture returned an unserveable stage: {other:?}"
+                )))
+            }
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
         transaction
             .commit()
             .await
             .map_err(|error| internal(format!("capture transaction could not commit: {error}")))?;
-        candidate_ids(&body)
+        Ok(CaptureOutcome {
+            candidate_ids: candidate_ids(&body)?,
+            replayed,
+        })
     }
 
     async fn absorb_snapshot(

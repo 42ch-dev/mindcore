@@ -15,7 +15,7 @@
 pub mod workflows;
 
 pub use workflows::{
-    AbsorbSnapshot, CitedRecord, RecallSnapshot, SpiMindWorkflows, WorkflowBinding,
+    AbsorbSnapshot, CaptureOutcome, CitedRecord, RecallSnapshot, SpiMindWorkflows, WorkflowBinding,
 };
 
 use std::future::Future;
@@ -239,7 +239,8 @@ pub enum SettlementDraft<'a> {
 /// candidate `pending` with no review write; [`Reject`] submits the same
 /// review operation with `action: "drop"` and the reason as rationale.
 /// Settle/drop still require current grants, CAS and a receipt on the
-/// caller's transaction — refusals propagate, never a second write route.
+/// caller's transaction, and revalidate every record the decision cited —
+/// refusals propagate, never a second write route.
 /// For a candidate update draft, [`AutoSettle`] composes
 /// `memory.records.update` with `memory.candidates.dismiss`; the other two
 /// verdicts resolve exactly as they do for a review draft.

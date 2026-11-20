@@ -444,6 +444,21 @@ impl PolicyHook for AutoPolicy {
     }
 }
 
+/// Refuses every draft, so the workflow drops the candidate.
+struct RejectPolicy;
+
+#[async_trait]
+impl PolicyHook for RejectPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::Reject {
+            reason: "no automatic settlement for this candidate".to_string(),
+        })
+    }
+}
+
 fn principal() -> Principal {
     serde_json::from_value(json!({ "principal_id": PRINCIPAL, "extensions": {} }))
         .expect("principal")
@@ -981,6 +996,24 @@ async fn dismiss_drops_the_candidate_without_a_record() {
             .expect("seeded record"),
         (1, "the north gate is closed".to_string())
     );
+
+    // Replaying the same capture reports the same drop and writes nothing more.
+    let replay = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_dismiss", "the north gate closes at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("replayed absorb");
+    assert_eq!(replay, outcomes);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -1442,5 +1475,131 @@ async fn a_binding_without_a_publisher_refuses_before_staging_anything() {
             .count_from("memory_candidates WHERE status = 'pending' AND revision = 1")
             .await,
         2
+    );
+}
+
+#[tokio::test]
+async fn a_replay_never_settles_what_a_policy_left_pending() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_held", "the north gate is closed at dusk");
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+
+    // The default policy holds every settlement, so the candidate stays pending.
+    let held = workflows
+        .absorb(
+            &principal(),
+            &request,
+            None,
+            &MindCapabilities {
+                reasoner: Some(&reasoner),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("held absorb");
+
+    // The replay runs under a policy that would settle it, over a reasoner that
+    // marks every call by bumping the record it read.
+    let bumping = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": [] }),
+        &harness.pool,
+    )
+    .bumping();
+    let policy = AutoPolicy;
+    let replay = workflows
+        .absorb(
+            &principal(),
+            &request,
+            None,
+            &MindCapabilities {
+                reasoner: Some(&bumping),
+                policy_hook: Some(&policy),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("replayed absorb");
+
+    assert_eq!(replay, held);
+    assert!(matches!(
+        replay.as_slice(),
+        [AbsorbCandidateOutcome::Pending { .. }]
+    ));
+    // The reasoner never ran again: the record it would have bumped and the
+    // promotion it would have written are both absent.
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_policy_rejection_revalidates_the_cited_evidence_it_consumes() {
+    let harness = granted_harness().await;
+    harness
+        .record(
+            "rec_wall",
+            "the east wall is guarded",
+            "2026-11-20T09:00:02.000Z",
+        )
+        .await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "promote",
+            "evidence_ids": ["rec_gate", "rec_wall"]
+        }),
+        &harness.pool,
+    )
+    .bumping_only("rec_wall");
+    let policy = RejectPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_reject_stale", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect_err("a refusal over a changed citation must not consume the candidate");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+    // The drop never reached staging: the candidate is still pending and no
+    // review intent was journaled or settled.
+    assert_eq!(
+        harness
+            .count_from("memory_candidates WHERE status = 'pending'")
+            .await,
+        1
+    );
+    assert_eq!(harness.count_from("memory_journal").await, 0);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        0
     );
 }

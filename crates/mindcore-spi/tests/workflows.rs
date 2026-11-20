@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use mindcore_spi::{
-    AbsorbCandidateOutcome, AbsorbSnapshot, CitedRecord, CognitiveTaskKind, DomainLens, Embedder,
-    EmbeddingIdentity, LensOutput, MindCapabilities, NoEmbeddings, PolicyDecision, PolicyHook,
-    Reasoner, RecallSnapshot, SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest,
-    WorkflowBinding,
+    AbsorbCandidateOutcome, AbsorbSnapshot, CaptureOutcome, CitedRecord, CognitiveTaskKind,
+    DomainLens, Embedder, EmbeddingIdentity, LensOutput, MindCapabilities, NoEmbeddings,
+    PolicyDecision, PolicyHook, Reasoner, RecallSnapshot, SettlementDraft, SpiError,
+    SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::{
@@ -116,7 +116,7 @@ impl WorkflowBinding for StubBinding {
         &self,
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<CaptureOutcome, SpiError> {
         unserved()
     }
 
@@ -184,7 +184,7 @@ impl WorkflowBinding for RefusingBinding {
         &self,
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<CaptureOutcome, SpiError> {
         unserved()
     }
 
@@ -684,6 +684,8 @@ struct AbsorbDouble {
     recorded: Recorded,
     /// The record id this binding's update leg already settled, if any.
     settled_update: Option<String>,
+    /// Captures served so far: the first commits the receipt, later ones replay it.
+    captures: AtomicUsize,
 }
 
 #[async_trait]
@@ -700,8 +702,13 @@ impl WorkflowBinding for AbsorbDouble {
         &self,
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
-    ) -> Result<Vec<String>, SpiError> {
-        Ok(vec!["cnd_1".to_string()])
+    ) -> Result<CaptureOutcome, SpiError> {
+        // The first capture commits the receipt; every later one replays it.
+        let call = self.captures.fetch_add(1, Ordering::SeqCst);
+        Ok(CaptureOutcome {
+            candidate_ids: vec!["cnd_1".to_string()],
+            replayed: call > 0,
+        })
     }
 
     async fn absorb_snapshot(
@@ -794,6 +801,22 @@ impl Reasoner for UnreachableReasoner {
     }
 }
 
+/// Counts the decisions it is asked for and promotes the candidate.
+struct CountingReasoner {
+    asked: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Reasoner for CountingReasoner {
+    async fn reason_structured(
+        &self,
+        _request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "action": "promote", "evidence_ids": ["rec_gate"] }))
+    }
+}
+
 /// Records the draft each verdict was made over, then returns `decision`.
 struct RecordingPolicy {
     decision: PolicyDecision,
@@ -839,6 +862,7 @@ fn absorb_after_update(
         page: page(),
         recorded: recorded.clone(),
         settled_update: settled_update.map(str::to_string),
+        captures: AtomicUsize::new(0),
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     (SpiMindWorkflows::new(double), recorded, seen)
@@ -1074,6 +1098,106 @@ async fn default_policy_leaves_the_candidate_pending() {
         }]
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
+}
+
+#[tokio::test]
+async fn a_replay_never_settles_what_a_policy_held() {
+    let (workflows, recorded, seen) = absorb(pending_candidate());
+    let asked = Arc::new(AtomicUsize::new(0));
+    let reasoner = CountingReasoner {
+        asked: Arc::clone(&asked),
+    };
+
+    // The default policy holds every settlement, and writes nothing.
+    let held = workflows
+        .absorb(
+            &principal(),
+            &capture_request(),
+            None,
+            &MindCapabilities {
+                reasoner: Some(&reasoner),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("held absorb");
+    assert_eq!(
+        held,
+        vec![AbsorbCandidateOutcome::Pending {
+            candidate_id: "cnd_1".to_string(),
+        }]
+    );
+
+    // The same capture replayed under a policy that would settle it: the replay
+    // reports the recorded hold instead of deciding again.
+    let policy = RecordingPolicy {
+        decision: PolicyDecision::AutoSettle,
+        seen: Arc::clone(&seen),
+    };
+    let replay = workflows
+        .absorb(
+            &principal(),
+            &capture_request(),
+            None,
+            &MindCapabilities {
+                reasoner: Some(&reasoner),
+                policy_hook: Some(&policy),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("replayed absorb");
+
+    assert_eq!(replay, held);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert!(seen.lock().expect("seen").is_empty());
+    assert!(recorded.reviews.lock().expect("reviews").is_empty());
+}
+
+#[tokio::test]
+async fn a_policy_rejection_drops_over_the_cited_evidence() {
+    let (workflows, recorded, seen) = absorb(pending_candidate());
+    let policy = RecordingPolicy {
+        decision: PolicyDecision::Reject {
+            reason: "the gate record is not trusted".to_string(),
+        },
+        seen: Arc::clone(&seen),
+    };
+    let verdict = json!({
+        "action": "update",
+        "record_id": "rec_gate",
+        "evidence_ids": ["rec_gate"]
+    });
+    let caps = MindCapabilities {
+        reasoner: Some(&FixedVerdict(verdict)),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcomes = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("absorb");
+
+    assert_eq!(
+        outcomes,
+        vec![AbsorbCandidateOutcome::Dropped {
+            candidate_id: "cnd_1".to_string(),
+        }]
+    );
+    let reviews = recorded.reviews.lock().expect("reviews");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["decision"]["action"], "drop");
+    assert_eq!(
+        reviews[0]["decision"]["rationale"],
+        "the gate record is not trusted"
+    );
+    // The refusal is the policy's, but the drop consumes the candidate over the
+    // same page the decision cited, so the binding revalidates it first.
+    assert_eq!(
+        reviews[0]["cited"],
+        json!([{ "record_id": "rec_gate", "revision": 3 }])
+    );
 }
 
 #[tokio::test]

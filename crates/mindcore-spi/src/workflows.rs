@@ -66,13 +66,15 @@ pub trait WorkflowBinding: Send + Sync {
     ) -> Result<RecallSnapshot, SpiError>;
 
     /// Run the existing capture path — admission, idempotency probe and the
-    /// deterministic classifier — and return the candidate ids it holds. A
-    /// replay returns the ids its recorded receipt holds.
+    /// deterministic classifier — and return the candidates it holds.
+    ///
+    /// A replay returns the ids its recorded receipt holds and reports itself,
+    /// so nothing it names was captured by this call.
     async fn capture(
         &self,
         principal: &Principal,
         request: &MemoryCaptureRequest,
-    ) -> Result<Vec<String>, SpiError>;
+    ) -> Result<CaptureOutcome, SpiError>;
 
     /// Read `candidate_id` and one bounded authorized recall page over the
     /// same subject and placement, on one transaction. The page is empty for
@@ -134,6 +136,16 @@ pub struct AbsorbSnapshot {
     pub records: Vec<RetainedRecord>,
 }
 
+/// One capture call: the candidates it addresses and whether it replayed an
+/// earlier capture receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureOutcome {
+    /// The candidate ids the capture receipt holds.
+    pub candidate_ids: Vec<String>,
+    /// The capture key already held a receipt, so no candidate here is fresh.
+    pub replayed: bool,
+}
+
 /// One record an absorb decision cited, with the revision the prompted page
 /// served it at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,12 +198,15 @@ impl SpiMindWorkflows {
     ///
     /// The capture runs the existing admission, idempotency probe and
     /// deterministic classifier. A candidate an earlier run already consumed
-    /// reports that run's recorded outcome, with or without a reasoner. Without
-    /// one every held candidate stays pending and no review is written. With
-    /// one, each pending candidate is read with one bounded authorized evidence
-    /// page, the reasoner runs outside any transaction, its reply is validated
-    /// against that exact page, and the policy hook decides whether the
-    /// validated settlement is submitted.
+    /// reports that run's recorded outcome, with or without a reasoner. A
+    /// replay — the capture key already held a receipt — reports `Pending` for
+    /// a candidate that is still pending: the recorded run did not settle it,
+    /// and a replay must never settle what it held. Without a reasoner every
+    /// fresh candidate stays pending and no review is written. With one, each
+    /// fresh candidate is read with one bounded authorized evidence page, the
+    /// reasoner runs outside any transaction, its reply is validated against
+    /// that exact page, and the policy hook decides whether the validated
+    /// settlement is submitted.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -199,22 +214,35 @@ impl SpiMindWorkflows {
         lens: Option<&dyn DomainLens>,
         caps: &MindCapabilities<'_>,
     ) -> Result<Vec<AbsorbCandidateOutcome>, SpiError> {
-        let candidate_ids = self.binding.capture(principal, request).await?;
+        let CaptureOutcome {
+            candidate_ids,
+            replayed,
+        } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidate_ids.len());
         for candidate_id in candidate_ids {
             outcomes.push(
-                self.absorb_candidate(principal, request, candidate_id, caps.reasoner, lens, caps)
-                    .await?,
+                self.absorb_candidate(
+                    principal,
+                    request,
+                    candidate_id,
+                    !replayed,
+                    caps.reasoner,
+                    lens,
+                    caps,
+                )
+                .await?,
             );
         }
         Ok(outcomes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn absorb_candidate(
         &self,
         principal: &Principal,
         request: &MemoryCaptureRequest,
         candidate_id: String,
+        fresh: bool,
         reasoner: Option<&dyn Reasoner>,
         lens: Option<&dyn DomainLens>,
         caps: &MindCapabilities<'_>,
@@ -234,6 +262,11 @@ impl SpiMindWorkflows {
                     .await
             }
         };
+        // The recorded run left this candidate pending — a policy hold, or no
+        // reasoner at all. Deciding again would let a replay settle it.
+        if !fresh {
+            return Ok(AbsorbCandidateOutcome::Pending { candidate_id });
+        }
         let Some(reasoner) = reasoner else {
             return Ok(AbsorbCandidateOutcome::Pending { candidate_id });
         };
@@ -280,6 +313,7 @@ impl SpiMindWorkflows {
                             expected_revision,
                             &review_key,
                             reason,
+                            &cited,
                         )
                         .await
                     }
@@ -318,6 +352,7 @@ impl SpiMindWorkflows {
                             expected_revision,
                             &review_key,
                             reason,
+                            &cited,
                         )
                         .await
                     }
@@ -371,6 +406,7 @@ impl SpiMindWorkflows {
                             expected_revision,
                             &review_key,
                             reason,
+                            &cited,
                         )
                         .await
                     }
@@ -646,9 +682,10 @@ fn invalid_verdict(message: impl Into<String>) -> SpiError {
 /// The policy rejected the proposal: the candidate is dropped through the same
 /// review operation, with the policy's reason as its rationale.
 ///
-/// The drop rests on the policy's refusal, not on the cited page, so it
-/// revalidates no evidence: a citation that moved cannot keep a refused
-/// candidate alive.
+/// The refusal is the policy's, not the cited page's — evidence that moved
+/// cannot keep a refused candidate alive. The citations are still revalidated,
+/// because the drop consumes the candidate: a consumption write never rests on
+/// evidence that changed or lost its grant after the page was served.
 #[allow(clippy::too_many_arguments)]
 async fn drop_candidate(
     binding: &dyn WorkflowBinding,
@@ -658,6 +695,7 @@ async fn drop_candidate(
     expected_revision: u64,
     review_key: &str,
     reason: String,
+    cited: &[CitedRecord],
 ) -> Result<AbsorbCandidateOutcome, SpiError> {
     let review = review_request(
         space,
@@ -666,7 +704,7 @@ async fn drop_candidate(
         review_key,
         json!({ "action": "drop", "rationale": reason }),
     )?;
-    binding.review_candidate(principal, &review, &[]).await?;
+    binding.review_candidate(principal, &review, cited).await?;
     Ok(AbsorbCandidateOutcome::Dropped {
         candidate_id: candidate_id.to_string(),
     })
