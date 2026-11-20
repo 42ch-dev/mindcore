@@ -277,6 +277,10 @@ async fn tool_registrations_drive_advertisement_and_installation() {
 }
 
 /// The runtime validates the scope the host admits, before Connect merges any request selection.
+///
+/// An unsupported host admission is not the peer's input, so it leaves the face as the same
+/// generic `NotAuthorized` a rejecting resolver returns; a caller-declared unsupported selection
+/// stays `InvalidInput` at the routed store.
 #[tokio::test]
 async fn admission_is_validated_where_the_face_is_assembled() {
     let serve = Fixture::open().await.serve();
@@ -298,9 +302,31 @@ async fn admission_is_validated_where_the_face_is_assembled() {
     };
     assert_eq!(refused.code, SpokeRejectCode::NotAuthorized);
 
-    let invalid = match (face.admission)("peer-cognition") {
+    let unsupported = match (face.admission)("peer-cognition") {
         SpokeResult::Reject(reject) => reject,
         SpokeResult::Ok(scope) => panic!("an unsupported selection reached Connect with {scope:?}"),
     };
-    assert_eq!(invalid.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        unsupported.code,
+        SpokeRejectCode::NotAuthorized,
+        "a host-admitted unsupported selection is a deny, not the caller's input error"
+    );
+    assert!(
+        unsupported.details.is_none(),
+        "host admission discloses no target details: {unsupported:?}"
+    );
+
+    let declared = match face
+        .store
+        .list_scoped_knowledge_entries(&unsupported_scope())
+        .await
+    {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(entries) => panic!("a caller-declared selection listed {entries:?}"),
+    };
+    assert_eq!(
+        declared.code,
+        SpokeRejectCode::InvalidInput,
+        "a caller-declared unsupported selection stays the caller's input error"
+    );
 }

@@ -22,7 +22,7 @@ use spoke_connect::remote::{
     ConnectResponder, KnowledgeAdmission, RemoteKnowledgeFace, RemoteMemoryService,
     RemoteServePorts, RemoteServePortsComposite, ToolHandler,
 };
-use spoke_operations::{validate_manifest_tools, SpokeResult};
+use spoke_operations::{spoke_reject, validate_manifest_tools, SpokeRejectCode, SpokeResult};
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
 
@@ -213,6 +213,11 @@ fn derive_manifest(
 /// The admitted scope is validated where the face is assembled: Connect's list merge keeps only
 /// the request's cognition selection, so a selection the face does not serve must be refused
 /// before the merge can drop it.
+///
+/// Host admission is not peer input, so an unsupported admitted selection is refused as the same
+/// generic `NotAuthorized` a rejecting resolver returns, never as the caller-declared
+/// `InvalidInput` the routed store keeps for request scopes: the peer learns nothing about what
+/// the face does not serve. The resolver's own refusal passes through unchanged.
 fn validated(admission: KnowledgeAdmission) -> KnowledgeAdmission {
     Arc::new(move |peer_id: &str| -> SpokeResult<Scope> {
         let scope = match admission(peer_id) {
@@ -221,7 +226,11 @@ fn validated(admission: KnowledgeAdmission) -> KnowledgeAdmission {
         };
         match validate_admission_scope(&scope) {
             SpokeResult::Ok(()) => SpokeResult::Ok(scope),
-            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+            SpokeResult::Reject(_) => spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                "knowledge scope not authorized",
+                None,
+            ),
         }
     })
 }
