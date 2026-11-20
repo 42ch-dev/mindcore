@@ -20,13 +20,13 @@ Getting this wrong re-opens the same problem the borrowed-transaction seam solve
 
 1. **The boundary is a trait set the host implements, plus a capability bundle the host hands in.** `Embedder`, `Reasoner`, `PolicyHook`, `DomainLens` are traits a host provides; `MindCapabilities` is the borrowed `&dyn` bundle those traits are injected through; `MindWorkflows` is the trait the host calls once its `MindCapabilities` are wired. A host that embeds Mindcore supplies capabilities, not a storage engine.
 
-2. **Bound types are published SPOKE DTOs.** `SettlementDraft`, `Decision`, `PolicyDecision`, `SpokeReject`/`Reject`, `ContextPack`, `AbsorbCandidateOutcome`, `DeliberateRequest`/`DeliberateOutcome` are `spoke-*` types, not Mindcore IR. The SPI speaks the same wire the rest of the system already carries — a host's `Embedder`/`Reasoner`/`PolicyHook` never sees `mindcore-base` types.
+2. **Bound types are published SPOKE DTOs where they exist; SPI-owned types fill the gaps.** `Decision`, `SpokeReject`, `CognitionRecord`, `MemoryCandidate` and the other wire types are `spoke-*`; `SettlementDraft`, `PolicyDecision`, `ContextPack`, `AbsorbCandidateOutcome`, `DeliberateRequest` and `DeliberateOutcome` are declared inside `mindcore-spi` itself because no SPOKE DTO covers them yet. The SPI speaks the SPOKE wire for the types it can, and owns the rest — a host's `Embedder`/`Reasoner`/`PolicyHook` never sees `mindcore-base` IR in either direction.
 
-3. **`NoEmbeddings` is a first-class degrade path.** `Embedder` is optional in every workflow signature (`Option<&dyn Embedder>`); a host without embeddings supplies `NoEmbeddings`, and the lexical path is the contract, not a fallback.
+3. **`NoEmbeddings` is a first-class degrade path.** Embedding is optional via `MindCapabilities.embedder: Option<&dyn Embedder>` — a host without embeddings supplies `NoEmbeddings` (or simply `embedder: None`), and the lexical path is the contract, not a fallback. Workflow signatures take `caps: &MindCapabilities<'_>`; no `MindWorkflows` method takes `Option<&dyn Embedder>` directly.
 
 4. **`PromptReasoner` bridges the reasoner without importing Nexus.** A host's reasoner is a `Fn(String) -> Future<Output=Result<String, SpiError>>` closure over whatever it already runs (ACP/`PromptExecutor` or any executor); `PromptReasoner` wraps full-text in the wire envelope and parses the whole reply as JSON — schema enforcement lives outside the bridge.
 
-5. **`DefaultPolicy` fails closed.** `policy_hook: None` yields `DefaultPolicy`, which returns `RequireHumanReview` for every `SettlementDraft` — a host that injects no policy never silently auto-settles.
+5. **`DefaultPolicy` is the intended fail-closed invariant.** `DefaultPolicy` returns `RequireHumanReview` for every `SettlementDraft` — the conservative decision a host that injects no policy must get. Today the SPI crate exposes `DefaultPolicy` and `MindCapabilities.policy_hook: Option<&dyn PolicyHook>` separately; the v05 workflow implementations will map `None` → `DefaultPolicy` at composition (documented invariant, not yet a shipped code path).
 
 6. **`MindWorkflows` signatures name the v05 workflows.** `recall_context`, `absorb`, `deliberate` are declared at signature level so a host's capabilities type-check today; the workflow bodies land in v05 (`I-000030`–`I-000033`). `MockWorkflows` in the crate's tests exists only to prove the surface is object-safe and externally implementable — its bodies are stubs, and no test asserts on its behavior.
 
@@ -40,8 +40,7 @@ Getting this wrong re-opens the same problem the borrowed-transaction seam solve
 
 ## Consequences
 
-- **Host coupling is fixed at the trait + `MindCapabilities` level** — an external impl compiles and runs without storage crates (the `mock_adapter` conformance proof), and a host implementing `MindWorkflows` binds to the SPOKE DTO vocabulary, not Mindcore internals.
+- **`NoEmbeddings` and `DefaultPolicy` are the shipped product surfaces** — their degrade/fail-closed semantics are part of the contract every host reads; a looser default in either is a breaking change. (`MindCapabilities`/`MindWorkflows`/`PromptReasoner` are the contract surface; `NoEmbeddings`/`DefaultPolicy` are the only behavior-bearing implementations shipped in this crate.)
 - **`mindcore-base` can refactor freely** so long as the SPOKE DTOs stay stable; the SPI surface does not move with it.
-- **`NoEmbeddings` and `DefaultPolicy` are the two real shipped surfaces** — their degrade/fail-closed semantics are now part of the contract every host reads; a looser default in either is a breaking change.
 - **v05 workflow signatures are pinned** — `recall_context`/`absorb`/`deliberate` land on `MindWorkflows` as declared; an implementation that needs different inputs forces an SPI revision, not a silent signature drift.
 - **The DTO-vs-IR coupling is now on record** — a future `I-000043` withheld-read or remote-spoke change can cite this ADR when deciding whether the SPI binds DTOs or needs the extra type layer.
