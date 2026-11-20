@@ -1,8 +1,9 @@
 use serde_json::Value;
 
 use super::{
-    array, as_object, check_cognition, extensions, nonempty, number, object, put, revision, string,
-    strings, timestamp, validate_anchor, Fields, WireError, WireVersion,
+    array, as_object, check_cognition, check_cognition_members, extensions, nonempty, number,
+    object, put, revision, string, strings, timestamp, validate_anchor, Fields, WireError,
+    WireVersion,
 };
 use crate::ir::{
     CandidateState, Classification, Consumption, ImportReference, MemoryCandidateIr, MemoryContent,
@@ -206,6 +207,9 @@ fn content_from_wire(value: Value) -> Result<MemoryContent, WireError> {
         cognition: fields.optional("cognition", array)?,
     };
     fields.finish()?;
+    if let Some(records) = &content.cognition {
+        check_cognition_members(NAME, records)?;
+    }
     for record in content.cognition.iter().flatten() {
         check_cognition(NAME, spoke_operations::validate_cognition_record(record))?;
     }

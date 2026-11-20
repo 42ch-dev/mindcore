@@ -401,13 +401,18 @@ fn modules_from_wire(value: Value) -> Result<KnowledgeModules, WireError> {
 
 fn cognition_from_wire(value: Value) -> Result<CognitionModule, WireError> {
     const NAME: &str = "knowledge_entry.modules.cognition";
-    check_cognition(NAME, spoke_operations::validate_cognition_module(&value))?;
-    let mut fields = Fields::new(NAME, value)?;
+    // Decode (and rule-check) members first so this module's extensions follow the same
+    // shared rule as every other extensions site; the pinned SPOKE gate stays as the
+    // whole-shape validation of records, facts and unknown members.
+    let mut fields = Fields::new(NAME, value.clone())?;
     let module = CognitionModule {
         records: fields.read("records", array)?,
         world_facts: fields.read("world_facts", array)?,
-        extensions: fields.read("extensions", as_object)?,
+        extensions: fields.read("extensions", extensions)?,
     };
+    check_cognition_members("cognition record", &module.records)?;
+    check_cognition_members("cognition world_fact", &module.world_facts)?;
+    check_cognition(NAME, spoke_operations::validate_cognition_module(&value))?;
     Ok(module)
 }
 
@@ -421,6 +426,28 @@ fn check_cognition(
             Err(WireError::Cognition(name, error.message))
         }
     }
+}
+
+/// I-000024: every schema-declared cognition extension map — module, record and world
+/// fact members and memory-content cognition records — follows the same namespace-keyed
+/// rule. Checks only the `extensions` member itself; opaque extension values are never
+/// descended into.
+pub(super) fn check_cognition_members(
+    object_name: &'static str,
+    members: &[Value],
+) -> Result<(), WireError> {
+    for member in members {
+        let Some(raw) = member.get("extensions") else {
+            continue;
+        };
+        if extensions(raw.clone()).is_none() {
+            return Err(WireError::InvalidField {
+                object: object_name,
+                field: "extensions",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn modules_to_wire(modules: KnowledgeModules) -> Value {
