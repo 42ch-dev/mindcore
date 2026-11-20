@@ -535,8 +535,34 @@ async fn settlement_refusals_keep_their_code_and_details() {
 
 #[tokio::test]
 async fn workflow_failures_map_to_stable_reject_kinds() {
+    let fake = Arc::new(Fake::default());
+    fake.reply_recall(Err(SpiError::DeadlineExceeded));
+    let reject = expect_reject(
+        tools(fake)
+            .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
+            .await,
+        "deadline",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("deadline_exceeded")
+    );
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str),
+        Some("retryable"),
+        "a bounded timeout committed nothing, so the caller may repeat the call"
+    );
+
     let internal_cases = [
-        (SpiError::DeadlineExceeded, "deadline_exceeded"),
         (SpiError::EmbeddingsUnavailable, "embeddings_unavailable"),
         (
             SpiError::EmbeddingFailed("provider 500".into()),
@@ -587,7 +613,11 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
             .await,
         "policy",
     );
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::InvalidInput,
+        "a policy veto is the proposal's refusal, not a lost admission"
+    );
     assert_eq!(
         reject
             .details
@@ -596,7 +626,10 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
             .and_then(Value::as_str),
         Some("policy_rejected")
     );
-    assert!(!reject.message.contains("domain redline"));
+    assert_eq!(
+        reject.message, "domain redline on the north gate",
+        "the host's reason reaches the caller"
+    );
 
     let fake = Arc::new(Fake::default());
     fake.reply_recall(Err(SpiError::InvalidInput(
