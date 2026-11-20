@@ -1480,11 +1480,11 @@ async fn absent_include_shared_and_null_filter_decode() {
     pool.close().await;
 }
 
-/// `list_unsettled_intents` returns exactly the non-`applied` intents of the subject in
-/// the space — `pending`, `deferred` and `quarantined` — in `created_at` order; `applied`
-/// rows and intents of another subject or space stay out.
+/// `has_unsettled_intent` probes exactly the non-`applied` intents of the subject in
+/// the space — `pending`, `deferred` and `quarantined`; `applied` rows and intents of
+/// another subject or space stay out.
 #[tokio::test]
-async fn list_unsettled_intents_covers_non_applied_states() {
+async fn has_unsettled_intent_covers_non_applied_states() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("settlement.db");
     let repo = SqliteMemoryRepository;
@@ -1558,31 +1558,14 @@ async fn list_unsettled_intents_covers_non_applied_states() {
         repo.insert_journal_intent(&mut tx, row).await.unwrap();
     }
 
-    let unsettled = repo
-        .list_unsettled_intents(
-            &mut tx,
-            &SpaceId::new("spc_workshop"),
-            &SubjectId::new("sub_mira"),
-        )
+    let space = SpaceId::new("spc_workshop");
+    let subject = SubjectId::new("sub_mira");
+    // The existence probe decodes no payload column: it holds while one of the
+    // three unsettled states exists for this subject, and never otherwise.
+    assert!(repo
+        .has_unsettled_intent(&mut tx, &space, &subject)
         .await
-        .unwrap();
-    let receipt_ids: Vec<&str> = unsettled
-        .iter()
-        .map(|row| row.receipt_id.as_str())
-        .collect();
-    assert_eq!(
-        receipt_ids,
-        ["rcp_pending", "rcp_deferred", "rcp_quarantined"]
-    );
-    assert_eq!(
-        unsettled
-            .iter()
-            .map(|row| row.state.as_str())
-            .collect::<Vec<_>>(),
-        ["pending", "deferred", "quarantined"]
-    );
-    // The existence probe mirrors the same non-`applied` set without decoding
-    // any payload column: it holds for each unsettled state, and only those.
+        .unwrap());
     for state in ["pending", "deferred", "quarantined"] {
         sqlx::query(
             "UPDATE memory_journal SET state = 'applied' \
@@ -1592,11 +1575,7 @@ async fn list_unsettled_intents_covers_non_applied_states() {
         .await
         .unwrap();
         assert!(!repo
-            .has_unsettled_intent(
-                &mut tx,
-                &SpaceId::new("spc_workshop"),
-                &SubjectId::new("sub_mira"),
-            )
+            .has_unsettled_intent(&mut tx, &space, &subject)
             .await
             .unwrap());
         sqlx::query("UPDATE memory_journal SET state = ? WHERE receipt_id = ?")
@@ -1606,11 +1585,7 @@ async fn list_unsettled_intents_covers_non_applied_states() {
             .await
             .unwrap();
         assert!(repo
-            .has_unsettled_intent(
-                &mut tx,
-                &SpaceId::new("spc_workshop"),
-                &SubjectId::new("sub_mira"),
-            )
+            .has_unsettled_intent(&mut tx, &space, &subject)
             .await
             .unwrap());
     }
@@ -1622,16 +1597,11 @@ async fn list_unsettled_intents_covers_non_applied_states() {
     .await
     .unwrap();
 
-    // A subject with no unsettled intents reads empty rather than erroring.
-    assert!(repo
-        .list_unsettled_intents(
-            &mut tx,
-            &SpaceId::new("spc_workshop"),
-            &SubjectId::new("sub_ava_new")
-        )
+    // A subject with no intents at all probes false rather than erroring.
+    assert!(!repo
+        .has_unsettled_intent(&mut tx, &space, &SubjectId::new("sub_ava_new"))
         .await
-        .unwrap()
-        .is_empty());
+        .unwrap());
     tx.rollback().await.unwrap();
     pool.close().await;
 }

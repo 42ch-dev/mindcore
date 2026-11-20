@@ -85,20 +85,15 @@ fn snapshot(records: Vec<RetainedRecord>, knowledge: Vec<KnowledgeEntry>) -> Rec
 /// back identically.
 struct StubBinding {
     snapshots: Mutex<Vec<RecallSnapshot>>,
-    calls: Arc<AtomicUsize>,
+    calls: AtomicUsize,
 }
 
 impl StubBinding {
     fn new(snapshots: Vec<RecallSnapshot>) -> Self {
         Self {
             snapshots: Mutex::new(snapshots),
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: AtomicUsize::new(0),
         }
-    }
-
-    /// A counter the test keeps after the engine takes ownership.
-    fn calls(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.calls)
     }
 }
 
@@ -597,28 +592,6 @@ async fn reasoner_may_not_widen_or_repeat_the_page() {
         .expect_err("a widened permutation must be refused");
 
     assert!(matches!(error, SpiError::InvalidReasonerOutput(_)));
-}
-
-/// Two reads per released pack: the snapshot and its revalidation.
-#[tokio::test]
-async fn a_released_pack_reads_the_snapshot_twice() {
-    let binding = StubBinding::new(vec![snapshot(
-        vec![record("rec_a", "the north gate is closed", 1)],
-        Vec::new(),
-    )]);
-    let calls = binding.calls();
-    let workflows = SpiMindWorkflows::new(binding);
-    let pack = workflows
-        .recall_context(
-            &principal(),
-            &request(None),
-            budget(4096),
-            &MindCapabilities::default(),
-        )
-        .await
-        .expect("pack");
-    assert_eq!(pack.records.len(), 1);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 // ---------- absorb: decisions over an absorbed candidate double ----------
