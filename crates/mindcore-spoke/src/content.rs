@@ -928,13 +928,27 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryRecordsUpdateResponse>(&receipt);
         }
-        admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) =
             admission::record(&self.repository, tx, &op.space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
+        // §7.7/MEM-R024: the fresh-effect gate binds the persisted subject and
+        // the record's own placement before any tombstone/revision check or
+        // effect, so a fenced subject or fenced context refuses without a write.
+        let record_scope = Scope::from(&current.scope);
+        let gated = Admission {
+            operation: op.operation,
+            space: &op.space,
+            principal: principal_id,
+            coverage: admission.coverage,
+            issuance: None,
+            subject_gate: Some(subject_id.as_str()),
+            placement_gate: Some(&record_scope),
+            freeze_gated: true,
+        };
+        admission::gate(&self.repository, tx, &gated).await?;
         if matches!(current.state, RecordState::Tombstoned { .. }) {
             return Err(Reject::terminal(
                 SpokeRejectCode::InvalidStatusTransition,
@@ -1176,13 +1190,37 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryRecordsDeleteResponse>(&receipt);
         }
-        admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) =
             admission::record(&self.repository, tx, &op.space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
+        // §7.7/MEM-R024: the fresh-effect gate binds the persisted subject and
+        // the record's own placement before any tombstone/revision check or
+        // effect, so a fenced subject or fenced context refuses without a write.
+        // Mindcore's selected policy applies the placement fence to delete too;
+        // SPOKE does not mandate it for erasure.
+        let record_scope = Scope::from(&current.scope);
+        let gated = Admission {
+            operation: op.operation,
+            space: &op.space,
+            principal: principal_id,
+            coverage: admission.coverage,
+            issuance: None,
+            subject_gate: Some(subject_id.as_str()),
+            placement_gate: Some(&record_scope),
+            freeze_gated: true,
+        };
+        admission::gate(&self.repository, tx, &gated).await?;
+        // §7.19: deleting a tombstone mirrors records.update: a fresh key gets
+        // INVALID_STATUS_TRANSITION; only the same key replays the old outcome.
+        if matches!(current.state, RecordState::Tombstoned { .. }) {
+            return Err(Reject::terminal(
+                SpokeRejectCode::InvalidStatusTransition,
+                format!("record {record_id} is tombstoned"),
+            ));
+        }
         if current.revision != expected_revision {
             return Err(Reject::terminal(
                 SpokeRejectCode::RevisionConflict,
@@ -1231,10 +1269,11 @@ impl MemoryAdapter {
                     .unwrap_or_default(),
             )?),
         )?;
+        // §7.19: the committed receipt's result is the pinned delete outcome,
+        // so a same-key replay decodes as a CommittedReceipt.
         let result = json!({
             "record_id": record_id,
-            "revision": updated.revision,
-            "scope": placement_wire(&Scope::from(&updated.scope)),
+            "tombstoned": true,
         });
         let receipt_id = mint("rct");
         self.stage_journal(
