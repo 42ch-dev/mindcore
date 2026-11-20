@@ -2,28 +2,21 @@
 //! admitted `Principal`, and the reject kinds a failed workflow surfaces.
 //!
 //! The handler's responder binding (weak session handle, authenticated peer) is exercised by the
-//! loopback task; here the serving path is driven with an already authenticated peer id.
+//! loopback task; here the serving path is driven with an already authenticated peer id. The
+//! mapping is crate-internal, so these assertions live beside it rather than behind a public API.
 
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
 
-use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
-use mindcore_runtime::{MindProviders, WorkflowTools};
 use mindcore_spi::{
     AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
     MindCapabilities, MindWorkflows, SpiError,
 };
-use spoke_connect::remote::MemoryAdmission;
-use spoke_operations::{
-    spoke_reject, validate_tool_arguments, SpokeReject, SpokeRejectCode, SpokeResult,
-};
-use spoke_schemas::{
-    CognitionRecord, KnowledgeEntry, MemoryCaptureRequest, MemoryRecallRequest, Principal,
-    RetainedRecord,
-};
+use spoke_operations::{spoke_reject, validate_tool_arguments};
+use spoke_schemas::{CognitionRecord, KnowledgeEntry, RetainedRecord};
+
+use super::*;
 
 /// A workflow engine that records what it was handed and answers a configured result.
 #[derive(Default)]
@@ -306,10 +299,9 @@ async fn absorb_round_trips_every_candidate_status() {
         },
     ]));
 
+    let tool = tools(Arc::clone(&fake));
     let value = expect_ok(
-        tools(Arc::clone(&fake))
-            .call(ABSORB, "peer-driver", absorb_arguments())
-            .await,
+        tool.call(ABSORB, "peer-driver", absorb_arguments()).await,
         "absorb",
     );
 
@@ -326,6 +318,29 @@ async fn absorb_round_trips_every_candidate_status() {
         ])
     );
     assert_eq!(fake.seen(), ["absorb:prn_driver:cap_1"]);
+
+    let output = output_of(&tool, ABSORB);
+    assert_closed(&output, &output, &mut Vec::new());
+    assert!(
+        accepts(&output, &output, &value),
+        "every emitted outcome matches an advertised branch: {value}"
+    );
+    assert!(
+        !accepts(
+            &output,
+            &output,
+            &json!([{ "status": "settled", "candidate_id": "cand_settled" }])
+        ),
+        "a settled outcome carries record_ids; the advertised branch without it is not settled"
+    );
+    assert!(
+        !accepts(
+            &output,
+            &output,
+            &json!([{ "status": "pending", "candidate_id": "cand_pending", "record_ids": [] }])
+        ),
+        "record_ids belong to the settled branch, never to pending"
+    );
 }
 
 #[tokio::test]
@@ -344,6 +359,11 @@ async fn deliberate_round_trips_every_outcome_branch() {
     assert_eq!(value["status"], "no_change");
     assert_eq!(value["verdict"]["recommendation"]["kind"], "none");
     assert!(value.get("draft").is_none(), "no draft is written");
+    let output = output_of(&tool, DELIBERATE);
+    assert!(
+        accepts(&output, &output, &value),
+        "a no_change outcome matches its advertised branch: {value}"
+    );
 
     fake.reply_deliberate(Ok(DeliberateOutcome::NeedsReview {
         verdict: json!({ "recommendation": { "kind": "promote" } }),
@@ -357,6 +377,10 @@ async fn deliberate_round_trips_every_outcome_branch() {
     assert_eq!(value["status"], "needs_review");
     assert_eq!(value["draft"]["record_id"], "cog_1");
     assert!(value.get("record").is_none(), "nothing settled");
+    assert!(
+        accepts(&output, &output, &value),
+        "a needs_review outcome matches its advertised branch: {value}"
+    );
 
     fake.reply_deliberate(Ok(DeliberateOutcome::Settled {
         verdict: json!({ "recommendation": { "kind": "promote" } }),
@@ -371,6 +395,27 @@ async fn deliberate_round_trips_every_outcome_branch() {
     assert_eq!(value["status"], "settled");
     assert_eq!(value["record"]["record_id"], "cog_1");
     assert_eq!(value["mind_state_version"], 3);
+    assert_closed(&output, &output, &mut Vec::new());
+    assert!(
+        accepts(&output, &output, &value),
+        "a settled outcome matches its advertised branch: {value}"
+    );
+    assert!(
+        !accepts(
+            &output,
+            &output,
+            &json!({ "status": "needs_review", "verdict": {} })
+        ),
+        "a review outcome carries its draft"
+    );
+    assert!(
+        !accepts(
+            &output,
+            &output,
+            &json!({ "status": "no_change", "verdict": {}, "draft": {} })
+        ),
+        "a no_change outcome carries no draft"
+    );
 
     assert_eq!(
         fake.seen(),
@@ -665,6 +710,71 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
             .is_none(),
         "a refused member is never advertised"
     );
+}
+
+/// One advertised output, resolved against itself: the result ABI a manifest-only consumer reads.
+fn output_of(tool: &WorkflowTools, capability_id: &str) -> Value {
+    tool.descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.capability_id.as_str() == capability_id)
+        .map(|descriptor| Value::Object(descriptor.output))
+        .unwrap_or_else(|| panic!("{capability_id} is advertised"))
+}
+
+/// Whether `value` is admitted by the advertised `schema`, over the constructs these descriptors
+/// use: branches, `const`/`enum`, the primitive types, closed objects and typed members.
+fn accepts(schema: &Value, root: &Value, value: &Value) -> bool {
+    let schema = resolve(schema, root);
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        return branches
+            .iter()
+            .filter(|branch| accepts(branch, root, value))
+            .count()
+            == 1;
+    }
+    if let Some(expected) = schema.get("const") {
+        return value == expected;
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values.contains(value);
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            let Some(object) = value.as_object() else {
+                return false;
+            };
+            let properties = schema.get("properties").and_then(Value::as_object);
+            for name in schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if !object.contains_key(name) {
+                    return false;
+                }
+            }
+            object.iter().all(|(name, member)| {
+                match properties.and_then(|properties| properties.get(name)) {
+                    Some(property) => accepts(property, root, member),
+                    None => schema.get("additionalProperties") != Some(&Value::Bool(false)),
+                }
+            })
+        }
+        Some("array") => value.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .all(|item| accepts(&schema["items"], root, item))
+        }),
+        Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
+        Some("number") => value.is_number(),
+        Some("string") => value.is_string(),
+        Some("boolean") => value.is_boolean(),
+        Some("null") => value.is_null(),
+        None => true,
+        other => panic!("the advertised schema uses an unsupported type: {other:?}"),
+    }
 }
 
 /// Resolve the local `#/…` references an advertised subschema uses against the advertised document.

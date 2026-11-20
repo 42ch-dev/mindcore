@@ -321,9 +321,10 @@ impl MemoryWorkflowBinding {
         let admitted = self.bound()?;
         let caller = principal_id(principal);
         if caller != admitted.caller.as_str() {
+            // Target-free: the peer learns it is not the route's caller, never which collection
+            // the host routed or bound.
             return Err(not_authorized(format!(
-                "principal {caller} is not admitted to knowledge collection {}",
-                admitted.scope.collection
+                "principal {caller} is not the admitted carrier caller"
             )));
         }
         self.granted_collection(tx, principal, space_id, capabilities)

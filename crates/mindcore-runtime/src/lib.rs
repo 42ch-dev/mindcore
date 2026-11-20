@@ -28,7 +28,8 @@ use spoke_operations::{spoke_reject, validate_manifest_tools, SpokeRejectCode, S
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
 
-pub use tools::{MindProviders, WorkflowTools};
+pub use tools::MindProviders;
+use tools::WorkflowTools;
 
 /// The `tools.*` namespace this runtime owns.
 const TOOLS_NAMESPACE: &str = "mindcore";

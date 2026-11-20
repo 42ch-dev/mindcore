@@ -51,6 +51,8 @@ const SUBJECT: &str = "subj_loopback";
 const PRINCIPAL: &str = "prn_loopback";
 const NOW: &str = "2026-11-21T00:00:00.000Z";
 const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
+/// A host-owned tool the runtime serves beside its own three.
+const HOST_TOOL: &str = "tools.mindcore.host_tool";
 
 const DIALER_SEED: [u8; 32] = [0x42u8; 32];
 const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
@@ -245,6 +247,19 @@ fn deliberate_descriptor() -> ToolDescriptor {
         "capability_id": DELIBERATE,
         "op": DELIBERATE,
         "description": "Derive a validated verdict over supplied evidence.",
+        "input": { "type": "object" },
+        "output": { "type": "object" },
+    }))
+    .expect("tool descriptor JSON matches the schema")
+}
+
+/// The host tool's descriptor, as a host could build one.
+fn host_tool_descriptor() -> ToolDescriptor {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "capability_id": HOST_TOOL,
+        "op": HOST_TOOL,
+        "description": "The host's own tool.",
         "input": { "type": "object" },
         "output": { "type": "object" },
     }))
@@ -838,8 +853,13 @@ async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
     assert!(
         reject
             .message
-            .contains("is not admitted to knowledge collection"),
+            .contains("is not the admitted carrier caller"),
         "the refusal is the carrier's one-caller rule: {reject:?}"
+    );
+    let refusal = format!("{reject:?}");
+    assert!(
+        !refusal.contains(COLLECTION),
+        "the refusal names no collection: {refusal}"
     );
     let revision: i64 = sqlx::query_scalar(
         "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
@@ -1029,4 +1049,44 @@ async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
         DELIBERATE,
         "op_unsupported",
     );
+}
+
+/// A host registration is served, not just advertised: the signed session invokes it and the
+/// host's own handler answers with its own result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), None);
+    faces.tools = vec![ToolRegistration::new(
+        host_tool_descriptor(),
+        |_responder| {
+            let handler: ToolHandler = Arc::new(|arguments: Value| {
+                Box::pin(async move {
+                    spoke_ok(json!({ "answered_by": HOST_TOOL, "arguments": arguments }))
+                })
+            });
+            handler
+        },
+    )];
+    let surface = surface(&serve, faces);
+    assert!(
+        capabilities(&surface).contains(&HOST_TOOL),
+        "the host registration is advertised: {:?}",
+        capabilities(&surface)
+    );
+
+    let session = connect(&surface, &[HOST_TOOL]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(HOST_TOOL, json!({ "probe": 1 }))
+            .await,
+        "the host's own tool",
+    );
+    assert_eq!(
+        result["answered_by"], HOST_TOOL,
+        "the installed host handler answered: {result}"
+    );
+    assert_eq!(result["arguments"], json!({ "probe": 1 }));
 }

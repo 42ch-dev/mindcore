@@ -63,7 +63,11 @@ impl MindProviders {
 }
 
 /// The Mind workflow tools: three registrations plus the thin serving path they share.
-pub struct WorkflowTools {
+///
+/// Hosts never build this: they assemble [`crate::MindcoreServe::surface`], and the surface
+/// installs these registrations. Its descriptor and dispatch surface stay crate-internal, because
+/// only the surface carries the deliberation route invariant.
+pub(crate) struct WorkflowTools {
     workflows: Arc<dyn MindWorkflows>,
     principals: MemoryAdmission,
     providers: MindProviders,
@@ -97,8 +101,10 @@ impl WorkflowTools {
             .collect()
     }
 
-    /// The descriptors alone: the ABI a caller reads from the manifest.
-    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+    /// The descriptors alone, as the mapping tests read the advertised ABI; advertisement and
+    /// installation both come from [`Self::registrations`].
+    #[cfg(test)]
+    pub(crate) fn descriptors(&self) -> Vec<ToolDescriptor> {
         Self::advertised()
             .into_iter()
             .map(|(capability_id, description, input, output)| {
@@ -134,8 +140,11 @@ impl WorkflowTools {
 
     /// Serve one call for an already authenticated `peer_id`.
     ///
-    /// Missing peer or principal is `NotAuthorized`; the resolver's own reject travels unchanged.
-    pub async fn call(
+    /// Test-only: the served entry is the handler [`Self::install`] builds, which takes the peer
+    /// from the responder session it serves. Missing peer or principal is `NotAuthorized`; the
+    /// resolver's own reject travels unchanged.
+    #[cfg(test)]
+    pub(crate) async fn call(
         &self,
         capability_id: &str,
         peer_id: &str,
@@ -445,9 +454,9 @@ fn descriptor(
 /// The served argument shapes. This one, [`absorb_input`] and [`deliberate_input`] each build a
 /// self-contained draft-07 subschema — own `$id`, so its local `#/definitions/…` resolve inside a
 /// manifest — mirroring the pinned `spoke-schemas` request DTOs the handler decodes. A client that
-/// only reads the manifest can build a valid call; `tests/tools.rs` pins each shape against the DTO.
-/// The cognition document is too large to restate by hand, so [`absorb_input`] pins it verbatim and
-/// splices its definitions in.
+/// only reads the manifest can build a valid call; the mapping tests pin each shape against the
+/// DTO. The cognition shapes are too large to restate by hand, so [`absorb_input`] and
+/// [`deliberate_input`] splice the pinned document's definitions in.
 fn recall_input() -> Value {
     json!({
         "$id": "https://mindcore.invalid/schemas/tools/recall-context.input.schema.json",
@@ -564,12 +573,15 @@ const COGNITION_REFERENCE: &str =
 const COMMON_REFERENCE: &str =
     "https://spoke42.invalid/schemas/common/common.schema.json#/definitions/";
 
-/// The pinned cognition document as an advertised subschema's flat `definitions`.
+/// The pinned definitions `roots` name, closed over every definition they reference, as an
+/// advertised subschema's flat `definitions`.
 ///
-/// Two mechanical rewrites keep the advertised manifest self-contained, and `tests/tools.rs` holds
+/// Two mechanical rewrites keep the advertised manifest self-contained, and the mapping tests hold
 /// every descriptor to both: absolute `$ref`s become local, and every object states its
-/// `additionalProperties`, so openness is never an omission a client must guess at.
-fn cognition_definitions() -> Map<String, Value> {
+/// `additionalProperties`, so openness is never an omission a client must guess at. Only the
+/// definitions the roots reach are spliced, so one advertised document carries no unused pinned
+/// shape.
+fn cognition_definitions(roots: &[&str]) -> Map<String, Value> {
     let pinned: Value =
         serde_json::from_str(COGNITION_SCHEMA).expect("the pinned cognition schema parses");
     let common: Value =
@@ -604,7 +616,44 @@ fn cognition_definitions() -> Map<String, Value> {
         localize_refs(definition);
         state_openness(definition);
     }
-    definitions
+
+    let mut selected = Map::new();
+    let mut pending: Vec<String> = roots.iter().map(|root| (*root).to_string()).collect();
+    while let Some(name) = pending.pop() {
+        if selected.contains_key(&name) {
+            continue;
+        }
+        let definition = definitions
+            .get(&name)
+            .unwrap_or_else(|| panic!("the pinned cognition schema defines {name}"))
+            .clone();
+        referenced(&definition, &mut pending);
+        selected.insert(name, definition);
+    }
+    selected
+}
+
+/// Every local definition name one advertised definition references.
+fn referenced(schema: &Value, names: &mut Vec<String>) {
+    match schema {
+        Value::Object(fields) => {
+            if let Some(reference) = fields.get("$ref").and_then(Value::as_str) {
+                names.push(
+                    reference
+                        .strip_prefix("#/definitions/")
+                        .unwrap_or_else(|| {
+                            panic!("the advertised definition references {reference}")
+                        })
+                        .to_string(),
+                );
+            }
+            for field in fields.values() {
+                referenced(field, names);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| referenced(item, names)),
+        _ => {}
+    }
 }
 
 /// Point a pinned definition's `$ref`s at the advertised document's own `definitions`.
@@ -747,28 +796,55 @@ fn absorb_input() -> Value {
     schema["definitions"]
         .as_object_mut()
         .expect("the advertised absorb input declares its definitions")
-        .extend(cognition_definitions());
+        .extend(cognition_definitions(&["cognition_record"]));
     schema
 }
 
+/// The absorb results as the seam's closed branches: a manifest-only consumer reads `status` and
+/// knows exactly which members its outcome carries.
 fn absorb_output() -> Value {
     json!({
         "type": "array",
         "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["status", "candidate_id"],
-            "properties": {
-                "status": { "enum": ["pending", "dropped", "settled"] },
-                "candidate_id": { "type": "string" },
-                "record_ids": { "type": "array", "items": { "type": "string" } },
-            },
+            "oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "candidate_id"],
+                    "properties": {
+                        "status": { "const": "pending" },
+                        "candidate_id": { "type": "string" },
+                    },
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "candidate_id"],
+                    "properties": {
+                        "status": { "const": "dropped" },
+                        "candidate_id": { "type": "string" },
+                    },
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "candidate_id", "record_ids"],
+                    "properties": {
+                        "status": { "const": "settled" },
+                        "candidate_id": { "type": "string" },
+                        "record_ids": { "type": "array", "items": { "type": "string" } },
+                    },
+                },
+            ],
         },
     })
 }
 
+/// The deliberation arguments, mirroring the pinned `spoke-schemas` request DTOs. `holder` and
+/// `target` splice the same pinned definitions `absorb` advertises — the workflow decodes exactly
+/// those DTOs, so the manifest and the handler cannot drift apart.
 fn deliberate_input() -> Value {
-    json!({
+    let mut schema = json!({
         "$id": "https://mindcore.invalid/schemas/tools/deliberate.input.schema.json",
         "type": "object",
         "additionalProperties": false,
@@ -776,8 +852,8 @@ fn deliberate_input() -> Value {
         "properties": {
             "space_id": { "type": "string", "minLength": 1 },
             "subject_id": { "type": "string", "minLength": 1 },
-            "holder": { "$ref": "#/definitions/cognition_reference" },
-            "target": { "$ref": "#/definitions/cognition_target" },
+            "holder": { "$ref": "#/definitions/CognitionReference" },
+            "target": { "$ref": "#/definitions/CognitionTarget" },
             "evidence": {
                 "type": "array",
                 "items": {
@@ -792,54 +868,73 @@ fn deliberate_input() -> Value {
             },
             "timeout_ms": { "type": "integer", "minimum": 1 },
         },
-        "definitions": {
-            "cognition_reference": {
+    });
+    schema["definitions"] = Value::Object(cognition_definitions(&[
+        "CognitionReference",
+        "CognitionTarget",
+    ]));
+    schema
+}
+
+/// The deliberation results as the seam's closed branches: `status` alone tells a manifest-only
+/// consumer which members the outcome carries. `verdict`, `draft` and `record` are opaque product
+/// objects, so their openness is stated rather than left to draft-07's implicit default.
+fn deliberate_output() -> Value {
+    json!({
+        "oneOf": [
+            {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["kind", "id", "namespace"],
+                "required": ["status", "verdict"],
                 "properties": {
-                    "kind": {
-                        "enum": [
-                            "knowledge_entry",
-                            "timeline_event",
-                            "memory_record",
-                            "memory_subject",
-                            "principal",
-                            "world",
-                            "external",
-                        ],
+                    "status": { "const": "no_change" },
+                    "verdict": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The validated reasoner verdict.",
                     },
-                    "id": { "type": "string", "minLength": 1 },
-                    "namespace": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
                 },
             },
-            "cognition_target": {
+            {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["carrier", "target_id", "kind"],
+                "required": ["status", "verdict", "draft"],
                 "properties": {
-                    "carrier": { "$ref": "#/definitions/cognition_reference" },
-                    "target_id": { "type": "string", "minLength": 1 },
-                    "kind": { "enum": ["proposition", "question", "perceived_content", "episode"] },
-                    "text": { "type": "string" },
-                    "about": { "$ref": "#/definitions/cognition_target" },
+                    "status": { "const": "needs_review" },
+                    "verdict": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The validated reasoner verdict.",
+                    },
+                    "draft": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The pinned SPOKE CognitionRecord under review.",
+                    },
                 },
             },
-        },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "verdict", "record", "mind_state_version"],
+                "properties": {
+                    "status": { "const": "settled" },
+                    "verdict": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The validated reasoner verdict.",
+                    },
+                    "record": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The pinned SPOKE CognitionRecord the carrier holds.",
+                    },
+                    "mind_state_version": { "type": "integer", "minimum": 0 },
+                },
+            },
+        ],
     })
 }
 
-fn deliberate_output() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["status", "verdict"],
-        "properties": {
-            "status": { "enum": ["no_change", "needs_review", "settled"] },
-            "verdict": { "type": "object" },
-            "draft": { "type": "object" },
-            "record": { "type": "object" },
-            "mind_state_version": { "type": "integer", "minimum": 0 },
-        },
-    })
-}
+#[cfg(test)]
+mod tests;

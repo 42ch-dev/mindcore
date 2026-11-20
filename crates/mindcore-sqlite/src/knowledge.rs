@@ -16,11 +16,11 @@ use spoke_schemas::{KnowledgeEntry, Scope};
 
 use crate::store::MindStore;
 
-/// Hard bound on one served collection list.
+/// Hard bound on one list of a stored collection.
 ///
-/// A served list decodes the routed collection's stored rows before the disclosure predicate
-/// filters them, so the collection is bounded at the query boundary instead of growing memory and
-/// work with its total size. An over-bound collection refuses the list; it never truncates.
+/// Every list decodes the collection's stored rows before any disclosure predicate filters them,
+/// so the collection is bounded at the query boundary instead of growing memory and work with its
+/// total size. An over-bound collection refuses the list; it never truncates.
 pub const SERVED_KNOWLEDGE_LIST_LIMIT: usize = 512;
 
 /// Refuse a scope carrying a selection the knowledge face does not serve.
@@ -70,7 +70,8 @@ impl ScopedKnowledgeStore {
         &self.scope
     }
 
-    /// Every entry of this collection, ordered by `entry_id` ASC.
+    /// Every entry of this collection, ordered by `entry_id` ASC and bounded by
+    /// [`SERVED_KNOWLEDGE_LIST_LIMIT`].
     pub async fn list_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
         entries(&self.pool, &self.scope.collection).await
     }
@@ -78,6 +79,9 @@ impl ScopedKnowledgeStore {
 
 /// Every entry of `collection`, ordered by `entry_id` ASC, read through the
 /// caller's transaction so a workflow reads one whole snapshot at one point.
+///
+/// Bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`] like the served list: the remote
+/// workflow's knowledge slot must not read and decode a collection of any size.
 pub async fn list_entries_in(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
@@ -85,21 +89,36 @@ pub async fn list_entries_in(
     entries(&mut **tx, collection).await
 }
 
+/// The stored rows of `collection`, ordered by `entry_id` ASC, bounded at the
+/// query boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] rows are decoded, and
+/// an over-bound collection refuses the list instead of growing memory and work
+/// with its total size.
 async fn entries<'e, E>(executor: E, collection: &str) -> SpokeResult<Vec<KnowledgeEntry>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
+    let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
     let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC",
+        "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC LIMIT ?",
     )
     .bind(collection)
+    .bind(limit + 1)
     .fetch_all(executor)
     .await;
     let payloads = match payloads {
         Ok(payloads) => payloads,
         Err(error) => return internal(format!("knowledge entries could not be listed: {error}")),
     };
-    decode_all(&payloads)
+    let stored = match decode_all(&payloads) {
+        SpokeResult::Ok(stored) => stored,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    if stored.len() as i64 > limit {
+        return internal(format!(
+            "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list is bounded"
+        ));
+    }
+    SpokeResult::Ok(stored)
 }
 
 fn decode_all(payloads: &[String]) -> SpokeResult<Vec<KnowledgeEntry>> {
@@ -166,30 +185,7 @@ impl RoutedKnowledgeStore {
     /// The routed collection's stored rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
     /// over-bound collection refuses the list instead of growing memory and work with its size.
     async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
-        let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
-        let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC LIMIT ?",
-        )
-        .bind(&self.scope.collection)
-        .bind(limit + 1)
-        .fetch_all(&self.pool)
-        .await;
-        let payloads = match payloads {
-            Ok(payloads) => payloads,
-            Err(error) => {
-                return internal(format!("knowledge entries could not be listed: {error}"))
-            }
-        };
-        let stored = match decode_all(&payloads) {
-            SpokeResult::Ok(stored) => stored,
-            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-        };
-        if stored.len() as i64 > limit {
-            return internal(format!(
-                "the served collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list op is bounded"
-            ));
-        }
-        SpokeResult::Ok(stored)
+        entries(&self.pool, &self.scope.collection).await
     }
 }
 

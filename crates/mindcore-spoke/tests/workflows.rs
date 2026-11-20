@@ -20,6 +20,7 @@ use mindcore_spi::{
     StructuredReasonRequest,
 };
 use mindcore_spoke::MemoryWorkflowBinding;
+use mindcore_sqlite::SERVED_KNOWLEDGE_LIST_LIMIT;
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
@@ -619,6 +620,54 @@ async fn knowledge_slot_reads_only_the_bound_collection() {
     assert_eq!(
         pack.knowledge[0].body.summary.as_deref(),
         Some("closed after dusk")
+    );
+}
+
+/// The knowledge slot is a served list too: an admitted recall decodes at most the served bound
+/// and refuses a larger collection instead of reading it whole.
+#[tokio::test]
+async fn knowledge_slot_refuses_a_collection_over_the_served_bound() {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
+    for index in 0..SERVED_KNOWLEDGE_LIST_LIMIT {
+        harness
+            .entry("wren", &format!("ke_{index:04}"), "bounded entry")
+            .await;
+    }
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let capabilities = MindCapabilities {
+        embedder: Some(&embedder),
+        ..MindCapabilities::default()
+    };
+
+    let pack = workflows
+        .recall_context(&principal(), &request(None, 10), budget(), &capabilities)
+        .await
+        .expect("a collection at the bound is served whole");
+    assert_eq!(
+        pack.knowledge.len(),
+        SERVED_KNOWLEDGE_LIST_LIMIT,
+        "the slot carries the whole bounded collection"
+    );
+
+    harness
+        .entry("wren", "ke_over", "one row past the bound")
+        .await;
+    let error = workflows
+        .recall_context(&principal(), &request(None, 10), budget(), &capabilities)
+        .await
+        .expect_err("an over-bound collection refuses the recall's knowledge slot");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert!(
+        reject
+            .message
+            .contains(&SERVED_KNOWLEDGE_LIST_LIMIT.to_string()),
+        "the refusal names the bound: {}",
+        reject.message
     );
 }
 

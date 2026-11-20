@@ -3,7 +3,6 @@
 //! compose no baseline provider.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -250,20 +249,16 @@ async fn attached_memory_service_is_advertised_and_served() {
     assert!(surface.ports.as_baseline().is_none());
 }
 
-/// A registration advertises its descriptor and installs its handler on the responder.
+/// A registration advertises its descriptor and is installed on the responder. Whether the
+/// installed handler answers is proven over a signed session by the loopback task.
 #[tokio::test]
 async fn tool_registrations_drive_advertisement_and_installation() {
     let serve = Fixture::open().await.serve();
-    let installed = Arc::new(AtomicUsize::new(0));
-    let registration = {
-        let installed = Arc::clone(&installed);
-        ToolRegistration::new(descriptor(HOST_TOOL), move |_responder| {
-            installed.fetch_add(1, Ordering::SeqCst);
-            let handler: ToolHandler =
-                Arc::new(|arguments: Value| Box::pin(async move { spoke_ok(arguments) }));
-            handler
-        })
-    };
+    let registration = ToolRegistration::new(descriptor(HOST_TOOL), |_responder| {
+        let handler: ToolHandler =
+            Arc::new(|arguments: Value| Box::pin(async move { spoke_ok(arguments) }));
+        handler
+    });
     let surface = expect_ok(
         serve.surface(ServeFaces {
             tools: vec![registration],
@@ -310,11 +305,6 @@ async fn tool_registrations_drive_advertisement_and_installation() {
     })
     .await;
     expect_ok(surface.register(&responder), "install handlers");
-    assert_eq!(
-        installed.load(Ordering::SeqCst),
-        1,
-        "one handler is built and installed per registration"
-    );
     responder.close();
 }
 
