@@ -238,9 +238,7 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         // the same refusal.
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
-            Err(error) => {
-                return internal(format!("knowledge entry could not be read: {error}"))
-            }
+            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
         };
         let entry = match read_entry(&mut tx, &self.scope.collection, entry_id).await {
             SpokeResult::Ok(entry) => match tx.commit().await {
@@ -734,8 +732,7 @@ pub async fn write_entry(
         return internal(format!("knowledge entry could not be written: {error}"));
     }
     // The returned DTO owns the submitted history: put the taken values back.
-    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&module_key())
-    {
+    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&module_key()) {
         if let Some(records) = module.get_mut("records") {
             *records = Value::Array(std::mem::take(&mut submitted_records));
         }
@@ -790,11 +787,7 @@ pub async fn append_cognition(
     };
     let stored_revision = stored_revision as u64;
     if stored_revision != expected_revision {
-        return stale(
-            entry_id,
-            Some(expected_revision),
-            Some(stored_revision),
-        );
+        return stale(entry_id, Some(expected_revision), Some(stored_revision));
     }
     // The record rules are the carrier contract's, not this adapter's: the same gate a full
     // put applies before any row write.
@@ -910,8 +903,12 @@ mod snapshot_seam {
 
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-    static SEAM: Mutex<Option<(UnboundedSender<&'static str>, UnboundedReceiver<&'static str>)>> =
-        Mutex::new(None);
+    static SEAM: Mutex<
+        Option<(
+            UnboundedSender<&'static str>,
+            UnboundedReceiver<&'static str>,
+        )>,
+    > = Mutex::new(None);
 
     pub(super) fn install(
         to_test: UnboundedSender<&'static str>,
@@ -1059,7 +1056,9 @@ mod tests {
     fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
         match result {
             SpokeResult::Ok(value) => value,
-            SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
+            SpokeResult::Reject(reject) => {
+                panic!("{context}: unexpectedly rejected with {reject:?}")
+            }
         }
     }
 
@@ -1105,7 +1104,8 @@ mod tests {
             "create cognition carrier",
         );
         expect_ok(
-            port.put_knowledge_entry(plain_carrier("ke_abel"), None).await,
+            port.put_knowledge_entry(plain_carrier("ke_abel"), None)
+                .await,
             "create module-less carrier",
         );
 
@@ -1114,11 +1114,13 @@ mod tests {
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
         snapshot_seam::install(hook_to_test, hook_rx);
         let read_port = store.knowledge(KnowledgeScope::new("wren"));
-        let reader =
-            tokio::spawn(async move { read_port.get_knowledge_entry("ke_wren").await });
+        let reader = tokio::spawn(async move { read_port.get_knowledge_entry("ke_wren").await });
         wait_for_seam(&mut test_rx).await;
 
-        let mut tx = second.begin_with("BEGIN IMMEDIATE").await.expect("begin append");
+        let mut tx = second
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin append");
         let assigned = expect_ok(
             append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_hearsay")).await,
             "concurrent append",
@@ -1156,7 +1158,10 @@ mod tests {
         let reader = tokio::spawn(async move { list_port.list_entries().await });
         wait_for_seam(&mut test_rx).await;
 
-        let mut tx = second.begin_with("BEGIN IMMEDIATE").await.expect("begin append");
+        let mut tx = second
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin append");
         let assigned = expect_ok(
             append_cognition(&mut tx, "wren", "ke_wren", 2, &belief("cog_newer")).await,
             "second concurrent append",
@@ -1173,9 +1178,18 @@ mod tests {
             "listing",
         );
         assert_eq!(listed.len(), 2);
-        let abel = listed.iter().find(|entry| entry.entry_id == "ke_abel").expect("abel listed");
-        assert!(module_of(abel).get("records").is_none(), "absent module stays absent");
-        let wren = listed.iter().find(|entry| entry.entry_id == "ke_wren").expect("wren listed");
+        let abel = listed
+            .iter()
+            .find(|entry| entry.entry_id == "ke_abel")
+            .expect("abel listed");
+        assert!(
+            module_of(abel).get("records").is_none(),
+            "absent module stays absent"
+        );
+        let wren = listed
+            .iter()
+            .find(|entry| entry.entry_id == "ke_wren")
+            .expect("wren listed");
         assert_eq!(wren.revision, Some(2));
         assert_eq!(
             record_ids(wren),
