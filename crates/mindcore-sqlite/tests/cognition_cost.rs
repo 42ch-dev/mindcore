@@ -135,9 +135,9 @@ async fn measured_append(
     record_id: &str,
 ) -> (usize, i64, u64, u64) {
     let mut connection = measured_connection(pool).await;
-    install_step_counter(&mut *connection).await;
+    install_step_counter(&mut connection).await;
     let before_steps = VDBE_STEPS.load(Ordering::Relaxed);
-    let mut tx = (&mut *connection)
+    let mut tx = connection
         .begin_with("BEGIN IMMEDIATE")
         .await
         .expect("begin append transaction");
@@ -158,7 +158,7 @@ async fn measured_append(
         .expect("total changes after the append");
     tx.commit().await.expect("commit the measured append");
     let steps = VDBE_STEPS.load(Ordering::Relaxed) - before_steps;
-    remove_step_counter(&mut *connection).await;
+    remove_step_counter(&mut connection).await;
     (statements, after_rows - before_rows, assigned, steps)
 }
 
@@ -166,7 +166,7 @@ async fn measured_append(
 /// the record id the holder's head points at.
 async fn measured_lookup(pool: &SqlitePool) -> (usize, u64, Option<String>) {
     let mut connection = measured_connection(pool).await;
-    install_step_counter(&mut *connection).await;
+    install_step_counter(&mut connection).await;
     let before_steps = VDBE_STEPS.load(Ordering::Relaxed);
     let before_statements = STATEMENTS.load(Ordering::Relaxed);
     let record = match read_current_record(&mut *connection, COLLECTION, CARRIER).await {
@@ -175,7 +175,7 @@ async fn measured_lookup(pool: &SqlitePool) -> (usize, u64, Option<String>) {
     };
     let statements = STATEMENTS.load(Ordering::Relaxed) - before_statements;
     let steps = VDBE_STEPS.load(Ordering::Relaxed) - before_steps;
-    remove_step_counter(&mut *connection).await;
+    remove_step_counter(&mut connection).await;
     let head = record.and_then(|record| {
         record
             .get("record_id")
