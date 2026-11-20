@@ -20,6 +20,7 @@ use mindcore_spi::{
     StructuredReasonRequest,
 };
 use mindcore_spoke::MemoryWorkflowBinding;
+use mindcore_sqlite::SERVED_KNOWLEDGE_LIST_LIMIT;
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
@@ -622,6 +623,54 @@ async fn knowledge_slot_reads_only_the_bound_collection() {
     );
 }
 
+/// The knowledge slot is a served list too: an admitted recall decodes at most the served bound
+/// and refuses a larger collection instead of reading it whole.
+#[tokio::test]
+async fn knowledge_slot_refuses_a_collection_over_the_served_bound() {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
+    for index in 0..SERVED_KNOWLEDGE_LIST_LIMIT {
+        harness
+            .entry("wren", &format!("ke_{index:04}"), "bounded entry")
+            .await;
+    }
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let capabilities = MindCapabilities {
+        embedder: Some(&embedder),
+        ..MindCapabilities::default()
+    };
+
+    let pack = workflows
+        .recall_context(&principal(), &request(None, 10), budget(), &capabilities)
+        .await
+        .expect("a collection at the bound is served whole");
+    assert_eq!(
+        pack.knowledge.len(),
+        SERVED_KNOWLEDGE_LIST_LIMIT,
+        "the slot carries the whole bounded collection"
+    );
+
+    harness
+        .entry("wren", "ke_over", "one row past the bound")
+        .await;
+    let error = workflows
+        .recall_context(&principal(), &request(None, 10), budget(), &capabilities)
+        .await
+        .expect_err("an over-bound collection refuses the recall's knowledge slot");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert!(
+        reject
+            .message
+            .contains(&SERVED_KNOWLEDGE_LIST_LIMIT.to_string()),
+        "the refusal names the bound: {}",
+        reject.message
+    );
+}
+
 #[tokio::test]
 async fn revoked_grant_during_provider_work_refuses_the_pack() {
     let harness = Harness::open().await;
@@ -730,9 +779,10 @@ async fn changed_revision_during_provider_work_refuses_the_pack() {
 }
 
 #[tokio::test]
-async fn memory_grant_alone_does_not_admit_knowledge() {
+async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
     let harness = Harness::open().await;
-    // `recall` is a memory capability; it admits no knowledge read.
+    // `recall` is a memory capability; it admits no knowledge read, so the slot stays empty
+    // while the memory pack the grant does authorize is released.
     harness.grant(&["recall"]).await;
     harness
         .record(
@@ -744,7 +794,7 @@ async fn memory_grant_alone_does_not_admit_knowledge() {
     harness.entry("wren", "ke_gate", "closed after dusk").await;
     let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
 
-    let error = workflows
+    let pack = workflows
         .recall_context(
             &principal(),
             &request(None, 10),
@@ -755,18 +805,19 @@ async fn memory_grant_alone_does_not_admit_knowledge() {
             },
         )
         .await
-        .expect_err("a memory grant must not release the bound collection");
+        .expect("the memory grant still releases its pack");
 
-    let SpiError::Settlement(reject) = error else {
-        panic!("expected a settlement refusal, got {error:?}");
-    };
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(record_ids(&pack), ["rec_a"]);
+    assert!(
+        pack.knowledge.is_empty(),
+        "a memory grant never fills the knowledge slot"
+    );
 }
 
 #[tokio::test]
-async fn another_principal_is_refused_the_bound_collection() {
+async fn another_granted_principal_reads_the_bound_collection() {
     let harness = Harness::open().await;
-    // The caller's own admission is complete — only the bound caller differs.
+    // The caller's own admission is complete; the carrier write is bound to another caller.
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
     harness
@@ -779,7 +830,7 @@ async fn another_principal_is_refused_the_bound_collection() {
     harness.entry("wren", "ke_gate", "closed after dusk").await;
     let (workflows, embedder) = harness.binding("prn_2", SideEffect::None);
 
-    let error = workflows
+    let pack = workflows
         .recall_context(
             &principal(),
             &request(None, 10),
@@ -790,16 +841,23 @@ async fn another_principal_is_refused_the_bound_collection() {
             },
         )
         .await
-        .expect_err("another caller's collection must not be served");
+        .expect("the caller's own knowledge grant admits the slot");
 
-    let SpiError::Settlement(reject) = error else {
-        panic!("expected a settlement refusal, got {error:?}");
-    };
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    // The route's caller is prn_2, so the slot proves the read authority is the caller's own
+    // grant against the bound collection rather than an identity match with the write caller.
+    let entries: Vec<&str> = pack
+        .knowledge
+        .iter()
+        .map(|entry| entry.entry_id.as_str())
+        .collect();
+    assert_eq!(entries, ["ke_gate"]);
 }
 
+/// Recall re-derives the knowledge grant over its own transaction and compares both reads: a
+/// revocation during provider work empties the slot, so the pack is retried against a snapshot
+/// that no longer includes it — never released against a slot whose authority just vanished.
 #[tokio::test]
-async fn revoked_knowledge_admission_during_provider_work_refuses_the_pack() {
+async fn revoked_knowledge_admission_during_provider_work_is_a_revision_conflict() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
@@ -824,12 +882,21 @@ async fn revoked_knowledge_admission_during_provider_work_refuses_the_pack() {
             },
         )
         .await
-        .expect_err("a revoked knowledge admission must not release a pack");
+        .expect_err("a revoked knowledge admission must not release the slot it filled");
 
     let SpiError::Settlement(reject) = error else {
         panic!("expected a settlement refusal, got {error:?}");
     };
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str),
+        Some("retryable"),
+        "the retried call reads an empty slot rather than the revoked one"
+    );
 }
 
 // ---------- absorb over the real adapter ----------
@@ -1950,9 +2017,19 @@ async fn deliberate(
     caps: &MindCapabilities<'_>,
     timeout: std::time::Duration,
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
+    deliberate_as(harness, PRINCIPAL, caps, timeout).await
+}
+
+/// One deliberation under a binding whose carrier route names `caller`.
+async fn deliberate_as(
+    harness: &Harness,
+    caller: &str,
+    caps: &MindCapabilities<'_>,
+    timeout: std::time::Duration,
+) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
     let workflows = SpiMindWorkflows::new(
         MemoryWorkflowBinding::new(harness.pool.clone(), true)
-            .with_knowledge_collection(PRINCIPAL, KnowledgeScope::new("wren")),
+            .with_knowledge_collection(caller, KnowledgeScope::new("wren")),
     );
     let holder_value = cognition_reference(CARRIER);
     let holder: spoke_schemas::data::cognition::CognitionReference =
@@ -2016,6 +2093,37 @@ async fn deliberate_harness() -> Harness {
 
 fn long_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(30)
+}
+
+#[tokio::test]
+async fn another_principal_cannot_write_the_bound_carrier() {
+    // Recall is admitted per caller; the carrier write keeps the one-caller limit.
+    let harness = deliberate_harness().await;
+    let reasoner =
+        DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = deliberate_as(&harness, "prn_2", &caps, long_timeout())
+        .await
+        .expect_err("only the route's caller may write its carrier");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the snapshot read refuses before the reasoner runs"
+    );
+    let (revision, _) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1);
 }
 
 #[tokio::test]

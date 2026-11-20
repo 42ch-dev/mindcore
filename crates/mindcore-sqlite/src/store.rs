@@ -45,4 +45,9 @@ impl MindStore {
     pub async fn close(self) {
         self.pool.close().await;
     }
+
+    /// A handle to this store's pool, for adapters that bind over the same connection.
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
 }
