@@ -180,6 +180,11 @@ impl MemoryWorkflowBinding {
 
     /// Publish every staged intent's targets, then settle them together on one
     /// fresh caller transaction. Both intents settle or neither does.
+    ///
+    /// The staging commit already happened, so from here an unresolved
+    /// publication or settlement leaves pending journal work: every failure is
+    /// reported as an uncertain outcome naming the receipts, never a clean
+    /// refusal the caller could retry as if nothing were durable.
     async fn settle_staged(
         &self,
         publisher: &JournalPublisher,
@@ -190,9 +195,14 @@ impl MemoryWorkflowBinding {
             .iter()
             .flat_map(|(_, owed)| owed.iter().cloned())
             .collect();
-        publisher(&targets)?;
+        let receipts: Vec<&str> = intents
+            .iter()
+            .map(|(receipt_id, _)| receipt_id.as_str())
+            .collect();
+        publisher(&targets)
+            .map_err(|error| unresolved(&receipts, "publication", format!("{error}")))?;
         let mut transaction = self.pool.begin().await.map_err(|error| {
-            internal(format!("settlement transaction could not begin: {error}"))
+            unresolved(&receipts, "settlement transaction begin", error.to_string())
         })?;
         let mut settled = None;
         for (receipt_id, _) in intents {
@@ -490,9 +500,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .intent_targets(&mut transaction, &space, &receipt_id)
             .await?;
         transaction.commit().await.map_err(|error| {
-            internal(format!(
-                "review staging transaction could not commit: {error}"
-            ))
+            uncertain_commit(&format!("review staging for receipt {receipt_id}"), error)
         })?;
         let body = self
             .settle_staged(publisher, &space, &[(receipt_id, targets)])
@@ -529,18 +537,19 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .await,
         )?;
         let mut intents = Vec::with_capacity(2);
-        for receipt_id in [update_receipt, dismiss_receipt] {
+        for receipt_id in [&update_receipt, &dismiss_receipt] {
             let targets = self
-                .intent_targets(&mut transaction, &space, &receipt_id)
+                .intent_targets(&mut transaction, &space, receipt_id)
                 .await?;
-            intents.push((receipt_id, targets));
+            intents.push((receipt_id.clone(), targets));
         }
         // Both effects are in this one staging transaction: a refusal above
         // rolls the transaction back with both of them.
         transaction.commit().await.map_err(|error| {
-            internal(format!(
-                "update staging transaction could not commit: {error}"
-            ))
+            uncertain_commit(
+                &format!("update staging for receipts {update_receipt}, {dismiss_receipt}"),
+                error,
+            )
         })?;
         let _ = self.settle_staged(publisher, &space, &intents).await?;
         Ok(())
@@ -836,6 +845,19 @@ fn internal(message: String) -> SpiError {
     })
 }
 
+/// A failure after the staging commit: the journal intent is durable and its
+/// publication or settlement is unconfirmed, so the outcome is unknown. The
+/// cause is preserved and the receipts name the recovery path.
+fn unresolved(receipts: &[&str], stage: &str, cause: String) -> SpiError {
+    SpiError::Settlement(
+        Reject::uncertain(format!(
+            "{stage} failed after receipts {} were staged: {cause}",
+            receipts.join(", ")
+        ))
+        .into_spoke(),
+    )
+}
+
 /// A write transaction whose commit failed left its outcome unknown: the row
 /// may or may not be durable, so the caller must resolve it instead of retrying
 /// on the assumption that nothing happened.
@@ -865,5 +887,28 @@ mod tests {
                 .and_then(Value::as_str),
             Some("uncertain")
         );
+    }
+
+    #[test]
+    fn an_unresolved_staging_keeps_its_receipts_and_cause() {
+        let error = unresolved(
+            &["rct_update", "rct_dismiss"],
+            "publication",
+            "invalid input: the medium is read-only".to_string(),
+        );
+        let SpiError::Settlement(reject) = error else {
+            panic!("an unresolved staging is a settlement refusal");
+        };
+        assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+        assert_eq!(
+            reject
+                .details
+                .as_ref()
+                .and_then(|details| details.get("retry_class"))
+                .and_then(Value::as_str),
+            Some("uncertain")
+        );
+        assert!(reject.message.contains("rct_update, rct_dismiss"));
+        assert!(reject.message.contains("the medium is read-only"));
     }
 }

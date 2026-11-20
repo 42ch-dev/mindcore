@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
@@ -360,6 +360,14 @@ impl Harness {
 
 fn publish_error(error: std::io::Error) -> SpiError {
     SpiError::InvalidInput(format!("publication failed: {error}"))
+}
+
+fn retry_class(reject: &spoke_operations::SpokeReject) -> Option<&str> {
+    reject
+        .details
+        .as_ref()
+        .and_then(|details| details.get("retry_class"))
+        .and_then(Value::as_str)
 }
 
 fn capture(key: &str, text: &str) -> MemoryCaptureRequest {
@@ -1525,6 +1533,119 @@ async fn a_binding_without_a_publisher_refuses_before_staging_anything() {
             .count_from("memory_candidates WHERE status = 'pending' AND revision = 1")
             .await,
         2
+    );
+}
+
+#[tokio::test]
+async fn a_publisher_that_fails_after_staging_reports_an_uncertain_outcome() {
+    let harness = granted_harness().await;
+    // The medium is installed and refuses after the intents were staged.
+    let workflows = SpiMindWorkflows::new(
+        MemoryWorkflowBinding::new(harness.pool.clone(), true).with_publisher(|_| {
+            Err(SpiError::InvalidInput(
+                "the medium is read-only".to_string(),
+            ))
+        }),
+    );
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_publish_fails", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect_err("a staged publication that failed is not a clean refusal");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(&reject), Some("uncertain"));
+    // The staged intent is durable and unsettled: its receipt is the recovery
+    // identity, and the cause survives.
+    let receipt: String =
+        sqlx::query_scalar("SELECT receipt_id FROM memory_journal WHERE state = 'pending'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the pending intent");
+    assert!(reject.message.contains(&receipt), "{}", reject.message);
+    assert!(
+        reject.message.contains("the medium is read-only"),
+        "{}",
+        reject.message
+    );
+    // The staged promotion is durable and unconfirmed: the seeded record plus
+    // the one the pending intent would publish.
+    assert_eq!(harness.count_from("memory_records").await, 2);
+}
+
+#[tokio::test]
+async fn a_settlement_that_cannot_begin_after_staging_reports_an_uncertain_outcome() {
+    let harness = granted_harness().await;
+    // The publisher closes the pool, so the settlement transaction cannot open
+    // after the staging commit.
+    let pool = harness.pool.clone();
+    let workflows = SpiMindWorkflows::new(
+        MemoryWorkflowBinding::new(pool.clone(), true).with_publisher(move |_| {
+            // Marking the pool closed is eager; the returned future is dropped.
+            let _closing = pool.close();
+            Ok(())
+        }),
+    );
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_begin_fails", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect_err("an unopened settlement is not a clean refusal");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(&reject), Some("uncertain"));
+    // The staged intent is durable: its receipt is the recovery identity.
+    let mut reader = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new().filename(harness.root.join("workflows.db")),
+    )
+    .await
+    .expect("read the staged fixture");
+    let receipt: String =
+        sqlx::query_scalar("SELECT receipt_id FROM memory_journal WHERE state = 'pending'")
+            .fetch_one(&mut reader)
+            .await
+            .expect("the pending intent");
+    assert!(reject.message.contains(&receipt), "{}", reject.message);
+    assert!(
+        reject.message.contains("settlement transaction begin"),
+        "{}",
+        reject.message
     );
 }
 
