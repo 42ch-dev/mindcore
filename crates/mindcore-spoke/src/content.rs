@@ -1382,7 +1382,11 @@ impl MemoryAdapter {
             };
             bodies.push(project::record_body(record));
         }
-        let consumed = start + bodies.len();
+        // The page cut is single-sourced in `apply_budget`: `consumed` counts
+        // kept records plus one skipped oversized first candidate, so a
+        // byte-capped page still advances (or ends, when the skipped record
+        // was the last one — `truncated: false`, `overflow_record_id` set).
+        let consumed = start + budget.consumed;
         let truncated = consumed < ranked.len();
         let next_cursor = truncated
             .then(|| policy::encode_cursor(principal_id, &scope, consumed as u64, &marker));

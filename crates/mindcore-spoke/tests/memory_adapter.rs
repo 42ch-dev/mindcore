@@ -2474,3 +2474,301 @@ async fn canonical_fence_targets_transition_and_legacy_shapes_reject() {
     );
     assert_eq!(revision, 4);
 }
+
+/// Seed one live shared record with an explicit `created_at`, which is what
+/// recall's ranking orders by.
+async fn seed_record(
+    tx: &mut Transaction<'_, Sqlite>,
+    record_id: &str,
+    text: &str,
+    created_at: &str,
+) {
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES (?, ?, ?, 'fact', ?, 'shared', NULL, ?, NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(record_id)
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(json!({ "text": text }).to_string())
+    .bind(
+        json!({
+            "source_context_ids": [],
+            "anchors": [],
+            "captured_by": "adapter",
+            "captured_at": NOW
+        })
+        .to_string(),
+    )
+    .bind(created_at)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await
+    .expect("seed record");
+}
+
+/// The front matter a projection carries, as parsed `key: value` pairs. Values
+/// stay in their serialized form so the test can decode the quoted ones.
+fn front_matter(content: &str) -> Vec<(String, String)> {
+    let mut blocks = content.split("---\n");
+    blocks.next().expect("opening delimiter");
+    blocks
+        .next()
+        .expect("front matter block")
+        .lines()
+        .map(|line| {
+            let (key, value) = line.split_once(": ").expect("key: value line");
+            (key.to_string(), value.to_string())
+        })
+        .collect()
+}
+
+/// §9.3/BUG-01: a byte-budget overflow must not mint a cursor that repeats the
+/// same offset. The oversized record is passed once (and named once), every
+/// servable record is served exactly once, and paging terminates.
+#[tokio::test]
+async fn recall_byte_budget_pages_advance_and_terminate() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_a", "aaaaaaaa", "2026-11-20T09:00:03.000Z").await;
+    seed_record(
+        &mut tx,
+        "rec_big",
+        &"x".repeat(32_768),
+        "2026-11-20T09:00:02.000Z",
+    )
+    .await;
+    seed_record(&mut tx, "rec_b", "bbbbbbbb", "2026-11-20T09:00:01.000Z").await;
+
+    let mut request = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "selection": { "mode": "subject_all" },
+        "budget": { "max_items": 2, "max_bytes": 64 },
+    });
+    let (mut served, mut cursors, mut overflow) = (Vec::new(), Vec::new(), Vec::new());
+    let mut pages = 0u32;
+    loop {
+        pages += 1;
+        assert!(pages <= 6, "byte-budget paging did not terminate");
+        let body = ready(
+            adapter
+                .recall(&mut tx, &principal(PRINCIPAL), request.clone())
+                .await,
+        );
+        for record in body["records"].as_array().expect("records") {
+            served.push(record["record_id"].as_str().expect("id").to_string());
+        }
+        if let Some(id) = body["overflow_record_id"].as_str() {
+            overflow.push(id.to_string());
+        }
+        let Some(cursor) = body["next_cursor"].as_str() else {
+            assert_eq!(body["truncated"], false);
+            break;
+        };
+        assert_eq!(body["truncated"], true);
+        assert!(
+            !cursors.iter().any(|seen| seen == cursor),
+            "cursor repeats {cursor}"
+        );
+        cursors.push(cursor.to_string());
+        request["cursor"] = json!(cursor);
+    }
+    // Every servable record served exactly once; the oversized one never is.
+    assert_eq!(served, vec!["rec_a", "rec_b"]);
+    assert!(overflow.iter().all(|id| id == "rec_big"), "{overflow:?}");
+    assert!(
+        !overflow.is_empty(),
+        "the skipped record is still named once"
+    );
+
+    // The skipped record was the last one: paging ends without a cursor and
+    // still reports the terminal overflow.
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_ok", "aaaaaaaa", "2026-11-20T09:00:02.000Z").await;
+    seed_record(
+        &mut tx,
+        "rec_tail",
+        &"x".repeat(32_768),
+        "2026-11-20T09:00:01.000Z",
+    )
+    .await;
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "budget": { "max_items": 1, "max_bytes": 64 },
+                }),
+            )
+            .await,
+    );
+    let cursor = body["next_cursor"].as_str().expect("first page advances");
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "budget": { "max_items": 1, "max_bytes": 64 },
+                    "cursor": cursor,
+                }),
+            )
+            .await,
+    );
+    assert_eq!(body["records"], json!([]));
+    assert_eq!(body["truncated"], false);
+    assert_eq!(body["next_cursor"], Value::Null);
+    assert_eq!(body["overflow_record_id"], "rec_tail");
+    tx.rollback().await.expect("rollback");
+}
+
+/// §6.6/BUG-02: a caller-derived scalar carrying a newline cannot inject a
+/// second front-matter key into the published projection.
+#[tokio::test]
+async fn record_projection_escapes_injected_front_matter() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["records_write"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let stage = adapter
+        .create_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "kind": "fact\nrevision: 999",
+                "scope": { "visibility": "context", "context_id": "ctx\nvisibility: shared" },
+                "content": { "text": "an authored record body" },
+                "idempotency_key": "inject-record"
+            }),
+        )
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    let targets = harness.targets(&mut tx, &receipt_id).await;
+    let content = targets[0]["content"].as_str().expect("content");
+    let fields = front_matter(content);
+    let mut keys: Vec<&str> = fields.iter().map(|(key, _)| key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "context_id",
+            "created_at",
+            "kind",
+            "record_id",
+            "revision",
+            "space_id",
+            "subject_id",
+            "updated_at",
+            "visibility",
+        ]
+    );
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .expect("field")
+    };
+    assert_eq!(field("revision"), "1");
+    assert_eq!(
+        serde_json::from_str::<String>(&field("kind")).expect("quoted kind"),
+        "fact\nrevision: 999"
+    );
+    assert_eq!(
+        serde_json::from_str::<String>(&field("context_id")).expect("quoted context"),
+        "ctx\nvisibility: shared"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// §6.8/BUG-02: the profile projection escapes both an open-vocabulary
+/// `profile_kind` and the caller's principal id (`updated_by`) the same way.
+#[tokio::test]
+async fn profile_projection_escapes_injected_front_matter() {
+    // The requester id is the projection's `updated_by`; a newline in it must
+    // not inject a key either.
+    const INJECTED_PRINCIPAL: &str = "p_1\nrevision: 999";
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(INJECTED_PRINCIPAL, &["profile_write"])
+        .await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let stage = adapter
+        .update_profile(
+            &mut tx,
+            &principal(INJECTED_PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "profile_kind": "personality\nrevision: 999",
+                "document": { "body": "an authored personality", "format": "markdown" },
+                "expected_revision": null,
+                "idempotency_key": "inject-profile"
+            }),
+        )
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    let targets = harness.targets(&mut tx, &receipt_id).await;
+    let content = targets[0]["content"].as_str().expect("content");
+    let fields = front_matter(content);
+    let mut keys: Vec<&str> = fields.iter().map(|(key, _)| key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "created_at",
+            "profile_kind",
+            "revision",
+            "space_id",
+            "subject_id",
+            "updated_at",
+            "updated_by",
+        ]
+    );
+    let revision = fields
+        .iter()
+        .filter(|(key, _)| key == "revision")
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(revision, vec!["1"]);
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .expect("field")
+    };
+    assert_eq!(
+        serde_json::from_str::<String>(&field("profile_kind")).expect("quoted profile kind"),
+        "personality\nrevision: 999"
+    );
+    assert_eq!(
+        serde_json::from_str::<String>(&field("updated_by")).expect("quoted updated_by"),
+        INJECTED_PRINCIPAL
+    );
+    tx.rollback().await.expect("rollback");
+}
