@@ -6,6 +6,7 @@ mod repository;
 mod store;
 
 pub mod cognition;
+pub mod vectors;
 
 pub use knowledge::{
     append_cognition, list_entries_in, read_carrier_header, read_entry, validate_admission_scope,

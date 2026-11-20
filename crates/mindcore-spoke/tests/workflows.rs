@@ -5,7 +5,8 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -25,6 +26,9 @@ use spoke_operations::SpokeRejectCode;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
 const DDL: &str = include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
+/// The optional vector cache, exactly as the shipped migration creates it.
+const VECTORS_DDL: &str =
+    include_str!("../../mindcore-sqlite/migrations/0002_memory_embedding_vectors.sql");
 /// The knowledge tables of `migrations/0001_init.sql`; that migration's legacy
 /// memory tables have a different shape than the protocol fixture above.
 const KNOWLEDGE_DDL: &str = "
@@ -64,12 +68,58 @@ enum SideEffect {
     RevokeKnowledgeGrant,
     BumpRevision,
     PendingIntent,
+    /// Revokes the recall grant once the record batch — the second provider
+    /// call of a cold recall — runs.
+    RevokeGrantOnRecordBatch,
+    /// Moves every record and poisons one record's new-revision row, so a
+    /// lookup of the moved page would fail to decode.
+    MovePageAndPoisonVector,
+}
+
+/// Revoke the fixture principal's recall grant.
+async fn revoke_recall_grant(pool: &SqlitePool) {
+    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = ?")
+        .bind(NOW)
+        .bind(PRINCIPAL)
+        .execute(pool)
+        .await
+        .expect("revoke the grant");
+}
+
+/// Withhold the subject's content: a pending journal intent on it.
+async fn withhold_subject(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO memory_journal \
+         (seq, receipt_id, space_id, subject_id, requester_principal_id, op, \
+          idempotency_key, state, targets_json, result_json, created_at, updated_at) \
+         VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_journal), 'rct_pending', \
+                 ?, ?, ?, 'memory.records.update', 'key', 'pending', '[]', NULL, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(PRINCIPAL)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(pool)
+    .await
+    .expect("stage a pending intent");
 }
 
 struct BoundaryEmbedder {
     identity: EmbeddingIdentity,
     side_effect: SideEffect,
     pool: SqlitePool,
+    /// Every text this embedder was asked for, in call order.
+    embedded: Arc<Mutex<Vec<String>>>,
+    /// How many provider calls ran, so a side effect can wait for the record
+    /// batch instead of firing on the query.
+    calls: AtomicUsize,
+}
+
+impl BoundaryEmbedder {
+    fn embedded(&self) -> Vec<String> {
+        self.embedded.lock().expect("embedded texts").clone()
+    }
 }
 
 #[async_trait]
@@ -79,16 +129,20 @@ impl Embedder for BoundaryEmbedder {
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        self.embedded
+            .lock()
+            .expect("embedded texts")
+            .extend(texts.iter().cloned());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
         match self.side_effect {
             SideEffect::None => {}
-            SideEffect::RevokeGrant => {
-                sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = ?")
-                    .bind(NOW)
-                    .bind(PRINCIPAL)
-                    .execute(&self.pool)
-                    .await
-                    .expect("revoke the grant");
+            SideEffect::RevokeGrant => revoke_recall_grant(&self.pool).await,
+            // A cold recall embeds the query first and its record batch second,
+            // so the second call is where the grant is revoked.
+            SideEffect::RevokeGrantOnRecordBatch if call == 1 => {
+                revoke_recall_grant(&self.pool).await
             }
+            SideEffect::RevokeGrantOnRecordBatch => {}
             SideEffect::RevokeKnowledgeGrant => {
                 // Only the knowledge admission is revoked; the recall grant stays live.
                 sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = ?")
@@ -104,23 +158,23 @@ impl Embedder for BoundaryEmbedder {
                     .await
                     .expect("bump the record revision");
             }
-            SideEffect::PendingIntent => {
+            SideEffect::MovePageAndPoisonVector => {
+                sqlx::query("UPDATE memory_records SET revision = revision + 1")
+                    .execute(&self.pool)
+                    .await
+                    .expect("bump the record revision");
+                // The moved page's row carries the new revision but cannot be
+                // decoded: a probe of the new revision is a storage error.
                 sqlx::query(
-                    "INSERT INTO memory_journal \
-                     (seq, receipt_id, space_id, subject_id, requester_principal_id, op, \
-                      idempotency_key, state, targets_json, result_json, created_at, updated_at) \
-                     VALUES (1, 'rct_pending', ?, ?, ?, 'memory.records.update', 'key', 'pending', \
-                             '[]', NULL, ?, ?)",
+                    "UPDATE memory_embedding_vectors \
+                     SET record_revision = record_revision + 1, vector = X'0000C07F00000000' \
+                     WHERE record_id = 'rec_c'",
                 )
-                .bind(SPACE)
-                .bind(SUBJECT)
-                .bind(PRINCIPAL)
-                .bind(NOW)
-                .bind(NOW)
                 .execute(&self.pool)
                 .await
-                .expect("stage a pending intent");
+                .expect("poison the moved record's row");
             }
+            SideEffect::PendingIntent => withhold_subject(&self.pool).await,
         }
         Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
     }
@@ -147,6 +201,10 @@ impl Harness {
             .await
             .expect("open pool");
         sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+        sqlx::raw_sql(VECTORS_DDL)
+            .execute(&pool)
+            .await
+            .expect("apply the vector DDL");
         sqlx::raw_sql(KNOWLEDGE_DDL)
             .execute(&pool)
             .await
@@ -285,14 +343,8 @@ impl Harness {
         .expect("seed knowledge entry");
     }
 
-    fn binding(
-        &self,
-        caller: &str,
-        side_effect: SideEffect,
-    ) -> (SpiMindWorkflows, BoundaryEmbedder) {
-        let binding = MemoryWorkflowBinding::new(self.pool.clone(), true)
-            .with_knowledge_collection(caller, KnowledgeScope::new("wren"));
-        let embedder = BoundaryEmbedder {
+    fn embedder(&self, side_effect: SideEffect) -> BoundaryEmbedder {
+        BoundaryEmbedder {
             identity: EmbeddingIdentity {
                 provider_id: "local".to_string(),
                 model_id: "axes".to_string(),
@@ -301,8 +353,19 @@ impl Harness {
             },
             side_effect,
             pool: self.pool.clone(),
-        };
-        (SpiMindWorkflows::new(binding), embedder)
+            embedded: Arc::new(Mutex::new(Vec::new())),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn binding(
+        &self,
+        caller: &str,
+        side_effect: SideEffect,
+    ) -> (SpiMindWorkflows, BoundaryEmbedder) {
+        let binding = MemoryWorkflowBinding::new(self.pool.clone(), true)
+            .with_knowledge_collection(caller, KnowledgeScope::new("wren"));
+        (SpiMindWorkflows::new(binding), self.embedder(side_effect))
     }
 
     /// An absorb-capable engine whose publisher writes journal targets under
@@ -369,6 +432,16 @@ impl Harness {
                 content["text"].as_str().expect("record text").to_string(),
             )
         })
+    }
+
+    async fn vector_rows(&self) -> Vec<(String, String, i64, i64, Vec<u8>)> {
+        sqlx::query_as(
+            "SELECT record_id, identity_hash, record_revision, dim, vector \
+             FROM memory_embedding_vectors ORDER BY record_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("vector rows")
     }
 }
 
@@ -2504,4 +2577,1113 @@ async fn a_subject_withheld_during_reasoning_refuses_the_carrier_write() {
     let (revision, payload) = stored_carrier(&harness).await;
     assert_eq!(revision, 1);
     assert!(payload.get("modules").is_none());
+}
+
+// ---------- vector warm after settlement ----------
+
+/// One auto-settling promote of `text`, with `embedder` injected when the host
+/// supplies one.
+async fn promote_with(
+    harness: &Harness,
+    key: &str,
+    text: &str,
+    embedder: Option<&dyn Embedder>,
+) -> Vec<AbsorbCandidateOutcome> {
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        embedder,
+    };
+    workflows
+        .absorb(&principal(), &capture(key, text), None, &caps)
+        .await
+        .expect("absorb")
+}
+
+fn warming_identity_hash() -> String {
+    match mindcore_sqlite::vectors::identity_hash("local", "axes", "1", 2) {
+        spoke_operations::SpokeResult::Ok(hash) => hash,
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("the warming identity hashes: {}", reject.message)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_settled_capture_warms_one_row_for_the_live_record() {
+    let harness = granted_harness().await;
+    let embedder = harness.embedder(SideEffect::None);
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled { record_ids, .. }] = outcomes.as_slice() else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        embedder.embedded(),
+        vec!["the north gate is closed at dusk".to_string()],
+        "the warm embeds the exact live record text"
+    );
+    let rows = harness.vector_rows().await;
+    assert_eq!(rows.len(), 1, "one settled record, one row");
+    let (record_id, identity_hash, revision, dim, vector) = &rows[0];
+    assert_eq!(record_id, &record_ids[0]);
+    assert_eq!(identity_hash, &warming_identity_hash());
+    assert_eq!(*revision, 1, "the committed revision is the row's revision");
+    assert_eq!(*dim, 2);
+    assert_eq!(
+        vector,
+        &[1.0f32, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<u8>>(),
+        "the row carries the provider's little-endian components"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_capture_warms_nothing() {
+    let harness = granted_harness().await;
+    let first = promote_with(
+        &harness,
+        "cap_warm_replay",
+        "the north gate is closed at dusk",
+        None,
+    )
+    .await;
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "no embedder, no row"
+    );
+
+    let embedder = harness.embedder(SideEffect::None);
+    let replay = promote_with(
+        &harness,
+        "cap_warm_replay",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    assert_eq!(replay, first, "a replay reports the same settlement");
+    assert!(
+        embedder.embedded().is_empty(),
+        "a replay has nothing fresh to embed"
+    );
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a replay writes no vector row"
+    );
+}
+
+#[tokio::test]
+async fn an_updated_settlement_warms_the_new_revision() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "update",
+            "record_id": "rec_gate",
+            "evidence_ids": ["rec_gate"]
+        }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let embedder = harness.embedder(SideEffect::None);
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        embedder: Some(&embedder),
+    };
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_warm_update", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("absorb");
+
+    let [AbsorbCandidateOutcome::Settled { record_ids, .. }] = outcomes.as_slice() else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(record_ids, &["rec_gate".to_string()]);
+    assert_eq!(
+        embedder.embedded(),
+        vec!["the north gate is closed at dusk".to_string()],
+        "the warm embeds the updated live text"
+    );
+    let rows = harness.vector_rows().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "rec_gate");
+    assert_eq!(rows[0].2, 2, "the row carries the committed revision");
+}
+
+#[tokio::test]
+async fn a_provider_failure_after_settlement_leaves_a_miss() {
+    struct FailingEmbedder {
+        identity: EmbeddingIdentity,
+    }
+
+    #[async_trait]
+    impl Embedder for FailingEmbedder {
+        fn identity(&self) -> Option<&EmbeddingIdentity> {
+            Some(&self.identity)
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+            Err(SpiError::EmbeddingFailed("provider down".to_string()))
+        }
+    }
+
+    let harness = granted_harness().await;
+    let embedder = FailingEmbedder {
+        identity: EmbeddingIdentity {
+            provider_id: "local".to_string(),
+            model_id: "axes".to_string(),
+            model_version: "1".to_string(),
+            dim: 2,
+        },
+    };
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm_fail",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled {
+        candidate_id,
+        record_ids,
+    }] = outcomes.as_slice()
+    else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        harness.stored_record(&record_ids[0]).await,
+        Some((1, "the north gate is closed at dusk".to_string())),
+        "the durable record survives the failed warm"
+    );
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a failed warm is a cache miss, not a Memory effect"
+    );
+}
+
+#[tokio::test]
+async fn a_revision_moved_during_the_warm_keeps_no_row() {
+    let harness = granted_harness().await;
+    let embedder = harness.embedder(SideEffect::BumpRevision);
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm_stale",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled { record_ids, .. }] = outcomes.as_slice() else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        harness
+            .stored_record(&record_ids[0])
+            .await
+            .expect("the promoted record")
+            .0,
+        2,
+        "the provider ran after the committed read and the record moved"
+    );
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "obsolete work cannot overwrite a newer vector"
+    );
+}
+
+#[tokio::test]
+async fn a_subject_withheld_during_the_warm_keeps_no_row() {
+    let harness = granted_harness().await;
+    // The provider stages an unsettled intent while it runs, so the subject is
+    // withheld from the settlement's live read onwards — before the fill.
+    let embedder = harness.embedder(SideEffect::PendingIntent);
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm_withheld",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled {
+        candidate_id,
+        record_ids,
+    }] = outcomes.as_slice()
+    else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        embedder.embedded(),
+        vec!["the north gate is closed at dusk".to_string()],
+        "the provider ran after the settlement's live read served the record"
+    );
+    assert_eq!(
+        harness.stored_record(&record_ids[0]).await,
+        Some((1, "the north gate is closed at dusk".to_string())),
+        "the already-settled Memory effect stays successful"
+    );
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a subject withheld before the fill gains no vector row"
+    );
+}
+
+/// The axis one text sits on: the market side, the gate, or the guards
+/// half-way. Equal texts land on the same vector, so a page can tie.
+fn axis_vector(text: &str) -> Vec<f32> {
+    if text.contains("market") {
+        vec![0.0, 1.0]
+    } else if text.contains("guards") {
+        vec![0.5, 0.5]
+    } else {
+        vec![1.0, 0.0]
+    }
+}
+
+/// Embeds by axis and keeps every text it was asked for, so a recall's provider
+/// cost is a count rather than an inference.
+struct AxisEmbedder {
+    identity: EmbeddingIdentity,
+    texts: Arc<Mutex<Vec<String>>>,
+}
+
+impl AxisEmbedder {
+    fn new(model_version: &str) -> Self {
+        Self {
+            identity: EmbeddingIdentity {
+                provider_id: "local".to_string(),
+                model_id: "axes".to_string(),
+                model_version: model_version.to_string(),
+                dim: 2,
+            },
+            texts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn embedded(&self) -> Vec<String> {
+        self.texts.lock().expect("embedded texts").clone()
+    }
+}
+
+#[async_trait]
+impl Embedder for AxisEmbedder {
+    fn identity(&self) -> Option<&EmbeddingIdentity> {
+        Some(&self.identity)
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        self.texts
+            .lock()
+            .expect("embedded texts")
+            .extend(texts.iter().cloned());
+        Ok(texts.iter().map(|text| axis_vector(text)).collect())
+    }
+}
+
+/// An embedder that names its identity but never serves a vector.
+struct UnavailableEmbedder(EmbeddingIdentity);
+
+#[async_trait]
+impl Embedder for UnavailableEmbedder {
+    fn identity(&self) -> Option<&EmbeddingIdentity> {
+        Some(&self.0)
+    }
+
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        Err(SpiError::EmbeddingsUnavailable)
+    }
+}
+
+fn axes_identity(model_version: &str) -> EmbeddingIdentity {
+    EmbeddingIdentity {
+        provider_id: "local".to_string(),
+        model_id: "axes".to_string(),
+        model_version: model_version.to_string(),
+        dim: 2,
+    }
+}
+
+fn embedding_caps(embedder: &dyn Embedder) -> MindCapabilities<'_> {
+    MindCapabilities {
+        embedder: Some(embedder),
+        ..MindCapabilities::default()
+    }
+}
+
+/// A recall-authorized page of three records in adapter order (newest first):
+/// the market, the closed gate and the sleeping guards.
+async fn vector_page() -> (Harness, SpiMindWorkflows) {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness
+        .record(
+            "rec_b",
+            "the market opens at dawn",
+            "2026-11-20T09:00:03.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:02.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_c",
+            "north gate guards sleep",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    (harness, workflows)
+}
+
+/// One cold recall that leaves the query slot and every page vector warm.
+async fn warm_page(workflows: &SpiMindWorkflows, embedder: &AxisEmbedder) {
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(embedder),
+        )
+        .await
+        .expect("warm recall");
+}
+
+#[tokio::test]
+async fn an_identical_warm_recall_makes_no_provider_call() {
+    let (harness, workflows) = vector_page().await;
+    let embedder = AxisEmbedder::new("1");
+
+    let first = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        embedder.embedded(),
+        [
+            "north gate",
+            "the north gate is closed",
+            "north gate guards sleep",
+            "the market opens at dawn",
+        ],
+        "a cold recall embeds the query and every page text"
+    );
+    assert_eq!(record_ids(&first), ["rec_a", "rec_c", "rec_b"]);
+    assert_eq!(
+        harness.vector_rows().await.len(),
+        3,
+        "every miss is filled once"
+    );
+
+    let second = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded().len(),
+        4,
+        "a warm identical recall makes no provider call"
+    );
+    assert_eq!(record_ids(&second), record_ids(&first));
+    assert_eq!(
+        harness.vector_rows().await.len(),
+        3,
+        "a warm page is never refilled"
+    );
+}
+
+#[tokio::test]
+async fn a_new_query_reuses_the_current_record_vectors() {
+    let (harness, workflows) = vector_page().await;
+    let embedder = AxisEmbedder::new("1");
+    warm_page(&workflows, &embedder).await;
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("market dawn"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded()[4..],
+        ["market dawn"],
+        "a new query embeds its own text only"
+    );
+    assert_eq!(record_ids(&pack), ["rec_b", "rec_c", "rec_a"]);
+    assert_eq!(harness.vector_rows().await.len(), 3);
+}
+
+#[tokio::test]
+async fn a_stale_revision_embeds_only_that_record() {
+    let (harness, workflows) = vector_page().await;
+    let embedder = AxisEmbedder::new("1");
+    warm_page(&workflows, &embedder).await;
+
+    sqlx::query(
+        "UPDATE memory_records SET revision = revision + 1, content_json = ? WHERE record_id = ?",
+    )
+    .bind(json!({ "text": "north gate guards wake" }).to_string())
+    .bind("rec_c")
+    .execute(&harness.pool)
+    .await
+    .expect("move rec_c");
+
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded()[4..],
+        ["north gate guards wake"],
+        "only the moved revision is embedded"
+    );
+    let rows = harness.vector_rows().await;
+    assert_eq!(rows.len(), 3, "the stale row is replaced, not duplicated");
+    let rec_c = rows
+        .iter()
+        .find(|row| row.0 == "rec_c")
+        .expect("the moved record's row");
+    assert_eq!(rec_c.2, 2, "the row carries the live revision");
+}
+
+#[tokio::test]
+async fn a_cold_unavailable_query_leaves_a_pre_populated_table_untouched() {
+    let (harness, workflows) = vector_page().await;
+    warm_page(&workflows, &AxisEmbedder::new("1")).await;
+    let before = harness.vector_rows().await;
+    assert_eq!(before.len(), 3);
+
+    let cold = UnavailableEmbedder(axes_identity("1"));
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("guards sleeping"), 10),
+            budget(),
+            &embedding_caps(&cold),
+        )
+        .await
+        .expect("lexical pack");
+
+    // The adapter's own order for that query, read with no embedder at all.
+    let lexical = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true))
+        .recall_context(
+            &principal(),
+            &request(Some("guards sleeping"), 10),
+            budget(),
+            &MindCapabilities::default(),
+        )
+        .await
+        .expect("lexical pack");
+    assert_eq!(record_ids(&pack), record_ids(&lexical), "lexical order");
+    assert_eq!(
+        harness.vector_rows().await,
+        before,
+        "an unavailable query writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_embedder_free_recall_never_probes_the_vector_table() {
+    let (harness, _workflows) = vector_page().await;
+    // With no embedder no statement may touch the table, so removing it leaves
+    // the recall working.
+    sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
+        .execute(&harness.pool)
+        .await
+        .expect("drop the vector table");
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &MindCapabilities::default(),
+        )
+        .await
+        .expect("lexical pack");
+
+    assert_eq!(
+        record_ids(&pack),
+        ["rec_a", "rec_c", "rec_b"],
+        "adapter order"
+    );
+}
+
+#[tokio::test]
+async fn a_miss_batch_that_goes_unavailable_writes_nothing() {
+    struct QueryOnlyEmbedder {
+        identity: EmbeddingIdentity,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Embedder for QueryOnlyEmbedder {
+        fn identity(&self) -> Option<&EmbeddingIdentity> {
+            Some(&self.identity)
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(texts.iter().map(|text| axis_vector(text)).collect())
+            } else {
+                Err(SpiError::EmbeddingsUnavailable)
+            }
+        }
+    }
+
+    let (harness, workflows) = vector_page().await;
+    let embedder = QueryOnlyEmbedder {
+        identity: axes_identity("1"),
+        calls: AtomicUsize::new(0),
+    };
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("lexical pack");
+
+    assert_eq!(
+        record_ids(&pack),
+        ["rec_a", "rec_c", "rec_b"],
+        "adapter order"
+    );
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a record batch that goes unavailable writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_withheld_read_with_a_warm_page_probes_nothing() {
+    let (harness, workflows) = vector_page().await;
+    // Warm both caches: the query slot and every page row.
+    warm_page(&workflows, &AxisEmbedder::new("1")).await;
+    // Any vector probe from here is a storage error, so a refusal that still
+    // probed could not be reported as the withheld guard.
+    sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
+        .execute(&harness.pool)
+        .await
+        .expect("drop the vector table");
+    withhold_subject(&harness.pool).await;
+    let embedder = AxisEmbedder::new("1");
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a withheld read must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str),
+        Some("UNRECONCILED"),
+        "the withheld guard, not a storage error"
+    );
+    assert!(
+        embedder.embedded().is_empty(),
+        "a warm slot does not let a refused page reach the provider"
+    );
+}
+
+#[tokio::test]
+async fn a_subject_withheld_after_the_query_call_is_refused_before_any_probe() {
+    let (harness, workflows) = vector_page().await;
+    // A vector probe from here is a storage error, so the refusal must be the
+    // withheld guard rebuilding admission after the query provider call.
+    sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
+        .execute(&harness.pool)
+        .await
+        .expect("drop the vector table");
+    let embedder = harness.embedder(SideEffect::PendingIntent);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a withheld page must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str),
+        Some("UNRECONCILED"),
+        "the second snapshot refused the withheld page"
+    );
+    assert_eq!(
+        embedder.embedded(),
+        ["north gate"],
+        "the query call ran, then the refusal: no record was probed or embedded"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_recall_keeps_no_query_vector() {
+    let (harness, workflows) = vector_page().await;
+    // The grant is revoked while the record batch is embedded, so the final
+    // reauthorization refuses a recall whose query vector was already
+    // validated.
+    let embedder = harness.embedder(SideEffect::RevokeGrantOnRecordBatch);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a revoked grant must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        embedder.embedded(),
+        [
+            "north gate",
+            "the north gate is closed",
+            "north gate guards sleep",
+            "the market opens at dawn",
+        ],
+        "the query and the record batch ran, then the refusal"
+    );
+
+    sqlx::query("UPDATE memory_grants SET revoked_at = NULL WHERE grant_id = 'grt_recall'")
+        .execute(&harness.pool)
+        .await
+        .expect("restore the grant");
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("the retried recall");
+
+    assert_eq!(
+        embedder.embedded()[4],
+        "north gate",
+        "the refused recall cached no query vector"
+    );
+}
+
+#[tokio::test]
+async fn a_release_that_cannot_reserve_its_write_serves_nothing() {
+    let (harness, _) = vector_page().await;
+    // The binding never waits, so contention must refuse at begin, not inside
+    // the fill after the reauthorization already ran.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(harness.root.join("workflows.db"))
+                .busy_timeout(Duration::ZERO),
+        )
+        .await
+        .expect("open zero-wait pool");
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(pool, true));
+
+    // Another connection holds SQLite's write reservation with a revocation
+    // staged: the commit that would invalidate a deferred release
+    // transaction's read snapshot.
+    let holder = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(harness.root.join("workflows.db"))
+                .busy_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("open the second writer");
+    let mut reservation = holder
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("hold the write reservation");
+    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = 'grt_recall'")
+        .bind(NOW)
+        .execute(&mut *reservation)
+        .await
+        .expect("stage the revocation");
+
+    let embedder = AxisEmbedder::new("1");
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a release that cannot reserve its write must not serve the page");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert!(
+        reject
+            .message
+            .contains("recall release transaction could not begin"),
+        "the reservation must be taken at begin, before the reauthorization read: {}",
+        reject.message
+    );
+    assert!(
+        reject.message.contains("locked"),
+        "the begin failure must carry SQLite's lock condition: {}",
+        reject.message
+    );
+
+    reservation
+        .rollback()
+        .await
+        .expect("release the write reservation");
+    holder.close().await;
+
+    // Nothing was released and no query vector survived the refusal: a retry
+    // re-embeds its query.
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("the retried recall");
+    assert_eq!(
+        embedder.embedded()[4],
+        "north gate",
+        "the refused recall cached no query vector"
+    );
+}
+
+#[tokio::test]
+async fn a_moved_page_conflicts_before_its_stored_vector_is_read() {
+    let (harness, workflows) = vector_page().await;
+    warm_page(&workflows, &AxisEmbedder::new("1")).await;
+    // The query provider call moves every record and poisons the moved
+    // record's row at its new revision: a probe would fail to decode.
+    let embedder = harness.embedder(SideEffect::MovePageAndPoisonVector);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("market dawn"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a moved page must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::RevisionConflict,
+        "the page moved, so the read refuses before decoding the newer row"
+    );
+}
+
+#[tokio::test]
+async fn a_retired_identity_never_serves_another_partition() {
+    let (harness, workflows) = vector_page().await;
+    let retired_embedder = AxisEmbedder::new("1");
+    warm_page(&workflows, &retired_embedder).await;
+
+    // A new serving identity cannot hit the rows another one wrote.
+    let other_engine =
+        SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    let other = AxisEmbedder::new("2");
+    other_engine
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&other),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        other.embedded().len(),
+        4,
+        "another identity embeds the query and every record"
+    );
+    assert_eq!(
+        harness.vector_rows().await.len(),
+        6,
+        "both partitions coexist"
+    );
+
+    let retired = match mindcore_sqlite::vectors::identity_hash("local", "axes", "1", 2) {
+        spoke_operations::SpokeResult::Ok(hash) => hash,
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("the retired identity hashes: {}", reject.message)
+        }
+    };
+    let deleted =
+        match mindcore_sqlite::vectors::delete_identity_vectors(&harness.pool, &retired).await {
+            spoke_operations::SpokeResult::Ok(deleted) => deleted,
+            spoke_operations::SpokeResult::Reject(reject) => {
+                panic!("the retired partition deletes: {}", reject.message)
+            }
+        };
+    assert_eq!(
+        deleted, 3,
+        "one delete clears exactly the retired partition"
+    );
+    assert_eq!(harness.vector_rows().await.len(), 3);
+
+    // Retirement also clears the identity's query slot: nothing the retired
+    // identity produced may be reused.
+    workflows.retire_identity(&axes_identity("1"));
+    let before = retired_embedder.embedded().len();
+    warm_page(&workflows, &retired_embedder).await;
+    assert_eq!(
+        retired_embedder.embedded()[before..],
+        [
+            "north gate",
+            "the north gate is closed",
+            "north gate guards sleep",
+            "the market opens at dawn",
+        ],
+        "a retired identity re-embeds its query and its missing rows"
+    );
+
+    // Retiring one identity leaves another identity's slot and rows warm.
+    let before = other.embedded().len();
+    other_engine.retire_identity(&axes_identity("1"));
+    other_engine
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&other),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        other.embedded().len(),
+        before,
+        "retiring identity 1 keeps identity 2 warm"
+    );
+}
+
+#[tokio::test]
+async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    // rec_a and rec_c share their text, so the page carries a real tie.
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:03.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_c",
+            "the north gate is closed",
+            "2026-11-20T09:00:02.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_d",
+            "north gate guards sleep",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_b",
+            "the market opens at dawn",
+            "2026-11-20T09:00:00.000Z",
+        )
+        .await;
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    let embedder = AxisEmbedder::new("1");
+
+    let fresh = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+    let page = ["rec_a", "rec_c", "rec_d", "rec_b"];
+    let texts = [
+        "the north gate is closed",
+        "the north gate is closed",
+        "north gate guards sleep",
+        "the market opens at dawn",
+    ];
+    assert_eq!(
+        record_ids(&fresh),
+        page,
+        "the tied pair keeps adapter order"
+    );
+
+    // The components the fill wrote, read back through the store's own codec.
+    let rows = harness.vector_rows().await;
+    let stored: Vec<Vec<f32>> = page
+        .iter()
+        .map(|record_id| {
+            let row = rows
+                .iter()
+                .find(|row| row.0 == *record_id)
+                .expect("the record's stored vector");
+            match mindcore_sqlite::vectors::decode_vector(
+                &row.4,
+                usize::try_from(row.3).expect("stored dimension"),
+            ) {
+                spoke_operations::SpokeResult::Ok(vector) => vector,
+                spoke_operations::SpokeResult::Reject(reject) => {
+                    panic!("the stored vector decodes: {}", reject.message)
+                }
+            }
+        })
+        .collect();
+    let fresh_vectors: Vec<Vec<f32>> = texts.iter().map(|text| axis_vector(text)).collect();
+    let bits = |vector: &Vec<f32>| -> Vec<u32> {
+        vector.iter().map(|component| component.to_bits()).collect()
+    };
+    for (fresh, stored) in fresh_vectors.iter().zip(&stored) {
+        assert_eq!(
+            bits(fresh),
+            bits(stored),
+            "the BLOB round-trips every component bit"
+        );
+    }
+
+    // Task 3's parity evidence: the same page and fixed query must score bit for
+    // bit the same from fresh provider vectors and from the reloaded BLOBs, so a
+    // score change that happens to preserve order cannot slip through.
+    let query_vector = axis_vector("north gate");
+    let fresh_scores = mindcore_spi::workflows::scored_bits_for_test(
+        &texts,
+        "north gate",
+        &query_vector,
+        &fresh_vectors,
+    );
+    let reloaded_scores =
+        mindcore_spi::workflows::scored_bits_for_test(&texts, "north gate", &query_vector, &stored);
+    assert_eq!(
+        reloaded_scores, fresh_scores,
+        "every item keeps its exact score bits once its vector is reloaded"
+    );
+
+    // A second engine starts with a cold query slot: every record vector it
+    // scores comes back through the stored BLOB, and it serves exactly the
+    // page those scores dictate.
+    let reloaded_engine =
+        SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    let reloaded = reloaded_engine
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        record_ids(&reloaded),
+        page,
+        "the persisted page ranks exactly like the in-memory one"
+    );
+    assert_eq!(reloaded.tokens_used, fresh.tokens_used);
+    assert_eq!(
+        embedder.embedded().len(),
+        6,
+        "only the cold query is embedded for the reloaded page"
+    );
 }
