@@ -300,7 +300,6 @@ impl MemoryAdapter {
         let request: MemoryReflectionsGenerateRequest =
             wire::decode(&raw, "memory.reflections.generate request")?;
         validated(validate_memory_reflections_generate(&request))?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.reflections.generate request")?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.to_string();
@@ -322,7 +321,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.reflections.generate",
             Some(request.idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,

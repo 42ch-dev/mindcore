@@ -1,10 +1,8 @@
 //! Request admission helpers. The pinned DTO proves the original JSON matches
-//! the operation contract; the canonical form of that DTO is what the payload
-//! digest binds and what field reads use, so a default the schema injects can
-//! never diverge from the digest the receipt records.
+//! the operation contract; every value the adapter stores or digests comes from
+//! the original `Value`, never from the DTO's re-serialization.
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::admission::Scope;
@@ -13,12 +11,6 @@ use crate::reject::{AResult, Reject};
 /// Deserialize the original request into its pinned DTO.
 pub(crate) fn decode<T: DeserializeOwned>(raw: &Value, what: &str) -> AResult<T> {
     serde_json::from_value(raw.clone()).map_err(|error| Reject::invalid(format!("{what}: {error}")))
-}
-
-/// The DTO's canonical JSON, which the payload digest covers.
-pub(crate) fn canonical<T: Serialize>(value: &T) -> AResult<Value> {
-    serde_json::to_value(value)
-        .map_err(|error| Reject::internal(format!("payload encode: {error}")))
 }
 
 pub(crate) fn object<'a>(value: &'a Value, what: &str) -> AResult<&'a Map<String, Value>> {

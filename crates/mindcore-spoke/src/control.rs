@@ -161,7 +161,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemorySpacesFreezeRequest =
             wire::decode(&raw, "memory.spaces.freeze request")?;
-        let payload = wire::canonical(&request)?;
         let stage = self
             .space_status::<MemorySpacesFreezeResponse>(
                 tx,
@@ -172,7 +171,7 @@ impl MemoryAdapter {
                 request.space_id.as_str(),
                 request.expected_revision.get(),
                 request.idempotency_key.as_str(),
-                &payload,
+                &raw,
             )
             .await?;
         Self::recheck::<MemorySpacesFreezeResponse>(stage)
@@ -186,7 +185,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemorySpacesUnfreezeRequest =
             wire::decode(&raw, "memory.spaces.unfreeze request")?;
-        let payload = wire::canonical(&request)?;
         let stage = self
             .space_status::<MemorySpacesUnfreezeResponse>(
                 tx,
@@ -197,7 +195,7 @@ impl MemoryAdapter {
                 request.space_id.as_str(),
                 request.expected_revision.get(),
                 request.idempotency_key.as_str(),
-                &payload,
+                &raw,
             )
             .await?;
         Self::recheck::<MemorySpacesUnfreezeResponse>(stage)
@@ -214,7 +212,7 @@ impl MemoryAdapter {
         space_id: &str,
         expected_revision: u64,
         idempotency_key: &str,
-        payload: &Value,
+        request: &Value,
     ) -> AResult<MemoryStage> {
         let principal_id = principal_id(principal);
         let op = Self::op(
@@ -222,7 +220,7 @@ impl MemoryAdapter {
             principal_id,
             operation,
             Some(idempotency_key),
-            payload,
+            request,
         )?;
         let requirements = vec![space_wide("admin")];
         let admission = Admission {
@@ -298,7 +296,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemorySubjectsEnsureRequest =
             wire::decode(&raw, "memory.subjects.ensure request")?;
-        let payload = wire::canonical(&request)?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.as_str();
         // §7.0.5: the one keyless op, so its receipt never replays and always
@@ -308,7 +305,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.subjects.ensure",
             None,
-            &payload,
+            &raw,
         )?;
         let requirements = vec![subject_scoped("capture", subject_id)];
         let admission = Admission {
@@ -413,7 +410,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemorySubjectsFenceRequest =
             wire::decode(&raw, "memory.subjects.fence request")?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.subjects.fence request")?;
         let action = wire::required(object, "action")?.to_string();
         let target = object
@@ -428,7 +424,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.subjects.fence",
             Some(request.idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let requirements = vec![subject_scoped("admin", subject_id.as_str())];
         let admission = Admission {
@@ -610,8 +606,7 @@ impl MemoryAdapter {
         principal: &Principal,
         raw: Value,
     ) -> AResult<MemoryStage> {
-        let request: MemoryGrantsGrantRequest = wire::decode(&raw, "memory.grants.grant request")?;
-        let payload = wire::canonical(&request)?;
+        let _request: MemoryGrantsGrantRequest = wire::decode(&raw, "memory.grants.grant request")?;
         let object = wire::object(&raw, "memory.grants.grant request")?;
         let space_id = wire::required(object, "space_id")?.to_string();
         let grantee = wire::required(object, "principal_id")?.to_string();
@@ -630,7 +625,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.grants.grant",
             Some(idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let issued_capabilities: Vec<&str> = capabilities.iter().map(String::as_str).collect();
         let issued_contexts: Vec<String> = context_ids.clone();
@@ -710,7 +705,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemoryGrantsRevokeRequest =
             wire::decode(&raw, "memory.grants.revoke request")?;
-        let payload = wire::canonical(&request)?;
         let principal_id = principal_id(principal);
         let expected_revision = request.expected_revision.get();
         let grant_id = request.grant_id.to_string();
@@ -719,7 +713,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.grants.revoke",
             Some(request.idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let requirements = vec![space_wide("admin")];
         let admission = Admission {

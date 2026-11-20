@@ -204,7 +204,6 @@ impl MemoryAdapter {
             &request,
             policy::max_content_bytes(),
         ))?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.capture request")?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.to_string();
@@ -215,7 +214,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.capture",
             Some(idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,
@@ -472,7 +471,6 @@ impl MemoryAdapter {
         let request: MemoryCandidatesReviewRequest =
             wire::decode(&raw, "memory.candidates.review request")?;
         validated(validate_memory_candidates_review(&request))?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.candidates.review request")?;
         let candidate_id = request.candidate_id.to_string();
         let expected_revision = Number::from(request.expected_revision.get());
@@ -488,7 +486,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.candidates.review",
             Some(idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,
@@ -533,7 +531,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemoryCandidatesDismissRequest =
             wire::decode(&raw, "memory.candidates.dismiss request")?;
-        let payload = wire::canonical(&request)?;
         let candidate_id = request.candidate_id.to_string();
         let expected_revision = Number::from(request.expected_revision.get());
         let idempotency_key = request.idempotency_key.to_string();
@@ -543,7 +540,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.candidates.dismiss",
             Some(idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,
@@ -592,7 +589,6 @@ impl MemoryAdapter {
             &request,
             policy::max_content_bytes(),
         ))?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.records.create request")?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.to_string();
@@ -603,7 +599,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.records.create",
             Some(idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,
@@ -895,7 +891,6 @@ impl MemoryAdapter {
             &request,
             policy::max_content_bytes(),
         ))?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.records.update request")?;
         let principal_id = principal_id(principal);
         let space_id = wire::required(object, "space_id")?.to_string();
@@ -907,7 +902,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.records.update",
             Some(idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,
@@ -1012,7 +1007,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemoryRecordsPromoteRequest =
             wire::decode(&raw, "memory.records.promote request")?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.records.promote request")?;
         let principal_id = principal_id(principal);
         let record_id = request.record_id.to_string();
@@ -1023,7 +1017,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.records.promote",
             Some(request.idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,
@@ -1146,7 +1140,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemoryRecordsDeleteRequest =
             wire::decode(&raw, "memory.records.delete request")?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.records.delete request")?;
         let principal_id = principal_id(principal);
         let record_id = request.record_id.to_string();
@@ -1157,7 +1150,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.records.delete",
             Some(request.idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,
@@ -1457,7 +1450,6 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemoryProfileUpdateRequest =
             wire::decode(&raw, "memory.profile.update request")?;
-        let payload = wire::canonical(&request)?;
         let object = wire::object(&raw, "memory.profile.update request")?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.to_string();
@@ -1475,7 +1467,7 @@ impl MemoryAdapter {
             principal_id,
             "memory.profile.update",
             Some(request.idempotency_key.as_str()),
-            &payload,
+            &raw,
         )?;
         let admission = Admission {
             operation: op.operation,

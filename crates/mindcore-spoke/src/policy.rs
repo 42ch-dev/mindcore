@@ -77,9 +77,11 @@ pub(crate) fn describe_body(reflections_enabled: bool) -> Value {
     })
 }
 
-/// §6.1 `payload_digest`: JCS/SHA-256 over `{"op", "payload"}`.
-pub(crate) fn payload_digest(op: &str, payload: &Value) -> AResult<String> {
-    digest(&json!({ "op": op, "payload": payload }))
+/// §6.1 `payload_digest` over the caller's original request: the canonical
+/// (JCS) form of exactly what arrived, with no wrapper member and no DTO
+/// normalization, so two distinct inputs can never collide onto one key.
+pub(crate) fn payload_digest(request: &Value) -> AResult<String> {
+    digest(request)
 }
 
 /// 64 lowercase hex over a canonical object.

@@ -841,6 +841,155 @@ async fn replayed_receipt_with_tampered_result_rejects() {
     tx.rollback().await.expect("rollback");
 }
 
+/// §6.5/F2-residual: expiry is an instant. A `+hh:mm` expiry whose text sorts
+/// after `now` is still expired, and a `-hh:mm` expiry whose text sorts before
+/// `now` is still live.
+#[tokio::test]
+async fn grant_expiry_is_compared_as_an_instant() {
+    use chrono::{Duration, FixedOffset, SecondsFormat, Utc};
+
+    fn offset_stamp(minutes_from_now: i64, offset_hours: i32) -> String {
+        let at = Utc::now() + Duration::minutes(minutes_from_now);
+        let offset = FixedOffset::east_opt(offset_hours * 3600).expect("fixed offset");
+        at.with_timezone(&offset)
+            .to_rfc3339_opts(SecondsFormat::Millis, false)
+    }
+
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture"]).await;
+    // Text sorts after `now` (local wall clock is ~10h ahead) but the instant
+    // is two hours in the past.
+    let expired = offset_stamp(-120, 12);
+    // Text sorts before `now` (local wall clock is ~10h behind) but the instant
+    // is two hours in the future.
+    let live = offset_stamp(120, -12);
+    harness
+        .seed_grant_with_expiry(STRANGER, &["admin"], Some(expired.as_str()))
+        .await;
+    harness
+        .seed_grant_with_expiry("p_offset", &["capture"], Some(live.as_str()))
+        .await;
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a receipt under an instant-aware check" },
+                    "idempotency_key": "cap-instant"
+                }),
+            )
+            .await,
+    );
+    let receipt_id = body["receipt_id"].as_str().expect("receipt id").to_string();
+
+    // Expired by instant: no participation, and an admin grant cannot rescue it.
+    let expired_probe = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(STRANGER),
+            json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+        )
+        .await;
+    let refusal = reject(&expired_probe);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(refusal), "terminal");
+
+    // Live by instant: the offset grant participates and reads its own receipt.
+    let own = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal("p_offset"),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "an offset caller's own capture" },
+                    "idempotency_key": "cap-offset"
+                }),
+            )
+            .await,
+    );
+    let own_receipt = own["receipt_id"].as_str().expect("receipt id").to_string();
+    let read = adapter
+        .get_receipt(
+            &mut tx,
+            &principal("p_offset"),
+            json!({ "space_id": SPACE, "receipt_id": own_receipt }),
+        )
+        .await;
+    assert!(
+        read.is_ok(),
+        "a live offset grant must participate: {read:?}"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// §6.1/F1-residual: the idempotency digest covers the original request, so two
+/// inputs the DTO would normalize to one shape are different payloads.
+#[tokio::test]
+async fn digest_binds_the_original_request_not_the_normalized_dto() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let with_null = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "shared" },
+        "content": { "text": "the same text either way", "structured": null },
+        "idempotency_key": "cap-digest"
+    });
+    let without_null = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "shared" },
+        "content": { "text": "the same text either way" },
+        "idempotency_key": "cap-digest"
+    });
+
+    let first = ready(
+        adapter
+            .capture(&mut tx, &principal(PRINCIPAL), with_null.clone())
+            .await,
+    );
+    let first_receipt = first["receipt_id"]
+        .as_str()
+        .expect("receipt id")
+        .to_string();
+
+    // Only a normalized member differs, but the original bytes differ: the key
+    // names a different payload and must not replay the earlier receipt.
+    let collision = adapter
+        .capture(&mut tx, &principal(PRINCIPAL), without_null.clone())
+        .await;
+    let refusal = reject(&collision);
+    assert_eq!(refusal.code, SpokeRejectCode::IdempotencyConflict);
+    assert_eq!(retry_class(refusal), "terminal");
+
+    // The identical original request still replays its receipt.
+    let replay = ready(
+        adapter
+            .capture(&mut tx, &principal(PRINCIPAL), with_null)
+            .await,
+    );
+    assert_eq!(
+        replay["receipt_id"].as_str().expect("receipt id"),
+        first_receipt
+    );
+    assert_eq!(harness.count(&mut tx, "memory_candidates").await, 1);
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
 /// The public surface compiles with the assignment's exact signature shape.
 #[allow(dead_code)]
 async fn every_named_operation(

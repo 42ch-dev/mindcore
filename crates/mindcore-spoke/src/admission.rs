@@ -293,15 +293,23 @@ pub(crate) fn one_grant_covers(
     })
 }
 
+/// Whether a stored expiry instant has passed. RFC 3339 offsets are honoured,
+/// so a `+hh:mm` expiry is compared as an instant and never as text.
+pub(crate) fn expiry_passed(expires_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    let Some(raw) = expires_at else {
+        return false;
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(at) => at.with_timezone(&Utc) <= now,
+        // An unparseable stored expiry fails closed: it cannot be shown live.
+        Err(_) => true,
+    }
+}
+
 /// A grant is live when it is unrevoked and unexpired; current participation
 /// (§7.28) is exactly this predicate, never revocation alone.
 pub(crate) fn live_grant(row: &MemoryGrantRow, now: DateTime<Utc>) -> bool {
-    let now = crate::policy::timestamp(now);
-    row.revoked_at.is_none()
-        && row
-            .expires_at
-            .as_deref()
-            .is_none_or(|expires_at| expires_at > now.as_str())
+    row.revoked_at.is_none() && !expiry_passed(row.expires_at.as_deref(), now)
 }
 
 /// Does any live grant reach this subject at all (§7.6 "any capability")?
@@ -312,15 +320,10 @@ pub(crate) fn any_grant_for_subject(
     subject_id: &str,
     now: DateTime<Utc>,
 ) -> bool {
-    let now = crate::policy::timestamp(now);
     rows.iter().any(|row| {
         row.principal_id.as_str() == principal
             && row.space_id.as_str() == space
-            && row.revoked_at.is_none()
-            && row
-                .expires_at
-                .as_deref()
-                .is_none_or(|expires_at| expires_at > now.as_str())
+            && !expiry_passed(row.expires_at.as_deref(), now)
             && row
                 .subject_id
                 .as_ref()
@@ -337,15 +340,10 @@ pub(crate) fn profile_visible(
     subject_id: &str,
     now: DateTime<Utc>,
 ) -> bool {
-    let now = crate::policy::timestamp(now);
     rows.iter().any(|row| {
         row.principal_id.as_str() == principal
             && row.space_id.as_str() == space
-            && row.revoked_at.is_none()
-            && row
-                .expires_at
-                .as_deref()
-                .is_none_or(|expires_at| expires_at > now.as_str())
+            && !expiry_passed(row.expires_at.as_deref(), now)
             && row
                 .subject_id
                 .as_ref()

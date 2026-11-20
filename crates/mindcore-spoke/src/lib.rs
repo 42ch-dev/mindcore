@@ -116,20 +116,20 @@ impl MemoryAdapter {
         }
     }
 
-    /// Project one op's request facts; the digest binds the canonical payload.
+    /// Project one op's request facts; the digest binds the original request.
     pub(crate) fn op<'a>(
         space: &str,
         principal: &'a str,
         operation: &'static str,
         idempotency_key: Option<&str>,
-        payload: &Value,
+        request: &Value,
     ) -> AResult<Op<'a>> {
         Ok(Op {
             space: SpaceId::new(space),
             requester: principal,
             operation,
             idempotency_key: idempotency_key.map(str::to_string),
-            payload_digest: policy::payload_digest(operation, payload)?,
+            payload_digest: policy::payload_digest(request)?,
             now: chrono::Utc::now(),
         })
     }
