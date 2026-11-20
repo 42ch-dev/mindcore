@@ -107,7 +107,7 @@ pub(crate) fn record_effect(record: &MemoryRecordIr, prior: Option<String>) -> A
     let mut front = format!(
         "---\nrecord_id: {}\nspace_id: {}\nsubject_id: {}\nkind: {}\nvisibility: {}\n",
         yaml_str(&record.record_id),
-        record.space_id.as_str(),
+        yaml_str(record.space_id.as_str()),
         yaml_str(record.subject_id.as_str()),
         yaml_str(&record.kind),
         visibility
@@ -140,7 +140,7 @@ pub(crate) fn candidate_effect(candidate: &MemoryCandidateIr) -> AResult<Value> 
         "---\ncandidate_id: {}\nspace_id: {}\nsubject_id: {}\nkind: {}\nstatus: {}\n\
          revision: {}\ncreated_at: {}\n---\n\n{}\n",
         yaml_str(&candidate.candidate_id),
-        candidate.space_id.as_str(),
+        yaml_str(candidate.space_id.as_str()),
         yaml_str(candidate.subject_id.as_str()),
         yaml_str(candidate_kind(candidate)),
         candidate_status(candidate),
@@ -173,7 +173,7 @@ pub(crate) fn profile_effect(profile: &MemoryProfileRow) -> AResult<Value> {
     let content = format!(
         "---\nspace_id: {}\nsubject_id: {}\nprofile_kind: {}\nupdated_by: {}\n\
          revision: {}\ncreated_at: {}\nupdated_at: {}\n---\n\n{document}\n",
-        profile.space_id.as_str(),
+        yaml_str(profile.space_id.as_str()),
         yaml_str(profile.subject_id.as_str()),
         yaml_str(&profile.profile_kind),
         yaml_str(profile.updated_by.as_str()),

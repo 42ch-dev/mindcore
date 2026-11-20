@@ -2701,18 +2701,23 @@ async fn record_projection_escapes_injected_front_matter() {
     tx.rollback().await.expect("rollback");
 }
 
-/// §6.8/BUG-02: the profile projection escapes an open-vocabulary
-/// `profile_kind` the same way.
+/// §6.8/BUG-02: the profile projection escapes both an open-vocabulary
+/// `profile_kind` and the caller's principal id (`updated_by`) the same way.
 #[tokio::test]
 async fn profile_projection_escapes_injected_front_matter() {
+    // The requester id is the projection's `updated_by`; a newline in it must
+    // not inject a key either.
+    const INJECTED_PRINCIPAL: &str = "p_1\nrevision: 999";
     let harness = Harness::open().await;
-    harness.seed_grant(PRINCIPAL, &["profile_write"]).await;
+    harness
+        .seed_grant(INJECTED_PRINCIPAL, &["profile_write"])
+        .await;
     let adapter = MemoryAdapter::new(true);
     let mut tx = harness.begin().await;
     let stage = adapter
         .update_profile(
             &mut tx,
-            &principal(PRINCIPAL),
+            &principal(INJECTED_PRINCIPAL),
             json!({
                 "space_id": SPACE,
                 "subject_id": SUBJECT,
@@ -2750,14 +2755,20 @@ async fn profile_projection_escapes_injected_front_matter() {
         .map(|(_, value)| value.as_str())
         .collect::<Vec<_>>();
     assert_eq!(revision, vec!["1"]);
-    let profile_kind = fields
-        .iter()
-        .find(|(key, _)| key == "profile_kind")
-        .map(|(_, value)| value.clone())
-        .expect("profile kind");
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .expect("field")
+    };
     assert_eq!(
-        serde_json::from_str::<String>(&profile_kind).expect("quoted profile kind"),
+        serde_json::from_str::<String>(&field("profile_kind")).expect("quoted profile kind"),
         "personality\nrevision: 999"
+    );
+    assert_eq!(
+        serde_json::from_str::<String>(&field("updated_by")).expect("quoted updated_by"),
+        INJECTED_PRINCIPAL
     );
     tx.rollback().await.expect("rollback");
 }
