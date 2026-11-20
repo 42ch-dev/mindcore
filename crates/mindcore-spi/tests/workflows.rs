@@ -9,11 +9,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use mindcore_spi::{
-    AbsorbCandidateOutcome, AbsorbSnapshot, CaptureOutcome, CitedRecord, CognitiveTaskKind,
-    DeliberateOutcome, DeliberateRequest, DeliberateSnapshot, DomainLens, Embedder,
-    EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings, PolicyDecision,
-    PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation, SettlementDraft, SpiError,
-    SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
+    AbsorbCandidateOutcome, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate,
+    CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest, DeliberateSnapshot,
+    DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings,
+    PolicyDecision, PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation,
+    SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
@@ -755,10 +755,18 @@ impl WorkflowBinding for AbsorbDouble {
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
-        // The first capture commits the receipt; every later one replays it.
+        // The first capture commits the receipt; every later one replays it,
+        // reporting the state the double's candidate is in.
         let call = self.captures.fetch_add(1, Ordering::SeqCst);
+        let lifecycle = match &self.candidate {
+            MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
+            MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
+        };
         Ok(CaptureOutcome {
-            candidate_ids: vec!["cnd_1".to_string()],
+            candidates: vec![CapturedCandidate {
+                candidate_id: "cnd_1".to_string(),
+                lifecycle,
+            }],
             replayed: call > 0,
         })
     }
@@ -1166,12 +1174,13 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
         }]
     );
     assert_eq!(replay, outcomes);
-    // Only the replay read the candidate back: a fresh capture needs no
-    // review or recall grant beyond its own admission.
+    // Neither run read the candidate back: a fresh capture's candidate is
+    // pending by construction, and a replay reports a pending candidate
+    // straight from its receipt, needing no review or recall grant.
     assert_eq!(
         recorded.snapshots.load(Ordering::SeqCst),
-        1,
-        "the fresh capture was reported without a candidate read"
+        0,
+        "a pending candidate is reported without a candidate read"
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
 }

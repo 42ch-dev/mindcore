@@ -23,11 +23,11 @@ use mindcore_base::cognition::{
     append_cognition_record, carrier_records, derive_mind_state, CARRIER_NAMESPACE,
 };
 use mindcore_base::ids::SpaceId;
-use mindcore_base::ir::{MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
+use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
-    AbsorbSnapshot, CaptureOutcome, CitedRecord, DeliberateSnapshot, RecallSnapshot, SpiError,
-    WorkflowBinding,
+    AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
+    DeliberateSnapshot, RecallSnapshot, SpiError, WorkflowBinding,
 };
 use mindcore_sqlite::{list_entries_in, read_entry, write_entry, SqliteMemoryRepository};
 
@@ -403,12 +403,29 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             }
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
+        let candidate_ids = candidate_ids(&body)?;
+        let mut candidates = Vec::with_capacity(candidate_ids.len());
+        for candidate_id in candidate_ids {
+            // A fresh capture just inserted its candidate pending; a replay
+            // reports the state its recorded run left, read under the receipt
+            // that names it.
+            let lifecycle = if replayed {
+                replayed_lifecycle(&mut transaction, request.space_id.as_str(), &candidate_id)
+                    .await?
+            } else {
+                CandidateLifecycle::Pending
+            };
+            candidates.push(CapturedCandidate {
+                candidate_id,
+                lifecycle,
+            });
+        }
         transaction
             .commit()
             .await
             .map_err(|error| internal(format!("capture transaction could not commit: {error}")))?;
         Ok(CaptureOutcome {
-            candidate_ids: candidate_ids(&body)?,
+            candidates,
             replayed,
         })
     }
@@ -784,6 +801,37 @@ fn candidate_ids(body: &Value) -> Result<Vec<String>, SpiError> {
                 .ok_or_else(|| internal("a captured candidate id is not a string".to_string()))
         })
         .collect()
+}
+
+/// Whether one candidate the caller's own capture receipt holds is still
+/// pending or was consumed.
+///
+/// The id comes from that receipt, so this read stays inside the capture's own
+/// authority: it reports one lifecycle bit and never the candidate's content,
+/// review or consumption, which keep their own grants.
+async fn replayed_lifecycle(
+    transaction: &mut Tx<'_>,
+    space_id: &str,
+    candidate_id: &str,
+) -> Result<CandidateLifecycle, SpiError> {
+    let space = SpaceId::new(space_id.to_string());
+    let candidate = SqliteMemoryRepository
+        .candidate(transaction, &space, candidate_id)
+        .await
+        .map_err(|error| {
+            internal(format!(
+                "candidate {candidate_id} could not be read: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            internal(format!(
+                "the capture receipt names absent candidate {candidate_id}"
+            ))
+        })?;
+    Ok(match candidate.state {
+        CandidateState::Pending { .. } => CandidateLifecycle::Pending,
+        CandidateState::Consumed { .. } => CandidateLifecycle::Consumed,
+    })
 }
 
 fn record_ids(body: &Value) -> Result<Vec<String>, SpiError> {

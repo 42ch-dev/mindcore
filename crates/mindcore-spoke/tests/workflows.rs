@@ -1376,6 +1376,35 @@ async fn no_reasoner_replay_reports_the_recorded_outcome() {
 }
 
 #[tokio::test]
+async fn a_capture_only_replay_of_a_pending_capture_reports_pending() {
+    let harness = Harness::open().await;
+    // Capture authority only: the caller never held the recall or review grant
+    // an absorb decision reads back through.
+    harness.grant(&["capture"]).await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_capture_only", "the north gate is closed at dusk");
+
+    let first = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("a capture-only absorb reports its fresh candidate");
+    assert!(matches!(
+        first.as_slice(),
+        [AbsorbCandidateOutcome::Pending { .. }]
+    ));
+
+    // The identical retry replays the capture receipt: the recorded run left the
+    // candidate pending, and the caller holds the receipt that names it, so the
+    // replay reports that state without demanding review or recall grants.
+    let replay = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("the capture-only retry must not demand review or recall");
+    assert_eq!(replay, first);
+    assert_eq!(harness.count_from("memory_candidates").await, 1);
+}
+
+#[tokio::test]
 async fn a_changed_non_target_citation_refuses_the_settlement() {
     let harness = granted_harness().await;
     harness
