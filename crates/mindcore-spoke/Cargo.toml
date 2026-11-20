@@ -20,6 +20,5 @@ chrono.workspace = true
 sqlx.workspace = true
 
 [dev-dependencies]
-mindcore-spi = { path = "../mindcore-spi", features = ["recall-probe"] }
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

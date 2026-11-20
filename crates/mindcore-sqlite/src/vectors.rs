@@ -142,28 +142,21 @@ where
     }
 }
 
-/// One record's stored vector, only when the row still carries the expected revision and
-/// dimension under that identity — any mismatch is a miss, not a usable approximation.
-pub async fn read_record_vector<'e, E>(
+/// The stored vectors for a page's `(record_id, revision)` pairs under one identity, in the same
+/// order.
+///
+/// One bounded statement reads the whole page through the identity index; a row is a hit only when
+/// it still carries the pair's revision and the serving dimension — any mismatch is a miss, not a
+/// usable approximation.
+pub async fn read_record_vectors<'e, E>(
     executor: E,
-    record_id: &str,
     identity_hash: &str,
-    record_revision: u64,
+    page: &[(&str, u64)],
     dim: usize,
-) -> SpokeResult<Option<Vec<f32>>>
+) -> SpokeResult<Vec<Option<Vec<f32>>>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let revision = match i64::try_from(record_revision) {
-        Ok(revision) if revision > 0 => revision,
-        _ => {
-            return spoke_reject(
-                SpokeRejectCode::InvalidInput,
-                format!("record revision {record_revision} is not a positive integer"),
-                None,
-            )
-        }
-    };
     let Some(stored_dim) = i64::try_from(dim).ok().filter(|dim| *dim > 0) else {
         return spoke_reject(
             SpokeRejectCode::InvalidInput,
@@ -171,24 +164,58 @@ where
             None,
         );
     };
-    let stored: Result<Option<(Vec<u8>,)>, sqlx::Error> = sqlx::query_as(
-        "SELECT vector FROM memory_embedding_vectors \
-         WHERE record_id = ?1 AND identity_hash = ?2 AND record_revision = ?3 AND dim = ?4",
-    )
-    .bind(record_id)
-    .bind(identity_hash)
-    .bind(revision)
-    .bind(stored_dim)
-    .fetch_optional(executor)
-    .await;
-    match stored {
-        Ok(Some((blob,))) => match decode_vector(&blob, dim) {
-            SpokeResult::Ok(vector) => SpokeResult::Ok(Some(vector)),
-            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
-        },
-        Ok(None) => SpokeResult::Ok(None),
-        Err(error) => internal(format!("record vector could not be read: {error}")),
+    let mut revisions = Vec::with_capacity(page.len());
+    for (_, revision) in page {
+        match i64::try_from(*revision) {
+            Ok(revision) if revision > 0 => revisions.push(revision),
+            _ => {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    format!("record revision {revision} is not a positive integer"),
+                    None,
+                )
+            }
+        }
     }
+    if page.is_empty() {
+        return SpokeResult::Ok(Vec::new());
+    }
+    let ids: Vec<&str> = page.iter().map(|(record_id, _)| *record_id).collect();
+    let ids = match serde_json::to_string(&ids) {
+        Ok(ids) => ids,
+        Err(error) => return internal(format!("page ids could not be encoded: {error}")),
+    };
+    let stored: Result<Vec<(String, i64, Vec<u8>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT record_id, record_revision, vector FROM memory_embedding_vectors \
+         WHERE identity_hash = ?1 AND dim = ?2 \
+         AND record_id IN (SELECT value FROM json_each(?3))",
+    )
+    .bind(identity_hash)
+    .bind(stored_dim)
+    .bind(ids)
+    .fetch_all(executor)
+    .await;
+    let stored = match stored {
+        Ok(rows) => rows,
+        Err(error) => return internal(format!("record vectors could not be read: {error}")),
+    };
+    let mut found: std::collections::HashMap<String, (i64, Vec<u8>)> = stored
+        .into_iter()
+        .map(|(record_id, revision, blob)| (record_id, (revision, blob)))
+        .collect();
+    let mut vectors = Vec::with_capacity(page.len());
+    for ((record_id, _), revision) in page.iter().zip(revisions) {
+        let vector = match found.remove(*record_id) {
+            None => None,
+            Some((stored_revision, _)) if stored_revision != revision => None,
+            Some((_, blob)) => match decode_vector(&blob, dim) {
+                SpokeResult::Ok(vector) => Some(vector),
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            },
+        };
+        vectors.push(vector);
+    }
+    SpokeResult::Ok(vectors)
 }
 
 /// Deletes one retired identity's whole partition through the identity index.
@@ -324,6 +351,19 @@ mod tests {
         );
     }
 
+    /// One page read through the batch lookup, as the binding uses it.
+    async fn page_vectors(
+        store: &crate::MindStore,
+        identity: &str,
+        page: &[(&str, u64)],
+        dim: usize,
+    ) -> Vec<Option<Vec<f32>>> {
+        expect_ok(
+            read_record_vectors(&store.pool(), identity, page, dim).await,
+            "read page",
+        )
+    }
+
     /// The table holds one row per record and identity, replaces the revision, and the identity
     /// index clears exactly one retired partition.
     #[tokio::test]
@@ -340,19 +380,13 @@ mod tests {
             "first write",
         );
         assert_eq!(
-            expect_ok(
-                read_record_vector(&store.pool(), "rec_1", &active, 1, 2).await,
-                "read current revision",
-            ),
-            Some(vec![1.0, 2.0])
+            page_vectors(&store, &active, &[("rec_1", 1)], 2).await,
+            vec![Some(vec![1.0, 2.0])]
         );
         // A stale revision is a miss, not an approximation.
         assert_eq!(
-            expect_ok(
-                read_record_vector(&store.pool(), "rec_1", &active, 2, 2).await,
-                "read stale revision",
-            ),
-            None
+            page_vectors(&store, &active, &[("rec_1", 2)], 2).await,
+            vec![None]
         );
 
         expect_ok(
@@ -360,18 +394,12 @@ mod tests {
             "replace revision",
         );
         assert_eq!(
-            expect_ok(
-                read_record_vector(&store.pool(), "rec_1", &active, 2, 2).await,
-                "read replaced revision",
-            ),
-            Some(vec![3.0, 4.0])
+            page_vectors(&store, &active, &[("rec_1", 2)], 2).await,
+            vec![Some(vec![3.0, 4.0])]
         );
         assert_eq!(
-            expect_ok(
-                read_record_vector(&store.pool(), "rec_1", &active, 1, 2).await,
-                "read old revision",
-            ),
-            None
+            page_vectors(&store, &active, &[("rec_1", 1)], 2).await,
+            vec![None]
         );
 
         // Another identity keeps its own partition.
@@ -387,18 +415,60 @@ mod tests {
             1
         );
         assert_eq!(
-            expect_ok(
-                read_record_vector(&store.pool(), "rec_1", &retired, 2, 2).await,
-                "read retired identity",
-            ),
-            None
+            page_vectors(&store, &retired, &[("rec_1", 2)], 2).await,
+            vec![None]
         );
         assert_eq!(
+            page_vectors(&store, &active, &[("rec_1", 2)], 2).await,
+            vec![Some(vec![3.0, 4.0])]
+        );
+
+        store.close().await;
+    }
+
+    /// One page read keeps the exact per-record hit semantics in page order: a current row hits,
+    /// a stale revision, another identity, another dimension and an absent row are misses.
+    #[tokio::test]
+    async fn page_lookup_keeps_exact_hit_semantics() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = crate::MindStore::open(&dir.path().join("mindcore.db"))
+            .await
+            .expect("open store");
+        let active = hash("provider", "model", "version", 2);
+        let other = hash("provider", "model", "other", 2);
+        for (record_id, revision) in [("rec_hit", 3), ("rec_stale", 1), ("rec_second", 2)] {
             expect_ok(
-                read_record_vector(&store.pool(), "rec_1", &active, 2, 2).await,
-                "read active identity",
-            ),
-            Some(vec![3.0, 4.0])
+                upsert_record_vector(&store.pool(), record_id, &active, revision, &[1.0, 0.0])
+                    .await,
+                "write",
+            );
+        }
+        expect_ok(
+            upsert_record_vector(&store.pool(), "rec_other", &other, 3, &[1.0, 0.0]).await,
+            "write another identity",
+        );
+
+        assert_eq!(
+            page_vectors(
+                &store,
+                &active,
+                &[
+                    ("rec_hit", 3),
+                    ("rec_stale", 2),
+                    ("rec_other", 3),
+                    ("rec_missing", 1),
+                    ("rec_second", 2),
+                ],
+                2,
+            )
+            .await,
+            vec![Some(vec![1.0, 0.0]), None, None, None, Some(vec![1.0, 0.0])],
+            "one entry per page row, exact hits only"
+        );
+        // Another dimension under the same identity is a miss too.
+        assert_eq!(
+            page_vectors(&store, &active, &[("rec_hit", 3)], 3).await,
+            vec![None]
         );
 
         store.close().await;

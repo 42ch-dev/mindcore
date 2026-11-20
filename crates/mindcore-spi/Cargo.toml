@@ -7,11 +7,6 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
-[features]
-# Test-only: count in-memory query-slot lookups so a test can prove a refused
-# read never probes the cache. Never enabled for a production build.
-recall-probe = []
-
 [dependencies]
 spoke-schemas.workspace = true
 spoke-operations.workspace = true

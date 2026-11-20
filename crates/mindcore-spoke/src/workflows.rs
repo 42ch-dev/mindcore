@@ -21,12 +21,15 @@ use sqlx::SqlitePool;
 use mindcore_base::boundary::CallerId;
 use mindcore_base::cognition::{carrier_records, CARRIER_NAMESPACE};
 use mindcore_base::ids::SpaceId;
-use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
+use mindcore_base::ir::{
+    CandidateState, MemoryJournalRow, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState,
+};
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
-    page_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, EmbeddingIdentity, PageFact, PageVectors, RecallSnapshot, SettledRecord,
-    SettledRevision, SpiError, WorkflowBinding,
+    page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
+    CapturedCandidate, CitedRecord, DeliberateSnapshot, EmbeddingIdentity, PageFact, PageVector,
+    PageVectors, RecallSnapshot, RecordFill, SettledRecord, SettledRevision, SnapshotFact,
+    SpiError, WorkflowBinding,
 };
 use mindcore_sqlite::{
     append_cognition, list_entries_in, read_carrier_header, read_entry, vectors,
@@ -102,13 +105,14 @@ impl MemoryWorkflowBinding {
         self
     }
 
-    /// The file targets one staged intent still owes.
-    async fn intent_targets(
+    /// The pending intent one staged receipt holds: the file targets it still
+    /// owes and the result that names the records it wrote.
+    async fn staged_intent(
         &self,
         transaction: &mut Tx<'_>,
         space: &SpaceId,
         receipt_id: &str,
-    ) -> Result<Vec<Value>, SpiError> {
+    ) -> Result<MemoryJournalRow, SpiError> {
         SqliteMemoryRepository
             .journal_intent(transaction, space, receipt_id)
             .await
@@ -117,33 +121,25 @@ impl MemoryWorkflowBinding {
                     "journal intent {receipt_id} could not be read: {error}"
                 ))
             })?
-            .map(|intent| intent.targets)
             .ok_or_else(|| internal(format!("receipt {receipt_id} has no journaled intent")))
     }
 
-    /// The records one staged intent committed, each at the revision its
-    /// staging wrote.
+    /// The records one staged intent's own result names, each at the revision
+    /// its staging wrote.
     ///
     /// Read on the staging transaction that wrote those rows: it holds the only
-    /// writable handle, so no later commit can move a revision between the
-    /// write and this read. Only a record projection names a record
-    /// (`effects::record_target`), so a candidate-only intent yields nothing.
+    /// writable handle, so no later commit can move a revision between the write
+    /// and this read. The result, not a publication path, owns record identity,
+    /// so a projection-path change can neither alter a fresh outcome nor
+    /// silently disable the warm.
     async fn staged_revisions(
         &self,
         transaction: &mut Tx<'_>,
         space: &SpaceId,
-        targets: &[Value],
+        intent: &MemoryJournalRow,
     ) -> Result<Vec<SettledRevision>, SpiError> {
         let mut settled = Vec::new();
-        for target in targets {
-            let Some(record_id) = target
-                .get("path")
-                .and_then(Value::as_str)
-                .and_then(|path| path.strip_prefix("records/"))
-                .and_then(|path| path.strip_suffix(".md"))
-            else {
-                continue;
-            };
+        for record_id in result_record_ids(intent.result.as_ref()) {
             let Some(record) = SqliteMemoryRepository
                 .record(transaction, space, record_id)
                 .await
@@ -517,34 +513,42 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .into_spoke(),
             ));
         }
-        let mut stored = Vec::with_capacity(records.len());
-        for record in &records {
-            let vector = match record {
+        let page: Vec<(&str, u64)> = records
+            .iter()
+            .filter_map(|record| match record {
                 RetainedRecord::LiveRecord(live) => {
-                    match vectors::read_record_vector(
-                        &mut *transaction,
-                        live.record_id.as_str(),
-                        &identity_hash,
-                        live.revision.get(),
-                        identity.dim,
-                    )
-                    .await
-                    {
-                        SpokeResult::Ok(vector) => vector,
-                        SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
-                    }
+                    Some((live.record_id.as_str(), live.revision.get()))
                 }
                 RetainedRecord::TombstonedRecord(_) => None,
-            };
-            stored.push(vector);
-        }
+            })
+            .collect();
+        let mut stored = match vectors::read_record_vectors(
+            &mut *transaction,
+            &identity_hash,
+            &page,
+            identity.dim,
+        )
+        .await
+        {
+            SpokeResult::Ok(vectors) => vectors.into_iter(),
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        let rows = records
+            .into_iter()
+            .map(|record| {
+                let vector = match &record {
+                    RetainedRecord::LiveRecord(_) => {
+                        stored.next().expect("one lookup per live record")
+                    }
+                    RetainedRecord::TombstonedRecord(_) => None,
+                };
+                PageVector { record, vector }
+            })
+            .collect();
         transaction.commit().await.map_err(|error| {
             internal(format!("vector read transaction could not commit: {error}"))
         })?;
-        Ok(PageVectors {
-            records,
-            vectors: stored,
-        })
+        Ok(rows)
     }
 
     async fn capture(
@@ -679,16 +683,16 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .review_candidate(&mut transaction, principal, render(request, "review")?)
                 .await,
         )?;
-        let targets = self
-            .intent_targets(&mut transaction, &space, &receipt_id)
+        let intent = self
+            .staged_intent(&mut transaction, &space, &receipt_id)
             .await?;
         let settled = self
-            .staged_revisions(&mut transaction, &space, &targets)
+            .staged_revisions(&mut transaction, &space, &intent)
             .await?;
         transaction.commit().await.map_err(|error| {
             uncertain_commit(&format!("review staging for receipt {receipt_id}"), error)
         })?;
-        self.settle_staged(publisher, &space, &[(receipt_id, targets)])
+        self.settle_staged(publisher, &space, &[(receipt_id, intent.targets)])
             .await?
             .ok_or_else(|| internal("the settled review carries no receipt".to_string()))?;
         Ok(settled)
@@ -724,16 +728,16 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let mut intents = Vec::with_capacity(2);
         let mut settled = Vec::new();
         for receipt_id in [&update_receipt, &dismiss_receipt] {
-            let targets = self
-                .intent_targets(&mut transaction, &space, receipt_id)
+            let intent = self
+                .staged_intent(&mut transaction, &space, receipt_id)
                 .await?;
-            // The dismissal leg names no record, so only the update leg's own
-            // projection yields a revision here.
+            // The dismissal leg names no record in its result, so only the
+            // update leg's own result yields a revision here.
             settled.extend(
-                self.staged_revisions(&mut transaction, &space, &targets)
+                self.staged_revisions(&mut transaction, &space, &intent)
                     .await?,
             );
-            intents.push((receipt_id.clone(), targets));
+            intents.push((receipt_id.clone(), intent.targets));
         }
         // Both effects are in this one staging transaction: a refusal above
         // rolls the transaction back with both of them.
@@ -784,48 +788,115 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         })
     }
 
-    async fn fill_record_vector(
+    async fn settle_recall(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        identity: Option<&EmbeddingIdentity>,
+        expected: &SnapshotFact,
+        fills: &[RecordFill],
+    ) -> Result<(), SpiError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!(
+                "recall release transaction could not begin: {error}"
+            ))
+        })?;
+        let records = self
+            .authorized_page(&mut transaction, principal, request)
+            .await?;
+        let knowledge = self
+            .knowledge_slot(&mut transaction, principal, request)
+            .await?;
+        if &snapshot_fact(&records, &knowledge) != expected {
+            return Err(SpiError::Settlement(
+                Reject::retryable(
+                    SpokeRejectCode::RevisionConflict,
+                    "the authorized snapshot moved while provider work ran; retry the recall",
+                )
+                .into_spoke(),
+            ));
+        }
+        // Only the page read above authorizes a fill; a cache-only failure
+        // below is a miss, never a refused release.
+        if let Some(identity) = identity {
+            if !fills.is_empty() {
+                if let Ok(identity_hash) = vector_identity(identity) {
+                    for fill in fills {
+                        let live = records.iter().any(|record| match record {
+                            RetainedRecord::LiveRecord(live) => {
+                                live.record_id.as_str() == fill.record.record_id
+                                    && live.revision.get() == fill.record.revision
+                            }
+                            RetainedRecord::TombstonedRecord(_) => false,
+                        });
+                        if !live {
+                            continue;
+                        }
+                        let _ = vectors::upsert_record_vector(
+                            &mut *transaction,
+                            &fill.record.record_id,
+                            &identity_hash,
+                            fill.record.revision,
+                            &fill.vector,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        // The reauthorization above is what the release rests on: a failed
+        // cache write rolls back to misses and still releases.
+        let _ = transaction.commit().await;
+        Ok(())
+    }
+
+    async fn fill_record_vectors(
         &self,
         principal: &Principal,
         space_id: &str,
-        record: &SettledRecord,
         identity: &EmbeddingIdentity,
-        vector: &[f32],
+        fills: &[RecordFill],
     ) -> Result<(), SpiError> {
+        if fills.is_empty() {
+            return Ok(());
+        }
         let identity_hash = vector_identity(identity)?;
         let mut transaction = self.pool.begin().await.map_err(|error| {
             internal(format!("vector fill transaction could not begin: {error}"))
         })?;
-        // The fill rechecks in its own transaction what the warm read saw: work
-        // that outlived a newer revision or a withheld subject writes nothing.
-        let body = ready(
-            self.adapter
-                .get_record(
-                    &mut transaction,
-                    principal,
-                    json!({ "space_id": space_id, "record_id": record.record_id }),
-                )
-                .await,
-            "memory.records.get",
-        )?;
-        let current = match decode_record(body)? {
-            RetainedRecord::LiveRecord(live) => live.revision.get(),
-            RetainedRecord::TombstonedRecord(_) => return Ok(()),
-        };
-        if current != record.revision {
-            return Ok(());
-        }
-        match vectors::upsert_record_vector(
-            &mut *transaction,
-            &record.record_id,
-            &identity_hash,
-            record.revision,
-            vector,
-        )
-        .await
-        {
-            SpokeResult::Ok(()) => {}
-            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        for fill in fills {
+            // The fill rechecks in this transaction what the warm read saw:
+            // work that outlived a newer revision or a withheld subject writes
+            // nothing.
+            let body = ready(
+                self.adapter
+                    .get_record(
+                        &mut transaction,
+                        principal,
+                        json!({ "space_id": space_id, "record_id": fill.record.record_id }),
+                    )
+                    .await,
+                "memory.records.get",
+            )?;
+            let current = match decode_record(body)? {
+                RetainedRecord::LiveRecord(live) => live.revision.get(),
+                RetainedRecord::TombstonedRecord(_) => continue,
+            };
+            if current != fill.record.revision {
+                continue;
+            }
+            match vectors::upsert_record_vector(
+                &mut *transaction,
+                &fill.record.record_id,
+                &identity_hash,
+                fill.record.revision,
+                &fill.vector,
+            )
+            .await
+            {
+                SpokeResult::Ok(()) => {}
+                SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+            }
         }
         transaction.commit().await.map_err(|error| {
             internal(format!("vector fill transaction could not commit: {error}"))
@@ -1038,6 +1109,22 @@ fn journal_pending(stage: SpokeResult<MemoryStage>) -> Result<String, SpiError> 
     }
 }
 
+/// The record ids one staged result names: a review lists them, an update
+/// names its single target. A candidate-only result names none.
+fn result_record_ids(result: Option<&Value>) -> Vec<&str> {
+    let Some(result) = result else {
+        return Vec::new();
+    };
+    match result.get("record_ids").and_then(Value::as_array) {
+        Some(ids) => ids.iter().filter_map(Value::as_str).collect(),
+        None => result
+            .get("record_id")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+    }
+}
+
 fn render<T: serde::Serialize>(request: &T, operation: &str) -> Result<Value, SpiError> {
     serde_json::to_value(request).map_err(|error| {
         internal(format!(
@@ -1200,6 +1287,25 @@ fn uncertain_commit(operation: &str, error: sqlx::Error) -> SpiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fresh settlement ids come from the staged result, never from a
+    /// publication path: a review lists its records, an update names one.
+    #[test]
+    fn a_settlement_result_names_the_records_to_warm() {
+        assert_eq!(
+            result_record_ids(Some(&json!({
+                "outcome": "promoted",
+                "record_ids": ["rec_a", "rec_b"],
+            }))),
+            ["rec_a", "rec_b"]
+        );
+        assert_eq!(
+            result_record_ids(Some(&json!({ "record_id": "rec_a", "revision": 4 }))),
+            ["rec_a"]
+        );
+        assert!(result_record_ids(Some(&json!({ "outcome": "dismissed" }))).is_empty());
+        assert!(result_record_ids(None).is_empty());
+    }
 
     #[test]
     fn a_failed_write_commit_is_uncertain_never_retryable() {

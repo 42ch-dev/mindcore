@@ -10,12 +10,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use mindcore_spi::{
-    page_fact, AbsorbCandidateOutcome, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
-    CapturedCandidate, CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest,
-    DeliberateSnapshot, DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput,
-    MindCapabilities, NoEmbeddings, PageFact, PageVectors, PolicyDecision, PolicyHook,
-    ProposalDraft, Reasoner, RecallSnapshot, Recommendation, SettledRecord, SettledRevision,
-    SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
+    page_fact, snapshot_fact, AbsorbCandidateOutcome, AbsorbSnapshot, CandidateLifecycle,
+    CaptureOutcome, CapturedCandidate, CitedRecord, CognitiveTaskKind, DeliberateOutcome,
+    DeliberateRequest, DeliberateSnapshot, DomainLens, Embedder, EmbeddingIdentity, Evidence,
+    LensOutput, MindCapabilities, NoEmbeddings, PageFact, PageVector, PageVectors, PolicyDecision,
+    PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation, RecordFill, SettledRecord,
+    SettledRevision, SettlementDraft, SnapshotFact, SpiError, SpiMindWorkflows,
+    StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
@@ -96,6 +97,8 @@ struct StubInner {
     calls: AtomicUsize,
     stored: Mutex<HashMap<(String, String, u64), Vec<f32>>>,
     vector_reads: AtomicUsize,
+    settle_calls: AtomicUsize,
+    settled_fills: Mutex<Vec<RecordFill>>,
 }
 
 impl StubBinding {
@@ -106,6 +109,8 @@ impl StubBinding {
                 calls: AtomicUsize::new(0),
                 stored: Mutex::new(HashMap::new()),
                 vector_reads: AtomicUsize::new(0),
+                settle_calls: AtomicUsize::new(0),
+                settled_fills: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -132,6 +137,20 @@ impl StubBinding {
     /// How many times the vector snapshot was read.
     fn vector_reads(&self) -> usize {
         self.inner.vector_reads.load(Ordering::SeqCst)
+    }
+
+    /// How many release boundaries the recall crossed.
+    fn settle_calls(&self) -> usize {
+        self.inner.settle_calls.load(Ordering::SeqCst)
+    }
+
+    /// The fills a successful release boundary carried, in call order.
+    fn settled_fills(&self) -> Vec<RecordFill> {
+        self.inner
+            .settled_fills
+            .lock()
+            .expect("settled fills")
+            .clone()
     }
 }
 
@@ -170,24 +189,24 @@ impl WorkflowBinding for StubBinding {
         }
         let partition = partition(identity);
         let stored = self.inner.stored.lock().expect("stored vectors");
-        let vectors = page
+        let rows: PageVectors = page
             .records
-            .iter()
-            .map(|record| match record {
-                RetainedRecord::LiveRecord(live) => stored
-                    .get(&(
-                        partition.clone(),
-                        live.record_id.as_str().to_string(),
-                        live.revision.get(),
-                    ))
-                    .cloned(),
-                RetainedRecord::TombstonedRecord(_) => None,
+            .into_iter()
+            .map(|record| {
+                let vector = match &record {
+                    RetainedRecord::LiveRecord(live) => stored
+                        .get(&(
+                            partition.clone(),
+                            live.record_id.as_str().to_string(),
+                            live.revision.get(),
+                        ))
+                        .cloned(),
+                    RetainedRecord::TombstonedRecord(_) => None,
+                };
+                PageVector { record, vector }
             })
             .collect();
-        Ok(PageVectors {
-            records: page.records,
-            vectors,
-        })
+        Ok(rows)
     }
 
     async fn capture(
@@ -237,13 +256,34 @@ impl WorkflowBinding for StubBinding {
         unserved()
     }
 
-    async fn fill_record_vector(
+    async fn settle_recall(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        _identity: Option<&EmbeddingIdentity>,
+        expected: &SnapshotFact,
+        fills: &[RecordFill],
+    ) -> Result<(), SpiError> {
+        self.inner.settle_calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.inner.calls.fetch_add(1, Ordering::SeqCst);
+        let page = self.page(call);
+        if &snapshot_fact(&page.records, &page.knowledge) != expected {
+            return Err(revision_conflict());
+        }
+        self.inner
+            .settled_fills
+            .lock()
+            .expect("settled fills")
+            .extend(fills.iter().cloned());
+        Ok(())
+    }
+
+    async fn fill_record_vectors(
         &self,
         _principal: &Principal,
         _space_id: &str,
-        _record: &SettledRecord,
         _identity: &EmbeddingIdentity,
-        _vector: &[f32],
+        _fills: &[RecordFill],
     ) -> Result<(), SpiError> {
         unserved()
     }
@@ -361,13 +401,23 @@ impl WorkflowBinding for RefusingBinding {
         unserved()
     }
 
-    async fn fill_record_vector(
+    async fn settle_recall(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        _identity: Option<&EmbeddingIdentity>,
+        _expected: &SnapshotFact,
+        _fills: &[RecordFill],
+    ) -> Result<(), SpiError> {
+        unreachable!("a refused page never reaches the release boundary")
+    }
+
+    async fn fill_record_vectors(
         &self,
         _principal: &Principal,
         _space_id: &str,
-        _record: &SettledRecord,
         _identity: &EmbeddingIdentity,
-        _vector: &[f32],
+        _fills: &[RecordFill],
     ) -> Result<(), SpiError> {
         unserved()
     }
@@ -731,6 +781,16 @@ async fn a_new_identity_embeds_every_record_again() {
         4,
         "another identity hits no stored vector"
     );
+    assert_eq!(
+        binding.settle_calls(),
+        1,
+        "one release boundary owns the whole miss batch"
+    );
+    assert_eq!(
+        binding.settled_fills().len(),
+        3,
+        "every miss reaches that one boundary together"
+    );
 }
 
 #[tokio::test]
@@ -773,50 +833,95 @@ async fn an_embedder_free_or_unavailable_recall_probes_no_vector_cache() {
 }
 
 #[tokio::test]
-async fn a_miss_batch_that_goes_unavailable_keeps_lexical_order() {
-    struct QueryOnlyEmbedder {
-        identity: EmbeddingIdentity,
-        calls: AtomicUsize,
-    }
+async fn a_miss_batch_that_goes_unavailable_keeps_the_warm_slot() {
+    /// A freshly embedded query vector, then an unavailable record batch: a
+    /// recall that installed its discarded query is visible in a later recall.
+    struct DistinctQueryEmbedder(EmbeddingIdentity);
 
     #[async_trait]
-    impl Embedder for QueryOnlyEmbedder {
+    impl Embedder for DistinctQueryEmbedder {
         fn identity(&self) -> Option<&EmbeddingIdentity> {
-            Some(&self.identity)
+            Some(&self.0)
         }
 
         async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
-            } else {
+            if texts.len() > 1 {
                 Err(SpiError::EmbeddingsUnavailable)
+            } else {
+                Ok(texts.iter().map(|_| vec![0.0, 1.0]).collect())
             }
         }
     }
 
     let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())]);
     let workflows = SpiMindWorkflows::new(binding.clone());
-    let embedder = QueryOnlyEmbedder {
-        identity: planted("1"),
-        calls: AtomicUsize::new(0),
-    };
-
-    let pack = workflows
+    // Warm the slot for one query under this identity and scope.
+    let warm = planted_embedder();
+    let warm_pack = workflows
         .recall_context(
             &principal(),
             &request(Some("north gate")),
             budget(4096),
-            &embedding_caps(&embedder),
+            &embedding_caps(&warm),
         )
         .await
-        .expect("pack");
+        .expect("warm pack");
+    assert_eq!(ids(&warm_pack), ["rec_a", "rec_c", "rec_b"]);
 
+    // A different query embeds its own vector, then its miss batch goes
+    // unavailable: lexical order, nothing written, and the warm slot for the
+    // first query must survive.
+    let cold = DistinctQueryEmbedder(planted("1"));
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("market dawn")),
+            budget(4096),
+            &embedding_caps(&cold),
+        )
+        .await
+        .expect("lexical pack");
     assert_eq!(
         ids(&pack),
         ["rec_b", "rec_a", "rec_c"],
         "hybrid work is discarded"
     );
-    assert_eq!(binding.vector_reads(), 1, "a read-only lookup may have run");
+    assert_eq!(binding.vector_reads(), 2, "a read-only lookup may have run");
+
+    // The warmed query still hits its slot: only the page is embedded.
+    let after = planted_embedder();
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &embedding_caps(&after),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        after.embedded().first().map(String::as_str),
+        Some("the market opens at dawn"),
+        "the discarded query vector never replaced the warm slot"
+    );
+    assert_eq!(ids(&pack), ["rec_a", "rec_c", "rec_b"]);
+
+    // The unavailable recall cached nothing for its own query either.
+    let market = planted_embedder();
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("market dawn")),
+            budget(4096),
+            &embedding_caps(&market),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        market.embedded().first().map(String::as_str),
+        Some("market dawn"),
+        "a late unavailable recall installed no query slot of its own"
+    );
 }
 
 #[tokio::test]
@@ -1319,19 +1424,29 @@ impl WorkflowBinding for AbsorbDouble {
         Ok(self.live.clone())
     }
 
-    async fn fill_record_vector(
+    async fn settle_recall(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        _identity: Option<&EmbeddingIdentity>,
+        _expected: &SnapshotFact,
+        _fills: &[RecordFill],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
+    async fn fill_record_vectors(
         &self,
         _principal: &Principal,
         _space_id: &str,
-        record: &SettledRecord,
         _identity: &EmbeddingIdentity,
-        _vector: &[f32],
+        fills: &[RecordFill],
     ) -> Result<(), SpiError> {
-        self.recorded
-            .fills
-            .lock()
-            .expect("fills")
-            .push((record.record_id.clone(), record.revision));
+        self.recorded.fills.lock().expect("fills").extend(
+            fills
+                .iter()
+                .map(|fill| (fill.record.record_id.clone(), fill.record.revision)),
+        );
         Ok(())
     }
 
@@ -2221,13 +2336,23 @@ impl WorkflowBinding for DeliberateDouble {
         unserved()
     }
 
-    async fn fill_record_vector(
+    async fn settle_recall(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        _identity: Option<&EmbeddingIdentity>,
+        _expected: &SnapshotFact,
+        _fills: &[RecordFill],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
+    async fn fill_record_vectors(
         &self,
         _principal: &Principal,
         _space_id: &str,
-        _record: &SettledRecord,
         _identity: &EmbeddingIdentity,
-        _vector: &[f32],
+        _fills: &[RecordFill],
     ) -> Result<(), SpiError> {
         unserved()
     }

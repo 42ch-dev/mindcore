@@ -38,10 +38,13 @@
   first, the query vector is resolved from one validated process-local slot keyed by principal, space,
   subject, exact query and serving identity, and the stored record vectors come from one snapshot that
   rebuilds admission and withholding and refuses a page that moved before any row is probed — a moved
-  record is `REVISION_CONFLICT`, never a decode of its newer row. Only missing or stale revisions are
-  embedded, and the query vector and the fresh record vectors are kept only after the recall
-  reauthorizes the page, so a refused recall leaves no cache entry behind. An identical warm recall
-  makes no provider call. No embedder, no serving identity or a cold `EmbeddingsUnavailable` leaves the
-  vector table untouched and keeps the adapter's lexical order; a batch that goes unavailable later
-  writes nothing. Retiring an identity clears its query slot as well as its stored partition. Ranking
-  is unchanged, and the persisted path scores bit-identically to the in-memory one, tie order included.
+  record is `REVISION_CONFLICT`, never a decode of its newer row, and one page-shaped statement reads
+  the whole page. Only missing or stale revisions are embedded; the release reauthorizes the page and
+  the knowledge set and writes those fresh vectors in the same transaction, so a refusal aborts the
+  release and no awaited cache write can observe one afterwards, while a cache-only storage failure is
+  a miss. The query slot is installed only once that boundary succeeds, and a late
+  `EmbeddingsUnavailable` keeps a warm slot instead of replacing it. An identical warm recall makes no
+  provider call. No embedder, no serving identity or a cold `EmbeddingsUnavailable` leaves the vector
+  table untouched and keeps the adapter's lexical order. Retiring an identity clears its query slot as
+  well as its stored partition. Ranking is unchanged, and the persisted path scores bit-identically to
+  the in-memory one, tie order included.
