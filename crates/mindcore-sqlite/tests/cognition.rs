@@ -623,3 +623,72 @@ fn records_without_revision_are_rejected() {
     };
     assert!(message.contains("revision"), "got {message}");
 }
+
+/// I-000036: the pinned typed `BeliefOrder` reads `i64` only, so a record whose `order`
+/// is a non-integer JSON representation (`1.0`) passes wire-shape validation but can
+/// never be read back. The carrier boundary refuses it on append, and a direct put
+/// carrying one is refused at `put_knowledge_entry` before the write reservation.
+#[test]
+fn float_order_record_is_rejected_on_append() {
+    let mut float_order = belief("cog_float_order", 0.4);
+    float_order["order"] = json!(1.0);
+    // The wire-shape gate itself still accepts the float: the representation
+    // rule is a carrier contract, not a schema change.
+    expect_ok(
+        validate_cognition_record(&float_order),
+        "float order passes wire-shape",
+    );
+
+    match append_cognition_record(&carrier("ke_wren", Some(1)), float_order) {
+        Err(MindError::RecordInvalid(message)) => {
+            assert!(message.contains("cog_float_order"), "got {message}")
+        }
+        other => panic!("float order must be RecordInvalid on append, got {other:?}"),
+    }
+}
+
+/// I-000036: a direct `put_knowledge_entry` cannot bypass the carrier rule — a module
+/// carrying `order: 1.0` is refused before the write reservation, while the same
+/// records written with integer `order` persist and render.
+#[tokio::test]
+async fn float_order_record_is_rejected_on_direct_put() {
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    let mut float_order = belief("cog_float_order", 0.4);
+    float_order["order"] = json!(1.0);
+    let poisoned = with_module(
+        "ke_wren",
+        None,
+        json!({"records": [float_order], "world_facts": [], "extensions": {}}),
+    );
+    match port.put_knowledge_entry(poisoned, None).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert!(reject.message.contains("cog_float_order"), "got {reject:?}");
+        }
+        SpokeResult::Ok(_) => panic!("a float-order carrier must not persist"),
+    }
+
+    let clean = with_module(
+        "ke_wren",
+        None,
+        json!({
+            "records": [belief("cog_hearsay", 0.4)],
+            "world_facts": [],
+            "extensions": {},
+        }),
+    );
+    let stored = expect_ok(
+        port.put_knowledge_entry(clean, None).await,
+        "integer-order carrier",
+    );
+    assert_eq!(stored.revision, Some(1));
+    let view = derive_mind_state(&stored).expect("derive integer carrier");
+    let value = mind_state_value(&view, "ms_wren_dusk").expect("render mind state");
+    expect_ok(validate_mind_state(&value), "integer-order mind state");
+    store.close().await;
+}

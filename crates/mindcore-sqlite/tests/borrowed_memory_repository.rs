@@ -354,7 +354,7 @@ async fn leased_receipt_settle_guarded_by_owner() {
 }
 
 /// §7.0.3 liveness: a crashed generation leaves a pending receipt under its lease; past the
-/// lease instant a different owner takes it over and settles.
+/// lease instant a different owner claims it, and only the persisted new owner settles.
 #[tokio::test]
 async fn expired_lease_pending_receipt_taken_over() {
     let dir = TempDir::new().unwrap();
@@ -384,6 +384,37 @@ async fn expired_lease_pending_receipt_taken_over() {
         .await
         .unwrap();
 
+    // A different owner claims the abandoned pending row: the CAS persists the new
+    // owner and expiry inside this caller-owned transaction.
+    let takeover = mindcore_base::ir::ReceiptLease {
+        owner_id: "instance-2".into(),
+        expires_at: "9999-01-01T00:00:00.000Z".into(),
+    };
+    assert!(repo
+        .claim_receipt_lease(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "rcp_gen_crash",
+            &takeover
+        )
+        .await
+        .unwrap());
+    // The claim is lost when the row no longer qualifies — already re-leased here, so the
+    // second claimant gets no work and the crashed owner still cannot settle.
+    let loser = mindcore_base::ir::ReceiptLease {
+        owner_id: "instance-3".into(),
+        expires_at: "9999-01-01T00:00:00.000Z".into(),
+    };
+    assert!(!repo
+        .claim_receipt_lease(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "rcp_gen_crash",
+            &loser
+        )
+        .await
+        .unwrap());
+
     let settled = ReviewReceiptIr {
         state: ReceiptState::Committed {
             completed_at: LATER.into(),
@@ -391,7 +422,15 @@ async fn expired_lease_pending_receipt_taken_over() {
         },
         ..pending.clone()
     };
-    // A different owner settles the abandoned pending row after lease expiry.
+    // Neither the crashed nor the losing owner can settle: owner matching is exact, and
+    // the expiry bypass is gone.
+    for stale_owner in ["instance-crashed", "instance-3"] {
+        assert!(!repo
+            .update_receipt(&mut tx, &settled, "pending", Some(stale_owner))
+            .await
+            .unwrap());
+    }
+    // The persisted takeover owner settles.
     assert!(repo
         .update_receipt(&mut tx, &settled, "pending", Some("instance-2"))
         .await
@@ -1406,9 +1445,7 @@ async fn absent_include_shared_and_null_filter_decode() {
            'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, \
            '{\"digest\":\"d\"}', 'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
     )
-    .bind(
-        "{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"],\"include_shared\":\"yes\"}",
-    )
+    .bind("{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"],\"include_shared\":\"yes\"}")
     .bind(TIME)
     .execute(&mut *tx)
     .await

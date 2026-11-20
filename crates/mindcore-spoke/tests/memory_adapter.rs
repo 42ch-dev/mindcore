@@ -1930,6 +1930,24 @@ async fn expired_lease_retry_takes_over_and_settles() {
     assert_ne!(work2.owner_id, work.owner_id);
     tx.commit().await.expect("commit retry probe");
 
+    // The takeover persisted B's owner: the crashed owner's stale completion can
+    // no longer settle behind B's claim.
+    let mut tx_a = harness.begin().await;
+    let stale = adapter.complete_reflection(&mut tx_a, work.compose()).await;
+    let refusal = reject(&stale);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    tx_a.rollback().await.expect("rollback stale settle");
+
+    // A third same-key retry sees the re-leased pending row: no takeover work,
+    // just the uncertainty contract.
+    let mut tx_c = harness.begin().await;
+    let third = adapter
+        .generate_reflection(&mut tx_c, &principal(PRINCIPAL), request.clone())
+        .await;
+    let refusal = reject(&third);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    tx_c.rollback().await.expect("rollback third retry");
+
     let mut tx2 = harness.begin().await;
     let completed = adapter.complete_reflection(&mut tx2, work2.compose()).await;
     let body = match completed {
@@ -2970,10 +2988,18 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     let mut tx = harness.begin().await;
     for result in [
         adapter
-            .update_record(&mut tx, &principal(PRINCIPAL), update("upd-c1", "rec_fenced"))
+            .update_record(
+                &mut tx,
+                &principal(PRINCIPAL),
+                update("upd-c1", "rec_fenced"),
+            )
             .await,
         adapter
-            .delete_record(&mut tx, &principal(PRINCIPAL), delete("del-c1", "rec_fenced"))
+            .delete_record(
+                &mut tx,
+                &principal(PRINCIPAL),
+                delete("del-c1", "rec_fenced"),
+            )
             .await,
     ] {
         let refusal = reject(&result);
@@ -2992,9 +3018,16 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
     // The unfenced sibling placement stays writable.
     let sibling = adapter
-        .update_record(&mut tx, &principal(PRINCIPAL), update("upd-sib", "rec_sibling"))
+        .update_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            update("upd-sib", "rec_sibling"),
+        )
         .await;
-    assert!(matches!(sibling, SpokeResult::Ok(MemoryStage::JournalPending { .. })));
+    assert!(matches!(
+        sibling,
+        SpokeResult::Ok(MemoryStage::JournalPending { .. })
+    ));
     tx.rollback().await.expect("rollback");
 
     // A fenced/archived subject fences every record write, placement aside.
@@ -3010,10 +3043,18 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     let mut tx = harness.begin().await;
     for result in [
         adapter
-            .update_record(&mut tx, &principal(PRINCIPAL), update("upd-f", "rec_sibling"))
+            .update_record(
+                &mut tx,
+                &principal(PRINCIPAL),
+                update("upd-f", "rec_sibling"),
+            )
             .await,
         adapter
-            .delete_record(&mut tx, &principal(PRINCIPAL), delete("del-f", "rec_sibling"))
+            .delete_record(
+                &mut tx,
+                &principal(PRINCIPAL),
+                delete("del-f", "rec_sibling"),
+            )
             .await,
     ] {
         let refusal = reject(&result);
@@ -3043,10 +3084,18 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     let mut tx = harness.begin().await;
     for result in [
         adapter
-            .update_record(&mut tx, &principal(PRINCIPAL), update("upd-m", "rec_sibling"))
+            .update_record(
+                &mut tx,
+                &principal(PRINCIPAL),
+                update("upd-m", "rec_sibling"),
+            )
             .await,
         adapter
-            .delete_record(&mut tx, &principal(PRINCIPAL), delete("del-m", "rec_sibling"))
+            .delete_record(
+                &mut tx,
+                &principal(PRINCIPAL),
+                delete("del-m", "rec_sibling"),
+            )
             .await,
     ] {
         let refusal = reject(&result);
@@ -3137,7 +3186,11 @@ async fn delete_of_tombstoned_rejects_and_the_key_still_replays() {
     .await
     .expect("fence subject");
     let mut tx = harness.begin().await;
-    let replay = ready(adapter.delete_record(&mut tx, &principal(PRINCIPAL), delete).await);
+    let replay = ready(
+        adapter
+            .delete_record(&mut tx, &principal(PRINCIPAL), delete)
+            .await,
+    );
     assert_eq!(replay["status"], "committed");
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
     tx.rollback().await.expect("rollback");
@@ -3369,13 +3422,12 @@ async fn null_filter_and_omitted_include_shared_survive_reflections() {
         .to_string();
 
     // The stored row carries no filter member.
-    let stored_filter: Option<String> = sqlx::query_scalar(
-        "SELECT filter_json FROM memory_reflections WHERE reflection_id = ?",
-    )
-    .bind(&reflection_id)
-    .fetch_one(&harness.pool)
-    .await
-    .expect("stored filter");
+    let stored_filter: Option<String> =
+        sqlx::query_scalar("SELECT filter_json FROM memory_reflections WHERE reflection_id = ?")
+            .bind(&reflection_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("stored filter");
     assert_eq!(stored_filter.as_deref(), None);
 
     // Simulate a legacy literal-'null' filter: reads must treat it as absent.
@@ -3536,7 +3588,8 @@ async fn recall_byte_budget_charges_content_cognition() {
 
     // `{"text":"a"}` is 11 bytes on the wire; the belief record's serialized
     // size is the cognition charge the budget must see.
-    let reference = |id: &str| json!({ "kind": "knowledge_entry", "id": id, "namespace": "mindcore" });
+    let reference =
+        |id: &str| json!({ "kind": "knowledge_entry", "id": id, "namespace": "mindcore" });
     let belief = json!({
         "kind": "belief",
         "order": 0,

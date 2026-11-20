@@ -376,7 +376,11 @@ async fn prompt_reasoner_wraps_full_text_in_the_wire_envelope() {
         .await
         .expect("valid JSON parses");
     assert_eq!(verdict, json!({ "verdict": "settle" }));
-    let prompt = captured.lock().expect("prompt sink").pop().expect("one call");
+    let prompt = captured
+        .lock()
+        .expect("prompt sink")
+        .pop()
+        .expect("one call");
     assert!(prompt.starts_with("fixed skeleton\n\n```json\n"));
     // The compact envelope serializes task_kind snake_case.
     assert!(prompt.contains("\"task_kind\":\"absorb\""));
@@ -398,7 +402,9 @@ async fn prompt_reasoner_rejects_malformed_full_text() {
 #[tokio::test]
 async fn prompt_reasoner_propagates_transport_refusals() {
     let reasoner = PromptReasoner::new(|_prompt: String| async {
-        Err(SpiError::ReasonerFailed("prompt executor refused".to_string()))
+        Err(SpiError::ReasonerFailed(
+            "prompt executor refused".to_string(),
+        ))
     });
     let schema = json!({ "type": "object" });
     match reasoner.reason_structured(reason_request(&schema)).await {

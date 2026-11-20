@@ -46,12 +46,16 @@ pub struct MindStateView {
     pub records: Vec<Value>,
 }
 
-/// Carrier invariants for one stored record: `current` view, and held by the carrier entry.
-/// Compared fields: `record.view` must be `"current"`, and `record.holder` must be the complete
-/// reference `{kind: "knowledge_entry", namespace: CARRIER_NAMESPACE, id: carrier_entry_id}` —
-/// the carrier is always a `KnowledgeEntry` stored in the Mindcore realm, and the pinned schema
-/// guarantees all three fields on every validated record's holder reference. Nothing else on the
-/// record (target, assessor, timestamps) is checked here.
+/// Carrier invariants for one stored record: `current` view, held by the carrier entry,
+/// and a present `order` written as a JSON integer. Compared fields: `record.view` must be
+/// `"current"`, `record.holder` must be the complete reference
+/// `{kind: "knowledge_entry", namespace: CARRIER_NAMESPACE, id: carrier_entry_id}` — the
+/// carrier is always a `KnowledgeEntry` stored in the Mindcore realm, and the pinned
+/// schema guarantees all three fields on every validated record's holder reference — and
+/// `record.order`, when present, must deserialize as the pinned integer type: JSON Schema
+/// `integer` accepts `1.0`, but the typed `BeliefOrder` (`i64`) cannot read it, so a
+/// non-integer representation is refused here instead of poisoning later derivation.
+/// Nothing else on the record (target, assessor, timestamps) is checked here.
 /// Returns the violation message when the record cannot live in `carrier_entry_id`'s carrier.
 pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Option<String> {
     let record_id = record
@@ -83,6 +87,14 @@ pub fn carrier_record_violation(record: &Value, carrier_entry_id: &str) -> Optio
         return Some(format!(
             "record {record_id} names holder {:?}/{:?}/{:?} but the carrier entry is knowledge_entry/{CARRIER_NAMESPACE}/{carrier_entry_id:?}",
             actual.0, actual.1, actual.2
+        ));
+    }
+    if record
+        .get("order")
+        .is_some_and(|order| order.as_i64().is_none())
+    {
+        return Some(format!(
+            "record {record_id} carries a non-integer order representation"
         ));
     }
     None
