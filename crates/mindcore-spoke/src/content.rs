@@ -344,6 +344,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no review grant on subject {subject_id}"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
         // §7.7: `archived` hides the subject from the default listing; a
@@ -452,6 +454,8 @@ impl MemoryAdapter {
             // §7.13: incomplete coverage hides the row exactly as an absent id.
             return Err(Reject::not_found(format!("candidate {candidate_id}")));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         Self::ready::<MemoryCandidatesGetResponse>(
             json!({ "candidate": project::candidate_body(&candidate) }),
         )
@@ -731,6 +735,8 @@ impl MemoryAdapter {
         if !reads || (tombstoned && !admin) {
             return Err(Reject::not_found(format!("record {record_id}")));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         Self::ready::<MemoryRecordsGetResponse>(json!({ "record": project::record_body(&record) }))
     }
 
@@ -808,6 +814,8 @@ impl MemoryAdapter {
                 "include_tombstoned requires an admin grant on the subject",
             ));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
         let selection = RecordSelection {
@@ -1331,6 +1339,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no recall grant covering the selection"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
         // §7.7: `archived` excludes the subject's records from recall.
@@ -1485,6 +1495,8 @@ impl MemoryAdapter {
                 "principal {principal_id} holds no profile-visible grant on subject {subject_id}"
             )));
         }
+        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
+            .await?;
         let kinds: Vec<String> = request.profile_kinds.clone();
         let profiles = self
             .repository

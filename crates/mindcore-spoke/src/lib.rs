@@ -27,8 +27,8 @@ use spoke_operations::{SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 use sqlx::{Sqlite, Transaction};
 
-use mindcore_base::ids::SpaceId;
-use mindcore_base::ir::{ReceiptFailure, ReceiptState, ReviewReceiptIr};
+use mindcore_base::ids::{SpaceId, SubjectId};
+use mindcore_base::ir::{MemoryRepository, ReceiptFailure, ReceiptState, ReviewReceiptIr};
 use mindcore_sqlite::SqliteMemoryRepository;
 
 use crate::admission::Op;
@@ -195,6 +195,27 @@ impl MemoryAdapter {
             payload_digest: policy::payload_digest(request)?,
             now: chrono::Utc::now(),
         })
+    }
+
+    /// §5.2/D-10: the caller's subject content stays withheld while any of its
+    /// durable intents is unsettled. Authorized read paths probe this on the
+    /// same borrowed transaction as the read — after their admission and
+    /// visibility checks and before any content is selected or projected.
+    async fn withhold_if_unsettled(
+        &self,
+        tx: &mut Tx<'_>,
+        space: &SpaceId,
+        subject_id: &str,
+    ) -> AResult<()> {
+        let unsettled = self
+            .repository
+            .list_unsettled_intents(tx, space, &SubjectId::new(subject_id))
+            .await?;
+        if unsettled.is_empty() {
+            Ok(())
+        } else {
+            Err(Reject::unreconciled(subject_id))
+        }
     }
 
     /// An optional op this build does not serve (§4.1): no storage, no receipt.

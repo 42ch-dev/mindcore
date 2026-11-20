@@ -53,6 +53,20 @@ impl Reject {
         Self::terminal(SpokeRejectCode::NotAuthorized, message)
     }
 
+    /// §5.2/D-10: an authorized read met an unsettled journal intent for its
+    /// subject. The closed vocabulary names no withholding, so it maps to a
+    /// terminal `INTERNAL_ERROR` carrying only `reason` and `subject_id` —
+    /// never the generic retryable path, and no receipt id, target or storage
+    /// diagnostic.
+    pub(crate) fn unreconciled(subject_id: &str) -> Self {
+        Self::terminal(
+            SpokeRejectCode::InternalError,
+            "subject content is withheld until its durable intents settle",
+        )
+        .detail("reason", Value::String("UNRECONCILED".to_string()))
+        .detail("subject_id", Value::String(subject_id.to_string()))
+    }
+
     /// An optional family or op this adapter build does not serve (§4.1).
     pub(crate) fn unsupported(op: &str) -> Self {
         Self::terminal(

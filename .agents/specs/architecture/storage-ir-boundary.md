@@ -37,6 +37,8 @@ Mindcore's Memory adapter returns the same terminal `NOT_FOUND` for a missing by
 
 A backend that owns its own pool cannot satisfy this contract; choosing the borrowed shape is a commitment that the store must not also open a transaction for the same logical effect.
 
+Withheld reads (spec §5.2/D-10): while any of a subject's journal intents in a space is unsettled — the non-`applied` states `pending`, `deferred`, `quarantined`; Mindcore writes only `pending` and `applied` — the adapter refuses the subject's content reads (`memory.records.get`, `memory.records.list`, `memory.recall`, `memory.candidates.get`, `memory.candidates.list`, `memory.profile.get`, `memory.reflections.state`, `memory.reflections.list`) after authorization and visibility checks, before any content, counts, digest or cursor is selected or projected. The refusal is a terminal `INTERNAL_ERROR` with `details.reason = "UNRECONCILED"`, `details.retry_class = "terminal"` and `details.subject_id` — never Nexus-style empty projections, and never the generic retryable internal-error path or storage diagnostics. The probe is `MemoryRepository::list_unsettled_intents` on the same borrowed transaction as the read. By-id reads keep the concealment rule above: nonexistent, uncovered and non-admin tombstoned rows still answer `NOT_FOUND` without `subject_id`. `memory.receipts.get` is not guarded — a pending receipt keeps `OUTCOME_UNCERTAIN`, and committed or failed envelopes still serve.
+
 Ablation: the caller's transaction borrow is required to keep admission, persisted effects and receipt atomic without a second pool or a nested commit.
 
 ## Invariants
