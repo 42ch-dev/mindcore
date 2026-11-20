@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_journal SET state = 'applied' WHERE receipt_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "e7f1b83ef01bb602448aa9bbe9372cfb276ee5d8f5aff2e0a966656a5e599b6e"
+}

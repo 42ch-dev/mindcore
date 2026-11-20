@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_receipts (receipt_id, space_id, requester_principal_id, op, idempotency_key, payload_digest, status, result_json, error_json, created_at, completed_at, owner_id, lease_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 13
+    },
+    "nullable": []
+  },
+  "hash": "f7eedc365e6536a7f3c727be195322d11c94fbb3c548847c790c402ddcfb9273"
+}

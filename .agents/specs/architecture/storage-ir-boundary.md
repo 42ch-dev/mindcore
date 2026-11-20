@@ -11,7 +11,7 @@ The protocol adapter that converts wire types to this model and back is written 
 
 ## Current state
 
-`mindcore-base::ir` defines the record families and the wire codec; `crates/mindcore-base/tests/ir_roundtrip.rs` proves the fidelity invariant. `mindcore-sqlite` still persists SPOKE payload JSON directly and still implements `KnowledgeEntryPort` itself, so no backend currently reads or writes through the IR and no repository borrows a caller's transaction (`I-000020`). The Nexus memory schema mapping is likewise open (`I-000021`).
+`mindcore-base::ir` defines the record families and the wire codec; `crates/mindcore-base/tests/ir_roundtrip.rs` proves the fidelity invariant. `mindcore-sqlite` ships `SqliteMemoryRepository`: it implements `MemoryRepository`, persists through the IR on the Nexus memory schema, and borrows the caller's transaction — `I-000020` and `I-000021` are resolved. The legacy pool-owning `MindStore`/`KnowledgeEntryPort` paths still exist alongside it.
 
 ## Record and codec boundary
 
@@ -30,7 +30,7 @@ Ablation: the pre-typed JSON boundary is required because a generated default ma
 
 ## Repository boundary
 
-A future SPOKE adapter owns request validation, grant checks, replay decisions, revision CAS orchestration and reject mapping. `MemoryRepository` offers only the record operations used by capture/candidate/retain/recall. Its explicit `&mut Tx<'_>` is a borrow of an already-open backend transaction or read snapshot — not a pool, not optional. The integration caller owns acquisition, begin, commit and rollback.
+The SPOKE adapter (`crates/mindcore-spoke::MemoryAdapter`) owns request validation, grant checks, replay decisions, revision CAS orchestration and reject mapping. `MemoryRepository` spans the full selector surface it uses — records, candidates, receipts, profiles, reflections, journal intents, provider meta and space/subject rows. Its explicit `&mut Tx<'_>` is a borrow of an already-open backend transaction or read snapshot — not a pool, not optional. The integration caller owns acquisition, begin, commit and rollback.
 
 All reads used to decide a write (authorization evidence, idempotency probe, revision/precondition reads), effect writes and the effect's receipt use that same transaction. Repositories enforce storage constraints but do not reapply protocol policy, start or settle transactions, or migrate. There is no autocommit overload.
 
@@ -40,7 +40,7 @@ Ablation: the caller's transaction borrow is required to keep admission, persist
 
 ## Invariants
 
-- Preserve known values and all permitted unknown namespace/member names and nested values, including JSON type, in `extensions`, `modules` (object **or** array), opaque content and receipt result/error details where the schema allows them. Never filter, stringify, rename or reinterpret them. Unknown members of **closed** objects are not valid wire and must be refused, not discarded or silently passed through. Closed cognition record/module shapes still receive their pinned validators; the open module namespace does not make `cognition` itself open.
+- Preserve known values and all permitted unknown namespace/member names and nested values, including JSON type, in `extensions`, `modules` and opaque content and receipt result/error details where the schema allows them: `modules`, when present, is a namespace-keyed object; individual module values may be objects or arrays where permitted. Never filter, stringify, rename or reinterpret them. Unknown members of **closed** objects are not valid wire and must be refused, not discarded or silently passed through. Closed cognition record/module shapes still receive their pinned validators; the open module namespace does not make `cognition` itself open.
 - Preserve all array order, including duplicates where valid, at every depth: knowledge body tags/attributes, cognition `records`/`world_facts`/evidence, Memory provenance and result arrays, opaque product arrays. No sorting or deduplication. JSON object key order, whitespace, escape spelling and number token formatting are not contractual; compare JSON values, not serialization bytes. Timestamp and identifier **strings** keep their original value, including precision and spelling.
 - Preserve absence vs an explicit valid empty map/array/string, zero or false; preserve present JSON null wherever permitted (for example inside opaque JSON), and reject it where the schema forbids it. Do not materialize defaults or use null as a stand-in for omission: absent `modules` is not `modules: {}`, absent `revision` is not `revision: 0`, absent receipt `idempotency_key`/result/error is not a null field.
 - Compare original fixture JSON with rebuilt JSON for each wire family and each status branch, with a standalone cognition record exercised through a KnowledgeEntry carrier. Include unknown namespaces and deep sentinel values; ordered non-sorted arrays; paired absent/present-empty/present-value fixtures; a legitimate explicit null; and closed-object negatives. Assert independently that the IR exposes the decoded identity, state and representative payload, and that changing a real IR field changes the corresponding wire member without touching neighbours. Do not build expected JSON by serializing a typed value first. Dropping an open field, defaulting an absent field or reordering an array must turn at least one test red.
@@ -48,7 +48,7 @@ Ablation: the caller's transaction borrow is required to keep admission, persist
 ## Where it lives
 
 - Contract implementation: `crates/mindcore-base/src/ir.rs`, `crates/mindcore-base/src/ir/wire.rs`, `crates/mindcore-base/src/ir/wire/memory.rs`; round-trip proof: `crates/mindcore-base/tests/ir_roundtrip.rs`.
-- The existing `MemoryStore` and the SQLite adapter remain separate: the SQLite path does not read or write through the IR yet, and no repository borrows a caller's transaction. Both are open (`I-000020`, `I-000021`).
+- The legacy `MemoryStore`/`KnowledgeEntryPort` adapters in `mindcore-sqlite` remain separate pool-owning paths. `SqliteMemoryRepository` reads and writes through the IR on the Nexus memory schema inside the caller's transaction — both `I-000020` and `I-000021` are resolved.
 
 ## Change obligations
 

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_grants SET revoked_at = ? WHERE principal_id = 'p_revoked'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d1c5d1bf82d47b60091e15d39ffe42d425187b47ea433777a6e118606a16a765"
+}

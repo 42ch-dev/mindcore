@@ -1,0 +1,206 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT candidate_id, space_id, subject_id, capture_visibility, capture_context_id, kind, content_json, provenance_json, classification_json, status, consumed_by_json, content_digest, occurred_at, expires_at, revision, created_at FROM memory_candidates WHERE space_id = ? AND subject_id = ? AND (? OR (? AND capture_visibility = 'shared') OR capture_context_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR status = ?) ORDER BY created_at, candidate_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "candidate_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "candidate_id"
+          }
+        }
+      },
+      {
+        "name": "space_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "subject_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "capture_visibility",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "capture_visibility"
+          }
+        }
+      },
+      {
+        "name": "capture_context_id",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "capture_context_id"
+          }
+        }
+      },
+      {
+        "name": "kind",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "content_json",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "content_json"
+          }
+        }
+      },
+      {
+        "name": "provenance_json",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "provenance_json"
+          }
+        }
+      },
+      {
+        "name": "classification_json",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "classification_json"
+          }
+        }
+      },
+      {
+        "name": "status",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "name": "consumed_by_json",
+        "ordinal": 10,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "consumed_by_json"
+          }
+        }
+      },
+      {
+        "name": "content_digest",
+        "ordinal": 11,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "content_digest"
+          }
+        }
+      },
+      {
+        "name": "occurred_at",
+        "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "occurred_at"
+          }
+        }
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 13,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "name": "revision",
+        "ordinal": 14,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 15,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "37160b731ebac6284ae156659d79b5c83e0d8930ad45a360b2c1ea6eec75b35c"
+}

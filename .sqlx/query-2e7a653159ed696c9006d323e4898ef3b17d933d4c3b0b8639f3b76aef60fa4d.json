@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT content_json AS \"content_json!\", provenance_json, occurred_at FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "content_json!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "content_json"
+          }
+        }
+      },
+      {
+        "name": "provenance_json",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "provenance_json"
+          }
+        }
+      },
+      {
+        "name": "occurred_at",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "occurred_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "2e7a653159ed696c9006d323e4898ef3b17d933d4c3b0b8639f3b76aef60fa4d"
+}

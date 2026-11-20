@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) VALUES ('spc_other', 'sub_mira', 'active', 1, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "3500244b57dcf35ecfa969481e5655cf3764caa50d247b97f7dfe2e42ce46fe3"
+}

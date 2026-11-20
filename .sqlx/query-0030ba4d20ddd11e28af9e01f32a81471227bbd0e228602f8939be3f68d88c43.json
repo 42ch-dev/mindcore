@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_records (record_id, space_id, subject_id, kind, content_json, scope_visibility, scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, revision, created_at, updated_at) VALUES ('rec_1', ?, ?, 'fact', '{\"text\":\"a shared record\"}', 'shared', NULL, '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\"captured_at\":\"2026-11-20T09:20:01.123Z\"}', NULL, NULL, NULL, 1, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "0030ba4d20ddd11e28af9e01f32a81471227bbd0e228602f8939be3f68d88c43"
+}

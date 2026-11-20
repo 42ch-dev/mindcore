@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_grants SET subject_id = ?, principal_id = ?, capabilities_json = ?, context_ids_json = ?, shared_access = ?, expires_at = ?, revoked_at = ?, revision = ? WHERE grant_id = ? AND space_id = ? AND revision = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "a7df0976bada873aae5ed4375b7437399bd4d1c5ecd3cb1a9686cb5e4ce358da"
+}

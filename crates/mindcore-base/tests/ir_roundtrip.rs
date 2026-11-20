@@ -425,3 +425,170 @@ fn rejects_null_for_typed_optionals_and_nonpositive_version() {
         assert!(knowledge_entry_from_wire(entry).is_err());
     }
 }
+
+// I-000024: `modules.cognition.extensions` routes through the same namespace-keyed
+// extension-map rule as every other extensions site. A bare object read would admit all
+// three invalid shapes below, so these fixtures go red if the shared check is removed.
+#[test]
+fn cognition_module_extensions_share_the_extension_rule() {
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!({"Vendor.Key": {"note": 1}});
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::InvalidField { .. })
+    ));
+
+    // A namespace key with a non-object value passes the codec's key-only rule but is
+    // still refused by the pinned SPOKE cognition gate.
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!({"vendor": "not-an-object"});
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::Cognition(..))
+    ));
+
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!([{"vendor": {}}]);
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::InvalidField { .. })
+    ));
+
+    // A schema-valid opaque map still round-trips untouched.
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    entry["modules"]["cognition"]["extensions"] = json!({
+        "module_vendor": {"nested": [null, {"k": false}, 0]},
+        "other-ns": {}
+    });
+    let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
+    let cognition = ir.modules.as_ref().unwrap().cognition.as_ref().unwrap();
+    assert_eq!(cognition.extensions["module_vendor"]["nested"][2], json!(0));
+    assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+}
+
+// I-000024 (member sites): schema-declared cognition record, world-fact and
+// memory-content cognition-record `extensions` go through the same key-only rule before
+// the pinned SPOKE validator. A non-namespace key is `InvalidField`; a namespace key
+// with a non-object value passes the codec and is refused by SPOKE as `Cognition`.
+#[test]
+fn cognition_member_extensions_share_the_extension_rule() {
+    for site in ["records", "world_facts"] {
+        // Invalid namespace key inside a member's extension map.
+        let mut entry = knowledge_entry();
+        entry["modules"] = json!({"cognition": cognition_module()});
+        entry["modules"]["cognition"][site][0]["extensions"] = json!({"Bad.Key": {"v": 1}});
+        assert!(
+            matches!(
+                knowledge_entry_from_wire(entry),
+                Err(WireError::InvalidField {
+                    field: "extensions",
+                    ..
+                })
+            ),
+            "{site} member namespace key"
+        );
+
+        // A namespace key with a non-object value passes the codec's key-only rule but is
+        // still refused by the pinned SPOKE cognition gate.
+        let mut entry = knowledge_entry();
+        entry["modules"] = json!({"cognition": cognition_module()});
+        entry["modules"]["cognition"][site][0]["extensions"] = json!({"vendor": [1, 2]});
+        assert!(
+            matches!(
+                knowledge_entry_from_wire(entry),
+                Err(WireError::Cognition(..))
+            ),
+            "{site} member non-object value"
+        );
+    }
+
+    // Memory-content cognition records share the rule.
+    let mut candidate = pending_candidate();
+    candidate["proposed"]["content"]["cognition"] =
+        json!([{"kind": "arbitrary", "extensions": {"Bad.Key": {}}}]);
+    assert!(matches!(
+        memory_candidate_from_wire(candidate),
+        Err(WireError::InvalidField {
+            field: "extensions",
+            ..
+        })
+    ));
+
+    // Schema-valid member extension maps still round-trip untouched.
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({"cognition": cognition_module()});
+    let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
+    assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+}
+
+// I-000025: `modules` is a namespace-keyed object; object-or-array applies to the
+// individual namespace values, never to the container itself.
+#[test]
+fn modules_is_an_object_with_object_or_array_values() {
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!([{"vendor": {}}]);
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::ExpectedObject("knowledge_entry.modules"))
+    ));
+
+    let mut entry = knowledge_entry();
+    entry["modules"] = json!({
+        "object_ns": {"opaque": [null, {"Deep!": ""}]},
+        "array_ns": [true, ["z", "a"], null]
+    });
+    let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
+    let modules = ir.modules.as_ref().unwrap();
+    assert_eq!(modules.other["array_ns"], json!([true, ["z", "a"], null]));
+    assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+}
+
+// I-000024: extension values are opaque — the key grammar bounds the map, and any JSON
+// value shape round-trips losslessly at every non-SPOKE-gated extension site.
+#[test]
+fn extension_values_are_opaque_and_round_trip() {
+    for value in [json!(5), json!([1, "two", null]), json!("text")] {
+        let mut entry = knowledge_entry();
+        entry["extensions"] = json!({"md_note": value.clone()});
+        entry["source_anchor"] = anchor();
+        entry["source_anchor"]["extensions"] = json!({"md_note": value.clone()});
+        let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
+        assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+
+        let mut candidate = pending_candidate();
+        candidate["extensions"] = json!({"md_note": value.clone()});
+        candidate["provenance"]["anchors"][0]["extensions"] = json!({"md_note": value.clone()});
+        let (version, ir) = memory_candidate_from_wire(candidate.clone()).unwrap();
+        assert_eq!(memory_candidate_to_wire(version, ir), candidate);
+
+        let mut receipt = failed_receipt();
+        receipt["extensions"] = json!({"md_note": value.clone()});
+        receipt["error"]["extensions"] = json!({"md_note": value.clone()});
+        let (version, ir) = review_receipt_from_wire(receipt.clone()).unwrap();
+        assert_eq!(review_receipt_to_wire(version, ir), receipt);
+    }
+
+    // A key outside the namespace grammar is still refused on every site.
+    let mut entry = knowledge_entry();
+    entry["extensions"] = json!({"md.note": 1});
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::InvalidField {
+            field: "extensions",
+            ..
+        })
+    ));
+    let mut candidate = pending_candidate();
+    candidate["provenance"]["anchors"][1]["extensions"] = json!({"md.note": 1});
+    assert!(matches!(
+        memory_candidate_from_wire(candidate),
+        Err(WireError::InvalidField {
+            field: "extensions",
+            ..
+        })
+    ));
+}

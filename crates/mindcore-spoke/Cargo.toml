@@ -1,0 +1,22 @@
+[package]
+name = "mindcore-spoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+mindcore-base = { path = "../mindcore-base" }
+mindcore-sqlite = { path = "../mindcore-sqlite" }
+spoke-schemas.workspace = true
+spoke-operations.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

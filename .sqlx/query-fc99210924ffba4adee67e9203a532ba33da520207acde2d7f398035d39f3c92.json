@@ -1,0 +1,105 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT s.space_id, s.display_name, s.authority_host_id, s.authority_generation, s.status, s.revision, s.created_at, (SELECT COUNT(*) FROM memory_receipts r WHERE r.space_id = s.space_id AND r.status = 'pending') AS pending_receipts FROM memory_spaces s ORDER BY s.space_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "space_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_spaces",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "display_name",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_spaces",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "name": "authority_host_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_spaces",
+            "name": "authority_host_id"
+          }
+        }
+      },
+      {
+        "name": "authority_generation",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_spaces",
+            "name": "authority_generation"
+          }
+        }
+      },
+      {
+        "name": "status",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_spaces",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "name": "revision",
+        "ordinal": 5,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_spaces",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_spaces",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "pending_receipts",
+        "ordinal": 7,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fc99210924ffba4adee67e9203a532ba33da520207acde2d7f398035d39f3c92"
+}

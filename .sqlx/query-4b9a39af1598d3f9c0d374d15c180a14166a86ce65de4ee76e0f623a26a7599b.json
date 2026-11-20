@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT content_json AS \"content_json!\" FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "content_json!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_candidates",
+            "name": "content_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "4b9a39af1598d3f9c0d374d15c180a14166a86ce65de4ee76e0f623a26a7599b"
+}

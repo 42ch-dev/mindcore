@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_receipts SET result_json = ? WHERE idempotency_key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "fae4e509e20685cf4dad49ea49e3c0e99b153624cd79439e74ab18ea71b6c84d"
+}

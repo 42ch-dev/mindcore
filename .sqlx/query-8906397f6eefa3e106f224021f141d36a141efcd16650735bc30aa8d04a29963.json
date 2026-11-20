@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_reflections (seq, reflection_id, space_id, subject_id, requester_principal_id, selection_json, basis_json, engine_policy_version, schema_version, revision, extensions_json, created_at, body_text, body_format, stale_cache) VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), 'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, '{\"digest\":\"d\"}', 'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "8906397f6eefa3e106f224021f141d36a141efcd16650735bc30aa8d04a29963"
+}

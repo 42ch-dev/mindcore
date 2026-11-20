@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_journal SET state = ?, targets_json = ?, result_json = ?, updated_at = ? WHERE space_id = ? AND receipt_id = ? AND state = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "62dee9a2d6540ac95c4141ebc2395319ff86aa6a95a9e6bc7fecacd2c2569fb2"
+}

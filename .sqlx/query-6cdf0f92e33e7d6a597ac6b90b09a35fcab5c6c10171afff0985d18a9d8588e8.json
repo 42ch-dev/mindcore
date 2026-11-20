@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_subjects (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "6cdf0f92e33e7d6a597ac6b90b09a35fcab5c6c10171afff0985d18a9d8588e8"
+}

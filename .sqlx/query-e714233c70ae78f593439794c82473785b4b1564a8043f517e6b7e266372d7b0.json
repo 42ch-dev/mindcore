@@ -1,0 +1,182 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT record_id, space_id, subject_id, kind, content_json, scope_visibility, scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, revision, created_at, updated_at FROM memory_records WHERE space_id = ? AND subject_id = ? AND tombstone_json IS NULL AND (? IS NULL OR scope_context_id = ?) ORDER BY created_at DESC, record_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "record_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "record_id"
+          }
+        }
+      },
+      {
+        "name": "space_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "subject_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "kind",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "content_json",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "content_json"
+          }
+        }
+      },
+      {
+        "name": "scope_visibility",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "scope_visibility"
+          }
+        }
+      },
+      {
+        "name": "scope_context_id",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "scope_context_id"
+          }
+        }
+      },
+      {
+        "name": "provenance_json",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "provenance_json"
+          }
+        }
+      },
+      {
+        "name": "import_ref_json",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "import_ref_json"
+          }
+        }
+      },
+      {
+        "name": "occurred_at",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "occurred_at"
+          }
+        }
+      },
+      {
+        "name": "tombstone_json",
+        "ordinal": 10,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "tombstone_json"
+          }
+        }
+      },
+      {
+        "name": "revision",
+        "ordinal": 11,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 13,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e714233c70ae78f593439794c82473785b4b1564a8043f517e6b7e266372d7b0"
+}
