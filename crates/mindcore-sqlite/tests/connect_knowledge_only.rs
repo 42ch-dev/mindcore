@@ -11,7 +11,10 @@
 //! configured `scope_id` selects the store's one collection. A baseline-only
 //! session is denied on the wire, a peer outside its admission or a list that
 //! names another scope is refused before storage, and an entry in another
-//! collection is indistinguishable from a missing one.
+//! collection is indistinguishable from a missing one. A declared viewpoint
+//! needs the negotiated `ke-ownership` flag and stays bounded by the admission
+//! and the disclosure predicate, and an unsupported scope selection is refused
+//! instead of ignored.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -122,6 +125,16 @@ fn scope_of(scope_id: &str) -> Scope {
 fn viewpoint_scope(scope_id: &str, viewpoint: &str) -> Scope {
     serde_json::from_value(json!({ "scope_id": scope_id, "viewpoint": viewpoint }))
         .expect("scope JSON matches the schema")
+}
+
+/// The served `scope_id` plus one selection the knowledge face does not serve.
+fn scope_with(selection: Value) -> Scope {
+    let mut scope = json!({ "scope_id": SCOPE_ID });
+    scope
+        .as_object_mut()
+        .expect("scope object")
+        .extend(selection.as_object().expect("selection object").clone());
+    serde_json::from_value(scope).expect("scope JSON matches the schema")
 }
 
 fn knowledge_manifest(host_id: &str, capabilities: &[&str]) -> HostCapabilityManifest {
@@ -589,4 +602,321 @@ async fn owner_private_entry_stays_hidden_from_a_foreign_viewpoint() {
     );
     assert_eq!(after.body.summary.as_deref(), Some("mira private"));
     assert_eq!(after.revision, Some(1));
+}
+
+/// A refused put names neither the served collection nor whether the id exists:
+/// a conditional put of an id that is absent — including one that exists only
+/// in another collection — answers exactly like a stale visible row, and a
+/// create-only collision names no collection either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_put_names_no_collection() {
+    let fixture = Fixture::open().await;
+    let adapter_peer_id = derive_peer_id_from_ed25519_pubkey(
+        &SigningKey::from_bytes(&[0x42u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let session = connect_knowledge_session(
+        &fixture,
+        admission_of(&adapter_peer_id, scope_of(SCOPE_ID)),
+        &["spoke-knowledge"],
+    )
+    .await;
+
+    let foreign = expect_reject(
+        KnowledgeEntryPort::put_knowledge_entry(
+            &*session.adapter,
+            entry("ke_elsewhere", "hidden elsewhere"),
+            Some(1),
+        )
+        .await,
+        "conditional put of an id that exists only in another collection",
+    );
+    let absent = expect_reject(
+        KnowledgeEntryPort::put_knowledge_entry(
+            &*session.adapter,
+            entry("ke_absent", "never written"),
+            Some(1),
+        )
+        .await,
+        "conditional put of an absent id",
+    );
+    assert_eq!(foreign.code, SpokeRejectCode::StoredRevisionStale);
+    assert_eq!(absent.code, foreign.code);
+    assert_eq!(
+        foreign.message, "knowledge entry ke_elsewhere does not hold the expected revision",
+        "the stale refusal names no collection"
+    );
+    assert_eq!(
+        absent.message, "knowledge entry ke_absent does not hold the expected revision",
+        "an absent id reads exactly like a foreign-only one"
+    );
+    assert_eq!(
+        absent.details, foreign.details,
+        "both report the same revisions"
+    );
+    let details = foreign
+        .details
+        .clone()
+        .expect("stale reject carries revisions");
+    assert_eq!(
+        details
+            .get("expected_base_revision")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        details.get("stored_revision"),
+        Some(&Value::Null),
+        "a row outside the served collection has no stored revision"
+    );
+
+    let collision = expect_reject(
+        KnowledgeEntryPort::put_knowledge_entry(
+            &*session.adapter,
+            entry("ke_alpha", "second create"),
+            None,
+        )
+        .await,
+        "create-only put of a visible id",
+    );
+    assert_eq!(collision.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
+    assert_eq!(
+        collision.message, "knowledge entry ke_alpha already exists",
+        "the collision refusal names no collection"
+    );
+    for reject in [&foreign, &absent, &collision] {
+        assert!(
+            !reject.message.contains("collection"),
+            "a refused put never names the served collection: {reject:?}"
+        );
+    }
+
+    let listed = expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(&*session.adapter, &scope_of(SCOPE_ID)).await,
+        "list after the refused puts",
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .map(|entry| entry.entry_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ke_alpha", "ke_beta"],
+        "no refused put left a row behind"
+    );
+    let elsewhere = expect_ok(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(OTHER_COLLECTION))
+            .get_knowledge_entry("ke_elsewhere")
+            .await,
+        "the other collection still holds its own entry",
+    );
+    assert_eq!(elsewhere.body.summary.as_deref(), Some("studio only"));
+}
+
+/// A declared viewpoint is served only under the negotiated `ke-ownership`
+/// flag: without it the owned list is denied on the wire, while the same list
+/// without a viewpoint is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_viewpoint_requires_negotiated_ownership() {
+    let fixture = Fixture::open().await;
+    let adapter_peer_id = derive_peer_id_from_ed25519_pubkey(
+        &SigningKey::from_bytes(&[0x42u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let session = connect_knowledge_session(
+        &fixture,
+        admission_of(&adapter_peer_id, scope_of(SCOPE_ID)),
+        &["spoke-knowledge"],
+    )
+    .await;
+
+    expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(&*session.adapter, &scope_of(SCOPE_ID)).await,
+        "viewpoint-free list under spoke-knowledge alone",
+    );
+    let denied = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*session.adapter,
+            &viewpoint_scope(SCOPE_ID, OWNER_VIEWPOINT),
+        )
+        .await,
+        "viewpoint list without the negotiated ownership flag",
+    );
+    assert_eq!(
+        denied.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "the frozen ownership conjunct answers the op_unsupported wire deny"
+    );
+    assert!(
+        denied.message.contains("ke-ownership"),
+        "the refusal names the missing capability: {}",
+        denied.message
+    );
+}
+
+/// A negotiated viewpoint is honoured only for the admitted one and still
+/// cannot widen the query: another scope and another viewpoint are refused, and
+/// disclosure keeps the owner-private entry away from a foreign viewpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negotiated_viewpoint_cannot_bypass_admission_or_disclosure() {
+    let fixture = Fixture::open().await;
+    let adapter_peer_id = derive_peer_id_from_ed25519_pubkey(
+        &SigningKey::from_bytes(&[0x42u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let ownership = &["spoke-knowledge", "ke-ownership"];
+
+    let owner = connect_knowledge_session(
+        &fixture,
+        admission_of(&adapter_peer_id, viewpoint_scope(SCOPE_ID, OWNER_VIEWPOINT)),
+        ownership,
+    )
+    .await;
+    let owner_list = expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*owner.adapter,
+            &viewpoint_scope(SCOPE_ID, OWNER_VIEWPOINT),
+        )
+        .await,
+        "owner viewpoint list",
+    );
+    assert!(
+        owner_list
+            .iter()
+            .any(|entry| entry.entry_id == "ke_mira_private"),
+        "the negotiated viewpoint is honoured for the owner"
+    );
+
+    let widened = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*owner.adapter,
+            &viewpoint_scope(OTHER_SCOPE_ID, OWNER_VIEWPOINT),
+        )
+        .await,
+        "cross-scope viewpoint list",
+    );
+    assert_eq!(widened.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        widened.details.is_none(),
+        "the refusal carries no target details"
+    );
+
+    let claimed = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*owner.adapter,
+            &viewpoint_scope(SCOPE_ID, FOREIGN_VIEWPOINT),
+        )
+        .await,
+        "viewpoint the admission does not grant",
+    );
+    assert_eq!(
+        claimed.code,
+        SpokeRejectCode::NotAuthorized,
+        "the negotiated capability lets the request declare a viewpoint, never pick one"
+    );
+
+    let foreign = connect_knowledge_session(
+        &fixture,
+        admission_of(
+            &adapter_peer_id,
+            viewpoint_scope(SCOPE_ID, FOREIGN_VIEWPOINT),
+        ),
+        ownership,
+    )
+    .await;
+    let foreign_list = expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*foreign.adapter,
+            &viewpoint_scope(SCOPE_ID, FOREIGN_VIEWPOINT),
+        )
+        .await,
+        "foreign viewpoint list",
+    );
+    assert!(
+        !foreign_list
+            .iter()
+            .any(|entry| entry.entry_id == "ke_mira_private"),
+        "a negotiated viewpoint still obeys the disclosure predicate"
+    );
+    let hidden = expect_reject(
+        KnowledgeEntryPort::get_knowledge_entry(&*foreign.adapter, "ke_mira_private").await,
+        "foreign viewpoint get",
+    );
+    assert_eq!(hidden.code, SpokeRejectCode::KnowledgeEntryNotFound);
+}
+
+/// Every op refuses a scope carrying a selection the knowledge face does not
+/// serve, instead of silently ignoring it and answering for the bare scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_scope_selections_are_refused_by_the_served_store() {
+    let fixture = Fixture::open().await;
+    let served = fixture
+        .store
+        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let selections = [
+        (
+            "cognition",
+            json!({ "cognition": { "view": "recorded_at", "filter": {} } }),
+        ),
+        (
+            "timeline events",
+            json!({ "timeline_event_ids": ["tl_one"] }),
+        ),
+        ("timeline scale", json!({ "timeline_scale": "day" })),
+        ("fork", json!({ "fork_id": "fork_one" })),
+        ("extensions", json!({ "extensions": { "toy_world": {} } })),
+    ];
+
+    for (label, selection) in selections {
+        let scope = scope_with(selection);
+        let refusals = [
+            expect_reject(
+                served.get_scoped_knowledge_entry(&scope, "ke_alpha").await,
+                "get under an unsupported selection",
+            ),
+            expect_reject(
+                served
+                    .put_scoped_knowledge_entry(
+                        &scope,
+                        entry("ke_delta", "must not be written"),
+                        None,
+                    )
+                    .await,
+                "put under an unsupported selection",
+            ),
+            expect_reject(
+                served.list_scoped_knowledge_entries(&scope).await,
+                "list under an unsupported selection",
+            ),
+        ];
+        for reject in refusals {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::InvalidInput,
+                "an unsupported {label} selection is refused, not ignored"
+            );
+            assert!(
+                reject
+                    .message
+                    .contains("serves no cognition, timeline, fork or extension selection"),
+                "the refusal names the unsupported selection: {reject:?}"
+            );
+            assert!(reject.details.is_none(), "the refusal carries no details");
+        }
+    }
+
+    assert_eq!(
+        expect_reject(
+            served
+                .get_scoped_knowledge_entry(&scope_of(SCOPE_ID), "ke_delta")
+                .await,
+            "no refused put wrote a row",
+        )
+        .code,
+        SpokeRejectCode::KnowledgeEntryNotFound
+    );
 }
