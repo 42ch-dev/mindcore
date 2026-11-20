@@ -426,7 +426,9 @@ async fn prompt_reasoner_propagates_transport_refusals() {
         let counter = Arc::clone(&counter);
         async move {
             counter.fetch_add(1, Ordering::SeqCst);
-            Err(SpiError::ReasonerFailed("prompt executor refused".to_string()))
+            Err(SpiError::ReasonerFailed(
+                "prompt executor refused".to_string(),
+            ))
         }
     });
     let schema = json!({ "type": "object" });
