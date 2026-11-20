@@ -11,23 +11,22 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-        env:
-          SQLX_OFFLINE: "true"
-      - run: cargo test --locked --workspace
-        env:
-          SQLX_OFFLINE: "true"
       - name: sqlx offline cache freshness
         run: |
-          cargo install sqlx-cli --version '=0.9.1' --locked --no-default-features --features sqlite
+          # sqlx-cli generates the .sqlx cache that the locked sqlx crate consumes;
+          # the two must share one version, so resolve sqlx-cli from Cargo.lock.
+          SQLX_VERSION="$(cargo metadata --locked --format-version 1 \
+            | jq -r '[.packages[] | select(.name == "sqlx")] | if length == 1 then .[0].version else error("expected exactly one resolved sqlx package") end')"
+          cargo install sqlx-cli --version "=$SQLX_VERSION" --locked --no-default-features --features sqlite
           fixture_dir="$(mktemp -d)"
           trap 'rm -rf "$fixture_dir"' EXIT
           sqlite3 -bail "$fixture_dir/settlement.db" < crates/mindcore-sqlite/tests/fixtures/settlement-prepare.sql
@@ -40,3 +39,9 @@ jobs:
             git diff --stat -- .sqlx/
             exit 1
           fi
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        env:
+          SQLX_OFFLINE: "true"
+      - run: cargo test --locked --workspace
+        env:
+          SQLX_OFFLINE: "true"
