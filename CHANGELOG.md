@@ -24,8 +24,18 @@
   untested.
 - `mindcore-sqlite`: optional retained-vector storage. `memory_embedding_vectors` holds one
   little-endian `f32` vector per `(record_id, identity_hash)` with its record revision and dimension,
-  indexed by identity so a retired identity's whole partition is one delete. The new migration
-  applies to a database created before it; the table starts empty.
+  indexed by identity so a retired identity's whole partition is one delete. `0002` is additive and
+  applies at open to an existing database whose earlier migrations still match; only a database whose
+  applied `0001` no longer matches its file is refused by the checksum and must be recreated. The
+  table starts empty.
+- `mindcore-sqlite`: a knowledge list hydrates its page's cognition records in one statement keyed
+  by the page's entries, not one statement per entry.
+- `mindcore-spoke`: the recall knowledge slot applies the served list's disclosure predicate. The
+  workflow binding carries no admitted viewpoint, so an `owner`-private entry never enters the
+  pack, whatever budget the recall asks for.
+- `mindcore-spi` / `mindcore-spoke`: a tombstone holds no vector. `records.delete` prunes the
+  record's stored vector rows inside the tombstone's own transaction, and the recall page's miss
+  set covers live records only, so a tombstoned body is never re-embedded or filled.
 - `mindcore-spi` / `mindcore-spoke`: a confirmed absorb settlement warms the retained vector of each
   fresh or updated record when the host supplies an embedder with a stable serving identity. The
   settlement reports the revision it committed for every record it names, and the warm embeds only a
