@@ -7,7 +7,8 @@
 //!
 //! The mapping stays thin: decode, call the workflow, encode. [`SpiError::Settlement`] keeps its
 //! reject unchanged (code, message and details); the other variants map to the seam's stable
-//! kinds, and provider internals never reach the wire message.
+//! kinds. A policy veto carries the host's reason and a deadline its retry class; provider
+//! internals never reach the wire message.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
@@ -368,12 +369,15 @@ fn workflow_reject(error: SpiError) -> SpokeReject {
             message,
             details: None,
         },
-        SpiError::PolicyRejected(_) => SpokeReject {
-            code: SpokeRejectCode::NotAuthorized,
-            message: "the settlement policy refused this proposal".into(),
+        // A policy veto is the host's decision about the proposal, not a failure and not a lost
+        // admission: it carries its own kind and the host's reason. `NotAuthorized` stays the
+        // lost-admission code.
+        SpiError::PolicyRejected(reason) => SpokeReject {
+            code: SpokeRejectCode::InvalidInput,
+            message: reason,
             details: Some(kind_details("policy_rejected")),
         },
-        SpiError::DeadlineExceeded => workflow_internal("deadline_exceeded"),
+        SpiError::DeadlineExceeded => workflow_retryable("deadline_exceeded"),
         SpiError::EmbeddingsUnavailable => workflow_internal("embeddings_unavailable"),
         SpiError::EmbeddingFailed(_) => workflow_internal("embedding_failed"),
         SpiError::ReasonerUnavailable => workflow_internal("reasoner_unavailable"),
@@ -389,6 +393,15 @@ fn workflow_internal(kind: &str) -> SpokeReject {
         message: "the mind workflow could not complete".into(),
         details: Some(kind_details(kind)),
     }
+}
+
+/// A refusal the caller may repeat unchanged: the deadline left nothing committed behind it.
+fn workflow_retryable(kind: &str) -> SpokeReject {
+    let mut reject = workflow_internal(kind);
+    if let Some(details) = reject.details.as_mut() {
+        details.insert("retry_class".to_string(), Value::String("retryable".into()));
+    }
+    reject
 }
 
 fn kind_details(kind: &str) -> Map<String, Value> {
