@@ -569,9 +569,11 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert!(update_receipt.is_some(), "record update is journaled");
 
-    // D10 promote is a same-scope no-op here (shared -> shared), still staged
-    // on the caller's transaction; expected revision is now 2.
-    staged(
+    // D10 promote moves the record into context scope ctx-b — the baseline's
+    // scope-change case: the row's scope and revision update inside the
+    // caller's transaction and the change is journaled (pending receipt +
+    // intent staged, not committed).
+    let promote_receipt = staged(
         adapter
             .promote_record(
                 &mut tx,
@@ -580,15 +582,31 @@ async fn every_selector_takes_the_caller_transaction() {
                     "space_id": SPACE,
                     "record_id": rn,
                     "expected_revision": 2,
-                    "target_scope": { "visibility": "shared" },
+                    "target_scope": { "visibility": "context", "context_id": "ctx-b" },
                     "idempotency_key": "par-promote",
                 }),
             )
             .await,
         "records.promote",
     );
+    assert!(
+        promote_receipt.is_some(),
+        "scope-change promote is journaled"
+    );
+    let (scope_visibility, scope_context_id, promote_rev): (String, Option<String>, i64) =
+        sqlx::query_as(
+            "SELECT scope_visibility, scope_context_id, revision \
+             FROM memory_records WHERE record_id = ?1",
+        )
+        .bind(&rn)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("promoted row");
+    assert_eq!(scope_visibility, "context");
+    assert_eq!(scope_context_id.as_deref(), Some("ctx-b"));
+    assert_eq!(promote_rev, 3);
 
-    // D11 delete at the live revision (update bumped to 2, promote no-ops).
+    // D11 delete at the live revision (update bumped to 2, promote to 3).
     staged(
         adapter
             .delete_record(
@@ -597,7 +615,7 @@ async fn every_selector_takes_the_caller_transaction() {
                 json!({
                     "space_id": SPACE,
                     "record_id": rn,
-                    "expected_revision": 2,
+                    "expected_revision": 3,
                     "idempotency_key": "par-delete",
                 }),
             )
@@ -696,8 +714,10 @@ async fn every_selector_takes_the_caller_transaction() {
         .expect("state digest")
         .to_string();
 
-    // F2 generate — leased reflection or an honest reject; either way the
-    // adapter answered on the caller's transaction.
+    // F2 generate — this fixture is complete (personality profile + live
+    // records + matching state digest), so the expected path is a leased
+    // ReflectionPending: a pending receipt carrying the lease is staged
+    // inside the caller's transaction for transaction-2 completion.
     let generate = adapter
         .generate_reflection(
             &mut tx,
@@ -711,9 +731,17 @@ async fn every_selector_takes_the_caller_transaction() {
             }),
         )
         .await;
-    match &generate {
-        SpokeResult::Ok(_) | SpokeResult::Reject(_) => {}
-    }
+    let work = match generate {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("generate did not stage a reflection lease: {other:?}"),
+    };
+    let lease_status: String =
+        sqlx::query_scalar("SELECT status FROM memory_receipts WHERE receipt_id = ?1")
+            .bind(&work.receipt_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("leased receipt staged");
+    assert_eq!(lease_status, "pending");
 
     // F3 list reflections.
     ready(
@@ -835,6 +863,22 @@ async fn caller_commit_persists_effect_receipt_and_intent() {
             .await
             .expect("candidate lookup");
     assert_eq!(persisted_candidate.as_deref(), Some(candidate_id.as_str()));
+    // (a) the journaled operation's record row persisted.
+    let record_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_records")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("record count");
+    assert_eq!(record_count, 1, "the journaled record must persist");
+    // (b) capture's own committed receipt persisted beside its effect.
+    let (cap_status, cap_receipt_id): (String, String) = sqlx::query_as(
+        "SELECT status, receipt_id FROM memory_receipts WHERE op = 'memory.capture'",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("capture receipt");
+    assert_eq!(cap_status, "committed");
+    assert!(cap_receipt_id.starts_with("rct_"), "{cap_receipt_id}");
+    // (c) the journaled effect's pending receipt + pending intent persisted.
     let (status, journal_state): (String, String) = sqlx::query_as(
         "SELECT r.status, j.state \
          FROM memory_receipts r JOIN memory_journal j ON j.receipt_id = r.receipt_id \
