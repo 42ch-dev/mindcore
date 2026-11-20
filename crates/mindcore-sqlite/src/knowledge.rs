@@ -16,6 +16,35 @@ use spoke_schemas::{KnowledgeEntry, Scope};
 
 use crate::store::MindStore;
 
+/// Hard bound on one served collection list.
+///
+/// A served list decodes the routed collection's stored rows before the disclosure predicate
+/// filters them, so the collection is bounded at the query boundary instead of growing memory and
+/// work with its total size. An over-bound collection refuses the list; it never truncates.
+pub const SERVED_KNOWLEDGE_LIST_LIMIT: usize = 512;
+
+/// Refuse a scope carrying a selection the knowledge face does not serve.
+///
+/// The host admission callback applies this to the scope it returns, before Connect merges it with
+/// a list request: that merge keeps only the request's cognition selection, so a cognition
+/// selection admitted but never validated would be dropped from the list scope while `get`/`put`
+/// still see it. The routed store applies the same rule to every caller-declared scope.
+pub fn validate_admission_scope(scope: &Scope) -> SpokeResult<()> {
+    if scope.cognition.is_some()
+        || scope.timeline_event_ids.is_some()
+        || scope.timeline_scale.is_some()
+        || scope.fork_id.is_some()
+        || scope.extensions.is_some()
+    {
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            "the knowledge face serves no cognition, timeline, fork or extension selection",
+            None,
+        );
+    }
+    SpokeResult::Ok(())
+}
+
 /// A knowledge port bound to one collection.
 ///
 /// The scope is fixed at construction and never changes: every statement filters on it, so the port
@@ -70,8 +99,12 @@ where
         Ok(payloads) => payloads,
         Err(error) => return internal(format!("knowledge entries could not be listed: {error}")),
     };
+    decode_all(&payloads)
+}
+
+fn decode_all(payloads: &[String]) -> SpokeResult<Vec<KnowledgeEntry>> {
     let mut stored = Vec::with_capacity(payloads.len());
-    for payload in &payloads {
+    for payload in payloads {
         match decode(payload) {
             SpokeResult::Ok(entry) => stored.push(entry),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -113,7 +146,7 @@ pub struct RoutedKnowledgeStore {
 }
 
 impl RoutedKnowledgeStore {
-    pub fn new(pool: SqlitePool, scope_id: impl Into<String>, scope: KnowledgeScope) -> Self {
+    fn new(pool: SqlitePool, scope_id: impl Into<String>, scope: KnowledgeScope) -> Self {
         Self {
             pool,
             scope_id: scope_id.into(),
@@ -127,19 +160,36 @@ impl RoutedKnowledgeStore {
         if scope.scope_id != self.scope_id {
             return not_authorized();
         }
-        if scope.cognition.is_some()
-            || scope.timeline_event_ids.is_some()
-            || scope.timeline_scale.is_some()
-            || scope.fork_id.is_some()
-            || scope.extensions.is_some()
-        {
-            return spoke_reject(
-                SpokeRejectCode::InvalidInput,
-                "the knowledge face serves no cognition, timeline, fork or extension selection",
-                None,
-            );
+        validate_admission_scope(scope)
+    }
+
+    /// The routed collection's stored rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
+    /// over-bound collection refuses the list instead of growing memory and work with its size.
+    async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
+        let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
+        let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC LIMIT ?",
+        )
+        .bind(&self.scope.collection)
+        .bind(limit + 1)
+        .fetch_all(&self.pool)
+        .await;
+        let payloads = match payloads {
+            Ok(payloads) => payloads,
+            Err(error) => {
+                return internal(format!("knowledge entries could not be listed: {error}"))
+            }
+        };
+        let stored = match decode_all(&payloads) {
+            SpokeResult::Ok(stored) => stored,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if stored.len() as i64 > limit {
+            return internal(format!(
+                "the served collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list op is bounded"
+            ));
         }
-        SpokeResult::Ok(())
+        SpokeResult::Ok(stored)
     }
 }
 
@@ -232,7 +282,7 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         if let SpokeResult::Reject(reject) = self.admit(scope) {
             return SpokeResult::Reject(reject);
         }
-        let entries = match entries(&self.pool, &self.scope.collection).await {
+        let entries = match self.served_entries().await {
             SpokeResult::Ok(entries) => entries,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
