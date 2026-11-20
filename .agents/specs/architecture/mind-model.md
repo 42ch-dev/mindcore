@@ -13,6 +13,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - Knowledge: an entry is created with `expected_base_revision = None` only when absent, updated with `Some(revision)` only when the stored revision equals it, and the adapter assigns `1` or `stored + 1` into both the column and the payload. Every write binds the collection fixed when the port instance was constructed; refusals leave the row untouched.
 - Cognition: current judgment lives on the holder's `KnowledgeEntry` under `modules.cognition` (`{records, world_facts, extensions}`); each append validates the incoming record as `view = "current"`, rejects duplicate record ids and leaves `revision` untouched. A stored record is accepted only when its holder is exactly `{kind: "knowledge_entry", namespace: "mindcore", id: <carrier entry id>}` — checked at `put_knowledge_entry` before the write reservation and again in `derive_mind_state`. `MindState` is derived from the carrier's authorized revision and is never persisted.
 - A present `modules.cognition` module is validated at the single persistence boundary (`put_knowledge_entry`) before the write reservation, so no path can commit an invalid carrier.
+- A present `order` on a stored cognition record must be written as a JSON integer representation: the pinned `BeliefOrder` type reads `i64` only, so `1.0` (or any non-integer number) is refused at the same carrier boundary — append and `put_knowledge_entry` share this rule, and the generic IR codec is not narrowed.
 
 ## Invariants
 

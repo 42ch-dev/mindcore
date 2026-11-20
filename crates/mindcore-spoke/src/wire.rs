@@ -24,10 +24,10 @@ pub(crate) fn object<'a>(value: &'a Value, what: &str) -> AResult<&'a Map<String
 /// any repository access (Nexus conformance `cognition_filter_unsupported`).
 pub(crate) fn reject_cognition_filter(raw: &Value) -> AResult<()> {
     match raw.as_object() {
-        Some(object) if object.contains_key("cognition_filter") => {
-            Err(Reject::invalid("this provider does not serve cognition-filtered requests")
-                .detail("field", json!("cognition_filter")))
-        }
+        Some(object) if object.contains_key("cognition_filter") => Err(Reject::invalid(
+            "this provider does not serve cognition-filtered requests",
+        )
+        .detail("field", json!("cognition_filter"))),
         _ => Ok(()),
     }
 }

@@ -354,7 +354,7 @@ async fn leased_receipt_settle_guarded_by_owner() {
 }
 
 /// §7.0.3 liveness: a crashed generation leaves a pending receipt under its lease; past the
-/// lease instant a different owner takes it over and settles.
+/// lease instant a different owner claims it, and only the persisted new owner settles.
 #[tokio::test]
 async fn expired_lease_pending_receipt_taken_over() {
     let dir = TempDir::new().unwrap();
@@ -384,6 +384,48 @@ async fn expired_lease_pending_receipt_taken_over() {
         .await
         .unwrap();
 
+    // A different owner claims the abandoned pending row: the CAS persists the new
+    // owner and expiry inside this caller-owned transaction. The expiry is measured
+    // from the claim instant (30s lease), not from when the transaction began.
+    assert!(repo
+        .claim_receipt_lease(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "rcp_gen_crash",
+            "instance-2",
+            30
+        )
+        .await
+        .unwrap());
+    // The stamped lease is in the future: a takeover stamped from the request
+    // instant could already be expired and re-leasable on the very next retry.
+    let stamped = repo
+        .receipt_lease(&mut tx, &SpaceId::new("spc_workshop"), "rcp_gen_crash")
+        .await
+        .unwrap()
+        .expect("claimed row carries a lease");
+    let stamped_at = chrono::DateTime::parse_from_rfc3339(&stamped).expect("lease stamp");
+    let claim_window = (
+        chrono::Utc::now() + chrono::Duration::seconds(25),
+        chrono::Utc::now() + chrono::Duration::seconds(35),
+    );
+    assert!(
+        stamped_at > claim_window.0 && stamped_at < claim_window.1,
+        "stamped lease {stamped} must be now+30s, inside {claim_window:?}"
+    );
+    // The claim is lost when the row no longer qualifies — already re-leased here, so the
+    // second claimant gets no work and the crashed owner still cannot settle.
+    assert!(!repo
+        .claim_receipt_lease(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "rcp_gen_crash",
+            "instance-3",
+            30
+        )
+        .await
+        .unwrap());
+
     let settled = ReviewReceiptIr {
         state: ReceiptState::Committed {
             completed_at: LATER.into(),
@@ -391,7 +433,15 @@ async fn expired_lease_pending_receipt_taken_over() {
         },
         ..pending.clone()
     };
-    // A different owner settles the abandoned pending row after lease expiry.
+    // Neither the crashed nor the losing owner can settle: owner matching is exact, and
+    // the expiry bypass is gone.
+    for stale_owner in ["instance-crashed", "instance-3"] {
+        assert!(!repo
+            .update_receipt(&mut tx, &settled, "pending", Some(stale_owner))
+            .await
+            .unwrap());
+    }
+    // The persisted takeover owner settles.
     assert!(repo
         .update_receipt(&mut tx, &settled, "pending", Some("instance-2"))
         .await
@@ -1406,9 +1456,7 @@ async fn absent_include_shared_and_null_filter_decode() {
            'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, \
            '{\"digest\":\"d\"}', 'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
     )
-    .bind(
-        "{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"],\"include_shared\":\"yes\"}",
-    )
+    .bind("{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"],\"include_shared\":\"yes\"}")
     .bind(TIME)
     .execute(&mut *tx)
     .await
