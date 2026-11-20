@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_receipts SET lease_expires_at = '2020-01-01T00:00:00.000Z' WHERE receipt_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "3e9387da6ee5e0b5abbe2d1d0165c5529ec6c1729dfa9a1f3ecac81c0bdced3c"
+}

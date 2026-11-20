@@ -563,7 +563,9 @@ pub trait MemoryRepository: Send + Sync {
     ) -> Result<(), Self::Error>;
 
     /// Replaces a receipt's status/payload guarded by its previously observed status and
-    /// owner; `observed_owner: None` matches an unleased (`NULL`) owner, never a wildcard.
+    /// owner; `observed_owner: None` matches an unleased (`NULL`) owner, never a wildcard. A
+    /// still-pending row whose lease instant passed is taken over by any owner (§7.0.3), so a
+    /// crashed generation cannot wedge its idempotency key; settled rows are never taken over.
     async fn update_receipt(
         &self,
         tx: &mut Self::Tx<'_>,
@@ -571,6 +573,16 @@ pub trait MemoryRepository: Send + Sync {
         observed_state: &str,
         observed_owner: Option<&str>,
     ) -> Result<bool, Self::Error>;
+
+    /// The stored lease expiry instant of one receipt: `Some` for a leased row, `None` for
+    /// an unleased or missing row. Probes read it to decide whether a pending row is
+    /// abandoned enough to take over.
+    async fn receipt_lease(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> Result<Option<String>, Self::Error>;
 
     /// Profiles of one subject; `kinds` restricts the profile kinds, empty selects all.
     async fn list_profiles(

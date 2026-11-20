@@ -342,9 +342,25 @@ impl MemoryAdapter {
             freeze_gated: true,
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
-        if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay::<MemoryReflectionsGenerateResponse>(&receipt);
-        }
+        // A probed receipt settles the key outright, except a pending row whose lease
+        // already lapsed: that retry takes it over below instead of answering uncertain
+        // forever.
+        let take_over = match admission::probe(&self.repository, tx, &op).await? {
+            Some(receipt)
+                if matches!(receipt.state, ReceiptState::Pending)
+                    && self
+                        .repository
+                        .receipt_lease(tx, &op.space, receipt.receipt_id.as_str())
+                        .await?
+                        .is_some_and(|expires_at| expires_at < policy::timestamp(op.now)) =>
+            {
+                Some(receipt.receipt_id.clone())
+            }
+            Some(receipt) => {
+                return Self::replay::<MemoryReflectionsGenerateResponse>(&receipt);
+            }
+            None => None,
+        };
         admission::gate(&self.repository, tx, &admission).await?;
         let basis = self
             .basis(
@@ -382,7 +398,6 @@ impl MemoryAdapter {
                 format!("subject {subject_id} has no authorized basis to generate from"),
             ));
         }
-        let receipt_id = mint("rct");
         let basis_json = json!({
             "profile_revisions": basis.profile_revisions.iter().map(|(kind, revision)| (kind.clone(), json!(revision))).collect::<Map<String, Value>>(),
             "record_count": basis.records.len(),
@@ -390,21 +405,30 @@ impl MemoryAdapter {
             "state_digest": current,
         });
         // §7.0.3: transaction 1 publishes the pending receipt and its lease; the
-        // caller commits, composes, and completes in transaction 2.
-        let lease = ReceiptLease {
-            owner_id: mint("own"),
-            expires_at: policy::timestamp(
-                op.now + chrono::Duration::seconds(GENERATION_LEASE_SECONDS),
-            ),
+        // caller commits, composes, and completes in transaction 2. A retry that
+        // found the abandoned pending row keeps its receipt id and takes it over
+        // under a fresh owner — the lapsed lease makes the settle CAS admit it.
+        let (receipt_id, owner_id) = match take_over {
+            Some(receipt_id) => (receipt_id, mint("own")),
+            None => {
+                let receipt_id = mint("rct");
+                let lease = ReceiptLease {
+                    owner_id: mint("own"),
+                    expires_at: policy::timestamp(
+                        op.now + chrono::Duration::seconds(GENERATION_LEASE_SECONDS),
+                    ),
+                };
+                let receipt = admission::pending_receipt(&op, receipt_id.as_str());
+                self.repository
+                    .insert_receipt(tx, &receipt, Some(&lease))
+                    .await?;
+                (receipt_id, lease.owner_id)
+            }
         };
-        let receipt = admission::pending_receipt(&op, receipt_id.as_str());
-        self.repository
-            .insert_receipt(tx, &receipt, Some(&lease))
-            .await?;
         Ok(MemoryStage::ReflectionPending(ReflectionWork {
             space: op.space.clone(),
             receipt_id,
-            owner_id: lease.owner_id,
+            owner_id,
             subject_id,
             selection: selection_json,
             filter: filter_json,
@@ -416,10 +440,12 @@ impl MemoryAdapter {
     // ── §7.27 generate completion (transaction 2) ──────────────────────
 
     /// Complete a leased generation in a fresh caller transaction: insert
-    /// the envelope and settle the pending receipt ONLY when that receipt
-    /// is still pending under the composed effect's owner. Any other owner
-    /// or state rolls the envelope back with the settlement, and the
-    /// completion is returned only after this transaction commits.
+    /// the envelope and settle the pending receipt when that receipt is
+    /// still pending under the composed effect's owner — or pending past
+    /// its lease, which any owner takes over to unwedge a crashed run.
+    /// A live lease under another owner, or a settled row, rolls the
+    /// envelope back with the settlement, and the completion is returned
+    /// only after this transaction commits.
     pub async fn complete_reflection(
         &self,
         tx: &mut Tx<'_>,
@@ -508,9 +534,10 @@ impl MemoryAdapter {
             },
             ..*receipt
         };
-        // The CAS carries the lease identity: only the owner the receipt was
-        // leased to may settle it, so a cross-owner or re-settled row refuses
-        // here and the caller's rollback removes the envelope with it.
+        // The CAS carries the lease identity: while the lease is live only the owner it was
+        // leased to may settle; past expiry the pending row is taken over, so a crashed
+        // generation unwedges. A re-settled or live wrong-owner row still refuses here and
+        // the caller's rollback removes the envelope with it.
         if !self
             .repository
             .update_receipt(tx, &settled, "pending", Some(effect.owner_id.as_str()))

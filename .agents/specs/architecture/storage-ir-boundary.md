@@ -11,7 +11,7 @@ The protocol adapter that converts wire types to this model and back is written 
 
 ## Current state
 
-`mindcore-base::ir` defines the record families and the wire codec; `crates/mindcore-base/tests/ir_roundtrip.rs` proves the fidelity invariant. `mindcore-sqlite` still persists SPOKE payload JSON directly and still implements `KnowledgeEntryPort` itself, so no backend currently reads or writes through the IR and no repository borrows a caller's transaction (`I-000020`). The Nexus memory schema mapping is likewise open (`I-000021`).
+`mindcore-base::ir` defines the record families and the wire codec; `crates/mindcore-base/tests/ir_roundtrip.rs` proves the fidelity invariant. `mindcore-sqlite` ships `SqliteMemoryRepository`: it implements `MemoryRepository`, persists through the IR on the Nexus memory schema, and borrows the caller's transaction — `I-000020` and `I-000021` are resolved. The legacy pool-owning `MindStore`/`KnowledgeEntryPort` paths still exist alongside it.
 
 ## Record and codec boundary
 
@@ -30,7 +30,7 @@ Ablation: the pre-typed JSON boundary is required because a generated default ma
 
 ## Repository boundary
 
-A future SPOKE adapter owns request validation, grant checks, replay decisions, revision CAS orchestration and reject mapping. `MemoryRepository` offers only the record operations used by capture/candidate/retain/recall. Its explicit `&mut Tx<'_>` is a borrow of an already-open backend transaction or read snapshot — not a pool, not optional. The integration caller owns acquisition, begin, commit and rollback.
+The SPOKE adapter (`crates/mindcore-spoke::MemoryAdapter`) owns request validation, grant checks, replay decisions, revision CAS orchestration and reject mapping. `MemoryRepository` spans the full selector surface it uses — records, candidates, receipts, profiles, reflections, journal intents, provider meta and space/subject rows. Its explicit `&mut Tx<'_>` is a borrow of an already-open backend transaction or read snapshot — not a pool, not optional. The integration caller owns acquisition, begin, commit and rollback.
 
 All reads used to decide a write (authorization evidence, idempotency probe, revision/precondition reads), effect writes and the effect's receipt use that same transaction. Repositories enforce storage constraints but do not reapply protocol policy, start or settle transactions, or migrate. There is no autocommit overload.
 
@@ -48,7 +48,7 @@ Ablation: the caller's transaction borrow is required to keep admission, persist
 ## Where it lives
 
 - Contract implementation: `crates/mindcore-base/src/ir.rs`, `crates/mindcore-base/src/ir/wire.rs`, `crates/mindcore-base/src/ir/wire/memory.rs`; round-trip proof: `crates/mindcore-base/tests/ir_roundtrip.rs`.
-- The existing `MemoryStore` and the SQLite adapter remain separate: the SQLite path does not read or write through the IR yet, and no repository borrows a caller's transaction. Both are open (`I-000020`, `I-000021`).
+- The legacy `MemoryStore`/`KnowledgeEntryPort` adapters in `mindcore-sqlite` remain separate pool-owning paths. `SqliteMemoryRepository` reads and writes through the IR on the Nexus memory schema inside the caller's transaction — both `I-000020` and `I-000021` are resolved.
 
 ## Change obligations
 
