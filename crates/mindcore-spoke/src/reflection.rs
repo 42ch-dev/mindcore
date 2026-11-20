@@ -506,7 +506,7 @@ impl MemoryAdapter {
                     "cost": { "unit_kind": unit_kind, "units": units },
                 }),
             },
-            ..receipt
+            ..*receipt
         };
         // The CAS carries the lease identity: only the owner the receipt was
         // leased to may settle it, so a cross-owner or re-settled row refuses

@@ -546,7 +546,7 @@ pub(crate) async fn probe(
                     ),
                 ));
             }
-            Ok(Some(receipt))
+            Ok(Some(*receipt))
         }
         Some(ReceiptRead::Evicted {
             payload_digest,

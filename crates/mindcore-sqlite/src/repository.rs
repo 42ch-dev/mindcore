@@ -569,7 +569,7 @@ fn receipt_read(row: &ReceiptRow) -> RepoResult<ReceiptRead> {
     }
     let wire = receipt_wire(row)?;
     let (_, ir) = review_receipt_from_wire(wire).map_err(invalid_row)?;
-    Ok(ReceiptRead::Retained(ir))
+    Ok(ReceiptRead::Retained(Box::new(ir)))
 }
 
 struct ReceiptColumns {
