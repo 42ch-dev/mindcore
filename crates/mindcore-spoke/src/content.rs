@@ -1297,6 +1297,10 @@ impl MemoryAdapter {
                 "record revision changed while the tombstone was written",
             ));
         }
+        // A tombstone keeps no vector: the row is unreachable and would only grow. The delete is
+        // cache-only — a storage failure leaves that stale row rather than refusing the durable
+        // tombstone, and the prune runs in the tombstone's own transaction so a rollback keeps it.
+        let _ = mindcore_sqlite::vectors::delete_record_vectors(&mut **tx, &record_id).await;
         let effect = effects::record_effect(
             &updated,
             Some(effects::projection_digest(
