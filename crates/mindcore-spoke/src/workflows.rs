@@ -652,7 +652,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let collection = self
             .admitted_collection(&mut transaction, principal, space_id, &[KNOWLEDGE_READ])
             .await?;
-        let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
+        let carrier = match read_entry(&mut transaction, collection, holder.id.as_str()).await {
             SpokeResult::Ok(carrier) => carrier,
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };

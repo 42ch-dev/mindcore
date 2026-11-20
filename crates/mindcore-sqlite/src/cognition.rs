@@ -31,9 +31,12 @@ pub async fn write_carrier(
 
 /// Appends one prepared record row at `append_seq` through the caller's transaction.
 ///
-/// The caller owns the head pointer and the carrier revision, so the row commits together with
-/// them or not at all. A duplicate scoped `record_id` is invalid input, not a storage failure.
-pub async fn insert_record(
+/// Crate-private raw row writer: `append_cognition` and the port's full put
+/// (`write_entry`) are its only callers, and they own every invariant this helper
+/// does not check — the record's wire shape, its holder identity, the carrier
+/// revision, the head pointer and the envelope. A duplicate scoped `record_id` is
+/// invalid input, not a storage failure.
+pub(crate) async fn insert_record(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,

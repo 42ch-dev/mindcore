@@ -165,14 +165,14 @@ fn stale<T>(
     )
 }
 
-/// One entry of `collection`, read through the caller's connection: the scoped
+/// One entry of `collection`, read through the caller's transaction: the scoped
 /// port and the workflow binding share this read, and a settlement reads it at
 /// the same point as the write it guards. The cognition module's records are
-/// projected from the holder's record rows in append order. The payload and the
-/// record rows are one snapshot only while `connection` holds a transaction —
-/// the port's pool reads begin one, and the workflow bindings hold theirs.
+/// projected from the holder's record rows in append order. Taking the
+/// transaction pins the payload and the record rows to one snapshot — the same
+/// whole read `list_entries_in` makes.
 pub async fn read_entry(
-    connection: &mut SqliteConnection,
+    tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,
 ) -> SpokeResult<KnowledgeEntry> {
@@ -181,7 +181,7 @@ pub async fn read_entry(
     )
     .bind(collection)
     .bind(entry_id)
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut **tx)
     .await;
     match payload {
         Ok(Some(payload)) => {
@@ -190,7 +190,7 @@ pub async fn read_entry(
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             };
             if let SpokeResult::Reject(reject) =
-                hydrate_cognition_records(connection, collection, &mut entry).await
+                hydrate_cognition_records(&mut **tx, collection, &mut entry).await
             {
                 return SpokeResult::Reject(reject);
             }
@@ -325,12 +325,19 @@ pub async fn write_entry(
     };
     let stored_created_at = stored.as_ref().map(|(_, created_at)| created_at.clone());
     let stored = stored.map(|(revision, _)| revision as u64);
-    let submitted_records = match entry.modules.get(&module_key()) {
-        Some(KnowledgeEntryModulesValue::Object(module)) => module
-            .get("records")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
+    // The submitted history moves out of the envelope instead of being copied: the
+    // module gate above pinned `records` to an array, the replace leaves exactly the
+    // empty member the stored payload requires, and the suffix inserts plus the
+    // returned DTO reuse the taken values — the old code copied this history twice,
+    // once here and once into the whole-entry clone before encoding.
+    let mut submitted_records: Vec<Value> = match entry.modules.get_mut(&module_key()) {
+        Some(KnowledgeEntryModulesValue::Object(module)) => match module.get_mut("records") {
+            Some(records) => match std::mem::replace(records, Value::Array(Vec::new())) {
+                Value::Array(records) => records,
+                _ => unreachable!("validated cognition module carries a records array"),
+            },
+            None => Vec::new(),
+        },
         _ => Vec::new(),
     };
 
@@ -410,11 +417,10 @@ pub async fn write_entry(
         }
     }
 
-    // The stored payload keeps the cognition envelope only: the record rows carry the values,
-    // and the empty `records` key preserves the member's presence.
-    let mut stored_entry = entry.clone();
-    strip_records(&mut stored_entry);
-    let payload = match encode(&stored_entry) {
+    // The stored payload keeps the cognition envelope only: the record rows carry the
+    // values, and the emptied `records` member preserves its presence — the encoding
+    // borrows the entry, no whole-entry copy.
+    let payload = match encode(&entry) {
         SpokeResult::Ok(payload) => payload,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
@@ -487,6 +493,13 @@ pub async fn write_entry(
     };
     if let Err(error) = written {
         return internal(format!("knowledge entry could not be written: {error}"));
+    }
+    // The returned DTO owns the submitted history: put the taken values back.
+    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&module_key())
+    {
+        if let Some(records) = module.get_mut("records") {
+            *records = Value::Array(std::mem::take(&mut submitted_records));
+        }
     }
     SpokeResult::Ok(entry)
 }
@@ -613,7 +626,7 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
             Ok(tx) => tx,
             Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
         };
-        match read_entry(&mut *tx, &self.scope.collection, entry_id).await {
+        match read_entry(&mut tx, &self.scope.collection, entry_id).await {
             SpokeResult::Ok(entry) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(entry),
                 Err(error) => internal(format!("knowledge entry could not be read: {error}")),

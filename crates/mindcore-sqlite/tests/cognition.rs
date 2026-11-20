@@ -11,7 +11,7 @@ use mindcore_base::cognition::{
 };
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_sqlite::cognition::{
-    insert_record, read_carrier, read_current_record, read_record, read_records, write_carrier,
+    read_carrier, read_current_record, read_record, read_records, write_carrier,
 };
 use mindcore_sqlite::{append_cognition, read_carrier_header, MindStore};
 use serde_json::{json, Value};
@@ -771,10 +771,10 @@ async fn float_order_record_is_rejected_on_direct_put() {
     store.close().await;
 }
 
-/// The record rows are the storage authority: they read back in `append_seq` order rather than
-/// the records' own `order`, a scoped `record_id` addresses one row, and a duplicate id in the
-/// same holder is invalid input. The header read sees the assigned revision with no head until
-/// an append advances it.
+/// The record rows are the storage authority, committed through the guarded append: they
+/// read back in `append_seq` order rather than the records' own `order`, a scoped
+/// `record_id` addresses one row, and a duplicate id in the same holder is invalid input.
+/// The header read sees the assigned revision with no head until an append advances it.
 #[tokio::test]
 async fn record_rows_keep_append_order_and_scoped_ids() {
     let temp = TempDb::new();
@@ -796,21 +796,21 @@ async fn record_rows_keep_append_order_and_scoped_ids() {
     );
     assert_eq!((header.revision, header.head_seq), (1, None));
 
-    // The second record sorts first by its own `order`: only the storage order may decide.
-    let mut second_by_storage = belief("cog_early", 0.6);
-    second_by_storage["order"] = json!(2);
+    // The second record carries its own `order` (2), independent of its storage
+    // position (second append): only the storage order may decide the read-back.
+    let second_by_storage = with_order(belief("cog_early", 0.6), 2);
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
     expect_ok(
-        insert_record(&mut tx, "wren", "ke_wren", 1, &belief("cog_late", 0.4)).await,
+        append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_late", 0.4)).await,
         "first record",
     );
     expect_ok(
-        insert_record(&mut tx, "wren", "ke_wren", 2, &second_by_storage).await,
+        append_cognition(&mut tx, "wren", "ke_wren", 2, &second_by_storage).await,
         "second record",
     );
-    match insert_record(&mut tx, "wren", "ke_wren", 3, &belief("cog_late", 0.9)).await {
+    match append_cognition(&mut tx, "wren", "ke_wren", 3, &belief("cog_late", 0.9)).await {
         SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
-        SpokeResult::Ok(()) => panic!("a duplicate scoped record_id must not be stored"),
+        SpokeResult::Ok(_) => panic!("a duplicate scoped record_id must not be stored"),
     }
     tx.commit().await.expect("commit");
 
