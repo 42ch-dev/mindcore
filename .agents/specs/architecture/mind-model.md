@@ -21,12 +21,14 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - A candidate is not recallable before review; a rejected write changes neither payload nor revision.
 - An entry is resolvable only through a port bound to its own collection, even when two collections hold the same raw `entry_id`; no API accepts a caller-supplied collection, `owner` or `viewpoint` as a selector.
 - Only an explicit carrier update changes the current judgment; adoption, a shared-content change and a read never do. Appending preserves the previously committed records byte-for-byte.
-- Stored timestamps are fixed-width RFC 3339 UTC; a value that cannot be read back is refused before insert.
+- Legacy `MemoryStore` capture and retain write timestamps as fixed-width RFC 3339 UTC, and `capture` refuses a caller timestamp it cannot read back before insert.
+- `ScopedKnowledgeStore` keeps the caller's timestamp values in the `KnowledgeEntry` payload without that memory round-trip refusal; the store encodes only its separate SQL bookkeeping columns. Raw timestamp spelling is not a guarantee of the typed knowledge port — wire fidelity belongs to the IR codec (`storage-ir-boundary.md`).
 
 ## Where it lives
 
 - `crates/mindcore-base/src/{ids,boundary,memory,knowledge,cognition}.rs`
 - `crates/mindcore-sqlite/src/{store,memory,knowledge,cognition}.rs`
+- Decision: [standalone embedded SQLite store](../../adr/implemented/architecture/2026-11-20-embedded-sqlite-storage.md)
 - `crates/mindcore-sqlite/migrations/0001_init.sql`
 - Tests: `crates/mindcore-sqlite/tests/{memory,knowledge,cognition,embedded_mind}.rs`; runnable scenario: `crates/mindcore-sqlite/examples/iteration_01.rs`
 - Fixture: `fixtures/iteration-01/shared-collection.json`

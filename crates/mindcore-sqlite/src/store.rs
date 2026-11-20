@@ -15,13 +15,16 @@ pub struct MindStore {
 
 impl MindStore {
     /// Creates the database file when absent and applies any pending embedded migration.
+    ///
+    /// Lock contention waits up to five seconds before `SQLITE_BUSY` can surface; the timeout
+    /// bounds the wait and does not guarantee that a competing operation succeeds.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
-            // A second handle waits for a writer's reservation instead of failing with SQLITE_BUSY.
+            // A second handle waits up to five seconds for a writer's reservation before SQLITE_BUSY surfaces.
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
