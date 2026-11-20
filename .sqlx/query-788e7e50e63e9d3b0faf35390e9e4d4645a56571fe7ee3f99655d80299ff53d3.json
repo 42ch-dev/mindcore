@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_profiles (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "788e7e50e63e9d3b0faf35390e9e4d4645a56571fe7ee3f99655d80299ff53d3"
+}

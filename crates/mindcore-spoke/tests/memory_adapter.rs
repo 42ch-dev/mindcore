@@ -38,26 +38,26 @@ impl Harness {
             .await
             .expect("open pool");
         sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_spaces \
              (space_id, display_name, authority_host_id, authority_generation, status, revision, \
               created_at) \
              VALUES (?, 'space', 'host_1', 1, 'active', 1, ?)",
+            SPACE,
+            NOW,
         )
-        .bind(SPACE)
-        .bind(NOW)
         .execute(&pool)
         .await
         .expect("seed space");
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_subjects \
              (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, \
               created_at) \
              VALUES (?, ?, NULL, NULL, 'active', '[]', 1, ?)",
+            SPACE,
+            SUBJECT,
+            NOW,
         )
-        .bind(SPACE)
-        .bind(SUBJECT)
-        .bind(NOW)
         .execute(&pool)
         .await
         .expect("seed subject");
@@ -79,18 +79,18 @@ impl Harness {
         capabilities: &[&str],
         expires_at: Option<&str>,
     ) {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_grants \
              (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
               shared_access, expires_at, revoked_at, revision, created_at) \
              VALUES (?, ?, NULL, ?, ?, '[]', 0, ?, NULL, 1, ?)",
+            format!("grt_{principal}"),
+            SPACE,
+            principal,
+            serde_json::to_string(capabilities).expect("capabilities"),
+            expires_at,
+            NOW,
         )
-        .bind(format!("grt_{principal}"))
-        .bind(SPACE)
-        .bind(principal)
-        .bind(serde_json::to_string(capabilities).expect("capabilities"))
-        .bind(expires_at)
-        .bind(NOW)
         .execute(&self.pool)
         .await
         .expect("seed grant");
@@ -214,11 +214,12 @@ async fn capture_commits_a_receipt_and_preserves_the_content_subtree() {
         .to_string();
     tx.commit().await.expect("commit");
 
-    let content: String = sqlx::query_scalar(
-        "SELECT content_json FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+    let content: String = sqlx::query_scalar!(
+        "SELECT content_json AS \"content_json!\" \
+         FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+        SPACE,
+        &candidate_id,
     )
-    .bind(SPACE)
-    .bind(&candidate_id)
     .fetch_one(&harness.pool)
     .await
     .expect("stored candidate");
@@ -256,19 +257,19 @@ async fn get_record_round_trips_wire_through_ir() {
         "revision": 1,
         "extensions": {}
     });
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
           scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
           revision, created_at, updated_at) \
          VALUES ('rec_1', ?, ?, 'fact', ?, 'shared', NULL, ?, NULL, NULL, NULL, 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        serde_json::to_string(&stored["content"]).expect("content"),
+        serde_json::to_string(&stored["provenance"]).expect("provenance"),
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(serde_json::to_string(&stored["content"]).expect("content"))
-    .bind(serde_json::to_string(&stored["provenance"]).expect("provenance"))
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed record");
@@ -343,11 +344,11 @@ async fn stale_space_revision_rejects_and_writes_nothing() {
     assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
     assert_eq!(retry_class(reject), "terminal");
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
-    let status: String = sqlx::query_scalar("SELECT status FROM memory_spaces WHERE space_id = ?")
-        .bind(SPACE)
-        .fetch_one(&mut *tx)
-        .await
-        .expect("space");
+    let status: String =
+        sqlx::query_scalar!("SELECT status FROM memory_spaces WHERE space_id = ?", SPACE)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("space");
     assert_eq!(status, "active");
     tx.rollback().await.expect("rollback");
 }
@@ -448,21 +449,25 @@ async fn journaled_mutation_stages_and_the_caller_rollback_erases_it() {
 
     // Staged, inside the caller's transaction.
     assert_eq!(harness.count(&mut tx, "memory_records").await, 1);
-    let (status, result_json): (String, Option<String>) =
-        sqlx::query_as("SELECT status, result_json FROM memory_receipts WHERE receipt_id = ?")
-            .bind(&receipt_id)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("staged receipt");
+    let receipt = sqlx::query!(
+        "SELECT status, result_json FROM memory_receipts WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("staged receipt");
+    let (status, result_json) = (receipt.status, receipt.result_json);
     assert_eq!(status, "pending");
     assert!(result_json.is_none());
 
-    let (state, targets_json): (String, String) =
-        sqlx::query_as("SELECT state, targets_json FROM memory_journal WHERE receipt_id = ?")
-            .bind(&receipt_id)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("staged intent");
+    let intent = sqlx::query!(
+        "SELECT state, targets_json FROM memory_journal WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("staged intent");
+    let (state, targets_json) = (intent.state, intent.targets_json);
     assert_eq!(state, "pending");
     let targets: Value = serde_json::from_str(&targets_json).expect("targets");
     assert_eq!(targets.as_array().expect("targets array").len(), 1);
@@ -516,16 +521,20 @@ async fn capture_preserves_original_member_presence() {
         .expect("candidate id")
         .to_string();
 
-    let (content, provenance, stored_occurred_at): (String, String, Option<String>) =
-        sqlx::query_as(
-            "SELECT content_json, provenance_json, occurred_at FROM memory_candidates \
-         WHERE space_id = ? AND candidate_id = ?",
-        )
-        .bind(SPACE)
-        .bind(&candidate_id)
-        .fetch_one(&mut *tx)
-        .await
-        .expect("stored candidate");
+    let stored = sqlx::query!(
+        "SELECT content_json AS \"content_json!\", provenance_json, occurred_at \
+         FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+        SPACE,
+        &candidate_id,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("stored candidate");
+    let (content, provenance, stored_occurred_at) = (
+        stored.content_json,
+        stored.provenance_json,
+        stored.occurred_at,
+    );
 
     let content: Value = serde_json::from_str(&content).expect("content json");
     assert_eq!(content["text"], "present-but-null structured stays present");
@@ -611,7 +620,7 @@ async fn empty_required_profile_is_incomplete() {
     harness
         .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
         .await;
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
           scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
@@ -620,24 +629,24 @@ async fn empty_required_profile_is_incomplete() {
                  '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
                    \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
                  NULL, NULL, NULL, 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed record");
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_profiles \
          (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
           updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        r#"{"body":"   ","format":"markdown"}"#,
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(r#"{"body":"   ","format":"markdown"}"#)
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed empty profile");
@@ -680,13 +689,16 @@ async fn empty_required_profile_is_incomplete() {
 
     // With authored content the same basis generates: the gate refused the
     // empty document, not the subject.
-    sqlx::query("UPDATE memory_profiles SET document_json = ? WHERE space_id = ? AND subject_id = ? AND profile_kind = 'personality'")
-        .bind(r#"{"body":"a real personality","format":"markdown"}"#)
-        .bind(SPACE)
-        .bind(SUBJECT)
-        .execute(&mut *tx)
-        .await
-        .expect("author the profile");
+    sqlx::query!(
+        "UPDATE memory_profiles SET document_json = ? \
+         WHERE space_id = ? AND subject_id = ? AND profile_kind = 'personality'",
+        r#"{"body":"a real personality","format":"markdown"}"#,
+        SPACE,
+        SUBJECT,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("author the profile");
     let staged = adapter
         .generate_reflection(
             &mut tx,
@@ -746,13 +758,16 @@ async fn promotion_into_fenced_context_refuses() {
     harness
         .seed_grant(PRINCIPAL, &["promote", "records_write"])
         .await;
-    sqlx::query("UPDATE memory_subjects SET fenced_contexts_json = '[\"c1\"]' WHERE space_id = ? AND subject_id = ?")
-        .bind(SPACE)
-        .bind(SUBJECT)
-        .execute(&harness.pool)
-        .await
-        .expect("fence context");
-    sqlx::query(
+    sqlx::query!(
+        "UPDATE memory_subjects SET fenced_contexts_json = '[\"c1\"]' \
+         WHERE space_id = ? AND subject_id = ?",
+        SPACE,
+        SUBJECT,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("fence context");
+    sqlx::query!(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
           scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
@@ -761,11 +776,11 @@ async fn promotion_into_fenced_context_refuses() {
                  '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
                    \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
                  NULL, NULL, NULL, 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed record");
@@ -823,12 +838,14 @@ async fn replayed_receipt_with_tampered_result_rejects() {
     );
     tx.commit().await.expect("commit");
 
-    sqlx::query("UPDATE memory_receipts SET result_json = ? WHERE idempotency_key = ?")
-        .bind(r#"{"candidate_ids":"not-an-array","classified":1}"#)
-        .bind("cap-tamper")
-        .execute(&harness.pool)
-        .await
-        .expect("tamper");
+    sqlx::query!(
+        "UPDATE memory_receipts SET result_json = ? WHERE idempotency_key = ?",
+        r#"{"candidate_ids":"not-an-array","classified":1}"#,
+        "cap-tamper",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("tamper");
 
     let mut tx = harness.begin().await;
     let replay = adapter
@@ -998,11 +1015,13 @@ async fn revoked_grant_denies_subject_and_profile_reads() {
     let harness = Harness::open().await;
     harness.seed_grant(PRINCIPAL, &["records_read"]).await;
     harness.seed_grant("p_revoked", &["admin"]).await;
-    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = 'p_revoked'")
-        .bind(NOW)
-        .execute(&harness.pool)
-        .await
-        .expect("revoke the grant");
+    sqlx::query!(
+        "UPDATE memory_grants SET revoked_at = ? WHERE principal_id = 'p_revoked'",
+        NOW,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("revoke the grant");
 
     let adapter = MemoryAdapter::new(true);
     let mut tx = harness.begin().await;
@@ -1209,12 +1228,13 @@ async fn stale_record_revision_rejects_without_a_second_write() {
     assert_eq!(refusal.code, SpokeRejectCode::RevisionConflict);
     assert_eq!(retry_class(refusal), "terminal");
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
-    let revision: i64 =
-        sqlx::query_scalar("SELECT revision FROM memory_records WHERE record_id = ?")
-            .bind(&record_id)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("record");
+    let revision: i64 = sqlx::query_scalar!(
+        "SELECT revision FROM memory_records WHERE record_id = ?",
+        &record_id,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("record");
     assert_eq!(revision, 1);
     tx.rollback().await.expect("rollback");
 }
@@ -1414,12 +1434,14 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
     assert_eq!(body["status"], "committed");
     tx2.commit().await.expect("commit settle");
 
-    let (state, targets): (String, String) =
-        sqlx::query_as("SELECT state, targets_json FROM memory_journal WHERE receipt_id = ?")
-            .bind(&receipt_id)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("intent");
+    let applied = sqlx::query!(
+        "SELECT state, targets_json FROM memory_journal WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("intent");
+    let (state, targets) = (applied.state, applied.targets_json);
     assert_eq!(state, "applied");
     assert_eq!(
         serde_json::from_str::<Value>(&targets).expect("targets"),
@@ -1485,16 +1507,16 @@ async fn settle_journal_reports_mismatch_as_uncertain() {
             .await,
     );
     let committed_id = capture["receipt_id"].as_str().expect("receipt").to_string();
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_receipts \
          (receipt_id, space_id, requester_principal_id, op, idempotency_key, \
           payload_digest, status, created_at) \
          VALUES ('rct_orphan', ?, ?, 'memory.records.create', 'orphan-key', ?, 'pending', ?)",
+        SPACE,
+        PRINCIPAL,
+        "a".repeat(64),
+        NOW,
     )
-    .bind(SPACE)
-    .bind(PRINCIPAL)
-    .bind("a".repeat(64))
-    .bind(NOW)
     .execute(&mut *tx)
     .await
     .expect("seed orphan pending receipt");
@@ -1517,11 +1539,13 @@ async fn settle_journal_reports_mismatch_as_uncertain() {
 
     // Force the pending intent ahead of its receipt: the settle pair refuses
     // as uncertainty and the caller's rollback keeps both sides untouched.
-    sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = ?")
-        .bind(&pending_id)
-        .execute(&mut *tx)
-        .await
-        .expect("move intent");
+    sqlx::query!(
+        "UPDATE memory_journal SET state = 'applied' WHERE receipt_id = ?",
+        &pending_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("move intent");
     let moved = adapter
         .settle_journal(&mut tx, &SpaceId::new(SPACE), &pending_id)
         .await;
@@ -1530,15 +1554,16 @@ async fn settle_journal_reports_mismatch_as_uncertain() {
     assert_eq!(retry_class(refusal), "uncertain");
     tx.rollback().await.expect("rollback");
 
-    let (state, status): (String, String) = sqlx::query_as(
+    let pair = sqlx::query!(
         "SELECT j.state, r.status FROM memory_journal j \
          JOIN memory_receipts r ON r.receipt_id = j.receipt_id \
          WHERE j.receipt_id = ?",
+        &pending_id,
     )
-    .bind(&pending_id)
     .fetch_one(&harness.pool)
     .await
     .expect("pair");
+    let (state, status) = (pair.state, pair.status);
     assert_eq!((state.as_str(), status.as_str()), ("pending", "pending"));
 }
 
@@ -1551,7 +1576,7 @@ async fn complete_reflection_settles_only_for_the_same_owner() {
     harness
         .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
         .await;
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
           scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
@@ -1560,24 +1585,24 @@ async fn complete_reflection_settles_only_for_the_same_owner() {
                  '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
                    \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
                  NULL, NULL, NULL, 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed record");
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_profiles \
          (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
           updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        r#"{"body":"a real personality","format":"markdown"}"#,
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(r#"{"body":"a real personality","format":"markdown"}"#)
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed profile");
@@ -1607,14 +1632,15 @@ async fn complete_reflection_settles_only_for_the_same_owner() {
         other => panic!("expected a reflection pending stage, got {other:?}"),
     };
     // The parked window: a leased pending receipt, no envelope, no cost.
-    let (status, owner): (String, String) =
-        sqlx::query_as("SELECT status, owner_id FROM memory_receipts WHERE receipt_id = ?")
-            .bind(&work.receipt_id)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("pending receipt");
-    assert_eq!(status, "pending");
-    assert_eq!(owner, work.owner_id);
+    let parked = sqlx::query!(
+        "SELECT status, owner_id FROM memory_receipts WHERE receipt_id = ?",
+        &work.receipt_id,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("pending receipt");
+    assert_eq!(parked.status, "pending");
+    assert_eq!(parked.owner_id.as_deref(), Some(work.owner_id.as_str()));
     assert_eq!(harness.count(&mut tx, "memory_reflections").await, 0);
     tx.commit().await.expect("commit lease");
 
@@ -1633,15 +1659,16 @@ async fn complete_reflection_settles_only_for_the_same_owner() {
         .to_string();
     tx2.commit().await.expect("commit completion");
 
-    let (cost_kind, cost_units): (String, f64) = sqlx::query_as(
-        "SELECT cost_unit_kind, cost_units FROM memory_reflections WHERE reflection_id = ?",
+    let envelope = sqlx::query!(
+        "SELECT cost_unit_kind AS \"cost_unit_kind!\", cost_units \
+         FROM memory_reflections WHERE reflection_id = ?",
+        &reflection_id,
     )
-    .bind(&reflection_id)
     .fetch_one(&harness.pool)
     .await
     .expect("envelope");
-    assert_eq!(cost_kind, "basis_record");
-    assert_eq!(cost_units, 1.0);
+    assert_eq!(envelope.cost_unit_kind, "basis_record");
+    assert_eq!(envelope.cost_units, Some(1.0));
 
     // Terminal replay returns the stored committed result.
     let mut tx = harness.begin().await;
@@ -1667,7 +1694,7 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
     harness
         .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
         .await;
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
           scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
@@ -1676,24 +1703,24 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
                  '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
                    \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
                  NULL, NULL, NULL, 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed record");
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_profiles \
          (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
           updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        r#"{"body":"a real personality","format":"markdown"}"#,
+        NOW,
+        NOW,
     )
-    .bind(SPACE)
-    .bind(SUBJECT)
-    .bind(r#"{"body":"a real personality","format":"markdown"}"#)
-    .bind(NOW)
-    .bind(NOW)
     .execute(&harness.pool)
     .await
     .expect("seed profile");
@@ -1736,12 +1763,13 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
     tx2.rollback().await.expect("rollback");
 
     assert_eq!(harness.count_pool("memory_reflections").await, 0);
-    let status: String =
-        sqlx::query_scalar("SELECT status FROM memory_receipts WHERE receipt_id = ?")
-            .bind(&receipt_id)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("receipt");
+    let status: String = sqlx::query_scalar!(
+        "SELECT status FROM memory_receipts WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("receipt");
     assert_eq!(status, "pending");
 
     // A same-key replay of the still-pending effect stays uncertain.
@@ -1769,7 +1797,7 @@ async fn staging_storage_failure_rolls_back_the_partial_write() {
 
     // Failing the journal table inside the caller's transaction makes the
     // intent insert fail AFTER the record insert: a genuine partial write.
-    sqlx::query("DROP TABLE memory_journal")
+    sqlx::query!("DROP TABLE memory_journal")
         .execute(&mut *tx)
         .await
         .expect("drop journal");

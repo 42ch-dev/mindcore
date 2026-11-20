@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_spaces (space_id, display_name, authority_host_id, authority_generation, status, revision, created_at) VALUES (?, 'space', 'host_1', 1, 'active', 1, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "86a637a63d74e5bb61c4304b990ad30850aa40a8b1d68d17ff748afd3188e0b4"
+}

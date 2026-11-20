@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT j.state, r.status FROM memory_journal j JOIN memory_receipts r ON r.receipt_id = j.receipt_id WHERE j.receipt_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "state",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "name": "status",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "status"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "fb25d7e9fd82d5045bdf17204f7f0929c918c06359d63db514aae3efc3cd8c98"
+}

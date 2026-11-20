@@ -37,22 +37,22 @@ async fn open(path: &std::path::Path) -> SqlitePool {
 async fn prepared(path: &std::path::Path) -> SqlitePool {
     let pool = open(path).await;
     sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_spaces \
          (space_id, display_name, authority_host_id, authority_generation, status, revision, \
           created_at) \
          VALUES ('spc_workshop', 'Workshop', 'host-1', 1, 'active', 1, ?)",
+        TIME,
     )
-    .bind(TIME)
     .execute(&pool)
     .await
     .expect("seed space");
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_subjects \
          (space_id, subject_id, status, revision, created_at) \
          VALUES ('spc_workshop', 'sub_mira', 'active', 1, ?)",
+        TIME,
     )
-    .bind(TIME)
     .execute(&pool)
     .await
     .expect("seed subject");
@@ -596,21 +596,21 @@ async fn guarded_updates_do_not_cross_spaces() {
     let pool = prepared(&path).await;
 
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_spaces \
          (space_id, authority_host_id, authority_generation, status, revision, created_at) \
          VALUES ('spc_other', 'host-2', 1, 'active', 1, ?)",
+        TIME,
     )
-    .bind(TIME)
     .execute(&mut *tx)
     .await
     .unwrap();
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_subjects \
          (space_id, subject_id, status, revision, created_at) \
          VALUES ('spc_other', 'sub_mira', 'active', 1, ?)",
+        TIME,
     )
-    .bind(TIME)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -692,7 +692,7 @@ async fn malformed_reflection_selections_fail_invalid_row() {
         let pool = prepared(&path).await;
 
         let mut tx = pool.begin().await.unwrap();
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_reflections \
              (seq, reflection_id, space_id, subject_id, requester_principal_id, \
               selection_json, basis_json, engine_policy_version, schema_version, revision, \
@@ -700,9 +700,9 @@ async fn malformed_reflection_selections_fail_invalid_row() {
              VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
                'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, '{\"digest\":\"d\"}', \
                'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
+            selection.to_string(),
+            TIME,
         )
-        .bind(selection.to_string())
-        .bind(TIME)
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -790,7 +790,7 @@ async fn evicted_receipt_distinguishes_expiry_from_conflict() {
         .await
         .unwrap();
     // Retention reclaims both payload columns in place (dedup tombstone shape).
-    sqlx::query(
+    sqlx::query!(
         "UPDATE memory_receipts SET result_json = NULL, error_json = NULL \
          WHERE receipt_id = 'rcp_1'",
     )
@@ -918,14 +918,14 @@ async fn tombstoned_record_with_null_reason_and_import_ref_reads() {
     repo.insert_record(&mut tx, &record).await.unwrap();
     // The pinned delete scrubs content, writes `reason: null` and leaves
     // `import_ref_json` in place.
-    sqlx::query(
+    sqlx::query!(
         "UPDATE memory_records \
          SET content_json = '{\"text\":\"\"}', tombstone_json = ?, updated_at = ?, \
              revision = revision + 1 \
          WHERE record_id = 'rec_1'",
+        json!({"deleted_at": LATER, "deleted_by": "prn_writer", "reason": null}).to_string(),
+        LATER,
     )
-    .bind(json!({"deleted_at": LATER, "deleted_by": "prn_writer", "reason": null}).to_string())
-    .bind(LATER)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -971,7 +971,7 @@ async fn malformed_persisted_column_returns_invalid_row() {
 
     let mut tx = pool.begin().await.unwrap();
     repo.insert_record(&mut tx, &live_record()).await.unwrap();
-    sqlx::query("UPDATE memory_records SET content_json = X'80' WHERE record_id = 'rec_1'")
+    sqlx::query!("UPDATE memory_records SET content_json = X'80' WHERE record_id = 'rec_1'")
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -1000,7 +1000,7 @@ async fn malformed_selection_with_none_filter_fails_invalid_row() {
     let pool = prepared(&path).await;
 
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_reflections \
          (seq, reflection_id, space_id, subject_id, requester_principal_id, \
           selection_json, basis_json, engine_policy_version, schema_version, revision, \
@@ -1008,9 +1008,9 @@ async fn malformed_selection_with_none_filter_fails_invalid_row() {
          VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
            'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, '{\"digest\":\"d\"}', \
            'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
+        json!({"mode": "everywhere"}).to_string(),
+        TIME,
     )
-    .bind(json!({"mode": "everywhere"}).to_string())
-    .bind(TIME)
     .execute(&mut *tx)
     .await
     .unwrap();

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DROP TABLE memory_journal",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "3b39b611bf550a2b300cfe3ff0a83c5d39a98c46b4b94f90a5d1c470fa1299cf"
+}

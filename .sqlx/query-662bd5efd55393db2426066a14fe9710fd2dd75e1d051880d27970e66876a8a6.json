@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT status, owner_id FROM memory_receipts WHERE receipt_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "status",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "name": "owner_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "owner_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "662bd5efd55393db2426066a14fe9710fd2dd75e1d051880d27970e66876a8a6"
+}

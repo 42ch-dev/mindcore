@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_reflections (seq, reflection_id, space_id, subject_id, requester_principal_id, selection_json, filter_json, cognition_filter_json, basis_json, engine_policy_version, model, schema_version, revision, extensions_json, created_at, body_text, body_format, cost_unit_kind, cost_units, stale_cache) VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_reflections), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 19
+    },
+    "nullable": []
+  },
+  "hash": "5d34625fc488576184382b56bdbabac0a3a2819f58105bd5a3c5f81032772073"
+}

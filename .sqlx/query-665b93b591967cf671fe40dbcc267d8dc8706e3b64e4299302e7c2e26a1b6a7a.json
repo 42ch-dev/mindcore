@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_journal (seq, receipt_id, space_id, subject_id, requester_principal_id, op, idempotency_key, state, targets_json, result_json, created_at, updated_at) VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_journal), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "665b93b591967cf671fe40dbcc267d8dc8706e3b64e4299302e7c2e26a1b6a7a"
+}

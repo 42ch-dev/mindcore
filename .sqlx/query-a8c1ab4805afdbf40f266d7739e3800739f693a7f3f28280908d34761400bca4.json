@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_receipts (receipt_id, space_id, requester_principal_id, op, idempotency_key, payload_digest, status, created_at) VALUES ('rct_orphan', ?, ?, 'memory.records.create', 'orphan-key', ?, 'pending', ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "a8c1ab4805afdbf40f266d7739e3800739f693a7f3f28280908d34761400bca4"
+}

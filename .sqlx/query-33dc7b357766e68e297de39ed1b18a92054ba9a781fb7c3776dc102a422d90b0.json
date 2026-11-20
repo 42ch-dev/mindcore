@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT revision FROM memory_records WHERE record_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "revision",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "revision"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "33dc7b357766e68e297de39ed1b18a92054ba9a781fb7c3776dc102a422d90b0"
+}

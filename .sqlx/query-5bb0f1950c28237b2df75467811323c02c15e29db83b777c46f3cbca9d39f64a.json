@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT key, value, updated_at FROM memory_provider_meta WHERE key = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "key",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_provider_meta",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "name": "value",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_provider_meta",
+            "name": "value"
+          }
+        }
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_provider_meta",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5bb0f1950c28237b2df75467811323c02c15e29db83b777c46f3cbca9d39f64a"
+}

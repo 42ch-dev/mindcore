@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_records SET content_json = '{\"text\":\"\"}', tombstone_json = ?, updated_at = ?, revision = revision + 1 WHERE record_id = 'rec_1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "b5bc2b23d806fe804942ea363b096e45459d4c5cd7dedde2870153b9270f50a3"
+}

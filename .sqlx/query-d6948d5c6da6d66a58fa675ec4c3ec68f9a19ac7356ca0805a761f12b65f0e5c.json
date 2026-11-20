@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_candidates (candidate_id, space_id, subject_id, capture_visibility, capture_context_id, kind, content_json, provenance_json, classification_json, status, consumed_by_json, content_digest, occurred_at, expires_at, revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 16
+    },
+    "nullable": []
+  },
+  "hash": "d6948d5c6da6d66a58fa675ec4c3ec68f9a19ac7356ca0805a761f12b65f0e5c"
+}

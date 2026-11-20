@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memory_grants (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "1e3a69bccd1bdb4536d25e590413416cbe3f9c9fbc9cdc0247def921a7ec59f6"
+}

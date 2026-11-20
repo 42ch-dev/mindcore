@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT state, targets_json FROM memory_journal WHERE receipt_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "state",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "name": "targets_json",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_journal",
+            "name": "targets_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "00e3fc1156a9ada137cce1f5c77df2a5b5f8bf6db50e96445a0f3ef5791c1ab2"
+}

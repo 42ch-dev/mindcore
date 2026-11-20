@@ -95,76 +95,122 @@ where
         .map_err(|error| invalid_row(format_args!("column {name}: {error}")))
 }
 
+/// Maps a macro-query fetch failure back to the borrowed path's contract: a stored
+/// column that cannot decode is an `InvalidRow`, everything else stays a drive error.
+fn decode_row(error: sqlx::Error) -> SqliteRepositoryError {
+    match error {
+        sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnIndexOutOfBounds { .. } => invalid_row(format_args!("row: {error}")),
+        other => other.into(),
+    }
+}
+
 // ── Candidate ───────────────────────────────────────────────────────────────
 
 const CANDIDATE_COLUMNS: &str = "candidate_id, space_id, subject_id, capture_visibility, \
      capture_context_id, kind, content_json, provenance_json, classification_json, status, \
      consumed_by_json, content_digest, occurred_at, expires_at, revision, created_at";
 
-fn candidate_ir(row: &SqliteRow) -> RepoResult<MemoryCandidateIr> {
-    let status: String = column(row, "status")?;
+/// A `memory_candidates` row; `Option` mirrors stored nullability so `query_as!`
+/// compile-time decoding and the dynamic-list decode share one shape.
+struct CandidateRow {
+    candidate_id: String,
+    space_id: String,
+    subject_id: String,
+    capture_visibility: String,
+    capture_context_id: Option<String>,
+    kind: String,
+    content_json: Option<String>,
+    provenance_json: String,
+    classification_json: String,
+    status: String,
+    consumed_by_json: Option<String>,
+    content_digest: Option<String>,
+    occurred_at: Option<String>,
+    expires_at: Option<String>,
+    revision: i64,
+    created_at: String,
+}
+
+/// Decodes the same shape by name for the dynamic-list path; missing columns and
+/// decode/type failures map to `InvalidRow` like a `query_as!` fetch error.
+fn candidate_row(row: &SqliteRow) -> RepoResult<CandidateRow> {
+    Ok(CandidateRow {
+        candidate_id: column(row, "candidate_id")?,
+        space_id: column(row, "space_id")?,
+        subject_id: column(row, "subject_id")?,
+        capture_visibility: column(row, "capture_visibility")?,
+        capture_context_id: column(row, "capture_context_id")?,
+        kind: column(row, "kind")?,
+        content_json: column(row, "content_json")?,
+        provenance_json: column(row, "provenance_json")?,
+        classification_json: column(row, "classification_json")?,
+        status: column(row, "status")?,
+        consumed_by_json: column(row, "consumed_by_json")?,
+        content_digest: column(row, "content_digest")?,
+        occurred_at: column(row, "occurred_at")?,
+        expires_at: column(row, "expires_at")?,
+        revision: column(row, "revision")?,
+        created_at: column(row, "created_at")?,
+    })
+}
+
+fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
+    let status = &row.status;
     let mut proposed = Map::new();
     // A consumed row with an empty stored kind has no representable proposal;
     // the consumed codec accepts `proposed` absent.
-    let kind: String = column(row, "kind")?;
-    if !kind.is_empty() {
-        proposed.insert("kind".into(), kind.into());
+    if !row.kind.is_empty() {
+        proposed.insert("kind".into(), row.kind.clone().into());
     }
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert(
-        "candidate_id".into(),
-        column::<String>(row, "candidate_id")?.into(),
-    );
-    wire.insert("space_id".into(), column::<String>(row, "space_id")?.into());
-    wire.insert(
-        "subject_id".into(),
-        column::<String>(row, "subject_id")?.into(),
-    );
+    wire.insert("candidate_id".into(), row.candidate_id.clone().into());
+    wire.insert("space_id".into(), row.space_id.clone().into());
+    wire.insert("subject_id".into(), row.subject_id.clone().into());
     wire.insert("capture_scope".into(), placement_wire(row)?);
     wire.insert(
         "classification".into(),
-        from_json(
-            &column::<String>(row, "classification_json")?,
-            "classification",
-        )?,
+        from_json(&row.classification_json, "classification")?,
     );
     wire.insert(
         "provenance".into(),
-        from_json(&column::<String>(row, "provenance_json")?, "provenance")?,
+        from_json(&row.provenance_json, "provenance")?,
     );
-    wire.insert(
-        "created_at".into(),
-        column::<String>(row, "created_at")?.into(),
-    );
-    wire.insert("revision".into(), column::<i64>(row, "revision")?.into());
+    wire.insert("created_at".into(), row.created_at.clone().into());
+    wire.insert("revision".into(), row.revision.into());
     wire.insert("extensions".into(), Map::new().into());
     wire.insert("status".into(), status.clone().into());
-    if let Some(occurred_at) = column::<Option<String>>(row, "occurred_at")? {
-        wire.insert("occurred_at".into(), occurred_at.into());
+    if let Some(occurred_at) = &row.occurred_at {
+        wire.insert("occurred_at".into(), occurred_at.clone().into());
     }
     match status.as_str() {
         "pending" => {
-            let content = column::<Option<String>>(row, "content_json")?
+            let content = row
+                .content_json
+                .clone()
                 .ok_or_else(|| invalid_row("pending candidate has no content_json"))
                 .and_then(|raw| from_json(&raw, "candidate content"))?;
             proposed.insert("content".into(), content);
-            if let Some(expires_at) = column::<Option<String>>(row, "expires_at")? {
-                wire.insert("expires_at".into(), expires_at.into());
+            if let Some(expires_at) = &row.expires_at {
+                wire.insert("expires_at".into(), expires_at.clone().into());
             }
         }
         "consumed" => {
-            let raw = column::<Option<String>>(row, "consumed_by_json")?;
             wire.insert(
                 "consumed_by".into(),
                 from_json(
-                    &raw.ok_or_else(|| invalid_row("consumed candidate has no consumed_by"))?,
+                    &row.consumed_by_json
+                        .clone()
+                        .ok_or_else(|| invalid_row("consumed candidate has no consumed_by"))?,
                     "candidate outcome",
                 )?,
             );
             wire.insert(
                 "content_digest".into(),
-                column::<Option<String>>(row, "content_digest")?
+                row.content_digest
+                    .clone()
                     .ok_or_else(|| invalid_row("consumed candidate has no content_digest"))?
                     .into(),
             );
@@ -178,13 +224,12 @@ fn candidate_ir(row: &SqliteRow) -> RepoResult<MemoryCandidateIr> {
     Ok(ir)
 }
 
-fn placement_wire(row: &SqliteRow) -> RepoResult<Value> {
-    let visibility: String = column(row, "capture_visibility")?;
-    match visibility.as_str() {
+fn placement_wire(row: &CandidateRow) -> RepoResult<Value> {
+    match row.capture_visibility.as_str() {
         "shared" => Ok(json!({"visibility": "shared"})),
         "context" => Ok(json!({
             "visibility": "context",
-            "context_id": column::<Option<String>>(row, "capture_context_id")?
+            "context_id": row.capture_context_id.clone()
                 .ok_or_else(|| invalid_row("context placement has no context id"))?,
         })),
         other => Err(invalid_row(format_args!("capture visibility {other}"))),
@@ -277,17 +322,21 @@ async fn candidate_by_key(
     space: &SpaceId,
     id: &str,
 ) -> RepoResult<Option<MemoryCandidateIr>> {
-    let sql = AssertSqlSafe(format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM memory_candidates \
-         WHERE space_id = ? AND candidate_id = ?"
-    ));
-    sqlx::query(sql)
-        .bind(space.as_str())
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(|row| candidate_ir(&row))
-        .transpose()
+    sqlx::query_as!(
+        CandidateRow,
+        "SELECT candidate_id, space_id, subject_id, capture_visibility, \
+         capture_context_id, kind, content_json, provenance_json, classification_json, status, \
+         consumed_by_json, content_digest, occurred_at, expires_at, revision, created_at \
+         FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+        space.as_str(),
+        id,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(decode_row)?
+    .as_ref()
+    .map(candidate_ir)
+    .transpose()
 }
 
 async fn insert_candidate_row(tx: &mut Tx<'_>, candidate: &MemoryCandidateIr) -> RepoResult<()> {
@@ -301,29 +350,29 @@ async fn insert_candidate_row(tx: &mut Tx<'_>, candidate: &MemoryCandidateIr) ->
         .clone()
         .ok_or_else(|| invalid_row("candidate has no kind to persist"))?;
     let (visibility, context_id) = placement_columns(&candidate.capture_scope);
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_candidates \
          (candidate_id, space_id, subject_id, capture_visibility, capture_context_id, kind, \
           content_json, provenance_json, classification_json, status, consumed_by_json, \
           content_digest, occurred_at, expires_at, revision, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &candidate.candidate_id,
+        &candidate.space_id,
+        &candidate.subject_id,
+        visibility,
+        context_id,
+        &kind,
+        &columns.content,
+        &columns.provenance,
+        &columns.classification,
+        columns.status,
+        &columns.consumed_by,
+        &columns.content_digest,
+        &candidate.occurred_at,
+        &columns.expires_at,
+        revision_i64(&candidate.revision)?,
+        &candidate.created_at,
     )
-    .bind(&candidate.candidate_id)
-    .bind(&candidate.space_id)
-    .bind(&candidate.subject_id)
-    .bind(visibility)
-    .bind(context_id)
-    .bind(&kind)
-    .bind(&columns.content)
-    .bind(&columns.provenance)
-    .bind(&columns.classification)
-    .bind(columns.status)
-    .bind(&columns.consumed_by)
-    .bind(&columns.content_digest)
-    .bind(&candidate.occurred_at)
-    .bind(&columns.expires_at)
-    .bind(revision_i64(&candidate.revision)?)
-    .bind(&candidate.created_at)
     .execute(&mut **tx)
     .await
     .map_err(|error| conflict(error, &candidate.candidate_id))?;
@@ -343,16 +392,52 @@ const RECORD_COLUMNS: &str = "record_id, space_id, subject_id, kind, content_jso
      scope_visibility, scope_context_id, provenance_json, import_ref_json, occurred_at, \
      tombstone_json, revision, created_at, updated_at";
 
-fn record_ir(row: &SqliteRow) -> RepoResult<MemoryRecordIr> {
+struct RecordRow {
+    record_id: String,
+    space_id: String,
+    subject_id: String,
+    kind: String,
+    content_json: String,
+    scope_visibility: String,
+    scope_context_id: Option<String>,
+    provenance_json: String,
+    import_ref_json: Option<String>,
+    occurred_at: Option<String>,
+    tombstone_json: Option<String>,
+    revision: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+fn record_row(row: &SqliteRow) -> RepoResult<RecordRow> {
+    Ok(RecordRow {
+        record_id: column(row, "record_id")?,
+        space_id: column(row, "space_id")?,
+        subject_id: column(row, "subject_id")?,
+        kind: column(row, "kind")?,
+        content_json: column(row, "content_json")?,
+        scope_visibility: column(row, "scope_visibility")?,
+        scope_context_id: column(row, "scope_context_id")?,
+        provenance_json: column(row, "provenance_json")?,
+        import_ref_json: column(row, "import_ref_json")?,
+        occurred_at: column(row, "occurred_at")?,
+        tombstone_json: column(row, "tombstone_json")?,
+        revision: column(row, "revision")?,
+        created_at: column(row, "created_at")?,
+        updated_at: column(row, "updated_at")?,
+    })
+}
+
+fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
     let mut scope = Map::new();
-    let visibility: String = column(row, "scope_visibility")?;
-    match visibility.as_str() {
+    match row.scope_visibility.as_str() {
         "shared" => scope.insert("visibility".into(), "shared".into()),
         "context" => {
             scope.insert("visibility".into(), "context".into());
             scope.insert(
                 "context_id".into(),
-                column::<Option<String>>(row, "scope_context_id")?
+                row.scope_context_id
+                    .clone()
                     .ok_or_else(|| invalid_row("context scope has no context id"))?
                     .into(),
             )
@@ -361,57 +446,42 @@ fn record_ir(row: &SqliteRow) -> RepoResult<MemoryRecordIr> {
     };
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert(
-        "record_id".into(),
-        column::<String>(row, "record_id")?.into(),
-    );
-    wire.insert("space_id".into(), column::<String>(row, "space_id")?.into());
-    wire.insert(
-        "subject_id".into(),
-        column::<String>(row, "subject_id")?.into(),
-    );
-    wire.insert("kind".into(), column::<String>(row, "kind")?.into());
+    wire.insert("record_id".into(), row.record_id.clone().into());
+    wire.insert("space_id".into(), row.space_id.clone().into());
+    wire.insert("subject_id".into(), row.subject_id.clone().into());
+    wire.insert("kind".into(), row.kind.clone().into());
     wire.insert("scope".into(), scope.into());
     wire.insert(
         "content".into(),
-        from_json(&column::<String>(row, "content_json")?, "record content")?,
+        from_json(&row.content_json, "record content")?,
     );
     wire.insert(
         "provenance".into(),
-        from_json(
-            &column::<String>(row, "provenance_json")?,
-            "record provenance",
-        )?,
+        from_json(&row.provenance_json, "record provenance")?,
     );
     // Pinned projection: the tombstone marks the row dead; a surviving
     // `import_ref_json` (the native delete leaves it) is dropped, and an explicit
     // JSON null `reason` normalizes to the wire's optional-member shape.
-    if let Some(raw) = column::<Option<String>>(row, "tombstone_json")? {
-        let mut tombstone = from_json(&raw, "record tombstone")?;
+    if let Some(raw) = &row.tombstone_json {
+        let mut tombstone = from_json(raw, "record tombstone")?;
         if let Some(object) = tombstone.as_object_mut() {
             if object.get("reason") == Some(&Value::Null) {
                 object.remove("reason");
             }
         }
         wire.insert("tombstone".into(), tombstone);
-    } else if let Some(import_ref) = column::<Option<String>>(row, "import_ref_json")? {
+    } else if let Some(import_ref) = &row.import_ref_json {
         wire.insert(
             "import_ref".into(),
-            from_json(&import_ref, "record import ref")?,
+            from_json(import_ref, "record import ref")?,
         );
     }
-    if let Some(occurred_at) = column::<Option<String>>(row, "occurred_at")? {
-        wire.insert("occurred_at".into(), occurred_at.into());
+    if let Some(occurred_at) = &row.occurred_at {
+        wire.insert("occurred_at".into(), occurred_at.clone().into());
     }
-    wire.insert(
-        "created_at".into(),
-        column::<String>(row, "created_at")?.into(),
-    );
-    wire.insert(
-        "updated_at".into(),
-        column::<String>(row, "updated_at")?.into(),
-    );
-    wire.insert("revision".into(), column::<i64>(row, "revision")?.into());
+    wire.insert("created_at".into(), row.created_at.clone().into());
+    wire.insert("updated_at".into(), row.updated_at.clone().into());
+    wire.insert("revision".into(), row.revision.into());
     wire.insert("extensions".into(), Map::new().into());
     let (_, ir) = memory_record_from_wire(wire.into()).map_err(invalid_row)?;
     Ok(ir)
@@ -447,49 +517,53 @@ async fn record_by_key(
     space: &SpaceId,
     id: &str,
 ) -> RepoResult<Option<MemoryRecordIr>> {
-    let sql = AssertSqlSafe(format!(
-        "SELECT {RECORD_COLUMNS} FROM memory_records \
-         WHERE space_id = ? AND record_id = ?"
-    ));
-    sqlx::query(sql)
-        .bind(space.as_str())
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(|row| record_ir(&row))
-        .transpose()
+    sqlx::query_as!(
+        RecordRow,
+        "SELECT record_id, space_id, subject_id, kind, content_json, \
+         scope_visibility, scope_context_id, provenance_json, import_ref_json, occurred_at, \
+         tombstone_json, revision, created_at, updated_at \
+         FROM memory_records WHERE space_id = ? AND record_id = ?",
+        space.as_str(),
+        id,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(decode_row)?
+    .as_ref()
+    .map(record_ir)
+    .transpose()
 }
 
 async fn insert_record_row(tx: &mut Tx<'_>, record: &MemoryRecordIr) -> RepoResult<()> {
     let columns = record_columns(record)?;
     let (visibility, context_id) = placement_columns(&record.scope);
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
           scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
           revision, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &record.record_id,
+        &record.space_id,
+        &record.subject_id,
+        &record.kind,
+        &columns.content,
+        visibility,
+        context_id,
+        to_json(
+            &memory_record_to_wire(version(), record.clone())
+                .get("provenance")
+                .cloned()
+                .unwrap_or_default(),
+            "record provenance",
+        )?,
+        &columns.import_ref,
+        &record.occurred_at,
+        &columns.tombstone,
+        revision_i64(&record.revision)?,
+        &record.created_at,
+        &record.updated_at,
     )
-    .bind(&record.record_id)
-    .bind(&record.space_id)
-    .bind(&record.subject_id)
-    .bind(&record.kind)
-    .bind(&columns.content)
-    .bind(visibility)
-    .bind(context_id)
-    .bind(to_json(
-        &memory_record_to_wire(version(), record.clone())
-            .get("provenance")
-            .cloned()
-            .unwrap_or_default(),
-        "record provenance",
-    )?)
-    .bind(&columns.import_ref)
-    .bind(&record.occurred_at)
-    .bind(&columns.tombstone)
-    .bind(revision_i64(&record.revision)?)
-    .bind(&record.created_at)
-    .bind(&record.updated_at)
     .execute(&mut **tx)
     .await
     .map_err(|error| conflict(error, &record.record_id))?;
@@ -498,45 +572,45 @@ async fn insert_record_row(tx: &mut Tx<'_>, record: &MemoryRecordIr) -> RepoResu
 
 // ── Receipt ─────────────────────────────────────────────────────────────────
 
-const RECEIPT_COLUMNS: &str = "receipt_id, space_id, requester_principal_id, op, \
-     idempotency_key, payload_digest, status, result_json, error_json, created_at, \
-     completed_at, owner_id, lease_expires_at";
+struct ReceiptRow {
+    receipt_id: String,
+    space_id: String,
+    requester_principal_id: String,
+    op: String,
+    idempotency_key: Option<String>,
+    payload_digest: String,
+    status: String,
+    result_json: Option<String>,
+    error_json: Option<String>,
+    created_at: String,
+    completed_at: Option<String>,
+}
 
-fn receipt_wire(row: &SqliteRow) -> RepoResult<Value> {
+fn receipt_wire(row: &ReceiptRow) -> RepoResult<Value> {
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert(
-        "receipt_id".into(),
-        column::<String>(row, "receipt_id")?.into(),
-    );
-    wire.insert("space_id".into(), column::<String>(row, "space_id")?.into());
+    wire.insert("receipt_id".into(), row.receipt_id.clone().into());
+    wire.insert("space_id".into(), row.space_id.clone().into());
     wire.insert(
         "requester_principal_id".into(),
-        column::<String>(row, "requester_principal_id")?.into(),
+        row.requester_principal_id.clone().into(),
     );
-    wire.insert("op".into(), column::<String>(row, "op")?.into());
-    if let Some(key) = column::<Option<String>>(row, "idempotency_key")? {
-        wire.insert("idempotency_key".into(), key.into());
+    wire.insert("op".into(), row.op.clone().into());
+    if let Some(key) = &row.idempotency_key {
+        wire.insert("idempotency_key".into(), key.clone().into());
     }
-    wire.insert(
-        "payload_digest".into(),
-        column::<String>(row, "payload_digest")?.into(),
-    );
-    wire.insert(
-        "created_at".into(),
-        column::<String>(row, "created_at")?.into(),
-    );
+    wire.insert("payload_digest".into(), row.payload_digest.clone().into());
+    wire.insert("created_at".into(), row.created_at.clone().into());
     wire.insert("extensions".into(), Map::new().into());
-    let status: String = column(row, "status")?;
-    wire.insert("status".into(), status.into());
-    if let Some(completed_at) = column::<Option<String>>(row, "completed_at")? {
-        wire.insert("completed_at".into(), completed_at.into());
+    wire.insert("status".into(), row.status.clone().into());
+    if let Some(completed_at) = &row.completed_at {
+        wire.insert("completed_at".into(), completed_at.clone().into());
     }
-    if let Some(result) = column::<Option<String>>(row, "result_json")? {
-        wire.insert("result".into(), from_json(&result, "receipt result")?);
+    if let Some(result) = &row.result_json {
+        wire.insert("result".into(), from_json(result, "receipt result")?);
     }
-    if let Some(error) = column::<Option<String>>(row, "error_json")? {
-        wire.insert("error".into(), from_json(&error, "receipt error")?);
+    if let Some(error) = &row.error_json {
+        wire.insert("error".into(), from_json(error, "receipt error")?);
     }
     Ok(wire.into())
 }
@@ -544,16 +618,14 @@ fn receipt_wire(row: &SqliteRow) -> RepoResult<Value> {
 /// Decodes one receipt row: a settled row whose payload columns were reclaimed by
 /// retention reports `Evicted` (digest + last status survive), anything else must
 /// decode as a full retained receipt.
-fn receipt_read(row: &SqliteRow) -> RepoResult<ReceiptRead> {
-    let evicted = column::<Option<String>>(row, "result_json")?.is_none()
-        && column::<Option<String>>(row, "error_json")?.is_none()
-        && column::<String>(row, "status")? != "pending";
+fn receipt_read(row: &ReceiptRow) -> RepoResult<ReceiptRead> {
+    let evicted = row.result_json.is_none() && row.error_json.is_none() && row.status != "pending";
     if evicted {
         return Ok(ReceiptRead::Evicted {
-            requester: column(row, "requester_principal_id")?,
-            operation: column(row, "op")?,
-            status: column(row, "status")?,
-            payload_digest: column(row, "payload_digest")?,
+            requester: row.requester_principal_id.clone(),
+            operation: row.op.clone(),
+            status: row.status.clone(),
+            payload_digest: row.payload_digest.clone(),
         });
     }
     let wire = receipt_wire(row)?;
@@ -597,26 +669,26 @@ async fn insert_receipt_row(
     lease: Option<&ReceiptLease>,
 ) -> RepoResult<()> {
     let columns = receipt_columns(receipt)?;
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO memory_receipts \
          (receipt_id, space_id, requester_principal_id, op, idempotency_key, payload_digest, \
           status, result_json, error_json, created_at, completed_at, owner_id, \
           lease_expires_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &receipt.receipt_id,
+        &receipt.space_id,
+        &receipt.requester,
+        &receipt.operation,
+        &receipt.idempotency_key,
+        &receipt.payload_digest,
+        columns.status,
+        &columns.result,
+        &columns.error,
+        &receipt.created_at,
+        &columns.completed_at,
+        lease.map(|lease| lease.owner_id.clone()),
+        lease.map(|lease| lease.expires_at.clone()),
     )
-    .bind(&receipt.receipt_id)
-    .bind(&receipt.space_id)
-    .bind(&receipt.requester)
-    .bind(&receipt.operation)
-    .bind(&receipt.idempotency_key)
-    .bind(&receipt.payload_digest)
-    .bind(columns.status)
-    .bind(&columns.result)
-    .bind(&columns.error)
-    .bind(&receipt.created_at)
-    .bind(&columns.completed_at)
-    .bind(lease.map(|lease| lease.owner_id.clone()))
-    .bind(lease.map(|lease| lease.expires_at.clone()))
     .execute(&mut **tx)
     .await
     .map_err(|error| conflict(error, &receipt.receipt_id))?;
@@ -625,78 +697,95 @@ async fn insert_receipt_row(
 
 // ── Row families ────────────────────────────────────────────────────────────
 
-fn space_row(row: &SqliteRow) -> RepoResult<MemorySpaceRow> {
-    Ok(MemorySpaceRow {
-        space_id: SpaceId::new(column::<String>(row, "space_id")?),
-        display_name: column(row, "display_name")?,
-        authority_host_id: column(row, "authority_host_id")?,
-        authority_generation: column(row, "authority_generation")?,
-        status: column(row, "status")?,
-        revision: column::<i64>(row, "revision")?.into(),
-        created_at: column(row, "created_at")?,
-        pending_receipts: column::<i64>(row, "pending_receipts")?
-            .try_into()
-            .unwrap_or(u64::MAX),
-    })
+struct SpaceRow {
+    space_id: String,
+    display_name: Option<String>,
+    authority_host_id: String,
+    authority_generation: i64,
+    status: String,
+    revision: i64,
+    created_at: String,
+    pending_receipts: i64,
 }
 
-const SPACE_COLUMNS: &str = "s.space_id, s.display_name, s.authority_host_id, \
-     s.authority_generation, s.status, s.revision, s.created_at, \
-     (SELECT COUNT(*) FROM memory_receipts r WHERE r.space_id = s.space_id \
-      AND r.status = 'pending') AS pending_receipts";
+fn space_row(row: SpaceRow) -> MemorySpaceRow {
+    MemorySpaceRow {
+        space_id: SpaceId::new(row.space_id),
+        display_name: row.display_name,
+        authority_host_id: row.authority_host_id,
+        authority_generation: row.authority_generation,
+        status: row.status,
+        revision: row.revision.into(),
+        created_at: row.created_at,
+        pending_receipts: row.pending_receipts.try_into().unwrap_or(u64::MAX),
+    }
+}
 
-fn subject_row(row: &SqliteRow) -> RepoResult<MemorySubjectRow> {
-    let kind = match (
-        column::<Option<String>>(row, "kind_ns")?,
-        column::<Option<String>>(row, "kind_id")?,
-    ) {
+fn subject_row(row: SubjectRow) -> RepoResult<MemorySubjectRow> {
+    let kind = match (row.kind_ns, row.kind_id) {
         (Some(namespace), Some(kind)) => Some((namespace, kind)),
         (None, None) => None,
         _ => return Err(invalid_row("subject kind pair is half set")),
     };
-    let fenced: Vec<String> = serde_json::from_str(&column::<String>(row, "fenced_contexts_json")?)
+    let fenced: Vec<String> = serde_json::from_str(&row.fenced_contexts_json)
         .map_err(|error| invalid_row(format_args!("fenced_contexts_json: {error}")))?;
     Ok(MemorySubjectRow {
-        space_id: SpaceId::new(column::<String>(row, "space_id")?),
-        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
+        space_id: SpaceId::new(row.space_id),
+        subject_id: SubjectId::new(row.subject_id),
         kind,
-        status: column(row, "status")?,
+        status: row.status,
         fenced_contexts: fenced.into_iter().map(ContextId::new).collect(),
-        revision: column::<i64>(row, "revision")?.into(),
-        created_at: column(row, "created_at")?,
+        revision: row.revision.into(),
+        created_at: row.created_at,
         extensions: Map::new(),
     })
 }
 
-const SUBJECT_COLUMNS: &str = "space_id, subject_id, kind_ns, kind_id, status, \
-     fenced_contexts_json, revision, created_at";
+struct SubjectRow {
+    space_id: String,
+    subject_id: String,
+    kind_ns: Option<String>,
+    kind_id: Option<String>,
+    status: String,
+    fenced_contexts_json: String,
+    revision: i64,
+    created_at: String,
+}
 
-fn grant_row(row: &SqliteRow) -> RepoResult<MemoryGrantRow> {
-    let capabilities: Vec<String> =
-        serde_json::from_str(&column::<String>(row, "capabilities_json")?)
-            .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
-    let contexts: Vec<String> =
-        serde_json::from_str(&column::<String>(row, "context_ids_json")?)
-            .map_err(|error| invalid_row(format_args!("context_ids_json: {error}")))?;
+fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
+    let capabilities: Vec<String> = serde_json::from_str(&row.capabilities_json)
+        .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
+    let contexts: Vec<String> = serde_json::from_str(&row.context_ids_json)
+        .map_err(|error| invalid_row(format_args!("context_ids_json: {error}")))?;
     Ok(MemoryGrantRow {
-        grant_id: column(row, "grant_id")?,
-        space_id: SpaceId::new(column::<String>(row, "space_id")?),
-        subject_id: column::<Option<String>>(row, "subject_id")?.map(SubjectId::new),
-        principal_id: CallerId::new(column::<String>(row, "principal_id")?),
+        grant_id: row.grant_id,
+        space_id: SpaceId::new(row.space_id),
+        subject_id: row.subject_id.map(SubjectId::new),
+        principal_id: CallerId::new(row.principal_id),
         capabilities,
         context_ids: contexts.into_iter().map(ContextId::new).collect(),
-        shared_access: column::<i64>(row, "shared_access")? != 0,
-        expires_at: column(row, "expires_at")?,
-        revoked_at: column(row, "revoked_at")?,
-        revision: column::<i64>(row, "revision")?.into(),
-        created_at: column(row, "created_at")?,
+        shared_access: row.shared_access != 0,
+        expires_at: row.expires_at,
+        revoked_at: row.revoked_at,
+        revision: row.revision.into(),
+        created_at: row.created_at,
         extensions: Map::new(),
     })
 }
 
-const GRANT_COLUMNS: &str = "grant_id, space_id, subject_id, principal_id, \
-     capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
-     revision, created_at";
+struct GrantRow {
+    grant_id: String,
+    space_id: String,
+    subject_id: Option<String>,
+    principal_id: String,
+    capabilities_json: String,
+    context_ids_json: String,
+    shared_access: i64,
+    expires_at: Option<String>,
+    revoked_at: Option<String>,
+    revision: i64,
+    created_at: String,
+}
 
 fn profile_row(row: &SqliteRow) -> RepoResult<MemoryProfileRow> {
     Ok(MemoryProfileRow {
@@ -715,58 +804,69 @@ fn profile_row(row: &SqliteRow) -> RepoResult<MemoryProfileRow> {
 const PROFILE_COLUMNS: &str = "space_id, subject_id, profile_kind, document_json, updated_by, \
      revision, created_at, updated_at";
 
-fn reflection_row(row: &SqliteRow) -> RepoResult<MemoryReflectionRow> {
-    let filter = column::<Option<String>>(row, "filter_json")?
+fn reflection_row(row: ReflectionRow) -> RepoResult<MemoryReflectionRow> {
+    let filter = row
+        .filter_json
         .map(|raw| from_json(&raw, "reflection filter"))
         .transpose()?;
-    let cognition_filter = column::<Option<String>>(row, "cognition_filter_json")?
+    let cognition_filter = row
+        .cognition_filter_json
         .map(|raw| from_json(&raw, "reflection cognition filter"))
         .transpose()?;
-    let extensions = match from_json(
-        &column::<String>(row, "extensions_json")?,
-        "reflection extensions",
-    )? {
+    let extensions = match from_json(&row.extensions_json, "reflection extensions")? {
         Value::Object(map) => map,
         _ => return Err(invalid_row("reflection extensions is not an object")),
     };
-    let cost = match (
-        column::<Option<String>>(row, "cost_unit_kind")?,
-        column::<Option<f64>>(row, "cost_units")?,
-    ) {
+    let cost = match (row.cost_unit_kind, row.cost_units) {
         (Some(unit_kind), Some(units)) => Some((unit_kind, units)),
         (None, None) => None,
         _ => return Err(invalid_row("reflection cost pair is half set")),
     };
     Ok(MemoryReflectionRow {
-        seq: column(row, "seq")?,
-        reflection_id: column(row, "reflection_id")?,
-        space_id: SpaceId::new(column::<String>(row, "space_id")?),
-        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
-        requester: CallerId::new(column::<String>(row, "requester_principal_id")?),
-        selection: from_json(
-            &column::<String>(row, "selection_json")?,
-            "reflection selection",
-        )?,
+        seq: row.seq,
+        reflection_id: row.reflection_id,
+        space_id: SpaceId::new(row.space_id),
+        subject_id: SubjectId::new(row.subject_id),
+        requester: CallerId::new(row.requester_principal_id),
+        selection: from_json(&row.selection_json, "reflection selection")?,
         filter,
         cognition_filter,
-        basis: from_json(&column::<String>(row, "basis_json")?, "reflection basis")?,
-        engine_policy_version: column(row, "engine_policy_version")?,
-        model: column(row, "model")?,
-        schema_version: column(row, "schema_version")?,
-        revision: column::<i64>(row, "revision")?.into(),
+        basis: from_json(&row.basis_json, "reflection basis")?,
+        engine_policy_version: row.engine_policy_version,
+        model: row.model,
+        schema_version: row.schema_version,
+        revision: row.revision.into(),
         extensions,
-        created_at: column(row, "created_at")?,
-        body_text: column(row, "body_text")?,
-        body_format: column(row, "body_format")?,
+        created_at: row.created_at,
+        body_text: row.body_text,
+        body_format: row.body_format,
         cost,
-        stale_cache: column::<i64>(row, "stale_cache")? != 0,
+        stale_cache: row.stale_cache != 0,
     })
 }
 
-const REFLECTION_COLUMNS: &str = "seq, reflection_id, space_id, subject_id, \
-     requester_principal_id, selection_json, filter_json, cognition_filter_json, basis_json, \
-     engine_policy_version, model, schema_version, revision, extensions_json, created_at, \
-     body_text, body_format, cost_unit_kind, cost_units, stale_cache";
+struct ReflectionRow {
+    seq: i64,
+    reflection_id: String,
+    space_id: String,
+    subject_id: String,
+    requester_principal_id: String,
+    selection_json: String,
+    filter_json: Option<String>,
+    cognition_filter_json: Option<String>,
+    basis_json: String,
+    engine_policy_version: String,
+    model: Option<String>,
+    schema_version: i64,
+    revision: i64,
+    extensions_json: String,
+    created_at: String,
+    body_text: String,
+    body_format: String,
+    cost_unit_kind: Option<String>,
+    cost_units: Option<f64>,
+    stale_cache: i64,
+}
 
 /// Parses a persisted reflection selection strictly: unknown modes and malformed members
 /// are `InvalidRow` rather than silently nonmatching or widened.
@@ -827,30 +927,43 @@ fn selection_covers(pinned: &PlacementSelection, requested: &PlacementSelection)
     }
 }
 
-fn journal_row(row: &SqliteRow) -> RepoResult<MemoryJournalRow> {
-    let targets: Vec<Value> = serde_json::from_str(&column::<String>(row, "targets_json")?)
+fn journal_row(row: JournalRow) -> RepoResult<MemoryJournalRow> {
+    let targets: Vec<Value> = serde_json::from_str(&row.targets_json)
         .map_err(|error| invalid_row(format_args!("targets_json: {error}")))?;
-    let result = column::<Option<String>>(row, "result_json")?
+    let result = row
+        .result_json
         .map(|raw| from_json(&raw, "journal result"))
         .transpose()?;
     Ok(MemoryJournalRow {
-        seq: column(row, "seq")?,
-        receipt_id: column(row, "receipt_id")?,
-        space_id: SpaceId::new(column::<String>(row, "space_id")?),
-        subject_id: SubjectId::new(column::<String>(row, "subject_id")?),
-        requester: CallerId::new(column::<String>(row, "requester_principal_id")?),
-        operation: column(row, "op")?,
-        idempotency_key: column(row, "idempotency_key")?,
-        state: column(row, "state")?,
+        seq: row.seq,
+        receipt_id: row.receipt_id,
+        space_id: SpaceId::new(row.space_id),
+        subject_id: SubjectId::new(row.subject_id),
+        requester: CallerId::new(row.requester_principal_id),
+        operation: row.op,
+        idempotency_key: row.idempotency_key,
+        state: row.state,
         targets,
         result,
-        created_at: column(row, "created_at")?,
-        updated_at: column(row, "updated_at")?,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
     })
 }
 
-const JOURNAL_COLUMNS: &str = "seq, receipt_id, space_id, subject_id, requester_principal_id, \
-     op, idempotency_key, state, targets_json, result_json, created_at, updated_at";
+struct JournalRow {
+    seq: i64,
+    receipt_id: String,
+    space_id: String,
+    subject_id: String,
+    requester_principal_id: String,
+    op: String,
+    idempotency_key: Option<String>,
+    state: String,
+    targets_json: String,
+    result_json: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
 
 // ── Selection predicate ─────────────────────────────────────────────────────
 
@@ -980,20 +1093,24 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         key: &ReceiptKey,
     ) -> RepoResult<Option<ReceiptRead>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {RECEIPT_COLUMNS} FROM memory_receipts \
+        sqlx::query_as!(
+            ReceiptRow,
+            "SELECT receipt_id, space_id, requester_principal_id, op, \
+             idempotency_key, payload_digest, status, result_json, error_json, created_at, \
+             completed_at FROM memory_receipts \
              WHERE space_id = ? AND requester_principal_id = ? AND op = ? \
-             AND idempotency_key = ?"
-        ));
-        sqlx::query(sql)
-            .bind(key.space.as_str())
-            .bind(key.requester.as_str())
-            .bind(&key.operation)
-            .bind(&key.idempotency_key)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|row| receipt_read(&row))
-            .transpose()
+             AND idempotency_key = ?",
+            key.space.as_str(),
+            key.requester.as_str(),
+            &key.operation,
+            &key.idempotency_key,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .as_ref()
+        .map(receipt_read)
+        .transpose()
     }
 
     async fn insert_review(
@@ -1014,32 +1131,31 @@ impl MemoryRepository for SqliteMemoryRepository {
         // `context: None` admits shared rows and every context; `Some` admits only rows
         // placed in that context (the legacy `context_id` predicate, restated over the
         // Nexus placement columns).
-        let sql = AssertSqlSafe(format!(
-            "SELECT {RECORD_COLUMNS} FROM memory_records \
+        sqlx::query_as!(
+            RecordRow,
+            "SELECT record_id, space_id, subject_id, kind, content_json, \
+             scope_visibility, scope_context_id, provenance_json, import_ref_json, occurred_at, \
+             tombstone_json, revision, created_at, updated_at FROM memory_records \
              WHERE space_id = ? AND subject_id = ? AND tombstone_json IS NULL \
              AND (? IS NULL OR scope_context_id = ?) \
-             ORDER BY created_at DESC, record_id"
-        ));
-        sqlx::query(sql)
-            .bind(query.space.as_str())
-            .bind(query.subject.as_str())
-            .bind(
-                query
-                    .context
-                    .as_ref()
-                    .map(|context| context.as_str().to_string()),
-            )
-            .bind(
-                query
-                    .context
-                    .as_ref()
-                    .map(|context| context.as_str().to_string()),
-            )
-            .fetch_all(&mut **tx)
-            .await?
-            .iter()
-            .map(record_ir)
-            .collect()
+             ORDER BY created_at DESC, record_id",
+            query.space.as_str(),
+            query.subject.as_str(),
+            query
+                .context
+                .as_ref()
+                .map(|context| context.as_str().to_string()),
+            query
+                .context
+                .as_ref()
+                .map(|context| context.as_str().to_string()),
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .iter()
+        .map(record_ir)
+        .collect()
     }
 
     async fn space(
@@ -1047,27 +1163,34 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         space: &SpaceId,
     ) -> RepoResult<Option<MemorySpaceRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {SPACE_COLUMNS} FROM memory_spaces s WHERE s.space_id = ?"
-        ));
-        sqlx::query(sql)
-            .bind(space.as_str())
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|row| space_row(&row))
-            .transpose()
+        let row = sqlx::query_as!(
+            SpaceRow,
+            "SELECT s.space_id, s.display_name, s.authority_host_id, \
+             s.authority_generation, s.status, s.revision, s.created_at, \
+             (SELECT COUNT(*) FROM memory_receipts r WHERE r.space_id = s.space_id \
+              AND r.status = 'pending') AS pending_receipts \
+             FROM memory_spaces s WHERE s.space_id = ?",
+            space.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(row.map(space_row))
     }
 
     async fn list_spaces(&self, tx: &mut Self::Tx<'_>) -> RepoResult<Vec<MemorySpaceRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {SPACE_COLUMNS} FROM memory_spaces s ORDER BY s.space_id"
-        ));
-        sqlx::query(sql)
-            .fetch_all(&mut **tx)
-            .await?
-            .iter()
-            .map(space_row)
-            .collect()
+        sqlx::query_as!(
+            SpaceRow,
+            "SELECT s.space_id, s.display_name, s.authority_host_id, \
+             s.authority_generation, s.status, s.revision, s.created_at, \
+             (SELECT COUNT(*) FROM memory_receipts r WHERE r.space_id = s.space_id \
+              AND r.status = 'pending') AS pending_receipts \
+             FROM memory_spaces s ORDER BY s.space_id",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)
+        .map(|rows| rows.into_iter().map(space_row).collect())
     }
 
     async fn update_space(
@@ -1076,18 +1199,18 @@ impl MemoryRepository for SqliteMemoryRepository {
         row: &MemorySpaceRow,
         observed_revision: &Number,
     ) -> RepoResult<bool> {
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_spaces SET display_name = ?, authority_host_id = ?, \
              authority_generation = ?, status = ?, revision = ? \
              WHERE space_id = ? AND revision = ?",
+            &row.display_name,
+            &row.authority_host_id,
+            row.authority_generation,
+            &row.status,
+            revision_i64(&row.revision)?,
+            row.space_id.as_str(),
+            revision_i64(observed_revision)?,
         )
-        .bind(&row.display_name)
-        .bind(&row.authority_host_id)
-        .bind(row.authority_generation)
-        .bind(&row.status)
-        .bind(revision_i64(&row.revision)?)
-        .bind(row.space_id.as_str())
-        .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1099,17 +1222,19 @@ impl MemoryRepository for SqliteMemoryRepository {
         space: &SpaceId,
         id: &str,
     ) -> RepoResult<Option<MemorySubjectRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {SUBJECT_COLUMNS} FROM memory_subjects \
-             WHERE space_id = ? AND subject_id = ?"
-        ));
-        sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|row| subject_row(&row))
-            .transpose()
+        sqlx::query_as!(
+            SubjectRow,
+            "SELECT space_id, subject_id, kind_ns, kind_id, status, \
+             fenced_contexts_json, revision, created_at FROM memory_subjects \
+             WHERE space_id = ? AND subject_id = ?",
+            space.as_str(),
+            id,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(subject_row)
+        .transpose()
     }
 
     async fn subject_by_kind(
@@ -1119,19 +1244,21 @@ impl MemoryRepository for SqliteMemoryRepository {
         namespace: &str,
         kind: &str,
     ) -> RepoResult<Option<MemorySubjectRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {SUBJECT_COLUMNS} FROM memory_subjects \
+        sqlx::query_as!(
+            SubjectRow,
+            "SELECT space_id, subject_id, kind_ns, kind_id, status, \
+             fenced_contexts_json, revision, created_at FROM memory_subjects \
              WHERE space_id = ? AND kind_ns = ? AND kind_id = ? \
-             ORDER BY subject_id LIMIT 1"
-        ));
-        sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(namespace)
-            .bind(kind)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|row| subject_row(&row))
-            .transpose()
+             ORDER BY subject_id LIMIT 1",
+            space.as_str(),
+            namespace,
+            kind,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(subject_row)
+        .transpose()
     }
 
     async fn insert_subject(
@@ -1150,20 +1277,20 @@ impl MemoryRepository for SqliteMemoryRepository {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| invalid_row(format_args!("fenced_contexts: {error}")))?;
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_subjects \
              (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, \
               revision, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            row.space_id.as_str(),
+            row.subject_id.as_str(),
+            kind_ns,
+            kind_id,
+            &row.status,
+            &fenced,
+            revision_i64(&row.revision)?,
+            &row.created_at,
         )
-        .bind(row.space_id.as_str())
-        .bind(row.subject_id.as_str())
-        .bind(kind_ns)
-        .bind(kind_id)
-        .bind(&row.status)
-        .bind(&fenced)
-        .bind(revision_i64(&row.revision)?)
-        .bind(&row.created_at)
         .execute(&mut **tx)
         .await
         .map_err(|error| conflict(error, format_args!("{}.{}", row.space_id, row.subject_id)))?;
@@ -1187,19 +1314,19 @@ impl MemoryRepository for SqliteMemoryRepository {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| invalid_row(format_args!("fenced_contexts: {error}")))?;
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_subjects SET kind_ns = ?, kind_id = ?, status = ?, \
              fenced_contexts_json = ?, revision = ? \
              WHERE space_id = ? AND subject_id = ? AND revision = ?",
+            kind_ns,
+            kind_id,
+            &row.status,
+            &fenced,
+            revision_i64(&row.revision)?,
+            row.space_id.as_str(),
+            row.subject_id.as_str(),
+            revision_i64(observed_revision)?,
         )
-        .bind(kind_ns)
-        .bind(kind_id)
-        .bind(&row.status)
-        .bind(&fenced)
-        .bind(revision_i64(&row.revision)?)
-        .bind(row.space_id.as_str())
-        .bind(row.subject_id.as_str())
-        .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1211,19 +1338,22 @@ impl MemoryRepository for SqliteMemoryRepository {
         space: &SpaceId,
         principal_filter: Option<&str>,
     ) -> RepoResult<Vec<MemoryGrantRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {GRANT_COLUMNS} FROM memory_grants \
-             WHERE space_id = ? AND (? IS NULL OR principal_id = ?) ORDER BY grant_id"
-        ));
-        sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(principal_filter)
-            .bind(principal_filter)
-            .fetch_all(&mut **tx)
-            .await?
-            .iter()
-            .map(grant_row)
-            .collect()
+        sqlx::query_as!(
+            GrantRow,
+            "SELECT grant_id, space_id, subject_id, principal_id, \
+             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+             revision, created_at FROM memory_grants \
+             WHERE space_id = ? AND (? IS NULL OR principal_id = ?) ORDER BY grant_id",
+            space.as_str(),
+            principal_filter,
+            principal_filter,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .into_iter()
+        .map(grant_row)
+        .collect()
     }
 
     async fn grant(
@@ -1232,17 +1362,20 @@ impl MemoryRepository for SqliteMemoryRepository {
         space: &SpaceId,
         id: &str,
     ) -> RepoResult<Option<MemoryGrantRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {GRANT_COLUMNS} FROM memory_grants \
-             WHERE space_id = ? AND grant_id = ?"
-        ));
-        sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|row| grant_row(&row))
-            .transpose()
+        sqlx::query_as!(
+            GrantRow,
+            "SELECT grant_id, space_id, subject_id, principal_id, \
+             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+             revision, created_at FROM memory_grants \
+             WHERE space_id = ? AND grant_id = ?",
+            space.as_str(),
+            id,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(grant_row)
+        .transpose()
     }
 
     async fn insert_grant(&self, tx: &mut Self::Tx<'_>, row: &MemoryGrantRow) -> RepoResult<()> {
@@ -1255,23 +1388,23 @@ impl MemoryRepository for SqliteMemoryRepository {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| invalid_row(format_args!("context_ids: {error}")))?;
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_grants \
              (grant_id, space_id, subject_id, principal_id, capabilities_json, \
               context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &row.grant_id,
+            row.space_id.as_str(),
+            row.subject_id.as_ref().map(|id| id.as_str().to_string()),
+            row.principal_id.as_str(),
+            &capabilities,
+            &contexts,
+            i64::from(row.shared_access),
+            &row.expires_at,
+            &row.revoked_at,
+            revision_i64(&row.revision)?,
+            &row.created_at,
         )
-        .bind(&row.grant_id)
-        .bind(row.space_id.as_str())
-        .bind(row.subject_id.as_ref().map(|id| id.as_str().to_string()))
-        .bind(row.principal_id.as_str())
-        .bind(&capabilities)
-        .bind(&contexts)
-        .bind(i64::from(row.shared_access))
-        .bind(&row.expires_at)
-        .bind(&row.revoked_at)
-        .bind(revision_i64(&row.revision)?)
-        .bind(&row.created_at)
         .execute(&mut **tx)
         .await
         .map_err(|error| conflict(error, &row.grant_id))?;
@@ -1293,23 +1426,23 @@ impl MemoryRepository for SqliteMemoryRepository {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| invalid_row(format_args!("context_ids: {error}")))?;
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_grants SET subject_id = ?, principal_id = ?, capabilities_json = ?, \
              context_ids_json = ?, shared_access = ?, expires_at = ?, revoked_at = ?, \
              revision = ? \
              WHERE grant_id = ? AND space_id = ? AND revision = ?",
+            row.subject_id.as_ref().map(|id| id.as_str().to_string()),
+            row.principal_id.as_str(),
+            &capabilities,
+            &contexts,
+            i64::from(row.shared_access),
+            &row.expires_at,
+            &row.revoked_at,
+            revision_i64(&row.revision)?,
+            &row.grant_id,
+            row.space_id.as_str(),
+            revision_i64(observed_revision)?,
         )
-        .bind(row.subject_id.as_ref().map(|id| id.as_str().to_string()))
-        .bind(row.principal_id.as_str())
-        .bind(&capabilities)
-        .bind(&contexts)
-        .bind(i64::from(row.shared_access))
-        .bind(&row.expires_at)
-        .bind(&row.revoked_at)
-        .bind(revision_i64(&row.revision)?)
-        .bind(&row.grant_id)
-        .bind(row.space_id.as_str())
-        .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1347,7 +1480,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             .fetch_all(&mut **tx)
             .await?
             .iter()
-            .map(candidate_ir)
+            .map(|row| candidate_row(row).and_then(|row| candidate_ir(&row)))
             .collect()
     }
 
@@ -1363,11 +1496,11 @@ impl MemoryRepository for SqliteMemoryRepository {
         let kind = match &columns.kind {
             Some(kind) => kind.clone(),
             None => {
-                let Some(stored) = sqlx::query_scalar::<_, String>(
+                let Some(stored) = sqlx::query_scalar!(
                     "SELECT kind FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+                    &row.space_id,
+                    &row.candidate_id,
                 )
-                .bind(&row.space_id)
-                .bind(&row.candidate_id)
                 .fetch_optional(&mut **tx)
                 .await?
                 else {
@@ -1377,29 +1510,29 @@ impl MemoryRepository for SqliteMemoryRepository {
             }
         };
         let (visibility, context_id) = placement_columns(&row.capture_scope);
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_candidates SET subject_id = ?, capture_visibility = ?, \
              capture_context_id = ?, kind = ?, content_json = ?, provenance_json = ?, \
              classification_json = ?, status = ?, consumed_by_json = ?, content_digest = ?, \
              occurred_at = ?, expires_at = ?, revision = ? \
              WHERE space_id = ? AND candidate_id = ? AND revision = ?",
+            &row.subject_id,
+            visibility,
+            &context_id,
+            &kind,
+            &columns.content,
+            &columns.provenance,
+            &columns.classification,
+            columns.status,
+            &columns.consumed_by,
+            &columns.content_digest,
+            &row.occurred_at,
+            &columns.expires_at,
+            revision_i64(&row.revision)?,
+            &row.space_id,
+            &row.candidate_id,
+            revision_i64(observed_revision)?,
         )
-        .bind(&row.subject_id)
-        .bind(visibility)
-        .bind(&context_id)
-        .bind(&kind)
-        .bind(&columns.content)
-        .bind(&columns.provenance)
-        .bind(&columns.classification)
-        .bind(columns.status)
-        .bind(&columns.consumed_by)
-        .bind(&columns.content_digest)
-        .bind(&row.occurred_at)
-        .bind(&columns.expires_at)
-        .bind(revision_i64(&row.revision)?)
-        .bind(&row.space_id)
-        .bind(&row.candidate_id)
-        .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1425,7 +1558,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             .fetch_all(&mut **tx)
             .await?
             .iter()
-            .map(record_ir)
+            .map(|row| record_row(row).and_then(|row| record_ir(&row)))
             .collect()
     }
 
@@ -1446,27 +1579,27 @@ impl MemoryRepository for SqliteMemoryRepository {
             .as_object_mut()
             .and_then(|wire| wire.remove("provenance"))
             .unwrap_or_default();
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_records SET subject_id = ?, kind = ?, content_json = ?, \
              scope_visibility = ?, scope_context_id = ?, provenance_json = ?, \
              import_ref_json = ?, occurred_at = ?, tombstone_json = ?, updated_at = ?, \
              revision = ? \
              WHERE space_id = ? AND record_id = ? AND revision = ?",
+            &row.subject_id,
+            &row.kind,
+            &columns.content,
+            visibility,
+            &context_id,
+            to_json(&provenance, "record provenance")?,
+            &columns.import_ref,
+            &row.occurred_at,
+            &columns.tombstone,
+            &row.updated_at,
+            revision_i64(&row.revision)?,
+            &row.space_id,
+            &row.record_id,
+            revision_i64(observed_revision)?,
         )
-        .bind(&row.subject_id)
-        .bind(&row.kind)
-        .bind(&columns.content)
-        .bind(visibility)
-        .bind(&context_id)
-        .bind(to_json(&provenance, "record provenance")?)
-        .bind(&columns.import_ref)
-        .bind(&row.occurred_at)
-        .bind(&columns.tombstone)
-        .bind(&row.updated_at)
-        .bind(revision_i64(&row.revision)?)
-        .bind(&row.space_id)
-        .bind(&row.record_id)
-        .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1478,19 +1611,21 @@ impl MemoryRepository for SqliteMemoryRepository {
         space: &SpaceId,
         id: &str,
     ) -> RepoResult<Option<ReceiptRead>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {RECEIPT_COLUMNS} FROM memory_receipts \
-             WHERE space_id = ? AND receipt_id = ?"
-        ));
-        let Some(row) = sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(id)
-            .fetch_optional(&mut **tx)
-            .await?
-        else {
-            return Ok(None);
-        };
-        receipt_read(&row).map(Some)
+        sqlx::query_as!(
+            ReceiptRow,
+            "SELECT receipt_id, space_id, requester_principal_id, op, \
+             idempotency_key, payload_digest, status, result_json, error_json, created_at, \
+             completed_at FROM memory_receipts \
+             WHERE space_id = ? AND receipt_id = ?",
+            space.as_str(),
+            id,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .as_ref()
+        .map(receipt_read)
+        .transpose()
     }
 
     async fn insert_receipt(
@@ -1510,19 +1645,19 @@ impl MemoryRepository for SqliteMemoryRepository {
         observed_owner: Option<&str>,
     ) -> RepoResult<bool> {
         let columns = receipt_columns(row)?;
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_receipts SET status = ?, result_json = ?, error_json = ?, \
              completed_at = ? \
              WHERE receipt_id = ? AND space_id = ? AND status = ? AND owner_id IS ?",
+            columns.status,
+            &columns.result,
+            &columns.error,
+            &columns.completed_at,
+            &row.receipt_id,
+            &row.space_id,
+            observed_state,
+            observed_owner,
         )
-        .bind(columns.status)
-        .bind(&columns.result)
-        .bind(&columns.error)
-        .bind(&columns.completed_at)
-        .bind(&row.receipt_id)
-        .bind(&row.space_id)
-        .bind(observed_state)
-        .bind(observed_owner)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1564,20 +1699,20 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         row: &MemoryProfileRow,
     ) -> RepoResult<()> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_profiles \
              (space_id, subject_id, profile_kind, document_json, updated_by, revision, \
               created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            row.space_id.as_str(),
+            row.subject_id.as_str(),
+            &row.profile_kind,
+            to_json(&row.document, "profile document")?,
+            row.updated_by.as_str(),
+            revision_i64(&row.revision)?,
+            &row.created_at,
+            &row.updated_at,
         )
-        .bind(row.space_id.as_str())
-        .bind(row.subject_id.as_str())
-        .bind(&row.profile_kind)
-        .bind(to_json(&row.document, "profile document")?)
-        .bind(row.updated_by.as_str())
-        .bind(revision_i64(&row.revision)?)
-        .bind(&row.created_at)
-        .bind(&row.updated_at)
         .execute(&mut **tx)
         .await
         .map_err(|error| {
@@ -1595,19 +1730,19 @@ impl MemoryRepository for SqliteMemoryRepository {
         row: &MemoryProfileRow,
         observed_revision: &Number,
     ) -> RepoResult<bool> {
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_profiles SET document_json = ?, updated_by = ?, updated_at = ?, \
              revision = ? \
              WHERE space_id = ? AND subject_id = ? AND profile_kind = ? AND revision = ?",
+            to_json(&row.document, "profile document")?,
+            row.updated_by.as_str(),
+            &row.updated_at,
+            revision_i64(&row.revision)?,
+            row.space_id.as_str(),
+            row.subject_id.as_str(),
+            &row.profile_kind,
+            revision_i64(observed_revision)?,
         )
-        .bind(to_json(&row.document, "profile document")?)
-        .bind(row.updated_by.as_str())
-        .bind(&row.updated_at)
-        .bind(revision_i64(&row.revision)?)
-        .bind(row.space_id.as_str())
-        .bind(row.subject_id.as_str())
-        .bind(&row.profile_kind)
-        .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1620,17 +1755,22 @@ impl MemoryRepository for SqliteMemoryRepository {
         subject: &str,
         selection: Option<&PlacementSelection>,
     ) -> RepoResult<Vec<MemoryReflectionRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {REFLECTION_COLUMNS} FROM memory_reflections \
-             WHERE space_id = ? AND subject_id = ? ORDER BY seq DESC"
-        ));
-        let rows = sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(subject)
-            .fetch_all(&mut **tx)
-            .await?;
+        let rows = sqlx::query_as!(
+            ReflectionRow,
+            "SELECT seq, reflection_id, space_id, subject_id, \
+             requester_principal_id, selection_json, filter_json, cognition_filter_json, \
+             basis_json, engine_policy_version, model, schema_version, revision, \
+             extensions_json, created_at, body_text, body_format, cost_unit_kind, cost_units, \
+             stale_cache FROM memory_reflections \
+             WHERE space_id = ? AND subject_id = ? ORDER BY seq DESC",
+            space.as_str(),
+            subject,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?;
         let mut reflections = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for row in rows {
             let reflection = reflection_row(row)?;
             // The pinned selection is validated on every read, filter or not.
             let pinned = pinned_selection(&reflection.selection)?;
@@ -1653,7 +1793,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             Some((unit_kind, units)) => (Some(unit_kind.clone()), Some(*units)),
             None => (None, None),
         };
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_reflections \
              (seq, reflection_id, space_id, subject_id, requester_principal_id, \
               selection_json, filter_json, cognition_filter_json, basis_json, \
@@ -1662,39 +1802,35 @@ impl MemoryRepository for SqliteMemoryRepository {
              VALUES (\
                (SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_reflections), \
                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&row.reflection_id)
-        .bind(row.space_id.as_str())
-        .bind(row.subject_id.as_str())
-        .bind(row.requester.as_str())
-        .bind(to_json(&row.selection, "reflection selection")?)
-        .bind(
+            &row.reflection_id,
+            row.space_id.as_str(),
+            row.subject_id.as_str(),
+            row.requester.as_str(),
+            to_json(&row.selection, "reflection selection")?,
             row.filter
                 .as_ref()
                 .map(|value| to_json(value, "reflection filter"))
                 .transpose()?,
-        )
-        .bind(
             row.cognition_filter
                 .as_ref()
                 .map(|value| to_json(value, "reflection cognition filter"))
                 .transpose()?,
+            to_json(&row.basis, "reflection basis")?,
+            &row.engine_policy_version,
+            &row.model,
+            row.schema_version,
+            revision_i64(&row.revision)?,
+            to_json(
+                &Value::Object(row.extensions.clone()),
+                "reflection extensions",
+            )?,
+            &row.created_at,
+            &row.body_text,
+            &row.body_format,
+            cost_unit_kind,
+            cost_units,
+            i64::from(row.stale_cache),
         )
-        .bind(to_json(&row.basis, "reflection basis")?)
-        .bind(&row.engine_policy_version)
-        .bind(&row.model)
-        .bind(row.schema_version)
-        .bind(revision_i64(&row.revision)?)
-        .bind(to_json(
-            &Value::Object(row.extensions.clone()),
-            "reflection extensions",
-        )?)
-        .bind(&row.created_at)
-        .bind(&row.body_text)
-        .bind(&row.body_format)
-        .bind(cost_unit_kind)
-        .bind(cost_units)
-        .bind(i64::from(row.stale_cache))
         .execute(&mut **tx)
         .await
         .map_err(|error| conflict(error, &row.reflection_id))?;
@@ -1707,17 +1843,19 @@ impl MemoryRepository for SqliteMemoryRepository {
         space: &SpaceId,
         receipt_id: &str,
     ) -> RepoResult<Option<MemoryJournalRow>> {
-        let sql = AssertSqlSafe(format!(
-            "SELECT {JOURNAL_COLUMNS} FROM memory_journal \
-             WHERE space_id = ? AND receipt_id = ?"
-        ));
-        sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(receipt_id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|row| journal_row(&row))
-            .transpose()
+        sqlx::query_as!(
+            JournalRow,
+            "SELECT seq AS \"seq!\", receipt_id, space_id, subject_id, requester_principal_id, \
+             op, idempotency_key, state, targets_json, result_json, created_at, updated_at \
+             FROM memory_journal WHERE space_id = ? AND receipt_id = ?",
+            space.as_str(),
+            receipt_id,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(journal_row)
+        .transpose()
     }
 
     async fn insert_journal_intent(
@@ -1725,32 +1863,27 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         row: &MemoryJournalRow,
     ) -> RepoResult<()> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_journal \
              (seq, receipt_id, space_id, subject_id, requester_principal_id, op, \
               idempotency_key, state, targets_json, result_json, created_at, updated_at) \
              VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_journal), \
                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&row.receipt_id)
-        .bind(row.space_id.as_str())
-        .bind(row.subject_id.as_str())
-        .bind(row.requester.as_str())
-        .bind(&row.operation)
-        .bind(&row.idempotency_key)
-        .bind(&row.state)
-        .bind(to_json(
-            &Value::Array(row.targets.clone()),
-            "journal targets",
-        )?)
-        .bind(
+            &row.receipt_id,
+            row.space_id.as_str(),
+            row.subject_id.as_str(),
+            row.requester.as_str(),
+            &row.operation,
+            &row.idempotency_key,
+            &row.state,
+            to_json(&Value::Array(row.targets.clone()), "journal targets")?,
             row.result
                 .as_ref()
                 .map(|value| to_json(value, "journal result"))
                 .transpose()?,
+            &row.created_at,
+            &row.updated_at,
         )
-        .bind(&row.created_at)
-        .bind(&row.updated_at)
         .execute(&mut **tx)
         .await
         .map_err(|error| conflict(error, &row.receipt_id))?;
@@ -1763,26 +1896,21 @@ impl MemoryRepository for SqliteMemoryRepository {
         row: &MemoryJournalRow,
         observed_state: &str,
     ) -> RepoResult<bool> {
-        let updated = sqlx::query(
+        let updated = sqlx::query!(
             "UPDATE memory_journal SET state = ?, targets_json = ?, result_json = ?, \
              updated_at = ? \
              WHERE space_id = ? AND receipt_id = ? AND state = ?",
-        )
-        .bind(&row.state)
-        .bind(to_json(
-            &Value::Array(row.targets.clone()),
-            "journal targets",
-        )?)
-        .bind(
+            &row.state,
+            to_json(&Value::Array(row.targets.clone()), "journal targets")?,
             row.result
                 .as_ref()
                 .map(|value| to_json(value, "journal result"))
                 .transpose()?,
+            &row.updated_at,
+            row.space_id.as_str(),
+            &row.receipt_id,
+            observed_state,
         )
-        .bind(&row.updated_at)
-        .bind(row.space_id.as_str())
-        .bind(&row.receipt_id)
-        .bind(observed_state)
         .execute(&mut **tx)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1797,20 +1925,14 @@ impl MemoryRepository for SqliteMemoryRepository {
         // Keys are caller-composed and already carry their space; `space` scopes the
         // caller's intent, the table keys on `key` alone.
         let _ = space;
-        sqlx::query_as::<_, (String, String, String)>(
+        sqlx::query_as!(
+            MemoryProviderMetaRow,
             "SELECT key, value, updated_at FROM memory_provider_meta WHERE key = ?",
+            key,
         )
-        .bind(key)
         .fetch_optional(&mut **tx)
         .await
-        .map(|row| {
-            row.map(|(key, value, updated_at)| MemoryProviderMetaRow {
-                key,
-                value,
-                updated_at,
-            })
-        })
-        .map_err(Into::into)
+        .map_err(decode_row)
     }
 
     async fn put_provider_meta(
@@ -1818,14 +1940,14 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         row: &MemoryProviderMetaRow,
     ) -> RepoResult<()> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO memory_provider_meta (key, value, updated_at) VALUES (?, ?, ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
              updated_at = excluded.updated_at",
+            &row.key,
+            &row.value,
+            &row.updated_at,
         )
-        .bind(&row.key)
-        .bind(&row.value)
-        .bind(&row.updated_at)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -1838,8 +1960,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         key: &str,
     ) -> RepoResult<bool> {
         let _ = space;
-        let deleted = sqlx::query("DELETE FROM memory_provider_meta WHERE key = ?")
-            .bind(key)
+        let deleted = sqlx::query!("DELETE FROM memory_provider_meta WHERE key = ?", key,)
             .execute(&mut **tx)
             .await?;
         Ok(deleted.rows_affected() == 1)

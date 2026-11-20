@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT status, result_json FROM memory_receipts WHERE receipt_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "status",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "name": "result_json",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "result_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "61d55c1807683b674164094b287d96ec5cdb22faa10a949d7642e9bbbb6d950b"
+}

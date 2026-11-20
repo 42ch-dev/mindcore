@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_subjects SET fenced_contexts_json = '[\"c1\"]' WHERE space_id = ? AND subject_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "6b90cb9d760725e4e13fbc7a4dd6b03c12a375a3c2b25c78174c85612b598339"
+}
