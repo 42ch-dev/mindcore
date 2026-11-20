@@ -364,9 +364,14 @@ pub(crate) fn recall_score(text: &str, terms: &[String]) -> usize {
         .count()
 }
 
-/// §9.3 budget outcome: the kept indices and the item the byte budget stopped at.
+/// §9.3 budget outcome: the kept indices, how many leading candidates the page
+/// disposed of (kept or skipped), and the item the budget stopped at.
 pub(crate) struct BudgetOutcome {
     pub(crate) kept: Vec<usize>,
+    /// Leading positions decided this page; the next page starts here. Equals
+    /// `kept.len()` except when the first candidate alone overflowed the byte
+    /// budget — that record is consumed (skipped) so paging always advances.
+    pub(crate) consumed: usize,
     pub(crate) overflow_record_id: Option<String>,
 }
 
@@ -381,19 +386,18 @@ pub(crate) fn apply_budget(
         if kept.len() as u64 >= max_items {
             return BudgetOutcome {
                 kept,
+                consumed: index,
                 overflow_record_id: Some(record_id.clone()),
             };
         }
         let size = u64::try_from(*size).unwrap_or(u64::MAX);
-        if max_bytes.is_some_and(|budget| bytes.saturating_add(size) > budget) && kept.is_empty() {
-            return BudgetOutcome {
-                kept,
-                overflow_record_id: Some(record_id.clone()),
-            };
-        }
         if max_bytes.is_some_and(|budget| bytes.saturating_add(size) > budget) {
+            // An oversized first candidate cannot ever be returned; consuming
+            // it (and still naming it once) keeps the cursor advancing.
+            let consumed = index + usize::from(kept.is_empty());
             return BudgetOutcome {
                 kept,
+                consumed,
                 overflow_record_id: Some(record_id.clone()),
             };
         }
@@ -401,6 +405,7 @@ pub(crate) fn apply_budget(
         kept.push(index);
     }
     BudgetOutcome {
+        consumed: kept.len(),
         kept,
         overflow_record_id: None,
     }

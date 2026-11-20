@@ -17,6 +17,30 @@ fn version() -> WireVersion {
         .expect("positive schema version")
 }
 
+/// One caller-derived string as a front-matter scalar. A safe identifier stays
+/// bare (byte-identical); anything else becomes a JSON-encoded double-quoted
+/// scalar, which YAML 1.2 reads identically and a newline can never split into
+/// injected keys.
+fn yaml_str(value: &str) -> String {
+    static YAML_WORDS: &[&str] = &[
+        "y", "yes", "n", "no", "true", "false", "on", "off", "null", "none", "~",
+    ];
+    let bare = !value.is_empty()
+        && value
+            .chars()
+            .next()
+            .is_some_and(|head| head.is_ascii_alphabetic() || head == '_')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && !YAML_WORDS.contains(&value.to_ascii_lowercase().as_str());
+    if bare {
+        value.to_string()
+    } else {
+        serde_json::to_string(value).expect("a string serializes")
+    }
+}
+
 /// §6.6 record projection target.
 pub(crate) fn record_target(record_id: &str) -> String {
     format!("records/{record_id}.md")
@@ -82,14 +106,14 @@ pub(crate) fn record_effect(record: &MemoryRecordIr, prior: Option<String>) -> A
         .and_then(Value::as_str);
     let mut front = format!(
         "---\nrecord_id: {}\nspace_id: {}\nsubject_id: {}\nkind: {}\nvisibility: {}\n",
-        record.record_id,
+        yaml_str(&record.record_id),
         record.space_id.as_str(),
-        record.subject_id.as_str(),
-        record.kind,
+        yaml_str(record.subject_id.as_str()),
+        yaml_str(&record.kind),
         visibility
     );
     if let Some(context_id) = context {
-        front.push_str(&format!("context_id: {context_id}\n"));
+        front.push_str(&format!("context_id: {}\n", yaml_str(context_id)));
     }
     front.push_str(&format!(
         "revision: {}\ncreated_at: {}\nupdated_at: {}\n---\n\n{}\n",
@@ -115,10 +139,10 @@ pub(crate) fn candidate_effect(candidate: &MemoryCandidateIr) -> AResult<Value> 
     let content = format!(
         "---\ncandidate_id: {}\nspace_id: {}\nsubject_id: {}\nkind: {}\nstatus: {}\n\
          revision: {}\ncreated_at: {}\n---\n\n{}\n",
-        candidate.candidate_id,
+        yaml_str(&candidate.candidate_id),
         candidate.space_id.as_str(),
-        candidate.subject_id.as_str(),
-        candidate_kind(candidate),
+        yaml_str(candidate.subject_id.as_str()),
+        yaml_str(candidate_kind(candidate)),
         candidate_status(candidate),
         candidate.revision,
         candidate.created_at,
@@ -150,9 +174,9 @@ pub(crate) fn profile_effect(profile: &MemoryProfileRow) -> AResult<Value> {
         "---\nspace_id: {}\nsubject_id: {}\nprofile_kind: {}\nupdated_by: {}\n\
          revision: {}\ncreated_at: {}\nupdated_at: {}\n---\n\n{document}\n",
         profile.space_id.as_str(),
-        profile.subject_id.as_str(),
-        profile.profile_kind,
-        profile.updated_by.as_str(),
+        yaml_str(profile.subject_id.as_str()),
+        yaml_str(&profile.profile_kind),
+        yaml_str(profile.updated_by.as_str()),
         profile.revision,
         profile.created_at,
         profile.updated_at
