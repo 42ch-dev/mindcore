@@ -15,6 +15,9 @@ serde_json.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+# Executor-independent timer: the deadline must bound provider futures without
+# this crate depending on a runtime.
+futures-timer = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

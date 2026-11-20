@@ -2031,6 +2031,19 @@ impl Reasoner for SlowReasoner {
     }
 }
 
+/// A reasoner that never resolves: only the deadline can end the call.
+struct HungReasoner;
+
+#[async_trait]
+impl Reasoner for HungReasoner {
+    async fn reason_structured(
+        &self,
+        _request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        std::future::pending().await
+    }
+}
+
 /// A policy that approves only after the request deadline.
 struct SlowPolicy(std::time::Duration);
 
@@ -2076,12 +2089,61 @@ async fn deliberate_starts_no_write_after_the_reasoner_overran_the_deadline() {
         timeout: TIGHT_TIMEOUT,
     };
 
+    let started = std::time::Instant::now();
     let error = workflows
         .deliberate(&principal(), request, None, &caps)
         .await
         .expect_err("a reasoner that ran past the deadline settles nothing");
 
     assert!(matches!(error, SpiError::DeadlineExceeded));
+    assert!(
+        started.elapsed() < SLOW_PHASE,
+        "the late verdict was dropped at the deadline, not awaited"
+    );
+    assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+#[tokio::test]
+async fn deliberate_drops_a_hung_reasoner_at_the_deadline() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = HungReasoner;
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: TIGHT_TIMEOUT,
+    };
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        workflows.deliberate(&principal(), request, None, &caps),
+    )
+    .await
+    .expect("a hung reasoner must not block the call");
+    let error = outcome.expect_err("a hung reasoner settles nothing");
+
+    assert!(matches!(error, SpiError::DeadlineExceeded));
+    assert!(
+        started.elapsed() < SLOW_PHASE,
+        "the deadline, not the provider, ended the call"
+    );
     assert!(settlements.lock().expect("settlements").is_empty());
 }
 
@@ -2115,12 +2177,17 @@ async fn deliberate_starts_no_write_after_the_policy_overran_the_deadline() {
         timeout: TIGHT_TIMEOUT,
     };
 
+    let started = std::time::Instant::now();
     let error = workflows
         .deliberate(&principal(), request, None, &caps)
         .await
         .expect_err("a policy that ran past the deadline starts no write");
 
     assert!(matches!(error, SpiError::DeadlineExceeded));
+    assert!(
+        started.elapsed() < SLOW_PHASE,
+        "the late decision was dropped at the deadline, not awaited"
+    );
     assert!(settlements.lock().expect("settlements").is_empty());
 }
 

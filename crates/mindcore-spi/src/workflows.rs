@@ -7,7 +7,9 @@
 //! policy calls never run inside a transaction.
 
 use std::collections::{HashMap, HashSet};
+use std::future::{poll_fn, Future};
 use std::num::NonZeroUsize;
+use std::task::Poll;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -526,8 +528,11 @@ impl SpiMindWorkflows {
     /// One authorized snapshot is read, the reasoner runs outside every
     /// transaction, its verdict is validated against that exact snapshot, the
     /// lens and policy decide, and the carrier is appended and CAS-persisted in
-    /// one write transaction. Every pre-commit phase checks the one deadline,
-    /// so a phase that returns after it never starts the write. Only a definite
+    /// one write transaction. The one deadline bounds the reasoner and policy
+    /// calls themselves, not just the boundaries between phases: a call still
+    /// running at expiry is dropped and reported as a deadline refusal, so no
+    /// pre-commit phase can outrun it. Once the write begins its actual or
+    /// uncertain outcome is preserved. Only a definite
     /// stale-revision conflict starts another attempt — at most twice, and
     /// never after the request deadline.
     pub async fn deliberate(
@@ -583,14 +588,16 @@ impl SpiMindWorkflows {
         let payload = deliberate_payload(request, &snapshot);
         let schema = deliberate_schema();
         let prompt = task_prompt(DELIBERATE_PROMPT, CognitiveTaskKind::Deliberate, lens);
-        let verdict = reasoner
-            .reason_structured(StructuredReasonRequest {
+        let verdict = before_deadline(
+            deadline,
+            reasoner.reason_structured(StructuredReasonRequest {
                 task_kind: CognitiveTaskKind::Deliberate,
                 system_prompt: &prompt,
                 user_payload: &payload,
                 output_schema: &schema,
-            })
-            .await?;
+            }),
+        )
+        .await?;
         ensure_time_left(deadline)?;
         let DeliberateProposal {
             recommendation,
@@ -620,10 +627,12 @@ impl SpiMindWorkflows {
         };
         let fallback = DefaultPolicy;
         let policy: &dyn PolicyHook = caps.policy_hook.unwrap_or(&fallback);
-        match policy
-            .evaluate_settlement(SettlementDraft::Cognition { proposed: &record })
-            .await?
-        {
+        let decision = before_deadline(
+            deadline,
+            policy.evaluate_settlement(SettlementDraft::Cognition { proposed: &record }),
+        )
+        .await?;
+        match decision {
             PolicyDecision::AutoSettle => {}
             PolicyDecision::RequireHumanReview { .. } => {
                 return Ok(DeliberateOutcome::NeedsReview {
@@ -715,6 +724,33 @@ fn ensure_time_left(deadline: Option<Instant>) -> Result<(), SpiError> {
         return Err(SpiError::DeadlineExceeded);
     }
     Ok(())
+}
+
+/// Await one provider call under the request's deadline and drop it at expiry,
+/// so a hung or late reasoner or policy surfaces as a deadline refusal instead
+/// of blocking the caller forever. A provider result that is already ready is
+/// kept; only a write that already began is never cancelled.
+async fn before_deadline<T>(
+    deadline: Option<Instant>,
+    work: impl Future<Output = Result<T, SpiError>>,
+) -> Result<T, SpiError> {
+    let Some(deadline) = deadline else {
+        return work.await;
+    };
+    let mut work = Box::pin(work);
+    let mut delay = Box::pin(futures_timer::Delay::new(
+        deadline.saturating_duration_since(Instant::now()),
+    ));
+    poll_fn(move |cx| {
+        if let Poll::Ready(outcome) = work.as_mut().poll(cx) {
+            return Poll::Ready(outcome);
+        }
+        if delay.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(SpiError::DeadlineExceeded));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Fixed skeleton of the absorb leg; a lens only adds guidance below it.

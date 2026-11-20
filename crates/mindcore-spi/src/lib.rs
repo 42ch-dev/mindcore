@@ -445,9 +445,10 @@ pub struct DeliberateRequest<'a> {
     pub target: &'a CognitionTarget,
     /// Evidence admitted for this deliberation.
     pub evidence: &'a [Evidence<'a>],
-    /// Elapsed-time budget, checked between pre-commit phases; a phase that
-    /// returns after it starts no write and overrun surfaces
-    /// [`SpiError::DeadlineExceeded`].
+    /// Elapsed-time budget for the whole call. It bounds the reasoner and
+    /// policy executions, not only the boundaries between phases: one still
+    /// running at expiry is dropped and overrun surfaces
+    /// [`SpiError::DeadlineExceeded`] without starting a write.
     pub timeout: std::time::Duration,
 }
 
