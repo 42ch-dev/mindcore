@@ -4,6 +4,7 @@
 //! bridges. No storage crate, Nexus or network dependency is involved.
 
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -134,6 +135,7 @@ fn target() -> CognitionTarget {
 
 struct MockEmbedder {
     identity: EmbeddingIdentity,
+    calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -143,6 +145,7 @@ impl Embedder for MockEmbedder {
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(texts
             .iter()
             .map(|text| vec![text.len() as f32; self.identity.dim])
@@ -322,6 +325,7 @@ fn embedding_identity_compares_all_four_fields() {
             model_version: "v1".to_string(),
             dim: 3,
         },
+        calls: Arc::new(AtomicUsize::new(0)),
     };
     let baseline = embedder.identity().expect("serving identity").clone();
     for variant in [
@@ -370,41 +374,60 @@ async fn prompt_reasoner_wraps_full_text_in_the_wire_envelope() {
             Ok(r#"{"verdict": "settle"}"#.to_string())
         }
     });
-    let schema = json!({ "type": "object" });
+    let schema = json!({ "type": "object", "required": ["verdict"] });
     let verdict = reasoner
         .reason_structured(reason_request(&schema))
         .await
         .expect("valid JSON parses");
     assert_eq!(verdict, json!({ "verdict": "settle" }));
-    let prompt = captured
-        .lock()
-        .expect("prompt sink")
-        .pop()
-        .expect("one call");
-    assert!(prompt.starts_with("fixed skeleton\n\n```json\n"));
-    // The compact envelope serializes task_kind snake_case.
-    assert!(prompt.contains("\"task_kind\":\"absorb\""));
-    assert!(prompt.contains("\"user_payload\":\"{}\""));
+
+    let prompts = captured.lock().expect("prompt sink");
+    assert_eq!(prompts.len(), 1, "the bridge calls the executor once");
+    let body = prompts[0]
+        .strip_prefix("fixed skeleton\n\n```json\n")
+        .and_then(|rest| rest.strip_suffix("\n```"))
+        .expect("prompt is the system prompt plus one fenced JSON block");
+    // Decode the outbound envelope: all three fields travel as values, so a
+    // dropped output_schema or a reshaped payload fails here.
+    let envelope: Value = serde_json::from_str(body).expect("envelope is JSON");
+    assert_eq!(envelope["task_kind"], json!("absorb"));
+    assert_eq!(envelope["user_payload"], json!("{}"));
+    assert_eq!(envelope["output_schema"], schema);
+    assert_eq!(envelope.as_object().expect("object").len(), 3);
 }
 
 #[tokio::test]
 async fn prompt_reasoner_rejects_malformed_full_text() {
-    let reasoner = PromptReasoner::new(|_prompt: String| async {
-        Ok("the verdict is obviously settle, trust me".to_string())
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let reasoner = PromptReasoner::new(move |_prompt: String| {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // A valid JSON value embedded in prose: a bridge that extracted
+            // the JSON would wrongly succeed instead of reporting
+            // InvalidReasonerOutput on the complete reply.
+            Ok(r#"the verdict is {"verdict": "settle"}, trust me"#.to_string())
+        }
     });
     let schema = json!({ "type": "object" });
     match reasoner.reason_structured(reason_request(&schema)).await {
         Err(SpiError::InvalidReasonerOutput(_)) => {}
         other => panic!("expected InvalidReasonerOutput, got {other:?}"),
     }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one prompt call");
 }
 
 #[tokio::test]
 async fn prompt_reasoner_propagates_transport_refusals() {
-    let reasoner = PromptReasoner::new(|_prompt: String| async {
-        Err(SpiError::ReasonerFailed(
-            "prompt executor refused".to_string(),
-        ))
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let reasoner = PromptReasoner::new(move |_prompt: String| {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(SpiError::ReasonerFailed("prompt executor refused".to_string()))
+        }
     });
     let schema = json!({ "type": "object" });
     match reasoner.reason_structured(reason_request(&schema)).await {
@@ -413,6 +436,7 @@ async fn prompt_reasoner_propagates_transport_refusals() {
         }
         other => panic!("expected ReasonerFailed, got {other:?}"),
     }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one prompt call");
 }
 
 // ---------- MindWorkflows over the injected capabilities ----------
@@ -424,6 +448,9 @@ async fn recall_embeds_when_available_and_degrades_lexically() {
     let request = recall_request();
     let budget = NonZeroUsize::new(64).expect("nonzero budget");
 
+    // The injected embedder is called; a degraded embedder reports
+    // EmbeddingsUnavailable and a valid pack still returns.
+    let calls = Arc::new(AtomicUsize::new(0));
     let embedder = MockEmbedder {
         identity: EmbeddingIdentity {
             provider_id: "mock-host".to_string(),
@@ -431,18 +458,18 @@ async fn recall_embeds_when_available_and_degrades_lexically() {
             model_version: "v1".to_string(),
             dim: 4,
         },
+        calls: Arc::clone(&calls),
     };
     let caps = MindCapabilities {
         embedder: Some(&embedder),
         reasoner: None,
         policy_hook: None,
     };
-    let pack = workflows
+    let _pack = workflows
         .recall_context(&principal, &request, budget, &caps)
         .await
         .expect("recall");
-    assert_eq!(pack.tokens_used, 4);
-    assert!(pack.records.is_empty() && pack.knowledge.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     // The degrade path: NoEmbeddings reports unavailability → lexical recall.
     let empty = NoEmbeddings;
@@ -450,11 +477,20 @@ async fn recall_embeds_when_available_and_degrades_lexically() {
         embedder: Some(&empty),
         ..caps
     };
-    let pack = workflows
+    workflows
         .recall_context(&principal, &request, budget, &caps)
         .await
         .expect("degraded recall");
-    assert_eq!(pack.tokens_used, 0);
+
+    // No embedder at all also stays on the lexical path.
+    let caps = MindCapabilities {
+        embedder: None,
+        ..caps
+    };
+    workflows
+        .recall_context(&principal, &request, budget, &caps)
+        .await
+        .expect("lexical recall without an embedder");
 }
 
 #[tokio::test]

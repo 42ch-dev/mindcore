@@ -205,7 +205,7 @@ pub enum SettlementDraft<'a> {
     CandidateReview {
         /// The captured pending candidate.
         candidate: &'a MemoryCandidate,
-        /// The proposed review decision (promote/update/dismiss).
+        /// The proposed review decision.
         proposed: &'a Decision,
     },
     /// A proposed cognition record; review returns a proposal without
