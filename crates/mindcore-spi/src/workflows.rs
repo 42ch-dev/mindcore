@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::{poll_fn, Future};
 use std::num::NonZeroUsize;
 use std::task::Poll;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
@@ -570,7 +570,7 @@ impl SpiMindWorkflows {
         let Some(reasoner) = caps.reasoner else {
             return Err(SpiError::ReasonerUnavailable);
         };
-        let deadline = Instant::now().checked_add(request.timeout);
+        let deadline = deadline_after(request.timeout);
         let mut retries = 0usize;
         loop {
             ensure_time_left(deadline)?;
@@ -596,7 +596,7 @@ impl SpiMindWorkflows {
         reasoner: &dyn Reasoner,
         lens: Option<&dyn DomainLens>,
         caps: &MindCapabilities<'_>,
-        deadline: Option<Instant>,
+        deadline: Instant,
     ) -> Result<DeliberateOutcome, SpiError> {
         let snapshot = self
             .binding
@@ -741,11 +741,28 @@ const DELIBERATE_RETRIES: usize = 2;
 /// claims an identity this snapshot never admitted.
 const MEMORY_RECORD_IDENTITY: (&str, &str) = ("memory_record", "mindcore");
 
+/// The longest request deadline the engine honours. A timeout is clamped here
+/// before the instant is computed, so no absurd value can overflow the instant
+/// and silently leave the call with no deadline at all.
+const MAX_TIMEOUT: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// The request's single deadline: `timeout` clamped to [`MAX_TIMEOUT`].
+///
+/// The clamp keeps the deadline a real instant for any caller-supplied
+/// duration; a residual instant overflow fails closed at "now" (every phase
+/// refuses) rather than dropping the bound.
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout.min(MAX_TIMEOUT))
+        .or_else(|| now.checked_add(MAX_TIMEOUT))
+        .unwrap_or(now)
+}
+
 /// The request's single deadline: no phase starts once it elapsed, so a
 /// reasoner, lens or policy that returns late never starts the carrier write.
 /// An outcome already in flight is never reported as a deadline refusal.
-fn ensure_time_left(deadline: Option<Instant>) -> Result<(), SpiError> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+fn ensure_time_left(deadline: Instant) -> Result<(), SpiError> {
+    if Instant::now() >= deadline {
         return Err(SpiError::DeadlineExceeded);
     }
     Ok(())
@@ -756,12 +773,9 @@ fn ensure_time_left(deadline: Option<Instant>) -> Result<(), SpiError> {
 /// of blocking the caller forever. A provider result that is already ready is
 /// kept; only a write that already began is never cancelled.
 async fn before_deadline<T>(
-    deadline: Option<Instant>,
+    deadline: Instant,
     work: impl Future<Output = Result<T, SpiError>>,
 ) -> Result<T, SpiError> {
-    let Some(deadline) = deadline else {
-        return work.await;
-    };
     let mut work = Box::pin(work);
     let mut delay = Box::pin(futures_timer::Delay::new(
         deadline.saturating_duration_since(Instant::now()),
@@ -1839,5 +1853,23 @@ fn record_text(record: &RetainedRecord) -> &str {
     match record {
         RetainedRecord::LiveRecord(record) => record.content.text.as_str(),
         RetainedRecord::TombstonedRecord(record) => record.content.text.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An absurd timeout is clamped, never dropped: the deadline stays a real
+    /// future instant, so every phase keeps its bound.
+    #[test]
+    fn an_absurd_timeout_still_yields_a_deadline() {
+        let deadline = deadline_after(Duration::MAX);
+        let now = Instant::now();
+        assert!(deadline > now, "an absurd timeout must keep a deadline");
+        assert!(
+            deadline.saturating_duration_since(now) <= MAX_TIMEOUT,
+            "the deadline must be clamped, not unbounded"
+        );
     }
 }

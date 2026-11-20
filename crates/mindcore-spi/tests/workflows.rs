@@ -2473,6 +2473,46 @@ async fn deliberate_starts_no_attempt_once_the_deadline_passed() {
     assert!(settlements.lock().expect("settlements").is_empty());
 }
 
+#[tokio::test]
+async fn deliberate_clamps_an_absurd_timeout_and_still_settles() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        // A timeout no instant can hold: the deadline is clamped, not dropped.
+        timeout: std::time::Duration::MAX,
+    };
+
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("a clamped deadline never refuses a call that fits inside it");
+
+    assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+    assert_eq!(settlements.lock().expect("settlements").len(), 1);
+}
+
 /// Refuses every absorb decision: prompt fragments guide, but only this
 /// deterministic check can refuse before the review write.
 struct RefusingAbsorbLens;
