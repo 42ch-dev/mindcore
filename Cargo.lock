@@ -2098,6 +2098,7 @@ dependencies = [
  "spoke-operations",
  "spoke-schemas",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
