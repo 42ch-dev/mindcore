@@ -22,6 +22,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: sqlx offline cache freshness
         run: |
+          set -o pipefail
           # sqlx-cli generates the .sqlx cache that the locked sqlx crate consumes;
           # the two must share one version, so resolve sqlx-cli from Cargo.lock.
           SQLX_VERSION="$(cargo metadata --locked --format-version 1 \
