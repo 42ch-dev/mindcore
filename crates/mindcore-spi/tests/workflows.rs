@@ -1718,9 +1718,11 @@ fn revision_conflict() -> SpiError {
     })
 }
 
+/// The refusal a binding returns when it cannot tell whether its write
+/// committed.
 fn uncertain_write() -> SpiError {
     SpiError::Settlement(spoke_operations::SpokeReject {
-        code: SpokeRejectCode::InternalError,
+        code: SpokeRejectCode::OutcomeUncertain,
         message: "the commit outcome is unknown".to_string(),
         details: None,
     })
@@ -1812,6 +1814,31 @@ async fn deliberate_refuses_fabricated_references_before_any_write() {
             verdict["record"]["basis"]["evidence"][0]["id"] = json!("rec_ghost");
             verdict
         },
+        {
+            // Visible id, fabricated identity: not the admitted reference.
+            let mut verdict = promote_verdict();
+            verdict["record"]["basis"]["evidence"][0]["namespace"] = json!("external");
+            verdict
+        },
+        {
+            // Visible id, fabricated kind: not the admitted reference either.
+            let mut verdict = promote_verdict();
+            verdict["record"]["basis"]["evidence"][0]["kind"] = json!("knowledge_entry");
+            verdict
+        },
+        {
+            // A visible record the verdict never cited has no revision the
+            // commit could revalidate.
+            let mut verdict = promote_verdict();
+            verdict["record_ids"] = json!([]);
+            verdict
+        },
+        {
+            // Supplied evidence carries no record identity a basis can bind to.
+            let mut verdict = promote_verdict();
+            verdict["record"]["basis"]["evidence"][0]["id"] = json!("ev_test");
+            verdict
+        },
     ];
     for verdict in verdicts.drain(..) {
         let binding = DeliberateDouble::new();
@@ -1900,6 +1927,200 @@ async fn deliberate_lens_violation_refuses_before_policy_and_write() {
         Some("adr"),
         "the lens saw the structured recommendation"
     );
+    assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+/// Refuses a `none` recommendation: this domain needs a record for every
+/// deliberation, so its redline binds even when nothing would be written.
+struct RefusingNoneLens(Arc<Mutex<Option<bool>>>);
+
+impl DomainLens for RefusingNoneLens {
+    fn describe(&self, _task_kind: CognitiveTaskKind) -> LensOutput<'_> {
+        LensOutput {
+            persona_and_stance: "an auditor",
+            salience_criteria: "anything that changes the record",
+            evidence_bar: "the supplied evidence",
+            redlines: &["never leave a deliberation without a record"],
+        }
+    }
+
+    fn validate_proposal(
+        &self,
+        draft: &ProposalDraft<'_>,
+        _admitted: &[&str],
+    ) -> Result<(), String> {
+        let ProposalDraft::Cognition {
+            recommendation,
+            record,
+            ..
+        } = draft
+        else {
+            panic!("a deliberate proposal is a cognition draft");
+        };
+        assert!(matches!(recommendation, Recommendation::None));
+        assert!(record.is_none(), "a none recommendation carries no record");
+        *self.0.lock().expect("draft") = Some(true);
+        Err("this domain requires a record for every deliberation".to_string())
+    }
+}
+
+#[tokio::test]
+async fn deliberate_lens_refuses_a_none_recommendation() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: json!({
+            "recommendation": { "kind": "none" },
+            "rationale": "the evidence says nothing new",
+            "evidence_ids": ["ev_test"],
+            "record_ids": []
+        }),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let lens = RefusingNoneLens(Arc::new(Mutex::new(None)));
+    let policy = UnreachablePolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, Some(&lens), &caps)
+        .await
+        .expect_err("a lens redline binds a none recommendation too");
+
+    assert!(
+        matches!(error, SpiError::PolicyRejected(_)),
+        "expected a policy refusal, got {error:?}"
+    );
+    assert_eq!(
+        *lens.0.lock().expect("draft"),
+        Some(true),
+        "the lens saw the none recommendation"
+    );
+    assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+/// A reasoner that returns its verdict only after the request deadline.
+struct SlowReasoner(std::time::Duration);
+
+#[async_trait]
+impl Reasoner for SlowReasoner {
+    async fn reason_structured(
+        &self,
+        _request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        tokio::time::sleep(self.0).await;
+        Ok(promote_verdict())
+    }
+}
+
+/// A policy that approves only after the request deadline.
+struct SlowPolicy(std::time::Duration);
+
+#[async_trait]
+impl PolicyHook for SlowPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        tokio::time::sleep(self.0).await;
+        Ok(PolicyDecision::AutoSettle)
+    }
+}
+
+/// A phase that overruns a ten-millisecond budget must start no write.
+const SLOW_PHASE: std::time::Duration = std::time::Duration::from_millis(200);
+const TIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[tokio::test]
+async fn deliberate_starts_no_write_after_the_reasoner_overran_the_deadline() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = SlowReasoner(SLOW_PHASE);
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: TIGHT_TIMEOUT,
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("a reasoner that ran past the deadline settles nothing");
+
+    assert!(matches!(error, SpiError::DeadlineExceeded));
+    assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+#[tokio::test]
+async fn deliberate_starts_no_write_after_the_policy_overran_the_deadline() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = SlowPolicy(SLOW_PHASE);
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: TIGHT_TIMEOUT,
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("a policy that ran past the deadline starts no write");
+
+    assert!(matches!(error, SpiError::DeadlineExceeded));
     assert!(settlements.lock().expect("settlements").is_empty());
 }
 
@@ -2086,10 +2307,13 @@ async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
         .deliberate(&principal(), request, None, &caps)
         .await
         .expect_err("an uncertain outcome is not a clean refusal");
-    assert!(matches!(
-        error,
-        SpiError::Settlement(ref reject) if reject.code == SpokeRejectCode::InternalError
-    ));
+    assert!(
+        matches!(
+            &error,
+            SpiError::Settlement(reject) if reject.code == SpokeRejectCode::OutcomeUncertain
+        ),
+        "the typed uncertain refusal must travel unchanged, got {error:?}"
+    );
     assert_eq!(snapshots.load(Ordering::SeqCst), 1);
     assert_eq!(settlements.lock().expect("settlements").len(), 1);
 }

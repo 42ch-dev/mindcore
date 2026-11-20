@@ -13,7 +13,7 @@ use spoke_schemas::data::cognition::{CognitionReference, CognitionReferenceKind}
 use spoke_schemas::data::memory_candidate::PlacementScope;
 use spoke_schemas::{
     KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest, MemoryCandidatesReviewRequest,
-    MemoryCaptureRequest, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
+    MemoryCaptureRequest, MemoryGrant, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
     RetainedRecord,
 };
 use sqlx::SqlitePool;
@@ -44,6 +44,15 @@ type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
 /// no knowledge capability, and no memory capability (`recall`, `records_read`)
 /// stands in for it.
 const KNOWLEDGE_READ: &str = "knowledge_read";
+
+/// The carrier-write capability. Reading a collection is not authority to
+/// modify the judgment it carries, so the write transaction requires this on
+/// its own.
+const KNOWLEDGE_WRITE: &str = "knowledge_write";
+
+/// The memory capability the subject page was read under; the write rechecks
+/// it because a verdict over that page depends on it.
+const RECALL: &str = "recall";
 
 /// One collection together with the caller it is admitted to.
 struct AdmittedCollection {
@@ -196,9 +205,10 @@ impl MemoryWorkflowBinding {
                 SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
             }
         }
-        transaction.commit().await.map_err(|error| {
-            internal(format!("settlement transaction could not commit: {error}"))
-        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| uncertain_commit("journal settlement", error))?;
         Ok(settled)
     }
 
@@ -220,18 +230,33 @@ impl MemoryWorkflowBinding {
         self
     }
 
+    /// Every live-admission candidate of `space_id`, read on `tx`.
+    async fn space_grants(
+        &self,
+        tx: &mut Tx<'_>,
+        space_id: &str,
+    ) -> Result<Vec<MemoryGrant>, SpiError> {
+        let space = SpaceId::new(space_id.to_string());
+        let rows = admission::grants(&SqliteMemoryRepository, tx, &space)
+            .await
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        admission::wire_grants(&rows).map_err(|reject| SpiError::Settlement(reject.into_spoke()))
+    }
+
     /// The bound collection, admitted to `principal` on `tx`: the caller must
-    /// be the one this binding serves and hold a live [`KNOWLEDGE_READ`] grant
-    /// in `space_id`.
+    /// be the one this binding serves and hold a live grant for every one of
+    /// `capabilities` in `space_id`.
     ///
-    /// Caller identity, live grant and collection are re-derived on every call,
+    /// Caller identity, live grants and collection are re-derived on every call,
     /// so a read after provider work runs the same admission and a revoked
-    /// knowledge grant refuses it. A memory grant never substitutes for this.
+    /// grant refuses it. A memory grant never substitutes for this, and a
+    /// knowledge read never stands in for [`KNOWLEDGE_WRITE`].
     async fn admitted_collection(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
         space_id: &str,
+        capabilities: &[&str],
     ) -> Result<&str, SpiError> {
         let Some(admitted) = &self.knowledge else {
             return Err(not_authorized(
@@ -246,25 +271,49 @@ impl MemoryWorkflowBinding {
             )));
         }
         let space = SpaceId::new(space_id.to_string());
-        let rows = admission::grants(&SqliteMemoryRepository, tx, &space)
-            .await
-            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
-        let grants = admission::wire_grants(&rows)
-            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
-        let requirement = GrantRequirement {
-            capability: KNOWLEDGE_READ,
-            subject_id: None,
-            context_ids: Vec::new(),
-            reads_shared: false,
-            subject_all: false,
-        };
-        if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
-            return Err(not_authorized(format!(
-                "principal {caller} holds no live {KNOWLEDGE_READ} grant in space {}",
-                space.as_str()
-            )));
+        let grants = self.space_grants(tx, space_id).await?;
+        for capability in capabilities {
+            let requirement = GrantRequirement {
+                capability,
+                subject_id: None,
+                context_ids: Vec::new(),
+                reads_shared: false,
+                subject_all: false,
+            };
+            if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
+                return Err(not_authorized(format!(
+                    "principal {caller} holds no live {capability} grant in space {}",
+                    space.as_str()
+                )));
+            }
         }
         Ok(admitted.scope.collection.as_str())
+    }
+
+    /// The subject's own admission, rechecked inside the write transaction: the
+    /// snapshot read needs it, so a grant revoked while the reasoner ran refuses
+    /// the write even when the verdict cites no memory record at all.
+    async fn revalidate_subject(
+        &self,
+        transaction: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+        subject_id: &str,
+    ) -> Result<(), SpiError> {
+        let space = SpaceId::new(space_id.to_string());
+        let grants = self.space_grants(transaction, space_id).await?;
+        let requirement = admission::selection_requirement(
+            RECALL,
+            subject_id,
+            &mindcore_base::ir::PlacementSelection::SubjectAll,
+        );
+        let caller = principal_id(principal);
+        if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
+            return Err(not_authorized(format!(
+                "principal {caller} holds no live {RECALL} grant covering subject {subject_id}"
+            )));
+        }
+        Ok(())
     }
 
     /// Fill the pack's knowledge slot from the admitted collection.
@@ -278,7 +327,7 @@ impl MemoryWorkflowBinding {
             return Ok(Vec::new());
         }
         let collection = self
-            .admitted_collection(tx, principal, request.space_id.as_str())
+            .admitted_collection(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
             .await?;
         match list_entries_in(tx, collection).await {
             SpokeResult::Ok(entries) => Ok(entries),
@@ -565,7 +614,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         );
         let records = decode_records(records?)?;
         let collection = self
-            .admitted_collection(&mut transaction, principal, space_id)
+            .admitted_collection(&mut transaction, principal, space_id, &[KNOWLEDGE_READ])
             .await?;
         let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
             SpokeResult::Ok(carrier) => carrier,
@@ -611,9 +660,16 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 ))
             })?;
         let collection = self
-            .admitted_collection(&mut transaction, principal, space_id)
+            .admitted_collection(
+                &mut transaction,
+                principal,
+                space_id,
+                &[KNOWLEDGE_READ, KNOWLEDGE_WRITE],
+            )
             .await?;
         let space = SpaceId::new(space_id.to_string());
+        self.revalidate_subject(&mut transaction, principal, space_id, subject_id)
+            .await?;
         self.adapter
             .withhold_if_unsettled(&mut transaction, &space, subject_id)
             .await
@@ -651,11 +707,10 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             SpokeResult::Ok(committed) => committed,
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
-        transaction.commit().await.map_err(|error| {
-            internal(format!(
-                "cognition settlement transaction could not commit: {error}"
-            ))
-        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| uncertain_commit("cognition settlement", error))?;
         let view = derive_mind_state(&committed).map_err(|error| {
             internal(format!(
                 "committed carrier {} derives no MindState: {error}",
@@ -779,4 +834,36 @@ fn internal(message: String) -> SpiError {
         message,
         details: Some(details),
     })
+}
+
+/// A write transaction whose commit failed left its outcome unknown: the row
+/// may or may not be durable, so the caller must resolve it instead of retrying
+/// on the assumption that nothing happened.
+fn uncertain_commit(operation: &str, error: sqlx::Error) -> SpiError {
+    SpiError::Settlement(
+        Reject::uncertain(format!("{operation} committed an unknown outcome: {error}"))
+            .into_spoke(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_write_commit_is_uncertain_never_retryable() {
+        let error = uncertain_commit("cognition settlement", sqlx::Error::Protocol("boom".into()));
+        let SpiError::Settlement(reject) = error else {
+            panic!("a failed commit is a settlement refusal");
+        };
+        assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+        assert_eq!(
+            reject
+                .details
+                .as_ref()
+                .and_then(|details| details.get("retry_class"))
+                .and_then(Value::as_str),
+            Some("uncertain")
+        );
+    }
 }

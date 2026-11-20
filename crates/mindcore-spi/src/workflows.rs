@@ -150,9 +150,10 @@ pub trait WorkflowBinding: Send + Sync {
     /// Append `record` to the holder carrier and persist the replacement under
     /// one caller-managed write transaction.
     ///
-    /// Rechecks the caller's knowledge admission, the subject's withholding and
-    /// every cited record revision against `cited`, and refuses a carrier that
-    /// no longer holds `expected_carrier_revision`. Returns the carrier revision
+    /// Rechecks the caller's admission to *write* the carrier (a read grant is
+    /// not one), the subject's recall admission, its withholding and every
+    /// cited record revision against `cited`, and refuses a carrier that no
+    /// longer holds `expected_carrier_revision`. Returns the carrier revision
     /// of the derived `MindState` after a confirmed commit.
     async fn commit_cognition(
         &self,
@@ -525,8 +526,10 @@ impl SpiMindWorkflows {
     /// One authorized snapshot is read, the reasoner runs outside every
     /// transaction, its verdict is validated against that exact snapshot, the
     /// lens and policy decide, and the carrier is appended and CAS-persisted in
-    /// one write transaction. Only a definite stale-revision conflict starts
-    /// another attempt — at most twice, and never after the request deadline.
+    /// one write transaction. Every pre-commit phase checks the one deadline,
+    /// so a phase that returns after it never starts the write. Only a definite
+    /// stale-revision conflict starts another attempt — at most twice, and
+    /// never after the request deadline.
     pub async fn deliberate(
         &self,
         principal: &Principal,
@@ -540,11 +543,9 @@ impl SpiMindWorkflows {
         let deadline = Instant::now().checked_add(request.timeout);
         let mut retries = 0usize;
         loop {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err(SpiError::DeadlineExceeded);
-            }
+            ensure_time_left(deadline)?;
             match self
-                .deliberate_attempt(principal, &request, reasoner, lens, caps)
+                .deliberate_attempt(principal, &request, reasoner, lens, caps, deadline)
                 .await
             {
                 Err(error) if stale_revision(&error) => {
@@ -565,6 +566,7 @@ impl SpiMindWorkflows {
         reasoner: &dyn Reasoner,
         lens: Option<&dyn DomainLens>,
         caps: &MindCapabilities<'_>,
+        deadline: Option<Instant>,
     ) -> Result<DeliberateOutcome, SpiError> {
         let snapshot = self
             .binding
@@ -576,6 +578,7 @@ impl SpiMindWorkflows {
                 DELIBERATE_PAGE_ITEMS,
             )
             .await?;
+        ensure_time_left(deadline)?;
         let admitted = admitted_references(request.evidence, &snapshot);
         let payload = deliberate_payload(request, &snapshot);
         let schema = deliberate_schema();
@@ -588,29 +591,33 @@ impl SpiMindWorkflows {
                 output_schema: &schema,
             })
             .await?;
+        ensure_time_left(deadline)?;
         let DeliberateProposal {
             recommendation,
             record,
             cited,
             cited_ids,
-        } = deliberate_proposal(&verdict, request, principal, &snapshot, &admitted)?;
-        let Some(record) = record else {
-            // `none`: no record, no policy and no write.
-            return Ok(DeliberateOutcome::NoChange { verdict });
-        };
+        } = deliberate_proposal(&verdict, request, principal, &snapshot)?;
         if let Some(lens) = lens {
             let admitted: Vec<&str> = admitted.iter().map(String::as_str).collect();
             let cited_ids: Vec<&str> = cited_ids.iter().map(String::as_str).collect();
+            // Both recommendation kinds reach the lens: a domain that refuses a
+            // `none` keeps its redline even when nothing would be written.
             lens.validate_proposal(
                 &ProposalDraft::Cognition {
                     recommendation: &recommendation,
-                    record: Some(&record),
+                    record: record.as_ref(),
                     cited_ids: &cited_ids,
                 },
                 &admitted,
             )
             .map_err(SpiError::PolicyRejected)?;
         }
+        ensure_time_left(deadline)?;
+        let Some(record) = record else {
+            // `none`: the lens was consulted, but no policy and no write follow.
+            return Ok(DeliberateOutcome::NoChange { verdict });
+        };
         let fallback = DefaultPolicy;
         let policy: &dyn PolicyHook = caps.policy_hook.unwrap_or(&fallback);
         match policy
@@ -626,6 +633,9 @@ impl SpiMindWorkflows {
             }
             PolicyDecision::Reject { reason } => return Err(SpiError::PolicyRejected(reason)),
         }
+        // Last point before the write begins: after it, an unknown outcome is
+        // reported as one rather than flattened into a deadline refusal.
+        ensure_time_left(deadline)?;
         let mind_state_version = self
             .binding
             .commit_cognition(
@@ -691,6 +701,21 @@ const DELIBERATE_PAGE_ITEMS: u64 = 32;
 /// Retries after the first attempt, so a stale carrier or citation never
 /// loops past three snapshots.
 const DELIBERATE_RETRIES: usize = 2;
+
+/// The identity every visible memory record's reference carries: the record
+/// kind and the Mindcore realm namespace. A basis entry naming any other pair
+/// claims an identity this snapshot never admitted.
+const MEMORY_RECORD_IDENTITY: (&str, &str) = ("memory_record", "mindcore");
+
+/// The request's single deadline: no phase starts once it elapsed, so a
+/// reasoner, lens or policy that returns late never starts the carrier write.
+/// An outcome already in flight is never reported as a deadline refusal.
+fn ensure_time_left(deadline: Option<Instant>) -> Result<(), SpiError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(SpiError::DeadlineExceeded);
+    }
+    Ok(())
+}
 
 /// Fixed skeleton of the absorb leg; a lens only adds guidance below it.
 const ABSORB_PROMPT: &str = "Decide what one captured memory candidate becomes for its \
@@ -878,7 +903,6 @@ fn deliberate_proposal(
     request: &DeliberateRequest<'_>,
     principal: &Principal,
     snapshot: &DeliberateSnapshot,
-    admitted: &[String],
 ) -> Result<DeliberateProposal, SpiError> {
     let object = verdict
         .as_object()
@@ -911,26 +935,7 @@ fn deliberate_proposal(
             let draft = object
                 .get("record")
                 .ok_or_else(|| invalid_verdict("a promotion carries no record"))?;
-            // A record's basis cites the records it rests on: a cited id the
-            // snapshot never admitted is the same hallucination the verdict's
-            // own citations are checked for.
-            for reference in draft
-                .get("basis")
-                .and_then(|basis| basis.get("evidence"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let id = reference
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !admitted.iter().any(|known| known == id) {
-                    return Err(invalid_verdict(format!(
-                        "basis evidence id {id} is not visible to this deliberation"
-                    )));
-                }
-            }
+            validate_basis(draft, snapshot, &cited)?;
             Some(stamp_cognition_record(draft, request, principal)?)
         }
     };
@@ -940,6 +945,54 @@ fn deliberate_proposal(
         cited,
         cited_ids,
     })
+}
+
+/// Every persisted basis reference must name the exact visible memory record it
+/// claims — kind, namespace and id — and be one of the verdict's own record
+/// citations, whose revisions the commit revalidates. An id with a fabricated
+/// kind/namespace, or one the verdict never cited, names no source the write
+/// transaction can recheck.
+fn validate_basis(
+    draft: &Value,
+    snapshot: &DeliberateSnapshot,
+    cited: &[CitedRecord],
+) -> Result<(), SpiError> {
+    for reference in draft
+        .get("basis")
+        .and_then(|basis| basis.get("evidence"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let field = |name: &str| {
+            reference
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        };
+        let (id, kind, namespace) = (field("id"), field("kind"), field("namespace"));
+        if (kind, namespace) != MEMORY_RECORD_IDENTITY {
+            return Err(invalid_verdict(format!(
+                "basis evidence {kind}:{namespace}:{id} is not a {}:{} reference",
+                MEMORY_RECORD_IDENTITY.0, MEMORY_RECORD_IDENTITY.1
+            )));
+        }
+        if !snapshot
+            .records
+            .iter()
+            .any(|record| record_id(record) == id)
+        {
+            return Err(invalid_verdict(format!(
+                "basis evidence id {id} is not visible to this deliberation"
+            )));
+        }
+        if !cited.iter().any(|record| record.record_id == id) {
+            return Err(invalid_verdict(format!(
+                "basis evidence id {id} is not cited in record_ids"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The structured recommendation of one verdict.

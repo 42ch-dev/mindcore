@@ -445,7 +445,9 @@ pub struct DeliberateRequest<'a> {
     pub target: &'a CognitionTarget,
     /// Evidence admitted for this deliberation.
     pub evidence: &'a [Evidence<'a>],
-    /// Elapsed-time budget; overrun surfaces [`SpiError::DeadlineExceeded`].
+    /// Elapsed-time budget, checked between pre-commit phases; a phase that
+    /// returns after it starts no write and overrun surfaces
+    /// [`SpiError::DeadlineExceeded`].
     pub timeout: std::time::Duration,
 }
 

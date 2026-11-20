@@ -199,6 +199,23 @@ impl Harness {
         .expect("seed knowledge grant");
     }
 
+    /// The carrier-write authority: a space-wide `knowledge_write` grant,
+    /// separate from the read admission it never substitutes for.
+    async fn carrier_grant(&self, principal: &str) {
+        sqlx::query(
+            "INSERT INTO memory_grants \
+             (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+              shared_access, expires_at, revoked_at, revision, created_at) \
+             VALUES ('grt_carrier', ?, NULL, ?, '[\"knowledge_write\"]', '[]', 0, NULL, NULL, 1, ?)",
+        )
+        .bind(SPACE)
+        .bind(principal)
+        .bind(NOW)
+        .execute(&self.pool)
+        .await
+        .expect("seed carrier grant");
+    }
+
     async fn record(&self, record_id: &str, text: &str, created_at: &str) {
         sqlx::query(
             "INSERT INTO memory_records \
@@ -1619,6 +1636,10 @@ enum DeliberateEffect {
     /// Move the cited record on every call: every attempt's citation is stale.
     BumpCitedAlways,
     RevokeKnowledgeGrant,
+    /// Revoke the separate carrier-write authority while the reasoner runs.
+    RevokeCarrierGrant,
+    /// Revoke the subject's recall grant while the reasoner runs.
+    RevokeRecallGrant,
     /// Withhold the subject: an unsettled intent appears while the reasoner runs.
     StagePendingIntent,
 }
@@ -1675,6 +1696,22 @@ impl Reasoner for DeliberateReasoner {
                     .execute(&self.pool)
                     .await
                     .expect("revoke the knowledge grant");
+            }
+            DeliberateEffect::RevokeCarrierGrant => {
+                sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = ?")
+                    .bind(NOW)
+                    .bind("grt_carrier")
+                    .execute(&self.pool)
+                    .await
+                    .expect("revoke the carrier grant");
+            }
+            DeliberateEffect::RevokeRecallGrant => {
+                sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = ?")
+                    .bind(NOW)
+                    .bind("grt_recall")
+                    .execute(&self.pool)
+                    .await
+                    .expect("revoke the recall grant");
             }
             DeliberateEffect::StagePendingIntent => {
                 sqlx::query(
@@ -1782,6 +1819,7 @@ async fn deliberate_harness() -> Harness {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
+    harness.carrier_grant(PRINCIPAL).await;
     harness
         .record(
             "rec_gate",
@@ -1970,6 +2008,143 @@ async fn a_revoked_knowledge_grant_refuses_the_carrier_write() {
         panic!("expected a settlement refusal, got {error:?}");
     };
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a refusal is never retried"
+    );
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1);
+    assert!(payload.get("modules").is_none());
+}
+
+#[tokio::test]
+async fn a_read_only_caller_refuses_the_carrier_write() {
+    // The read admission alone reaches the snapshot; it never authorizes the write.
+    let harness = deliberate_harness().await;
+    sqlx::query("DELETE FROM memory_grants WHERE grant_id = 'grt_carrier'")
+        .execute(&harness.pool)
+        .await
+        .expect("drop the carrier grant");
+    let reasoner =
+        DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect_err("a read-only caller must not write the carrier");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        reject.message.contains("knowledge_write"),
+        "the refusal names the missing write authority: {reject:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a refusal is never retried"
+    );
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1);
+    assert!(payload.get("modules").is_none());
+}
+
+#[tokio::test]
+async fn a_revoked_carrier_grant_refuses_the_carrier_write() {
+    let harness = deliberate_harness().await;
+    let reasoner = DeliberateReasoner::new(
+        promote_verdict(),
+        DeliberateEffect::RevokeCarrierGrant,
+        &harness.pool,
+    );
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect_err("a revoked write grant must not write the carrier");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a refusal is never retried"
+    );
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1);
+    assert!(payload.get("modules").is_none());
+}
+
+/// A promotion resting on a declared prior: it cites no memory record at all.
+fn prior_verdict() -> Value {
+    json!({
+        "recommendation": { "kind": "promote", "target_kind": "adr" },
+        "rationale": "the warden's standing assumption already holds",
+        "evidence_ids": [],
+        "record_ids": [],
+        "record": {
+            "kind": "belief",
+            "order": 1,
+            "q": {
+                "value": 0.8,
+                "assertion": "belief_attribution",
+                "method": "two_witness_reports",
+                "calibration": "uncalibrated"
+            },
+            "assessor_role": "holder_self_report",
+            "basis": {
+                "kind": "prior",
+                "description": "the warden has always held the north gate"
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_revoked_subject_grant_refuses_a_write_that_cites_nothing() {
+    let harness = deliberate_harness().await;
+    let reasoner = DeliberateReasoner::new(
+        prior_verdict(),
+        DeliberateEffect::RevokeRecallGrant,
+        &harness.pool,
+    );
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect_err("a revoked subject grant must refuse the write without citations");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        reject.message.contains("recall"),
+        "the refusal names the missing subject admission: {reject:?}"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
