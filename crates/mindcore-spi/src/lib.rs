@@ -2,7 +2,7 @@
 //!
 //! Host-facing capability and workflow contracts for embedding, structured
 //! reasoning, settlement policy and domain lenses, pinned to the published
-//! SPOKE 0.16.1 DTOs. This crate deliberately depends only on the SPOKE base
+//! SPOKE 0.17.0 DTOs. This crate deliberately depends only on the SPOKE base
 //! crates plus serde/async infrastructure: no `mindcore-*` storage crate,
 //! no Nexus, no network or model SDK enters the contract surface.
 //!
@@ -15,8 +15,10 @@
 pub mod workflows;
 
 pub use workflows::{
-    AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, RecallSnapshot, SpiMindWorkflows, WorkflowBinding,
+    page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
+    CapturedCandidate, CitedRecord, DeliberateSnapshot, PageFact, PageVector, PageVectors,
+    RecallSnapshot, RecordFill, SettledRecord, SettledRevision, SnapshotFact, SpiMindWorkflows,
+    WorkflowBinding,
 };
 
 use std::future::Future;

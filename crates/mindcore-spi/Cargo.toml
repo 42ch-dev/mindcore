@@ -7,6 +7,12 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Test-only ranking probe (`workflows::scored_bits_for_test`). Only
+# `mindcore-spoke`'s [dev-dependencies] enable it; it must never be enabled by a
+# production dependency edge.
+test-scoring = []
+
 [dependencies]
 spoke-schemas.workspace = true
 spoke-operations.workspace = true

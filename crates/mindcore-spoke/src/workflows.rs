@@ -8,7 +8,10 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
-use spoke_operations::{GrantRequirement, SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    knowledge_entry_visible_to_viewpoint, GrantRequirement, SpokeReject, SpokeRejectCode,
+    SpokeResult,
+};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionReferenceKind};
 use spoke_schemas::data::memory_candidate::PlacementScope;
 use spoke_schemas::{
@@ -19,17 +22,22 @@ use spoke_schemas::{
 use sqlx::SqlitePool;
 
 use mindcore_base::boundary::CallerId;
-use mindcore_base::cognition::{
-    append_cognition_record, carrier_records, derive_mind_state, CARRIER_NAMESPACE,
-};
+use mindcore_base::cognition::{carrier_records, CARRIER_NAMESPACE};
 use mindcore_base::ids::SpaceId;
-use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
+use mindcore_base::ir::{
+    CandidateState, MemoryJournalRow, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState,
+};
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
-    AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, RecallSnapshot, SpiError, WorkflowBinding,
+    page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
+    CapturedCandidate, CitedRecord, DeliberateSnapshot, EmbeddingIdentity, PageFact, PageVector,
+    PageVectors, RecallSnapshot, RecordFill, SettledRecord, SettledRevision, SnapshotFact,
+    SpiError, WorkflowBinding,
 };
-use mindcore_sqlite::{list_entries_in, read_entry, write_entry, SqliteMemoryRepository};
+use mindcore_sqlite::{
+    append_cognition, list_entries_in, read_carrier_header, read_entry, vectors,
+    SqliteMemoryRepository,
+};
 
 use crate::admission;
 use crate::reject::Reject;
@@ -100,13 +108,14 @@ impl MemoryWorkflowBinding {
         self
     }
 
-    /// The file targets one staged intent still owes.
-    async fn intent_targets(
+    /// The pending intent one staged receipt holds: the file targets it still
+    /// owes and the result that names the records it wrote.
+    async fn staged_intent(
         &self,
         transaction: &mut Tx<'_>,
         space: &SpaceId,
         receipt_id: &str,
-    ) -> Result<Vec<Value>, SpiError> {
+    ) -> Result<MemoryJournalRow, SpiError> {
         SqliteMemoryRepository
             .journal_intent(transaction, space, receipt_id)
             .await
@@ -115,8 +124,47 @@ impl MemoryWorkflowBinding {
                     "journal intent {receipt_id} could not be read: {error}"
                 ))
             })?
-            .map(|intent| intent.targets)
             .ok_or_else(|| internal(format!("receipt {receipt_id} has no journaled intent")))
+    }
+
+    /// The records one staged intent's own result names, each at the revision
+    /// its staging wrote.
+    ///
+    /// Read on the staging transaction that wrote those rows: it holds the only
+    /// writable handle, so no later commit can move a revision between the write
+    /// and this read. The result, not a publication path, owns record identity,
+    /// so a projection-path change can neither alter a fresh outcome nor
+    /// silently disable the warm.
+    async fn staged_revisions(
+        &self,
+        transaction: &mut Tx<'_>,
+        space: &SpaceId,
+        intent: &MemoryJournalRow,
+    ) -> Result<Vec<SettledRevision>, SpiError> {
+        let mut settled = Vec::new();
+        for record_id in result_record_ids(intent.result.as_ref()) {
+            let Some(record) = SqliteMemoryRepository
+                .record(transaction, space, record_id)
+                .await
+                .map_err(|error| {
+                    internal(format!(
+                        "staged record {record_id} could not be read: {error}"
+                    ))
+                })?
+            else {
+                continue;
+            };
+            let Some(revision) = record.revision.as_u64() else {
+                return Err(internal(format!(
+                    "staged record {record_id} carries no integer revision"
+                )));
+            };
+            settled.push(SettledRevision {
+                record_id: record_id.to_string(),
+                revision,
+            });
+        }
+        Ok(settled)
     }
 
     /// The host publisher, or the typed refusal a settlement leg owes before it
@@ -228,11 +276,13 @@ impl MemoryWorkflowBinding {
         Ok(settled)
     }
 
-    /// Fill the pack's knowledge slot from `scope`, admitted to `caller` only.
+    /// Bind the collection the carrier write serves, admitted to `caller` only.
     ///
-    /// The collection is one caller's knowledge scope: every read needs that
-    /// caller to match and to hold a live [`KNOWLEDGE_READ`] grant in the
-    /// request's space, so another principal's memory grant never reaches it.
+    /// Deliberation reads and CAS-writes one caller's carrier entry, so every
+    /// deliberate call needs `caller` to be the principal and to hold a live
+    /// [`KNOWLEDGE_READ`]/[`KNOWLEDGE_WRITE`] grant in the request's space.
+    /// Recall's knowledge slot is not restricted to `caller`: any principal
+    /// holding its own live [`KNOWLEDGE_READ`] grant reads this collection.
     #[must_use]
     pub fn with_knowledge_collection(
         mut self,
@@ -259,33 +309,29 @@ impl MemoryWorkflowBinding {
         admission::wire_grants(&rows).map_err(|reject| SpiError::Settlement(reject.into_spoke()))
     }
 
-    /// The bound collection, admitted to `principal` on `tx`: the caller must
-    /// be the one this binding serves and hold a live grant for every one of
-    /// `capabilities` in `space_id`.
+    /// The one collection this binding serves, when the host bound one.
+    fn bound(&self) -> Result<&AdmittedCollection, SpiError> {
+        self.knowledge.as_ref().ok_or_else(|| {
+            not_authorized("this workflow binding serves no knowledge collection".to_string())
+        })
+    }
+
+    /// The bound collection, read under `principal`'s own live grant for every
+    /// one of `capabilities` in `space_id`.
     ///
-    /// Caller identity, live grants and collection are re-derived on every call,
-    /// so a read after provider work runs the same admission and a revoked
-    /// grant refuses it. A memory grant never substitutes for this, and a
-    /// knowledge read never stands in for [`KNOWLEDGE_WRITE`].
-    async fn admitted_collection(
+    /// Live grants are re-derived on every call, so a read after provider work
+    /// runs the same admission and a revoked grant refuses it. A memory grant
+    /// never substitutes for this, and a knowledge read never stands in for
+    /// [`KNOWLEDGE_WRITE`].
+    async fn granted_collection(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
         space_id: &str,
         capabilities: &[&str],
-    ) -> Result<&str, SpiError> {
-        let Some(admitted) = &self.knowledge else {
-            return Err(not_authorized(
-                "this workflow binding serves no knowledge collection".to_string(),
-            ));
-        };
+    ) -> Result<&AdmittedCollection, SpiError> {
+        let admitted = self.bound()?;
         let caller = principal_id(principal);
-        if caller != admitted.caller.as_str() {
-            return Err(not_authorized(format!(
-                "principal {caller} is not admitted to knowledge collection {}",
-                admitted.scope.collection
-            )));
-        }
         let space = SpaceId::new(space_id.to_string());
         let grants = self.space_grants(tx, space_id).await?;
         for capability in capabilities {
@@ -303,7 +349,35 @@ impl MemoryWorkflowBinding {
                 )));
             }
         }
-        Ok(admitted.scope.collection.as_str())
+        Ok(admitted)
+    }
+
+    /// The bound collection for the carrier write: `principal` must be the one
+    /// caller this binding serves and hold a live grant for every one of
+    /// `capabilities` in `space_id`.
+    ///
+    /// The caller match is the recorded one-caller write limit: deliberation
+    /// settles onto one principal's carrier entry, so another admitted peer
+    /// reads memory and knowledge but never writes this carrier.
+    async fn admitted_collection(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+        capabilities: &[&str],
+    ) -> Result<&str, SpiError> {
+        let admitted = self.bound()?;
+        let caller = principal_id(principal);
+        if caller != admitted.caller.as_str() {
+            // Target-free: the peer learns it is not the route's caller, never which collection
+            // the host routed or bound.
+            return Err(not_authorized(format!(
+                "principal {caller} is not the admitted carrier caller"
+            )));
+        }
+        self.granted_collection(tx, principal, space_id, capabilities)
+            .await
+            .map(|admitted| admitted.scope.collection.as_str())
     }
 
     /// The subject's own admission, rechecked inside the write transaction: the
@@ -332,7 +406,19 @@ impl MemoryWorkflowBinding {
         Ok(())
     }
 
-    /// Fill the pack's knowledge slot from the admitted collection.
+    /// Fill the pack's knowledge slot: any caller holding a live
+    /// [`KNOWLEDGE_READ`] grant in the request's space reads the bound
+    /// collection, whichever caller the carrier write is bound to.
+    ///
+    /// The slot applies the same disclosure predicate as the served knowledge
+    /// list. This binding carries no admitted viewpoint, so an entry a
+    /// viewpoint-free read hides — an `owner`-private one — never reaches the
+    /// pack, however large the recall's budget.
+    ///
+    /// Best effort: the slot never decides whether the recall is authorized, so
+    /// a caller without that grant reads its memory records with an empty slot
+    /// exactly as it would with no collection bound. Storage and list failures
+    /// are not authorization, and still fail the call.
     async fn knowledge_slot(
         &self,
         tx: &mut Tx<'_>,
@@ -342,12 +428,45 @@ impl MemoryWorkflowBinding {
         if self.knowledge.is_none() {
             return Ok(Vec::new());
         }
-        let collection = self
-            .admitted_collection(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
-            .await?;
-        match list_entries_in(tx, collection).await {
-            SpokeResult::Ok(entries) => Ok(entries),
+        let granted = match self
+            .granted_collection(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(SpiError::Settlement(reject)) if reject.code == SpokeRejectCode::NotAuthorized => {
+                return Ok(Vec::new())
+            }
+            Err(error) => return Err(error),
+        };
+        match list_entries_in(tx, granted.scope.collection.as_str()).await {
+            SpokeResult::Ok(entries) => Ok(entries
+                .into_iter()
+                .filter(|entry| knowledge_entry_visible_to_viewpoint(entry, None))
+                .collect()),
             SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
+        }
+    }
+
+    /// The authorized recall page of `request`, read through `memory.recall`
+    /// on `transaction`: ACL, withholding and the SPOKE page budget are the
+    /// adapter's own checks, so no storage read precedes them.
+    async fn authorized_page(
+        &self,
+        transaction: &mut Tx<'_>,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+    ) -> Result<Vec<RetainedRecord>, SpiError> {
+        let raw = serde_json::to_value(request)
+            .map_err(|error| internal(format!("recall request could not be rendered: {error}")))?;
+        let stage = match self.adapter.recall(transaction, principal, raw).await {
+            SpokeResult::Ok(stage) => stage,
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        match stage {
+            MemoryStage::Ready(body) => decode_records(body),
+            other => Err(internal(format!(
+                "memory.recall returned an unserveable stage: {other:?}"
+            ))),
         }
     }
 }
@@ -359,24 +478,13 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         principal: &Principal,
         request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError> {
-        let raw = serde_json::to_value(request)
-            .map_err(|error| internal(format!("recall request could not be rendered: {error}")))?;
         let mut transaction =
             self.pool.begin().await.map_err(|error| {
                 internal(format!("recall transaction could not begin: {error}"))
             })?;
-        let stage = match self.adapter.recall(&mut transaction, principal, raw).await {
-            SpokeResult::Ok(stage) => stage,
-            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
-        };
-        let records = match stage {
-            MemoryStage::Ready(body) => decode_records(body)?,
-            other => {
-                return Err(internal(format!(
-                    "memory.recall returned an unserveable stage: {other:?}"
-                )))
-            }
-        };
+        let records = self
+            .authorized_page(&mut transaction, principal, request)
+            .await?;
         let knowledge = self
             .knowledge_slot(&mut transaction, principal, request)
             .await?;
@@ -385,6 +493,73 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .await
             .map_err(|error| internal(format!("recall transaction could not commit: {error}")))?;
         Ok(RecallSnapshot { records, knowledge })
+    }
+
+    async fn recall_vectors(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        identity: &EmbeddingIdentity,
+        expected: &[PageFact],
+    ) -> Result<PageVectors, SpiError> {
+        let identity_hash = vector_identity(identity)?;
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!("vector read transaction could not begin: {error}"))
+        })?;
+        // The same authorized read as the recall itself: a page that lost its
+        // grant or became withheld refuses here, so no row is probed for it.
+        let records = self
+            .authorized_page(&mut transaction, principal, request)
+            .await?;
+        // The page the caller holds is the only one this read may serve: a
+        // record that moved after the first read is refused before its new
+        // revision is looked up, so a decode of the newer row can never
+        // surface as a storage error instead of the conflict.
+        if page_fact(&records) != expected {
+            return Err(SpiError::Settlement(
+                Reject::retryable(
+                    SpokeRejectCode::RevisionConflict,
+                    "the authorized page moved while the query was embedded; retry the recall",
+                )
+                .into_spoke(),
+            ));
+        }
+        let page: Vec<(&str, u64)> = records
+            .iter()
+            .filter_map(|record| match record {
+                RetainedRecord::LiveRecord(live) => {
+                    Some((live.record_id.as_str(), live.revision.get()))
+                }
+                RetainedRecord::TombstonedRecord(_) => None,
+            })
+            .collect();
+        let mut stored = match vectors::read_record_vectors(
+            &mut *transaction,
+            &identity_hash,
+            &page,
+            identity.dim,
+        )
+        .await
+        {
+            SpokeResult::Ok(vectors) => vectors.into_iter(),
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        let rows = records
+            .into_iter()
+            .map(|record| {
+                let vector = match &record {
+                    RetainedRecord::LiveRecord(_) => {
+                        stored.next().expect("one lookup per live record")
+                    }
+                    RetainedRecord::TombstonedRecord(_) => None,
+                };
+                PageVector { record, vector }
+            })
+            .collect();
+        transaction.commit().await.map_err(|error| {
+            internal(format!("vector read transaction could not commit: {error}"))
+        })?;
+        Ok(rows)
     }
 
     async fn capture(
@@ -504,7 +679,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         principal: &Principal,
         request: &MemoryCandidatesReviewRequest,
         cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         let publisher = self.publisher()?;
         let space = SpaceId::new(request.space_id.to_string());
         let mut transaction = self.pool.begin().await.map_err(|error| {
@@ -519,17 +694,19 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .review_candidate(&mut transaction, principal, render(request, "review")?)
                 .await,
         )?;
-        let targets = self
-            .intent_targets(&mut transaction, &space, &receipt_id)
+        let intent = self
+            .staged_intent(&mut transaction, &space, &receipt_id)
+            .await?;
+        let settled = self
+            .staged_revisions(&mut transaction, &space, &intent)
             .await?;
         transaction.commit().await.map_err(|error| {
             uncertain_commit(&format!("review staging for receipt {receipt_id}"), error)
         })?;
-        let body = self
-            .settle_staged(publisher, &space, &[(receipt_id, targets)])
+        self.settle_staged(publisher, &space, &[(receipt_id, intent.targets)])
             .await?
             .ok_or_else(|| internal("the settled review carries no receipt".to_string()))?;
-        record_ids(&body)
+        Ok(settled)
     }
 
     async fn update_candidate(
@@ -539,7 +716,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         update: &MemoryRecordsUpdateRequest,
         dismiss: &MemoryCandidatesDismissRequest,
         cited: &[CitedRecord],
-    ) -> Result<(), SpiError> {
+    ) -> Result<Vec<SettledRevision>, SpiError> {
         let publisher = self.publisher()?;
         let space = SpaceId::new(space_id.to_string());
         let mut transaction = self.pool.begin().await.map_err(|error| {
@@ -560,11 +737,18 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .await,
         )?;
         let mut intents = Vec::with_capacity(2);
+        let mut settled = Vec::new();
         for receipt_id in [&update_receipt, &dismiss_receipt] {
-            let targets = self
-                .intent_targets(&mut transaction, &space, receipt_id)
+            let intent = self
+                .staged_intent(&mut transaction, &space, receipt_id)
                 .await?;
-            intents.push((receipt_id.clone(), targets));
+            // The dismissal leg names no record in its result, so only the
+            // update leg's own result yields a revision here.
+            settled.extend(
+                self.staged_revisions(&mut transaction, &space, &intent)
+                    .await?,
+            );
+            intents.push((receipt_id.clone(), intent.targets));
         }
         // Both effects are in this one staging transaction: a refusal above
         // rolls the transaction back with both of them.
@@ -575,6 +759,169 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             )
         })?;
         let _ = self.settle_staged(publisher, &space, &intents).await?;
+        Ok(settled)
+    }
+
+    async fn settled_record(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!(
+                "settled record read transaction could not begin: {error}"
+            ))
+        })?;
+        let body = ready(
+            self.adapter
+                .get_record(
+                    &mut transaction,
+                    principal,
+                    json!({ "space_id": space_id, "record_id": record_id }),
+                )
+                .await,
+            "memory.records.get",
+        )?;
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "settled record read transaction could not commit: {error}"
+            ))
+        })?;
+        let record = decode_record(body)?;
+        Ok(match record {
+            RetainedRecord::LiveRecord(live) => Some(SettledRecord {
+                record_id: live.record_id.as_str().to_string(),
+                revision: live.revision.get(),
+                text: live.content.text,
+            }),
+            RetainedRecord::TombstonedRecord(_) => None,
+        })
+    }
+
+    async fn settle_recall(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        identity: Option<&EmbeddingIdentity>,
+        expected: &SnapshotFact,
+        fills: &[RecordFill],
+    ) -> Result<(), SpiError> {
+        // A fill writes under the transaction that reauthorizes it. Take the
+        // write reservation at begin so no other connection can commit
+        // between the reauthorization read and the first fill: a deferred
+        // begin would upgrade a snapshot another writer already invalidated
+        // and fail the write after the release was warranted. A recall with
+        // nothing to fill only reads, so it keeps the cheaper transaction.
+        let identity_hash = identity
+            .filter(|_| !fills.is_empty())
+            .and_then(|identity| vector_identity(identity).ok());
+        let mut transaction = match identity_hash {
+            Some(_) => self.pool.begin_with("BEGIN IMMEDIATE").await,
+            None => self.pool.begin().await,
+        }
+        .map_err(|error| {
+            internal(format!(
+                "recall release transaction could not begin: {error}"
+            ))
+        })?;
+        let records = self
+            .authorized_page(&mut transaction, principal, request)
+            .await?;
+        let knowledge = self
+            .knowledge_slot(&mut transaction, principal, request)
+            .await?;
+        if &snapshot_fact(&records, &knowledge) != expected {
+            return Err(SpiError::Settlement(
+                Reject::retryable(
+                    SpokeRejectCode::RevisionConflict,
+                    "the authorized snapshot moved while provider work ran; retry the recall",
+                )
+                .into_spoke(),
+            ));
+        }
+        // Only the page read above authorizes a fill; with the write
+        // reservation held from begin, a cache-only failure below is a miss,
+        // never an invalidated release.
+        if let Some(identity_hash) = identity_hash {
+            for fill in fills {
+                let live = records.iter().any(|record| match record {
+                    RetainedRecord::LiveRecord(live) => {
+                        live.record_id.as_str() == fill.record.record_id
+                            && live.revision.get() == fill.record.revision
+                    }
+                    RetainedRecord::TombstonedRecord(_) => false,
+                });
+                if !live {
+                    continue;
+                }
+                let _ = vectors::upsert_record_vector(
+                    &mut *transaction,
+                    &fill.record.record_id,
+                    &identity_hash,
+                    fill.record.revision,
+                    &fill.vector,
+                )
+                .await;
+            }
+        }
+        // The reauthorization above is what the release rests on: a failed
+        // cache write rolls back to misses and still releases.
+        let _ = transaction.commit().await;
+        Ok(())
+    }
+
+    async fn fill_record_vectors(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        identity: &EmbeddingIdentity,
+        fills: &[RecordFill],
+    ) -> Result<(), SpiError> {
+        if fills.is_empty() {
+            return Ok(());
+        }
+        let identity_hash = vector_identity(identity)?;
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!("vector fill transaction could not begin: {error}"))
+        })?;
+        for fill in fills {
+            // The fill rechecks in this transaction what the warm read saw:
+            // work that outlived a newer revision or a withheld subject writes
+            // nothing.
+            let body = ready(
+                self.adapter
+                    .get_record(
+                        &mut transaction,
+                        principal,
+                        json!({ "space_id": space_id, "record_id": fill.record.record_id }),
+                    )
+                    .await,
+                "memory.records.get",
+            )?;
+            let current = match decode_record(body)? {
+                RetainedRecord::LiveRecord(live) => live.revision.get(),
+                RetainedRecord::TombstonedRecord(_) => continue,
+            };
+            if current != fill.record.revision {
+                continue;
+            }
+            match vectors::upsert_record_vector(
+                &mut *transaction,
+                &fill.record.record_id,
+                &identity_hash,
+                fill.record.revision,
+                &fill.vector,
+            )
+            .await
+            {
+                SpokeResult::Ok(()) => {}
+                SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+            }
+        }
+        transaction.commit().await.map_err(|error| {
+            internal(format!("vector fill transaction could not commit: {error}"))
+        })?;
         Ok(())
     }
 
@@ -652,11 +999,11 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let collection = self
             .admitted_collection(&mut transaction, principal, space_id, &[KNOWLEDGE_READ])
             .await?;
-        let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
+        let carrier = match read_entry(&mut transaction, collection, holder.id.as_str()).await {
             SpokeResult::Ok(carrier) => carrier,
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
-        carrier_holder(holder, &carrier)?;
+        carrier_holder(holder, carrier.entry_id.as_str())?;
         let carrier_revision = carrier.revision.ok_or_else(|| {
             internal(format!(
                 "carrier {} holds no assigned revision",
@@ -712,17 +1059,13 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
         self.revalidate_cited(&mut transaction, principal, space_id, cited)
             .await?;
-        let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
-            SpokeResult::Ok(carrier) => carrier,
-            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
-        };
-        carrier_holder(holder, &carrier)?;
-        let current = carrier.revision.ok_or_else(|| {
-            internal(format!(
-                "carrier {} holds no assigned revision",
-                carrier.entry_id
-            ))
-        })?;
+        let header =
+            match read_carrier_header(&mut *transaction, collection, holder.id.as_str()).await {
+                SpokeResult::Ok(header) => header,
+                SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+            };
+        carrier_holder(holder, holder.id.as_str())?;
+        let current = header.revision;
         if current != expected_carrier_revision {
             return Err(SpiError::Settlement(
                 Reject::retryable(
@@ -730,37 +1073,38 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                     format!(
                         "carrier {} moved to revision {current}, the verdict was derived from \
                          {expected_carrier_revision}; retry the deliberation",
-                        carrier.entry_id
+                        holder.id.as_str()
                     ),
                 )
                 .into_spoke(),
             ));
         }
-        let next = append_cognition_record(&carrier, record).map_err(|error| {
-            SpiError::InvalidInput(format!("cognition record could not be appended: {error}"))
-        })?;
-        let committed = match write_entry(&mut transaction, collection, next, Some(current)).await {
-            SpokeResult::Ok(committed) => committed,
+        // The append validates the record, inserts its one row and advances the head and
+        // the carrier revision inside this transaction; the workflow's grant, withholding
+        // and citation rechecks above already ran against the same snapshot.
+        let assigned = match append_cognition(
+            &mut transaction,
+            collection,
+            holder.id.as_str(),
+            current,
+            &record,
+        )
+        .await
+        {
+            SpokeResult::Ok(assigned) => assigned,
+            SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::InvalidInput => {
+                return Err(SpiError::InvalidInput(format!(
+                    "cognition record could not be appended: {}",
+                    reject.message
+                )));
+            }
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
         transaction
             .commit()
             .await
             .map_err(|error| uncertain_commit("cognition settlement", error))?;
-        let view = derive_mind_state(&committed).map_err(|error| {
-            SpiError::Settlement(
-                Reject::uncertain(format!(
-                    "committed carrier {} at revision {} derives no MindState: {error}; the \
-                     append is durable, resolve it instead of retrying",
-                    committed.entry_id,
-                    committed
-                        .revision
-                        .map_or_else(|| "unassigned".to_string(), |revision| revision.to_string())
-                ))
-                .into_spoke(),
-            )
-        })?;
-        Ok(view.carrier_revision)
+        Ok(assigned)
     }
 }
 
@@ -783,6 +1127,22 @@ fn journal_pending(stage: SpokeResult<MemoryStage>) -> Result<String, SpiError> 
             "expected a journaled stage, got {other:?}"
         ))),
         SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
+    }
+}
+
+/// The record ids one staged result names: a review lists them, an update
+/// names its single target. A candidate-only result names none.
+fn result_record_ids(result: Option<&Value>) -> Vec<&str> {
+    let Some(result) = result else {
+        return Vec::new();
+    };
+    match result.get("record_ids").and_then(Value::as_array) {
+        Some(ids) => ids.iter().filter_map(Value::as_str).collect(),
+        None => result
+            .get("record_id")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -851,20 +1211,6 @@ async fn replayed_lifecycle(
     })
 }
 
-fn record_ids(body: &Value) -> Result<Vec<String>, SpiError> {
-    let ids = body
-        .pointer("/result/record_ids")
-        .and_then(Value::as_array)
-        .ok_or_else(|| internal("the settled review carries no record_ids".to_string()))?;
-    ids.iter()
-        .map(|id| {
-            id.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| internal("a settled record id is not a string".to_string()))
-        })
-        .collect()
-}
-
 fn decode_records(body: Value) -> Result<Vec<RetainedRecord>, SpiError> {
     let Value::Object(mut body) = body else {
         return Err(internal(
@@ -878,16 +1224,42 @@ fn decode_records(body: Value) -> Result<Vec<RetainedRecord>, SpiError> {
         .map_err(|error| internal(format!("memory.recall records do not decode: {error}")))
 }
 
+fn decode_record(body: Value) -> Result<RetainedRecord, SpiError> {
+    let record = body
+        .get("record")
+        .cloned()
+        .ok_or_else(|| internal("memory.records.get carries no record".to_string()))?;
+    serde_json::from_value(record).map_err(|error| {
+        internal(format!(
+            "memory.records.get record does not decode: {error}"
+        ))
+    })
+}
+
 fn not_authorized(message: String) -> SpiError {
     SpiError::Settlement(Reject::not_authorized(message).into_spoke())
 }
 
+/// The storage partition of one serving embedder.
+fn vector_identity(identity: &EmbeddingIdentity) -> Result<String, SpiError> {
+    match vectors::identity_hash(
+        &identity.provider_id,
+        &identity.model_id,
+        &identity.model_version,
+        identity.dim,
+    ) {
+        SpokeResult::Ok(hash) => Ok(hash),
+        SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
+    }
+}
+
 /// The holder must be this carrier entry in the Mindcore realm: the carrier
-/// record invariant accepts nothing else.
-fn carrier_holder(holder: &CognitionReference, carrier: &KnowledgeEntry) -> Result<(), SpiError> {
+/// record invariant accepts nothing else. The carrier row is addressed by its
+/// own id, so the id check identifies the holder's row.
+fn carrier_holder(holder: &CognitionReference, entry_id: &str) -> Result<(), SpiError> {
     if holder.kind == CognitionReferenceKind::KnowledgeEntry
         && holder.namespace.as_str() == CARRIER_NAMESPACE
-        && holder.id.as_str() == carrier.entry_id.as_str()
+        && holder.id.as_str() == entry_id
     {
         return Ok(());
     }
@@ -896,7 +1268,7 @@ fn carrier_holder(holder: &CognitionReference, carrier: &KnowledgeEntry) -> Resu
         holder.kind,
         holder.namespace.as_str(),
         holder.id.as_str(),
-        carrier.entry_id
+        entry_id
     )))
 }
 
@@ -936,6 +1308,25 @@ fn uncertain_commit(operation: &str, error: sqlx::Error) -> SpiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fresh settlement ids come from the staged result, never from a
+    /// publication path: a review lists its records, an update names one.
+    #[test]
+    fn a_settlement_result_names_the_records_to_warm() {
+        assert_eq!(
+            result_record_ids(Some(&json!({
+                "outcome": "promoted",
+                "record_ids": ["rec_a", "rec_b"],
+            }))),
+            ["rec_a", "rec_b"]
+        );
+        assert_eq!(
+            result_record_ids(Some(&json!({ "record_id": "rec_a", "revision": 4 }))),
+            ["rec_a"]
+        );
+        assert!(result_record_ids(Some(&json!({ "outcome": "dismissed" }))).is_empty());
+        assert!(result_record_ids(None).is_empty());
+    }
 
     #[test]
     fn a_failed_write_commit_is_uncertain_never_retryable() {

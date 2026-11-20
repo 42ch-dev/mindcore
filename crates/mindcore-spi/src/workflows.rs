@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::{poll_fn, Future};
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,9 +30,9 @@ use spoke_schemas::{
 
 use crate::{
     AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DeliberateOutcome,
-    DeliberateRequest, DomainLens, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities,
-    MindWorkflows, PolicyDecision, PolicyHook, ProposalDraft, Reasoner, Recommendation,
-    SettlementDraft, SpiError, StructuredReasonRequest,
+    DeliberateRequest, DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput,
+    MindCapabilities, MindWorkflows, PolicyDecision, PolicyHook, ProposalDraft, Reasoner,
+    Recommendation, SettlementDraft, SpiError, StructuredReasonRequest,
 };
 
 /// BM25 term-frequency saturation and length normalisation (the standard
@@ -56,6 +57,41 @@ pub struct RecallSnapshot {
     pub knowledge: Vec<KnowledgeEntry>,
 }
 
+/// One record of an authorized page: its id and the revision the page served.
+///
+/// Two reads served the same page only when every pair matches in page order.
+pub type PageFact = (String, u64);
+
+/// The facts a released recall must still serve: the page and the admitted
+/// knowledge entries, each in read order.
+pub type SnapshotFact = (Vec<PageFact>, Vec<(String, Option<u64>)>);
+
+/// One authorized page row and the vector stored for it under one identity.
+///
+/// One entry per page row, so an adapter cannot misalign a vector with a record.
+#[derive(Debug, Clone)]
+pub struct PageVector {
+    /// The page record this read served.
+    pub record: RetainedRecord,
+    /// The stored vector for a live record still served at this revision under
+    /// this identity; `None` is a miss — no row, another revision, another
+    /// dimension, a retired identity or a tombstone.
+    pub vector: Option<Vec<f32>>,
+}
+
+/// One authorized page read taken for the vector cache: one entry per page row.
+pub type PageVectors = Vec<PageVector>;
+
+/// One record vector a recall or warm computed, waiting for the binding's cache
+/// write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordFill {
+    /// The live record the provider embedded, at the revision it was read at.
+    pub record: SettledRecord,
+    /// The provider vector for that record's text under the serving identity.
+    pub vector: Vec<f32>,
+}
+
 /// The DTO-only storage seam of the workflow engine.
 ///
 /// One call is one transaction over the caller's scope: `memory.recall`
@@ -73,6 +109,25 @@ pub trait WorkflowBinding: Send + Sync {
         principal: &Principal,
         request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError>;
+
+    /// Read the authorized page again and, for every record it still serves
+    /// live at that revision, the vector stored under `identity`.
+    ///
+    /// This is the snapshot that selects vector rows after a query provider
+    /// call: admission and withholding are rebuilt on the same transaction, so
+    /// a page that lost its grant or became withheld is a refusal, never a
+    /// cache hit. `expected` is the page the caller already holds: a read that
+    /// would serve any other page is refused with `REVISION_CONFLICT` before a
+    /// single row is probed, so a record that moved during provider work is
+    /// never read at its new revision. An absent row, another revision,
+    /// another dimension or a retired identity is `None`.
+    async fn recall_vectors(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        identity: &EmbeddingIdentity,
+        expected: &[PageFact],
+    ) -> Result<PageVectors, SpiError>;
 
     /// Run the existing capture path — admission, idempotency probe and the
     /// deterministic classifier — and return the candidates it holds.
@@ -97,7 +152,8 @@ pub trait WorkflowBinding: Send + Sync {
     ) -> Result<AbsorbSnapshot, SpiError>;
 
     /// Submit one review decision over `cited`, publish its targets and settle
-    /// its receipt; returns the record ids the review created.
+    /// its receipt; returns the records the review created, each with the
+    /// revision the settlement committed.
     ///
     /// Every cited record is revalidated in the same staging transaction: one
     /// that changed, disappeared, became withheld or lost its admission
@@ -107,10 +163,11 @@ pub trait WorkflowBinding: Send + Sync {
         principal: &Principal,
         request: &MemoryCandidatesReviewRequest,
         cited: &[CitedRecord],
-    ) -> Result<Vec<String>, SpiError>;
+    ) -> Result<Vec<SettledRevision>, SpiError>;
 
     /// Stage `memory.records.update` and `memory.candidates.dismiss` in one
-    /// transaction, publish both intents' targets and settle both receipts.
+    /// transaction, publish both intents' targets and settle both receipts;
+    /// returns the updated record with the revision the settlement committed.
     ///
     /// `cited` is revalidated in that same staging transaction first.
     async fn update_candidate(
@@ -120,7 +177,7 @@ pub trait WorkflowBinding: Send + Sync {
         update: &MemoryRecordsUpdateRequest,
         dismiss: &MemoryCandidatesDismissRequest,
         cited: &[CitedRecord],
-    ) -> Result<(), SpiError>;
+    ) -> Result<Vec<SettledRevision>, SpiError>;
 
     /// The record id this caller's update leg already settled under
     /// `idempotency_key`.
@@ -133,6 +190,53 @@ pub trait WorkflowBinding: Send + Sync {
         space_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<String>, SpiError>;
+
+    /// Read the live projection of one record a settlement just committed.
+    ///
+    /// `None` when the record is now a tombstone: there is nothing to warm. A
+    /// record this caller may no longer read, or whose subject became withheld,
+    /// surfaces as a refusal — the warm treats it as a miss too.
+    async fn settled_record(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError>;
+
+    /// Reauthorize the released recall and store its remaining vectors, all in
+    /// one transaction.
+    ///
+    /// The read rebuilds admission and withholding and compares the page and
+    /// the knowledge set to `expected`: a refusal or a moved set aborts before
+    /// anything is written. When there is a fill to write, the transaction
+    /// takes the write reservation at begin (`BEGIN IMMEDIATE`), so no other
+    /// connection can commit between that reauthorization and the write: a
+    /// caller that sees `Ok` therefore releases a page whose cache write
+    /// observed the same live reauthorization. A fill that no page row still
+    /// serves live at its revision is skipped, and with the reservation held a
+    /// cache-only storage failure is a miss rather than a refused release.
+    async fn settle_recall(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        identity: Option<&EmbeddingIdentity>,
+        expected: &SnapshotFact,
+        fills: &[RecordFill],
+    ) -> Result<(), SpiError>;
+
+    /// Store every warmed vector for `space_id` under `identity` on one
+    /// transaction, rechecking each record's live revision and withholding.
+    ///
+    /// A tombstone, a moved revision or a withheld subject writes nothing, and
+    /// an unreadable record refuses the leg. The commit binds every element
+    /// together; the caller treats a refusal as a cache miss.
+    async fn fill_record_vectors(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        identity: &EmbeddingIdentity,
+        fills: &[RecordFill],
+    ) -> Result<(), SpiError>;
 
     /// Read one deliberation snapshot: the subject's authorized memory page
     /// and the caller's admitted holder carrier, on one transaction.
@@ -226,6 +330,32 @@ pub enum CandidateLifecycle {
     Consumed,
 }
 
+/// One record a settlement just committed: the revision and the exact live
+/// text the recall path scores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRecord {
+    /// The record id the settlement named.
+    pub record_id: String,
+    /// The revision the settlement committed.
+    pub revision: u64,
+    /// The live `record_text` a warmed vector must embed.
+    pub text: String,
+}
+
+/// One record a settlement just committed: the id it named and the revision it
+/// left behind.
+///
+/// A settlement reports this pair, not only the id, so the warm can tell work
+/// that is still the settled revision from work a later writer already made
+/// obsolete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRevision {
+    /// The record id the settlement named.
+    pub record_id: String,
+    /// The revision the settlement committed for that record.
+    pub revision: u64,
+}
+
 /// One record an absorb decision cited, with the revision the prompted page
 /// served it at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +369,24 @@ pub struct CitedRecord {
 /// The workflow engine over one [`WorkflowBinding`].
 pub struct SpiMindWorkflows {
     binding: Box<dyn WorkflowBinding>,
+    /// The one recent validated query vector: replaced, never grown. A recall
+    /// installs it only after it reauthorized the page, and [`Self::retire_identity`]
+    /// clears it.
+    query_slot: Mutex<Option<QuerySlot>>,
+    /// Test-only: every query-slot lookup, so a refused read can prove it
+    /// never reached the in-memory cache. In-crate tests only; production
+    /// builds compile neither the counter nor its increment.
+    #[cfg(test)]
+    query_slot_probes: std::sync::atomic::AtomicUsize,
+}
+
+/// One validated query vector and the exact scope allowed to reuse it: another
+/// principal, space, subject, query text or embedding identity is a miss.
+struct QuerySlot {
+    /// `(principal, space, subject, exact trimmed query)` as authorized.
+    scope: (String, String, String, String),
+    identity: EmbeddingIdentity,
+    vector: Vec<f32>,
 }
 
 impl SpiMindWorkflows {
@@ -246,16 +394,67 @@ impl SpiMindWorkflows {
     pub fn new(binding: impl WorkflowBinding + 'static) -> Self {
         Self {
             binding: Box::new(binding),
+            query_slot: Mutex::new(None),
+            #[cfg(test)]
+            query_slot_probes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// How many recalls have looked the in-memory query slot up.
+    #[cfg(test)]
+    fn query_slot_probes(&self) -> usize {
+        self.query_slot_probes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The slot's query vector, only for the exact scope it was validated in.
+    fn cached_query(
+        &self,
+        scope: &(String, String, String, String),
+        identity: &EmbeddingIdentity,
+    ) -> Option<Vec<f32>> {
+        #[cfg(test)]
+        self.query_slot_probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let slot = self.query_slot.lock().ok()?;
+        let slot = slot.as_ref()?;
+        (slot.scope == *scope && slot.identity == *identity).then(|| slot.vector.clone())
+    }
+
+    /// Keep `vector` for `scope`: the caller installs it only after the recall
+    /// reauthorized the page this vector was validated against.
+    fn install_query(&self, slot: QuerySlot) {
+        if let Ok(mut current) = self.query_slot.lock() {
+            *current = Some(slot);
+        }
+    }
+
+    /// Retire one serving identity's query vector.
+    ///
+    /// The host calls this when it rotates identity, together with deleting
+    /// that identity's stored partition: no slot may outlive the rows it was
+    /// validated against, so a later recall re-embeds its query instead of
+    /// reusing a vector the retired identity produced. Another identity's slot
+    /// stays warm.
+    pub fn retire_identity(&self, identity: &EmbeddingIdentity) {
+        if let Ok(mut slot) = self.query_slot.lock() {
+            if slot.as_ref().is_some_and(|slot| slot.identity == *identity) {
+                *slot = None;
+            }
         }
     }
 
     /// Pack an authorized context pack under `max_tokens`.
     ///
     /// One recall page is read, reranked by the injected capabilities, then
-    /// revalidated against the same read path before anything is released: a
-    /// refused reread propagates and a changed page returns
-    /// `REVISION_CONFLICT`, so no record revision or grant that moved during
-    /// provider work reaches the pack.
+    /// reauthorized and filled through one binding call before anything is
+    /// released: a refused reread propagates and a changed page or knowledge
+    /// set returns `REVISION_CONFLICT`, so no record revision or grant that
+    /// moved during provider work reaches the pack. The page's missing vectors
+    /// are written inside that same call, so no awaited cache work can observe
+    /// a later refusal after the release was authorized. The query slot is
+    /// installed only once that call succeeded, so a refused recall leaves no
+    /// cache entry behind.
     pub async fn recall_context(
         &self,
         principal: &Principal,
@@ -265,11 +464,18 @@ impl SpiMindWorkflows {
     ) -> Result<ContextPack, SpiError> {
         let RecallSnapshot { records, knowledge } =
             self.binding.recall_snapshot(principal, request).await?;
-        let before = snapshot_fact(&records, &knowledge);
-        let ranked = rank(records, request.query.as_deref(), caps).await?;
-        let released = self.binding.recall_snapshot(principal, request).await?;
-        if snapshot_fact(&released.records, &released.knowledge) != before {
-            return Err(revision_conflict());
+        let expected = snapshot_fact(&records, &knowledge);
+        let RankedRecall {
+            records: ranked,
+            fills,
+            query,
+        } = self.rank(principal, request, records, caps).await?;
+        let identity = caps.embedder.and_then(|embedder| embedder.identity());
+        self.binding
+            .settle_recall(principal, request, identity, &expected, &fills)
+            .await?;
+        if let Some(slot) = query {
+            self.install_query(slot);
         }
         pack(ranked, knowledge, max_tokens)
     }
@@ -396,13 +602,17 @@ impl SpiMindWorkflows {
                     .await?;
                 match verdict {
                     PolicyDecision::AutoSettle => {
-                        let record_ids = self
+                        let settled = self
                             .binding
                             .review_candidate(principal, &review, &cited)
                             .await?;
+                        self.warm_settled(principal, &space, &settled, caps).await;
                         Ok(AbsorbCandidateOutcome::Settled {
                             candidate_id,
-                            record_ids,
+                            record_ids: settled
+                                .into_iter()
+                                .map(|record| record.record_id)
+                                .collect(),
                         })
                     }
                     PolicyDecision::RequireHumanReview { .. } => {
@@ -490,12 +700,17 @@ impl SpiMindWorkflows {
                     .await?;
                 match verdict {
                     PolicyDecision::AutoSettle => {
-                        self.binding
+                        let settled = self
+                            .binding
                             .update_candidate(principal, &space, &update, &dismiss, &cited)
                             .await?;
+                        self.warm_settled(principal, &space, &settled, caps).await;
                         Ok(AbsorbCandidateOutcome::Settled {
                             candidate_id,
-                            record_ids: vec![record_id],
+                            record_ids: settled
+                                .into_iter()
+                                .map(|record| record.record_id)
+                                .collect(),
                         })
                     }
                     PolicyDecision::RequireHumanReview { .. } => {
@@ -517,6 +732,69 @@ impl SpiMindWorkflows {
                 }
             }
         }
+    }
+
+    /// Warm the vector cache for records a settlement just committed.
+    ///
+    /// Runs after that settlement transaction closed and before the outcome is
+    /// reported, so the live read and the provider call hold no transaction.
+    /// Every failure is a cache miss: a post-commit warm never undoes, replays
+    /// or misreports the durable Memory effect it serves.
+    async fn warm_settled(
+        &self,
+        principal: &Principal,
+        space: &str,
+        settled: &[SettledRevision],
+        caps: &MindCapabilities<'_>,
+    ) {
+        let Some(embedder) = caps.embedder else {
+            return;
+        };
+        let Some(identity) = embedder.identity() else {
+            return;
+        };
+        for settled in settled {
+            let _ = self
+                .warm_record(principal, space, settled, embedder, identity)
+                .await;
+        }
+    }
+
+    /// Warm one settled record: the live read, one provider call outside every
+    /// transaction, then a fill that rechecks the revision and withholding.
+    ///
+    /// The live read must still serve the revision the settlement committed. A
+    /// record that moved since makes the settled work obsolete: its text was
+    /// never this revision's, so nothing is embedded and no row is written.
+    async fn warm_record(
+        &self,
+        principal: &Principal,
+        space: &str,
+        settled: &SettledRevision,
+        embedder: &dyn Embedder,
+        identity: &EmbeddingIdentity,
+    ) -> Result<(), SpiError> {
+        let Some(record) = self
+            .binding
+            .settled_record(principal, space, &settled.record_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        if record.revision != settled.revision {
+            return Ok(());
+        }
+        let mut vectors = checked_vectors(
+            embedder
+                .embed_batch(std::slice::from_ref(&record.text))
+                .await?,
+            1,
+            identity,
+        )?;
+        let vector = vectors.pop().expect("one text yields one vector");
+        self.binding
+            .fill_record_vectors(principal, space, identity, &[RecordFill { record, vector }])
+            .await
     }
 
     /// What an earlier run of this exact capture recorded for one candidate
@@ -1573,16 +1851,19 @@ fn dismiss_request(
     .map_err(|error| SpiError::InvalidInput(format!("absorb dismiss request: {error}")))
 }
 
-/// What decides which items a snapshot holds: each item's identity and
-/// revision, in page order.
-type SnapshotFact = (Vec<(String, u64)>, Vec<(String, Option<u64>)>);
+/// The page facts of `records`, in page order: two reads that agree on them
+/// served the same page.
+pub fn page_fact(records: &[RetainedRecord]) -> Vec<PageFact> {
+    records
+        .iter()
+        .map(|record| (record_id(record).to_string(), record_revision(record)))
+        .collect()
+}
 
-fn snapshot_fact(records: &[RetainedRecord], knowledge: &[KnowledgeEntry]) -> SnapshotFact {
+/// The facts of one authorized recall read: the page and the knowledge set.
+pub fn snapshot_fact(records: &[RetainedRecord], knowledge: &[KnowledgeEntry]) -> SnapshotFact {
     (
-        records
-            .iter()
-            .map(|record| (record_id(record).to_string(), record_revision(record)))
-            .collect(),
+        page_fact(records),
         knowledge
             .iter()
             .map(|entry| (entry.entry_id.clone(), entry.revision))
@@ -1601,49 +1882,193 @@ fn revision_conflict() -> SpiError {
     })
 }
 
-/// Hybrid rerank of the page, or the adapter order when it cannot run.
-///
-/// The page is never widened: an empty query, an embedder without a serving
-/// identity or `EmbeddingsUnavailable` all preserve the lexical order the
-/// adapter returned, and every other provider failure propagates.
-async fn rank(
+/// One ranked page and what the caller may keep once it reauthorized the page.
+struct RankedRecall {
+    /// The page in release order.
     records: Vec<RetainedRecord>,
-    query: Option<&str>,
-    caps: &MindCapabilities<'_>,
-) -> Result<Vec<RetainedRecord>, SpiError> {
-    let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
-        return Ok(records);
-    };
-    let Some(embedder) = caps.embedder else {
-        return Ok(records);
-    };
-    let Some(identity) = embedder.identity() else {
-        return Ok(records);
-    };
-    if records.is_empty() {
-        return Ok(records);
-    }
+    /// Record vectors the release boundary writes in its own transaction.
+    fills: Vec<RecordFill>,
+    /// The query vector this recall embedded, validated against the vector
+    /// snapshot, for the caller to install only after final reauthorization.
+    query: Option<QuerySlot>,
+}
 
-    let texts: Vec<&str> = records.iter().map(record_text).collect();
-    let mut batch = Vec::with_capacity(texts.len() + 1);
-    batch.push(query.to_string());
-    batch.extend(texts.iter().map(|text| (*text).to_string()));
-    let vectors = match embedder.embed_batch(&batch).await {
-        Ok(vectors) => vectors,
-        Err(SpiError::EmbeddingsUnavailable) => return Ok(records),
-        Err(error) => return Err(error),
-    };
-    let vectors = checked_vectors(vectors, batch.len(), identity)?;
-    let scores = hybrid_scores(&texts, query, &vectors[0], &vectors[1..]);
-    let mut order: Vec<usize> = (0..records.len()).collect();
-    // Stable: equal scores keep the adapter's order.
-    order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
-    let mut records = reorder(records, &order);
-    if let Some(reasoner) = caps.reasoner {
-        let permutation = reasoner_permutation(reasoner, query, &records).await?;
-        records = reorder(records, &permutation);
+impl RankedRecall {
+    /// The adapter's lexical order, with nothing to cache or fill.
+    fn lexical(records: Vec<RetainedRecord>) -> Self {
+        Self {
+            records,
+            fills: Vec::new(),
+            query: None,
+        }
     }
-    Ok(records)
+}
+
+impl SpiMindWorkflows {
+    /// Hybrid rerank of the page, or the adapter order when it cannot run.
+    ///
+    /// The page is never widened: an empty query, an embedder without a serving
+    /// identity or `EmbeddingsUnavailable` all preserve the lexical order the
+    /// adapter returned, and every other provider failure propagates.
+    ///
+    /// The query vector is resolved first — from the one process-local slot or
+    /// the provider — before any persisted record is probed. The stored vectors
+    /// then come from one snapshot that rebuilds admission and withholding and
+    /// refuses a page that moved before probing a row, only missing or stale
+    /// revisions are embedded, and the freshly embedded ones come back as fills
+    /// the caller writes after it reauthorized the page. A freshly embedded
+    /// query vector comes back for the caller to install the same way.
+    async fn rank(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        records: Vec<RetainedRecord>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<RankedRecall, SpiError> {
+        let Some(query) = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        else {
+            return Ok(RankedRecall::lexical(records));
+        };
+        let Some(embedder) = caps.embedder else {
+            return Ok(RankedRecall::lexical(records));
+        };
+        let Some(identity) = embedder.identity() else {
+            return Ok(RankedRecall::lexical(records));
+        };
+        if records.is_empty() {
+            return Ok(RankedRecall::lexical(records));
+        }
+
+        let scope = (
+            principal.principal_id.as_str().to_string(),
+            request.space_id.as_str().to_string(),
+            request.subject_id.as_str().to_string(),
+            query.to_string(),
+        );
+        let (query_vector, fresh_query) = match self.cached_query(&scope, identity) {
+            Some(vector) => (vector, None),
+            None => {
+                let batch = [query.to_string()];
+                let vectors = match embedder.embed_batch(&batch).await {
+                    Ok(vectors) => vectors,
+                    Err(SpiError::EmbeddingsUnavailable) => {
+                        return Ok(RankedRecall::lexical(records))
+                    }
+                    Err(error) => return Err(error),
+                };
+                let vector = checked_vectors(vectors, 1, identity)?
+                    .pop()
+                    .expect("one text yields one vector");
+                let slot = QuerySlot {
+                    scope,
+                    identity: identity.clone(),
+                    vector: vector.clone(),
+                };
+                (vector, Some(slot))
+            }
+        };
+
+        // The snapshot that selects vector rows: admission and withholding are
+        // rebuilt and the page is compared before a row is probed, so a page
+        // that moved since the first read is refused here rather than served
+        // from a stale cache.
+        let expected = page_fact(&records);
+        let page = self
+            .binding
+            .recall_vectors(principal, request, identity, &expected)
+            .await?;
+        if page
+            .iter()
+            .map(|row| {
+                (
+                    record_id(&row.record).to_string(),
+                    record_revision(&row.record),
+                )
+            })
+            .ne(expected.iter().cloned())
+        {
+            return Err(revision_conflict());
+        }
+
+        let mut records = Vec::with_capacity(page.len());
+        let mut stored = Vec::with_capacity(page.len());
+        for row in page {
+            records.push(row.record);
+            stored.push(row.vector);
+        }
+        let texts: Vec<&str> = records.iter().map(record_text).collect();
+        // Only a live record can fill a vector row: a tombstone has no text left
+        // to embed and its row is pruned, so it is never a miss.
+        let misses: Vec<usize> = stored
+            .iter()
+            .enumerate()
+            .filter_map(|(index, vector)| {
+                (vector.is_none() && matches!(records[index], RetainedRecord::LiveRecord(_)))
+                    .then_some(index)
+            })
+            .collect();
+        let mut fresh = Vec::new();
+        if !misses.is_empty() {
+            let batch: Vec<String> = misses
+                .iter()
+                .map(|index| texts[*index].to_string())
+                .collect();
+            let vectors = match embedder.embed_batch(&batch).await {
+                Ok(vectors) => vectors,
+                // Hybrid work — the query vector included — is discarded and
+                // nothing is written, so the lexical result keeps a warm slot.
+                Err(SpiError::EmbeddingsUnavailable) => return Ok(RankedRecall::lexical(records)),
+                Err(error) => return Err(error),
+            };
+            fresh = checked_vectors(vectors, misses.len(), identity)?;
+        }
+
+        let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+        let mut fills = Vec::with_capacity(misses.len());
+        let mut fresh = fresh.into_iter();
+        for (index, stored) in stored.into_iter().enumerate() {
+            let vector = match stored {
+                Some(vector) => Some(vector),
+                None => match &records[index] {
+                    RetainedRecord::LiveRecord(live) => {
+                        let vector = fresh.next().expect("one vector per live miss");
+                        fills.push(RecordFill {
+                            record: SettledRecord {
+                                record_id: live.record_id.as_str().to_string(),
+                                revision: live.revision.get(),
+                                text: live.content.text.clone(),
+                            },
+                            vector: vector.clone(),
+                        });
+                        Some(vector)
+                    }
+                    // A tombstone holds no vector: it scores without similarity
+                    // rather than paying a provider call on every recall.
+                    RetainedRecord::TombstonedRecord(_) => None,
+                },
+            };
+            vectors.push(vector);
+        }
+
+        let scores = hybrid_scores(&texts, query, &query_vector, &vectors);
+        let mut order: Vec<usize> = (0..records.len()).collect();
+        // Stable: equal scores keep the adapter's order.
+        order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+        let mut records = reorder(records, &order);
+        if let Some(reasoner) = caps.reasoner {
+            let permutation = reasoner_permutation(reasoner, query, &records).await?;
+            records = reorder(records, &permutation);
+        }
+        Ok(RankedRecall {
+            records,
+            fills,
+            query: fresh_query,
+        })
+    }
 }
 
 fn checked_vectors(
@@ -1680,11 +2105,20 @@ fn checked_vectors(
 }
 
 /// `0.5 × normalised_BM25 + 0.5 × (1 + cosine)/2` over the page only.
-fn hybrid_scores(
+///
+/// This is the page ranking scorer, not a reproduction of a pack's order: the
+/// engine sorts by it descending and keeps the adapter's order on ties, but a
+/// configured reasoner may then reorder the page.
+///
+/// One score per text. `None` is a text with no serving vector — a tombstone —
+/// and scores with `0` similarity, whose term still contributes `0.25`;
+/// mismatched slices never panic, so pass one entry per text for the documented
+/// formula.
+pub(crate) fn hybrid_scores(
     texts: &[&str],
     query: &str,
     query_vector: &[f32],
-    vectors: &[Vec<f32>],
+    vectors: &[Option<Vec<f32>>],
 ) -> Vec<f64> {
     let lexical = bm25_scores(texts, query);
     let maximum = lexical.iter().copied().fold(0.0f64, f64::max);
@@ -1697,9 +2131,32 @@ fn hybrid_scores(
             } else {
                 0.0
             };
-            let similarity = cosine(query_vector, &vectors[index]);
+            let similarity = vectors
+                .get(index)
+                .and_then(Option::as_deref)
+                .map_or(0.0, |vector| cosine(query_vector, vector));
             0.5 * normalised + 0.5 * (1.0 + similarity) / 2.0
         })
+        .collect()
+}
+
+/// Test-only view of the page scorer: one score per text, as raw `f64` bits.
+///
+/// Exists so `mindcore-spoke`'s tests can compare the ranking of fresh provider
+/// vectors against vectors reloaded from persisted BLOBs bit for bit. Only that
+/// crate's `[dev-dependencies]` enable the `test-scoring` feature; the feature
+/// must never be enabled by a production dependency edge.
+#[cfg(feature = "test-scoring")]
+pub fn scored_bits_for_test(
+    texts: &[&str],
+    query: &str,
+    query_vector: &[f32],
+    vectors: &[Vec<f32>],
+) -> Vec<u64> {
+    let vectors: Vec<Option<Vec<f32>>> = vectors.iter().cloned().map(Some).collect();
+    hybrid_scores(texts, query, query_vector, &vectors)
+        .into_iter()
+        .map(f64::to_bits)
         .collect()
 }
 
@@ -1910,5 +2367,221 @@ mod tests {
             deadline.saturating_duration_since(now) <= MAX_TIMEOUT,
             "the deadline must be clamped, not unbounded"
         );
+    }
+
+    /// The page read refuses before any provider work; every later leg would
+    /// be a bug if it ran.
+    struct RefusingBinding;
+
+    #[async_trait]
+    impl WorkflowBinding for RefusingBinding {
+        async fn recall_snapshot(
+            &self,
+            _principal: &Principal,
+            _request: &MemoryRecallRequest,
+        ) -> Result<RecallSnapshot, SpiError> {
+            Err(SpiError::Settlement(SpokeReject {
+                code: SpokeRejectCode::NotAuthorized,
+                message: "subject is withheld".to_string(),
+                details: None,
+            }))
+        }
+
+        async fn recall_vectors(
+            &self,
+            _principal: &Principal,
+            _request: &MemoryRecallRequest,
+            _identity: &EmbeddingIdentity,
+            _expected: &[PageFact],
+        ) -> Result<PageVectors, SpiError> {
+            unreachable!("a refused page never reaches the vector snapshot")
+        }
+
+        async fn settle_recall(
+            &self,
+            _principal: &Principal,
+            _request: &MemoryRecallRequest,
+            _identity: Option<&EmbeddingIdentity>,
+            _expected: &SnapshotFact,
+            _fills: &[RecordFill],
+        ) -> Result<(), SpiError> {
+            unreachable!("a refused page never reaches the release boundary")
+        }
+
+        async fn capture(
+            &self,
+            _principal: &Principal,
+            _request: &MemoryCaptureRequest,
+        ) -> Result<CaptureOutcome, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn absorb_snapshot(
+            &self,
+            _principal: &Principal,
+            _space_id: &str,
+            _candidate_id: &str,
+            _max_items: u64,
+        ) -> Result<AbsorbSnapshot, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn review_candidate(
+            &self,
+            _principal: &Principal,
+            _request: &MemoryCandidatesReviewRequest,
+            _cited: &[CitedRecord],
+        ) -> Result<Vec<SettledRevision>, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn update_candidate(
+            &self,
+            _principal: &Principal,
+            _space_id: &str,
+            _update: &MemoryRecordsUpdateRequest,
+            _dismiss: &MemoryCandidatesDismissRequest,
+            _cited: &[CitedRecord],
+        ) -> Result<Vec<SettledRevision>, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn settled_record(
+            &self,
+            _principal: &Principal,
+            _space_id: &str,
+            _record_id: &str,
+        ) -> Result<Option<SettledRecord>, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn fill_record_vectors(
+            &self,
+            _principal: &Principal,
+            _space_id: &str,
+            _identity: &EmbeddingIdentity,
+            _fills: &[RecordFill],
+        ) -> Result<(), SpiError> {
+            unreachable!("a refused page never reaches the warm")
+        }
+
+        async fn recorded_update(
+            &self,
+            _principal: &Principal,
+            _space_id: &str,
+            _idempotency_key: &str,
+        ) -> Result<Option<String>, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn deliberate_snapshot(
+            &self,
+            _principal: &Principal,
+            _space_id: &str,
+            _subject_id: &str,
+            _holder: &CognitionReference,
+            _max_items: u64,
+        ) -> Result<DeliberateSnapshot, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn commit_cognition(
+            &self,
+            _principal: &Principal,
+            _space_id: &str,
+            _subject_id: &str,
+            _holder: &CognitionReference,
+            _expected_carrier_revision: u64,
+            _record: Value,
+            _cited: &[CitedRecord],
+        ) -> Result<u64, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+    }
+
+    struct StubEmbedder(EmbeddingIdentity);
+
+    #[async_trait]
+    impl Embedder for StubEmbedder {
+        fn identity(&self) -> Option<&EmbeddingIdentity> {
+            Some(&self.0)
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    /// A refused page is decided by the read alone: it never consults the warm
+    /// query slot, which survives for a later authorized recall.
+    #[tokio::test]
+    async fn a_refused_page_never_probes_the_query_slot() {
+        let workflows = SpiMindWorkflows::new(RefusingBinding);
+        let identity = EmbeddingIdentity {
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_version: "version".to_string(),
+            dim: 2,
+        };
+        workflows.install_query(QuerySlot {
+            scope: (
+                "prn_1".to_string(),
+                "spc_1".to_string(),
+                "subj_1".to_string(),
+                "north gate".to_string(),
+            ),
+            identity: identity.clone(),
+            vector: vec![1.0, 0.0],
+        });
+        let embedder = StubEmbedder(identity);
+        let caps = MindCapabilities {
+            embedder: Some(&embedder),
+            ..MindCapabilities::default()
+        };
+        let principal: Principal =
+            serde_json::from_value(json!({ "principal_id": "prn_1", "extensions": {} }))
+                .expect("principal");
+        let request: MemoryRecallRequest = serde_json::from_value(json!({
+            "space_id": "spc_1",
+            "subject_id": "subj_1",
+            "selection": { "mode": "shared_only" },
+            "budget": { "max_items": 10 },
+            "query": "north gate",
+        }))
+        .expect("recall request");
+
+        let error = workflows
+            .recall_context(
+                &principal,
+                &request,
+                NonZeroUsize::new(64).expect("budget"),
+                &caps,
+            )
+            .await
+            .expect_err("a refused page must not release a pack");
+
+        let SpiError::Settlement(reject) = error else {
+            panic!("expected a settlement refusal, got {error:?}");
+        };
+        assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+        assert_eq!(
+            workflows.query_slot_probes(),
+            0,
+            "a refused page never looks the query slot up"
+        );
+    }
+
+    /// A caller that passes fewer vectors than texts gets a defined score
+    /// instead of a panic.
+    #[test]
+    fn a_short_vector_slice_scores_without_panicking() {
+        let scores = hybrid_scores(
+            &["north gate", "market dawn"],
+            "north gate",
+            &[1.0, 0.0],
+            &[Some(vec![1.0, 0.0])],
+        );
+        assert_eq!(scores.len(), 2);
+        assert!(scores.iter().all(|score| score.is_finite()));
     }
 }

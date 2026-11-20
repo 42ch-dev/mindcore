@@ -1,0 +1,26 @@
+[package]
+name = "mindcore-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+mindcore-base = { path = "../mindcore-base" }
+mindcore-sqlite = { path = "../mindcore-sqlite" }
+mindcore-spi = { path = "../mindcore-spi" }
+mindcore-spoke = { path = "../mindcore-spoke" }
+serde.workspace = true
+serde_json.workspace = true
+spoke-connect = { workspace = true, features = ["remote-adapter"] }
+spoke-operations.workspace = true
+spoke-schemas.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+ed25519-dalek = "2"
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
