@@ -24,8 +24,8 @@ use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
-    AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, EmbeddingIdentity, PageVectors, RecallSnapshot, SettledRecord,
+    page_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
+    DeliberateSnapshot, EmbeddingIdentity, PageFact, PageVectors, RecallSnapshot, SettledRecord,
     SettledRevision, SpiError, WorkflowBinding,
 };
 use mindcore_sqlite::{
@@ -493,6 +493,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         principal: &Principal,
         request: &MemoryRecallRequest,
         identity: &EmbeddingIdentity,
+        expected: &[PageFact],
     ) -> Result<PageVectors, SpiError> {
         let identity_hash = vector_identity(identity)?;
         let mut transaction = self.pool.begin().await.map_err(|error| {
@@ -503,6 +504,19 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let records = self
             .authorized_page(&mut transaction, principal, request)
             .await?;
+        // The page the caller holds is the only one this read may serve: a
+        // record that moved after the first read is refused before its new
+        // revision is looked up, so a decode of the newer row can never
+        // surface as a storage error instead of the conflict.
+        if page_fact(&records) != expected {
+            return Err(SpiError::Settlement(
+                Reject::retryable(
+                    SpokeRejectCode::RevisionConflict,
+                    "the authorized page moved while the query was embedded; retry the recall",
+                )
+                .into_spoke(),
+            ));
+        }
         let mut stored = Vec::with_capacity(records.len());
         for record in &records {
             let vector = match record {

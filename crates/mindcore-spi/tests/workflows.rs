@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use mindcore_spi::{
-    AbsorbCandidateOutcome, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate,
-    CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest, DeliberateSnapshot,
-    DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings,
-    PageVectors, PolicyDecision, PolicyHook, ProposalDraft, Reasoner, RecallSnapshot,
-    Recommendation, SettledRecord, SettledRevision, SettlementDraft, SpiError, SpiMindWorkflows,
-    StructuredReasonRequest, WorkflowBinding,
+    page_fact, AbsorbCandidateOutcome, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
+    CapturedCandidate, CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest,
+    DeliberateSnapshot, DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput,
+    MindCapabilities, NoEmbeddings, PageFact, PageVectors, PolicyDecision, PolicyHook,
+    ProposalDraft, Reasoner, RecallSnapshot, Recommendation, SettledRecord, SettledRevision,
+    SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
@@ -159,11 +159,15 @@ impl WorkflowBinding for StubBinding {
         _principal: &Principal,
         _request: &MemoryRecallRequest,
         identity: &EmbeddingIdentity,
+        expected: &[PageFact],
     ) -> Result<PageVectors, SpiError> {
         self.inner.vector_reads.fetch_add(1, Ordering::SeqCst);
         // Storage serves the page the recall just read; a caller that queued a
         // newer snapshot sees it on the next recall read.
         let page = self.page(self.inner.calls.load(Ordering::SeqCst).saturating_sub(1));
+        if page_fact(&page.records) != expected {
+            return Err(revision_conflict());
+        }
         let partition = partition(identity);
         let stored = self.inner.stored.lock().expect("stored vectors");
         let vectors = page
@@ -298,13 +302,16 @@ impl WorkflowBinding for RefusingBinding {
         Err(self.0.clone())
     }
 
+    /// A page read that refuses never reaches the vector cache; a probe here
+    /// would mean the refusal came after the lookup, so it fails loudly.
     async fn recall_vectors(
         &self,
         _principal: &Principal,
         _request: &MemoryRecallRequest,
         _identity: &EmbeddingIdentity,
+        _expected: &[PageFact],
     ) -> Result<PageVectors, SpiError> {
-        unserved()
+        panic!("a refused page must never probe the vector cache");
     }
 
     async fn capture(
@@ -813,6 +820,59 @@ async fn a_miss_batch_that_goes_unavailable_keeps_lexical_order() {
 }
 
 #[tokio::test]
+async fn a_refused_recall_leaves_no_cached_query_vector() {
+    // The page moves while the miss batch is embedded, so the recall is
+    // refused after the query vector was computed and validated.
+    let binding = StubBinding::new(vec![
+        snapshot(vector_page(1), Vec::new()),
+        snapshot(vector_page(2), Vec::new()),
+    ]);
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let embedder = planted_embedder();
+    let caps = embedding_caps(&embedder);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &caps,
+        )
+        .await
+        .expect_err("a page that moved after the miss batch must not release a pack");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+    assert_eq!(
+        embedder.embedded(),
+        [
+            "north gate",
+            "the market opens at dawn",
+            "the north gate is closed",
+            "north gate guards sleep",
+        ],
+        "the refused recall embedded the query and the miss batch"
+    );
+
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &caps,
+        )
+        .await
+        .expect("the retried recall");
+
+    assert_eq!(
+        embedder.embedded()[4],
+        "north gate",
+        "the refused recall cached no query vector"
+    );
+}
+
+#[tokio::test]
 async fn no_provider_work_runs_before_a_withheld_read_is_refused() {
     let embedder = planted_embedder();
     let workflows = SpiMindWorkflows::new(RefusingBinding(SpiError::Settlement(
@@ -1166,6 +1226,7 @@ impl WorkflowBinding for AbsorbDouble {
         _principal: &Principal,
         _request: &MemoryRecallRequest,
         _identity: &EmbeddingIdentity,
+        _expected: &[PageFact],
     ) -> Result<PageVectors, SpiError> {
         unserved()
     }
@@ -2108,6 +2169,7 @@ impl WorkflowBinding for DeliberateDouble {
         _principal: &Principal,
         _request: &MemoryRecallRequest,
         _identity: &EmbeddingIdentity,
+        _expected: &[PageFact],
     ) -> Result<PageVectors, SpiError> {
         unserved()
     }

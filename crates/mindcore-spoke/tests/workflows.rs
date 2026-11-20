@@ -67,6 +67,41 @@ enum SideEffect {
     RevokeKnowledgeGrant,
     BumpRevision,
     PendingIntent,
+    /// Revokes the recall grant once the record batch — the second provider
+    /// call of a cold recall — runs.
+    RevokeGrantOnRecordBatch,
+    /// Moves every record and poisons one record's new-revision row, so a
+    /// lookup of the moved page would fail to decode.
+    MovePageAndPoisonVector,
+}
+
+/// Revoke the fixture principal's recall grant.
+async fn revoke_recall_grant(pool: &SqlitePool) {
+    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = ?")
+        .bind(NOW)
+        .bind(PRINCIPAL)
+        .execute(pool)
+        .await
+        .expect("revoke the grant");
+}
+
+/// Withhold the subject's content: a pending journal intent on it.
+async fn withhold_subject(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO memory_journal \
+         (seq, receipt_id, space_id, subject_id, requester_principal_id, op, \
+          idempotency_key, state, targets_json, result_json, created_at, updated_at) \
+         VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_journal), 'rct_pending', \
+                 ?, ?, ?, 'memory.records.update', 'key', 'pending', '[]', NULL, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(PRINCIPAL)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(pool)
+    .await
+    .expect("stage a pending intent");
 }
 
 struct BoundaryEmbedder {
@@ -75,6 +110,9 @@ struct BoundaryEmbedder {
     pool: SqlitePool,
     /// Every text this embedder was asked for, in call order.
     embedded: Arc<Mutex<Vec<String>>>,
+    /// How many provider calls ran, so a side effect can wait for the record
+    /// batch instead of firing on the query.
+    calls: AtomicUsize,
 }
 
 impl BoundaryEmbedder {
@@ -94,16 +132,16 @@ impl Embedder for BoundaryEmbedder {
             .lock()
             .expect("embedded texts")
             .extend(texts.iter().cloned());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
         match self.side_effect {
             SideEffect::None => {}
-            SideEffect::RevokeGrant => {
-                sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = ?")
-                    .bind(NOW)
-                    .bind(PRINCIPAL)
-                    .execute(&self.pool)
-                    .await
-                    .expect("revoke the grant");
+            SideEffect::RevokeGrant => revoke_recall_grant(&self.pool).await,
+            // A cold recall embeds the query first and its record batch second,
+            // so the second call is where the grant is revoked.
+            SideEffect::RevokeGrantOnRecordBatch if call == 1 => {
+                revoke_recall_grant(&self.pool).await
             }
+            SideEffect::RevokeGrantOnRecordBatch => {}
             SideEffect::RevokeKnowledgeGrant => {
                 // Only the knowledge admission is revoked; the recall grant stays live.
                 sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = ?")
@@ -119,23 +157,23 @@ impl Embedder for BoundaryEmbedder {
                     .await
                     .expect("bump the record revision");
             }
-            SideEffect::PendingIntent => {
+            SideEffect::MovePageAndPoisonVector => {
+                sqlx::query("UPDATE memory_records SET revision = revision + 1")
+                    .execute(&self.pool)
+                    .await
+                    .expect("bump the record revision");
+                // The moved page's row carries the new revision but cannot be
+                // decoded: a probe of the new revision is a storage error.
                 sqlx::query(
-                    "INSERT INTO memory_journal \
-                     (seq, receipt_id, space_id, subject_id, requester_principal_id, op, \
-                      idempotency_key, state, targets_json, result_json, created_at, updated_at) \
-                     VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM memory_journal), 'rct_pending', \
-                             ?, ?, ?, 'memory.records.update', 'key', 'pending', '[]', NULL, ?, ?)",
+                    "UPDATE memory_embedding_vectors \
+                     SET record_revision = record_revision + 1, vector = X'0000C07F00000000' \
+                     WHERE record_id = 'rec_c'",
                 )
-                .bind(SPACE)
-                .bind(SUBJECT)
-                .bind(PRINCIPAL)
-                .bind(NOW)
-                .bind(NOW)
                 .execute(&self.pool)
                 .await
-                .expect("stage a pending intent");
+                .expect("poison the moved record's row");
             }
+            SideEffect::PendingIntent => withhold_subject(&self.pool).await,
         }
         Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
     }
@@ -315,6 +353,7 @@ impl Harness {
             side_effect,
             pool: self.pool.clone(),
             embedded: Arc::new(Mutex::new(Vec::new())),
+            calls: AtomicUsize::new(0),
         }
     }
 
@@ -3174,14 +3213,17 @@ async fn a_miss_batch_that_goes_unavailable_writes_nothing() {
 }
 
 #[tokio::test]
-async fn a_withheld_read_refuses_before_any_provider_work() {
+async fn a_withheld_read_with_a_warm_page_probes_nothing() {
     let (harness, workflows) = vector_page().await;
-    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = ?")
-        .bind(NOW)
-        .bind(PRINCIPAL)
+    // Warm both caches: the query slot and every page row.
+    warm_page(&workflows, &AxisEmbedder::new("1")).await;
+    // Any vector probe from here is a storage error, so a refusal that still
+    // probed could not be reported as the withheld guard.
+    sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
         .execute(&harness.pool)
         .await
-        .expect("revoke the recall grant");
+        .expect("drop the vector table");
+    withhold_subject(&harness.pool).await;
     let embedder = AxisEmbedder::new("1");
 
     let error = workflows
@@ -3197,12 +3239,143 @@ async fn a_withheld_read_refuses_before_any_provider_work() {
     let SpiError::Settlement(reject) = error else {
         panic!("expected a settlement refusal, got {error:?}");
     };
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str),
+        Some("UNRECONCILED"),
+        "the withheld guard, not a storage error"
+    );
     assert!(
         embedder.embedded().is_empty(),
-        "no vector or cache work runs for a refused page"
+        "a warm slot does not let a refused page reach the provider"
     );
-    assert!(harness.vector_rows().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_subject_withheld_after_the_query_call_is_refused_before_any_probe() {
+    let (harness, workflows) = vector_page().await;
+    // A vector probe from here is a storage error, so the refusal must be the
+    // withheld guard rebuilding admission after the query provider call.
+    sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
+        .execute(&harness.pool)
+        .await
+        .expect("drop the vector table");
+    let embedder = harness.embedder(SideEffect::PendingIntent);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a withheld page must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str),
+        Some("UNRECONCILED"),
+        "the second snapshot refused the withheld page"
+    );
+    assert_eq!(
+        embedder.embedded(),
+        ["north gate"],
+        "the query call ran, then the refusal: no record was probed or embedded"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_recall_keeps_no_query_vector() {
+    let (harness, workflows) = vector_page().await;
+    // The grant is revoked while the record batch is embedded, so the final
+    // reauthorization refuses a recall whose query vector was already
+    // validated.
+    let embedder = harness.embedder(SideEffect::RevokeGrantOnRecordBatch);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a revoked grant must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        embedder.embedded(),
+        [
+            "north gate",
+            "the north gate is closed",
+            "north gate guards sleep",
+            "the market opens at dawn",
+        ],
+        "the query and the record batch ran, then the refusal"
+    );
+
+    sqlx::query("UPDATE memory_grants SET revoked_at = NULL WHERE grant_id = 'grt_recall'")
+        .execute(&harness.pool)
+        .await
+        .expect("restore the grant");
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("the retried recall");
+
+    assert_eq!(
+        embedder.embedded()[4],
+        "north gate",
+        "the refused recall cached no query vector"
+    );
+}
+
+#[tokio::test]
+async fn a_moved_page_conflicts_before_its_stored_vector_is_read() {
+    let (harness, workflows) = vector_page().await;
+    warm_page(&workflows, &AxisEmbedder::new("1")).await;
+    // The query provider call moves every record and poisons the moved
+    // record's row at its new revision: a probe would fail to decode.
+    let embedder = harness.embedder(SideEffect::MovePageAndPoisonVector);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("market dawn"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a moved page must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::RevisionConflict,
+        "the page moved, so the read refuses before decoding the newer row"
+    );
 }
 
 #[tokio::test]
@@ -3254,17 +3427,38 @@ async fn a_retired_identity_never_serves_another_partition() {
     );
     assert_eq!(harness.vector_rows().await.len(), 3);
 
-    // The retired identity re-embeds its records; its query slot still holds.
+    // Retirement also clears the identity's query slot: nothing the retired
+    // identity produced may be reused.
+    workflows.retire_identity(&axes_identity("1"));
     let before = retired_embedder.embedded().len();
     warm_page(&workflows, &retired_embedder).await;
     assert_eq!(
         retired_embedder.embedded()[before..],
         [
+            "north gate",
             "the north gate is closed",
             "north gate guards sleep",
             "the market opens at dawn",
         ],
-        "the retired rows are misses and the warm query is not re-embedded"
+        "a retired identity re-embeds its query and its missing rows"
+    );
+
+    // Retiring one identity leaves another identity's slot and rows warm.
+    let before = other.embedded().len();
+    other_engine.retire_identity(&axes_identity("1"));
+    other_engine
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&other),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        other.embedded().len(),
+        before,
+        "retiring identity 1 keeps identity 2 warm"
     );
 }
 
@@ -3313,15 +3507,78 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         )
         .await
         .expect("pack");
+    let page = ["rec_a", "rec_c", "rec_d", "rec_b"];
+    let texts = [
+        "the north gate is closed",
+        "the north gate is closed",
+        "north gate guards sleep",
+        "the market opens at dawn",
+    ];
     assert_eq!(
         record_ids(&fresh),
-        ["rec_a", "rec_c", "rec_d", "rec_b"],
+        page,
         "the tied pair keeps adapter order"
     );
-    assert_eq!(harness.vector_rows().await.len(), 4);
+
+    // The components the fill wrote, read back through the store's own codec.
+    let rows = harness.vector_rows().await;
+    let stored: Vec<Vec<f32>> = page
+        .iter()
+        .map(|record_id| {
+            let row = rows
+                .iter()
+                .find(|row| row.0 == *record_id)
+                .expect("the record's stored vector");
+            match mindcore_sqlite::vectors::decode_vector(
+                &row.4,
+                usize::try_from(row.3).expect("stored dimension"),
+            ) {
+                spoke_operations::SpokeResult::Ok(vector) => vector,
+                spoke_operations::SpokeResult::Reject(reject) => {
+                    panic!("the stored vector decodes: {}", reject.message)
+                }
+            }
+        })
+        .collect();
+    let fresh_vectors: Vec<Vec<f32>> = texts.iter().map(|text| axis_vector(text)).collect();
+    let bits = |vector: &Vec<f32>| -> Vec<u32> {
+        vector.iter().map(|component| component.to_bits()).collect()
+    };
+    for (fresh, stored) in fresh_vectors.iter().zip(&stored) {
+        assert_eq!(
+            bits(fresh),
+            bits(stored),
+            "the BLOB round-trips every component bit"
+        );
+    }
+
+    // Scored over the same page, the persisted components give identical
+    // per-item bits, and the stable order keeps the tie in adapter order.
+    let query_vector = axis_vector("north gate");
+    let in_memory =
+        mindcore_spi::hybrid_scores(&texts, "north gate", &query_vector, &fresh_vectors);
+    let reloaded_scores = mindcore_spi::hybrid_scores(&texts, "north gate", &query_vector, &stored);
+    let score_bits =
+        |scores: &[f64]| -> Vec<u64> { scores.iter().map(|score| score.to_bits()).collect() };
+    assert_eq!(
+        score_bits(&in_memory),
+        score_bits(&reloaded_scores),
+        "a persisted component cannot change a score bit"
+    );
+    let order = |scores: &[f64]| {
+        let mut order: Vec<usize> = (0..scores.len()).collect();
+        order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+        order
+    };
+    assert_eq!(
+        order(&reloaded_scores),
+        [0, 1, 2, 3],
+        "the tied pair keeps adapter order"
+    );
 
     // A second engine starts with a cold query slot: every record vector it
-    // scores comes back through the stored little-endian f32 blob.
+    // scores comes back through the stored BLOB, and it serves exactly the
+    // page those scores dictate.
     let reloaded_engine =
         SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
     let reloaded = reloaded_engine
@@ -3334,9 +3591,13 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         .await
         .expect("pack");
 
+    let expected: Vec<&str> = order(&reloaded_scores)
+        .into_iter()
+        .map(|index| page[index])
+        .collect();
     assert_eq!(
         record_ids(&reloaded),
-        record_ids(&fresh),
+        expected,
         "the persisted page ranks exactly like the in-memory one"
     );
     assert_eq!(reloaded.tokens_used, fresh.tokens_used);
