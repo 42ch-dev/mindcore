@@ -17,8 +17,9 @@ impl MindStore {
     /// Creates the database file when absent and applies any pending embedded migration.
     ///
     /// Lock contention may enter SQLite's busy handler for up to five seconds, but SQLite can
-    /// still return `SQLITE_BUSY` sooner — including paths that never consult the handler, such
-    /// as lock-upgrade deadlock avoidance. The timeout is a cap, not a wait guarantee.
+    /// still return `SQLITE_BUSY` sooner — the handler is not consulted for every case, such as a
+    /// write whose WAL read snapshot another connection's commit already invalidated. The
+    /// timeout is a cap, not a wait guarantee.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
