@@ -7,24 +7,28 @@
 //! [`MindcoreServe::surface`] derives `capabilities` and `tools` from the composed faces and the
 //! registrations, never from a host-supplied capability string.
 
+pub mod tools;
+
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_spi::{SpiError, SpiMindWorkflows};
+use mindcore_spi::{MindWorkflows, SpiError, SpiMindWorkflows};
 use mindcore_spoke::MemoryWorkflowBinding;
 use mindcore_sqlite::{validate_admission_scope, MindStore};
 use spoke_connect::core::{
     CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_MEMORY,
 };
 use spoke_connect::remote::{
-    ConnectResponder, KnowledgeAdmission, RemoteKnowledgeFace, RemoteMemoryService,
-    RemoteServePorts, RemoteServePortsComposite, ToolHandler,
+    ConnectResponder, KnowledgeAdmission, MemoryAdmission, RemoteKnowledgeFace,
+    RemoteMemoryService, RemoteServePorts, RemoteServePortsComposite, ToolHandler,
 };
 use spoke_operations::{spoke_reject, validate_manifest_tools, SpokeRejectCode, SpokeResult};
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
+
+pub use tools::{MindProviders, WorkflowTools};
 
 /// The `tools.*` namespace this runtime owns.
 const TOOLS_NAMESPACE: &str = "mindcore";
@@ -36,7 +40,7 @@ const TOOLS_NAMESPACE: &str = "mindcore";
 /// work; each workflow keeps its own `SpiError` classification.
 pub struct MindcoreServe {
     store: MindStore,
-    workflows: SpiMindWorkflows,
+    workflows: Arc<SpiMindWorkflows>,
 }
 
 impl MindcoreServe {
@@ -54,7 +58,7 @@ impl MindcoreServe {
             MemoryWorkflowBinding::new(store.pool(), reflections_enabled).with_publisher(publish);
         Self {
             store,
-            workflows: SpiMindWorkflows::new(binding),
+            workflows: Arc::new(SpiMindWorkflows::new(binding)),
         }
     }
 
@@ -69,7 +73,11 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        let manifest = derive_manifest(faces.manifest, faces.memory.is_some(), &faces.tools);
+        let workflows: Arc<dyn MindWorkflows> = self.workflows.clone();
+        let mut tools =
+            WorkflowTools::new(workflows, faces.principals, faces.providers).registrations();
+        tools.extend(faces.tools);
+        let manifest = derive_manifest(faces.manifest, faces.memory.is_some(), &tools);
         let manifest = match manifest {
             SpokeResult::Ok(manifest) => manifest,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -85,7 +93,7 @@ impl MindcoreServe {
         SpokeResult::Ok(MindcoreSurface {
             ports: Arc::new(ports),
             manifest,
-            tools: faces.tools,
+            tools,
         })
     }
 }
@@ -104,7 +112,12 @@ pub struct ServeFaces {
     pub admission: KnowledgeAdmission,
     /// The host's memory family service. `None` composes no memory face and advertises none.
     pub memory: Option<Arc<dyn RemoteMemoryService>>,
-    /// The tools the runtime serves: every descriptor is advertised and its handler installed.
+    /// Maps the authenticated peer to the `Principal` the workflows admit. The same host mapping
+    /// the memory face uses; never read from the wire.
+    pub principals: MemoryAdmission,
+    /// Providers and the domain lens injected into each workflow call.
+    pub providers: MindProviders,
+    /// Additional host tools: every descriptor is advertised and its handler installed.
     pub tools: Vec<ToolRegistration>,
 }
 

@@ -11,11 +11,12 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_runtime::{MindcoreServe, ServeFaces, ToolRegistration};
+use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
+use mindcore_runtime::{MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_sqlite::MindStore;
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
-    RemoteIdentity, RemoteMemoryService, ToolHandler,
+    MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler,
 };
 use spoke_operations::{
     spoke_ok, spoke_reject, validate_manifest_tools, SpokeRejectCode, SpokeResult,
@@ -25,7 +26,7 @@ use spoke_schemas::{HostCapabilityManifest, Scope};
 
 const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
-const RECALL_CONTEXT: &str = "tools.mindcore.recall_context";
+const HOST_TOOL: &str = "tools.mindcore.host_tool";
 
 struct Fixture {
     _dir: TempDir,
@@ -94,6 +95,21 @@ fn admission() -> KnowledgeAdmission {
     })
 }
 
+/// The host's peer-to-principal admission: the driver is admitted, a stranger is not.
+fn principals() -> MemoryAdmission {
+    Arc::new(|peer_id: &str| match peer_id {
+        "peer-owner" => SpokeResult::Ok(
+            serde_json::from_value(json!({ "principal_id": "prn_owner", "extensions": {} }))
+                .expect("principal JSON matches the schema"),
+        ),
+        _ => spoke_reject(
+            SpokeRejectCode::NotAuthorized,
+            format!("peer {peer_id} holds no workflow admission"),
+            None,
+        ),
+    })
+}
+
 /// The memory service is host-supplied; this fixture only proves the face is attached.
 struct RecordingMemory;
 
@@ -115,6 +131,8 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         knowledge: KnowledgeScope::new(COLLECTION),
         admission: admission(),
         memory: None,
+        principals: principals(),
+        providers: MindProviders::default(),
         tools: Vec::new(),
     }
 }
@@ -147,7 +165,7 @@ fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
     }
 }
 
-/// The knowledge face is the only composed face, so it is the only family advertised.
+/// The knowledge family and the three Mind tools are the only served capabilities.
 #[tokio::test]
 async fn manifest_follows_the_composed_faces() {
     let serve = Fixture::open().await.serve();
@@ -156,18 +174,30 @@ async fn manifest_follows_the_composed_faces() {
         "assemble surface",
     );
 
-    assert_eq!(capabilities(&surface), ["spoke-knowledge", "ke-ownership"]);
-    assert!(
-        surface.manifest.tools.is_empty(),
-        "no tool is registered, so none is advertised"
+    assert_eq!(
+        capabilities(&surface),
+        [
+            "spoke-knowledge",
+            "ke-ownership",
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE
+        ]
     );
+    let tools: Vec<&str> = surface
+        .manifest
+        .tools
+        .iter()
+        .map(|tool| tool.capability_id.as_str())
+        .collect();
+    assert_eq!(tools, [RECALL_CONTEXT, ABSORB, DELIBERATE]);
     assert!(
         surface
             .manifest
             .namespaces
             .iter()
-            .all(|namespace| namespace.as_str() != "mindcore"),
-        "the tool namespace is advertised only when a tool is served"
+            .any(|namespace| namespace.as_str() == "mindcore"),
+        "the runtime owns the tool namespace it advertises"
     );
     expect_ok(
         validate_manifest_tools(&surface.manifest),
@@ -202,7 +232,14 @@ async fn attached_memory_service_is_advertised_and_served() {
 
     assert_eq!(
         capabilities(&surface),
-        ["spoke-knowledge", "ke-ownership", "spoke-memory"]
+        [
+            "spoke-knowledge",
+            "ke-ownership",
+            "spoke-memory",
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE
+        ]
     );
     assert!(
         surface.ports.as_memory().is_some(),
@@ -219,7 +256,7 @@ async fn tool_registrations_drive_advertisement_and_installation() {
     let installed = Arc::new(AtomicUsize::new(0));
     let registration = {
         let installed = Arc::clone(&installed);
-        ToolRegistration::new(descriptor(RECALL_CONTEXT), move |_responder| {
+        ToolRegistration::new(descriptor(HOST_TOOL), move |_responder| {
             installed.fetch_add(1, Ordering::SeqCst);
             let handler: ToolHandler =
                 Arc::new(|arguments: Value| Box::pin(async move { spoke_ok(arguments) }));
@@ -236,13 +273,17 @@ async fn tool_registrations_drive_advertisement_and_installation() {
 
     assert_eq!(
         capabilities(&surface),
-        ["spoke-knowledge", "ke-ownership", RECALL_CONTEXT]
+        [
+            "spoke-knowledge",
+            "ke-ownership",
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE,
+            HOST_TOOL
+        ]
     );
-    assert_eq!(surface.manifest.tools.len(), 1);
-    assert_eq!(
-        surface.manifest.tools[0].capability_id.as_str(),
-        RECALL_CONTEXT
-    );
+    assert_eq!(surface.manifest.tools.len(), 4);
+    assert_eq!(surface.manifest.tools[3].capability_id.as_str(), HOST_TOOL);
     assert!(
         surface
             .manifest
