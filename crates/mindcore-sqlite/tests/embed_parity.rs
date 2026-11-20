@@ -14,6 +14,7 @@
 //! exercised here as `CAPABILITY_PORT_MISSING` refusals; `settle_journal` /
 //! `complete_reflection` are caller-phase methods, not selectors).
 
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -774,22 +775,55 @@ async fn every_selector_takes_the_caller_transaction() {
     );
 
     // O2 transfer family: all five refuse CAPABILITY_PORT_MISSING on the
-    // supplied transaction.
+    // supplied transaction, exercised with the baseline's typed payloads
+    // (export id + chunk ordinal, staged import chunk descriptor, import id).
+    let zero_digest = "0".repeat(64);
     let transfer = [
         adapter
-            .create_export(&mut tx, &admin, json!({ "space_id": SPACE }))
+            .create_export(
+                &mut tx,
+                &admin,
+                json!({ "space_id": SPACE, "idempotency_key": "opt-export" }),
+            )
             .await,
         adapter
-            .get_export(&mut tx, &admin, json!({ "space_id": SPACE }))
+            .get_export(
+                &mut tx,
+                &admin,
+                json!({ "space_id": SPACE, "export_id": "exp_1", "chunk_ordinal": 0 }),
+            )
             .await,
         adapter
-            .stage_import(&mut tx, &admin, json!({ "space_id": SPACE }))
+            .stage_import(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "chunk": {
+                        "export_id": "exp_1",
+                        "chunk_ordinal": 1,
+                        "chunk_count": 2,
+                        "bundle_digest": zero_digest,
+                        "chunk_digest": zero_digest,
+                        "bytes": 1,
+                    },
+                    "idempotency_key": "opt-stage",
+                }),
+            )
             .await,
         adapter
-            .activate_import(&mut tx, &admin, json!({ "space_id": SPACE }))
+            .activate_import(
+                &mut tx,
+                &admin,
+                json!({ "space_id": SPACE, "import_id": "imp_1", "idempotency_key": "opt-activate" }),
+            )
             .await,
         adapter
-            .discard_import(&mut tx, &admin, json!({ "space_id": SPACE }))
+            .discard_import(
+                &mut tx,
+                &admin,
+                json!({ "space_id": SPACE, "import_id": "imp_1", "idempotency_key": "opt-discard" }),
+            )
             .await,
     ];
     // Compare refusal code, retry class and details.op against the O2 contract.
@@ -1320,9 +1354,49 @@ async fn journaled_effect_survives_reopen_and_settles() {
         assert_eq!(recomputed, digest, "digest-matched file for {rel}");
     }
 
-    // Phase 2: settle_journal in a fresh caller transaction commits the
-    // receipt and applies the intent; before it commits a poll reports
-    // OUTCOME_UNCERTAIN, after it the same id returns the committed body.
+    // Post-COMMIT / settle-path fault: publication has already landed, then
+    // a storage failure inside the settlement transaction (journal table
+    // renamed out from under the read) makes the outcome genuinely unknown —
+    // the adapter reports OUTCOME_UNCERTAIN with the `uncertain` retry class,
+    // never a retryable pre-commit reject.
+    let published_files = file_set(&store_dir);
+    let mut tx = harness.begin().await;
+    sqlx::query("ALTER TABLE memory_journal RENAME TO memory_journal_broken")
+        .execute(&mut *tx)
+        .await
+        .expect("inject storage failure");
+    match adapter
+        .settle_journal(&mut tx, &pending_space(), &pending)
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+            assert_eq!(
+                reject.details.as_ref().expect("details")["retry_class"],
+                "uncertain"
+            );
+        }
+        other => panic!("a storage-faulted settle must report uncertain: {other:?}"),
+    }
+    tx.rollback().await.expect("rollback restores the table");
+
+    // The caller's rollback leaves nothing new durable: the intent and its
+    // receipt stay pending, and the renamed table reverts with them.
+    let (status, state): (String, String) = sqlx::query_as(
+        "SELECT r.status, j.state \
+         FROM memory_receipts r JOIN memory_journal j ON j.receipt_id = r.receipt_id \
+         WHERE r.receipt_id = ?1",
+    )
+    .bind(&pending)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("receipt + intent after fault rollback");
+    assert_eq!(status, "pending");
+    assert_eq!(state, "pending");
+    assert_eq!(file_set(&store_dir), published_files);
+
+    // Poll before settlement reports OUTCOME_UNCERTAIN; republish the owed
+    // targets (idempotent) and the retry settle commits receipt + intent.
     let mut tx = harness.begin().await;
     match adapter
         .get_receipt(
@@ -1337,12 +1411,13 @@ async fn journaled_effect_survives_reopen_and_settles() {
         }
         other => panic!("a pending receipt must poll uncertain: {other:?}"),
     }
+    republish(&store_dir, &targets);
     let body = match adapter
         .settle_journal(&mut tx, &pending_space(), &pending)
         .await
     {
         SpokeResult::Ok(body) => body,
-        other => panic!("settle_journal failed: {other:?}"),
+        other => panic!("retry settle failed: {other:?}"),
     };
     assert_eq!(body["status"], "committed");
     tx.commit().await.expect("settle commit");
@@ -1360,10 +1435,10 @@ async fn journaled_effect_survives_reopen_and_settles() {
     assert_eq!(state, "applied");
     assert_eq!(targets, "[]", "settlement scrubs the targets");
 
-    // Replay-does-not-duplicate-publish: a second settle of the committed
-    // receipt returns the stored outcome, and replaying the original op
-    // request serves the committed receipt — neither stages a second effect,
-    // record or intent.
+    // Replay-does-not-duplicate-publish: a second settle returns the stored
+    // outcome and replaying the original op request serves the committed
+    // receipt — no second publish: the file set is byte-identical to the
+    // post-publish snapshot and no new record or intent appears.
     let mut tx = harness.begin().await;
     let body = match adapter
         .settle_journal(&mut tx, &pending_space(), &pending)
@@ -1382,13 +1457,48 @@ async fn journaled_effect_survives_reopen_and_settles() {
     tx.commit().await.expect("replay tx commit");
     assert_eq!(harness.count("memory_records").await, 1);
     assert_eq!(harness.count("memory_journal").await, 1);
-
-    // The published projection survives the settle: digest-checkable bytes
-    // on disk, durable receipt + applied intent in the reopened DB.
-    assert!(
-        store_dir.join(format!("records/{record_id}.md")).exists(),
-        "record projection file published"
+    assert_eq!(
+        file_set(&store_dir),
+        published_files,
+        "replay must not republish or touch the file set"
     );
+}
+
+/// Relative path → file bytes for everything under `dir` (empty when the
+/// directory does not exist) — the publish-set snapshot the replay legs
+/// compare.
+fn file_set(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.insert(
+                    path.strip_prefix(&dir).unwrap_or(&path).to_path_buf(),
+                    std::fs::read(&path).expect("read published file"),
+                );
+            }
+        }
+    }
+    files
+}
+
+/// Re-confirm every staged target on disk — the idempotent republish the
+/// caller runs after a settlement attempt whose outcome stayed uncertain.
+fn republish(store_dir: &Path, targets_json: &str) {
+    for target in serde_json::from_str::<Vec<Value>>(targets_json).expect("targets json") {
+        let rel = target["path"].as_str().expect("target path");
+        let content = target["content"].as_str().expect("target content");
+        let file = store_dir.join(rel);
+        std::fs::create_dir_all(file.parent().expect("target dir")).expect("mkdir");
+        std::fs::write(&file, content).expect("republish target");
+    }
 }
 
 /// O1: the unadvertised build refuses every Reflection selector — the same
@@ -1884,4 +1994,555 @@ async fn promotion_into_shared_scope() {
 
     tx.commit().await.expect("caller commit");
     assert_eq!(harness.count("memory_journal").await, 2);
+}
+
+/// Baseline D1/D2: distinct bearer kinds (U `nexus/character`, V
+/// `nexus/character-other`), context-scoped captures, exact-replay and
+/// altered-content controls, and scoped candidate paging — O pages U/A and
+/// U/B in order, the V/A candidate never appears, and a `review`@ctx-a
+/// principal pages only its own context's candidates.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn scoped_capture_baseline_d1_d2() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+    let reviewer = principal("ctr_p");
+    let mut tx = harness.begin().await;
+
+    // Ensure V with a distinct bearer kind — the second creation is valid
+    // only because its kind.id differs from U's `character`.
+    let body = ready(
+        adapter
+            .ensure_subject(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": "sbj_other",
+                    "kind": { "ns": "nexus", "id": "character-other" },
+                }),
+            )
+            .await,
+        "subjects.ensure",
+    );
+    assert_eq!(body["result"]["created"], true);
+
+    // Grant P review coverage on U confined to ctx-a (baseline D2's
+    // restricted lister).
+    ready(
+        adapter
+            .grant(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "principal_id": "ctr_p",
+                    "capabilities": ["review"],
+                    "context_ids": [CTX_A],
+                    "shared_access": false,
+                    "idempotency_key": "d2-review-a",
+                }),
+            )
+            .await,
+        "grants.grant",
+    );
+
+    // CAP(U,A,d-a) → ca, CAP(U,B,d-b) → cb, CAP(U,A,d-c) → cc, CAP(V,A,d-v).
+    let capture = |key: &str, subject: &str, context: &str| {
+        json!({
+            "space_id": SPACE,
+            "subject_id": subject,
+            "capture_scope": { "visibility": "context", "context_id": context },
+            "content": { "text": "the northern gate opens before dawn" },
+            "idempotency_key": key,
+        })
+    };
+    let mut ids = Vec::new();
+    for (key, context) in [("d-a", CTX_A), ("d-b", "ctx-b"), ("d-c", CTX_A)] {
+        let body = ready(
+            adapter
+                .capture(&mut tx, &admin, capture(key, SUBJECT, context))
+                .await,
+            "capture",
+        );
+        assert_eq!(body["result"]["classified"], 1);
+        assert!(
+            !body.to_string().contains("northern gate"),
+            "result must be content-free: {body}"
+        );
+        ids.push(
+            body["result"]["candidate_ids"][0]
+                .as_str()
+                .expect("candidate id")
+                .to_string(),
+        );
+    }
+    let [cand_a, _cand_b, cand_c] = ids.as_slice() else {
+        unreachable!()
+    };
+    let body = ready(
+        adapter
+            .capture(&mut tx, &admin, capture("d-v", "sbj_other", CTX_A))
+            .await,
+        "capture-v",
+    );
+    let cand_v = body["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("v candidate id")
+        .to_string();
+
+    // Exact replay of d-a returns the same committed receipt/candidate id;
+    // the same key with changed text is IDEMPOTENCY_CONFLICT/terminal.
+    let body = ready(
+        adapter
+            .capture(&mut tx, &admin, capture("d-a", SUBJECT, CTX_A))
+            .await,
+        "capture replay",
+    );
+    assert_eq!(body["result"]["candidate_ids"][0], *cand_a);
+    let mut changed = capture("d-a", SUBJECT, CTX_A);
+    changed["content"]["text"] = json!("Changed northern gate evening.");
+    match adapter.capture(&mut tx, &admin, changed).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::IdempotencyConflict);
+            assert_eq!(
+                reject.details.as_ref().expect("details")["retry_class"],
+                "terminal"
+            );
+        }
+        other => panic!("altered replay must conflict: {other:?}"),
+    }
+
+    // D2: O pages U's pending candidates limit=1 — [ca], [cb], [cc], no gap,
+    // and cv is excluded from U's listing entirely.
+    let mut cursor = Value::Null;
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let body = ready(
+            adapter
+                .list_candidates(
+                    &mut tx,
+                    &admin,
+                    json!({
+                        "space_id": SPACE,
+                        "subject_id": SUBJECT,
+                        "status": "pending",
+                        "limit": 1,
+                        "cursor": cursor,
+                    }),
+                )
+                .await,
+            "candidates.list",
+        );
+        pages.push(
+            body["candidates"].as_array().expect("candidates")[0]["candidate_id"]
+                .as_str()
+                .expect("id")
+                .to_string(),
+        );
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = json!(next),
+            None => break,
+        }
+    }
+    assert_eq!(pages.len(), 3, "three pending U candidates: {pages:?}");
+    assert!(
+        !pages.contains(&cand_v),
+        "V candidate must not list under U"
+    );
+
+    // The restricted principal pages only its granted context: [ca], [cc],
+    // skipping the ctx-b candidate without a gap.
+    let mut cursor = Value::Null;
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let body = ready(
+            adapter
+                .list_candidates(
+                    &mut tx,
+                    &reviewer,
+                    json!({
+                        "space_id": SPACE,
+                        "subject_id": SUBJECT,
+                        "status": "pending",
+                        "limit": 1,
+                        "cursor": cursor,
+                    }),
+                )
+                .await,
+            "candidates.list restricted",
+        );
+        pages.push(
+            body["candidates"].as_array().expect("candidates")[0]["candidate_id"]
+                .as_str()
+                .expect("id")
+                .to_string(),
+        );
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = json!(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        pages.as_slice(),
+        [cand_a.as_str(), cand_c.as_str()],
+        "restricted pages must be ca, cc with no gap: {pages:?}"
+    );
+
+    tx.commit().await.expect("caller commit");
+}
+
+/// Baseline D12: recall pages ranked results under the item budget —
+/// `max_items=1` yields one record per page with `total_authorized=2`, only
+/// page 1 truncates, and tombstoned rows never appear. The byte-budget arm
+/// names the overflowing record without fabricating content.
+#[tokio::test]
+async fn recall_pagination_d12() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+    let mut tx = harness.begin().await;
+
+    let mut records = Vec::new();
+    for (key, text) in [
+        ("d12-create-a", "the northern gate opens before dawn"),
+        ("d12-create-b", "the northern gate closes at dusk"),
+        ("d12-create-del", "an unrelated southern record"),
+    ] {
+        staged(
+            adapter
+                .create_record(
+                    &mut tx,
+                    &admin,
+                    json!({
+                        "space_id": SPACE,
+                        "subject_id": SUBJECT,
+                        "kind": "fact",
+                        "scope": { "visibility": "context", "context_id": CTX_A },
+                        "source_context_ids": [CTX_A],
+                        "content": { "text": text },
+                        "idempotency_key": key,
+                    }),
+                )
+                .await,
+            "records.create",
+        );
+        records.push(
+            sqlx::query_scalar::<_, String>(
+                "SELECT record_id FROM memory_records WHERE content_json LIKE ?1",
+            )
+            .bind(format!("%{text}%"))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("record id"),
+        );
+    }
+    let [_r1, _r2, r_del] = records.as_slice() else {
+        unreachable!()
+    };
+    staged(
+        adapter
+            .delete_record(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "record_id": r_del,
+                    "expected_revision": 1,
+                    "idempotency_key": "d12-delete",
+                }),
+            )
+            .await,
+        "records.delete",
+    );
+
+    // Page 1: one record, truncated, cursor continues; page 2 serves the
+    // remaining record with no further cursor. The tombstone is absent.
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "query": "northern gate",
+                    "budget": { "max_items": 1 },
+                }),
+            )
+            .await,
+        "recall page 1",
+    );
+    assert_eq!(body["records"].as_array().expect("records").len(), 1);
+    assert_eq!(body["total_authorized"], 2);
+    assert_eq!(body["truncated"], true);
+    let cursor = body["next_cursor"].clone();
+    assert!(!cursor.is_null(), "page 1 must continue");
+
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "query": "northern gate",
+                    "budget": { "max_items": 1 },
+                    "cursor": cursor,
+                }),
+            )
+            .await,
+        "recall page 2",
+    );
+    assert_eq!(body["records"].as_array().expect("records").len(), 1);
+    assert_eq!(body["total_authorized"], 2);
+    assert_eq!(body["truncated"], false);
+    assert!(body["next_cursor"].is_null());
+
+    // Byte budget below one record's size: the budget names the overflowing
+    // record and keeps the page honest — no fabricated partial body.
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "selected_contexts", "context_ids": [CTX_A] },
+                    "filter": { "source_context_ids": [CTX_A] },
+                    "budget": { "max_items": 10, "max_bytes": 1 },
+                }),
+            )
+            .await,
+        "recall byte budget",
+    );
+    assert_eq!(body["total_authorized"], 2);
+    assert_eq!(body["truncated"], true);
+    assert!(body["overflow_record_id"].is_string());
+
+    tx.commit().await.expect("caller commit");
+}
+
+/// Baseline F3: `reflections.list` pages newest-first through its cursor —
+/// after a second generation the updated envelope leads page 1 while the
+/// first follows on page 2, and each row reports its own recomputed stale
+/// flag.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reflection_pagination_f3() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+
+    // Transaction 1: profile + basis record + first generation lease.
+    let mut tx = harness.begin().await;
+    staged(
+        adapter
+            .update_profile(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "profile_kind": "personality",
+                    "expected_revision": null,
+                    "document": { "format": "markdown", "body": "# Parity subject" },
+                    "idempotency_key": "f3-profile",
+                }),
+            )
+            .await,
+        "profile.update",
+    );
+    staged(
+        adapter
+            .create_record(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "kind": "fact",
+                    "scope": { "visibility": "shared" },
+                    "content": { "text": "basis record" },
+                    "idempotency_key": "f3-record",
+                }),
+            )
+            .await,
+        "records.create",
+    );
+    let record_id: String = sqlx::query_scalar("SELECT record_id FROM memory_records")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("record id");
+    let digest = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                }),
+            )
+            .await,
+        "reflections.state",
+    )["state_digest"]
+        .as_str()
+        .expect("digest")
+        .to_string();
+    let work = match adapter
+        .generate_reflection(
+            &mut tx,
+            &admin,
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "selection": { "mode": "subject_all" },
+                "expected_state_digest": digest,
+                "idempotency_key": "f3-generate",
+            }),
+        )
+        .await
+    {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("generate did not stage a lease: {other:?}"),
+    };
+    tx.commit().await.expect("tx1 commit");
+
+    // Transaction 2: complete the first lease.
+    let mut tx = harness.begin().await;
+    let body = match adapter.complete_reflection(&mut tx, work.compose()).await {
+        SpokeResult::Ok(body) => body,
+        other => panic!("complete_reflection failed: {other:?}"),
+    };
+    let first_id = body["result"]["reflection_id"]
+        .as_str()
+        .expect("first reflection")
+        .to_string();
+    tx.commit().await.expect("tx2 commit");
+
+    // Transaction 3: update the basis record, re-read the state digest and
+    // stage the second generation.
+    let mut tx = harness.begin().await;
+    staged(
+        adapter
+            .update_record(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "record_id": record_id,
+                    "expected_revision": 1,
+                    "content": { "text": "A changed basis." },
+                    "idempotency_key": "f3-change",
+                }),
+            )
+            .await,
+        "records.update",
+    );
+    let digest = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                }),
+            )
+            .await,
+        "reflections.state updated",
+    )["state_digest"]
+        .as_str()
+        .expect("updated digest")
+        .to_string();
+    let work = match adapter
+        .generate_reflection(
+            &mut tx,
+            &admin,
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "selection": { "mode": "subject_all" },
+                "expected_state_digest": digest,
+                "idempotency_key": "f3-generate-updated",
+            }),
+        )
+        .await
+    {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("updated generate did not stage a lease: {other:?}"),
+    };
+    tx.commit().await.expect("tx3 commit");
+
+    // Transaction 4: complete the updated lease.
+    let mut tx = harness.begin().await;
+    let body = match adapter.complete_reflection(&mut tx, work.compose()).await {
+        SpokeResult::Ok(body) => body,
+        other => panic!("complete_reflection failed: {other:?}"),
+    };
+    let updated_id = body["result"]["reflection_id"]
+        .as_str()
+        .expect("updated reflection")
+        .to_string();
+    tx.commit().await.expect("tx4 commit");
+
+    // List limit=1: the updated (newest) envelope leads, the stale first
+    // envelope follows on the cursor page — each flag recomputed at read.
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .list_reflections(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "limit": 1,
+                }),
+            )
+            .await,
+        "reflections.list page 1",
+    );
+    let page1 = body["reflections"].as_array().expect("reflections");
+    assert_eq!(page1.len(), 1);
+    assert_eq!(page1[0]["reflection_id"], updated_id);
+    assert_eq!(page1[0]["stale"], false);
+    let cursor = body["next_cursor"].clone();
+    assert!(!cursor.is_null(), "page 1 must continue");
+
+    let body = ready(
+        adapter
+            .list_reflections(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "limit": 1,
+                    "cursor": cursor,
+                }),
+            )
+            .await,
+        "reflections.list page 2",
+    );
+    let page2 = body["reflections"].as_array().expect("reflections");
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0]["reflection_id"], first_id);
+    assert_eq!(
+        page2[0]["stale"], true,
+        "the pinned-basis reflection is stale"
+    );
+    assert!(body["next_cursor"].is_null());
+    tx.commit().await.expect("read commit");
 }
