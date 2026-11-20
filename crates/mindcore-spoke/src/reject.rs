@@ -1,0 +1,109 @@
+//! The protocol refusal surface: every failure leaves the adapter as a
+//! [`SpokeReject`] whose `details.retry_class` tells the caller whether the
+//! transaction may be retried. Storage diagnostics never cross this boundary.
+
+use serde_json::{Map, Value};
+use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
+
+use mindcore_base::ir::wire::WireError;
+use mindcore_sqlite::SqliteRepositoryError;
+
+/// A refusal before the boundary projection.
+pub(crate) struct Reject {
+    pub(crate) code: SpokeRejectCode,
+    pub(crate) message: String,
+    pub(crate) details: Map<String, Value>,
+}
+
+pub(crate) type AResult<T> = Result<T, Reject>;
+
+const RETRY_CLASS: &str = "retry_class";
+
+impl Reject {
+    /// A refusal that repeating the same request cannot change.
+    pub(crate) fn terminal(code: SpokeRejectCode, message: impl Into<String>) -> Self {
+        Self::with_class(code, message, "terminal")
+    }
+
+    /// A refusal the caller may retry because no effect can have committed.
+    pub(crate) fn retryable(code: SpokeRejectCode, message: impl Into<String>) -> Self {
+        Self::with_class(code, message, "retryable")
+    }
+
+    /// The caller must resolve the outcome before retrying (§14.2/§14.3).
+    pub(crate) fn uncertain(message: impl Into<String>) -> Self {
+        Self::with_class(SpokeRejectCode::OutcomeUncertain, message, "uncertain")
+    }
+
+    /// Malformed wire input, version or selector.
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::terminal(SpokeRejectCode::InvalidInput, message)
+    }
+
+    /// A pre-commit repository failure: the caller rolls the transaction back.
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::retryable(SpokeRejectCode::InternalError, message)
+    }
+
+    pub(crate) fn not_found(what: impl std::fmt::Display) -> Self {
+        Self::terminal(SpokeRejectCode::NotFound, format!("{what} not found"))
+    }
+
+    pub(crate) fn not_authorized(message: impl Into<String>) -> Self {
+        Self::terminal(SpokeRejectCode::NotAuthorized, message)
+    }
+
+    /// An optional family or op this adapter build does not serve (§4.1).
+    pub(crate) fn unsupported(op: &str) -> Self {
+        Self::terminal(
+            SpokeRejectCode::CapabilityPortMissing,
+            format!("{op} is not served by this provider build"),
+        )
+        .detail("op", Value::String(op.to_string()))
+    }
+
+    pub(crate) fn detail(mut self, key: &str, value: Value) -> Self {
+        self.details.insert(key.to_string(), value);
+        self
+    }
+
+    pub(crate) fn into_spoke(self) -> SpokeReject {
+        SpokeReject {
+            code: self.code,
+            message: self.message,
+            details: Some(self.details),
+        }
+    }
+
+    fn with_class(code: SpokeRejectCode, message: impl Into<String>, class: &str) -> Self {
+        let mut details = Map::new();
+        details.insert(RETRY_CLASS.to_string(), Value::String(class.to_string()));
+        Self {
+            code,
+            message: message.into(),
+            details,
+        }
+    }
+}
+
+impl From<SqliteRepositoryError> for Reject {
+    fn from(_: SqliteRepositoryError) -> Self {
+        // A driver failure before the caller's commit is retryable and its
+        // diagnostics stay local: the protocol names no storage vocabulary.
+        Self::internal("storage failure before commit")
+    }
+}
+
+impl From<WireError> for Reject {
+    fn from(error: WireError) -> Self {
+        Self::invalid(error.to_string())
+    }
+}
+
+/// Project one operation result onto the wire channel.
+pub(crate) fn settle<T>(result: AResult<T>) -> SpokeResult<T> {
+    match result {
+        Ok(value) => spoke_operations::spoke_ok(value),
+        Err(reject) => SpokeResult::Reject(reject.into_spoke()),
+    }
+}
