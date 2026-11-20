@@ -12,11 +12,9 @@
 -- Recorded deviations from pinned DDL:
 --   * owner_id / lease_expires_at on memory_receipts are INLINED into the table
 --     rather than ALTERed (source: 20261110000001_memory_reflections.sql:63-64)
---   * extensions_json TEXT NOT NULL DEFAULT '{}' added to memory_candidates,
---     memory_records, memory_receipts — Nexus stores no per-document extensions
---     and projects "extensions":{}; Mindcore's IR fidelity rule requires
---     persistence (task-1-schema-map.md §3 D-1). A defaulted column is invisible
---     to every pinned Nexus statement, which all use explicit column lists.
+--   * no other column deviation: the pinned schema stores no per-document
+--     `extensions` on candidates/records/receipts — the borrowed path does not
+--     persist them either (task-1-schema-map.md §3 D-1)
 
 -- ── Control plane (v1.227 NXM-1 round A) ──
 -- Source: 20261101000001_memory_control_metadata.sql:35-43
@@ -66,7 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_grants_space_subject
     ON memory_grants (space_id, subject_id);
 
 -- ── Content plane (v1.227 NXM-1 round B) ──
--- Source: 20261101000002_memory_content_metadata.sql:37-67 (+ extensions_json, D-1)
+-- Source: 20261101000002_memory_content_metadata.sql:37-67
 CREATE TABLE IF NOT EXISTS memory_candidates (
     candidate_id TEXT PRIMARY KEY,
     space_id TEXT NOT NULL,
@@ -84,7 +82,6 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
     expires_at TEXT,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     created_at TEXT NOT NULL,
-    extensions_json TEXT NOT NULL DEFAULT '{}',
     CHECK ((capture_visibility = 'context') = (capture_context_id IS NOT NULL)),
     CHECK ((status = 'consumed') = (consumed_by_json IS NOT NULL)),
     CHECK ((status = 'consumed') = (content_json IS NULL)),
@@ -99,7 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_candidates_pending_expires
     ON memory_candidates (expires_at)
     WHERE status = 'pending';
 
--- Source: 20261101000002_memory_content_metadata.sql:80-97 (+ extensions_json, D-1)
+-- Source: 20261101000002_memory_content_metadata.sql:80-97
 CREATE TABLE IF NOT EXISTS memory_records (
     record_id TEXT PRIMARY KEY,
     space_id TEXT NOT NULL,
@@ -114,8 +111,6 @@ CREATE TABLE IF NOT EXISTS memory_records (
     tombstone_json TEXT,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    extensions_json TEXT NOT NULL DEFAULT '{}',
     CHECK ((scope_visibility = 'context') = (scope_context_id IS NOT NULL))
 ) WITHOUT ROWID;
 
@@ -136,9 +131,8 @@ CREATE TABLE IF NOT EXISTS memory_profiles (
     PRIMARY KEY (space_id, subject_id, profile_kind)
 ) WITHOUT ROWID;
 
--- ── Operation receipts: post-tombstone-rebuild shape ──
--- Source: 20261101000003_memory_receipt_tombstones.sql:15-54 (+ extensions_json, D-1;
--- + owner_id/lease_expires_at inlined from 20261110000001_memory_reflections.sql:63-64)
+-- Source: 20261101000003_memory_receipt_tombstones.sql:15-54 (post-rebuild shape)
+-- + owner_id/lease_expires_at inlined from 20261110000001_memory_reflections.sql:63-64
 CREATE TABLE IF NOT EXISTS memory_receipts (
     receipt_id TEXT PRIMARY KEY,
     space_id TEXT NOT NULL,
@@ -154,8 +148,6 @@ CREATE TABLE IF NOT EXISTS memory_receipts (
     completed_at TEXT,
     -- Generation lease (§7.0.3); NULL on terminal receipts.
     owner_id TEXT,
-    lease_expires_at TEXT,
-    extensions_json TEXT NOT NULL DEFAULT '{}',
     -- §6.10 payload contract: pending carries no payload/stamp; a settled row
     -- carries one payload (served body) or none (content-free tombstone).
     CHECK (
