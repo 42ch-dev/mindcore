@@ -40,8 +40,13 @@ const TOOLS_NAMESPACE: &str = "mindcore";
 /// work; each workflow keeps its own `SpiError` classification.
 pub struct MindcoreServe {
     store: MindStore,
-    workflows: Arc<SpiMindWorkflows>,
+    reflections: bool,
+    publish: Arc<JournalPublisher>,
 }
+
+/// The host's journal publisher: a settlement leg without one is refused by the binding, and the
+/// runtime never invents a publisher.
+type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
 
 impl MindcoreServe {
     /// Build over the host's store.
@@ -54,17 +59,23 @@ impl MindcoreServe {
         reflections_enabled: bool,
         publish: impl Fn(&[Value]) -> Result<(), SpiError> + Send + Sync + 'static,
     ) -> Self {
-        let binding =
-            MemoryWorkflowBinding::new(store.pool(), reflections_enabled).with_publisher(publish);
         Self {
             store,
-            workflows: Arc::new(SpiMindWorkflows::new(binding)),
+            reflections: reflections_enabled,
+            publish: Arc::new(publish),
         }
     }
 
-    /// The workflow engine the tool handlers call.
-    pub fn workflows(&self) -> &SpiMindWorkflows {
-        &self.workflows
+    /// The engine one surface serves: the deliberation leg reads and writes a carrier entry, so the
+    /// binding needs the one caller and the one collection the host served with it.
+    fn workflows(&self, faces: &ServeFaces) -> Arc<SpiMindWorkflows> {
+        let publish = Arc::clone(&self.publish);
+        let mut binding = MemoryWorkflowBinding::new(self.store.pool(), self.reflections)
+            .with_publisher(move |targets| publish(targets));
+        if let Some(caller) = &faces.workflow_caller {
+            binding = binding.with_knowledge_collection(caller.clone(), faces.knowledge.clone());
+        }
+        Arc::new(SpiMindWorkflows::new(binding))
     }
 
     /// Assemble the ports, manifest and tool registrations for `ConnectResponderOptions`.
@@ -73,9 +84,14 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        let workflows: Arc<dyn MindWorkflows> = self.workflows.clone();
+        let workflows: Arc<dyn MindWorkflows> = self.workflows(&faces);
         let mut tools =
             WorkflowTools::new(workflows, faces.principals, faces.providers).registrations();
+        // Deliberation settles onto the host's carrier collection; a surface without that route
+        // serves no deliberation, so it advertises none rather than a tool that can only refuse.
+        if faces.workflow_caller.is_none() {
+            tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
+        }
         tools.extend(faces.tools);
         let manifest = derive_manifest(faces.manifest, faces.memory.is_some(), &tools);
         let manifest = match manifest {
@@ -117,6 +133,10 @@ pub struct ServeFaces {
     pub principals: MemoryAdmission,
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
+    /// The one principal the workflow engine admits to the served knowledge collection: the
+    /// deliberation leg reads and CAS-writes its carrier entry through that route. `None` serves
+    /// no deliberation and advertises none — the tool is never installed on a surface without it.
+    pub workflow_caller: Option<String>,
     /// Additional host tools: every descriptor is advertised and its handler installed.
     pub tools: Vec<ToolRegistration>,
 }

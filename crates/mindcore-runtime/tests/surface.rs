@@ -133,6 +133,7 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         memory: None,
         principals: principals(),
         providers: MindProviders::default(),
+        workflow_caller: Some("prn_owner".to_string()),
         tools: Vec::new(),
     }
 }

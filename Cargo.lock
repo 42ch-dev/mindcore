@@ -2093,6 +2093,7 @@ name = "mindcore-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ed25519-dalek 2.2.0",
  "mindcore-base",
  "mindcore-spi",
  "mindcore-spoke",
@@ -2102,6 +2103,7 @@ dependencies = [
  "spoke-connect",
  "spoke-operations",
  "spoke-schemas",
+ "sqlx",
  "tempfile",
  "tokio",
 ]

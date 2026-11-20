@@ -1,0 +1,736 @@
+//! Signed in-process loopback over the composed surface against a real SQLite store.
+//!
+//! A remote consumer dials a `ConnectResponder` built from [`MindcoreServe::surface`] on a
+//! throwaway Ed25519 pair over the in-process transport: signed hellos, a signed session
+//! snapshot, a fail-closed allowlist, then the Mind tools. Handlers are installed before the
+//! dialer connects, exactly as a host must.
+//!
+//! The fixture is a protocol-shaped store: the pre-release `0001_init.sql` legacy memory tables
+//! (which predate the protocol shape the adapter reads) are dropped before the protocol DDL
+//! applies, while the migrated `knowledge_entries` table keeps its own store path.
+//!
+//! Advertisement honesty is the negative side: a face the host did not attach advertises nothing
+//! and denies its ops on the wire, and a tool the runtime does not serve answers `op_unsupported`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ed25519_dalek::SigningKey;
+use serde_json::{json, Value};
+use tempfile::TempDir;
+
+use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
+use mindcore_runtime::{MindProviders, MindcoreServe, MindcoreSurface, ServeFaces};
+use mindcore_spi::{CognitiveTaskKind, Reasoner, SpiError, StructuredReasonRequest};
+use mindcore_sqlite::MindStore;
+use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
+use spoke_connect::remote::{
+    connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
+    ConnectResponderOptions, KnowledgeAdmission, MemoryAdmission, RemoteAdapter,
+    RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService,
+};
+use spoke_operations::{
+    spoke_ok, spoke_reject, KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject,
+    SpokeRejectCode, SpokeResult,
+};
+use spoke_schemas::{HostCapabilityManifest, MemoryRecallRequest, Principal, Scope};
+
+const SCOPE_ID: &str = "spoke-scope-001";
+const COLLECTION: &str = "wren";
+const CARRIER: &str = "ke_wren";
+const SPACE: &str = "spc_loopback";
+const SUBJECT: &str = "subj_loopback";
+const PRINCIPAL: &str = "prn_loopback";
+const NOW: &str = "2026-11-21T00:00:00.000Z";
+const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
+
+const DIALER_SEED: [u8; 32] = [0x42u8; 32];
+const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
+
+const PROTOCOL_DDL: &str =
+    include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
+const LEGACY_MEMORY_TABLES: &str = "
+DROP TABLE memory_records;
+DROP TABLE review_receipts;
+DROP TABLE memory_candidates;";
+
+/// One store the runtime serves: the protocol memory shape with two retained records, the
+/// grants the workflows read, and the knowledge collection the face serves.
+struct Fixture {
+    dir: TempDir,
+    store: MindStore,
+}
+
+impl Fixture {
+    async fn open() -> Self {
+        let dir = TempDir::new().expect("temporary directory");
+        let store = MindStore::open(&dir.path().join("loopback.db"))
+            .await
+            .expect("open store");
+        let pool = store.pool();
+        sqlx::raw_sql(LEGACY_MEMORY_TABLES)
+            .execute(&pool)
+            .await
+            .expect("drop the legacy memory tables");
+        sqlx::raw_sql(PROTOCOL_DDL)
+            .execute(&pool)
+            .await
+            .expect("apply the protocol DDL");
+        sqlx::query(
+            "INSERT INTO memory_spaces \
+             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+              created_at) \
+             VALUES (?, 'loopback space', 'host_1', 1, 'active', 1, ?)",
+        )
+        .bind(SPACE)
+        .bind(NOW)
+        .execute(&pool)
+        .await
+        .expect("seed space");
+        sqlx::query(
+            "INSERT INTO memory_subjects \
+             (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, \
+              created_at) \
+             VALUES (?, ?, NULL, NULL, 'active', '[]', 1, ?)",
+        )
+        .bind(SPACE)
+        .bind(SUBJECT)
+        .bind(NOW)
+        .execute(&pool)
+        .await
+        .expect("seed subject");
+        for (grant_id, capabilities) in [
+            ("grt_recall", json!(["recall"])),
+            (
+                "grt_knowledge",
+                json!(["knowledge_read", "knowledge_write"]),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO memory_grants \
+                 (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+                  context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+                 VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+            )
+            .bind(grant_id)
+            .bind(SPACE)
+            .bind(PRINCIPAL)
+            .bind(capabilities.to_string())
+            .bind(NOW)
+            .execute(&pool)
+            .await
+            .expect("seed grant");
+        }
+        seed_record(&pool, "rec_north_gate", "the north gate is closed").await;
+        seed_record(&pool, "rec_market", "the market opens at dawn").await;
+        Self { dir, store }
+    }
+
+    /// The carrier entry the deliberation holder names.
+    async fn seed_carrier(&self) {
+        expect_ok(
+            self.store
+                .knowledge(KnowledgeScope::new(COLLECTION))
+                .put_knowledge_entry(
+                    serde_json::from_value(json!({
+                        "schema_version": 1,
+                        "entry_id": CARRIER,
+                        "entry_type": "note",
+                        "canonical_name": "Wren's carrier",
+                        "status": "confirmed",
+                        "body": { "summary": "what Wren currently holds" },
+                        "extensions": {},
+                    }))
+                    .expect("carrier JSON matches the schema"),
+                    None,
+                )
+                .await,
+            "write the carrier entry",
+        );
+    }
+
+    /// The store and its directory part company: the engine takes the store, the caller keeps the
+    /// directory alive for the session's lifetime.
+    fn serve(self) -> (TempDir, MindcoreServe) {
+        let Self { dir, store } = self;
+        (dir, MindcoreServe::new(store, false, |_targets| Ok(())))
+    }
+}
+
+async fn seed_record(pool: &sqlx::SqlitePool, record_id: &str, text: &str) {
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES (?, ?, ?, 'fact', ?, 'shared', NULL, ?, NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(record_id)
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(json!({ "text": text }).to_string())
+    .bind(
+        json!({
+            "source_context_ids": [],
+            "anchors": [],
+            "captured_by": "loopback",
+            "captured_at": NOW,
+        })
+        .to_string(),
+    )
+    .bind(NOW)
+    .bind(NOW)
+    .execute(pool)
+    .await
+    .expect("seed record");
+}
+
+/// One signed hello's manifest with exactly the capabilities its side claims.
+fn hello(host_id: &str, capabilities: &[&str]) -> HostCapabilityManifest {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "host_id": host_id,
+        "roles": ["data-store"],
+        "capabilities": capabilities,
+        "namespaces": ["toy_world"],
+        "extensions": {},
+    }))
+    .expect("manifest JSON matches the schema")
+}
+
+fn capabilities(surface: &MindcoreSurface) -> Vec<&str> {
+    surface
+        .manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect()
+}
+
+fn scope_of(scope_id: &str) -> Scope {
+    serde_json::from_value(json!({ "scope_id": scope_id })).expect("scope JSON matches the schema")
+}
+
+fn principal() -> Principal {
+    serde_json::from_value(json!({ "principal_id": PRINCIPAL, "extensions": {} }))
+        .expect("principal JSON matches the schema")
+}
+
+fn dialer_peer_id() -> String {
+    derive_peer_id_from_ed25519_pubkey(
+        &SigningKey::from_bytes(&DIALER_SEED)
+            .verifying_key()
+            .to_bytes(),
+    )
+}
+
+/// Both host admissions admit the dialer's authenticated peer id and nothing else, so a served
+/// call proves the responder took the peer from its session rather than from the arguments.
+fn knowledge_admission() -> KnowledgeAdmission {
+    let peer_id = dialer_peer_id();
+    Arc::new(move |peered: &str| match peered == peer_id {
+        true => SpokeResult::Ok(scope_of(SCOPE_ID)),
+        false => refuse_knowledge(peered),
+    })
+}
+
+fn refuse_knowledge(peer_id: &str) -> SpokeResult<Scope> {
+    spoke_reject(
+        SpokeRejectCode::NotAuthorized,
+        format!("peer {peer_id} holds no knowledge admission"),
+        None,
+    )
+}
+
+fn principal_admission() -> MemoryAdmission {
+    let peer_id = dialer_peer_id();
+    Arc::new(move |peered: &str| match peered == peer_id {
+        true => spoke_ok(principal()),
+        false => spoke_reject(
+            SpokeRejectCode::NotAuthorized,
+            format!("peer {peered} holds no workflow admission"),
+            None,
+        ),
+    })
+}
+
+/// The host's memory family service; a test attaches it only where it means to serve it.
+struct MemoryFace;
+
+#[async_trait]
+impl RemoteMemoryService for MemoryFace {
+    async fn invoke(&self, peer_id: &str, op: &str, _payload: Value) -> SpokeResult<Value> {
+        if peer_id != dialer_peer_id() {
+            return spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                format!("peer {peer_id} holds no memory admission"),
+                None,
+            );
+        }
+        if op != "memory.recall" {
+            return spoke_reject(
+                SpokeRejectCode::CapabilityPortMissing,
+                format!("the fixture memory face does not serve {op}"),
+                None,
+            );
+        }
+        spoke_ok(json!({
+            "engine_policy_version": "loopback-memory-face",
+            "records": [],
+            "total_authorized": 7,
+            "truncated": false,
+        }))
+    }
+}
+
+/// The host's reasoner: one `none` verdict over the evidence the deliberation supplied.
+struct NoChangeReasoner;
+
+#[async_trait]
+impl Reasoner for NoChangeReasoner {
+    async fn reason_structured(
+        &self,
+        request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        assert_eq!(request.task_kind, CognitiveTaskKind::Deliberate);
+        let payload: Value =
+            serde_json::from_str(request.user_payload).expect("the deliberation payload is JSON");
+        assert_eq!(payload["evidence"][0]["evidence_id"], "ev_gate");
+        assert!(
+            payload["records"].as_array().is_some_and(|records| records
+                .iter()
+                .any(|record| record["record_id"] == "rec_north_gate")),
+            "the authorized memory page reached the reasoner: {}",
+            request.user_payload
+        );
+        Ok(json!({
+            "recommendation": { "kind": "none" },
+            "rationale": "the evidence carries nothing the carrier does not already hold",
+            "evidence_ids": ["ev_gate"],
+            "record_ids": ["rec_north_gate"],
+        }))
+    }
+}
+
+/// The host's side of the surface. `workflow_caller` is the one principal the deliberation route
+/// admits; without it the runtime serves and advertises no `deliberate` at all.
+fn faces(
+    manifest: HostCapabilityManifest,
+    memory: Option<Arc<dyn RemoteMemoryService>>,
+    providers: MindProviders,
+    workflow_caller: Option<&str>,
+) -> ServeFaces {
+    ServeFaces {
+        manifest,
+        scope_id: SCOPE_ID.to_string(),
+        knowledge: KnowledgeScope::new(COLLECTION),
+        admission: knowledge_admission(),
+        memory,
+        principals: principal_admission(),
+        providers,
+        workflow_caller: workflow_caller.map(str::to_string),
+        tools: Vec::new(),
+    }
+}
+
+fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
+    expect_ok(serve.surface(faces), "assemble the served surface")
+}
+
+struct Session {
+    adapter: Arc<RemoteAdapter>,
+    responder: Arc<ConnectResponder>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.adapter.close();
+        self.responder.close();
+    }
+}
+
+/// Establish a real signed loopback session over `surface`, the dialer claiming exactly
+/// `dialer_capabilities` in its hello. Handlers are installed before the dialer connects.
+async fn connect(surface: &MindcoreSurface, dialer_capabilities: &[&str]) -> Session {
+    let pair = loopback_transport_pair();
+    let dialer = dialer_peer_id();
+    let responder_pubkey = SigningKey::from_bytes(&RESPONDER_SEED)
+        .verifying_key()
+        .to_bytes();
+    let responder_peer_id = derive_peer_id_from_ed25519_pubkey(&responder_pubkey);
+
+    let responder = connect_responder(ConnectResponderOptions {
+        transport: Arc::new(pair.server),
+        identity: RemoteIdentity {
+            seed: RESPONDER_SEED,
+        },
+        manifest: surface.manifest.clone(),
+        allowlist: vec![dialer.clone()],
+        peer_keys: HashMap::from([(
+            dialer.clone(),
+            SigningKey::from_bytes(&DIALER_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )]),
+        ports: Some(Arc::clone(&surface.ports)),
+        invoke_timeout_ms: Some(10_000),
+    })
+    .await;
+    expect_ok(surface.register(&responder), "install the served handlers");
+
+    let adapter = connect_remote_adapter(RemoteAdapterOptions {
+        transport: Arc::new(pair.client),
+        local_identity: RemoteIdentity { seed: DIALER_SEED },
+        local_manifest: hello("loopback-dialer", dialer_capabilities),
+        remote_pubkey: responder_pubkey,
+        allowlist: vec![responder_peer_id.clone()],
+        invoke_timeout_ms: Some(10_000),
+        capability_token: None,
+    })
+    .await
+    .expect("signed loopback handshake must succeed");
+
+    assert_eq!(adapter.state(), RemoteAdapterState::Established);
+    assert_eq!(
+        adapter.remote_peer_id().as_deref(),
+        Some(responder_peer_id.as_str())
+    );
+    assert_eq!(
+        responder.remote_peer_id().as_deref(),
+        Some(dialer.as_str()),
+        "the responder serves the authenticated peer, not a claimed one"
+    );
+    Session { adapter, responder }
+}
+
+fn recall_arguments() -> Value {
+    json!({
+        "request": {
+            "space_id": SPACE,
+            "subject_id": SUBJECT,
+            "selection": { "mode": "subject_all" },
+            "budget": { "max_items": 10 },
+        },
+        "max_tokens": 1_000,
+    })
+}
+
+fn recall_request() -> MemoryRecallRequest {
+    serde_json::from_value(json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "selection": { "mode": "subject_all" },
+        "budget": { "max_items": 10 },
+    }))
+    .expect("recall request JSON matches the schema")
+}
+
+fn deliberate_arguments() -> Value {
+    json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER },
+        "target": {
+            "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER },
+            "target_id": "prop_north_gate",
+            "kind": "proposition",
+        },
+        "evidence": [{ "id": "ev_gate", "text": "the north gate is closed at dusk" }],
+        "timeout_ms": 5_000,
+    })
+}
+
+fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
+    match result {
+        SpokeResult::Ok(value) => value,
+        SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
+    }
+}
+
+fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
+    match result {
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value:?}"),
+        SpokeResult::Reject(reject) => reject,
+    }
+}
+
+/// The dispatch-deny branch: the client sees `CapabilityPortMissing` and the pinned raw wire code.
+fn assert_wire_deny<T: std::fmt::Debug>(result: SpokeResult<T>, op: &str, wire_code: &str) {
+    let reject = expect_reject(result, op);
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "{op} must answer the dispatch-deny row: {reject:?}"
+    );
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("wire_code"))
+            .and_then(Value::as_str),
+        Some(wire_code),
+        "pinned raw reject code for {op}"
+    );
+    assert!(
+        reject.message.contains(op),
+        "reject message names the refused op: {}",
+        reject.message
+    );
+}
+
+/// A remote consumer reaches the store: `recall_context` runs the real workflow over the fixture's
+/// protocol memory tables, admitted from the responder's authenticated peer, and the manifest
+/// advertises exactly the tools it installs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_consumer_recalls_context_through_the_composed_surface() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-baseline"]),
+            None,
+            MindProviders::default(),
+            None,
+        ),
+    );
+
+    assert_eq!(
+        capabilities(&surface),
+        ["spoke-knowledge", "ke-ownership", RECALL_CONTEXT, ABSORB],
+        "the manifest advertises exactly the knowledge face and the served tools"
+    );
+    assert_eq!(
+        surface
+            .manifest
+            .tools
+            .iter()
+            .map(|tool| tool.capability_id.as_str())
+            .collect::<Vec<_>>(),
+        [RECALL_CONTEXT, ABSORB],
+        "no deliberation route, so no deliberation tool is installed"
+    );
+
+    let session = connect(&surface, &["spoke-knowledge", RECALL_CONTEXT]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, recall_arguments())
+            .await,
+        "the served recall_context tool",
+    );
+
+    let mut ids: Vec<&str> = result["records"]
+        .as_array()
+        .expect("the pack carries a records array")
+        .iter()
+        .map(|record| {
+            record["record_id"]
+                .as_str()
+                .expect("a packed record carries its id")
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["rec_market", "rec_north_gate"]);
+    assert!(
+        result["tokens_used"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0),
+        "the pack reports the tokens it used: {result}"
+    );
+    assert_eq!(
+        result["knowledge"],
+        json!([]),
+        "the workflow binding serves no knowledge slot of its own"
+    );
+}
+
+/// A remote consumer reaches the carrier: `deliberate` reads the real memory page and the real
+/// carrier entry through the composed surface and returns the reasoner's validated verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_consumer_deliberates_through_the_composed_surface() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let providers = MindProviders {
+        reasoner: Some(Arc::new(NoChangeReasoner)),
+        ..MindProviders::default()
+    };
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, providers, Some(PRINCIPAL)),
+    );
+    assert!(
+        capabilities(&surface).contains(&DELIBERATE),
+        "a wired deliberation route is advertised: {:?}",
+        capabilities(&surface)
+    );
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the served deliberate tool",
+    );
+
+    assert_eq!(result["status"], "no_change");
+    assert_eq!(
+        result["verdict"]["rationale"],
+        "the evidence carries nothing the carrier does not already hold"
+    );
+    assert_eq!(result["verdict"]["record_ids"], json!(["rec_north_gate"]));
+    // `no_change` is the branch that reads the carrier and writes nothing: the carrier is still at
+    // the revision the snapshot read. The settled branch's carrier write is covered by the
+    // workflow tests in `mindcore-spoke`.
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind(CARRIER)
+    .fetch_one(&pool)
+    .await
+    .expect("read the carrier revision");
+    assert_eq!(
+        revision, 1,
+        "a no_change verdict leaves the carrier untouched"
+    );
+}
+
+/// Advertisement honesty for the optional face: the dialer claims `spoke-memory` in both
+/// sessions, yet the op is denied while the host attaches no memory service and served verbatim
+/// once it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let absent = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            None,
+            MindProviders::default(),
+            None,
+        ),
+    );
+    assert!(
+        !capabilities(&absent).contains(&"spoke-memory"),
+        "an unattached memory face is never advertised: {:?}",
+        capabilities(&absent)
+    );
+
+    let session = connect(&absent, &["spoke-memory"]).await;
+    assert_wire_deny(
+        MemoryPort::recall(&*session.adapter, &principal(), recall_request()).await,
+        "memory.recall",
+        "capability_missing",
+    );
+    drop(session);
+
+    let attached = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            Some(Arc::new(MemoryFace)),
+            MindProviders::default(),
+            None,
+        ),
+    );
+    assert!(
+        capabilities(&attached).contains(&"spoke-memory"),
+        "an attached memory face is advertised: {:?}",
+        capabilities(&attached)
+    );
+    let session = connect(&attached, &["spoke-memory"]).await;
+    let body = expect_ok(
+        MemoryPort::recall(&*session.adapter, &principal(), recall_request()).await,
+        "the attached memory face",
+    );
+    let body = serde_json::to_value(body).expect("the memory response serializes");
+    assert_eq!(
+        body["engine_policy_version"], "loopback-memory-face",
+        "the host's memory service answered the authenticated peer"
+    );
+    assert_eq!(body["total_authorized"], 7);
+}
+
+/// The baseline face is never composed: the dialer claims `spoke-baseline`, the responder still
+/// advertises none, and a real baseline op answers `op_unsupported`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_baseline_face_is_never_composed_or_advertised() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-baseline"]),
+            None,
+            MindProviders::default(),
+            None,
+        ),
+    );
+    assert!(
+        !capabilities(&surface).contains(&"spoke-baseline"),
+        "no baseline provider is composed: {:?}",
+        capabilities(&surface)
+    );
+
+    let session = connect(&surface, &["spoke-baseline"]).await;
+    assert_wire_deny(
+        ScopeQueryPort::list_timeline_events(&*session.adapter, &scope_of(SCOPE_ID)).await,
+        "port.scope.list_timeline_events",
+        "op_unsupported",
+    );
+}
+
+/// A tool the runtime does not serve: the dialer claims the id, the responder advertises neither
+/// the capability nor a handler, and the invoke answers `op_unsupported`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unserved_tool_answers_op_unsupported() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, MindProviders::default(), None),
+    );
+    assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
+
+    let session = connect(&surface, &[UNSERVED_TOOL]).await;
+    assert_wire_deny(
+        session.adapter.invoke_tool(UNSERVED_TOOL, json!({})).await,
+        UNSERVED_TOOL,
+        "op_unsupported",
+    );
+}
+
+/// Advertisement honesty for the deliberation route: a surface assembled without a workflow caller
+/// installs no `deliberate` handler, advertises none, and answers the invoke with
+/// `op_unsupported` even when the dialer claims the id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, MindProviders::default(), None),
+    );
+    assert!(
+        !capabilities(&surface).contains(&DELIBERATE),
+        "an unwired deliberation route is never advertised: {:?}",
+        capabilities(&surface)
+    );
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    assert_wire_deny(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        DELIBERATE,
+        "op_unsupported",
+    );
+}
