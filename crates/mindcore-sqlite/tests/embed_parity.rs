@@ -2293,7 +2293,9 @@ async fn scoped_capture_baseline_d1_d2() {
 /// Baseline D12: recall pages ranked results under the item budget —
 /// `max_items=1` yields one record per page with `total_authorized=2`, only
 /// page 1 truncates, and tombstoned rows never appear. The byte-budget arm
-/// names the overflowing record without fabricating content.
+/// names the overflowing record without fabricating content. The deleted
+/// record's text matches the query word for word, so its absence is
+/// tombstone filtering, not a query that could never have matched it.
 #[tokio::test]
 async fn recall_pagination_d12() {
     let harness = Harness::open().await;
@@ -2305,7 +2307,10 @@ async fn recall_pagination_d12() {
     for (key, text) in [
         ("d12-create-a", "the northern gate opens before dawn"),
         ("d12-create-b", "the northern gate closes at dusk"),
-        ("d12-create-del", "an unrelated southern record"),
+        (
+            "d12-create-del",
+            "the northern gate ledger is sealed and unreadable",
+        ),
     ] {
         let create_receipt = staged(
             adapter
@@ -2368,9 +2373,10 @@ async fn recall_pagination_d12() {
     )
     .await;
 
-    // The tombstone is real: the row still exists in `memory_records` with a
-    // tombstone marker, so its absence from recall pages proves recall
-    // filters tombstones rather than the query shape never matching it.
+    // The tombstone is real and its text matches the query below: the row
+    // still exists in `memory_records` with a tombstone marker, so its absence
+    // from every recall page proves recall filters tombstones rather than the
+    // query shape never matching it.
     let tombstone: Option<String> =
         sqlx::query_scalar("SELECT tombstone_json FROM memory_records WHERE record_id = ?1")
             .bind(r_del)
