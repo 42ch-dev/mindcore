@@ -805,12 +805,13 @@ async fn promotion_into_fenced_context_refuses() {
     assert_eq!(retry_class(refusal), "terminal");
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
     assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
-    let (visibility, revision): (String, i64) = sqlx::query_as(
+    let stored = sqlx::query!(
         "SELECT scope_visibility, revision FROM memory_records WHERE record_id = 'rec_1'",
     )
     .fetch_one(&mut *tx)
     .await
     .expect("record");
+    let (visibility, revision) = (stored.scope_visibility, stored.revision);
     assert_eq!((visibility.as_str(), revision), ("shared", 1));
     tx.rollback().await.expect("rollback");
 }
