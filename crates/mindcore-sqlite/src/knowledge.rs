@@ -808,17 +808,6 @@ pub async fn write_entry(
     SpokeResult::Ok(entry)
 }
 
-/// Drops the inline records array from the stored payload's cognition module: the record rows
-/// carry the values, the empty `records` key preserves the member's presence.
-fn strip_records(entry: &mut KnowledgeEntry) {
-    let key = module_key();
-    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&key) {
-        if module.contains_key("records") {
-            module.insert("records".to_string(), Value::Array(Vec::new()));
-        }
-    }
-}
-
 /// Append one validated cognition record inside the caller's transaction: compare the
 /// carrier revision without reading history, insert the record row at `head + 1` and
 /// advance the head and the outer revision together. Returns the assigned revision.
@@ -879,7 +868,7 @@ pub async fn append_cognition(
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
     entry.revision = Some(stored_revision + 1);
-    entry.modules.entry(module_key()).or_insert_with(|| {
+    let module = entry.modules.entry(module_key()).or_insert_with(|| {
         // First record of a carrier without a module: seed the same envelope a full
         // put would have committed.
         KnowledgeEntryModulesValue::Object(Map::from_iter([
@@ -888,7 +877,12 @@ pub async fn append_cognition(
             ("extensions".to_string(), Value::Object(Map::new())),
         ]))
     });
-    strip_records(&mut entry);
+    // The record rows carry the values and only a present `records` member is hydrated, so a
+    // module stored without one gains the empty member here: the appended row is projected
+    // instead of landing behind a member no read can see.
+    if let KnowledgeEntryModulesValue::Object(module) = module {
+        module.insert("records".to_string(), Value::Array(Vec::new()));
+    }
     let payload = match encode(&entry) {
         SpokeResult::Ok(payload) => payload,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
