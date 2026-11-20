@@ -1405,28 +1405,39 @@ impl MemoryAdapter {
             .unwrap_or(ranked.len())
             .min(ranked.len());
         let remaining = &ranked[start..];
-        let sizes: Vec<(String, usize)> = remaining
-            .iter()
-            .map(|(_, record)| (record.record_id.clone(), record_body_size(record)))
-            .collect();
-        let budget = policy::apply_budget(
-            &sizes,
-            request.budget.max_items.get(),
-            request.budget.max_bytes.map(|bound| bound.get()),
-        );
-        let mut bodies = Vec::with_capacity(budget.kept.len());
-        for index in &budget.kept {
-            let Some((_, record)) = remaining.get(*index) else {
-                return Err(Reject::internal(
-                    "recall budget selected an out-of-range item",
-                ));
-            };
-            bodies.push(project::record_body(record));
+        // §9.3/I-000061: walk the remaining candidates once, projecting each
+        // body only as the budget reaches it and charging the emitted
+        // `Content` object's UTF-8 bytes only when `max_bytes` is set. An
+        // oversized first candidate is kept whole (and named once via
+        // `overflow_record_id`); a later overflow defers to the page the
+        // next cursor reaches — the deferred item is not consumed here.
+        let max_items = request.budget.max_items.get();
+        let max_bytes = request.budget.max_bytes.map(|bound| bound.get());
+        let mut bodies = Vec::new();
+        let mut bytes = 0u64;
+        let mut overflow_record_id = None;
+        for (_, record) in remaining {
+            if bodies.len() as u64 >= max_items {
+                overflow_record_id = Some(record.record_id.clone());
+                break;
+            }
+            let body = project::record_body(record);
+            if let Some(budget) = max_bytes {
+                let size = u64::try_from(body["content"].to_string().len()).unwrap_or(u64::MAX);
+                if bytes.saturating_add(size) > budget {
+                    overflow_record_id = Some(record.record_id.clone());
+                    if bodies.is_empty() {
+                        bodies.push(body);
+                    }
+                    break;
+                }
+                bytes = bytes.saturating_add(size);
+            }
+            bodies.push(body);
         }
-        // The page cut is single-sourced in `apply_budget`: an oversized first
-        // candidate is kept whole (and named once via `overflow_record_id`),
-        // while a later overflow defers to the page the next cursor reaches.
-        let consumed = start + budget.consumed;
+        // The page cut: `bodies` are the kept candidates this page disposed of —
+        // a deferred overflow is not consumed, so the next cursor reaches it.
+        let consumed = start + bodies.len();
         let truncated = consumed < ranked.len();
         let next_cursor = truncated
             .then(|| policy::encode_cursor(principal_id, &scope, consumed as u64, &marker));
@@ -1434,7 +1445,7 @@ impl MemoryAdapter {
             "records": bodies,
             "total_authorized": total,
             "truncated": truncated,
-            "overflow_record_id": budget.overflow_record_id,
+            "overflow_record_id": overflow_record_id,
             "next_cursor": next_cursor,
             "engine_policy_version": policy::ENGINE_POLICY_VERSION,
         }))
@@ -2073,11 +2084,4 @@ fn record_text(record: &MemoryRecordIr) -> String {
         RecordState::Live { content, .. } => content.text.clone(),
         RecordState::Tombstoned { .. } => String::new(),
     }
-}
-
-/// §9.3/I-000061: the recall byte budget charges the serialized UTF-8 bytes of
-/// the emitted `Content` object — `text`, `structured` and `cognition` — taken
-/// from the same wire projection the response carries.
-fn record_body_size(record: &MemoryRecordIr) -> usize {
-    project::record_body(record)["content"].to_string().len()
 }
