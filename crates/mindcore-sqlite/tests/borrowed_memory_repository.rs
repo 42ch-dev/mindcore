@@ -385,32 +385,43 @@ async fn expired_lease_pending_receipt_taken_over() {
         .unwrap();
 
     // A different owner claims the abandoned pending row: the CAS persists the new
-    // owner and expiry inside this caller-owned transaction.
-    let takeover = mindcore_base::ir::ReceiptLease {
-        owner_id: "instance-2".into(),
-        expires_at: "9999-01-01T00:00:00.000Z".into(),
-    };
+    // owner and expiry inside this caller-owned transaction. The expiry is measured
+    // from the claim instant (30s lease), not from when the transaction began.
     assert!(repo
         .claim_receipt_lease(
             &mut tx,
             &SpaceId::new("spc_workshop"),
             "rcp_gen_crash",
-            &takeover
+            "instance-2",
+            30
         )
         .await
         .unwrap());
+    // The stamped lease is in the future: a takeover stamped from the request
+    // instant could already be expired and re-leasable on the very next retry.
+    let stamped = repo
+        .receipt_lease(&mut tx, &SpaceId::new("spc_workshop"), "rcp_gen_crash")
+        .await
+        .unwrap()
+        .expect("claimed row carries a lease");
+    let stamped_at = chrono::DateTime::parse_from_rfc3339(&stamped).expect("lease stamp");
+    let claim_window = (
+        chrono::Utc::now() + chrono::Duration::seconds(25),
+        chrono::Utc::now() + chrono::Duration::seconds(35),
+    );
+    assert!(
+        stamped_at > claim_window.0 && stamped_at < claim_window.1,
+        "stamped lease {stamped} must be now+30s, inside {claim_window:?}"
+    );
     // The claim is lost when the row no longer qualifies — already re-leased here, so the
     // second claimant gets no work and the crashed owner still cannot settle.
-    let loser = mindcore_base::ir::ReceiptLease {
-        owner_id: "instance-3".into(),
-        expires_at: "9999-01-01T00:00:00.000Z".into(),
-    };
     assert!(!repo
         .claim_receipt_lease(
             &mut tx,
             &SpaceId::new("spc_workshop"),
             "rcp_gen_crash",
-            &loser
+            "instance-3",
+            30
         )
         .await
         .unwrap());

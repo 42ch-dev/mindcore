@@ -577,16 +577,19 @@ pub trait MemoryRepository: Send + Sync {
 
     /// Re-leases one pending receipt to a new owner, guarded by space, receipt id, pending
     /// status and a persisted lease whose expiry instant has already passed (§7.0.3), so a
-    /// crashed generation cannot wedge its idempotency key. `true` means the caller's
-    /// transaction now owns the new lease pair; `false` means the row no longer qualifies
-    /// (settled, missing or re-leased) and the caller falls back to the replay/uncertainty
-    /// contract instead of issuing work.
+    /// crashed generation cannot wedge its idempotency key. Both the expiry guard and the
+    /// stamped `expires_at` are computed at claim time (`lease_seconds` measured from the
+    /// claim instant, never from the request instant captured earlier in the transaction).
+    /// `true` means the caller's transaction now owns the new lease pair; `false` means the
+    /// row no longer qualifies (settled, missing or re-leased) and the caller falls back to
+    /// the replay/uncertainty contract instead of issuing work.
     async fn claim_receipt_lease(
         &self,
         tx: &mut Self::Tx<'_>,
         space: &SpaceId,
         id: &str,
-        lease: &ReceiptLease,
+        owner_id: &str,
+        lease_seconds: i64,
     ) -> Result<bool, Self::Error>;
 
     /// The stored lease expiry instant of one receipt: `Some` for a leased row, `None` for

@@ -1586,20 +1586,26 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         space: &SpaceId,
         id: &str,
-        lease: &ReceiptLease,
+        owner_id: &str,
+        lease_seconds: i64,
     ) -> RepoResult<bool> {
         // §7.0.3 lease takeover: the claim stamps a fresh owner and expiry, guarded by the
         // persisted lease instant already having passed, so a lost claim races a live or
-        // re-leased row rather than overwriting it. Stamps keep the same
-        // `%Y-%m-%dT%H:%M:%S%.3fZ` spelling `policy::timestamp` writes, so text order is
-        // instant order.
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        // re-leased row rather than overwriting it. The expiry is measured from the claim
+        // instant — never the request instant — so the stamped lease always outlives this
+        // transaction's own probe. Stamps keep the same `%Y-%m-%dT%H:%M:%S%.3fZ` spelling
+        // `policy::timestamp` writes, so text order is instant order.
+        let now = Utc::now();
+        let expires_at = (now + chrono::Duration::seconds(lease_seconds))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let now = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let claimed = sqlx::query!(
             "UPDATE memory_receipts SET owner_id = ?, lease_expires_at = ? \
              WHERE receipt_id = ? AND space_id = ? AND status = 'pending' \
              AND lease_expires_at <= ?",
-            &lease.owner_id,
-            &lease.expires_at,
+            owner_id,
+            &expires_at,
             id,
             space.as_str(),
             &now,

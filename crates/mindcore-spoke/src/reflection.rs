@@ -418,15 +418,19 @@ impl MemoryAdapter {
         // this same transaction, so the returned work's owner is the persisted one.
         let (receipt_id, owner_id) = match take_over {
             Some(receipt_id) => {
-                let lease = ReceiptLease {
-                    owner_id: mint("own"),
-                    expires_at: policy::timestamp(
-                        op.now + chrono::Duration::seconds(GENERATION_LEASE_SECONDS),
-                    ),
-                };
+                let owner_id = mint("own");
+                // The lease is stamped at claim time inside the repository, not at
+                // `op.now` — the staging tx may sit on its basis work for longer
+                // than the lease itself.
                 let claimed = self
                     .repository
-                    .claim_receipt_lease(tx, &op.space, receipt_id.as_str(), &lease)
+                    .claim_receipt_lease(
+                        tx,
+                        &op.space,
+                        receipt_id.as_str(),
+                        owner_id.as_str(),
+                        GENERATION_LEASE_SECONDS,
+                    )
                     .await?;
                 if !claimed {
                     // The abandoned row raced: the loser follows the same
@@ -443,7 +447,7 @@ impl MemoryAdapter {
                         }
                     }
                 }
-                (receipt_id, lease.owner_id)
+                (receipt_id, owner_id)
             }
             None => {
                 let receipt_id = mint("rct");
@@ -475,12 +479,12 @@ impl MemoryAdapter {
     // ── §7.27 generate completion (transaction 2) ──────────────────────
 
     /// Complete a leased generation in a fresh caller transaction: insert
-    /// the envelope and settle the pending receipt when that receipt is
-    /// still pending under the composed effect's owner — or pending past
-    /// its lease, which any owner takes over to unwedge a crashed run.
-    /// A live lease under another owner, or a settled row, rolls the
-    /// envelope back with the settlement, and the completion is returned
-    /// only after this transaction commits.
+    /// the envelope and settle the pending receipt only while that receipt
+    /// is still pending under the composed effect's owner — the owner a
+    /// successful lease claim persisted (a lapsed lease alone no longer
+    /// admits any owner). A live or re-leased row under another owner, or
+    /// a settled row, rolls the envelope back with the settlement, and the
+    /// completion is returned only after this transaction commits.
     pub async fn complete_reflection(
         &self,
         tx: &mut Tx<'_>,
