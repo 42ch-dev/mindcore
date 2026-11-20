@@ -2603,6 +2603,16 @@ async fn seed_record(
     text: &str,
     created_at: &str,
 ) {
+    seed_record_content(tx, record_id, json!({ "text": text }), created_at).await;
+}
+
+/// Seed one live shared record carrying an arbitrary `Content` object.
+async fn seed_record_content(
+    tx: &mut Transaction<'_, Sqlite>,
+    record_id: &str,
+    content: Value,
+    created_at: &str,
+) {
     sqlx::query(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
@@ -2613,7 +2623,7 @@ async fn seed_record(
     .bind(record_id)
     .bind(SPACE)
     .bind(SUBJECT)
-    .bind(json!({ "text": text }).to_string())
+    .bind(content.to_string())
     .bind(
         json!({
             "source_context_ids": [],
@@ -2647,8 +2657,9 @@ fn front_matter(content: &str) -> Vec<(String, String)> {
 }
 
 /// §9.3/BUG-01: a byte-budget overflow must not mint a cursor that repeats the
-/// same offset. The oversized record is passed once (and named once), every
-/// servable record is served exactly once, and paging terminates.
+/// same offset. An oversized first candidate is returned whole (and named via
+/// `overflow_record_id`), a later overflow defers, every servable record is
+/// served exactly once, and paging terminates.
 #[tokio::test]
 async fn recall_byte_budget_pages_advance_and_terminate() {
     let harness = Harness::open().await;
@@ -2699,16 +2710,13 @@ async fn recall_byte_budget_pages_advance_and_terminate() {
         cursors.push(cursor.to_string());
         request["cursor"] = json!(cursor);
     }
-    // Every servable record served exactly once; the oversized one never is.
-    assert_eq!(served, vec!["rec_a", "rec_b"]);
-    assert!(overflow.iter().all(|id| id == "rec_big"), "{overflow:?}");
-    assert!(
-        !overflow.is_empty(),
-        "the skipped record is still named once"
-    );
+    // I-000061: the oversized candidate is served whole on its own page; every
+    // record appears exactly once, and the budget names it at each cut.
+    assert_eq!(served, vec!["rec_a", "rec_big", "rec_b"]);
+    assert!(!overflow.is_empty() && overflow.iter().all(|id| id == "rec_big"));
 
-    // The skipped record was the last one: paging ends without a cursor and
-    // still reports the terminal overflow.
+    // An oversized trailing candidate is still returned whole on the page its
+    // cursor reaches.
     let harness = Harness::open().await;
     harness.seed_grant(PRINCIPAL, &["recall"]).await;
     let mut tx = harness.begin().await;
@@ -2750,7 +2758,9 @@ async fn recall_byte_budget_pages_advance_and_terminate() {
             )
             .await,
     );
-    assert_eq!(body["records"], json!([]));
+    let records = body["records"].as_array().expect("records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], "rec_tail");
     assert_eq!(body["truncated"], false);
     assert_eq!(body["next_cursor"], Value::Null);
     assert_eq!(body["overflow_record_id"], "rec_tail");
@@ -3402,5 +3412,204 @@ async fn null_filter_and_omitted_include_shared_survive_reflections() {
     );
     assert_eq!(state["last_reflection_id"], reflection_id);
     assert_eq!(state["stale"], false);
+    tx.rollback().await.expect("rollback");
+}
+
+/// I-000055: a served operation that accepts the `cognition_filter` member in
+/// its pinned shape refuses raw presence — including a literal `null` — with
+/// `INVALID_INPUT`/`terminal` and `details.field = "cognition_filter"`, before
+/// typed decoding erases it and before any repository access. A family this
+/// build does not serve still refuses first.
+#[tokio::test]
+async fn cognition_filter_presence_rejects_at_every_pinned_boundary() {
+    let harness = Harness::open().await;
+    // No grant and an unknown space: the refusal must precede repository access.
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let check = |label: &str, result: SpokeResult<MemoryStage>| {
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::InvalidInput, "{label}");
+        assert_eq!(retry_class(refusal), "terminal", "{label}");
+        assert_eq!(
+            refusal.details.as_ref().expect("details")["field"],
+            json!("cognition_filter"),
+            "{label}"
+        );
+    };
+
+    check(
+        "memory.records.list",
+        adapter
+            .list_records(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_absent", "subject_id": SUBJECT,
+                        "cognition_filter": {} }),
+            )
+            .await,
+    );
+    check(
+        "memory.records.list (null)",
+        adapter
+            .list_records(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_absent", "subject_id": SUBJECT,
+                        "cognition_filter": null }),
+            )
+            .await,
+    );
+    check(
+        "memory.recall",
+        adapter
+            .recall(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_absent", "subject_id": SUBJECT,
+                        "cognition_filter": { "kinds": ["belief"] } }),
+            )
+            .await,
+    );
+    check(
+        "memory.reflections.state",
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_absent", "subject_id": SUBJECT,
+                        "cognition_filter": null }),
+            )
+            .await,
+    );
+    check(
+        "memory.reflections.list",
+        adapter
+            .list_reflections(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_absent", "subject_id": SUBJECT,
+                        "cognition_filter": { "q_min": 0.5 } }),
+            )
+            .await,
+    );
+    check(
+        "memory.reflections.generate",
+        adapter
+            .generate_reflection(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_absent", "subject_id": SUBJECT,
+                        "cognition_filter": null }),
+            )
+            .await,
+    );
+
+    // A build without the reflection family keeps its family refusal first.
+    let disabled = MemoryAdapter::new(false);
+    let state = disabled
+        .get_reflection_state(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": "sp_absent", "subject_id": SUBJECT,
+                    "cognition_filter": null }),
+        )
+        .await;
+    let refusal = reject(&state);
+    assert_eq!(refusal.code, SpokeRejectCode::CapabilityPortMissing);
+    assert_eq!(
+        refusal.details.as_ref().expect("details")["op"],
+        "memory.reflections.state"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// I-000061: the recall byte budget charges the serialized `Content` object,
+/// so `cognition` alone changes the page cut. The deferred record is reached
+/// by the next cursor, and a first-candidate overflow is returned whole.
+#[tokio::test]
+async fn recall_byte_budget_charges_content_cognition() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    // `{"text":"a"}` is 11 bytes on the wire; the belief record's serialized
+    // size is the cognition charge the budget must see.
+    let reference = |id: &str| json!({ "kind": "knowledge_entry", "id": id, "namespace": "mindcore" });
+    let belief = json!({
+        "kind": "belief",
+        "order": 0,
+        "record_id": "cog_padded",
+        "holder": reference("ke_wren"),
+        "target": {
+            "carrier": reference("ke_carrier"),
+            "target_id": "prop_padded_for_the_budget_cut",
+            "kind": "proposition",
+        },
+        "assessor": reference("ke_wren"),
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [reference("mem_hearsay")],
+        },
+        "assessment_context": { "context_id": "ctx_budget" },
+        "effective_at": "2026-11-20T08:00:00Z",
+        "assessed_at": "2026-11-20T08:05:00Z",
+        "view": "recorded_at",
+        "q": {
+            "value": 0.4,
+            "assertion": "belief_attribution",
+            "method": "single_self_report",
+            "calibration": "uncalibrated",
+        },
+        "extensions": {},
+    });
+    let content = json!({ "text": "a", "cognition": [belief] });
+    let cognition_bytes = content.to_string().len() - json!({ "text": "a" }).to_string().len();
+    assert!(
+        cognition_bytes > 128,
+        "the cognition member must outweigh the budget"
+    );
+    seed_record(&mut tx, "rec_plain", "a", "2026-11-20T09:00:03.000Z").await;
+    seed_record_content(&mut tx, "rec_cog", content, "2026-11-20T09:00:02.000Z").await;
+    seed_record(&mut tx, "rec_small", "b", "2026-11-20T09:00:01.000Z").await;
+
+    let page = async |cursor: Option<&str>, tx: &mut Transaction<'_, Sqlite>| {
+        let mut request = json!({
+            "space_id": SPACE,
+            "subject_id": SUBJECT,
+            "selection": { "mode": "subject_all" },
+            "budget": { "max_items": 4, "max_bytes": 48 },
+        });
+        if let Some(cursor) = cursor {
+            request["cursor"] = json!(cursor);
+        }
+        ready(adapter.recall(tx, &principal(PRINCIPAL), request).await)
+    };
+
+    // The cognition bytes push rec_cog past the 48-byte page: it defers.
+    let first = page(None, &mut tx).await;
+    let records = first["records"].as_array().expect("records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], "rec_plain");
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["overflow_record_id"], "rec_cog");
+    let cursor = first["next_cursor"].as_str().expect("next cursor");
+
+    // The next page serves the deferred record whole.
+    let second = page(Some(cursor), &mut tx).await;
+    let records = second["records"].as_array().expect("records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], "rec_cog");
+    assert_eq!(second["truncated"], true);
+    let cursor = second["next_cursor"].as_str().expect("next cursor");
+
+    let third = page(Some(cursor), &mut tx).await;
+    let records = third["records"].as_array().expect("records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], "rec_small");
+    assert_eq!(third["truncated"], false);
+    assert_eq!(third["next_cursor"], Value::Null);
     tx.rollback().await.expect("rollback");
 }

@@ -115,6 +115,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.state"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsStateRequest =
             wire::decode(&raw, "memory.reflections.state request")?;
         validated(validate_memory_reflections_state(&request))?;
@@ -196,6 +197,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.list"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsListRequest =
             wire::decode(&raw, "memory.reflections.list request")?;
         validated(validate_memory_reflections_list(
@@ -301,6 +303,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.generate"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsGenerateRequest =
             wire::decode(&raw, "memory.reflections.generate request")?;
         validated(validate_memory_reflections_generate(&request))?;
