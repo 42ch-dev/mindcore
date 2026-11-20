@@ -232,7 +232,11 @@ fn candidate_columns(candidate: &MemoryCandidateIr) -> RepoResult<CandidateColum
                         .ok_or_else(|| invalid_row("pending candidate kind is empty"))?,
                 ),
                 content: Some(to_json(
-                    &content.unwrap_or(Value::Null),
+                    // unreachable via public IR today; kept as a defensive guard so a future
+                    // encoder change cannot silently write an unreadable row
+                    &content.ok_or_else(|| {
+                        invalid_row("pending candidate wire misses proposed.content")
+                    })?,
                     "candidate content",
                 )?),
                 provenance: to_json(
@@ -648,8 +652,8 @@ struct SpaceRow {
     pending_receipts: i64,
 }
 
-fn space_row(row: SpaceRow) -> MemorySpaceRow {
-    MemorySpaceRow {
+fn space_row(row: SpaceRow) -> RepoResult<MemorySpaceRow> {
+    Ok(MemorySpaceRow {
         space_id: SpaceId::new(row.space_id),
         display_name: row.display_name,
         authority_host_id: row.authority_host_id,
@@ -657,8 +661,9 @@ fn space_row(row: SpaceRow) -> MemorySpaceRow {
         status: row.status,
         revision: row.revision.into(),
         created_at: row.created_at,
-        pending_receipts: row.pending_receipts.try_into().unwrap_or(u64::MAX),
-    }
+        pending_receipts: u64::try_from(row.pending_receipts)
+            .map_err(|_| invalid_row("negative pending_receipts"))?,
+    })
 }
 
 fn subject_row(row: SubjectRow) -> RepoResult<MemorySubjectRow> {
@@ -1054,7 +1059,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_optional(&mut **tx)
         .await
         .map_err(decode_row)?;
-        Ok(row.map(space_row))
+        Ok(row.map(space_row).transpose()?)
     }
 
     async fn list_spaces(&self, tx: &mut Self::Tx<'_>) -> RepoResult<Vec<MemorySpaceRow>> {
@@ -1069,7 +1074,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)
-        .map(|rows| rows.into_iter().map(space_row).collect())
+        .and_then(|rows| rows.into_iter().map(space_row).collect())
     }
 
     async fn update_space(
@@ -1894,5 +1899,64 @@ impl MemoryRepository for SqliteMemoryRepository {
             .execute(&mut **tx)
             .await?;
         Ok(deleted.rows_affected() == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIME: &str = "2026-11-20T09:20:01.123Z";
+
+    fn pending_row(content_json: Option<&str>) -> CandidateRow {
+        CandidateRow {
+            candidate_id: "cand_1".into(),
+            space_id: "spc_workshop".into(),
+            subject_id: "sub_mira".into(),
+            capture_visibility: "shared".into(),
+            capture_context_id: None,
+            kind: "local_note".into(),
+            content_json: content_json.map(str::to_string),
+            provenance_json: "{}".into(),
+            classification_json: "{}".into(),
+            status: "pending".into(),
+            consumed_by_json: None,
+            content_digest: None,
+            occurred_at: None,
+            expires_at: None,
+            revision: 1,
+            created_at: TIME.into(),
+        }
+    }
+
+    // BUG-02: the reader-side contract is that a pending row whose `content_json` is SQL
+    // NULL (or JSON null) cannot decode; the writer guard that mirrors it is defensive.
+    #[test]
+    fn pending_candidate_content_refusal_is_defensive_reader_contract() {
+        for content in [None, Some("null")] {
+            assert!(matches!(
+                candidate_ir(&pending_row(content)),
+                Err(SqliteRepositoryError::InvalidRow(_))
+            ));
+        }
+    }
+
+    // A count that cannot be a `u64` is a corrupt row, not a saturated one.
+    #[test]
+    fn space_row_rejects_negative_pending_receipts() {
+        let row = SpaceRow {
+            space_id: "spc_workshop".into(),
+            display_name: None,
+            authority_host_id: "host-1".into(),
+            authority_generation: 1,
+            status: "active".into(),
+            revision: 1,
+            created_at: TIME.into(),
+            pending_receipts: -1,
+        };
+        assert!(matches!(
+            space_row(row),
+            Err(SqliteRepositoryError::InvalidRow(_))
+        ));
     }
 }
