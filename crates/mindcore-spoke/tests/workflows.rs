@@ -1202,6 +1202,37 @@ async fn absent_reasoner_matches_deterministic_capture() {
 }
 
 #[tokio::test]
+async fn a_capture_only_principal_absorbs_a_pending_candidate() {
+    let harness = Harness::open().await;
+    // Capture admission only: reading the candidate back needs `review`, and
+    // the evidence page needs `recall`.
+    harness.grant(&["capture"]).await;
+    let workflows = harness.absorb_binding();
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_capture_only", "the north gate is closed at dusk"),
+            None,
+            &MindCapabilities::default(),
+        )
+        .await
+        .expect("a fresh capture reports its own receipt");
+
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = outcomes.as_slice() else {
+        panic!("expected the capture's own candidate, got {outcomes:?}");
+    };
+    assert_eq!(harness.candidate_status(candidate_id).await, "pending");
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op != 'memory.capture'")
+            .await,
+        0,
+        "no review was written"
+    );
+}
+
+#[tokio::test]
 async fn fabricated_evidence_leaves_the_captured_candidate_unchanged() {
     let harness = granted_harness().await;
     let workflows = harness.absorb_binding();

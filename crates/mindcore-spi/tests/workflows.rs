@@ -724,6 +724,8 @@ struct Recorded {
     reviews: Arc<Mutex<Vec<Value>>>,
     updates: Arc<Mutex<Vec<Value>>>,
     update_keys: Arc<Mutex<Vec<String>>>,
+    /// Candidate reads served so far.
+    snapshots: Arc<AtomicUsize>,
 }
 
 /// One captured candidate over a fixed page, with every submitted settlement
@@ -768,6 +770,7 @@ impl WorkflowBinding for AbsorbDouble {
         _candidate_id: &str,
         _max_items: u64,
     ) -> Result<AbsorbSnapshot, SpiError> {
+        self.recorded.snapshots.fetch_add(1, Ordering::SeqCst);
         Ok(AbsorbSnapshot {
             candidate: self.candidate.clone(),
             records: self.page.clone(),
@@ -930,13 +933,28 @@ fn absorb_after_update(
     candidate: MemoryCandidate,
     settled_update: Option<&str>,
 ) -> (SpiMindWorkflows, Recorded, Arc<Mutex<Vec<Value>>>) {
+    absorb_at(candidate, settled_update, 0)
+}
+
+/// An absorb double whose capture key is already held: its first call replays.
+fn absorb_replayed(
+    candidate: MemoryCandidate,
+) -> (SpiMindWorkflows, Recorded, Arc<Mutex<Vec<Value>>>) {
+    absorb_at(candidate, None, 1)
+}
+
+fn absorb_at(
+    candidate: MemoryCandidate,
+    settled_update: Option<&str>,
+    captures: usize,
+) -> (SpiMindWorkflows, Recorded, Arc<Mutex<Vec<Value>>>) {
     let recorded = Recorded::default();
     let double = AbsorbDouble {
         candidate,
         page: page(),
         recorded: recorded.clone(),
         settled_update: settled_update.map(str::to_string),
-        captures: AtomicUsize::new(0),
+        captures: AtomicUsize::new(captures),
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     (SpiMindWorkflows::new(double), recorded, seen)
@@ -1148,6 +1166,13 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
         }]
     );
     assert_eq!(replay, outcomes);
+    // Only the replay read the candidate back: a fresh capture needs no
+    // review or recall grant beyond its own admission.
+    assert_eq!(
+        recorded.snapshots.load(Ordering::SeqCst),
+        1,
+        "the fresh capture was reported without a candidate read"
+    );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
 }
 
@@ -1299,7 +1324,9 @@ async fn a_consumed_candidate_reports_its_recorded_outcome() {
 
 #[tokio::test]
 async fn no_reasoner_replay_reports_the_recorded_outcome() {
-    let (workflows, recorded, _) = absorb(consumed_candidate());
+    // The capture key is already held: this call is a replay, and its consumed
+    // candidate still projects the recorded outcome without a reasoner.
+    let (workflows, recorded, _) = absorb_replayed(consumed_candidate());
     let caps = MindCapabilities::default();
 
     let outcomes = workflows

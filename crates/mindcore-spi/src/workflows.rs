@@ -253,16 +253,19 @@ impl SpiMindWorkflows {
     /// Decide what each captured candidate becomes.
     ///
     /// The capture runs the existing admission, idempotency probe and
-    /// deterministic classifier. A candidate an earlier run already consumed
-    /// reports that run's recorded outcome, with or without a reasoner. A
-    /// replay — the capture key already held a receipt — reports `Pending` for
-    /// a candidate that is still pending: the recorded run did not settle it,
-    /// and a replay must never settle what it held. Without a reasoner every
-    /// fresh candidate stays pending and no review is written. With one, each
-    /// fresh candidate is read with one bounded authorized evidence page, the
-    /// reasoner runs outside any transaction, its reply is validated against
-    /// that exact page, and the policy hook decides whether the validated
-    /// settlement is submitted.
+    /// deterministic classifier. Without a reasoner every fresh candidate
+    /// stays pending and no review is written, reported straight from the
+    /// capture receipt: reading it back needs review and recall grants the
+    /// capture admission never required. A candidate an earlier run already
+    /// consumed reports that run's recorded outcome, with or without a
+    /// reasoner. A replay — the capture key already held a receipt — reports
+    /// `Pending` for a candidate that is still pending: the recorded run did
+    /// not settle it, and a replay must never settle what it held.
+    ///
+    /// With a reasoner, each fresh candidate is read with one bounded
+    /// authorized evidence page, the reasoner runs outside any transaction,
+    /// its reply is validated against that exact page, and the policy hook
+    /// decides whether the validated settlement is submitted.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -276,30 +279,32 @@ impl SpiMindWorkflows {
         } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidate_ids.len());
         for candidate_id in candidate_ids {
+            if replayed {
+                outcomes.push(
+                    self.replay_candidate(principal, request, candidate_id)
+                        .await?,
+                );
+                continue;
+            }
+            let Some(reasoner) = caps.reasoner else {
+                outcomes.push(AbsorbCandidateOutcome::Pending { candidate_id });
+                continue;
+            };
             outcomes.push(
-                self.absorb_candidate(
-                    principal,
-                    request,
-                    candidate_id,
-                    !replayed,
-                    caps.reasoner,
-                    lens,
-                    caps,
-                )
-                .await?,
+                self.absorb_candidate(principal, request, candidate_id, reasoner, lens, caps)
+                    .await?,
             );
         }
         Ok(outcomes)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Decide and settle one freshly captured candidate.
     async fn absorb_candidate(
         &self,
         principal: &Principal,
         request: &MemoryCaptureRequest,
         candidate_id: String,
-        fresh: bool,
-        reasoner: Option<&dyn Reasoner>,
+        reasoner: &dyn Reasoner,
         lens: Option<&dyn DomainLens>,
         caps: &MindCapabilities<'_>,
     ) -> Result<AbsorbCandidateOutcome, SpiError> {
@@ -311,20 +316,12 @@ impl SpiMindWorkflows {
             .await?;
         let pending = match &candidate {
             MemoryCandidate::PendingCandidate(pending) => pending,
-            // A replay of an earlier absorb reports what that run recorded.
+            // Another run consumed this candidate after the capture committed.
             MemoryCandidate::ConsumedCandidate(consumed) => {
                 return self
                     .recorded_outcome(principal, &space, &capture_key, consumed)
                     .await
             }
-        };
-        // The recorded run left this candidate pending — a policy hold, or no
-        // reasoner at all. Deciding again would let a replay settle it.
-        if !fresh {
-            return Ok(AbsorbCandidateOutcome::Pending { candidate_id });
-        }
-        let Some(reasoner) = reasoner else {
-            return Ok(AbsorbCandidateOutcome::Pending { candidate_id });
         };
         let action = decide(reasoner, pending, &records, lens).await?;
         if let Some(lens) = lens {
@@ -484,6 +481,33 @@ impl SpiMindWorkflows {
                         .await
                     }
                 }
+            }
+        }
+    }
+
+    /// What an earlier run of this exact capture recorded for one candidate,
+    /// or the pending state it left: a replay never decides again.
+    async fn replay_candidate(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+        candidate_id: String,
+    ) -> Result<AbsorbCandidateOutcome, SpiError> {
+        let space = request.space_id.to_string();
+        let AbsorbSnapshot { candidate, .. } = self
+            .binding
+            .absorb_snapshot(principal, &space, &candidate_id, ABSORB_PAGE_ITEMS)
+            .await?;
+        match &candidate {
+            MemoryCandidate::ConsumedCandidate(consumed) => {
+                let capture_key = request.idempotency_key.to_string();
+                self.recorded_outcome(principal, &space, &capture_key, consumed)
+                    .await
+            }
+            // The recorded run left this candidate pending — a policy hold, or
+            // no reasoner at all.
+            MemoryCandidate::PendingCandidate(_) => {
+                Ok(AbsorbCandidateOutcome::Pending { candidate_id })
             }
         }
     }
