@@ -44,14 +44,26 @@ impl ScopedKnowledgeStore {
     }
 
     /// Every entry of this collection, ordered by `entry_id` ASC.
+    ///
+    /// The projection runs inside one read transaction: SQLite pins the snapshot at
+    /// the first statement, so an append committed by another connection between the
+    /// carrier payloads and the record rows is invisible to both — the listing is
+    /// one whole committed state, never a carrier revision paired with records it
+    /// never had.
     pub async fn list_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
-        let mut connection = match self.pool.acquire().await {
-            Ok(connection) => connection,
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
             Err(error) => {
                 return internal(format!("knowledge entries could not be listed: {error}"))
             }
         };
-        entries(&mut connection, &self.scope.collection).await
+        match entries(&mut *tx, &self.scope.collection).await {
+            SpokeResult::Ok(listed) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(listed),
+                Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
     }
 }
 
@@ -156,7 +168,9 @@ fn stale<T>(
 /// One entry of `collection`, read through the caller's connection: the scoped
 /// port and the workflow binding share this read, and a settlement reads it at
 /// the same point as the write it guards. The cognition module's records are
-/// projected from the holder's record rows in append order.
+/// projected from the holder's record rows in append order. The payload and the
+/// record rows are one snapshot only while `connection` holds a transaction —
+/// the port's pool reads begin one, and the workflow bindings hold theirs.
 pub async fn read_entry(
     connection: &mut SqliteConnection,
     collection: &str,
@@ -208,6 +222,9 @@ async fn hydrate_cognition_records(
     if !carries_records {
         return SpokeResult::Ok(());
     }
+    // Unit-test seam: suspends the projection between its two statements.
+    #[cfg(test)]
+    snapshot_seam::interleave().await;
     let records = match read_records(&mut *connection, collection, &entry.entry_id).await {
         SpokeResult::Ok(records) => records,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -589,11 +606,20 @@ pub async fn append_cognition(
 #[async_trait]
 impl KnowledgeEntryPort for ScopedKnowledgeStore {
     async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
-        let mut connection = match self.pool.acquire().await {
-            Ok(connection) => connection,
+        // One read transaction pins the snapshot: the carrier payload and its record
+        // rows project from one committed state, the same whole read `list_entries`
+        // makes, even if another connection appends between the two statements.
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
             Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
         };
-        read_entry(&mut connection, &self.scope.collection, entry_id).await
+        match read_entry(&mut *tx, &self.scope.collection, entry_id).await {
+            SpokeResult::Ok(entry) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(entry),
+                Err(error) => internal(format!("knowledge entry could not be read: {error}")),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
     }
 
     async fn put_knowledge_entry(
@@ -622,5 +648,300 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
             return internal(format!("knowledge write could not commit: {error}"));
         }
         SpokeResult::Ok(entry)
+    }
+}
+
+// Unit-test seam for the full-DTO read regression: when a test installs its channels,
+// the projection suspends here — after the carrier payload statement, before the
+// records statement — until the test reports that a second connection committed an
+// append in that window. That is the exact interleave the snapshot contract forbids
+// pairing. Without an installed seam this falls through immediately.
+#[cfg(test)]
+mod snapshot_seam {
+    use std::sync::Mutex;
+
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+    static SEAM: Mutex<Option<(UnboundedSender<&'static str>, UnboundedReceiver<&'static str>)>> =
+        Mutex::new(None);
+
+    pub(super) fn install(
+        to_test: UnboundedSender<&'static str>,
+        from_test: UnboundedReceiver<&'static str>,
+    ) {
+        *SEAM.lock().expect("snapshot seam lock") = Some((to_test, from_test));
+    }
+
+    pub(super) fn uninstall() {
+        *SEAM.lock().expect("snapshot seam lock") = None;
+    }
+
+    pub(super) async fn interleave() {
+        let (to_test, mut from_test) = match SEAM.lock().expect("snapshot seam lock").take() {
+            Some(pair) => pair,
+            None => return,
+        };
+        if to_test.send("at_records_seam").is_err() {
+            return;
+        }
+        let _ = from_test.recv().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    use mindcore_base::cognition::CARRIER_NAMESPACE;
+    use serde_json::{json, Value};
+    use spoke_schemas::knowledge_entry::{KnowledgeEntryBody, KnowledgeEntryCanonicalName};
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    fn plain_carrier(entry_id: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            body: KnowledgeEntryBody::default(),
+            canonical_name: KnowledgeEntryCanonicalName::try_from(format!("{entry_id} name"))
+                .expect("non-empty canonical name"),
+            created_at: None,
+            disclosure: None,
+            entry_id: entry_id.to_string(),
+            entry_type: "character".to_string(),
+            extensions: HashMap::new(),
+            modules: HashMap::new(),
+            owner: None,
+            revision: Some(1),
+            schema_version: NonZeroU64::new(1).expect("non-zero wire baseline"),
+            source_anchor: None,
+            status: "confirmed".to_string(),
+            updated_at: None,
+        }
+    }
+
+    fn cognition_carrier(entry_id: &str) -> KnowledgeEntry {
+        let mut entry = plain_carrier(entry_id);
+        entry.modules.insert(
+            KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key"),
+            KnowledgeEntryModulesValue::from(
+                json!({"records": [], "world_facts": [], "extensions": {}})
+                    .as_object()
+                    .expect("module fixture is an object")
+                    .clone(),
+            ),
+        );
+        entry
+    }
+
+    // One current-view belief record held by ke_wren, the shape an append accepts.
+    fn belief(record_id: &str) -> Value {
+        json!({
+            "kind": "belief",
+            "order": 1,
+            "record_id": record_id,
+            "holder": {
+                "kind": "knowledge_entry",
+                "id": "ke_wren",
+                "namespace": CARRIER_NAMESPACE,
+            },
+            "target": {
+                "carrier": {
+                    "kind": "knowledge_entry",
+                    "id": "ke_shared_north_gate",
+                    "namespace": CARRIER_NAMESPACE,
+                },
+                "target_id": "prop_north_gate_closed",
+                "kind": "proposition",
+            },
+            "assessor": {
+                "kind": "knowledge_entry",
+                "id": "ke_wren",
+                "namespace": CARRIER_NAMESPACE,
+            },
+            "assessor_role": "holder_self_report",
+            "basis": {
+                "kind": "evidence",
+                "evidence": [{
+                    "kind": "memory_record",
+                    "id": "mem_hearsay",
+                    "namespace": CARRIER_NAMESPACE,
+                }],
+            },
+            "assessment_context": {"context_id": "ctx_dusk_at_the_gate"},
+            "effective_at": "2026-11-19T18:00:00Z",
+            "assessed_at": "2026-11-19T18:05:00Z",
+            "view": "current",
+            "q": {
+                "value": 0.4,
+                "assertion": "belief_attribution",
+                "method": "single_self_report",
+                "calibration": "uncalibrated",
+            },
+            "extensions": {},
+        })
+    }
+
+    fn module_of(entry: &KnowledgeEntry) -> Value {
+        serde_json::to_value(&entry.modules).expect("modules serialize")["cognition"].clone()
+    }
+
+    fn record_ids(entry: &KnowledgeEntry) -> Vec<String> {
+        let module = module_of(entry);
+        module["records"]
+            .as_array()
+            .map(|records| {
+                records
+                    .iter()
+                    .filter_map(|record| {
+                        record
+                            .get("record_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
+        match result {
+            SpokeResult::Ok(value) => value,
+            SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
+        }
+    }
+
+    async fn second_pool(path: &std::path::Path) -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("open second connection")
+    }
+
+    async fn wait_for_seam(test_rx: &mut mpsc::UnboundedReceiver<&'static str>) {
+        let signal = timeout(Duration::from_secs(10), test_rx.recv())
+            .await
+            .expect("projection did not reach the seam in time");
+        assert_eq!(signal, Some("at_records_seam"));
+    }
+
+    /// Regression for the task-2 review Critical: the full-DTO port reads ran the
+    /// carrier payload statement and the records statement as two autocommit
+    /// queries, so an append committed between them paired an older carrier
+    /// revision with records it never had — a DTO that never existed.
+    ///
+    /// Construction: the seam suspends each projection exactly between its two
+    /// statements, and a second connection commits an append in that window. Every
+    /// asserted DTO must be a state that actually existed: revision `r` of
+    /// `ke_wren` pairs with exactly the `r - 1` records appended before it.
+    #[tokio::test]
+    async fn full_dto_reads_project_one_snapshot_across_a_concurrent_append() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("mindcore.db");
+        let store = MindStore::open(&path).await.expect("open store");
+        let port = store.knowledge(KnowledgeScope::new("wren"));
+        let second = second_pool(&path).await;
+
+        expect_ok(
+            port.put_knowledge_entry(cognition_carrier("ke_wren"), None)
+                .await,
+            "create cognition carrier",
+        );
+        expect_ok(
+            port.put_knowledge_entry(plain_carrier("ke_abel"), None).await,
+            "create module-less carrier",
+        );
+
+        // The entry read: revision 1's payload pairs with revision 1's records.
+        let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
+        let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
+        snapshot_seam::install(hook_to_test, hook_rx);
+        let read_port = store.knowledge(KnowledgeScope::new("wren"));
+        let reader =
+            tokio::spawn(async move { read_port.get_knowledge_entry("ke_wren").await });
+        wait_for_seam(&mut test_rx).await;
+
+        let mut tx = second.begin_with("BEGIN IMMEDIATE").await.expect("begin append");
+        let assigned = expect_ok(
+            append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_hearsay")).await,
+            "concurrent append",
+        );
+        assert_eq!(assigned, 2);
+        tx.commit().await.expect("commit append");
+        test_to_hook.send("appended").expect("reader alive");
+
+        let dto = expect_ok(
+            timeout(Duration::from_secs(10), reader)
+                .await
+                .expect("entry read did not finish in time")
+                .expect("reader task"),
+            "full DTO read",
+        );
+        assert_eq!(dto.revision, Some(1));
+        assert!(
+            record_ids(&dto).is_empty(),
+            "revision 1's snapshot has no records, got {:?}",
+            record_ids(&dto)
+        );
+
+        // The append really committed during the read: a fresh read sees revision 2.
+        let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
+        assert_eq!(fresh.revision, Some(2));
+        assert_eq!(record_ids(&fresh), vec!["cog_hearsay"]);
+
+        // The listing path: ke_wren's payload was read at revision 2, so its
+        // records must stay revision 2's even though the append commits before
+        // the listing reaches its records statement.
+        let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
+        let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
+        snapshot_seam::install(hook_to_test, hook_rx);
+        let list_port = store.knowledge(KnowledgeScope::new("wren"));
+        let reader = tokio::spawn(async move { list_port.list_entries().await });
+        wait_for_seam(&mut test_rx).await;
+
+        let mut tx = second.begin_with("BEGIN IMMEDIATE").await.expect("begin append");
+        let assigned = expect_ok(
+            append_cognition(&mut tx, "wren", "ke_wren", 2, &belief("cog_newer")).await,
+            "second concurrent append",
+        );
+        assert_eq!(assigned, 3);
+        tx.commit().await.expect("commit append");
+        test_to_hook.send("appended").expect("reader alive");
+
+        let listed = expect_ok(
+            timeout(Duration::from_secs(10), reader)
+                .await
+                .expect("listing did not finish in time")
+                .expect("reader task"),
+            "listing",
+        );
+        assert_eq!(listed.len(), 2);
+        let abel = listed.iter().find(|entry| entry.entry_id == "ke_abel").expect("abel listed");
+        assert!(module_of(abel).get("records").is_none(), "absent module stays absent");
+        let wren = listed.iter().find(|entry| entry.entry_id == "ke_wren").expect("wren listed");
+        assert_eq!(wren.revision, Some(2));
+        assert_eq!(
+            record_ids(wren),
+            vec!["cog_hearsay"],
+            "wren's records must come from its own snapshot"
+        );
+
+        // The second append really committed during the listing.
+        let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
+        assert_eq!(fresh.revision, Some(3));
+        assert_eq!(record_ids(&fresh), vec!["cog_hearsay", "cog_newer"]);
+
+        snapshot_seam::uninstall();
+        second.close().await;
+        store.close().await;
     }
 }
