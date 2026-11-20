@@ -208,10 +208,12 @@ pub trait WorkflowBinding: Send + Sync {
     ///
     /// The read rebuilds admission and withholding and compares the page and
     /// the knowledge set to `expected`: a refusal or a moved set aborts before
-    /// anything is written. A caller that sees `Ok` therefore releases a page
-    /// whose cache write observed the same live reauthorization — no awaited
-    /// cache work can intervene between the check and the release. A fill that
-    /// no page row still serves live at its revision is skipped, and a
+    /// anything is written. When there is a fill to write, the transaction
+    /// takes the write reservation at begin (`BEGIN IMMEDIATE`), so no other
+    /// connection can commit between that reauthorization and the write: a
+    /// caller that sees `Ok` therefore releases a page whose cache write
+    /// observed the same live reauthorization. A fill that no page row still
+    /// serves live at its revision is skipped, and with the reservation held a
     /// cache-only storage failure is a miss rather than a refused release.
     async fn settle_recall(
         &self,
@@ -2102,10 +2104,10 @@ fn checked_vectors(
 /// engine sorts by it descending and keeps the adapter's order on ties, but a
 /// configured reasoner may then reorder the page.
 ///
-/// One score per text. A text whose matching vector is absent scores the
-/// lexical term alone (cosine contributes `0`), so mismatched slices never
-/// panic; pass one vector per text for the documented formula.
-pub fn hybrid_scores(
+/// One score per text. A matching vector that is absent scores with `0`
+/// similarity, whose term still contributes `0.25`; mismatched slices never
+/// panic, so pass one vector per text for the documented formula.
+pub(crate) fn hybrid_scores(
     texts: &[&str],
     query: &str,
     query_vector: &[f32],

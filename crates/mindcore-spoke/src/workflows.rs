@@ -796,7 +796,20 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         expected: &SnapshotFact,
         fills: &[RecordFill],
     ) -> Result<(), SpiError> {
-        let mut transaction = self.pool.begin().await.map_err(|error| {
+        // A fill writes under the transaction that reauthorizes it. Take the
+        // write reservation at begin so no other connection can commit
+        // between the reauthorization read and the first fill: a deferred
+        // begin would upgrade a snapshot another writer already invalidated
+        // and fail the write after the release was warranted. A recall with
+        // nothing to fill only reads, so it keeps the cheaper transaction.
+        let identity_hash = identity
+            .filter(|_| !fills.is_empty())
+            .and_then(|identity| vector_identity(identity).ok());
+        let mut transaction = match identity_hash {
+            Some(_) => self.pool.begin_with("BEGIN IMMEDIATE").await,
+            None => self.pool.begin().await,
+        }
+        .map_err(|error| {
             internal(format!(
                 "recall release transaction could not begin: {error}"
             ))
@@ -816,32 +829,29 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .into_spoke(),
             ));
         }
-        // Only the page read above authorizes a fill; a cache-only failure
-        // below is a miss, never a refused release.
-        if let Some(identity) = identity {
-            if !fills.is_empty() {
-                if let Ok(identity_hash) = vector_identity(identity) {
-                    for fill in fills {
-                        let live = records.iter().any(|record| match record {
-                            RetainedRecord::LiveRecord(live) => {
-                                live.record_id.as_str() == fill.record.record_id
-                                    && live.revision.get() == fill.record.revision
-                            }
-                            RetainedRecord::TombstonedRecord(_) => false,
-                        });
-                        if !live {
-                            continue;
-                        }
-                        let _ = vectors::upsert_record_vector(
-                            &mut *transaction,
-                            &fill.record.record_id,
-                            &identity_hash,
-                            fill.record.revision,
-                            &fill.vector,
-                        )
-                        .await;
+        // Only the page read above authorizes a fill; with the write
+        // reservation held from begin, a cache-only failure below is a miss,
+        // never an invalidated release.
+        if let Some(identity_hash) = identity_hash {
+            for fill in fills {
+                let live = records.iter().any(|record| match record {
+                    RetainedRecord::LiveRecord(live) => {
+                        live.record_id.as_str() == fill.record.record_id
+                            && live.revision.get() == fill.record.revision
                     }
+                    RetainedRecord::TombstonedRecord(_) => false,
+                });
+                if !live {
+                    continue;
                 }
+                let _ = vectors::upsert_record_vector(
+                    &mut *transaction,
+                    &fill.record.record_id,
+                    &identity_hash,
+                    fill.record.revision,
+                    &fill.vector,
+                )
+                .await;
             }
         }
         // The reauthorization above is what the release rests on: a failed

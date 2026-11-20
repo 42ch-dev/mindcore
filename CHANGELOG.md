@@ -40,7 +40,9 @@
   rebuilds admission and withholding and refuses a page that moved before any row is probed — a moved
   record is `REVISION_CONFLICT`, never a decode of its newer row, and one page-shaped statement reads
   the whole page. Only missing or stale revisions are embedded; the release reauthorizes the page and
-  the knowledge set and writes those fresh vectors in the same transaction, so a refusal aborts the
+  the knowledge set and writes those fresh vectors in the same transaction, taking SQLite's write
+  reservation at begin when it has a fill, so a concurrent writer cannot invalidate the
+  reauthorization snapshot between the check and the write: a refusal aborts the
   release and no awaited cache write can observe one afterwards, while a cache-only storage failure is
   a miss. The query slot is installed only once that boundary succeeds, and a late
   `EmbeddingsUnavailable` keeps a warm slot instead of replacing it. An identical warm recall makes no

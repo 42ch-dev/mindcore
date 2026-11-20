@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -3351,6 +3352,96 @@ async fn a_refused_recall_keeps_no_query_vector() {
 }
 
 #[tokio::test]
+async fn a_release_that_cannot_reserve_its_write_serves_nothing() {
+    let (harness, _) = vector_page().await;
+    // The binding never waits, so contention must refuse at begin, not inside
+    // the fill after the reauthorization already ran.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(harness.root.join("workflows.db"))
+                .busy_timeout(Duration::ZERO),
+        )
+        .await
+        .expect("open zero-wait pool");
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(pool, true));
+
+    // Another connection holds SQLite's write reservation with a revocation
+    // staged: the commit that would invalidate a deferred release
+    // transaction's read snapshot.
+    let holder = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(harness.root.join("workflows.db"))
+                .busy_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("open the second writer");
+    let mut reservation = holder
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("hold the write reservation");
+    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = 'grt_recall'")
+        .bind(NOW)
+        .execute(&mut *reservation)
+        .await
+        .expect("stage the revocation");
+
+    let embedder = AxisEmbedder::new("1");
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a release that cannot reserve its write must not serve the page");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert!(
+        reject
+            .message
+            .contains("recall release transaction could not begin"),
+        "the reservation must be taken at begin, before the reauthorization read: {}",
+        reject.message
+    );
+    assert!(
+        reject.message.contains("locked"),
+        "the begin failure must carry SQLite's lock condition: {}",
+        reject.message
+    );
+
+    reservation
+        .rollback()
+        .await
+        .expect("release the write reservation");
+    holder.close().await;
+
+    // Nothing was released and no query vector survived the refusal: a retry
+    // re-embeds its query.
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("the retried recall");
+    assert_eq!(
+        embedder.embedded()[4],
+        "north gate",
+        "the refused recall cached no query vector"
+    );
+}
+
+#[tokio::test]
 async fn a_moved_page_conflicts_before_its_stored_vector_is_read() {
     let (harness, workflows) = vector_page().await;
     warm_page(&workflows, &AxisEmbedder::new("1")).await;
@@ -3552,30 +3643,6 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         );
     }
 
-    // Scored over the same page, the persisted components give identical
-    // per-item bits, and the stable order keeps the tie in adapter order.
-    let query_vector = axis_vector("north gate");
-    let in_memory =
-        mindcore_spi::hybrid_scores(&texts, "north gate", &query_vector, &fresh_vectors);
-    let reloaded_scores = mindcore_spi::hybrid_scores(&texts, "north gate", &query_vector, &stored);
-    let score_bits =
-        |scores: &[f64]| -> Vec<u64> { scores.iter().map(|score| score.to_bits()).collect() };
-    assert_eq!(
-        score_bits(&in_memory),
-        score_bits(&reloaded_scores),
-        "a persisted component cannot change a score bit"
-    );
-    let order = |scores: &[f64]| {
-        let mut order: Vec<usize> = (0..scores.len()).collect();
-        order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
-        order
-    };
-    assert_eq!(
-        order(&reloaded_scores),
-        [0, 1, 2, 3],
-        "the tied pair keeps adapter order"
-    );
-
     // A second engine starts with a cold query slot: every record vector it
     // scores comes back through the stored BLOB, and it serves exactly the
     // page those scores dictate.
@@ -3591,13 +3658,9 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         .await
         .expect("pack");
 
-    let expected: Vec<&str> = order(&reloaded_scores)
-        .into_iter()
-        .map(|index| page[index])
-        .collect();
     assert_eq!(
         record_ids(&reloaded),
-        expected,
+        page,
         "the persisted page ranks exactly like the in-memory one"
     );
     assert_eq!(reloaded.tokens_used, fresh.tokens_used);

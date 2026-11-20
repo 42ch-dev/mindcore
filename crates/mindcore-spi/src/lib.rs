@@ -15,7 +15,7 @@
 pub mod workflows;
 
 pub use workflows::{
-    hybrid_scores, page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
+    page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
     CapturedCandidate, CitedRecord, DeliberateSnapshot, PageFact, PageVector, PageVectors,
     RecallSnapshot, RecordFill, SettledRecord, SettledRevision, SnapshotFact, SpiMindWorkflows,
     WorkflowBinding,
