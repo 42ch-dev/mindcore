@@ -3,17 +3,19 @@
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
-use sqlx::{Executor, Sqlite, SqlitePool, Transaction};
+use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 use mindcore_base::cognition::carrier_record_violation;
 use mindcore_base::knowledge::KnowledgeScope;
 use spoke_operations::{
-    filter_knowledge_entries_by_scope, spoke_reject, validate_cognition_module, KnowledgeEntryPort,
-    ScopedKnowledgePort, SpokeRejectCode, SpokeResult,
+    filter_knowledge_entries_by_scope, spoke_reject, validate_cognition_module,
+    validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort, SpokeRejectCode,
+    SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
 use spoke_schemas::{KnowledgeEntry, Scope};
 
+use crate::cognition::{insert_record, read_records};
 use crate::store::MindStore;
 
 /// Hard bound on one list of a stored collection.
@@ -54,8 +56,9 @@ pub fn validate_admission_scope(scope: &Scope) -> SpokeResult<()> {
 /// `put` persists the submitted payload unchanged except for the assigned `revision` (`1` on create,
 /// stored + 1 on update) and, on update, the stored row's `created_at`, which the payload repeats so
 /// payload and column agree; the SQL timestamp columns carry the store's own write bookkeeping.
-/// A present `modules.cognition` is gated here, so no caller can commit a module that the next
-/// derivation would reject.
+/// Cognition records are the exception to "unchanged": they are stored as their own rows and the
+/// payload keeps the module envelope without the inline array. A present `modules.cognition` is
+/// gated here, so no caller can commit a module that the next derivation would reject.
 pub struct ScopedKnowledgeStore {
     pool: SqlitePool,
     scope: KnowledgeScope,
@@ -72,8 +75,26 @@ impl ScopedKnowledgeStore {
 
     /// Every entry of this collection, ordered by `entry_id` ASC and bounded by
     /// [`SERVED_KNOWLEDGE_LIST_LIMIT`].
+    ///
+    /// The projection runs inside one read transaction: SQLite pins the snapshot at
+    /// the first statement, so an append committed by another connection between the
+    /// carrier payloads and the record rows is invisible to both — the listing is
+    /// one whole committed state, never a carrier revision paired with records it
+    /// never had.
     pub async fn list_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
-        entries(&self.pool, &self.scope.collection).await
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!("knowledge entries could not be listed: {error}"))
+            }
+        };
+        match entries(&mut tx, &self.scope.collection).await {
+            SpokeResult::Ok(listed) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(listed),
+                Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
     }
 }
 
@@ -86,48 +107,46 @@ pub async fn list_entries_in(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
 ) -> SpokeResult<Vec<KnowledgeEntry>> {
-    entries(&mut **tx, collection).await
+    entries(&mut *tx, collection).await
 }
 
 /// The stored rows of `collection`, ordered by `entry_id` ASC, bounded at the
 /// query boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] rows are decoded, and
 /// an over-bound collection refuses the list instead of growing memory and work
 /// with its total size.
-async fn entries<'e, E>(executor: E, collection: &str) -> SpokeResult<Vec<KnowledgeEntry>>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
+async fn entries(
+    connection: &mut SqliteConnection,
+    collection: &str,
+) -> SpokeResult<Vec<KnowledgeEntry>> {
     let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
     let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
         "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC LIMIT ?",
     )
     .bind(collection)
     .bind(limit + 1)
-    .fetch_all(executor)
+    .fetch_all(&mut *connection)
     .await;
     let payloads = match payloads {
         Ok(payloads) => payloads,
         Err(error) => return internal(format!("knowledge entries could not be listed: {error}")),
     };
-    let stored = match decode_all(&payloads) {
-        SpokeResult::Ok(stored) => stored,
-        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-    };
+    let mut stored = Vec::with_capacity(payloads.len());
+    for payload in &payloads {
+        let mut entry = match decode(payload) {
+            SpokeResult::Ok(entry) => entry,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if let SpokeResult::Reject(reject) =
+            hydrate_cognition_records(connection, collection, &mut entry).await
+        {
+            return SpokeResult::Reject(reject);
+        }
+        stored.push(entry);
+    }
     if stored.len() as i64 > limit {
         return internal(format!(
             "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list is bounded"
         ));
-    }
-    SpokeResult::Ok(stored)
-}
-
-fn decode_all(payloads: &[String]) -> SpokeResult<Vec<KnowledgeEntry>> {
-    let mut stored = Vec::with_capacity(payloads.len());
-    for payload in payloads {
-        match decode(payload) {
-            SpokeResult::Ok(entry) => stored.push(entry),
-            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-        }
     }
     SpokeResult::Ok(stored)
 }
@@ -184,8 +203,22 @@ impl RoutedKnowledgeStore {
 
     /// The routed collection's stored rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
     /// over-bound collection refuses the list instead of growing memory and work with its size.
+    /// The projection runs inside one read transaction, so the carrier payloads and the
+    /// record rows project from one whole committed state.
     async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
-        entries(&self.pool, &self.scope.collection).await
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!("knowledge entries could not be listed: {error}"))
+            }
+        };
+        match entries(&mut tx, &self.scope.collection).await {
+            SpokeResult::Ok(listed) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(listed),
+                Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
     }
 }
 
@@ -199,9 +232,23 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         if let SpokeResult::Reject(reject) = self.admit(scope) {
             return SpokeResult::Reject(reject);
         }
-        // A missing row and a row hidden by the admission reach the same refusal.
-        let entry = match read_entry(&self.pool, &self.scope.collection, entry_id).await {
-            SpokeResult::Ok(entry) => entry,
+        // One read transaction pins the snapshot: the carrier payload and its record
+        // rows project from one committed state, the same whole read the scoped
+        // port's get makes. A missing row and a row hidden by the admission reach
+        // the same refusal.
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!("knowledge entry could not be read: {error}"))
+            }
+        };
+        let entry = match read_entry(&mut tx, &self.scope.collection, entry_id).await {
+            SpokeResult::Ok(entry) => match tx.commit().await {
+                Ok(()) => entry,
+                Err(error) => {
+                    return internal(format!("knowledge entry could not be read: {error}"))
+                }
+            },
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
             {
@@ -236,7 +283,7 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
             Ok(transaction) => transaction,
             Err(error) => return internal(format!("knowledge write could not begin: {error}")),
         };
-        let existing = read_entry(&mut *transaction, &self.scope.collection, &entry.entry_id).await;
+        let existing = read_entry(&mut transaction, &self.scope.collection, &entry.entry_id).await;
         let existing = match existing {
             SpokeResult::Ok(existing) => Some(existing),
             SpokeResult::Reject(reject)
@@ -313,7 +360,7 @@ fn not_found<T>(entry_id: &str) -> SpokeResult<T> {
     )
 }
 
-fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
+pub(crate) fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
     spoke_reject(SpokeRejectCode::InternalError, message, None)
 }
 
@@ -336,9 +383,12 @@ fn encode_timestamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+fn module_key() -> KnowledgeEntryModulesKey {
+    "cognition".parse().expect("valid module namespace")
+}
+
 fn cognition_module(entry: &KnowledgeEntry) -> Option<Value> {
-    let key: KnowledgeEntryModulesKey = "cognition".parse().expect("valid module namespace");
-    match entry.modules.get(&key)? {
+    match entry.modules.get(&module_key())? {
         KnowledgeEntryModulesValue::Object(module) => Some(Value::Object(module.clone())),
         KnowledgeEntryModulesValue::Array(items) => Some(Value::Array(items.clone())),
     }
@@ -357,26 +407,37 @@ fn stale<T>(entry_id: &str, expected: Option<u64>, stored: Option<u64>) -> Spoke
     )
 }
 
-/// One entry of `collection`, read through the caller's executor: the scoped
+/// One entry of `collection`, read through the caller's transaction: the scoped
 /// port and the workflow binding share this read, and a settlement reads it at
-/// the same point as the write it guards.
-pub async fn read_entry<'e, E>(
-    executor: E,
+/// the same point as the write it guards. The cognition module's records are
+/// projected from the holder's record rows in append order. Taking the
+/// transaction pins the payload and the record rows to one snapshot — the same
+/// whole read `list_entries_in` makes.
+pub async fn read_entry(
+    tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,
-) -> SpokeResult<KnowledgeEntry>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
+) -> SpokeResult<KnowledgeEntry> {
     let payload: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
         "SELECT payload FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
     )
     .bind(collection)
     .bind(entry_id)
-    .fetch_optional(executor)
+    .fetch_optional(&mut **tx)
     .await;
     match payload {
-        Ok(Some(payload)) => decode(&payload),
+        Ok(Some(payload)) => {
+            let mut entry = match decode(&payload) {
+                SpokeResult::Ok(entry) => entry,
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+            if let SpokeResult::Reject(reject) =
+                hydrate_cognition_records(&mut *tx, collection, &mut entry).await
+            {
+                return SpokeResult::Reject(reject);
+            }
+            SpokeResult::Ok(entry)
+        }
         Ok(None) => spoke_reject(
             SpokeRejectCode::KnowledgeEntryNotFound,
             format!("no knowledge entry {entry_id} in collection {collection}"),
@@ -386,8 +447,83 @@ where
     }
 }
 
+/// Projects `modules.cognition.records` from the holder's record rows: the rows are
+/// the storage authority and the payload keeps only the module envelope. A present
+/// `records` member stays present (empty while there are no rows); an absent module
+/// or member stays absent.
+async fn hydrate_cognition_records(
+    connection: &mut SqliteConnection,
+    collection: &str,
+    entry: &mut KnowledgeEntry,
+) -> SpokeResult<()> {
+    let key = module_key();
+    let carries_records = matches!(
+        entry.modules.get(&key),
+        Some(KnowledgeEntryModulesValue::Object(module)) if module.contains_key("records")
+    );
+    if !carries_records {
+        return SpokeResult::Ok(());
+    }
+    // Unit-test seam: suspends the projection between its two statements.
+    #[cfg(test)]
+    snapshot_seam::interleave().await;
+    let records = match read_records(&mut *connection, collection, &entry.entry_id).await {
+        SpokeResult::Ok(records) => records,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&key) {
+        module.insert("records".to_string(), Value::Array(records));
+    }
+    SpokeResult::Ok(())
+}
+
+/// One holder's assigned revision and current-judgment pointer, read without hydrating its
+/// payload or history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrierHeader {
+    pub revision: u64,
+    pub head_seq: Option<i64>,
+}
+
+/// One holder's header, read through the caller's executor: the append path compares the
+/// revision and takes the next `append_seq` from here instead of reading the carrier history.
+pub async fn read_carrier_header<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+) -> SpokeResult<CarrierHeader>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let header: Result<Option<(i64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, cognition_head_seq FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(executor)
+    .await;
+    match header {
+        Ok(Some((revision, head_seq))) => SpokeResult::Ok(CarrierHeader {
+            revision: revision as u64,
+            head_seq,
+        }),
+        Ok(None) => spoke_reject(
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            format!("no knowledge entry {entry_id} in collection {collection}"),
+            None,
+        ),
+        Err(error) => internal(format!("carrier header could not be read: {error}")),
+    }
+}
+
 /// Write one entry of `collection` against `expected_base_revision` through the
 /// caller's transaction, assigning `1` on create and `stored + 1` on update.
+///
+/// The submitted cognition records are stored as their own rows: on create all of them, on
+/// update only the suffix behind the immutable committed prefix — dropping, reordering or
+/// rewriting a committed record is invalid input. The stored payload keeps the module
+/// envelope without the inline array.
 ///
 /// An update also restores the stored row's `created_at` into the payload: the
 /// SQL column keeps the original creation instant across an update, so the
@@ -431,6 +567,21 @@ pub async fn write_entry(
     };
     let stored_created_at = stored.as_ref().map(|(_, created_at)| created_at.clone());
     let stored = stored.map(|(revision, _)| revision as u64);
+    // The submitted history moves out of the envelope instead of being copied: the
+    // module gate above pinned `records` to an array, the replace leaves exactly the
+    // empty member the stored payload requires, and the suffix inserts plus the
+    // returned DTO reuse the taken values — the old code copied this history twice,
+    // once here and once into the whole-entry clone before encoding.
+    let mut submitted_records: Vec<Value> = match entry.modules.get_mut(&module_key()) {
+        Some(KnowledgeEntryModulesValue::Object(module)) => match module.get_mut("records") {
+            Some(records) => match std::mem::replace(records, Value::Array(Vec::new())) {
+                Value::Array(records) => records,
+                _ => unreachable!("validated cognition module carries a records array"),
+            },
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
 
     let revision = match expected_base_revision {
         None => match stored {
@@ -468,28 +619,62 @@ pub async fn write_entry(
         entry.created_at = Some(created_at);
     }
 
+    // Record rows are immutable once committed: an update must carry every committed record
+    // unchanged and may only append its validated suffix. Reading the rows is fine here — a full
+    // DTO put processes its full payload anyway; only the dedicated append and current lookup are
+    // bounded independently of history.
+    let committed = match stored {
+        Some(_) => match read_records(&mut **tx, collection, &entry.entry_id).await {
+            SpokeResult::Ok(records) => records,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        },
+        None => Vec::new(),
+    };
+    if submitted_records.len() < committed.len() {
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            format!(
+                "knowledge entry {} drops {} committed cognition record(s)",
+                entry.entry_id,
+                committed.len() - submitted_records.len()
+            ),
+            None,
+        );
+    }
+    for (index, (committed_record, submitted)) in
+        committed.iter().zip(submitted_records.iter()).enumerate()
+    {
+        if committed_record != submitted {
+            return spoke_reject(
+                SpokeRejectCode::InvalidInput,
+                format!(
+                    "knowledge entry {} rewrites committed cognition record at position {index}",
+                    entry.entry_id
+                ),
+                None,
+            );
+        }
+    }
+
+    // The stored payload keeps the cognition envelope only: the record rows carry the
+    // values, and the emptied `records` member preserves its presence — the encoding
+    // borrows the entry, no whole-entry copy.
     let payload = match encode(&entry) {
         SpokeResult::Ok(payload) => payload,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
     let created_at = encode_timestamp(entry.created_at.unwrap_or(now));
     let updated_at = encode_timestamp(now);
-    let written: Result<(), sqlx::Error> = match stored {
-        Some(_) => sqlx::query(
-            "UPDATE knowledge_entries SET revision = ?, payload = ?, updated_at = ?
-             WHERE collection = ? AND entry_id = ?",
-        )
-        .bind(revision as i64)
-        .bind(&payload)
-        .bind(&updated_at)
-        .bind(collection)
-        .bind(&entry.entry_id)
-        .execute(&mut **tx)
-        .await
-        .map(|_| ()),
-        None => sqlx::query(
-            "INSERT INTO knowledge_entries (collection, entry_id, revision, payload, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+    let head = (!submitted_records.is_empty()).then_some(submitted_records.len() as i64);
+    let suffix = &submitted_records[committed.len()..];
+
+    if stored.is_none() {
+        // The carrier row exists before the record rows that reference it; the head foreign
+        // key can only be set once those rows exist.
+        let written = sqlx::query(
+            "INSERT INTO knowledge_entries \
+             (collection, entry_id, revision, cognition_head_seq, payload, created_at, updated_at)
+             VALUES (?, ?, ?, NULL, ?, ?, ?)",
         )
         .bind(collection)
         .bind(&entry.entry_id)
@@ -498,19 +683,191 @@ pub async fn write_entry(
         .bind(&created_at)
         .bind(&updated_at)
         .execute(&mut **tx)
+        .await;
+        if let Err(error) = written {
+            return internal(format!("knowledge entry could not be written: {error}"));
+        }
+    }
+    for (offset, record) in suffix.iter().enumerate() {
+        if let SpokeResult::Reject(reject) = insert_record(
+            tx,
+            collection,
+            &entry.entry_id,
+            committed.len() as i64 + offset as i64 + 1,
+            record,
+        )
+        .await
+        {
+            return SpokeResult::Reject(reject);
+        }
+    }
+    let written: Result<(), sqlx::Error> = match stored {
+        Some(_) => sqlx::query(
+            "UPDATE knowledge_entries \
+             SET revision = ?, cognition_head_seq = ?, payload = ?, updated_at = ? \
+             WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(revision as i64)
+        .bind(head)
+        .bind(&payload)
+        .bind(&updated_at)
+        .bind(collection)
+        .bind(&entry.entry_id)
+        .execute(&mut **tx)
         .await
         .map(|_| ()),
+        None => match head {
+            None => Ok(()),
+            Some(head) => sqlx::query(
+                "UPDATE knowledge_entries SET cognition_head_seq = ? \
+                 WHERE collection = ? AND entry_id = ?",
+            )
+            .bind(head)
+            .bind(collection)
+            .bind(&entry.entry_id)
+            .execute(&mut **tx)
+            .await
+            .map(|_| ()),
+        },
     };
     if let Err(error) = written {
         return internal(format!("knowledge entry could not be written: {error}"));
     }
+    // The returned DTO owns the submitted history: put the taken values back.
+    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&module_key())
+    {
+        if let Some(records) = module.get_mut("records") {
+            *records = Value::Array(std::mem::take(&mut submitted_records));
+        }
+    }
     SpokeResult::Ok(entry)
+}
+
+/// Drops the inline records array from the stored payload's cognition module: the record rows
+/// carry the values, the empty `records` key preserves the member's presence.
+fn strip_records(entry: &mut KnowledgeEntry) {
+    let key = module_key();
+    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&key) {
+        if module.contains_key("records") {
+            module.insert("records".to_string(), Value::Array(Vec::new()));
+        }
+    }
+}
+
+/// Append one validated cognition record inside the caller's transaction: compare the
+/// carrier revision without reading history, insert the record row at `head + 1` and
+/// advance the head and the outer revision together. Returns the assigned revision.
+///
+/// A stale expected revision is the generic stale rejection — `commit_cognition` rechecks
+/// the revision first and reports the retryable conflict. A duplicate scoped `record_id`
+/// is invalid input, not a storage failure. Rollback of the caller's transaction leaves
+/// every row and the revision unchanged.
+pub async fn append_cognition(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+    expected_revision: u64,
+    record: &Value,
+) -> SpokeResult<u64> {
+    let header: Result<Option<(i64, Option<i64>, String)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, cognition_head_seq, payload FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(&mut **tx)
+    .await;
+    let (stored_revision, head_seq, payload) = match header {
+        Ok(Some(header)) => header,
+        Ok(None) => {
+            return spoke_reject(
+                SpokeRejectCode::KnowledgeEntryNotFound,
+                format!("no knowledge entry {entry_id} in collection {collection}"),
+                None,
+            )
+        }
+        Err(error) => return internal(format!("carrier header could not be read: {error}")),
+    };
+    let stored_revision = stored_revision as u64;
+    if stored_revision != expected_revision {
+        return stale(
+            entry_id,
+            Some(expected_revision),
+            Some(stored_revision),
+        );
+    }
+    // The record rules are the carrier contract's, not this adapter's: the same gate a full
+    // put applies before any row write.
+    if let SpokeResult::Reject(reject) = validate_cognition_record(record) {
+        return SpokeResult::Reject(reject);
+    }
+    if let Some(violation) = carrier_record_violation(record, entry_id) {
+        return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
+    }
+    let append_seq = head_seq.map_or(1, |head| head + 1);
+    if let SpokeResult::Reject(reject) =
+        insert_record(tx, collection, entry_id, append_seq, record).await
+    {
+        return SpokeResult::Reject(reject);
+    }
+
+    // Re-encode the carrier envelope with the advanced revision: records live in their own
+    // rows, so this touches the carrier row only — never an earlier record.
+    let mut entry = match decode(&payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    entry.revision = Some(stored_revision + 1);
+    entry.modules.entry(module_key()).or_insert_with(|| {
+        // First record of a carrier without a module: seed the same envelope a full
+        // put would have committed.
+        KnowledgeEntryModulesValue::Object(Map::from_iter([
+            ("records".to_string(), Value::Array(Vec::new())),
+            ("world_facts".to_string(), Value::Array(Vec::new())),
+            ("extensions".to_string(), Value::Object(Map::new())),
+        ]))
+    });
+    strip_records(&mut entry);
+    let payload = match encode(&entry) {
+        SpokeResult::Ok(payload) => payload,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    let written = sqlx::query(
+        "UPDATE knowledge_entries \
+         SET revision = ?, cognition_head_seq = ?, payload = ?, updated_at = ? \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind((stored_revision + 1) as i64)
+    .bind(append_seq)
+    .bind(&payload)
+    .bind(encode_timestamp(Utc::now()))
+    .bind(collection)
+    .bind(entry_id)
+    .execute(&mut **tx)
+    .await;
+    if let Err(error) = written {
+        return internal(format!("knowledge entry could not be written: {error}"));
+    }
+    SpokeResult::Ok(stored_revision + 1)
 }
 
 #[async_trait]
 impl KnowledgeEntryPort for ScopedKnowledgeStore {
     async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
-        read_entry(&self.pool, &self.scope.collection, entry_id).await
+        // One read transaction pins the snapshot: the carrier payload and its record
+        // rows project from one committed state, the same whole read `list_entries`
+        // makes, even if another connection appends between the two statements.
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
+        };
+        match read_entry(&mut tx, &self.scope.collection, entry_id).await {
+            SpokeResult::Ok(entry) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(entry),
+                Err(error) => internal(format!("knowledge entry could not be read: {error}")),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
     }
 
     async fn put_knowledge_entry(
@@ -539,5 +896,300 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
             return internal(format!("knowledge write could not commit: {error}"));
         }
         SpokeResult::Ok(entry)
+    }
+}
+
+// Unit-test seam for the full-DTO read regression: when a test installs its channels,
+// the projection suspends here — after the carrier payload statement, before the
+// records statement — until the test reports that a second connection committed an
+// append in that window. That is the exact interleave the snapshot contract forbids
+// pairing. Without an installed seam this falls through immediately.
+#[cfg(test)]
+mod snapshot_seam {
+    use std::sync::Mutex;
+
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+    static SEAM: Mutex<Option<(UnboundedSender<&'static str>, UnboundedReceiver<&'static str>)>> =
+        Mutex::new(None);
+
+    pub(super) fn install(
+        to_test: UnboundedSender<&'static str>,
+        from_test: UnboundedReceiver<&'static str>,
+    ) {
+        *SEAM.lock().expect("snapshot seam lock") = Some((to_test, from_test));
+    }
+
+    pub(super) fn uninstall() {
+        *SEAM.lock().expect("snapshot seam lock") = None;
+    }
+
+    pub(super) async fn interleave() {
+        let (to_test, mut from_test) = match SEAM.lock().expect("snapshot seam lock").take() {
+            Some(pair) => pair,
+            None => return,
+        };
+        if to_test.send("at_records_seam").is_err() {
+            return;
+        }
+        let _ = from_test.recv().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    use mindcore_base::cognition::CARRIER_NAMESPACE;
+    use serde_json::{json, Value};
+    use spoke_schemas::knowledge_entry::{KnowledgeEntryBody, KnowledgeEntryCanonicalName};
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    fn plain_carrier(entry_id: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            body: KnowledgeEntryBody::default(),
+            canonical_name: KnowledgeEntryCanonicalName::try_from(format!("{entry_id} name"))
+                .expect("non-empty canonical name"),
+            created_at: None,
+            disclosure: None,
+            entry_id: entry_id.to_string(),
+            entry_type: "character".to_string(),
+            extensions: HashMap::new(),
+            modules: HashMap::new(),
+            owner: None,
+            revision: Some(1),
+            schema_version: NonZeroU64::new(1).expect("non-zero wire baseline"),
+            source_anchor: None,
+            status: "confirmed".to_string(),
+            updated_at: None,
+        }
+    }
+
+    fn cognition_carrier(entry_id: &str) -> KnowledgeEntry {
+        let mut entry = plain_carrier(entry_id);
+        entry.modules.insert(
+            KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key"),
+            KnowledgeEntryModulesValue::from(
+                json!({"records": [], "world_facts": [], "extensions": {}})
+                    .as_object()
+                    .expect("module fixture is an object")
+                    .clone(),
+            ),
+        );
+        entry
+    }
+
+    // One current-view belief record held by ke_wren, the shape an append accepts.
+    fn belief(record_id: &str) -> Value {
+        json!({
+            "kind": "belief",
+            "order": 1,
+            "record_id": record_id,
+            "holder": {
+                "kind": "knowledge_entry",
+                "id": "ke_wren",
+                "namespace": CARRIER_NAMESPACE,
+            },
+            "target": {
+                "carrier": {
+                    "kind": "knowledge_entry",
+                    "id": "ke_shared_north_gate",
+                    "namespace": CARRIER_NAMESPACE,
+                },
+                "target_id": "prop_north_gate_closed",
+                "kind": "proposition",
+            },
+            "assessor": {
+                "kind": "knowledge_entry",
+                "id": "ke_wren",
+                "namespace": CARRIER_NAMESPACE,
+            },
+            "assessor_role": "holder_self_report",
+            "basis": {
+                "kind": "evidence",
+                "evidence": [{
+                    "kind": "memory_record",
+                    "id": "mem_hearsay",
+                    "namespace": CARRIER_NAMESPACE,
+                }],
+            },
+            "assessment_context": {"context_id": "ctx_dusk_at_the_gate"},
+            "effective_at": "2026-11-19T18:00:00Z",
+            "assessed_at": "2026-11-19T18:05:00Z",
+            "view": "current",
+            "q": {
+                "value": 0.4,
+                "assertion": "belief_attribution",
+                "method": "single_self_report",
+                "calibration": "uncalibrated",
+            },
+            "extensions": {},
+        })
+    }
+
+    fn module_of(entry: &KnowledgeEntry) -> Value {
+        serde_json::to_value(&entry.modules).expect("modules serialize")["cognition"].clone()
+    }
+
+    fn record_ids(entry: &KnowledgeEntry) -> Vec<String> {
+        let module = module_of(entry);
+        module["records"]
+            .as_array()
+            .map(|records| {
+                records
+                    .iter()
+                    .filter_map(|record| {
+                        record
+                            .get("record_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
+        match result {
+            SpokeResult::Ok(value) => value,
+            SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
+        }
+    }
+
+    async fn second_pool(path: &std::path::Path) -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("open second connection")
+    }
+
+    async fn wait_for_seam(test_rx: &mut mpsc::UnboundedReceiver<&'static str>) {
+        let signal = timeout(Duration::from_secs(10), test_rx.recv())
+            .await
+            .expect("projection did not reach the seam in time");
+        assert_eq!(signal, Some("at_records_seam"));
+    }
+
+    /// Regression for the task-2 review Critical: the full-DTO port reads ran the
+    /// carrier payload statement and the records statement as two autocommit
+    /// queries, so an append committed between them paired an older carrier
+    /// revision with records it never had — a DTO that never existed.
+    ///
+    /// Construction: the seam suspends each projection exactly between its two
+    /// statements, and a second connection commits an append in that window. Every
+    /// asserted DTO must be a state that actually existed: revision `r` of
+    /// `ke_wren` pairs with exactly the `r - 1` records appended before it.
+    #[tokio::test]
+    async fn full_dto_reads_project_one_snapshot_across_a_concurrent_append() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("mindcore.db");
+        let store = MindStore::open(&path).await.expect("open store");
+        let port = store.knowledge(KnowledgeScope::new("wren"));
+        let second = second_pool(&path).await;
+
+        expect_ok(
+            port.put_knowledge_entry(cognition_carrier("ke_wren"), None)
+                .await,
+            "create cognition carrier",
+        );
+        expect_ok(
+            port.put_knowledge_entry(plain_carrier("ke_abel"), None).await,
+            "create module-less carrier",
+        );
+
+        // The entry read: revision 1's payload pairs with revision 1's records.
+        let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
+        let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
+        snapshot_seam::install(hook_to_test, hook_rx);
+        let read_port = store.knowledge(KnowledgeScope::new("wren"));
+        let reader =
+            tokio::spawn(async move { read_port.get_knowledge_entry("ke_wren").await });
+        wait_for_seam(&mut test_rx).await;
+
+        let mut tx = second.begin_with("BEGIN IMMEDIATE").await.expect("begin append");
+        let assigned = expect_ok(
+            append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_hearsay")).await,
+            "concurrent append",
+        );
+        assert_eq!(assigned, 2);
+        tx.commit().await.expect("commit append");
+        test_to_hook.send("appended").expect("reader alive");
+
+        let dto = expect_ok(
+            timeout(Duration::from_secs(10), reader)
+                .await
+                .expect("entry read did not finish in time")
+                .expect("reader task"),
+            "full DTO read",
+        );
+        assert_eq!(dto.revision, Some(1));
+        assert!(
+            record_ids(&dto).is_empty(),
+            "revision 1's snapshot has no records, got {:?}",
+            record_ids(&dto)
+        );
+
+        // The append really committed during the read: a fresh read sees revision 2.
+        let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
+        assert_eq!(fresh.revision, Some(2));
+        assert_eq!(record_ids(&fresh), vec!["cog_hearsay"]);
+
+        // The listing path: ke_wren's payload was read at revision 2, so its
+        // records must stay revision 2's even though the append commits before
+        // the listing reaches its records statement.
+        let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
+        let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
+        snapshot_seam::install(hook_to_test, hook_rx);
+        let list_port = store.knowledge(KnowledgeScope::new("wren"));
+        let reader = tokio::spawn(async move { list_port.list_entries().await });
+        wait_for_seam(&mut test_rx).await;
+
+        let mut tx = second.begin_with("BEGIN IMMEDIATE").await.expect("begin append");
+        let assigned = expect_ok(
+            append_cognition(&mut tx, "wren", "ke_wren", 2, &belief("cog_newer")).await,
+            "second concurrent append",
+        );
+        assert_eq!(assigned, 3);
+        tx.commit().await.expect("commit append");
+        test_to_hook.send("appended").expect("reader alive");
+
+        let listed = expect_ok(
+            timeout(Duration::from_secs(10), reader)
+                .await
+                .expect("listing did not finish in time")
+                .expect("reader task"),
+            "listing",
+        );
+        assert_eq!(listed.len(), 2);
+        let abel = listed.iter().find(|entry| entry.entry_id == "ke_abel").expect("abel listed");
+        assert!(module_of(abel).get("records").is_none(), "absent module stays absent");
+        let wren = listed.iter().find(|entry| entry.entry_id == "ke_wren").expect("wren listed");
+        assert_eq!(wren.revision, Some(2));
+        assert_eq!(
+            record_ids(wren),
+            vec!["cog_hearsay"],
+            "wren's records must come from its own snapshot"
+        );
+
+        // The second append really committed during the listing.
+        let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
+        assert_eq!(fresh.revision, Some(3));
+        assert_eq!(record_ids(&fresh), vec!["cog_hearsay", "cog_newer"]);
+
+        snapshot_seam::uninstall();
+        second.close().await;
+        store.close().await;
     }
 }

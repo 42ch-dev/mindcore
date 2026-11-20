@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,8 +10,10 @@ use mindcore_base::cognition::{
     append_cognition_record, derive_mind_state, mind_state_value, MindError, CARRIER_NAMESPACE,
 };
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_sqlite::cognition::{read_carrier, write_carrier};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::cognition::{
+    read_carrier, read_current_record, read_record, read_records, write_carrier,
+};
+use mindcore_sqlite::{append_cognition, read_carrier_header, MindStore};
 use serde_json::{json, Value};
 use spoke_operations::{
     validate_cognition_module, validate_cognition_record, validate_mind_state, KnowledgeEntryPort,
@@ -22,6 +24,8 @@ use spoke_schemas::knowledge_entry::{
     KnowledgeEntryModulesValue,
 };
 use spoke_schemas::KnowledgeEntry;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -118,6 +122,33 @@ fn belief(record_id: &str, q: f64) -> Value {
     })
 }
 
+/// One narrated order-0 world fact: the envelope value a stored carrier must
+/// preserve beside its records.
+fn world_fact() -> Value {
+    json!({
+        "fact_id": "fact_gate_curfew",
+        "holder": {
+            "kind": "world",
+            "id": "world_almanac",
+            "namespace": CARRIER_NAMESPACE,
+        },
+        "target": {
+            "carrier": {
+                "kind": "knowledge_entry",
+                "id": "ke_shared_north_gate",
+                "namespace": CARRIER_NAMESPACE,
+            },
+            "kind": "proposition",
+            "target_id": "prop_north_gate_closed",
+        },
+        "order": 0,
+        "assessment_context": {"context_id": "ctx_village_almanac"},
+        "effective_at": "2026-11-19T18:00:00Z",
+        "recorded_at": "2026-11-19T18:05:00Z",
+        "extensions": {},
+    })
+}
+
 fn with_module(entry_id: &str, revision: Option<u64>, module: Value) -> KnowledgeEntry {
     let mut entry = carrier(entry_id, revision);
     entry.modules.insert(
@@ -136,11 +167,58 @@ fn module_of(entry: &KnowledgeEntry) -> Value {
     serde_json::to_value(&entry.modules).expect("modules serialize")["cognition"].clone()
 }
 
+/// The pinned `BeliefOrder` accepts 0–3 only, and order 2/3 require a nested
+/// `about` target whose chain depth follows the order: 1 is plain, 2 nests one
+/// `about`, 3 nests two. The outer target identity is kept, so records stay in
+/// the same projection group as their order-1 siblings.
+fn with_order(mut record: Value, order: i64) -> Value {
+    record["order"] = json!(order);
+    if order > 1 {
+        let mut about = json!({
+            "carrier": {
+                "kind": "knowledge_entry",
+                "id": "ke_shared_north_gate",
+                "namespace": CARRIER_NAMESPACE,
+            },
+            "kind": "proposition",
+            "target_id": "prop_gate_archway",
+        });
+        for depth in 1..order - 1 {
+            about = json!({
+                "about": about,
+                "carrier": {
+                    "kind": "knowledge_entry",
+                    "id": "ke_shared_north_gate",
+                    "namespace": CARRIER_NAMESPACE,
+                },
+                "kind": "proposition",
+                "target_id": format!("prop_gate_layer_{depth}"),
+            });
+        }
+        record["target"]["about"] = about;
+    }
+    record
+}
+
 fn module_keys(records: &[Value]) -> Vec<&str> {
     records
         .iter()
         .filter_map(|record| record.get("record_id").and_then(Value::as_str))
         .collect()
+}
+
+/// A second single-connection pool on the same file, so a test can hold SQLite's
+/// write reservation itself: storage-level appends borrow its transactions.
+async fn second_pool(path: &Path) -> SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("open second connection")
 }
 
 fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
@@ -690,5 +768,838 @@ async fn float_order_record_is_rejected_on_direct_put() {
     let view = derive_mind_state(&stored).expect("derive integer carrier");
     let value = mind_state_value(&view, "ms_wren_dusk").expect("render mind state");
     expect_ok(validate_mind_state(&value), "integer-order mind state");
+    store.close().await;
+}
+
+/// The record rows are the storage authority, committed through the guarded append: they
+/// read back in `append_seq` order rather than the records' own `order`, a scoped
+/// `record_id` addresses one row, and a duplicate id in the same holder is invalid input.
+/// The header read sees the assigned revision with no head until an append advances it.
+#[tokio::test]
+async fn record_rows_keep_append_order_and_scoped_ids() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+
+    // A second connection so the test holds the write reservation itself.
+    let pool = second_pool(&path).await;
+
+    let header = expect_ok(
+        read_carrier_header(&pool, "wren", "ke_wren").await,
+        "header",
+    );
+    assert_eq!((header.revision, header.head_seq), (1, None));
+
+    // The second record carries its own `order` (2), independent of its storage
+    // position (second append): only the storage order may decide the read-back.
+    let second_by_storage = with_order(belief("cog_early", 0.6), 2);
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    expect_ok(
+        append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_late", 0.4)).await,
+        "first record",
+    );
+    expect_ok(
+        append_cognition(&mut tx, "wren", "ke_wren", 2, &second_by_storage).await,
+        "second record",
+    );
+    match append_cognition(&mut tx, "wren", "ke_wren", 3, &belief("cog_late", 0.9)).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        SpokeResult::Ok(_) => panic!("a duplicate scoped record_id must not be stored"),
+    }
+    tx.commit().await.expect("commit");
+
+    let records = expect_ok(read_records(&pool, "wren", "ke_wren").await, "records");
+    assert_eq!(module_keys(&records), vec!["cog_late", "cog_early"]);
+
+    let scoped = expect_ok(
+        read_record(&pool, "wren", "ke_wren", "cog_early").await,
+        "scoped read",
+    )
+    .expect("the stored record is addressable by its scoped id");
+    assert_eq!(scoped["q"]["value"].as_f64(), Some(0.6));
+
+    store.close().await;
+}
+
+/// CAS regression: an append against a stale expected revision is refused with the
+/// generic stale rejection (the workflow maps it to the retryable conflict) and
+/// leaves the committed record, head and revision untouched.
+#[tokio::test]
+async fn append_rejects_a_stale_revision_without_touching_rows() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    let pool = second_pool(&path).await;
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    let assigned = expect_ok(
+        append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_hearsay", 0.4)).await,
+        "first append",
+    );
+    assert_eq!(assigned, 2);
+    tx.commit().await.expect("commit");
+
+    // Complete pre-rejection snapshot: the rejected transaction is compared against
+    // these bytes record-by-record, not by record ids alone.
+    let committed =
+        expect_ok(read_records(&pool, "wren", "ke_wren").await, "committed records");
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    match append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_newer", 0.5)).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::StoredRevisionStale);
+            let details = reject.details.as_ref().expect("stale details");
+            assert_eq!(details.get("expected_base_revision"), Some(&json!(1)));
+            assert_eq!(details.get("stored_revision"), Some(&json!(2)));
+            // Still inside the rejecting transaction, so a write-then-reject
+            // implementation cannot hide its writes behind the rollback below.
+            let header = expect_ok(
+                read_carrier_header(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction header",
+            );
+            assert_eq!(
+                (header.revision, header.head_seq),
+                (2, Some(1)),
+                "the rejection must not advance the head or the revision inside the transaction"
+            );
+            let records = expect_ok(
+                read_records(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction records",
+            );
+            assert_eq!(
+                serde_json::to_string(&records).expect("in-transaction records serialize"),
+                serde_json::to_string(&committed).expect("committed records serialize"),
+                "a stale rejection that rewrote the committed cog_hearsay payload would diverge here",
+            );
+        }
+        SpokeResult::Ok(_) => panic!("a stale expected revision must not append"),
+    }
+    tx.rollback().await.expect("rollback");
+
+    let header = expect_ok(
+        read_carrier_header(&pool, "wren", "ke_wren").await,
+        "header",
+    );
+    assert_eq!((header.revision, header.head_seq), (2, Some(1)));
+    let records = expect_ok(read_records(&pool, "wren", "ke_wren").await, "records");
+    assert_eq!(module_keys(&records), vec!["cog_hearsay"]);
+    store.close().await;
+}
+
+/// CAS regression: a duplicate scoped record_id at the current revision is invalid
+/// input at the storage append — not a storage failure — and writes nothing.
+#[tokio::test]
+async fn append_rejects_a_duplicate_id_at_the_current_revision() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    let pool = second_pool(&path).await;
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    let assigned = expect_ok(
+        append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_hearsay", 0.4)).await,
+        "first append",
+    );
+    assert_eq!(assigned, 2);
+    tx.commit().await.expect("commit");
+
+    // Complete pre-rejection snapshot: the rejected transaction is compared against
+    // these bytes record-by-record, not by record ids alone.
+    let committed =
+        expect_ok(read_records(&pool, "wren", "ke_wren").await, "committed records");
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    match append_cognition(&mut tx, "wren", "ke_wren", 2, &belief("cog_hearsay", 0.9)).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert!(
+                reject.message.contains("cog_hearsay") && reject.message.contains("already exists"),
+                "got {reject:?}"
+            );
+            // Still inside the rejecting transaction, so a write-then-reject
+            // implementation cannot hide its writes behind the rollback below.
+            let header = expect_ok(
+                read_carrier_header(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction header",
+            );
+            assert_eq!(
+                (header.revision, header.head_seq),
+                (2, Some(1)),
+                "the rejection must not advance the head or the revision inside the transaction"
+            );
+            let records = expect_ok(
+                read_records(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction records",
+            );
+            assert_eq!(
+                serde_json::to_string(&records).expect("in-transaction records serialize"),
+                serde_json::to_string(&committed).expect("committed records serialize"),
+                "the duplicate must not add a row or alter any committed field inside the transaction",
+            );
+            let current = expect_ok(
+                read_current_record(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction current",
+            )
+            .expect("the committed record is still the head");
+            assert_eq!(
+                current["q"]["value"].as_f64(),
+                Some(0.4),
+                "the duplicate must not overwrite the committed record inside the transaction"
+            );
+        }
+        SpokeResult::Ok(_) => panic!("a duplicate scoped record_id must not append"),
+    }
+    tx.rollback().await.expect("rollback");
+
+    let header = expect_ok(
+        read_carrier_header(&pool, "wren", "ke_wren").await,
+        "header",
+    );
+    assert_eq!((header.revision, header.head_seq), (2, Some(1)));
+    let current = expect_ok(
+        read_current_record(&pool, "wren", "ke_wren").await,
+        "current",
+    )
+    .expect("the committed record is the head");
+    assert_eq!(
+        current["q"]["value"].as_f64(),
+        Some(0.4),
+        "the duplicate never overwrote the committed record"
+    );
+    store.close().await;
+}
+
+/// Rollback of the caller's transaction discards the record row, the head advance
+/// and the revision advance together.
+#[tokio::test]
+async fn rollback_discards_an_append_entirely() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    let pool = second_pool(&path).await;
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    match append_cognition(
+        &mut tx,
+        "wren",
+        "ke_wren",
+        1,
+        &belief("cog_rolled_back", 0.4),
+    )
+    .await
+    {
+        SpokeResult::Ok(assigned) => assert_eq!(assigned, 2, "the append succeeds first"),
+        SpokeResult::Reject(reject) => panic!("the append itself must succeed: {reject:?}"),
+    }
+    tx.rollback().await.expect("rollback");
+
+    let header = expect_ok(
+        read_carrier_header(&pool, "wren", "ke_wren").await,
+        "header",
+    );
+    assert_eq!(
+        (header.revision, header.head_seq),
+        (1, None),
+        "the rollback restores the empty carrier"
+    );
+    let records = expect_ok(read_records(&pool, "wren", "ke_wren").await, "records");
+    assert!(records.is_empty(), "no record row survives the rollback");
+    assert_eq!(
+        expect_ok(
+            read_current_record(&pool, "wren", "ke_wren").await,
+            "current"
+        ),
+        None
+    );
+    store.close().await;
+}
+
+/// Module presence is explicit storage state: an absent module stays absent with no
+/// head, an empty records member stays present-but-empty with no head, and the first
+/// append onto a module-less carrier seeds the same envelope a full put would have.
+#[tokio::test]
+async fn missing_and_empty_cognition_modules_stay_explicit() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let pool = second_pool(&path).await;
+
+    let created = expect_ok(
+        port.put_knowledge_entry(carrier("ke_plain", None), None)
+            .await,
+        "create module-less carrier",
+    );
+    assert_eq!(created.revision, Some(1));
+    let created_empty = expect_ok(
+        port.put_knowledge_entry(
+            with_module(
+                "ke_empty",
+                None,
+                json!({"records": [], "world_facts": [], "extensions": {}}),
+            ),
+            None,
+        )
+        .await,
+        "create empty-records carrier",
+    );
+    assert_eq!(created_empty.revision, Some(1));
+
+    let plain = expect_ok(
+        read_carrier(&port, "ke_plain").await,
+        "read module-less carrier",
+    );
+    assert!(
+        serde_json::to_value(&plain).expect("entry serializes")["modules"]
+            .get("cognition")
+            .is_none(),
+        "an absent module stays absent"
+    );
+    let empty = expect_ok(read_carrier(&port, "ke_empty").await, "read empty carrier");
+    assert_eq!(
+        module_of(&empty)["records"],
+        json!([]),
+        "an empty records member stays present"
+    );
+    assert!(matches!(
+        derive_mind_state(&plain),
+        Err(MindError::NoRecords)
+    ));
+    assert!(matches!(
+        derive_mind_state(&empty),
+        Err(MindError::NoRecords)
+    ));
+    for entry_id in ["ke_plain", "ke_empty"] {
+        let header = expect_ok(read_carrier_header(&pool, "wren", entry_id).await, "header");
+        assert_eq!(header.head_seq, None, "{entry_id} has no rows to point at");
+    }
+
+    // The first storage append onto the module-less carrier seeds the envelope.
+    let mut seeded = belief("cog_seeded", 0.4);
+    seeded["holder"] = reference("knowledge_entry", "ke_plain");
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    match append_cognition(&mut tx, "wren", "ke_plain", 1, &seeded).await {
+        SpokeResult::Ok(assigned) => assert_eq!(assigned, 2),
+        SpokeResult::Reject(reject) => {
+            panic!("append onto a module-less carrier rejected: {reject:?}")
+        }
+    }
+    tx.commit().await.expect("commit");
+
+    let seeded_read = expect_ok(read_carrier(&port, "ke_plain").await, "read seeded carrier");
+    let records = module_of(&seeded_read)["records"]
+        .as_array()
+        .expect("records")
+        .clone();
+    assert_eq!(module_keys(&records), vec!["cog_seeded"]);
+    assert_eq!(
+        module_of(&seeded_read)["world_facts"],
+        json!([]),
+        "the seeded envelope matches the full-put shape"
+    );
+    let header = expect_ok(
+        read_carrier_header(&pool, "wren", "ke_plain").await,
+        "seeded header",
+    );
+    assert_eq!((header.revision, header.head_seq), (2, Some(1)));
+    store.close().await;
+}
+
+/// Full-put CAS: the committed record prefix is immutable — dropping, rewriting or
+/// reordering it is invalid input, every refusal leaves the stored carrier untouched,
+/// and a put that only appends a suffix commits the new revision.
+#[tokio::test]
+async fn full_put_keeps_the_committed_prefix_immutable() {
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    let first = with_order(belief("cog_prefix_first", 0.4), 2);
+    let second = belief("cog_prefix_second", 0.6);
+    let created = expect_ok(
+        port.put_knowledge_entry(
+            with_module(
+                "ke_wren",
+                None,
+                json!({
+                    "records": [first.clone(), second.clone()],
+                    "world_facts": [world_fact()],
+                    "extensions": {},
+                }),
+            ),
+            None,
+        )
+        .await,
+        "create carrier with two records",
+    );
+    assert_eq!(created.revision, Some(1));
+    let baseline = expect_ok(read_carrier(&port, "ke_wren").await, "read carrier");
+
+    // Dropping a committed record is invalid input.
+    match port
+        .put_knowledge_entry(
+            with_module(
+                "ke_wren",
+                Some(1),
+                json!({
+                    "records": [second.clone()],
+                    "world_facts": [world_fact()],
+                    "extensions": {},
+                }),
+            ),
+            Some(1),
+        )
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert!(
+                reject.message.contains("drops 1 committed"),
+                "got {reject:?}"
+            );
+        }
+        SpokeResult::Ok(entry) => panic!("a prefix-dropping put was persisted: {entry:?}"),
+    }
+
+    // Rewriting a committed record's value is invalid input.
+    let rewritten = with_order(belief("cog_prefix_first", 0.45), 2);
+    match port
+        .put_knowledge_entry(
+            with_module(
+                "ke_wren",
+                Some(1),
+                json!({
+                    "records": [rewritten, second.clone()],
+                    "world_facts": [world_fact()],
+                    "extensions": {},
+                }),
+            ),
+            Some(1),
+        )
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert!(
+                reject
+                    .message
+                    .contains("rewrites committed cognition record at position 0"),
+                "got {reject:?}"
+            );
+        }
+        SpokeResult::Ok(entry) => panic!("a prefix-rewriting put was persisted: {entry:?}"),
+    }
+
+    // Reordering the committed prefix is invalid input too.
+    match port
+        .put_knowledge_entry(
+            with_module(
+                "ke_wren",
+                Some(1),
+                json!({
+                    "records": [second.clone(), first.clone()],
+                    "world_facts": [world_fact()],
+                    "extensions": {},
+                }),
+            ),
+            Some(1),
+        )
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert!(
+                reject
+                    .message
+                    .contains("rewrites committed cognition record at position 0"),
+                "got {reject:?}"
+            );
+        }
+        SpokeResult::Ok(entry) => panic!("a prefix-reordering put was persisted: {entry:?}"),
+    }
+
+    // Every refusal left the stored carrier exactly as it was.
+    let reread = expect_ok(read_carrier(&port, "ke_wren").await, "reread carrier");
+    assert_eq!(reread.revision, Some(1));
+    assert_eq!(
+        serde_json::to_value(&reread).expect("entry serializes"),
+        serde_json::to_value(&baseline).expect("entry serializes"),
+        "the refused puts must leave the committed prefix untouched"
+    );
+
+    // A put that appends a validated suffix commits.
+    let suffix = belief("cog_prefix_third", 0.75);
+    let updated = expect_ok(
+        port.put_knowledge_entry(
+            with_module(
+                "ke_wren",
+                Some(1),
+                json!({
+                    "records": [first, second, suffix],
+                    "world_facts": [world_fact()],
+                    "extensions": {},
+                }),
+            ),
+            Some(1),
+        )
+        .await,
+        "append-only put",
+    );
+    assert_eq!(updated.revision, Some(2));
+    let reread = expect_ok(
+        read_carrier(&port, "ke_wren").await,
+        "read after suffix put",
+    );
+    let records = module_of(&reread)["records"]
+        .as_array()
+        .expect("records")
+        .clone();
+    assert_eq!(
+        module_keys(&records),
+        vec!["cog_prefix_first", "cog_prefix_second", "cog_prefix_third"]
+    );
+    assert_eq!(
+        records[0]["q"]["value"].as_f64(),
+        Some(0.4),
+        "the committed prefix keeps its values"
+    );
+    assert_eq!(
+        module_of(&reread)["world_facts"],
+        json!([world_fact()]),
+        "the put preserves the module envelope beside the appended suffix"
+    );
+    store.close().await;
+}
+
+/// Per-holder isolation: heads, records and record-id uniqueness are scoped per
+/// (collection, entry) — two holders in one collection and the same entry id in two
+/// collections keep independent pointers, and one holder's record id never blocks
+/// another holder's.
+#[tokio::test]
+async fn holders_and_collections_isolate_heads_records_and_ids() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let wren = store.knowledge(KnowledgeScope::new("wren"));
+    let studio = store.knowledge(KnowledgeScope::new("studio"));
+    let pool = second_pool(&path).await;
+
+    expect_ok(
+        wren.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create wren holder",
+    );
+    expect_ok(
+        wren.put_knowledge_entry(carrier("ke_fox", None), None)
+            .await,
+        "create fox holder",
+    );
+    expect_ok(
+        studio
+            .put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create studio holder",
+    );
+
+    let held = |entry_id: &str, record_id: &str, q: f64| {
+        let mut record = belief(record_id, q);
+        record["holder"] = reference("knowledge_entry", entry_id);
+        record
+    };
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    let w1 = expect_ok(
+        append_cognition(
+            &mut tx,
+            "wren",
+            "ke_wren",
+            1,
+            &held("ke_wren", "cog_w1", 0.4),
+        )
+        .await,
+        "append w1",
+    );
+    assert_eq!(w1, 2);
+    let f1 = expect_ok(
+        append_cognition(&mut tx, "wren", "ke_fox", 1, &held("ke_fox", "cog_f1", 0.5)).await,
+        "append f1",
+    );
+    assert_eq!(f1, 2);
+    let w2 = expect_ok(
+        append_cognition(
+            &mut tx,
+            "wren",
+            "ke_wren",
+            2,
+            &held("ke_wren", "cog_w2", 0.6),
+        )
+        .await,
+        "append w2",
+    );
+    assert_eq!(w2, 3);
+    let s1 = expect_ok(
+        append_cognition(
+            &mut tx,
+            "studio",
+            "ke_wren",
+            1,
+            &held("ke_wren", "cog_s1", 0.7),
+        )
+        .await,
+        "append s1",
+    );
+    assert_eq!(s1, 2);
+    // The same record_id as wren's committed cog_w1 is a different scoped id in studio.
+    let s2 = expect_ok(
+        append_cognition(
+            &mut tx,
+            "studio",
+            "ke_wren",
+            2,
+            &held("ke_wren", "cog_w1", 0.9),
+        )
+        .await,
+        "studio reuses wren's record id",
+    );
+    assert_eq!(s2, 3);
+    tx.commit().await.expect("commit");
+
+    // Current judgments are per holder.
+    let wren_current = expect_ok(
+        read_current_record(&pool, "wren", "ke_wren").await,
+        "wren current",
+    )
+    .expect("wren has a head");
+    assert_eq!(wren_current["record_id"].as_str(), Some("cog_w2"));
+    let fox_current = expect_ok(
+        read_current_record(&pool, "wren", "ke_fox").await,
+        "fox current",
+    )
+    .expect("fox has a head");
+    assert_eq!(fox_current["record_id"].as_str(), Some("cog_f1"));
+    let studio_current = expect_ok(
+        read_current_record(&pool, "studio", "ke_wren").await,
+        "studio current",
+    )
+    .expect("studio has a head");
+    assert_eq!(studio_current["record_id"].as_str(), Some("cog_w1"));
+    assert_eq!(studio_current["q"]["value"].as_f64(), Some(0.9));
+
+    // Historical lookups never cross the scope.
+    let fox_sees_w1 = expect_ok(
+        read_record(&pool, "wren", "ke_fox", "cog_w1").await,
+        "fox scoped lookup",
+    );
+    assert_eq!(fox_sees_w1, None);
+    let fox_records = expect_ok(read_records(&pool, "wren", "ke_fox").await, "fox records");
+    assert_eq!(module_keys(&fox_records), vec!["cog_f1"]);
+
+    // Independent revisions and heads per holder and per collection.
+    for (collection, entry_id, expected) in [
+        ("wren", "ke_wren", (3, Some(2))),
+        ("wren", "ke_fox", (2, Some(1))),
+        ("studio", "ke_wren", (3, Some(2))),
+    ] {
+        let header = expect_ok(
+            read_carrier_header(&pool, collection, entry_id).await,
+            "header",
+        );
+        assert_eq!(
+            (header.revision, header.head_seq),
+            expected,
+            "{collection}/{entry_id}"
+        );
+    }
+    store.close().await;
+}
+
+/// Historical rows stay addressable by scoped id while the head moves, and reads
+/// follow append order, not the records' own `order` field.
+#[tokio::test]
+async fn historical_records_stay_addressable_while_the_head_moves() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let pool = second_pool(&path).await;
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+
+    // Appended oldest first; the DTO `order` field counts the other way.
+    let oldest = with_order(belief("cog_oldest", 0.2), 3);
+    let middle = with_order(belief("cog_middle", 0.5), 1);
+    let newest = with_order(belief("cog_newest", 0.8), 2);
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    for (expected, record) in [(1, &oldest), (2, &middle), (3, &newest)] {
+        let assigned = expect_ok(
+            append_cognition(&mut tx, "wren", "ke_wren", expected, record).await,
+            "append",
+        );
+        assert_eq!(assigned, expected + 1);
+    }
+    tx.commit().await.expect("commit");
+
+    let historical = expect_ok(
+        read_record(&pool, "wren", "ke_wren", "cog_oldest").await,
+        "oldest lookup",
+    )
+    .expect("the historical row is addressable");
+    assert_eq!(historical["q"]["value"].as_f64(), Some(0.2));
+    let middle_read = expect_ok(
+        read_record(&pool, "wren", "ke_wren", "cog_middle").await,
+        "middle lookup",
+    )
+    .expect("the historical row is addressable");
+    assert_eq!(middle_read["q"]["value"].as_f64(), Some(0.5));
+    let missing = expect_ok(
+        read_record(&pool, "wren", "ke_wren", "cog_absent").await,
+        "missing lookup",
+    );
+    assert_eq!(missing, None);
+
+    let records = expect_ok(read_records(&pool, "wren", "ke_wren").await, "records");
+    assert_eq!(
+        module_keys(&records),
+        vec!["cog_oldest", "cog_middle", "cog_newest"],
+        "append order, not the DTO order field"
+    );
+    let current = expect_ok(
+        read_current_record(&pool, "wren", "ke_wren").await,
+        "current",
+    )
+    .expect("the head is the newest record");
+    assert_eq!(current["record_id"].as_str(), Some("cog_newest"));
+    let header = expect_ok(
+        read_carrier_header(&pool, "wren", "ke_wren").await,
+        "header",
+    );
+    assert_eq!((header.revision, header.head_seq), (4, Some(3)));
+    store.close().await;
+}
+
+/// Independent wire baselines captured from the pre-change fixture shape: the exact
+/// bytes the inline-record carrier produced before the per-row storage landed — the
+/// full `KnowledgeEntry` DTO with its assigned revision, and the derived `MindState`
+/// envelope. Fixed once under `fixtures/`, never built at test time from the
+/// production composition or projection helpers the storage path shares, so a
+/// shared-projection regression cannot pass by regressing both sides together. The
+/// `None` carrier fields (`created_at`, `disclosure`, `owner`, `source_anchor`,
+/// `updated_at`) are absent from the baselines; the write keeps them `None` and
+/// stores its timestamps in SQL columns outside the payload.
+const EXPECTED_STORED_DTO: &str = include_str!("fixtures/pre_change_dto.json");
+
+const EXPECTED_MIND_STATE: &str = include_str!("fixtures/pre_change_mind_state.json");
+
+/// The storage projection equals the pre-change composition: the records stored as
+/// rows read back as the exact full DTO bytes the pre-change inline-record carrier
+/// produced — carrier fields and revision included — and the derived `MindState`
+/// envelope is byte-identical too, selecting within each group by append order,
+/// never by the DTO `order` field.
+#[tokio::test]
+async fn projection_matches_the_pre_change_fixtures_across_groups() {
+    let temp = TempDb::new();
+    let store = MindStore::open(&temp.database_path())
+        .await
+        .expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    let north_first = with_order(belief("cog_a", 0.4), 2);
+    let north_second = belief("cog_b", 0.7);
+    let mut south = belief("cog_c", 0.3);
+    south["target"]["target_id"] = json!("prop_south_gate_open");
+
+    let created = expect_ok(
+        port.put_knowledge_entry(
+            with_module(
+                "ke_wren",
+                None,
+                json!({
+                    "records": [north_first, north_second, south],
+                    "world_facts": [world_fact()],
+                    "extensions": {},
+                }),
+            ),
+            None,
+        )
+        .await,
+        "create carrier with three records",
+    );
+    assert_eq!(created.revision, Some(1), "create assigns revision 1");
+    let stored = expect_ok(read_carrier(&port, "ke_wren").await, "read stored carrier");
+    assert_eq!(
+        stored.revision,
+        Some(1),
+        "the stored carrier carries its assigned revision"
+    );
+    assert_eq!(
+        serde_json::to_string(&stored).expect("stored entry serializes"),
+        EXPECTED_STORED_DTO,
+        "the stored full DTO must be byte-identical to the pre-change inline-record wire shape"
+    );
+
+    let view = derive_mind_state(&stored).expect("derive from the stored carrier");
+    assert_eq!(view.holder_entry_id, "ke_wren");
+    assert_eq!(view.carrier_revision, 1);
+    let state = mind_state_value(&view, "ms_wren_fixture").expect("render the stored view");
+    assert_eq!(
+        serde_json::to_string(&state).expect("mind state serializes"),
+        EXPECTED_MIND_STATE,
+        "the derived MindState must be byte-identical to the pre-change derivation"
+    );
+
+    // Two addressed targets are two groups, in first-appearance order; the last
+    // appended record of each group wins, whatever its `order` says.
+    let items = state["cognition"]["items"]
+        .as_array()
+        .expect("projection items");
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]["target"]["target_id"],
+        json!("prop_north_gate_closed")
+    );
+    assert_eq!(
+        items[0]["selection"]["input_record_ids"],
+        json!(["cog_a", "cog_b"])
+    );
+    assert_eq!(
+        items[0]["selection"]["selected_record_id"], "cog_b",
+        "append order wins inside the group, not the DTO order field"
+    );
+    assert_eq!(
+        items[1]["target"]["target_id"],
+        json!("prop_south_gate_open")
+    );
+    assert_eq!(items[1]["selection"]["input_record_ids"], json!(["cog_c"]));
+    assert_eq!(items[1]["selection"]["selected_record_id"], "cog_c");
     store.close().await;
 }

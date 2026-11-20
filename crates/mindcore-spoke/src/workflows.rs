@@ -19,9 +19,7 @@ use spoke_schemas::{
 use sqlx::SqlitePool;
 
 use mindcore_base::boundary::CallerId;
-use mindcore_base::cognition::{
-    append_cognition_record, carrier_records, derive_mind_state, CARRIER_NAMESPACE,
-};
+use mindcore_base::cognition::{carrier_records, CARRIER_NAMESPACE};
 use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
 use mindcore_base::knowledge::KnowledgeScope;
@@ -29,7 +27,9 @@ use mindcore_spi::{
     AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
     DeliberateSnapshot, RecallSnapshot, SpiError, WorkflowBinding,
 };
-use mindcore_sqlite::{list_entries_in, read_entry, write_entry, SqliteMemoryRepository};
+use mindcore_sqlite::{
+    append_cognition, list_entries_in, read_carrier_header, read_entry, SqliteMemoryRepository,
+};
 
 use crate::admission;
 use crate::reject::Reject;
@@ -692,11 +692,11 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let collection = self
             .admitted_collection(&mut transaction, principal, space_id, &[KNOWLEDGE_READ])
             .await?;
-        let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
+        let carrier = match read_entry(&mut transaction, collection, holder.id.as_str()).await {
             SpokeResult::Ok(carrier) => carrier,
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
-        carrier_holder(holder, &carrier)?;
+        carrier_holder(holder, carrier.entry_id.as_str())?;
         let carrier_revision = carrier.revision.ok_or_else(|| {
             internal(format!(
                 "carrier {} holds no assigned revision",
@@ -752,17 +752,13 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
         self.revalidate_cited(&mut transaction, principal, space_id, cited)
             .await?;
-        let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
-            SpokeResult::Ok(carrier) => carrier,
-            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
-        };
-        carrier_holder(holder, &carrier)?;
-        let current = carrier.revision.ok_or_else(|| {
-            internal(format!(
-                "carrier {} holds no assigned revision",
-                carrier.entry_id
-            ))
-        })?;
+        let header =
+            match read_carrier_header(&mut *transaction, collection, holder.id.as_str()).await {
+                SpokeResult::Ok(header) => header,
+                SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+            };
+        carrier_holder(holder, holder.id.as_str())?;
+        let current = header.revision;
         if current != expected_carrier_revision {
             return Err(SpiError::Settlement(
                 Reject::retryable(
@@ -770,37 +766,38 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                     format!(
                         "carrier {} moved to revision {current}, the verdict was derived from \
                          {expected_carrier_revision}; retry the deliberation",
-                        carrier.entry_id
+                        holder.id.as_str()
                     ),
                 )
                 .into_spoke(),
             ));
         }
-        let next = append_cognition_record(&carrier, record).map_err(|error| {
-            SpiError::InvalidInput(format!("cognition record could not be appended: {error}"))
-        })?;
-        let committed = match write_entry(&mut transaction, collection, next, Some(current)).await {
-            SpokeResult::Ok(committed) => committed,
+        // The append validates the record, inserts its one row and advances the head and
+        // the carrier revision inside this transaction; the workflow's grant, withholding
+        // and citation rechecks above already ran against the same snapshot.
+        let assigned = match append_cognition(
+            &mut transaction,
+            collection,
+            holder.id.as_str(),
+            current,
+            &record,
+        )
+        .await
+        {
+            SpokeResult::Ok(assigned) => assigned,
+            SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::InvalidInput => {
+                return Err(SpiError::InvalidInput(format!(
+                    "cognition record could not be appended: {}",
+                    reject.message
+                )));
+            }
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
         transaction
             .commit()
             .await
             .map_err(|error| uncertain_commit("cognition settlement", error))?;
-        let view = derive_mind_state(&committed).map_err(|error| {
-            SpiError::Settlement(
-                Reject::uncertain(format!(
-                    "committed carrier {} at revision {} derives no MindState: {error}; the \
-                     append is durable, resolve it instead of retrying",
-                    committed.entry_id,
-                    committed
-                        .revision
-                        .map_or_else(|| "unassigned".to_string(), |revision| revision.to_string())
-                ))
-                .into_spoke(),
-            )
-        })?;
-        Ok(view.carrier_revision)
+        Ok(assigned)
     }
 }
 
@@ -923,11 +920,12 @@ fn not_authorized(message: String) -> SpiError {
 }
 
 /// The holder must be this carrier entry in the Mindcore realm: the carrier
-/// record invariant accepts nothing else.
-fn carrier_holder(holder: &CognitionReference, carrier: &KnowledgeEntry) -> Result<(), SpiError> {
+/// record invariant accepts nothing else. The carrier row is addressed by its
+/// own id, so the id check identifies the holder's row.
+fn carrier_holder(holder: &CognitionReference, entry_id: &str) -> Result<(), SpiError> {
     if holder.kind == CognitionReferenceKind::KnowledgeEntry
         && holder.namespace.as_str() == CARRIER_NAMESPACE
-        && holder.id.as_str() == carrier.entry_id.as_str()
+        && holder.id.as_str() == entry_id
     {
         return Ok(());
     }
@@ -936,7 +934,7 @@ fn carrier_holder(holder: &CognitionReference, carrier: &KnowledgeEntry) -> Resu
         holder.kind,
         holder.namespace.as_str(),
         holder.id.as_str(),
-        carrier.entry_id
+        entry_id
     )))
 }
 
