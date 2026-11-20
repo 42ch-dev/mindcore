@@ -1577,6 +1577,24 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(updated.rows_affected() == 1)
     }
 
+    async fn receipt_lease(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> RepoResult<Option<String>> {
+        sqlx::query_scalar!(
+            "SELECT lease_expires_at FROM memory_receipts \
+             WHERE space_id = ? AND receipt_id = ?",
+            space.as_str(),
+            id,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
     async fn list_profiles(
         &self,
         tx: &mut Self::Tx<'_>,

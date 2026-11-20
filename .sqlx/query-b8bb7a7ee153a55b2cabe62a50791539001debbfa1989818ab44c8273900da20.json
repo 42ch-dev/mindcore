@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT lease_expires_at FROM memory_receipts WHERE space_id = ? AND receipt_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "lease_expires_at",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "lease_expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "b8bb7a7ee153a55b2cabe62a50791539001debbfa1989818ab44c8273900da20"
+}

@@ -574,6 +574,16 @@ pub trait MemoryRepository: Send + Sync {
         observed_owner: Option<&str>,
     ) -> Result<bool, Self::Error>;
 
+    /// The stored lease expiry instant of one receipt: `Some` for a leased row, `None` for
+    /// an unleased or missing row. Probes read it to decide whether a pending row is
+    /// abandoned enough to take over.
+    async fn receipt_lease(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        id: &str,
+    ) -> Result<Option<String>, Self::Error>;
+
     /// Profiles of one subject; `kinds` restricts the profile kinds, empty selects all.
     async fn list_profiles(
         &self,

@@ -1837,6 +1837,126 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
     tx.rollback().await.expect("rollback");
 }
 
+/// §7.0.3 liveness: a generation that crashed after staging leaves a pending
+/// receipt whose lease has lapsed. A retry under the same idempotency key does
+/// not answer uncertain forever — it stages takeover work under a fresh owner
+/// and the completion settles.
+#[tokio::test]
+async fn expired_lease_retry_takes_over_and_settles() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
+        .await;
+    sqlx::query!(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_1', ?, ?, 'fact', '{\"text\":\"a live basis record\"}', 'shared', NULL, \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        NOW,
+        NOW,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("seed record");
+    sqlx::query!(
+        "INSERT INTO memory_profiles \
+         (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
+          updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+        SPACE,
+        SUBJECT,
+        r#"{"body":"a real personality","format":"markdown"}"#,
+        NOW,
+        NOW,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("seed profile");
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let state = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" } }),
+            )
+            .await,
+    );
+    let digest = state["state_digest"].as_str().expect("digest").to_string();
+    let request = json!({ "space_id": SPACE, "subject_id": SUBJECT,
+        "selection": { "mode": "subject_all" },
+        "expected_state_digest": digest,
+        "idempotency_key": "gen-takeover" });
+    let staged = adapter
+        .generate_reflection(&mut tx, &principal(PRINCIPAL), request.clone())
+        .await;
+    let work = match staged {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("expected a reflection pending stage, got {other:?}"),
+    };
+    let receipt_id = work.receipt_id.clone();
+    // The crash: transaction 1 commits, the caller never completes.
+    tx.commit().await.expect("commit lease");
+
+    // Advance past the lease instant.
+    sqlx::query!(
+        "UPDATE memory_receipts SET lease_expires_at = '2020-01-01T00:00:00.000Z' \
+         WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("expire lease");
+
+    // The same-key retry does not answer uncertain: it stages takeover work on
+    // the abandoned receipt under a fresh owner.
+    let mut tx = harness.begin().await;
+    let retried = adapter
+        .generate_reflection(&mut tx, &principal(PRINCIPAL), request.clone())
+        .await;
+    let work2 = match retried {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("expected takeover work, got {other:?}"),
+    };
+    assert_eq!(work2.receipt_id, receipt_id);
+    assert_ne!(work2.owner_id, work.owner_id);
+    tx.commit().await.expect("commit retry probe");
+
+    let mut tx2 = harness.begin().await;
+    let completed = adapter.complete_reflection(&mut tx2, work2.compose()).await;
+    let body = match completed {
+        SpokeResult::Ok(body) => body,
+        SpokeResult::Reject(reject) => panic!("completion rejected: {reject:?}"),
+    };
+    assert_eq!(body["status"], "committed");
+    let reflection_id = body["result"]["reflection_id"]
+        .as_str()
+        .expect("reflection id")
+        .to_string();
+    tx2.commit().await.expect("commit completion");
+
+    // The replay now resolves the key to the stored committed result.
+    let mut tx = harness.begin().await;
+    let replay = ready(
+        adapter
+            .generate_reflection(&mut tx, &principal(PRINCIPAL), request)
+            .await,
+    );
+    assert_eq!(
+        replay["result"]["reflection_id"].as_str().expect("id"),
+        reflection_id
+    );
+    tx.rollback().await.expect("rollback");
+}
+
 /// §5.2: a storage failure mid-staging surfaces as a retryable internal
 /// reject — never a receipt or success — and the caller's rollback erases
 /// the partial write: the record was inserted, the intent insert failed,
