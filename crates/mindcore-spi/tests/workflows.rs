@@ -9,11 +9,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use mindcore_spi::{
-    AbsorbCandidateOutcome, AbsorbSnapshot, CaptureOutcome, CitedRecord, CognitiveTaskKind,
-    DeliberateOutcome, DeliberateRequest, DeliberateSnapshot, DomainLens, Embedder,
-    EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings, PolicyDecision,
-    PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation, SettlementDraft, SpiError,
-    SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
+    AbsorbCandidateOutcome, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate,
+    CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest, DeliberateSnapshot,
+    DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings,
+    PolicyDecision, PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation,
+    SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
@@ -755,10 +755,18 @@ impl WorkflowBinding for AbsorbDouble {
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
-        // The first capture commits the receipt; every later one replays it.
+        // The first capture commits the receipt; every later one replays it,
+        // reporting the state the double's candidate is in.
         let call = self.captures.fetch_add(1, Ordering::SeqCst);
+        let lifecycle = match &self.candidate {
+            MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
+            MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
+        };
         Ok(CaptureOutcome {
-            candidate_ids: vec!["cnd_1".to_string()],
+            candidates: vec![CapturedCandidate {
+                candidate_id: "cnd_1".to_string(),
+                lifecycle,
+            }],
             replayed: call > 0,
         })
     }
@@ -1166,12 +1174,13 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
         }]
     );
     assert_eq!(replay, outcomes);
-    // Only the replay read the candidate back: a fresh capture needs no
-    // review or recall grant beyond its own admission.
+    // Neither run read the candidate back: a fresh capture's candidate is
+    // pending by construction, and a replay reports a pending candidate
+    // straight from its receipt, needing no review or recall grant.
     assert_eq!(
         recorded.snapshots.load(Ordering::SeqCst),
-        1,
-        "the fresh capture was reported without a candidate read"
+        0,
+        "a pending candidate is reported without a candidate read"
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
 }
@@ -2471,6 +2480,46 @@ async fn deliberate_starts_no_attempt_once_the_deadline_passed() {
         "no attempt, and so no retry, starts after the deadline"
     );
     assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+#[tokio::test]
+async fn deliberate_clamps_an_absurd_timeout_and_still_settles() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        // A timeout no instant can hold: the deadline is clamped, not dropped.
+        timeout: std::time::Duration::MAX,
+    };
+
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("a clamped deadline never refuses a call that fits inside it");
+
+    assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+    assert_eq!(settlements.lock().expect("settlements").len(), 1);
 }
 
 /// Refuses every absorb decision: prompt fragments guide, but only this

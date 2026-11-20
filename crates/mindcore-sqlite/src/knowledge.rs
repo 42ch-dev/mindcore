@@ -22,7 +22,8 @@ use crate::store::MindStore;
 /// the payload and never select rows.
 ///
 /// `put` persists the submitted payload unchanged except for the assigned `revision` (`1` on create,
-/// stored + 1 on update); the SQL timestamp columns carry the store's own write bookkeeping.
+/// stored + 1 on update) and, on update, the stored row's `created_at`, which the payload repeats so
+/// payload and column agree; the SQL timestamp columns carry the store's own write bookkeeping.
 /// A present `modules.cognition` is gated here, so no caller can commit a module that the next
 /// derivation would reject.
 pub struct ScopedKnowledgeStore {
@@ -166,6 +167,10 @@ where
 /// Write one entry of `collection` against `expected_base_revision` through the
 /// caller's transaction, assigning `1` on create and `stored + 1` on update.
 ///
+/// An update also restores the stored row's `created_at` into the payload: the
+/// SQL column keeps the original creation instant across an update, so the
+/// payload must not carry a fresher one.
+///
 /// The caller holds the write reservation, so the revision comparison and the
 /// write cannot interleave with another handle on the same file.
 pub async fn write_entry(
@@ -191,17 +196,19 @@ pub async fn write_entry(
         }
     }
 
-    let stored: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    let stored: Result<Option<(i64, String)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, created_at FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
     )
     .bind(collection)
     .bind(&entry.entry_id)
     .fetch_optional(&mut **tx)
     .await;
     let stored = match stored {
-        Ok(stored) => stored.map(|revision| revision as u64),
+        Ok(stored) => stored,
         Err(error) => return internal(format!("stored revision could not be read: {error}")),
     };
+    let stored_created_at = stored.as_ref().map(|(_, created_at)| created_at.clone());
+    let stored = stored.map(|(revision, _)| revision as u64);
 
     let revision = match expected_base_revision {
         None => match stored {
@@ -223,9 +230,24 @@ pub async fn write_entry(
         },
     };
 
-    // Store bookkeeping stays in the SQL timestamp columns; the payload keeps the caller's.
+    // Store bookkeeping stays in the SQL timestamp columns; the payload keeps
+    // the caller's, except the creation instant an update never moves.
     let now = Utc::now();
     entry.revision = Some(revision);
+    if let Some(stored_created_at) = stored_created_at {
+        let created_at = match DateTime::parse_from_rfc3339(&stored_created_at) {
+            Ok(created_at) => created_at.with_timezone(&Utc),
+            Err(error) => {
+                return internal(format!(
+                    "stored created_at of knowledge entry {} is not RFC 3339: {error}",
+                    entry.entry_id
+                ))
+            }
+        };
+        // The row column is not rewritten by an update, so the payload carries
+        // the stored instant: payload and column never diverge on it.
+        entry.created_at = Some(created_at);
+    }
 
     let payload = match encode(&entry) {
         SpokeResult::Ok(payload) => payload,
