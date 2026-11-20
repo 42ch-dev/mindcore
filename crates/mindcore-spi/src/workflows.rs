@@ -2132,6 +2132,25 @@ pub(crate) fn hybrid_scores(
         .collect()
 }
 
+/// Test-only view of the page scorer: one score per text, as raw `f64` bits.
+///
+/// Exists so `mindcore-spoke`'s tests can compare the ranking of fresh provider
+/// vectors against vectors reloaded from persisted BLOBs bit for bit. Only that
+/// crate's `[dev-dependencies]` enable the `test-scoring` feature; the feature
+/// must never be enabled by a production dependency edge.
+#[cfg(feature = "test-scoring")]
+pub fn scored_bits_for_test(
+    texts: &[&str],
+    query: &str,
+    query_vector: &[f32],
+    vectors: &[Vec<f32>],
+) -> Vec<u64> {
+    hybrid_scores(texts, query, query_vector, vectors)
+        .into_iter()
+        .map(f64::to_bits)
+        .collect()
+}
+
 fn bm25_scores(texts: &[&str], query: &str) -> Vec<f64> {
     let terms = query_terms(query);
     let documents: Vec<Vec<String>> = texts.iter().map(|text| terms_of(text)).collect();

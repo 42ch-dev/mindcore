@@ -3643,6 +3643,23 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         );
     }
 
+    // Task 3's parity evidence: the same page and fixed query must score bit for
+    // bit the same from fresh provider vectors and from the reloaded BLOBs, so a
+    // score change that happens to preserve order cannot slip through.
+    let query_vector = axis_vector("north gate");
+    let fresh_scores = mindcore_spi::workflows::scored_bits_for_test(
+        &texts,
+        "north gate",
+        &query_vector,
+        &fresh_vectors,
+    );
+    let reloaded_scores =
+        mindcore_spi::workflows::scored_bits_for_test(&texts, "north gate", &query_vector, &stored);
+    assert_eq!(
+        reloaded_scores, fresh_scores,
+        "every item keeps its exact score bits once its vector is reloaded"
+    );
+
     // A second engine starts with a cold query slot: every record vector it
     // scores comes back through the stored BLOB, and it serves exactly the
     // page those scores dictate.
