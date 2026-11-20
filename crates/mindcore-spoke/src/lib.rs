@@ -17,6 +17,9 @@ mod project;
 mod reflection;
 mod reject;
 mod wire;
+mod workflows;
+
+pub use workflows::MemoryWorkflowBinding;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

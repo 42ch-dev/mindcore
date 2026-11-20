@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool, Transaction};
 
 use mindcore_base::cognition::carrier_record_violation;
 use mindcore_base::knowledge::KnowledgeScope;
@@ -41,27 +41,41 @@ impl ScopedKnowledgeStore {
 
     /// Every entry of this collection, ordered by `entry_id` ASC.
     pub async fn list_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
-        let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC",
-        )
-        .bind(&self.scope.collection)
-        .fetch_all(&self.pool)
-        .await;
-        let payloads = match payloads {
-            Ok(payloads) => payloads,
-            Err(error) => {
-                return internal(format!("knowledge entries could not be listed: {error}"))
-            }
-        };
-        let mut entries = Vec::with_capacity(payloads.len());
-        for payload in &payloads {
-            match decode(payload) {
-                SpokeResult::Ok(entry) => entries.push(entry),
-                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-            }
-        }
-        SpokeResult::Ok(entries)
+        entries(&self.pool, &self.scope.collection).await
     }
+}
+
+/// Every entry of `collection`, ordered by `entry_id` ASC, read through the
+/// caller's transaction so a workflow reads one whole snapshot at one point.
+pub async fn list_entries_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+) -> SpokeResult<Vec<KnowledgeEntry>> {
+    entries(&mut **tx, collection).await
+}
+
+async fn entries<'e, E>(executor: E, collection: &str) -> SpokeResult<Vec<KnowledgeEntry>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC",
+    )
+    .bind(collection)
+    .fetch_all(executor)
+    .await;
+    let payloads = match payloads {
+        Ok(payloads) => payloads,
+        Err(error) => return internal(format!("knowledge entries could not be listed: {error}")),
+    };
+    let mut stored = Vec::with_capacity(payloads.len());
+    for payload in &payloads {
+        match decode(payload) {
+            SpokeResult::Ok(entry) => stored.push(entry),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        }
+    }
+    SpokeResult::Ok(stored)
 }
 
 impl MindStore {

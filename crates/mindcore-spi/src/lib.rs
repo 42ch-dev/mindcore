@@ -7,9 +7,15 @@
 //! no Nexus, no network or model SDK enters the contract surface.
 //!
 //! [`MindWorkflows`]' methods are contracts for the next workflow tranche;
-//! this crate ships no production workflow implementation. [`PromptReasoner`]
-//! is the only included bridge: it adapts a text-prompt executor closure (the
-//! Nexus `PromptExecutor` seam, bound by the caller) to [`Reasoner`].
+//! [`SpiMindWorkflows`] implements `recall_context` over a DTO-only
+//! [`WorkflowBinding`], and `absorb`/`deliberate` remain contracts.
+//! [`PromptReasoner`] is the only included capability bridge: it adapts a
+//! text-prompt executor closure (the Nexus `PromptExecutor` seam, bound by the
+//! caller) to [`Reasoner`].
+
+pub mod workflows;
+
+pub use workflows::{RecallSnapshot, SpiMindWorkflows, WorkflowBinding};
 
 use std::future::Future;
 
