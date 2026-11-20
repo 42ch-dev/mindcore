@@ -387,6 +387,7 @@ async fn expired_lease_pending_receipt_taken_over() {
     // A different owner claims the abandoned pending row: the CAS persists the new
     // owner and expiry inside this caller-owned transaction. The expiry is measured
     // from the claim instant (30s lease), not from when the transaction began.
+    let claim_start = chrono::Utc::now();
     assert!(repo
         .claim_receipt_lease(
             &mut tx,
@@ -397,6 +398,7 @@ async fn expired_lease_pending_receipt_taken_over() {
         )
         .await
         .unwrap());
+    let claim_end = chrono::Utc::now();
     // The stamped lease is in the future: a takeover stamped from the request
     // instant could already be expired and re-leasable on the very next retry.
     let stamped = repo
@@ -405,13 +407,14 @@ async fn expired_lease_pending_receipt_taken_over() {
         .unwrap()
         .expect("claimed row carries a lease");
     let stamped_at = chrono::DateTime::parse_from_rfc3339(&stamped).expect("lease stamp");
-    let claim_window = (
-        chrono::Utc::now() + chrono::Duration::seconds(25),
-        chrono::Utc::now() + chrono::Duration::seconds(35),
-    );
+    // The stamp is millisecond-truncated, so its instant can sit a millisecond
+    // below the full-precision claim start.
+    let earliest = claim_start + chrono::Duration::seconds(30) - chrono::Duration::milliseconds(1);
+    let latest = claim_end + chrono::Duration::seconds(30);
     assert!(
-        stamped_at > claim_window.0 && stamped_at < claim_window.1,
-        "stamped lease {stamped} must be now+30s, inside {claim_window:?}"
+        stamped_at >= earliest && stamped_at <= latest,
+        "stamped lease {stamped} must sit inside the measured claim interval +30s \
+         ({earliest}..={latest})"
     );
     // The claim is lost when the row no longer qualifies — already re-leased here, so the
     // second claimant gets no work and the crashed owner still cannot settle.
@@ -1434,16 +1437,23 @@ async fn absent_include_shared_and_null_filter_decode() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].reflection_id, "rfl_legacy");
     assert_eq!(rows[0].filter, None);
-    let invisible = repo
+    // A request pinning the same context with `include_shared: false` still
+    // covers the row: the stored flag decodes as `false` (had it decoded as
+    // `true`, this request would see nothing — unlike `SharedOnly`, which
+    // rejects a pinned selected-contexts row either way).
+    let covered = repo
         .list_reflections(
             &mut tx,
             &SpaceId::new("spc_workshop"),
             "sub_mira",
-            Some(&PlacementSelection::SharedOnly),
+            Some(&PlacementSelection::SelectedContexts {
+                context_ids: vec![ContextId::new("ctx_a")],
+                include_shared: false,
+            }),
         )
         .await
         .unwrap();
-    assert!(invisible.is_empty());
+    assert_eq!(covered.len(), 1);
 
     // A present non-boolean `include_shared` still fails strict decode.
     sqlx::query(

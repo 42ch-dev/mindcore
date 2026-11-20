@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT revision, content_json, tombstone_json FROM memory_records WHERE space_id = ? AND record_id = 'rec_fenced'",
+  "describe": {
+    "columns": [
+      {
+        "name": "revision",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "content_json",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "content_json"
+          }
+        }
+      },
+      {
+        "name": "tombstone_json",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "tombstone_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "d66dc2a7625cee374a3cd26779ea7f8ca017d66e1303b19e5e21f2dab40fc72d"
+}

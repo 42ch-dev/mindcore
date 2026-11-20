@@ -1933,7 +1933,9 @@ async fn expired_lease_retry_takes_over_and_settles() {
     // The takeover persisted B's owner: the crashed owner's stale completion can
     // no longer settle behind B's claim.
     let mut tx_a = harness.begin().await;
-    let stale = adapter.complete_reflection(&mut tx_a, work.compose()).await;
+    let stale = adapter
+        .complete_reflection(&mut tx_a, work.clone().compose())
+        .await;
     let refusal = reject(&stale);
     assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
     tx_a.rollback().await.expect("rollback stale settle");
@@ -1947,6 +1949,37 @@ async fn expired_lease_retry_takes_over_and_settles() {
     let refusal = reject(&third);
     assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
     tx_c.rollback().await.expect("rollback third retry");
+
+    // Even after B's stamped lease itself lapses, ownership stays persisted:
+    // the crashed owner's completion is still refused, the envelope never
+    // lands, and the receipt stays pending until the recorded owner settles.
+    sqlx::query!(
+        "UPDATE memory_receipts SET lease_expires_at = '2020-01-01T00:00:00.000Z' \
+         WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("expire takeover lease");
+    let mut tx_a2 = harness.begin().await;
+    let stale = adapter
+        .complete_reflection(&mut tx_a2, work.compose())
+        .await;
+    let refusal = reject(&stale);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    tx_a2
+        .rollback()
+        .await
+        .expect("rollback expired-lease settle");
+    assert_eq!(harness.count_pool("memory_reflections").await, 0);
+    let status: String = sqlx::query_scalar!(
+        "SELECT status FROM memory_receipts WHERE receipt_id = ?",
+        &receipt_id,
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("receipt");
+    assert_eq!(status, "pending");
 
     let mut tx2 = harness.begin().await;
     let completed = adapter.complete_reflection(&mut tx2, work2.compose()).await;
@@ -3016,6 +3049,20 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     }
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
     assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
+    // The refusals wrote nothing: revision, content and tombstone are the
+    // seeded values read back inside this same transaction.
+    let row = sqlx::query!(
+        "SELECT revision, content_json, tombstone_json FROM memory_records \
+         WHERE space_id = ? AND record_id = 'rec_fenced'",
+        SPACE,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read fenced record");
+    assert_eq!(row.revision, 1);
+    assert_eq!(row.content_json, r#"{"text":"a live record"}"#);
+    assert_eq!(row.tombstone_json.as_deref(), None);
+
     // The unfenced sibling placement stays writable.
     let sibling = adapter
         .update_record(
@@ -3210,6 +3257,28 @@ async fn uncovered_by_id_rows_read_as_not_found() {
     let adapter = MemoryAdapter::new(true);
 
     let mut tx = harness.begin().await;
+    // The same id rejects identically before the row exists and after it
+    // exists but is uncovered — concealment is total.
+    let before = adapter
+        .update_record(
+            &mut tx,
+            &principal(STRANGER),
+            json!({
+                "space_id": SPACE,
+                "record_id": "rec_held",
+                "expected_revision": 1,
+                "idempotency_key": "upd-held-before",
+                "content": { "text": "x" }
+            }),
+        )
+        .await;
+    let absent_reject = reject(&before);
+    assert_eq!(absent_reject.code, SpokeRejectCode::NotFound);
+    let absent_envelope = (
+        absent_reject.code,
+        absent_reject.message.clone(),
+        absent_reject.details.clone(),
+    );
     seed_record(&mut tx, "rec_held", "a held record", NOW).await;
     // The held candidate exists for PRINCIPAL only.
     let captured = ready(
@@ -3335,6 +3404,83 @@ async fn uncovered_by_id_rows_read_as_not_found() {
     let refusal = reject(&created);
     assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
     assert_eq!(retry_class(refusal), "terminal");
+    // After seeding, the held id still rejects with the byte-identical
+    // envelope the absent id produced.
+    let after = adapter
+        .update_record(
+            &mut tx,
+            &principal(STRANGER),
+            json!({
+                "space_id": SPACE,
+                "record_id": "rec_held",
+                "expected_revision": 1,
+                "idempotency_key": "upd-held-after",
+                "content": { "text": "x" }
+            }),
+        )
+        .await;
+    let covered_reject = reject(&after);
+    assert_eq!(
+        (
+            covered_reject.code,
+            covered_reject.message.clone(),
+            covered_reject.details.clone(),
+        ),
+        absent_envelope,
+        "an uncovered record must be indistinguishable from a missing one",
+    );
+    tx.rollback().await.expect("rollback");
+
+    // Split coverage stays concealed: one grant covers only the shared source,
+    // another only the c9 target — §6.5 never unions them — so promote of the
+    // held record rejects exactly like a missing record.
+    for (grant_id, shared_access, contexts) in [
+        ("grt_split_shared", 1, "[\"c1\"]"),
+        ("grt_split_c9", 0, "[\"c9\"]"),
+    ] {
+        sqlx::query(
+            "INSERT INTO memory_grants \
+             (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+              shared_access, expires_at, revoked_at, revision, created_at) \
+             VALUES (?, ?, NULL, ?, '[\"promote\",\"records_write\"]', ?, ?, NULL, NULL, 1, ?)",
+        )
+        .bind(grant_id)
+        .bind(SPACE)
+        .bind(STRANGER)
+        .bind(contexts)
+        .bind(shared_access)
+        .bind(NOW)
+        .execute(&harness.pool)
+        .await
+        .expect("seed split grant");
+    }
+    let mut tx = harness.begin().await;
+    for (record_id, key) in [
+        ("rec_held", "pro-held-split"),
+        ("rec_absent", "pro-absent-split"),
+    ] {
+        let result = adapter
+            .promote_record(
+                &mut tx,
+                &principal(STRANGER),
+                json!({
+                    "space_id": SPACE,
+                    "record_id": record_id,
+                    "expected_revision": 1,
+                    "target_scope": { "visibility": "context", "context_id": "c9" },
+                    "idempotency_key": key
+                }),
+            )
+            .await;
+        let refusal = reject(&result);
+        assert_eq!(
+            refusal.code,
+            SpokeRejectCode::NotFound,
+            "record {record_id}"
+        );
+        assert_eq!(retry_class(refusal), "terminal");
+        assert_eq!(refusal.message, format!("record {record_id} not found"));
+    }
     tx.rollback().await.expect("rollback");
 }
 
