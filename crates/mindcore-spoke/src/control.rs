@@ -383,7 +383,11 @@ impl MemoryAdapter {
             subject_id,
             Utc::now(),
         ) {
-            return Err(Reject::not_found(format!("subject {subject_id}")));
+            // §7.6/S-4: no coverage is `NOT_AUTHORIZED` before the row is read,
+            // so a revoked or expired grant cannot disclose the subject either.
+            return Err(Reject::not_authorized(format!(
+                "principal {principal_id} holds no live grant on subject {subject_id}"
+            )));
         }
         let Some(row) = admission::subject(&self.repository, tx, &space, subject_id).await? else {
             return Err(Reject::not_found(format!("subject {subject_id}")));

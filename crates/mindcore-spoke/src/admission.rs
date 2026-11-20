@@ -323,6 +323,7 @@ pub(crate) fn any_grant_for_subject(
     rows.iter().any(|row| {
         row.principal_id.as_str() == principal
             && row.space_id.as_str() == space
+            && row.revoked_at.is_none()
             && !expiry_passed(row.expires_at.as_deref(), now)
             && row
                 .subject_id
@@ -343,6 +344,7 @@ pub(crate) fn profile_visible(
     rows.iter().any(|row| {
         row.principal_id.as_str() == principal
             && row.space_id.as_str() == space
+            && row.revoked_at.is_none()
             && !expiry_passed(row.expires_at.as_deref(), now)
             && row
                 .subject_id

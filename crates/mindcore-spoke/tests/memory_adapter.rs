@@ -990,6 +990,69 @@ async fn digest_binds_the_original_request_not_the_normalized_dto() {
     tx.rollback().await.expect("rollback");
 }
 
+/// §6.5/§7.6/§7.23: a revoked-but-unexpired grant is not live, so subject and
+/// profile reads refuse instead of disclosing; a live grant still passes.
+#[tokio::test]
+async fn revoked_grant_denies_subject_and_profile_reads() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["records_read"]).await;
+    harness.seed_grant("p_revoked", &["admin"]).await;
+    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = 'p_revoked'")
+        .bind(NOW)
+        .execute(&harness.pool)
+        .await
+        .expect("revoke the grant");
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let subject = adapter
+        .get_subject(
+            &mut tx,
+            &principal("p_revoked"),
+            json!({ "space_id": SPACE, "subject_id": SUBJECT }),
+        )
+        .await;
+    let refusal = reject(&subject);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(refusal), "terminal");
+
+    let profile = adapter
+        .get_profile(
+            &mut tx,
+            &principal("p_revoked"),
+            json!({ "space_id": SPACE, "subject_id": SUBJECT, "profile_kinds": ["personality"] }),
+        )
+        .await;
+    let refusal = reject(&profile);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(refusal), "terminal");
+
+    // Unrevoked and unexpired: both reads proceed (the profile read is
+    // honestly empty rather than refused).
+    let subject = ready(
+        adapter
+            .get_subject(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT }),
+            )
+            .await,
+    );
+    assert_eq!(subject["subject"]["subject_id"], SUBJECT);
+    let profiles = ready(
+        adapter
+            .get_profile(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT, "profile_kinds": ["personality"] }),
+            )
+            .await,
+    );
+    assert_eq!(profiles["profiles"], json!([]));
+    tx.rollback().await.expect("rollback");
+}
+
 /// The public surface compiles with the assignment's exact signature shape.
 #[allow(dead_code)]
 async fn every_named_operation(
