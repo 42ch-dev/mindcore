@@ -220,8 +220,10 @@ where
 
 /// Deletes one retired identity's whole partition through the identity index.
 ///
-/// The caller drains in-flight fills for that identity first and passes the trusted retired hash,
-/// never a request value; other identities and their rows are untouched.
+/// The storage layer neither drains nor blocks a fill already in flight for that identity: a fill
+/// that commits afterwards re-creates rows, so a caller that needs the partition to stay gone
+/// quiesces those fills first. Pass the trusted retired hash, never a request value; other
+/// identities and their rows are untouched.
 pub async fn delete_identity_vectors<'e, E>(executor: E, identity_hash: &str) -> SpokeResult<u64>
 where
     E: Executor<'e, Database = Sqlite>,
