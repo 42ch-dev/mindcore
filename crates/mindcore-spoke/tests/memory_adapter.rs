@@ -4339,21 +4339,41 @@ async fn receipts_poll_serves_regardless_of_unsettled_intents() {
     assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
     assert_eq!(retry_class(refusal), "uncertain");
 
-    for (label, receipt_id, status) in [
-        ("committed", committed_receipt.as_str(), "committed"),
-        ("failed", "rct_mine_failed", "failed"),
-    ] {
-        let body = ready(
-            adapter
-                .get_receipt(
-                    &mut tx,
-                    &principal(PRINCIPAL),
-                    json!({ "space_id": SPACE, "receipt_id": receipt_id }),
-                )
-                .await,
-        );
-        assert_eq!(body["receipt"]["status"], json!(status), "{label}");
-    }
+    let committed = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "receipt_id": committed_receipt }),
+            )
+            .await,
+    );
+    assert_eq!(committed["receipt"]["status"], "committed");
+    assert_eq!(
+        committed["receipt"]["result"], committed_body["result"],
+        "committed poll must serve the recorded result"
+    );
+
+    let failed = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "receipt_id": "rct_mine_failed" }),
+            )
+            .await,
+    );
+    assert_eq!(failed["receipt"]["status"], "failed");
+    assert_eq!(
+        failed["receipt"]["error"],
+        json!({
+            "code": "INTERNAL_ERROR",
+            "message": "a recorded failure",
+            "details": {"retry_class": "terminal"},
+            "extensions": {},
+        }),
+        "failed poll must serve the recorded error envelope"
+    );
 
     // Another requester's receipt stays `NOT_AUTHORIZED`, not withheld.
     let theirs = adapter
