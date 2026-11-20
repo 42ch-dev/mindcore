@@ -16,7 +16,8 @@
 //! and denies its ops on the wire, and a tool the runtime does not serve answers `op_unsupported`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
@@ -28,7 +29,9 @@ use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{
     MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
 };
-use mindcore_spi::{CognitiveTaskKind, Reasoner, SpiError, StructuredReasonRequest};
+use mindcore_spi::{
+    CognitiveTaskKind, Embedder, EmbeddingIdentity, Reasoner, SpiError, StructuredReasonRequest,
+};
 use mindcore_sqlite::MindStore;
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
@@ -1089,4 +1092,198 @@ async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
         "the installed host handler answered: {result}"
     );
     assert_eq!(result["arguments"], json!({ "probe": 1 }));
+}
+
+/// An embedder whose serving identity the test rotates: it records every text it embeds, so a
+/// recall's provider cost is a count rather than an inference.
+struct RotatingEmbedder {
+    first: EmbeddingIdentity,
+    second: EmbeddingIdentity,
+    second_active: AtomicBool,
+    embedded: Mutex<Vec<String>>,
+}
+
+impl RotatingEmbedder {
+    fn new(first: EmbeddingIdentity, second: EmbeddingIdentity) -> Self {
+        Self {
+            first,
+            second,
+            second_active: AtomicBool::new(false),
+            embedded: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The host rotating its embedder to the other serving identity.
+    fn rotate(&self) {
+        let active = self.second_active.load(Ordering::SeqCst);
+        self.second_active.store(!active, Ordering::SeqCst);
+    }
+
+    fn embedded(&self) -> Vec<String> {
+        self.embedded.lock().expect("embedded texts").clone()
+    }
+}
+
+#[async_trait]
+impl Embedder for RotatingEmbedder {
+    fn identity(&self) -> Option<&EmbeddingIdentity> {
+        Some(match self.second_active.load(Ordering::SeqCst) {
+            true => &self.second,
+            false => &self.first,
+        })
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        self.embedded
+            .lock()
+            .expect("embedded texts")
+            .extend(texts.iter().cloned());
+        Ok(texts
+            .iter()
+            .map(|text| match text.contains("market") {
+                true => vec![0.0, 1.0],
+                false => vec![1.0, 0.0],
+            })
+            .collect())
+    }
+}
+
+/// A serving identity over the same model, distinguished only by its version pin.
+fn axes_identity(model_version: &str) -> EmbeddingIdentity {
+    EmbeddingIdentity {
+        provider_id: "local".to_string(),
+        model_id: "axes".to_string(),
+        model_version: model_version.to_string(),
+        dim: 2,
+    }
+}
+
+/// How many stored vectors one identity's partition holds.
+async fn vector_rows(pool: &sqlx::SqlitePool, model_version: &str) -> i64 {
+    let hash = expect_ok(
+        mindcore_sqlite::vectors::identity_hash("local", "axes", model_version, 2),
+        "hash the serving identity",
+    );
+    sqlx::query_scalar("SELECT COUNT(*) FROM memory_embedding_vectors WHERE identity_hash = ?")
+        .bind(hash)
+        .fetch_one(pool)
+        .await
+        .expect("count one identity's vectors")
+}
+
+/// The fixture recall with a query: only the query path writes a query slot and record vectors.
+fn query_recall_arguments() -> Value {
+    let mut arguments = recall_arguments();
+    arguments["request"]["query"] = json!("north gate");
+    arguments
+}
+
+/// Identity rotation has one supported host entry: retiring through the surface clears that
+/// identity's query slot and deletes its stored partition, leaving another identity's slot and
+/// rows warm and making a later recall under the retired identity recompute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_an_identity_clears_its_slot_and_partition() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let embedder = Arc::new(RotatingEmbedder::new(
+        axes_identity("1"),
+        axes_identity("2"),
+    ));
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders {
+                embedder: Some(embedder.clone()),
+                ..MindProviders::default()
+            },
+            None,
+        ),
+    );
+    let session = connect(&surface, &[RECALL_CONTEXT]).await;
+
+    // Identity 1 writes its partition and installs the one query slot.
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under identity 1",
+    );
+    assert_eq!(
+        vector_rows(&pool, "1").await,
+        2,
+        "the serving identity stores one row per live record"
+    );
+
+    // Rotation moves the slot to identity 2; identity 1's rows stay until it is retired.
+    embedder.rotate();
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under identity 2",
+    );
+    assert_eq!(vector_rows(&pool, "2").await, 2);
+
+    let deleted = expect_ok(
+        surface.retire_embedding_identity(&axes_identity("1")).await,
+        "retire identity 1 through the surface",
+    );
+    assert_eq!(deleted, 2, "retirement reports the rows it deleted");
+    assert_eq!(
+        vector_rows(&pool, "1").await,
+        0,
+        "the retired partition is empty"
+    );
+    assert_eq!(
+        vector_rows(&pool, "2").await,
+        2,
+        "another identity's rows survive"
+    );
+
+    // Identity 2's slot and rows are still warm: a recall needs no provider call at all.
+    let before = embedder.embedded().len();
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under identity 2 after the retirement",
+    );
+    assert_eq!(
+        embedder.embedded().len(),
+        before,
+        "another identity's query slot survives the retirement"
+    );
+
+    // The retired identity recomputes instead of serving rows it no longer has.
+    embedder.rotate();
+    let before = embedder.embedded().len();
+    expect_ok(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, query_recall_arguments())
+            .await,
+        "recall under the retired identity",
+    );
+    let mut reembedded = embedder.embedded()[before..].to_vec();
+    reembedded.sort();
+    assert_eq!(
+        reembedded,
+        [
+            "north gate",
+            "the market opens at dawn",
+            "the north gate is closed",
+        ],
+        "the retired identity re-embeds its query and its rows"
+    );
+    assert_eq!(
+        vector_rows(&pool, "1").await,
+        2,
+        "the retired identity fills its partition again"
+    );
 }

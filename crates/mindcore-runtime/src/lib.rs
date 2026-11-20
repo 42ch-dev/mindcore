@@ -14,9 +14,9 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_spi::{MindWorkflows, SpiError, SpiMindWorkflows};
+use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
 use mindcore_spoke::MemoryWorkflowBinding;
-use mindcore_sqlite::{validate_admission_scope, MindStore};
+use mindcore_sqlite::{validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
     CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_MEMORY,
 };
@@ -27,6 +27,7 @@ use spoke_connect::remote::{
 use spoke_operations::{spoke_reject, validate_manifest_tools, SpokeRejectCode, SpokeResult};
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
+use sqlx::SqlitePool;
 
 pub use tools::MindProviders;
 use tools::WorkflowTools;
@@ -85,9 +86,10 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        let workflows: Arc<dyn MindWorkflows> = self.workflows(&faces);
+        let workflows = self.workflows(&faces);
+        let engine: Arc<dyn MindWorkflows> = workflows.clone();
         let mut tools =
-            WorkflowTools::new(workflows, faces.principals, faces.providers).registrations();
+            WorkflowTools::new(engine, faces.principals, faces.providers).registrations();
         tools.extend(faces.tools);
         // Deliberation settles onto the host's carrier collection; a surface without that route
         // serves no deliberation. The invariant holds over the final set, so a host registration
@@ -112,6 +114,8 @@ impl MindcoreServe {
             ports: Arc::new(ports),
             manifest,
             tools,
+            workflows,
+            pool: self.store.pool(),
         })
     }
 }
@@ -181,9 +185,40 @@ pub struct MindcoreSurface {
     /// serve.
     pub manifest: HostCapabilityManifest,
     tools: Vec<ToolRegistration>,
+    /// The engine behind the tools: its query slot is the in-memory half of identity retirement.
+    workflows: Arc<SpiMindWorkflows>,
+    /// The pool the vectors live on: the disk half of identity retirement.
+    pool: SqlitePool,
 }
 
 impl MindcoreSurface {
+    /// Retire one serving identity: clear its in-memory query slot, then delete its stored
+    /// partition.
+    ///
+    /// This is the one supported host entry, so rotating identity never means remembering both
+    /// halves. Returns how many stored vectors were deleted — zero for an identity with no rows —
+    /// and another identity keeps its rows and its query slot. An identity with no dimension is
+    /// refused as `InvalidInput`.
+    ///
+    /// Call it between recalls: the surface does not drain a recall already in flight for
+    /// `identity`, and a fill that commits afterwards re-creates rows this call deleted.
+    pub async fn retire_embedding_identity(
+        &self,
+        identity: &EmbeddingIdentity,
+    ) -> SpokeResult<u64> {
+        self.workflows.retire_identity(identity);
+        let hash = match vectors::identity_hash(
+            &identity.provider_id,
+            &identity.model_id,
+            &identity.model_version,
+            identity.dim,
+        ) {
+            SpokeResult::Ok(hash) => hash,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        vectors::delete_identity_vectors(&self.pool, &hash).await
+    }
+
     /// Install every served tool handler on `responder`.
     ///
     /// Run this before the host lets inbound hello traffic reach the responder: a dialer may invoke

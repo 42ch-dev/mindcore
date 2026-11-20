@@ -17,10 +17,10 @@ serde_json.workspace = true
 spoke-connect = { workspace = true, features = ["remote-adapter"] }
 spoke-operations.workspace = true
 spoke-schemas.workspace = true
+sqlx.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
 ed25519-dalek = "2"
-sqlx.workspace = true
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
