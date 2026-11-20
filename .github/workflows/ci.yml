@@ -20,4 +20,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        env:
+          SQLX_OFFLINE: "true"
       - run: cargo test --locked --workspace
+        env:
+          SQLX_OFFLINE: "true"
+      - name: sqlx offline cache freshness
+        run: |
+          cargo install sqlx-cli --version '=0.9.1' --locked --no-default-features --features sqlite
+          fixture_dir="$(mktemp -d)"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          sqlite3 -bail "$fixture_dir/settlement.db" < crates/mindcore-sqlite/tests/fixtures/settlement-prepare.sql
+          SQLX_OFFLINE=false DATABASE_URL="sqlite://$fixture_dir/settlement.db" \
+            cargo sqlx prepare --workspace -- --locked --workspace --all-targets
+          cache_changes="$(git status --porcelain --untracked-files=all -- .sqlx/)"
+          test -z "$cache_changes"

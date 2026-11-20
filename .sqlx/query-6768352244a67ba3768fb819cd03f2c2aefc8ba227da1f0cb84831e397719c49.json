@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_receipts SET result_json = NULL, error_json = NULL WHERE receipt_id = 'rcp_1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "6768352244a67ba3768fb819cd03f2c2aefc8ba227da1f0cb84831e397719c49"
+}

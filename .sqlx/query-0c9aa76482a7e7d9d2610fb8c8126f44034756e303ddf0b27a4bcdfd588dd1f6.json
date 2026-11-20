@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_subjects SET kind_ns = ?, kind_id = ?, status = ?, fenced_contexts_json = ?, revision = ? WHERE space_id = ? AND subject_id = ? AND revision = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "0c9aa76482a7e7d9d2610fb8c8126f44034756e303ddf0b27a4bcdfd588dd1f6"
+}

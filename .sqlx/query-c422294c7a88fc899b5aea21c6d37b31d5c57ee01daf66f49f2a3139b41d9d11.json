@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT cost_unit_kind AS \"cost_unit_kind!\", cost_units FROM memory_reflections WHERE reflection_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "cost_unit_kind!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_reflections",
+            "name": "cost_unit_kind"
+          }
+        }
+      },
+      {
+        "name": "cost_units",
+        "ordinal": 1,
+        "type_info": "Float",
+        "origin": {
+          "Table": {
+            "table": "memory_reflections",
+            "name": "cost_units"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "c422294c7a88fc899b5aea21c6d37b31d5c57ee01daf66f49f2a3139b41d9d11"
+}

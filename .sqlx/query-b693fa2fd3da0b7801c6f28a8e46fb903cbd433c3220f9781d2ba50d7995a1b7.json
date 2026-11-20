@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_spaces SET display_name = ?, authority_host_id = ?, authority_generation = ?, status = ?, revision = ? WHERE space_id = ? AND revision = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "b693fa2fd3da0b7801c6f28a8e46fb903cbd433c3220f9781d2ba50d7995a1b7"
+}

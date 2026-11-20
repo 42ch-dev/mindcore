@@ -1,0 +1,146 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT receipt_id, space_id, requester_principal_id, op, idempotency_key, payload_digest, status, result_json, error_json, created_at, completed_at FROM memory_receipts WHERE space_id = ? AND receipt_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "receipt_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "receipt_id"
+          }
+        }
+      },
+      {
+        "name": "space_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "requester_principal_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "requester_principal_id"
+          }
+        }
+      },
+      {
+        "name": "op",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "op"
+          }
+        }
+      },
+      {
+        "name": "idempotency_key",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "idempotency_key"
+          }
+        }
+      },
+      {
+        "name": "payload_digest",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "payload_digest"
+          }
+        }
+      },
+      {
+        "name": "status",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "name": "result_json",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "result_json"
+          }
+        }
+      },
+      {
+        "name": "error_json",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "error_json"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "completed_at",
+        "ordinal": 10,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_receipts",
+            "name": "completed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "995c253449e6a8d544abd889b4be3fc51aa3835dc3daab0a93b9569aabb15d7b"
+}

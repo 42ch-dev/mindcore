@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM memory_provider_meta WHERE key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "fdbc0bb11fc3b714cbb7c750691ae158325325feacb2c361a629b68ba08ec166"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_candidates SET subject_id = ?, capture_visibility = ?, capture_context_id = ?, kind = ?, content_json = ?, provenance_json = ?, classification_json = ?, status = ?, consumed_by_json = ?, content_digest = ?, occurred_at = ?, expires_at = ?, revision = ? WHERE space_id = ? AND candidate_id = ? AND revision = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 16
+    },
+    "nullable": []
+  },
+  "hash": "6b7821adfd830ba67ce66b2feb4c8c9f40566c2b461c61bbea04e0c00ca484b1"
+}

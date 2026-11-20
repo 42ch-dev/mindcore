@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_records SET content_json = X'80' WHERE record_id = 'rec_1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "c67ab821dc9faf1786564d838c3350d14246b64c1edf76fd10b032cf5b1c1f77"
+}

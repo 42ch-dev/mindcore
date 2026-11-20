@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_profiles SET document_json = ? WHERE space_id = ? AND subject_id = ? AND profile_kind = 'personality'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "8b9c51b6b59c5f0f517d2435706d2626057d0d1c27fec6931168f638b03effd9"
+}

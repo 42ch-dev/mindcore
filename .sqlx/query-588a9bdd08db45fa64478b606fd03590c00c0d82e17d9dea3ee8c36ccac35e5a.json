@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memory_profiles SET document_json = ?, updated_by = ?, updated_at = ?, revision = ? WHERE space_id = ? AND subject_id = ? AND profile_kind = ? AND revision = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "588a9bdd08db45fa64478b606fd03590c00c0d82e17d9dea3ee8c36ccac35e5a"
+}

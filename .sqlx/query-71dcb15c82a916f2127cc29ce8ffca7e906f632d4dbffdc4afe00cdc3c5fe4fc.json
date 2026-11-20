@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT scope_visibility, revision FROM memory_records WHERE record_id = 'rec_1'",
+  "describe": {
+    "columns": [
+      {
+        "name": "scope_visibility",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "scope_visibility"
+          }
+        }
+      },
+      {
+        "name": "revision",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_records",
+            "name": "revision"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "71dcb15c82a916f2127cc29ce8ffca7e906f632d4dbffdc4afe00cdc3c5fe4fc"
+}

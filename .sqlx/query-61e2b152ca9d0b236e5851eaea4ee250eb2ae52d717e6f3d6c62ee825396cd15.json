@@ -1,0 +1,110 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, created_at FROM memory_subjects WHERE space_id = ? AND subject_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "space_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "subject_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "kind_ns",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "kind_ns"
+          }
+        }
+      },
+      {
+        "name": "kind_id",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "kind_id"
+          }
+        }
+      },
+      {
+        "name": "status",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "name": "fenced_contexts_json",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "fenced_contexts_json"
+          }
+        }
+      },
+      {
+        "name": "revision",
+        "ordinal": 6,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_subjects",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "61e2b152ca9d0b236e5851eaea4ee250eb2ae52d717e6f3d6c62ee825396cd15"
+}
