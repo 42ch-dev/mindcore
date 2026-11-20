@@ -1826,6 +1826,32 @@ impl MemoryRepository for SqliteMemoryRepository {
         .transpose()
     }
 
+    async fn list_unsettled_intents(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+        subject: &SubjectId,
+    ) -> RepoResult<Vec<MemoryJournalRow>> {
+        // The literal `state <> 'applied'` predicate matches the partial index
+        // `idx_memory_journal_unsettled (space_id, subject_id, created_at)`.
+        sqlx::query_as!(
+            JournalRow,
+            "SELECT seq AS \"seq!\", receipt_id, space_id, subject_id, requester_principal_id, \
+             op, idempotency_key, state, targets_json, result_json, created_at, updated_at \
+             FROM memory_journal \
+             WHERE space_id = ? AND subject_id = ? AND state <> 'applied' \
+             ORDER BY created_at",
+            space.as_str(),
+            subject.as_str(),
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .into_iter()
+        .map(journal_row)
+        .collect()
+    }
+
     async fn insert_journal_intent(
         &self,
         tx: &mut Self::Tx<'_>,
