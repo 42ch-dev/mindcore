@@ -232,6 +232,8 @@ fn candidate_columns(candidate: &MemoryCandidateIr) -> RepoResult<CandidateColum
                         .ok_or_else(|| invalid_row("pending candidate kind is empty"))?,
                 ),
                 content: Some(to_json(
+                    // unreachable via public IR today; kept as a defensive guard so a future
+                    // encoder change cannot silently write an unreadable row
                     &content.ok_or_else(|| {
                         invalid_row("pending candidate wire misses proposed.content")
                     })?,
@@ -1927,10 +1929,10 @@ mod tests {
         }
     }
 
-    // BUG-02: a pending row whose `content_json` is SQL NULL (or JSON null) cannot
-    // decode; the writer must refuse instead of persisting it.
+    // BUG-02: the reader-side contract is that a pending row whose `content_json` is SQL
+    // NULL (or JSON null) cannot decode; the writer guard that mirrors it is defensive.
     #[test]
-    fn pending_candidate_row_without_content_is_invalid() {
+    fn pending_candidate_content_refusal_is_defensive_reader_contract() {
         for content in [None, Some("null")] {
             assert!(matches!(
                 candidate_ir(&pending_row(content)),
