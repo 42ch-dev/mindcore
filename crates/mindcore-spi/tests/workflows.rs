@@ -1414,8 +1414,10 @@ impl DomainLens for StubLens {
     }
 }
 
-/// Promotes only when the lens block reached the prompt.
-struct LensAwareReasoner(Arc<Mutex<Option<String>>>);
+/// Promotes only when the lens block reached the prompt, recording the system
+/// prompt and the user payload so two runs can be compared for everything but
+/// the lens.
+struct LensAwareReasoner(Arc<Mutex<Option<(String, String)>>>);
 
 #[async_trait]
 impl Reasoner for LensAwareReasoner {
@@ -1423,7 +1425,10 @@ impl Reasoner for LensAwareReasoner {
         &self,
         request: StructuredReasonRequest<'_>,
     ) -> Result<Value, SpiError> {
-        *self.0.lock().expect("prompt") = Some(request.system_prompt.to_string());
+        *self.0.lock().expect("prompt") = Some((
+            request.system_prompt.to_string(),
+            request.user_payload.to_string(),
+        ));
         Ok(json!({ "action": "promote", "evidence_ids": [] }))
     }
 }
@@ -1452,7 +1457,7 @@ async fn a_lens_adds_its_domain_guidance_to_the_absorb_prompt() {
         outcomes.as_slice(),
         [AbsorbCandidateOutcome::Settled { .. }]
     ));
-    let prompt = prompt.lock().expect("prompt").clone().expect("prompt");
+    let (prompt, _payload) = prompt.lock().expect("prompt").clone().expect("prompt");
     assert!(prompt.starts_with("Decide what one captured memory candidate"));
     assert!(prompt.contains("## Domain guidance"));
     assert!(prompt.contains("a gate warden"));
@@ -2948,16 +2953,20 @@ async fn only_the_lens_differs_across_the_narrative_and_engineering_absorb() {
         1
     );
 
-    let narrative = narrative_prompt
+    let (narrative, narrative_payload) = narrative_prompt
         .lock()
         .expect("prompt")
         .clone()
         .expect("prompt");
-    let engineering = engineering_prompt
+    let (engineering, engineering_payload) = engineering_prompt
         .lock()
         .expect("prompt")
         .clone()
         .expect("prompt");
+    assert_eq!(
+        narrative_payload, engineering_payload,
+        "only the lens input differs"
+    );
     assert!(narrative.starts_with("Decide what one captured memory candidate"));
     assert!(engineering.starts_with("Decide what one captured memory candidate"));
     assert!(narrative.contains("a narrative continuity editor"));
