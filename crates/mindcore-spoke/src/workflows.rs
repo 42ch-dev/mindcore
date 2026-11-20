@@ -25,7 +25,7 @@ use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRea
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
     AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, EmbeddingIdentity, RecallSnapshot, SettledRecord, SpiError,
+    DeliberateSnapshot, EmbeddingIdentity, PageVectors, RecallSnapshot, SettledRecord, SpiError,
     WorkflowBinding,
 };
 use mindcore_sqlite::{
@@ -392,6 +392,29 @@ impl MemoryWorkflowBinding {
             SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
         }
     }
+
+    /// The authorized recall page of `request`, read through `memory.recall`
+    /// on `transaction`: ACL, withholding and the SPOKE page budget are the
+    /// adapter's own checks, so no storage read precedes them.
+    async fn authorized_page(
+        &self,
+        transaction: &mut Tx<'_>,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+    ) -> Result<Vec<RetainedRecord>, SpiError> {
+        let raw = serde_json::to_value(request)
+            .map_err(|error| internal(format!("recall request could not be rendered: {error}")))?;
+        let stage = match self.adapter.recall(transaction, principal, raw).await {
+            SpokeResult::Ok(stage) => stage,
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        match stage {
+            MemoryStage::Ready(body) => decode_records(body),
+            other => Err(internal(format!(
+                "memory.recall returned an unserveable stage: {other:?}"
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -401,24 +424,13 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         principal: &Principal,
         request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError> {
-        let raw = serde_json::to_value(request)
-            .map_err(|error| internal(format!("recall request could not be rendered: {error}")))?;
         let mut transaction =
             self.pool.begin().await.map_err(|error| {
                 internal(format!("recall transaction could not begin: {error}"))
             })?;
-        let stage = match self.adapter.recall(&mut transaction, principal, raw).await {
-            SpokeResult::Ok(stage) => stage,
-            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
-        };
-        let records = match stage {
-            MemoryStage::Ready(body) => decode_records(body)?,
-            other => {
-                return Err(internal(format!(
-                    "memory.recall returned an unserveable stage: {other:?}"
-                )))
-            }
-        };
+        let records = self
+            .authorized_page(&mut transaction, principal, request)
+            .await?;
         let knowledge = self
             .knowledge_slot(&mut transaction, principal, request)
             .await?;
@@ -427,6 +439,51 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .await
             .map_err(|error| internal(format!("recall transaction could not commit: {error}")))?;
         Ok(RecallSnapshot { records, knowledge })
+    }
+
+    async fn recall_vectors(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        identity: &EmbeddingIdentity,
+    ) -> Result<PageVectors, SpiError> {
+        let identity_hash = vector_identity(identity)?;
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!("vector read transaction could not begin: {error}"))
+        })?;
+        // The same authorized read as the recall itself: a page that lost its
+        // grant or became withheld refuses here, so no row is probed for it.
+        let records = self
+            .authorized_page(&mut transaction, principal, request)
+            .await?;
+        let mut stored = Vec::with_capacity(records.len());
+        for record in &records {
+            let vector = match record {
+                RetainedRecord::LiveRecord(live) => {
+                    match vectors::read_record_vector(
+                        &mut *transaction,
+                        live.record_id.as_str(),
+                        &identity_hash,
+                        live.revision.get(),
+                        identity.dim,
+                    )
+                    .await
+                    {
+                        SpokeResult::Ok(vector) => vector,
+                        SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+                    }
+                }
+                RetainedRecord::TombstonedRecord(_) => None,
+            };
+            stored.push(vector);
+        }
+        transaction.commit().await.map_err(|error| {
+            internal(format!("vector read transaction could not commit: {error}"))
+        })?;
+        Ok(PageVectors {
+            records,
+            vectors: stored,
+        })
     }
 
     async fn capture(
@@ -665,15 +722,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         identity: &EmbeddingIdentity,
         vector: &[f32],
     ) -> Result<(), SpiError> {
-        let identity_hash = match vectors::identity_hash(
-            &identity.provider_id,
-            &identity.model_id,
-            &identity.model_version,
-            identity.dim,
-        ) {
-            SpokeResult::Ok(hash) => hash,
-            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
-        };
+        let identity_hash = vector_identity(identity)?;
         let mut transaction = self.pool.begin().await.map_err(|error| {
             internal(format!("vector fill transaction could not begin: {error}"))
         })?;
@@ -1025,6 +1074,19 @@ fn decode_record(body: Value) -> Result<RetainedRecord, SpiError> {
 
 fn not_authorized(message: String) -> SpiError {
     SpiError::Settlement(Reject::not_authorized(message).into_spoke())
+}
+
+/// The storage partition of one serving embedder.
+fn vector_identity(identity: &EmbeddingIdentity) -> Result<String, SpiError> {
+    match vectors::identity_hash(
+        &identity.provider_id,
+        &identity.model_id,
+        &identity.model_version,
+        identity.dim,
+    ) {
+        SpokeResult::Ok(hash) => Ok(hash),
+        SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
+    }
 }
 
 /// The holder must be this carrier entry in the Mindcore realm: the carrier

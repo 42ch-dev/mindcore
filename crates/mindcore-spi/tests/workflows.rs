@@ -1,6 +1,7 @@
 //! Workflow behaviour over a pinned binding double: the recall page order,
 //! hybrid rerank, pack budget and snapshot revalidation, with no storage.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,9 +13,9 @@ use mindcore_spi::{
     AbsorbCandidateOutcome, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate,
     CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest, DeliberateSnapshot,
     DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings,
-    PolicyDecision, PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation,
-    SettledRecord, SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest,
-    WorkflowBinding,
+    PageVectors, PolicyDecision, PolicyHook, ProposalDraft, Reasoner, RecallSnapshot,
+    Recommendation, SettledRecord, SettlementDraft, SpiError, SpiMindWorkflows,
+    StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
@@ -83,19 +84,63 @@ fn snapshot(records: Vec<RetainedRecord>, knowledge: Vec<KnowledgeEntry>) -> Rec
 }
 
 /// Repeats its last snapshot once the list runs out, so a stable page reads
-/// back identically.
+/// back identically, and serves the vectors a warm table already holds under
+/// `(identity, record, revision)`.
+#[derive(Clone)]
 struct StubBinding {
+    inner: Arc<StubInner>,
+}
+
+struct StubInner {
     snapshots: Mutex<Vec<RecallSnapshot>>,
     calls: AtomicUsize,
+    stored: Mutex<HashMap<(String, String, u64), Vec<f32>>>,
+    vector_reads: AtomicUsize,
 }
 
 impl StubBinding {
     fn new(snapshots: Vec<RecallSnapshot>) -> Self {
         Self {
-            snapshots: Mutex::new(snapshots),
-            calls: AtomicUsize::new(0),
+            inner: Arc::new(StubInner {
+                snapshots: Mutex::new(snapshots),
+                calls: AtomicUsize::new(0),
+                stored: Mutex::new(HashMap::new()),
+                vector_reads: AtomicUsize::new(0),
+            }),
         }
     }
+
+    /// The page the read of `index` serves.
+    fn page(&self, index: usize) -> RecallSnapshot {
+        let snapshots = self.inner.snapshots.lock().expect("snapshots");
+        snapshots[index.min(snapshots.len() - 1)].clone()
+    }
+
+    /// Seed the vectors the table already holds under `identity`.
+    fn seeded(self, identity: &EmbeddingIdentity, vectors: &[(&str, u64, Vec<f32>)]) -> Self {
+        let mut stored = self.inner.stored.lock().expect("stored vectors");
+        for (record_id, revision, vector) in vectors {
+            stored.insert(
+                (partition(identity), (*record_id).to_string(), *revision),
+                vector.clone(),
+            );
+        }
+        drop(stored);
+        self
+    }
+
+    /// How many times the vector snapshot was read.
+    fn vector_reads(&self) -> usize {
+        self.inner.vector_reads.load(Ordering::SeqCst)
+    }
+}
+
+/// The cache partition of one identity, as the double keys it.
+fn partition(identity: &EmbeddingIdentity) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        identity.provider_id, identity.model_id, identity.model_version, identity.dim
+    )
 }
 
 #[async_trait]
@@ -105,9 +150,40 @@ impl WorkflowBinding for StubBinding {
         _principal: &Principal,
         _request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let snapshots = self.snapshots.lock().expect("snapshots");
-        Ok(snapshots[call.min(snapshots.len() - 1)].clone())
+        let call = self.inner.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.page(call))
+    }
+
+    async fn recall_vectors(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        identity: &EmbeddingIdentity,
+    ) -> Result<PageVectors, SpiError> {
+        self.inner.vector_reads.fetch_add(1, Ordering::SeqCst);
+        // Storage serves the page the recall just read; a caller that queued a
+        // newer snapshot sees it on the next recall read.
+        let page = self.page(self.inner.calls.load(Ordering::SeqCst).saturating_sub(1));
+        let partition = partition(identity);
+        let stored = self.inner.stored.lock().expect("stored vectors");
+        let vectors = page
+            .records
+            .iter()
+            .map(|record| match record {
+                RetainedRecord::LiveRecord(live) => stored
+                    .get(&(
+                        partition.clone(),
+                        live.record_id.as_str().to_string(),
+                        live.revision.get(),
+                    ))
+                    .cloned(),
+                RetainedRecord::TombstonedRecord(_) => None,
+            })
+            .collect();
+        Ok(PageVectors {
+            records: page.records,
+            vectors,
+        })
     }
 
     async fn capture(
@@ -222,6 +298,15 @@ impl WorkflowBinding for RefusingBinding {
         Err(self.0.clone())
     }
 
+    async fn recall_vectors(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        _identity: &EmbeddingIdentity,
+    ) -> Result<PageVectors, SpiError> {
+        unserved()
+    }
+
     async fn capture(
         &self,
         _principal: &Principal,
@@ -318,6 +403,8 @@ impl WorkflowBinding for RefusingBinding {
 /// the market record the second.
 struct PlantedEmbedder {
     identity: EmbeddingIdentity,
+    /// Every text this embedder was asked for, in call order.
+    texts: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -327,6 +414,10 @@ impl Embedder for PlantedEmbedder {
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        self.texts
+            .lock()
+            .expect("embedded texts")
+            .extend(texts.iter().cloned());
         Ok(texts
             .iter()
             .map(|text| {
@@ -342,14 +433,41 @@ impl Embedder for PlantedEmbedder {
     }
 }
 
+impl PlantedEmbedder {
+    fn embedded(&self) -> Vec<String> {
+        self.texts.lock().expect("embedded texts").clone()
+    }
+}
+
+/// The planted identity under `model_version`, so a test can name a second
+/// serving identity over the same page.
+fn planted(model_version: &str) -> EmbeddingIdentity {
+    EmbeddingIdentity {
+        provider_id: "planted".to_string(),
+        model_id: "axes".to_string(),
+        model_version: model_version.to_string(),
+        dim: 2,
+    }
+}
+
 fn planted_embedder() -> PlantedEmbedder {
     PlantedEmbedder {
-        identity: EmbeddingIdentity {
-            provider_id: "planted".to_string(),
-            model_id: "axes".to_string(),
-            model_version: "1".to_string(),
-            dim: 2,
-        },
+        identity: planted("1"),
+        texts: Arc::new(Mutex::new(Vec::new())),
+    }
+}
+
+/// Names its identity but never serves a vector.
+struct UnavailableEmbedder(EmbeddingIdentity);
+
+#[async_trait]
+impl Embedder for UnavailableEmbedder {
+    fn identity(&self) -> Option<&EmbeddingIdentity> {
+        Some(&self.0)
+    }
+
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        Err(SpiError::EmbeddingsUnavailable)
     }
 }
 
@@ -448,6 +566,281 @@ async fn planted_vectors_rerank_only_the_page() {
 
     assert_eq!(ids(&pack), ["rec_a", "rec_c", "rec_b"]);
     assert_eq!(pack.records.len(), 3);
+}
+
+/// The fixture page in adapter order: the market, the closed gate and the
+/// sleeping guards.
+fn vector_page(guards_revision: u64) -> Vec<RetainedRecord> {
+    vec![
+        record("rec_b", "the market opens at dawn", 1),
+        record("rec_a", "the north gate is closed", 1),
+        record("rec_c", "north gate guards sleep", guards_revision),
+    ]
+}
+
+fn embedding_caps(embedder: &dyn Embedder) -> MindCapabilities<'_> {
+    MindCapabilities {
+        embedder: Some(embedder),
+        ..MindCapabilities::default()
+    }
+}
+
+/// The vectors a warm table already holds for the fixture page at revision 1.
+fn warm_vectors() -> [(&'static str, u64, Vec<f32>); 3] {
+    [
+        ("rec_b", 1, vec![0.0, 1.0]),
+        ("rec_a", 1, vec![1.0, 0.0]),
+        ("rec_c", 1, vec![0.5, 0.5]),
+    ]
+}
+
+#[tokio::test]
+async fn a_warm_identical_recall_needs_no_provider_call() {
+    let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())])
+        .seeded(&planted("1"), &warm_vectors());
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let embedder = planted_embedder();
+    let caps = embedding_caps(&embedder);
+
+    let first = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &caps,
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        embedder.embedded(),
+        ["north gate"],
+        "a warm page embeds the query alone"
+    );
+    assert_eq!(ids(&first), ["rec_a", "rec_c", "rec_b"]);
+    assert_eq!(binding.vector_reads(), 1);
+
+    let second = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &caps,
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded().len(),
+        1,
+        "a warm identical recall makes no provider call"
+    );
+    assert_eq!(ids(&second), ids(&first));
+}
+
+#[tokio::test]
+async fn a_new_query_with_warm_records_embeds_only_the_query() {
+    let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())])
+        .seeded(&planted("1"), &warm_vectors());
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let embedder = planted_embedder();
+    let caps = embedding_caps(&embedder);
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &caps,
+        )
+        .await
+        .expect("warm recall");
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("market dawn")),
+            budget(4096),
+            &caps,
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded()[1..],
+        ["market dawn"],
+        "a new query embeds its own text only"
+    );
+    assert_eq!(ids(&pack), ["rec_b", "rec_c", "rec_a"]);
+}
+
+#[tokio::test]
+async fn a_stale_revision_embeds_only_that_record() {
+    // The table holds revision 1, then the guards record moves: only its stored
+    // vector is stale.
+    let binding = StubBinding::new(vec![snapshot(vector_page(2), Vec::new())])
+        .seeded(&planted("1"), &warm_vectors());
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let embedder = planted_embedder();
+
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded(),
+        ["north gate", "north gate guards sleep"],
+        "only the moved revision is embedded"
+    );
+}
+
+#[tokio::test]
+async fn a_new_identity_embeds_every_record_again() {
+    let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())])
+        .seeded(&planted("1"), &warm_vectors());
+    // A second identity starts with a cold query slot too: nothing the first
+    // one stored belongs to it.
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let other = PlantedEmbedder {
+        identity: planted("2"),
+        texts: Arc::new(Mutex::new(Vec::new())),
+    };
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &embedding_caps(&other),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        other.embedded().len(),
+        4,
+        "another identity hits no stored vector"
+    );
+}
+
+#[tokio::test]
+async fn an_embedder_free_or_unavailable_recall_probes_no_vector_cache() {
+    let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())])
+        .seeded(&planted("1"), &warm_vectors());
+
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &MindCapabilities::default(),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(ids(&pack), ["rec_b", "rec_a", "rec_c"], "adapter order");
+    assert_eq!(binding.vector_reads(), 0, "no embedder probes nothing");
+
+    // A cold `EmbeddingsUnavailable` stops before any table I/O too, even over
+    // a page the double already holds vectors for.
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let cold = UnavailableEmbedder(planted("1"));
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &embedding_caps(&cold),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(ids(&pack), ["rec_b", "rec_a", "rec_c"], "adapter order");
+    assert_eq!(
+        binding.vector_reads(),
+        0,
+        "an unavailable provider probes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_miss_batch_that_goes_unavailable_keeps_lexical_order() {
+    struct QueryOnlyEmbedder {
+        identity: EmbeddingIdentity,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Embedder for QueryOnlyEmbedder {
+        fn identity(&self) -> Option<&EmbeddingIdentity> {
+            Some(&self.identity)
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+            } else {
+                Err(SpiError::EmbeddingsUnavailable)
+            }
+        }
+    }
+
+    let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())]);
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let embedder = QueryOnlyEmbedder {
+        identity: planted("1"),
+        calls: AtomicUsize::new(0),
+    };
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        ids(&pack),
+        ["rec_b", "rec_a", "rec_c"],
+        "hybrid work is discarded"
+    );
+    assert_eq!(binding.vector_reads(), 1, "a read-only lookup may have run");
+}
+
+#[tokio::test]
+async fn no_provider_work_runs_before_a_withheld_read_is_refused() {
+    let embedder = planted_embedder();
+    let workflows = SpiMindWorkflows::new(RefusingBinding(SpiError::Settlement(
+        spoke_operations::SpokeReject {
+            code: SpokeRejectCode::NotAuthorized,
+            message: "subject is withheld".to_string(),
+            details: None,
+        },
+    )));
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a withheld read must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        embedder.embedded().is_empty(),
+        "no provider work runs for a refused page"
+    );
 }
 
 #[tokio::test]
@@ -761,6 +1154,15 @@ impl WorkflowBinding for AbsorbDouble {
         _principal: &Principal,
         _request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError> {
+        unserved()
+    }
+
+    async fn recall_vectors(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        _identity: &EmbeddingIdentity,
+    ) -> Result<PageVectors, SpiError> {
         unserved()
     }
 
@@ -1569,6 +1971,15 @@ impl WorkflowBinding for DeliberateDouble {
         _principal: &Principal,
         _request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError> {
+        unserved()
+    }
+
+    async fn recall_vectors(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+        _identity: &EmbeddingIdentity,
+    ) -> Result<PageVectors, SpiError> {
         unserved()
     }
 

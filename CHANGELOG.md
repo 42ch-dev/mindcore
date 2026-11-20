@@ -32,3 +32,12 @@
   revision and withholding, so work that outlived its record writes nothing. A failed warm is a
   cache miss, never a failed, rolled-back or replayed Memory mutation; no embedder, no serving
   identity and an idempotent replay write nothing.
+- `mindcore-spi` / `mindcore-spoke`: recall now reuses the retained vectors. The page is authorized
+  first, the query vector is resolved from one validated process-local slot keyed by principal, space,
+  subject, exact query and serving identity, and the stored record vectors come from one snapshot that
+  rebuilds admission and withholding before any row is probed. Only missing or stale revisions are
+  embedded, the fresh ones are filled after the recall reauthorizes the page, and an identical warm
+  recall makes no provider call. No embedder, no serving identity or a cold `EmbeddingsUnavailable`
+  leaves the vector table untouched and keeps the adapter's lexical order; a batch that goes
+  unavailable later writes nothing. Ranking is unchanged, and the persisted path scores bit-identically
+  to the in-memory one, tie order included.

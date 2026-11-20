@@ -2777,3 +2777,533 @@ async fn a_revision_moved_during_the_warm_keeps_no_row() {
         "obsolete work cannot overwrite a newer vector"
     );
 }
+
+/// The axis one text sits on: the market side, the gate, or the guards
+/// half-way. Equal texts land on the same vector, so a page can tie.
+fn axis_vector(text: &str) -> Vec<f32> {
+    if text.contains("market") {
+        vec![0.0, 1.0]
+    } else if text.contains("guards") {
+        vec![0.5, 0.5]
+    } else {
+        vec![1.0, 0.0]
+    }
+}
+
+/// Embeds by axis and keeps every text it was asked for, so a recall's provider
+/// cost is a count rather than an inference.
+struct AxisEmbedder {
+    identity: EmbeddingIdentity,
+    texts: Arc<Mutex<Vec<String>>>,
+}
+
+impl AxisEmbedder {
+    fn new(model_version: &str) -> Self {
+        Self {
+            identity: EmbeddingIdentity {
+                provider_id: "local".to_string(),
+                model_id: "axes".to_string(),
+                model_version: model_version.to_string(),
+                dim: 2,
+            },
+            texts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn embedded(&self) -> Vec<String> {
+        self.texts.lock().expect("embedded texts").clone()
+    }
+}
+
+#[async_trait]
+impl Embedder for AxisEmbedder {
+    fn identity(&self) -> Option<&EmbeddingIdentity> {
+        Some(&self.identity)
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        self.texts
+            .lock()
+            .expect("embedded texts")
+            .extend(texts.iter().cloned());
+        Ok(texts.iter().map(|text| axis_vector(text)).collect())
+    }
+}
+
+/// An embedder that names its identity but never serves a vector.
+struct UnavailableEmbedder(EmbeddingIdentity);
+
+#[async_trait]
+impl Embedder for UnavailableEmbedder {
+    fn identity(&self) -> Option<&EmbeddingIdentity> {
+        Some(&self.0)
+    }
+
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        Err(SpiError::EmbeddingsUnavailable)
+    }
+}
+
+fn axes_identity(model_version: &str) -> EmbeddingIdentity {
+    EmbeddingIdentity {
+        provider_id: "local".to_string(),
+        model_id: "axes".to_string(),
+        model_version: model_version.to_string(),
+        dim: 2,
+    }
+}
+
+fn embedding_caps(embedder: &dyn Embedder) -> MindCapabilities<'_> {
+    MindCapabilities {
+        embedder: Some(embedder),
+        ..MindCapabilities::default()
+    }
+}
+
+/// A recall-authorized page of three records in adapter order (newest first):
+/// the market, the closed gate and the sleeping guards.
+async fn vector_page() -> (Harness, SpiMindWorkflows) {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness
+        .record(
+            "rec_b",
+            "the market opens at dawn",
+            "2026-11-20T09:00:03.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:02.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_c",
+            "north gate guards sleep",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    (harness, workflows)
+}
+
+/// One cold recall that leaves the query slot and every page vector warm.
+async fn warm_page(workflows: &SpiMindWorkflows, embedder: &AxisEmbedder) {
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(embedder),
+        )
+        .await
+        .expect("warm recall");
+}
+
+#[tokio::test]
+async fn an_identical_warm_recall_makes_no_provider_call() {
+    let (harness, workflows) = vector_page().await;
+    let embedder = AxisEmbedder::new("1");
+
+    let first = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        embedder.embedded(),
+        [
+            "north gate",
+            "the north gate is closed",
+            "north gate guards sleep",
+            "the market opens at dawn",
+        ],
+        "a cold recall embeds the query and every page text"
+    );
+    assert_eq!(record_ids(&first), ["rec_a", "rec_c", "rec_b"]);
+    assert_eq!(
+        harness.vector_rows().await.len(),
+        3,
+        "every miss is filled once"
+    );
+
+    let second = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded().len(),
+        4,
+        "a warm identical recall makes no provider call"
+    );
+    assert_eq!(record_ids(&second), record_ids(&first));
+    assert_eq!(
+        harness.vector_rows().await.len(),
+        3,
+        "a warm page is never refilled"
+    );
+}
+
+#[tokio::test]
+async fn a_new_query_reuses_the_current_record_vectors() {
+    let (harness, workflows) = vector_page().await;
+    let embedder = AxisEmbedder::new("1");
+    warm_page(&workflows, &embedder).await;
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("market dawn"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded()[4..],
+        ["market dawn"],
+        "a new query embeds its own text only"
+    );
+    assert_eq!(record_ids(&pack), ["rec_b", "rec_c", "rec_a"]);
+    assert_eq!(harness.vector_rows().await.len(), 3);
+}
+
+#[tokio::test]
+async fn a_stale_revision_embeds_only_that_record() {
+    let (harness, workflows) = vector_page().await;
+    let embedder = AxisEmbedder::new("1");
+    warm_page(&workflows, &embedder).await;
+
+    sqlx::query(
+        "UPDATE memory_records SET revision = revision + 1, content_json = ? WHERE record_id = ?",
+    )
+    .bind(json!({ "text": "north gate guards wake" }).to_string())
+    .bind("rec_c")
+    .execute(&harness.pool)
+    .await
+    .expect("move rec_c");
+
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        embedder.embedded()[4..],
+        ["north gate guards wake"],
+        "only the moved revision is embedded"
+    );
+    let rows = harness.vector_rows().await;
+    assert_eq!(rows.len(), 3, "the stale row is replaced, not duplicated");
+    let rec_c = rows
+        .iter()
+        .find(|row| row.0 == "rec_c")
+        .expect("the moved record's row");
+    assert_eq!(rec_c.2, 2, "the row carries the live revision");
+}
+
+#[tokio::test]
+async fn a_cold_unavailable_query_leaves_a_pre_populated_table_untouched() {
+    let (harness, workflows) = vector_page().await;
+    warm_page(&workflows, &AxisEmbedder::new("1")).await;
+    let before = harness.vector_rows().await;
+    assert_eq!(before.len(), 3);
+
+    let cold = UnavailableEmbedder(axes_identity("1"));
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("guards sleeping"), 10),
+            budget(),
+            &embedding_caps(&cold),
+        )
+        .await
+        .expect("lexical pack");
+
+    // The adapter's own order for that query, read with no embedder at all.
+    let lexical = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true))
+        .recall_context(
+            &principal(),
+            &request(Some("guards sleeping"), 10),
+            budget(),
+            &MindCapabilities::default(),
+        )
+        .await
+        .expect("lexical pack");
+    assert_eq!(record_ids(&pack), record_ids(&lexical), "lexical order");
+    assert_eq!(
+        harness.vector_rows().await,
+        before,
+        "an unavailable query writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_embedder_free_recall_never_probes_the_vector_table() {
+    let (harness, _workflows) = vector_page().await;
+    // With no embedder no statement may touch the table, so removing it leaves
+    // the recall working.
+    sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
+        .execute(&harness.pool)
+        .await
+        .expect("drop the vector table");
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &MindCapabilities::default(),
+        )
+        .await
+        .expect("lexical pack");
+
+    assert_eq!(
+        record_ids(&pack),
+        ["rec_a", "rec_c", "rec_b"],
+        "adapter order"
+    );
+}
+
+#[tokio::test]
+async fn a_miss_batch_that_goes_unavailable_writes_nothing() {
+    struct QueryOnlyEmbedder {
+        identity: EmbeddingIdentity,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Embedder for QueryOnlyEmbedder {
+        fn identity(&self) -> Option<&EmbeddingIdentity> {
+            Some(&self.identity)
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(texts.iter().map(|text| axis_vector(text)).collect())
+            } else {
+                Err(SpiError::EmbeddingsUnavailable)
+            }
+        }
+    }
+
+    let (harness, workflows) = vector_page().await;
+    let embedder = QueryOnlyEmbedder {
+        identity: axes_identity("1"),
+        calls: AtomicUsize::new(0),
+    };
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("lexical pack");
+
+    assert_eq!(
+        record_ids(&pack),
+        ["rec_a", "rec_c", "rec_b"],
+        "adapter order"
+    );
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a record batch that goes unavailable writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_withheld_read_refuses_before_any_provider_work() {
+    let (harness, workflows) = vector_page().await;
+    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = ?")
+        .bind(NOW)
+        .bind(PRINCIPAL)
+        .execute(&harness.pool)
+        .await
+        .expect("revoke the recall grant");
+    let embedder = AxisEmbedder::new("1");
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect_err("a withheld read must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        embedder.embedded().is_empty(),
+        "no vector or cache work runs for a refused page"
+    );
+    assert!(harness.vector_rows().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_retired_identity_never_serves_another_partition() {
+    let (harness, workflows) = vector_page().await;
+    let retired_embedder = AxisEmbedder::new("1");
+    warm_page(&workflows, &retired_embedder).await;
+
+    // A new serving identity cannot hit the rows another one wrote.
+    let other_engine =
+        SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    let other = AxisEmbedder::new("2");
+    other_engine
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&other),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        other.embedded().len(),
+        4,
+        "another identity embeds the query and every record"
+    );
+    assert_eq!(
+        harness.vector_rows().await.len(),
+        6,
+        "both partitions coexist"
+    );
+
+    let retired = match mindcore_sqlite::vectors::identity_hash("local", "axes", "1", 2) {
+        spoke_operations::SpokeResult::Ok(hash) => hash,
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("the retired identity hashes: {}", reject.message)
+        }
+    };
+    let deleted =
+        match mindcore_sqlite::vectors::delete_identity_vectors(&harness.pool, &retired).await {
+            spoke_operations::SpokeResult::Ok(deleted) => deleted,
+            spoke_operations::SpokeResult::Reject(reject) => {
+                panic!("the retired partition deletes: {}", reject.message)
+            }
+        };
+    assert_eq!(
+        deleted, 3,
+        "one delete clears exactly the retired partition"
+    );
+    assert_eq!(harness.vector_rows().await.len(), 3);
+
+    // The retired identity re-embeds its records; its query slot still holds.
+    let before = retired_embedder.embedded().len();
+    warm_page(&workflows, &retired_embedder).await;
+    assert_eq!(
+        retired_embedder.embedded()[before..],
+        [
+            "the north gate is closed",
+            "north gate guards sleep",
+            "the market opens at dawn",
+        ],
+        "the retired rows are misses and the warm query is not re-embedded"
+    );
+}
+
+#[tokio::test]
+async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    // rec_a and rec_c share their text, so the page carries a real tie.
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:03.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_c",
+            "the north gate is closed",
+            "2026-11-20T09:00:02.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_d",
+            "north gate guards sleep",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness
+        .record(
+            "rec_b",
+            "the market opens at dawn",
+            "2026-11-20T09:00:00.000Z",
+        )
+        .await;
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    let embedder = AxisEmbedder::new("1");
+
+    let fresh = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+    assert_eq!(
+        record_ids(&fresh),
+        ["rec_a", "rec_c", "rec_d", "rec_b"],
+        "the tied pair keeps adapter order"
+    );
+    assert_eq!(harness.vector_rows().await.len(), 4);
+
+    // A second engine starts with a cold query slot: every record vector it
+    // scores comes back through the stored little-endian f32 blob.
+    let reloaded_engine =
+        SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    let reloaded = reloaded_engine
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &embedding_caps(&embedder),
+        )
+        .await
+        .expect("pack");
+
+    assert_eq!(
+        record_ids(&reloaded),
+        record_ids(&fresh),
+        "the persisted page ranks exactly like the in-memory one"
+    );
+    assert_eq!(reloaded.tokens_used, fresh.tokens_used);
+    assert_eq!(
+        embedder.embedded().len(),
+        6,
+        "only the cold query is embedded for the reloaded page"
+    );
+}

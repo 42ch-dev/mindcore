@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::{poll_fn, Future};
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,6 +57,18 @@ pub struct RecallSnapshot {
     pub knowledge: Vec<KnowledgeEntry>,
 }
 
+/// One authorized page read taken for the vector cache: the page the storage
+/// re-served under the caller's live grants plus one stored vector per record.
+#[derive(Debug, Clone)]
+pub struct PageVectors {
+    /// The page as this read served it, in adapter order.
+    pub records: Vec<RetainedRecord>,
+    /// One stored vector per record, aligned with `records`: `None` is a miss
+    /// under that identity — no row, another revision, another dimension or a
+    /// retired identity.
+    pub vectors: Vec<Option<Vec<f32>>>,
+}
+
 /// The DTO-only storage seam of the workflow engine.
 ///
 /// One call is one transaction over the caller's scope: `memory.recall`
@@ -73,6 +86,21 @@ pub trait WorkflowBinding: Send + Sync {
         principal: &Principal,
         request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError>;
+
+    /// Read the authorized page again and, for every record it still serves
+    /// live at that revision, the vector stored under `identity`.
+    ///
+    /// This is the snapshot that selects vector rows after a query provider
+    /// call: admission and withholding are rebuilt on the same transaction, so
+    /// a page that lost its grant or became withheld is a refusal, never a
+    /// cache hit. An absent row, another revision, another dimension or a
+    /// retired identity is `None`.
+    async fn recall_vectors(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        identity: &EmbeddingIdentity,
+    ) -> Result<PageVectors, SpiError>;
 
     /// Run the existing capture path — admission, idempotency probe and the
     /// deterministic classifier — and return the candidates it holds.
@@ -278,6 +306,18 @@ pub struct CitedRecord {
 /// The workflow engine over one [`WorkflowBinding`].
 pub struct SpiMindWorkflows {
     binding: Box<dyn WorkflowBinding>,
+    /// The one recent validated query vector: replaced, never grown, so an
+    /// identity retirement cannot leave a stale slot behind.
+    query_slot: Mutex<Option<QuerySlot>>,
+}
+
+/// One validated query vector and the exact scope allowed to reuse it: another
+/// principal, space, subject, query text or embedding identity is a miss.
+struct QuerySlot {
+    /// `(principal, space, subject, exact trimmed query)` as authorized.
+    scope: (String, String, String, String),
+    identity: EmbeddingIdentity,
+    vector: Vec<f32>,
 }
 
 impl SpiMindWorkflows {
@@ -285,6 +325,35 @@ impl SpiMindWorkflows {
     pub fn new(binding: impl WorkflowBinding + 'static) -> Self {
         Self {
             binding: Box::new(binding),
+            query_slot: Mutex::new(None),
+        }
+    }
+
+    /// The slot's query vector, only for the exact scope it was validated in.
+    fn cached_query(
+        &self,
+        scope: &(String, String, String, String),
+        identity: &EmbeddingIdentity,
+    ) -> Option<Vec<f32>> {
+        let slot = self.query_slot.lock().ok()?;
+        let slot = slot.as_ref()?;
+        (slot.scope == *scope && slot.identity == *identity).then(|| slot.vector.clone())
+    }
+
+    /// Keep `vector` for `scope`: only a vector the caller already validated
+    /// against the identity enters the slot.
+    fn remember_query(
+        &self,
+        scope: (String, String, String, String),
+        identity: &EmbeddingIdentity,
+        vector: &[f32],
+    ) {
+        if let Ok(mut slot) = self.query_slot.lock() {
+            *slot = Some(QuerySlot {
+                scope,
+                identity: identity.clone(),
+                vector: vector.to_vec(),
+            });
         }
     }
 
@@ -294,7 +363,8 @@ impl SpiMindWorkflows {
     /// revalidated against the same read path before anything is released: a
     /// refused reread propagates and a changed page returns
     /// `REVISION_CONFLICT`, so no record revision or grant that moved during
-    /// provider work reaches the pack.
+    /// provider work reaches the pack. Vectors this recall computed are filled
+    /// only after that reauthorization.
     pub async fn recall_context(
         &self,
         principal: &Principal,
@@ -305,10 +375,27 @@ impl SpiMindWorkflows {
         let RecallSnapshot { records, knowledge } =
             self.binding.recall_snapshot(principal, request).await?;
         let before = snapshot_fact(&records, &knowledge);
-        let ranked = rank(records, request.query.as_deref(), caps).await?;
+        let (ranked, fills) = self.rank(principal, request, records, caps).await?;
         let released = self.binding.recall_snapshot(principal, request).await?;
         if snapshot_fact(&released.records, &released.knowledge) != before {
             return Err(revision_conflict());
+        }
+        // Best effort: the fill rechecks the record's own revision and
+        // withholding, so a refused one is a cache miss, never a refused or
+        // altered pack.
+        if let Some(identity) = caps.embedder.and_then(|embedder| embedder.identity()) {
+            for (record, vector) in fills {
+                let _ = self
+                    .binding
+                    .fill_record_vector(
+                        principal,
+                        request.space_id.as_str(),
+                        &record,
+                        identity,
+                        &vector,
+                    )
+                    .await;
+            }
         }
         pack(ranked, knowledge, max_tokens)
     }
@@ -1705,49 +1792,134 @@ fn revision_conflict() -> SpiError {
     })
 }
 
-/// Hybrid rerank of the page, or the adapter order when it cannot run.
-///
-/// The page is never widened: an empty query, an embedder without a serving
-/// identity or `EmbeddingsUnavailable` all preserve the lexical order the
-/// adapter returned, and every other provider failure propagates.
-async fn rank(
-    records: Vec<RetainedRecord>,
-    query: Option<&str>,
-    caps: &MindCapabilities<'_>,
-) -> Result<Vec<RetainedRecord>, SpiError> {
-    let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
-        return Ok(records);
-    };
-    let Some(embedder) = caps.embedder else {
-        return Ok(records);
-    };
-    let Some(identity) = embedder.identity() else {
-        return Ok(records);
-    };
-    if records.is_empty() {
-        return Ok(records);
-    }
+impl SpiMindWorkflows {
+    /// Hybrid rerank of the page, or the adapter order when it cannot run.
+    ///
+    /// The page is never widened: an empty query, an embedder without a serving
+    /// identity or `EmbeddingsUnavailable` all preserve the lexical order the
+    /// adapter returned, and every other provider failure propagates.
+    ///
+    /// The query vector is resolved first — from the one process-local slot or
+    /// the provider — before any persisted record is probed. The stored vectors
+    /// then come from one snapshot that rebuilds admission and withholding,
+    /// only missing or stale revisions are embedded, and the freshly embedded
+    /// ones come back as fills the caller writes after it reauthorized the page.
+    async fn rank(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        records: Vec<RetainedRecord>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<(Vec<RetainedRecord>, Vec<(SettledRecord, Vec<f32>)>), SpiError> {
+        let Some(query) = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        else {
+            return Ok((records, Vec::new()));
+        };
+        let Some(embedder) = caps.embedder else {
+            return Ok((records, Vec::new()));
+        };
+        let Some(identity) = embedder.identity() else {
+            return Ok((records, Vec::new()));
+        };
+        if records.is_empty() {
+            return Ok((records, Vec::new()));
+        }
 
-    let texts: Vec<&str> = records.iter().map(record_text).collect();
-    let mut batch = Vec::with_capacity(texts.len() + 1);
-    batch.push(query.to_string());
-    batch.extend(texts.iter().map(|text| (*text).to_string()));
-    let vectors = match embedder.embed_batch(&batch).await {
-        Ok(vectors) => vectors,
-        Err(SpiError::EmbeddingsUnavailable) => return Ok(records),
-        Err(error) => return Err(error),
-    };
-    let vectors = checked_vectors(vectors, batch.len(), identity)?;
-    let scores = hybrid_scores(&texts, query, &vectors[0], &vectors[1..]);
-    let mut order: Vec<usize> = (0..records.len()).collect();
-    // Stable: equal scores keep the adapter's order.
-    order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
-    let mut records = reorder(records, &order);
-    if let Some(reasoner) = caps.reasoner {
-        let permutation = reasoner_permutation(reasoner, query, &records).await?;
-        records = reorder(records, &permutation);
+        let scope = (
+            principal.principal_id.as_str().to_string(),
+            request.space_id.as_str().to_string(),
+            request.subject_id.as_str().to_string(),
+            query.to_string(),
+        );
+        let query_vector = match self.cached_query(&scope, identity) {
+            Some(vector) => vector,
+            None => {
+                let batch = [query.to_string()];
+                let vectors = match embedder.embed_batch(&batch).await {
+                    Ok(vectors) => vectors,
+                    Err(SpiError::EmbeddingsUnavailable) => return Ok((records, Vec::new())),
+                    Err(error) => return Err(error),
+                };
+                checked_vectors(vectors, 1, identity)?
+                    .pop()
+                    .expect("one text yields one vector")
+            }
+        };
+
+        // The snapshot that selects vector rows: admission and withholding are
+        // rebuilt, so a page that moved since the first read is refused here
+        // rather than served from a stale cache.
+        let page = self
+            .binding
+            .recall_vectors(principal, request, identity)
+            .await?;
+        if snapshot_fact(&page.records, &[]) != snapshot_fact(&records, &[]) {
+            return Err(revision_conflict());
+        }
+        // Validated against the identity and authorized by the snapshot above.
+        self.remember_query(scope, identity, &query_vector);
+
+        let texts: Vec<&str> = page.records.iter().map(record_text).collect();
+        let misses: Vec<usize> = (0..texts.len())
+            .filter(|index| page.vectors[*index].is_none())
+            .collect();
+        let mut fresh = Vec::new();
+        if !misses.is_empty() {
+            let batch: Vec<String> = misses
+                .iter()
+                .map(|index| texts[*index].to_string())
+                .collect();
+            let vectors = match embedder.embed_batch(&batch).await {
+                Ok(vectors) => vectors,
+                // The query slot stays warm; hybrid work is discarded and
+                // nothing is written.
+                Err(SpiError::EmbeddingsUnavailable) => return Ok((records, Vec::new())),
+                Err(error) => return Err(error),
+            };
+            fresh = checked_vectors(vectors, misses.len(), identity)?;
+        }
+
+        let mut vectors = Vec::with_capacity(texts.len());
+        let mut fills = Vec::with_capacity(misses.len());
+        let mut fresh = fresh.into_iter();
+        for (index, stored) in page.vectors.into_iter().enumerate() {
+            let vector = match stored {
+                Some(vector) => vector,
+                None => {
+                    let vector = fresh.next().expect("one vector per miss");
+                    // A tombstone holds no vector: replaying its text would
+                    // only refill a row the store refuses to keep.
+                    if let RetainedRecord::LiveRecord(live) = &page.records[index] {
+                        fills.push((
+                            SettledRecord {
+                                record_id: live.record_id.as_str().to_string(),
+                                revision: live.revision.get(),
+                                text: live.content.text.clone(),
+                            },
+                            vector.clone(),
+                        ));
+                    }
+                    vector
+                }
+            };
+            vectors.push(vector);
+        }
+
+        let scores = hybrid_scores(&texts, query, &query_vector, &vectors);
+        let mut order: Vec<usize> = (0..page.records.len()).collect();
+        // Stable: equal scores keep the adapter's order.
+        order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+        let mut records = reorder(page.records, &order);
+        if let Some(reasoner) = caps.reasoner {
+            let permutation = reasoner_permutation(reasoner, query, &records).await?;
+            records = reorder(records, &permutation);
+        }
+        Ok((records, fills))
     }
-    Ok(records)
 }
 
 fn checked_vectors(
@@ -2014,5 +2186,48 @@ mod tests {
             deadline.saturating_duration_since(now) <= MAX_TIMEOUT,
             "the deadline must be clamped, not unbounded"
         );
+    }
+
+    /// Scored over the same page and query, components reloaded from the
+    /// storage encoding rank bit-identically to the fresh ones, ties included:
+    /// the persisted path cannot rank differently from the in-memory one.
+    ///
+    /// The reload below is the storage encoding itself — little-endian IEEE 754
+    /// binary32, no header and no quantization; the real codec in
+    /// `mindcore-sqlite` is what its own round-trip test pins.
+    #[test]
+    fn reloaded_vectors_score_identically_and_keep_tie_order() {
+        let texts = [
+            "the north gate is closed",
+            "the market opens at dawn",
+            "the north gate is closed",
+        ];
+        let query = "north gate";
+        let query_vector = [1.0f32, 0.0];
+        let fresh = [vec![1.0f32, 0.0], vec![0.0f32, 1.0], vec![1.0f32, 0.0]];
+        let reloaded: Vec<Vec<f32>> = fresh
+            .iter()
+            .map(|vector| {
+                vector
+                    .iter()
+                    .map(|value| f32::from_le_bytes(value.to_le_bytes()))
+                    .collect()
+            })
+            .collect();
+
+        let in_memory = hybrid_scores(&texts, query, &query_vector, &fresh);
+        let stored = hybrid_scores(&texts, query, &query_vector, &reloaded);
+        for (left, right) in in_memory.iter().zip(&stored) {
+            assert_eq!(left.to_bits(), right.to_bits());
+        }
+
+        let order = |scores: &[f64]| {
+            let mut order: Vec<usize> = (0..scores.len()).collect();
+            order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+            order
+        };
+        assert_eq!(order(&in_memory), order(&stored));
+        // The two equal texts tie and keep the adapter's order.
+        assert_eq!(order(&stored), [0, 2, 1]);
     }
 }
