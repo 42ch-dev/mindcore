@@ -59,7 +59,7 @@ impl SnapshotSeam {
 
 #[cfg(not(test))]
 #[derive(Default)]
-pub(crate) struct SnapshotSeam;
+pub(crate) struct SnapshotSeam {}
 
 #[cfg(not(test))]
 impl SnapshotSeam {
