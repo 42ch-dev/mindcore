@@ -2294,6 +2294,16 @@ async fn scoped_capture_baseline_d1_d2() {
 /// `max_items=1` yields one record per page with `total_authorized=2`, only
 /// page 1 truncates, and tombstoned rows never appear. The byte-budget arm
 /// names the overflowing record without fabricating content.
+///
+/// Tombstone exclusion is query-shape independent, proven against the shape
+/// the shipped code has: `records.delete` scrubs the body to `{"text":""}` and
+/// keeps only the deletion mark, and recall's candidate query admits live rows
+/// only, so no query word can reach a tombstoned row. The test therefore takes
+/// a positive control with the deleted record's own words while it is live
+/// (they rank it first), then reruns the same words after the delete: no
+/// surviving record carries them, yet the zero-score siblings still come back
+/// and the tombstone does not — its absence is the tombstone filter, not a
+/// query that could never have matched it.
 #[tokio::test]
 async fn recall_pagination_d12() {
     let harness = Harness::open().await;
@@ -2305,7 +2315,10 @@ async fn recall_pagination_d12() {
     for (key, text) in [
         ("d12-create-a", "the northern gate opens before dawn"),
         ("d12-create-b", "the northern gate closes at dusk"),
-        ("d12-create-del", "an unrelated southern record"),
+        (
+            "d12-create-del",
+            "the northern gate ledger is sealed and unreadable",
+        ),
     ] {
         let create_receipt = staged(
             adapter
@@ -2345,6 +2358,34 @@ async fn recall_pagination_d12() {
     let [r1, r2, r_del] = records.as_slice() else {
         unreachable!()
     };
+    // Positive control while the record is live: its own words match it and
+    // rank it first, while the two siblings score zero and are still served.
+    // The same words are rerun after the delete below, so their later failure
+    // to produce this record cannot be blamed on the query shape.
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "query": "sealed unreadable",
+                    "budget": { "max_items": 10 },
+                }),
+            )
+            .await,
+        "recall before delete",
+    );
+    assert_eq!(body["total_authorized"], 3);
+    let matches = body["records"].as_array().expect("records");
+    assert_eq!(matches.len(), 3, "recall admits zero-score rows too");
+    assert_eq!(
+        matches[0]["record_id"],
+        json!(r_del),
+        "the deleted record's words rank it first"
+    );
     let delete_receipt = staged(
         adapter
             .delete_record(
@@ -2368,9 +2409,8 @@ async fn recall_pagination_d12() {
     )
     .await;
 
-    // The tombstone is real: the row still exists in `memory_records` with a
-    // tombstone marker, so its absence from recall pages proves recall
-    // filters tombstones rather than the query shape never matching it.
+    // Tombstoning scrubs the body and keeps the deletion mark: the row below
+    // still exists, but carries no searchable text for any query to rank.
     let tombstone: Option<String> =
         sqlx::query_scalar("SELECT tombstone_json FROM memory_records WHERE record_id = ?1")
             .bind(r_del)
@@ -2381,9 +2421,55 @@ async fn recall_pagination_d12() {
         tombstone.is_some(),
         "r_del must persist as a tombstoned row"
     );
+    let content: String =
+        sqlx::query_scalar("SELECT content_json FROM memory_records WHERE record_id = ?1")
+            .bind(r_del)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("deleted record content");
+    assert_eq!(
+        serde_json::from_str::<Value>(&content).expect("content json"),
+        json!({ "text": "" }),
+        "the tombstone retains no searchable text"
+    );
+
+    // Same words as the positive control, now that no surviving record carries
+    // them: both zero-score siblings are still served and the tombstone is not,
+    // so the exclusion is the tombstone filter rather than the query shape.
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "query": "sealed unreadable",
+                    "budget": { "max_items": 10 },
+                }),
+            )
+            .await,
+        "recall after delete",
+    );
+    assert_eq!(body["total_authorized"], 2);
+    let mut survived: Vec<&str> = body["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .map(|record| record["record_id"].as_str().expect("record id"))
+        .collect();
+    survived.sort_unstable();
+    let mut expected = vec![r1.as_str(), r2.as_str()];
+    expected.sort_unstable();
+    assert_eq!(
+        survived, expected,
+        "zero-score live rows stay served; the tombstone does not"
+    );
 
     // Page 1: one record, truncated, cursor continues; page 2 serves the
-    // remaining record with no further cursor. The tombstone is absent.
+    // remaining record with no further cursor. A second query shape reaches
+    // the same two live rows and still never the tombstone.
     let body = ready(
         adapter
             .recall(

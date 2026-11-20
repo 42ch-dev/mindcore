@@ -1414,8 +1414,10 @@ impl DomainLens for StubLens {
     }
 }
 
-/// Promotes only when the lens block reached the prompt.
-struct LensAwareReasoner(Arc<Mutex<Option<String>>>);
+/// Promotes only when the lens block reached the prompt, recording the system
+/// prompt and the user payload so two runs can be compared for everything but
+/// the lens.
+struct LensAwareReasoner(Arc<Mutex<Option<(String, String)>>>);
 
 #[async_trait]
 impl Reasoner for LensAwareReasoner {
@@ -1423,7 +1425,10 @@ impl Reasoner for LensAwareReasoner {
         &self,
         request: StructuredReasonRequest<'_>,
     ) -> Result<Value, SpiError> {
-        *self.0.lock().expect("prompt") = Some(request.system_prompt.to_string());
+        *self.0.lock().expect("prompt") = Some((
+            request.system_prompt.to_string(),
+            request.user_payload.to_string(),
+        ));
         Ok(json!({ "action": "promote", "evidence_ids": [] }))
     }
 }
@@ -1452,7 +1457,7 @@ async fn a_lens_adds_its_domain_guidance_to_the_absorb_prompt() {
         outcomes.as_slice(),
         [AbsorbCandidateOutcome::Settled { .. }]
     ));
-    let prompt = prompt.lock().expect("prompt").clone().expect("prompt");
+    let (prompt, _payload) = prompt.lock().expect("prompt").clone().expect("prompt");
     assert!(prompt.starts_with("Decide what one captured memory candidate"));
     assert!(prompt.contains("## Domain guidance"));
     assert!(prompt.contains("a gate warden"));
@@ -2608,4 +2613,363 @@ async fn an_absorb_lens_enforces_a_redline_on_the_dismissal_rationale() {
     );
     assert!(seen.lock().expect("seen").is_empty(), "policy never ran");
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
+}
+
+// ---------- second lens: engineering evaluator vs Nexus narrative ----------
+
+/// The observations the engineering fixture has independently verified as
+/// reproducible test/CI/performance evidence. A record's text, a verdict's
+/// rationale or a target label never adds to this set.
+const VERIFIED_EVIDENCE: &[&str] = &["ev_test"];
+
+/// Engineering-evaluator lens: a second domain over the same engine.
+struct EngineeringEvaluatorLens;
+
+impl DomainLens for EngineeringEvaluatorLens {
+    fn describe(&self, _task_kind: CognitiveTaskKind) -> LensOutput<'_> {
+        LensOutput {
+            persona_and_stance: "an engineering evaluator weighing test, CI and performance signal",
+            salience_criteria: "test, CI and performance signals on the head commit",
+            evidence_bar: "reproducible evidence: a named test, CI run or benchmark",
+            redlines: &["never promote an unverified observation to an ADR"],
+        }
+    }
+
+    fn validate_proposal(
+        &self,
+        draft: &ProposalDraft<'_>,
+        admitted: &[&str],
+    ) -> Result<(), String> {
+        let ProposalDraft::Cognition {
+            recommendation: Recommendation::Promote { target_kind },
+            cited_ids,
+            ..
+        } = draft
+        else {
+            // The redline binds ADR promotion only: an absorb decision or a
+            // `none` recommendation rests on the engine's own checks.
+            return Ok(());
+        };
+        if target_kind != "adr" {
+            return Ok(());
+        }
+        if cited_ids
+            .iter()
+            .any(|id| VERIFIED_EVIDENCE.contains(id) && admitted.contains(id))
+        {
+            return Ok(());
+        }
+        Err("an ADR cites no test, CI or performance observation this fixture verified".to_string())
+    }
+}
+
+/// Nexus-style narrative lens over the same trait: no redline against the
+/// proposal this domain is asked to accept.
+struct NarrativeLens;
+
+impl DomainLens for NarrativeLens {
+    fn describe(&self, _task_kind: CognitiveTaskKind) -> LensOutput<'_> {
+        LensOutput {
+            persona_and_stance: "a narrative continuity editor for the Nexus chronicle",
+            salience_criteria: "voice, motive and continuity of the told events",
+            evidence_bar: "a cited passage of the supplied narrative record",
+            redlines: &["never contradict a settled scene"],
+        }
+    }
+
+    fn validate_proposal(
+        &self,
+        _draft: &ProposalDraft<'_>,
+        _admitted: &[&str],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The one request both domains deliberate over.
+fn lens_request<'a>(
+    holder: &'a CognitionReference,
+    target: &'a CognitionTarget,
+    evidence: &'a [Evidence<'a>],
+) -> DeliberateRequest<'a> {
+    DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder,
+        target,
+        evidence,
+        timeout: std::time::Duration::from_secs(30),
+    }
+}
+
+/// A promote-to-adr verdict citing exactly these ids. The rationale is model
+/// text: it can claim verification but never confers it.
+fn adr_verdict(rationale: &str, evidence_ids: &[&str], record_ids: &[&str]) -> Value {
+    let mut verdict = promote_verdict();
+    verdict["rationale"] = json!(rationale);
+    verdict["evidence_ids"] = json!(evidence_ids);
+    verdict["record_ids"] = json!(record_ids);
+    verdict
+}
+
+/// Returns a fixed verdict and records the prompt it was handed, so two runs
+/// over one request can be compared for everything but the lens.
+struct PromptedVerdict {
+    verdict: Value,
+    prompt: Arc<Mutex<Option<(String, String)>>>,
+}
+
+#[async_trait]
+impl Reasoner for PromptedVerdict {
+    async fn reason_structured(
+        &self,
+        request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        *self.prompt.lock().expect("prompt") = Some((
+            request.system_prompt.to_string(),
+            request.user_payload.to_string(),
+        ));
+        Ok(self.verdict.clone())
+    }
+}
+
+#[tokio::test]
+async fn only_the_lens_differs_across_the_narrative_and_engineering_deliberation() {
+    let verdict = adr_verdict(
+        "the gate test passed on the supplied evidence",
+        &["ev_test"],
+        &["rec_gate"],
+    );
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+
+    let narrative_prompt = Arc::new(Mutex::new(None));
+    let narrative_reasoner = PromptedVerdict {
+        verdict: verdict.clone(),
+        prompt: Arc::clone(&narrative_prompt),
+    };
+    let narrative_policy = AutoPolicy;
+    let narrative_caps = MindCapabilities {
+        reasoner: Some(&narrative_reasoner),
+        policy_hook: Some(&narrative_policy),
+        ..MindCapabilities::default()
+    };
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let outcome = workflows
+        .deliberate(
+            &principal(),
+            lens_request(&holder, &target, &evidence),
+            Some(&NarrativeLens),
+            &narrative_caps,
+        )
+        .await
+        .expect("the narrative lens settles the promotion");
+    assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+    assert_eq!(settlements.lock().expect("settlements").len(), 1);
+
+    let engineering_prompt = Arc::new(Mutex::new(None));
+    let engineering_reasoner = PromptedVerdict {
+        verdict: verdict.clone(),
+        prompt: Arc::clone(&engineering_prompt),
+    };
+    let engineering_policy = AutoPolicy;
+    let engineering_caps = MindCapabilities {
+        reasoner: Some(&engineering_reasoner),
+        policy_hook: Some(&engineering_policy),
+        ..MindCapabilities::default()
+    };
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let outcome = workflows
+        .deliberate(
+            &principal(),
+            lens_request(&holder, &target, &evidence),
+            Some(&EngineeringEvaluatorLens),
+            &engineering_caps,
+        )
+        .await
+        .expect("the engineering lens settles the verified promotion");
+    assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+    assert_eq!(settlements.lock().expect("settlements").len(), 1);
+
+    let narrative = narrative_prompt
+        .lock()
+        .expect("prompt")
+        .clone()
+        .expect("prompt");
+    let engineering = engineering_prompt
+        .lock()
+        .expect("prompt")
+        .clone()
+        .expect("prompt");
+    assert_eq!(narrative.1, engineering.1, "only the lens input differs");
+    assert!(narrative.0.contains("- never contradict a settled scene"));
+    assert!(engineering
+        .0
+        .contains("test, CI and performance signals on the head commit"));
+    assert!(engineering
+        .0
+        .contains("- never promote an unverified observation to an ADR"));
+}
+
+#[tokio::test]
+async fn an_engineering_adr_needs_a_verified_citation_before_the_hook() {
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+
+    // The proposal rests on the resolvable local observation only; the prose
+    // claiming CI verification is model text.
+    let reasoner = DeliberateReasoner {
+        verdict: adr_verdict(
+            "verified: the gate test passed in CI on the head commit",
+            &[],
+            &["rec_gate"],
+        ),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = UnreachablePolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+
+    let error = workflows
+        .deliberate(
+            &principal(),
+            lens_request(&holder, &target, &evidence),
+            Some(&EngineeringEvaluatorLens),
+            &caps,
+        )
+        .await
+        .expect_err("an unverified observation cannot settle as an ADR");
+
+    assert!(
+        matches!(error, SpiError::PolicyRejected(_)),
+        "expected a lens refusal, got {error:?}"
+    );
+    assert!(
+        settlements.lock().expect("settlements").is_empty(),
+        "the carrier is unchanged"
+    );
+
+    // The same proposal resting on the fixture-verified observation settles.
+    let reasoner = DeliberateReasoner {
+        verdict: adr_verdict(
+            "the gate test passed on the supplied evidence",
+            &["ev_test"],
+            &["rec_gate"],
+        ),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+
+    let outcome = workflows
+        .deliberate(
+            &principal(),
+            lens_request(&holder, &target, &evidence),
+            Some(&EngineeringEvaluatorLens),
+            &caps,
+        )
+        .await
+        .expect("a verified citation settles");
+
+    assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+    assert_eq!(settlements.lock().expect("settlements").len(), 1);
+}
+
+#[tokio::test]
+async fn only_the_lens_differs_across_the_narrative_and_engineering_absorb() {
+    let narrative_prompt = Arc::new(Mutex::new(None));
+    let narrative_reasoner = LensAwareReasoner(Arc::clone(&narrative_prompt));
+    let narrative_policy = AutoPolicy;
+    let narrative_caps = MindCapabilities {
+        reasoner: Some(&narrative_reasoner),
+        policy_hook: Some(&narrative_policy),
+        ..MindCapabilities::default()
+    };
+    let (narrative_workflows, narrative_recorded, _) = absorb(pending_candidate());
+    let outcomes = narrative_workflows
+        .absorb(
+            &principal(),
+            &capture_request(),
+            Some(&NarrativeLens),
+            &narrative_caps,
+        )
+        .await
+        .expect("the narrative lens settles the promotion");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [AbsorbCandidateOutcome::Settled { .. }]
+    ));
+    assert_eq!(narrative_recorded.reviews.lock().expect("reviews").len(), 1);
+
+    let engineering_prompt = Arc::new(Mutex::new(None));
+    let engineering_reasoner = LensAwareReasoner(Arc::clone(&engineering_prompt));
+    let engineering_policy = AutoPolicy;
+    let engineering_caps = MindCapabilities {
+        reasoner: Some(&engineering_reasoner),
+        policy_hook: Some(&engineering_policy),
+        ..MindCapabilities::default()
+    };
+    let (engineering_workflows, engineering_recorded, _) = absorb(pending_candidate());
+    let outcomes = engineering_workflows
+        .absorb(
+            &principal(),
+            &capture_request(),
+            Some(&EngineeringEvaluatorLens),
+            &engineering_caps,
+        )
+        .await
+        .expect("the engineering lens binds ADR promotion only");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [AbsorbCandidateOutcome::Settled { .. }]
+    ));
+    assert_eq!(
+        engineering_recorded.reviews.lock().expect("reviews").len(),
+        1
+    );
+
+    let (narrative, narrative_payload) = narrative_prompt
+        .lock()
+        .expect("prompt")
+        .clone()
+        .expect("prompt");
+    let (engineering, engineering_payload) = engineering_prompt
+        .lock()
+        .expect("prompt")
+        .clone()
+        .expect("prompt");
+    assert_eq!(
+        narrative_payload, engineering_payload,
+        "only the lens input differs"
+    );
+    assert!(narrative.starts_with("Decide what one captured memory candidate"));
+    assert!(engineering.starts_with("Decide what one captured memory candidate"));
+    assert!(narrative.contains("a narrative continuity editor"));
+    assert!(engineering.contains("an engineering evaluator"));
+    assert!(engineering.contains("- never promote an unverified observation to an ADR"));
 }

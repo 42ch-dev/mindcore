@@ -1,0 +1,146 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, revision, created_at FROM memory_grants WHERE principal_id = ? AND space_id IN (SELECT space_id FROM memory_spaces) ORDER BY space_id, grant_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "grant_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "grant_id"
+          }
+        }
+      },
+      {
+        "name": "space_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "space_id"
+          }
+        }
+      },
+      {
+        "name": "subject_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "subject_id"
+          }
+        }
+      },
+      {
+        "name": "principal_id",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "principal_id"
+          }
+        }
+      },
+      {
+        "name": "capabilities_json",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "capabilities_json"
+          }
+        }
+      },
+      {
+        "name": "context_ids_json",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "context_ids_json"
+          }
+        }
+      },
+      {
+        "name": "shared_access",
+        "ordinal": 6,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "shared_access"
+          }
+        }
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "name": "revoked_at",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "revoked_at"
+          }
+        }
+      },
+      {
+        "name": "revision",
+        "ordinal": 9,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 10,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_grants",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "3bd6c33204fb0785cfab513358565f2ad6e356aa290c11672df89965e183e98f"
+}
