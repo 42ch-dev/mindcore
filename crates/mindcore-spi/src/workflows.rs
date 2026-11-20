@@ -8,21 +8,27 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use spoke_operations::{jcs_sha256_hex, SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    jcs_sha256_hex, validate_cognition_record, SpokeReject, SpokeRejectCode, SpokeResult,
+};
+use spoke_schemas::data::cognition::CognitionReference;
 use spoke_schemas::data::memory_candidate::{ConsumedCandidate, Outcome, PendingCandidate};
 use spoke_schemas::{
-    KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest, MemoryCandidatesReviewRequest,
-    MemoryCaptureRequest, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
-    RetainedRecord,
+    CognitionRecord, KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest,
+    MemoryCandidatesReviewRequest, MemoryCaptureRequest, MemoryRecallRequest,
+    MemoryRecordsUpdateRequest, Principal, RetainedRecord,
 };
 
 use crate::{
-    AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DomainLens,
-    EmbeddingIdentity, LensOutput, MindCapabilities, PolicyDecision, PolicyHook, Reasoner,
+    AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DeliberateOutcome,
+    DeliberateRequest, DomainLens, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities,
+    MindWorkflows, PolicyDecision, PolicyHook, ProposalDraft, Reasoner, Recommendation,
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
 
@@ -57,6 +63,7 @@ pub struct RecallSnapshot {
 /// storage-shaped, so the workflow can call a provider between two calls and
 /// revalidate afterwards.
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait WorkflowBinding: Send + Sync {
     /// Read the current authorized snapshot for `request`.
     async fn recall_snapshot(
@@ -124,6 +131,52 @@ pub trait WorkflowBinding: Send + Sync {
         space_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<String>, SpiError>;
+
+    /// Read one deliberation snapshot: the subject's authorized memory page
+    /// and the caller's admitted holder carrier, on one transaction.
+    ///
+    /// The holder must name the existing carrier entry of the caller's bound
+    /// knowledge collection. A memory grant is not an admission to the
+    /// carrier; only the binding's knowledge admission is.
+    async fn deliberate_snapshot(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        subject_id: &str,
+        holder: &CognitionReference,
+        max_items: u64,
+    ) -> Result<DeliberateSnapshot, SpiError>;
+
+    /// Append `record` to the holder carrier and persist the replacement under
+    /// one caller-managed write transaction.
+    ///
+    /// Rechecks the caller's knowledge admission, the subject's withholding and
+    /// every cited record revision against `cited`, and refuses a carrier that
+    /// no longer holds `expected_carrier_revision`. Returns the carrier revision
+    /// of the derived `MindState` after a confirmed commit.
+    async fn commit_cognition(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        subject_id: &str,
+        holder: &CognitionReference,
+        expected_carrier_revision: u64,
+        record: Value,
+        cited: &[CitedRecord],
+    ) -> Result<u64, SpiError>;
+}
+
+/// One deliberation read: the subject's authorized memory page and the holder
+/// carrier's current-view cognition records, read on one transaction.
+#[derive(Debug, Clone)]
+pub struct DeliberateSnapshot {
+    /// The bounded, ACL- and withholding-checked subject page, in adapter
+    /// order.
+    pub records: Vec<RetainedRecord>,
+    /// The carrier's current-view cognition records, in carrier order.
+    pub cognition: Vec<Value>,
+    /// The carrier revision the read served; a settlement CAS expects it.
+    pub carrier_revision: u64,
 }
 
 /// One absorb read: the candidate and the bounded evidence page it was decided
@@ -271,6 +324,23 @@ impl SpiMindWorkflows {
             return Ok(AbsorbCandidateOutcome::Pending { candidate_id });
         };
         let action = decide(reasoner, pending, &records, lens).await?;
+        if let Some(lens) = lens {
+            let admitted: Vec<&str> = records.iter().map(record_id).collect();
+            let cited: Vec<&str> = action
+                .cited()
+                .iter()
+                .map(|record| record.record_id.as_str())
+                .collect();
+            lens.validate_proposal(
+                &ProposalDraft::Absorb {
+                    action: action.kind(),
+                    target_record_id: action.target(),
+                    cited_ids: &cited,
+                },
+                &admitted,
+            )
+            .map_err(SpiError::PolicyRejected)?;
+        }
         let expected_revision = pending.revision.get();
         let review_key = absorb_key(&capture_key, &candidate_id, "review")?;
         let fallback = DefaultPolicy;
@@ -448,11 +518,179 @@ impl SpiMindWorkflows {
             Outcome::Dropped => Ok(AbsorbCandidateOutcome::Dropped { candidate_id }),
         }
     }
+
+    /// Derive a validated verdict over the supplied evidence and settle the
+    /// record it promotes onto the holder's cognition carrier.
+    ///
+    /// One authorized snapshot is read, the reasoner runs outside every
+    /// transaction, its verdict is validated against that exact snapshot, the
+    /// lens and policy decide, and the carrier is appended and CAS-persisted in
+    /// one write transaction. Only a definite stale-revision conflict starts
+    /// another attempt — at most twice, and never after the request deadline.
+    pub async fn deliberate(
+        &self,
+        principal: &Principal,
+        request: DeliberateRequest<'_>,
+        lens: Option<&dyn DomainLens>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<DeliberateOutcome, SpiError> {
+        let Some(reasoner) = caps.reasoner else {
+            return Err(SpiError::ReasonerUnavailable);
+        };
+        let deadline = Instant::now().checked_add(request.timeout);
+        let mut retries = 0usize;
+        loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(SpiError::DeadlineExceeded);
+            }
+            match self
+                .deliberate_attempt(principal, &request, reasoner, lens, caps)
+                .await
+            {
+                Err(error) if stale_revision(&error) => {
+                    if retries == DELIBERATE_RETRIES {
+                        return Err(error);
+                    }
+                    retries += 1;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    async fn deliberate_attempt(
+        &self,
+        principal: &Principal,
+        request: &DeliberateRequest<'_>,
+        reasoner: &dyn Reasoner,
+        lens: Option<&dyn DomainLens>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<DeliberateOutcome, SpiError> {
+        let snapshot = self
+            .binding
+            .deliberate_snapshot(
+                principal,
+                request.space_id,
+                request.subject_id,
+                request.holder,
+                DELIBERATE_PAGE_ITEMS,
+            )
+            .await?;
+        let admitted = admitted_references(request.evidence, &snapshot);
+        let payload = deliberate_payload(request, &snapshot);
+        let schema = deliberate_schema();
+        let prompt = task_prompt(DELIBERATE_PROMPT, CognitiveTaskKind::Deliberate, lens);
+        let verdict = reasoner
+            .reason_structured(StructuredReasonRequest {
+                task_kind: CognitiveTaskKind::Deliberate,
+                system_prompt: &prompt,
+                user_payload: &payload,
+                output_schema: &schema,
+            })
+            .await?;
+        let DeliberateProposal {
+            recommendation,
+            record,
+            cited,
+            cited_ids,
+        } = deliberate_proposal(&verdict, request, principal, &snapshot, &admitted)?;
+        let Some(record) = record else {
+            // `none`: no record, no policy and no write.
+            return Ok(DeliberateOutcome::NoChange { verdict });
+        };
+        if let Some(lens) = lens {
+            let admitted: Vec<&str> = admitted.iter().map(String::as_str).collect();
+            let cited_ids: Vec<&str> = cited_ids.iter().map(String::as_str).collect();
+            lens.validate_proposal(
+                &ProposalDraft::Cognition {
+                    recommendation: &recommendation,
+                    record: Some(&record),
+                    cited_ids: &cited_ids,
+                },
+                &admitted,
+            )
+            .map_err(SpiError::PolicyRejected)?;
+        }
+        let fallback = DefaultPolicy;
+        let policy: &dyn PolicyHook = caps.policy_hook.unwrap_or(&fallback);
+        match policy
+            .evaluate_settlement(SettlementDraft::Cognition { proposed: &record })
+            .await?
+        {
+            PolicyDecision::AutoSettle => {}
+            PolicyDecision::RequireHumanReview { .. } => {
+                return Ok(DeliberateOutcome::NeedsReview {
+                    verdict,
+                    draft: record,
+                })
+            }
+            PolicyDecision::Reject { reason } => return Err(SpiError::PolicyRejected(reason)),
+        }
+        let mind_state_version = self
+            .binding
+            .commit_cognition(
+                principal,
+                request.space_id,
+                request.subject_id,
+                request.holder,
+                snapshot.carrier_revision,
+                serde_json::to_value(&record)
+                    .map_err(|error| SpiError::InvalidInput(error.to_string()))?,
+                &cited,
+            )
+            .await?;
+        Ok(DeliberateOutcome::Settled {
+            verdict,
+            record,
+            mind_state_version,
+        })
+    }
+}
+
+#[async_trait]
+impl MindWorkflows for SpiMindWorkflows {
+    async fn recall_context(
+        &self,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+        max_tokens: NonZeroUsize,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<ContextPack, SpiError> {
+        SpiMindWorkflows::recall_context(self, principal, request, max_tokens, caps).await
+    }
+
+    async fn absorb(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+        lens: Option<&dyn DomainLens>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<Vec<AbsorbCandidateOutcome>, SpiError> {
+        SpiMindWorkflows::absorb(self, principal, request, lens, caps).await
+    }
+
+    async fn deliberate(
+        &self,
+        principal: &Principal,
+        request: DeliberateRequest<'_>,
+        lens: Option<&dyn DomainLens>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<DeliberateOutcome, SpiError> {
+        SpiMindWorkflows::deliberate(self, principal, request, lens, caps).await
+    }
 }
 
 /// Bounded evidence page one absorb decision may cite: one recall page per
 /// candidate, never a second page.
 const ABSORB_PAGE_ITEMS: u64 = 32;
+
+/// Bounded subject page one deliberation reads: one recall page, never a
+/// second page.
+const DELIBERATE_PAGE_ITEMS: u64 = 32;
+
+/// Retries after the first attempt, so a stale carrier or citation never
+/// loops past three snapshots.
+const DELIBERATE_RETRIES: usize = 2;
 
 /// Fixed skeleton of the absorb leg; a lens only adds guidance below it.
 const ABSORB_PROMPT: &str = "Decide what one captured memory candidate becomes for its \
@@ -504,25 +742,384 @@ fn absorb_schema() -> Value {
     })
 }
 
-/// The fixed skeleton plus a lens's named domain-guidance block.
-fn absorb_prompt(lens: Option<&dyn DomainLens>) -> String {
+/// Fixed skeleton of the deliberate leg; a lens only adds guidance below it.
+const DELIBERATE_PROMPT: &str = "Deliberate what one cognition holder should record for the \
+     supplied cognition target, resting only on the supplied evidence and the holder's visible \
+     records. Return exactly one verdict. recommendation.kind is none when nothing should be \
+     recorded, or promote with target_kind naming what the record promotes (an observation, a \
+     belief, an ADR...). rationale explains the verdict in prose. evidence_ids lists the supplied \
+     evidence the verdict rests on and record_ids the visible record ids it rests on: unique, \
+     never repeated, never invented. A promotion carries record with the cognition record's own \
+     content; record_id, holder, target, assessor, assessment_context, assessed_at, effective_at, \
+     view and extensions are fixed outside this reply and never supplied.";
+
+/// The fixed skeleton plus a lens's named domain-guidance block, inserted
+/// after the instructions for either workflow's task kind.
+fn task_prompt(
+    skeleton: &str,
+    task_kind: CognitiveTaskKind,
+    lens: Option<&dyn DomainLens>,
+) -> String {
     let Some(lens) = lens else {
-        return ABSORB_PROMPT.to_string();
+        return skeleton.to_string();
     };
     let LensOutput {
         persona_and_stance,
         salience_criteria,
         evidence_bar,
         redlines,
-    } = lens.describe(CognitiveTaskKind::Absorb);
+    } = lens.describe(task_kind);
     let mut prompt = format!(
-        "{ABSORB_PROMPT}\n\n## Domain guidance\nPersona and stance: {persona_and_stance}\n\
+        "{skeleton}\n\n## Domain guidance\nPersona and stance: {persona_and_stance}\n\
          Salience criteria: {salience_criteria}\nEvidence bar: {evidence_bar}\nRedlines:\n"
     );
     for redline in redlines {
         prompt.push_str(&format!("- {redline}\n"));
     }
     prompt
+}
+
+/// Output schema handed to the deliberate reasoner. The workflow validates
+/// the reply and every cited id itself; the inner record is validated by the
+/// pinned cognition schema after the workflow stamps its own fields.
+fn deliberate_schema() -> Value {
+    let strings = json!({ "type": "array", "items": { "type": "string" } });
+    json!({
+        "type": "object",
+        "properties": {
+            "recommendation": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": { "kind": { "const": "none" } },
+                        "required": ["kind"],
+                        "additionalProperties": false,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "promote" },
+                            "target_kind": { "type": "string" },
+                        },
+                        "required": ["kind", "target_kind"],
+                        "additionalProperties": false,
+                    },
+                ],
+            },
+            "rationale": { "type": "string" },
+            "evidence_ids": strings.clone(),
+            "record_ids": strings,
+            "record": { "type": "object" },
+        },
+        "required": ["recommendation", "rationale", "evidence_ids", "record_ids"],
+        "additionalProperties": false,
+    })
+}
+
+/// One validated deliberation verdict, with everything the workflow will
+/// settle or revalidate.
+struct DeliberateProposal {
+    recommendation: Recommendation,
+    record: Option<CognitionRecord>,
+    cited: Vec<CitedRecord>,
+    cited_ids: Vec<String>,
+}
+
+/// Every reference a verdict may cite: the supplied evidence ids plus the
+/// memory and cognition records this snapshot made visible.
+fn admitted_references(evidence: &[Evidence<'_>], snapshot: &DeliberateSnapshot) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut admit = |id: &str| {
+        if !ids.iter().any(|known| known == id) {
+            ids.push(id.to_string());
+        }
+    };
+    for item in evidence {
+        admit(item.id);
+    }
+    for record in &snapshot.records {
+        admit(record_id(record));
+    }
+    for record in &snapshot.cognition {
+        if let Some(id) = record.get("record_id").and_then(Value::as_str) {
+            admit(id);
+        }
+    }
+    ids
+}
+
+/// The reasoner payload: the admitted evidence as data, beside the visible
+/// memory page, the visible cognition records and the target.
+fn deliberate_payload(request: &DeliberateRequest<'_>, snapshot: &DeliberateSnapshot) -> String {
+    let evidence: Vec<Value> = request
+        .evidence
+        .iter()
+        .map(|item| json!({ "evidence_id": item.id, "text": item.text }))
+        .collect();
+    let records: Vec<Value> = snapshot
+        .records
+        .iter()
+        .map(|record| json!({ "record_id": record_id(record), "text": record_text(record) }))
+        .collect();
+    json!({
+        "target": request.target,
+        "holder": request.holder,
+        "evidence": evidence,
+        "records": records,
+        "cognition": snapshot.cognition,
+    })
+    .to_string()
+}
+
+/// Validate the closed verdict shape, every cited reference and the proposed
+/// record, stamping the workflow-owned fields from trusted inputs.
+fn deliberate_proposal(
+    verdict: &Value,
+    request: &DeliberateRequest<'_>,
+    principal: &Principal,
+    snapshot: &DeliberateSnapshot,
+    admitted: &[String],
+) -> Result<DeliberateProposal, SpiError> {
+    let object = verdict
+        .as_object()
+        .ok_or_else(|| invalid_verdict("the verdict is not an object"))?;
+    let allowed = [
+        "recommendation",
+        "rationale",
+        "evidence_ids",
+        "record_ids",
+        "record",
+    ];
+    if let Some(unexpected) = object
+        .keys()
+        .find(|member| !allowed.contains(&member.as_str()))
+    {
+        return Err(invalid_verdict(format!("the verdict carries {unexpected}")));
+    }
+    if !object
+        .get("rationale")
+        .and_then(Value::as_str)
+        .is_some_and(|rationale| !rationale.trim().is_empty())
+    {
+        return Err(invalid_verdict("the verdict carries no rationale"));
+    }
+    let recommendation = deliberate_recommendation(object)?;
+    let (cited, cited_ids) = deliberate_citations(object, request, snapshot)?;
+    let record = match recommendation {
+        Recommendation::None => None,
+        Recommendation::Promote { .. } => {
+            let draft = object
+                .get("record")
+                .ok_or_else(|| invalid_verdict("a promotion carries no record"))?;
+            // A record's basis cites the records it rests on: a cited id the
+            // snapshot never admitted is the same hallucination the verdict's
+            // own citations are checked for.
+            for reference in draft
+                .get("basis")
+                .and_then(|basis| basis.get("evidence"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let id = reference
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !admitted.iter().any(|known| known == id) {
+                    return Err(invalid_verdict(format!(
+                        "basis evidence id {id} is not visible to this deliberation"
+                    )));
+                }
+            }
+            Some(stamp_cognition_record(draft, request, principal)?)
+        }
+    };
+    Ok(DeliberateProposal {
+        recommendation,
+        record,
+        cited,
+        cited_ids,
+    })
+}
+
+/// The structured recommendation of one verdict.
+fn deliberate_recommendation(object: &Map<String, Value>) -> Result<Recommendation, SpiError> {
+    let recommendation = object
+        .get("recommendation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_verdict("the verdict names no recommendation"))?;
+    match recommendation.get("kind").and_then(Value::as_str) {
+        Some("none") => {
+            if recommendation.len() != 1 || object.contains_key("record") {
+                return Err(invalid_verdict("a none recommendation carries no record"));
+            }
+            Ok(Recommendation::None)
+        }
+        Some("promote") => {
+            if recommendation.len() != 2 {
+                return Err(invalid_verdict(
+                    "a promote recommendation carries kind and target_kind",
+                ));
+            }
+            let target_kind = recommendation
+                .get("target_kind")
+                .and_then(Value::as_str)
+                .filter(|kind| !kind.trim().is_empty())
+                .ok_or_else(|| invalid_verdict("a promotion names no target_kind"))?;
+            Ok(Recommendation::Promote {
+                target_kind: target_kind.to_string(),
+            })
+        }
+        Some(other) => Err(invalid_verdict(format!("{other} is not a recommendation"))),
+        None => Err(invalid_verdict("the recommendation names no kind")),
+    }
+}
+
+/// The exact references the verdict cites, each checked against the allowlist
+/// the snapshot authorized.
+fn deliberate_citations(
+    object: &Map<String, Value>,
+    request: &DeliberateRequest<'_>,
+    snapshot: &DeliberateSnapshot,
+) -> Result<(Vec<CitedRecord>, Vec<String>), SpiError> {
+    let mut cited = Vec::new();
+    let mut cited_ids = Vec::new();
+    for id in string_ids(object, "evidence_ids")? {
+        if !request.evidence.iter().any(|item| item.id == id) {
+            return Err(invalid_verdict(format!(
+                "evidence id {id} was not supplied to this deliberation"
+            )));
+        }
+        cited_ids.push(id);
+    }
+    for id in string_ids(object, "record_ids")? {
+        match snapshot
+            .records
+            .iter()
+            .find(|record| record_id(record) == id)
+        {
+            Some(record) => cited.push(CitedRecord {
+                record_id: id.clone(),
+                revision: record_revision(record),
+            }),
+            // A carrier record needs no revision check of its own: the
+            // carrier CAS covers every change to it.
+            None if snapshot.cognition.iter().any(|record| {
+                record.get("record_id").and_then(Value::as_str) == Some(id.as_str())
+            }) => {}
+            None => {
+                return Err(invalid_verdict(format!(
+                    "record id {id} is not visible to this deliberation"
+                )))
+            }
+        }
+        cited_ids.push(id);
+    }
+    Ok((cited, cited_ids))
+}
+
+/// `field`: unique nonempty ids, never repeated.
+fn string_ids(object: &Map<String, Value>, field: &str) -> Result<Vec<String>, SpiError> {
+    let values = object
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_verdict(format!("the verdict names no {field} array")))?;
+    let mut ids: Vec<String> = Vec::with_capacity(values.len());
+    for value in values {
+        let id = value
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid_verdict(format!("a {field} entry is not a nonempty string")))?;
+        if ids.iter().any(|known| known == id) {
+            return Err(invalid_verdict(format!("{field} entry {id} appears twice")));
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
+/// Stamp the workflow-owned fields onto the proposed record, then validate it
+/// against the pinned cognition schema. The model supplies only content; the
+/// identity, holder, target, context, timestamps and view are trusted inputs.
+fn stamp_cognition_record(
+    draft: &Value,
+    request: &DeliberateRequest<'_>,
+    principal: &Principal,
+) -> Result<CognitionRecord, SpiError> {
+    let mut record = draft
+        .as_object()
+        .cloned()
+        .ok_or_else(|| invalid_verdict("the proposed record is not an object"))?;
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let stamped = [
+        ("record_id", Value::String(new_record_id(request)?)),
+        ("holder", render_value(request.holder)?),
+        ("target", render_value(request.target)?),
+        (
+            "assessor",
+            json!({
+                "kind": "principal",
+                "namespace": "mindcore",
+                "id": principal.principal_id.as_str(),
+            }),
+        ),
+        (
+            "assessment_context",
+            json!({ "context_id": request.subject_id }),
+        ),
+        ("assessed_at", Value::String(now.clone())),
+        ("effective_at", Value::String(now)),
+        ("view", Value::String("current".to_string())),
+        ("extensions", Value::Object(Map::new())),
+    ];
+    for (field, value) in stamped {
+        record.insert(field.to_string(), value);
+    }
+    let record = Value::Object(record);
+    if let SpokeResult::Reject(reject) = validate_cognition_record(&record) {
+        return Err(invalid_verdict(format!(
+            "the proposed record was rejected ({}): {}",
+            reject.code, reject.message
+        )));
+    }
+    serde_json::from_value(record)
+        .map_err(|error| invalid_verdict(format!("the proposed record does not decode: {error}")))
+}
+
+/// A fresh record id: the workflow clock plus a digest of the trusted target
+/// identity, unique within this carrier without a stored counter.
+fn new_record_id(request: &DeliberateRequest<'_>) -> Result<String, SpiError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let digest = match jcs_sha256_hex(&json!({
+        "space_id": request.space_id,
+        "subject_id": request.subject_id,
+        "holder": request.holder,
+        "target": request.target,
+    })) {
+        SpokeResult::Ok(digest) => digest,
+        SpokeResult::Reject(reject) => return Err(SpiError::InvalidInput(reject.message)),
+    };
+    Ok(format!("cog_{nanos:x}_{}", &digest[..16]))
+}
+
+fn render_value<T: Serialize>(value: &T) -> Result<Value, SpiError> {
+    serde_json::to_value(value).map_err(|error| SpiError::InvalidInput(error.to_string()))
+}
+
+/// A definite stale-revision conflict: no effect committed, so a fresh attempt
+/// over a fresh snapshot can succeed.
+fn stale_revision(error: &SpiError) -> bool {
+    matches!(
+        error,
+        SpiError::Settlement(reject)
+            if matches!(
+                reject.code,
+                SpokeRejectCode::RevisionConflict | SpokeRejectCode::StoredRevisionStale
+            )
+    )
 }
 
 /// One validated settle-or-not decision over the prompted page, with the page
@@ -540,6 +1137,34 @@ enum AbsorbAction {
         rationale: String,
         cited: Vec<CitedRecord>,
     },
+}
+
+impl AbsorbAction {
+    /// The wire action the decision maps to.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Promote { .. } => "promote",
+            Self::Update { .. } => "update",
+            Self::Dismiss { .. } => "dismiss",
+        }
+    }
+
+    /// The record an update replaces.
+    fn target(&self) -> Option<&str> {
+        match self {
+            Self::Update { record_id, .. } => Some(record_id),
+            _ => None,
+        }
+    }
+
+    /// The prompted-page records the decision cites.
+    fn cited(&self) -> &[CitedRecord] {
+        match self {
+            Self::Promote { cited } | Self::Update { cited, .. } | Self::Dismiss { cited, .. } => {
+                cited
+            }
+        }
+    }
 }
 
 /// Ask the reasoner once and validate its reply against `records`.
@@ -563,7 +1188,7 @@ async fn decide(
     })
     .to_string();
     let schema = absorb_schema();
-    let prompt = absorb_prompt(lens);
+    let prompt = task_prompt(ABSORB_PROMPT, CognitiveTaskKind::Absorb, lens);
     let verdict = reasoner
         .reason_structured(StructuredReasonRequest {
             task_kind: CognitiveTaskKind::Absorb,

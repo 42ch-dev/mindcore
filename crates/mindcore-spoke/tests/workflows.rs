@@ -4,6 +4,8 @@
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -1602,4 +1604,416 @@ async fn a_policy_rejection_revalidates_the_cited_evidence_it_consumes() {
             .await,
         0
     );
+}
+
+// ── deliberate over the real carrier ─────────────────────────────────
+
+const CARRIER: &str = "ke_wren";
+
+/// What the reasoner does to the store while it deliberates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeliberateEffect {
+    None,
+    /// Move the cited record once: only the first attempt's citation is stale.
+    BumpCitedOnce,
+    /// Move the cited record on every call: every attempt's citation is stale.
+    BumpCitedAlways,
+    RevokeKnowledgeGrant,
+    /// Withhold the subject: an unsettled intent appears while the reasoner runs.
+    StagePendingIntent,
+}
+
+struct DeliberateReasoner {
+    verdict: Value,
+    effect: DeliberateEffect,
+    pool: SqlitePool,
+    calls: Arc<AtomicUsize>,
+}
+
+impl DeliberateReasoner {
+    fn new(verdict: Value, effect: DeliberateEffect, pool: &SqlitePool) -> Self {
+        Self {
+            verdict,
+            effect,
+            pool: pool.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn calls(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.calls)
+    }
+}
+
+#[async_trait]
+impl Reasoner for DeliberateReasoner {
+    async fn reason_structured(
+        &self,
+        request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        assert_eq!(request.task_kind, CognitiveTaskKind::Deliberate);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.effect {
+            DeliberateEffect::None => {}
+            DeliberateEffect::BumpCitedOnce if call == 0 => {
+                sqlx::query("UPDATE memory_records SET revision = revision + 1")
+                    .execute(&self.pool)
+                    .await
+                    .expect("bump the cited record");
+            }
+            DeliberateEffect::BumpCitedOnce => {}
+            DeliberateEffect::BumpCitedAlways => {
+                sqlx::query("UPDATE memory_records SET revision = revision + 1")
+                    .execute(&self.pool)
+                    .await
+                    .expect("bump the cited record");
+            }
+            DeliberateEffect::RevokeKnowledgeGrant => {
+                sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = ?")
+                    .bind(NOW)
+                    .bind("grt_knowledge")
+                    .execute(&self.pool)
+                    .await
+                    .expect("revoke the knowledge grant");
+            }
+            DeliberateEffect::StagePendingIntent => {
+                sqlx::query(
+                    "INSERT INTO memory_journal \
+                     (seq, receipt_id, space_id, subject_id, requester_principal_id, op, \
+                      idempotency_key, state, targets_json, result_json, created_at, updated_at) \
+                     VALUES (1, 'rct_pending', ?, ?, ?, 'memory.records.update', 'key', 'pending', \
+                             '[]', NULL, ?, ?)",
+                )
+                .bind(SPACE)
+                .bind(SUBJECT)
+                .bind(PRINCIPAL)
+                .bind(NOW)
+                .bind(NOW)
+                .execute(&self.pool)
+                .await
+                .expect("stage a pending intent");
+            }
+        }
+        Ok(self.verdict.clone())
+    }
+}
+
+fn cognition_reference(id: &str) -> Value {
+    json!({ "kind": "knowledge_entry", "namespace": "mindcore", "id": id })
+}
+
+fn promote_verdict() -> Value {
+    json!({
+        "recommendation": { "kind": "promote", "target_kind": "adr" },
+        "rationale": "the gate test passed on the cited record",
+        "evidence_ids": ["ev_gate"],
+        "record_ids": ["rec_gate"],
+        "record": {
+            "kind": "belief",
+            "order": 1,
+            "q": {
+                "value": 0.8,
+                "assertion": "belief_attribution",
+                "method": "two_witness_reports",
+                "calibration": "uncalibrated"
+            },
+            "assessor_role": "holder_self_report",
+            "basis": {
+                "kind": "evidence",
+                "evidence": [{ "kind": "memory_record", "namespace": "mindcore", "id": "rec_gate" }]
+            }
+        }
+    })
+}
+
+/// One deliberation over the seeded carrier.
+async fn deliberate(
+    harness: &Harness,
+    caps: &MindCapabilities<'_>,
+    timeout: std::time::Duration,
+) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
+    let workflows = SpiMindWorkflows::new(
+        MemoryWorkflowBinding::new(harness.pool.clone(), true)
+            .with_knowledge_collection(PRINCIPAL, KnowledgeScope::new("wren")),
+    );
+    let holder_value = cognition_reference(CARRIER);
+    let holder: spoke_schemas::data::cognition::CognitionReference =
+        serde_json::from_value(holder_value).expect("holder");
+    let target: spoke_schemas::data::cognition::CognitionTarget = serde_json::from_value(json!({
+        "carrier": cognition_reference("ke_shared_gate"),
+        "target_id": "prop_gate_closed",
+        "kind": "proposition"
+    }))
+    .expect("target");
+    let evidence = [mindcore_spi::Evidence {
+        id: "ev_gate",
+        text: "the gate test passed on this commit",
+    }];
+    let request = mindcore_spi::DeliberateRequest {
+        space_id: SPACE,
+        subject_id: SUBJECT,
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout,
+    };
+    workflows
+        .deliberate(&principal(), request, None, caps)
+        .await
+}
+
+/// The carrier's stored revision and payload.
+async fn stored_carrier(harness: &Harness) -> (i64, Value) {
+    let (revision, payload): (i64, String) = sqlx::query_as(
+        "SELECT revision, payload FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
+    )
+    .bind(CARRIER)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("stored carrier");
+    (
+        revision,
+        serde_json::from_str(&payload).expect("carrier payload"),
+    )
+}
+
+/// A harness holding one subject record and the admitted carrier entry.
+async fn deliberate_harness() -> Harness {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
+    harness
+        .record(
+            "rec_gate",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness
+        .entry("wren", CARRIER, "the warden's north gate")
+        .await;
+    harness
+}
+
+fn long_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
+#[tokio::test]
+async fn deliberate_commits_a_cognition_record_onto_the_carrier() {
+    let harness = deliberate_harness().await;
+    let reasoner =
+        DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcome = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect("deliberate");
+    let cases = match outcome {
+        mindcore_spi::DeliberateOutcome::Settled {
+            record,
+            mind_state_version,
+            ..
+        } => (record, mind_state_version),
+        other => panic!("expected a settlement, got {other:?}"),
+    };
+    let (record, mind_state_version) = cases;
+
+    // The settled view descends from the committed carrier, not a draft.
+    assert_eq!(mind_state_version, 2);
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 2);
+    let records = payload["modules"]["cognition"]["records"]
+        .as_array()
+        .expect("cognition records");
+    assert_eq!(records.len(), 1);
+    let stored = &records[0];
+    assert_eq!(stored["holder"], cognition_reference(CARRIER));
+    assert_eq!(stored["target"]["target_id"], "prop_gate_closed");
+    assert_eq!(stored["view"], "current");
+    assert_eq!(stored["assessor"]["kind"], "principal");
+    assert_eq!(
+        serde_json::to_value(&record).expect("record serializes"),
+        *stored
+    );
+}
+
+#[tokio::test]
+async fn default_policy_holds_the_verdict_without_writing() {
+    let harness = deliberate_harness().await;
+    let reasoner =
+        DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        ..MindCapabilities::default()
+    };
+
+    let outcome = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect("deliberate");
+
+    assert!(matches!(
+        outcome,
+        mindcore_spi::DeliberateOutcome::NeedsReview { .. }
+    ));
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1, "the carrier was not written");
+    assert!(
+        payload.get("modules").is_none(),
+        "no cognition record reached the carrier"
+    );
+}
+
+#[tokio::test]
+async fn a_cited_record_that_moved_during_reasoning_is_retried() {
+    let harness = deliberate_harness().await;
+    let reasoner = DeliberateReasoner::new(
+        promote_verdict(),
+        DeliberateEffect::BumpCitedOnce,
+        &harness.pool,
+    );
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcome = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect("the fresh snapshot settles");
+
+    assert!(matches!(
+        outcome,
+        mindcore_spi::DeliberateOutcome::Settled {
+            mind_state_version: 2,
+            ..
+        }
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one retry over a fresh snapshot"
+    );
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 2);
+    assert_eq!(
+        payload["modules"]["cognition"]["records"]
+            .as_array()
+            .expect("records")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_unsettled_citation_conflict_surfaces_without_writing() {
+    let harness = deliberate_harness().await;
+    let reasoner = DeliberateReasoner::new(
+        promote_verdict(),
+        DeliberateEffect::BumpCitedAlways,
+        &harness.pool,
+    );
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect_err("a citation that keeps moving exhausts the retries");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "one attempt plus two retries"
+    );
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1);
+    assert!(payload.get("modules").is_none());
+}
+
+#[tokio::test]
+async fn a_revoked_knowledge_grant_refuses_the_carrier_write() {
+    let harness = deliberate_harness().await;
+    let reasoner = DeliberateReasoner::new(
+        promote_verdict(),
+        DeliberateEffect::RevokeKnowledgeGrant,
+        &harness.pool,
+    );
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect_err("a revoked admission must not write the carrier");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a refusal is never retried"
+    );
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1);
+    assert!(payload.get("modules").is_none());
+}
+
+#[tokio::test]
+async fn a_subject_withheld_during_reasoning_refuses_the_carrier_write() {
+    let harness = deliberate_harness().await;
+    let reasoner = DeliberateReasoner::new(
+        promote_verdict(),
+        DeliberateEffect::StagePendingIntent,
+        &harness.pool,
+    );
+    let calls = reasoner.calls();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = deliberate(&harness, &caps, long_timeout())
+        .await
+        .expect_err("a withheld subject must not gain a cognition record");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str),
+        Some("UNRECONCILED")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "withholding is terminal");
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1);
+    assert!(payload.get("modules").is_none());
 }

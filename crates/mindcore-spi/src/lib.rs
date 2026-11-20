@@ -6,8 +6,8 @@
 //! crates plus serde/async infrastructure: no `mindcore-*` storage crate,
 //! no Nexus, no network or model SDK enters the contract surface.
 //!
-//! [`SpiMindWorkflows`] implements `recall_context` and `absorb` over a
-//! DTO-only [`WorkflowBinding`]; `deliberate` remains a contract.
+//! [`SpiMindWorkflows`] implements `recall_context`, `absorb` and `deliberate`
+//! over a DTO-only [`WorkflowBinding`].
 //! [`PromptReasoner`] is the only included capability bridge: it adapts a
 //! text-prompt executor closure (the Nexus `PromptExecutor` seam, bound by the
 //! caller) to [`Reasoner`].
@@ -15,7 +15,8 @@
 pub mod workflows;
 
 pub use workflows::{
-    AbsorbSnapshot, CaptureOutcome, CitedRecord, RecallSnapshot, SpiMindWorkflows, WorkflowBinding,
+    AbsorbSnapshot, CaptureOutcome, CitedRecord, DeliberateSnapshot, RecallSnapshot,
+    SpiMindWorkflows, WorkflowBinding,
 };
 
 use std::future::Future;
@@ -311,6 +312,49 @@ pub struct LensOutput<'a> {
     pub redlines: &'a [&'a str],
 }
 
+/// The structured recommendation of one deliberation verdict, separated from
+/// its descriptive prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recommendation {
+    /// The verdict records nothing.
+    None,
+    /// The verdict promotes one record whose `target_kind` names what it
+    /// promotes (for example an observation, a belief or an ADR).
+    Promote {
+        /// What the promoted record is, in the lens's own vocabulary.
+        target_kind: String,
+    },
+}
+
+/// One proposal a workflow validated against its authorized snapshot, handed
+/// to [`DomainLens::validate_proposal`] before policy or any write.
+///
+/// It carries what the workflow would settle — never raw reasoner text, a
+/// storage handle or an unfiltered evidence set. Every id it cites already
+/// passed the workflow's reference check against the admitted snapshot.
+#[derive(Debug, Clone, Copy)]
+pub enum ProposalDraft<'a> {
+    /// One validated absorb decision over the prompted record page.
+    Absorb {
+        /// The decision: `promote`, `update` or `dismiss`.
+        action: &'a str,
+        /// The record an `update` decision replaces.
+        target_record_id: Option<&'a str>,
+        /// The page ids the decision cites.
+        cited_ids: &'a [&'a str],
+    },
+    /// One validated deliberation verdict.
+    Cognition {
+        /// The structured recommendation.
+        recommendation: &'a Recommendation,
+        /// The stamped record a promotion would append; `None` when the
+        /// recommendation is [`Recommendation::None`].
+        record: Option<&'a CognitionRecord>,
+        /// The supplied evidence ids and visible record ids the verdict cites.
+        cited_ids: &'a [&'a str],
+    },
+}
+
 /// Domain lens: declarative prompt fragments keyed by task kind.
 ///
 /// `None` in place of a lens means the fixed skeleton alone is used.
@@ -318,6 +362,15 @@ pub struct LensOutput<'a> {
 pub trait DomainLens: Send + Sync {
     /// Fragments for one cognitive task kind.
     fn describe(&self, task_kind: CognitiveTaskKind) -> LensOutput<'_>;
+
+    /// Refuse a proposal this domain will not settle, or accept it.
+    ///
+    /// Runs after the workflow's schema and reference validation and before
+    /// the policy hook or any write, in both `absorb` and `deliberate`. A
+    /// refusal surfaces as [`SpiError::PolicyRejected`] and settles nothing;
+    /// `admitted` is the exact reference set the snapshot authorized.
+    fn validate_proposal(&self, draft: &ProposalDraft<'_>, admitted: &[&str])
+        -> Result<(), String>;
 }
 
 /// Capabilities injected into one workflow call.
@@ -416,11 +469,16 @@ pub enum DeliberateOutcome {
         /// The unsettled cognition record draft.
         draft: CognitionRecord,
     },
+    /// The verdict recommended no record, so nothing was written.
+    NoChange {
+        /// The validated structured verdict.
+        verdict: Value,
+    },
 }
 
-/// The MIND workflow surface. Contracts only — the implementation lands in
-/// the workflow tranche above this crate. `principal` is caller-supplied
-/// trusted context, never parsed from request JSON.
+/// The MIND workflow surface, implemented by [`SpiMindWorkflows`] over a
+/// [`WorkflowBinding`]. `principal` is caller-supplied trusted context, never
+/// parsed from request JSON.
 #[async_trait]
 pub trait MindWorkflows: Send + Sync {
     /// Pack an authorized context pack under a token budget.

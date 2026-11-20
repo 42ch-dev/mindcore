@@ -10,11 +10,13 @@ use serde_json::{json, Value};
 
 use mindcore_spi::{
     AbsorbCandidateOutcome, AbsorbSnapshot, CaptureOutcome, CitedRecord, CognitiveTaskKind,
-    DomainLens, Embedder, EmbeddingIdentity, LensOutput, MindCapabilities, NoEmbeddings,
-    PolicyDecision, PolicyHook, Reasoner, RecallSnapshot, SettlementDraft, SpiError,
+    DeliberateOutcome, DeliberateRequest, DeliberateSnapshot, DomainLens, Embedder,
+    EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings, PolicyDecision,
+    PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation, SettlementDraft, SpiError,
     SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
+use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::{
     KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest, MemoryCandidatesReviewRequest,
     MemoryCaptureRequest, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
@@ -158,6 +160,30 @@ impl WorkflowBinding for StubBinding {
     ) -> Result<Option<String>, SpiError> {
         unserved()
     }
+
+    async fn deliberate_snapshot(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _max_items: u64,
+    ) -> Result<DeliberateSnapshot, SpiError> {
+        unserved()
+    }
+
+    async fn commit_cognition(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _expected_carrier_revision: u64,
+        _record: Value,
+        _cited: &[CitedRecord],
+    ) -> Result<u64, SpiError> {
+        unserved()
+    }
 }
 
 /// A read-only double: it serves the recall page and refuses the settlement
@@ -224,6 +250,30 @@ impl WorkflowBinding for RefusingBinding {
         _space_id: &str,
         _idempotency_key: &str,
     ) -> Result<Option<String>, SpiError> {
+        unserved()
+    }
+
+    async fn deliberate_snapshot(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _max_items: u64,
+    ) -> Result<DeliberateSnapshot, SpiError> {
+        Err(self.0.clone())
+    }
+
+    async fn commit_cognition(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _expected_carrier_revision: u64,
+        _record: Value,
+        _cited: &[CitedRecord],
+    ) -> Result<u64, SpiError> {
         unserved()
     }
 }
@@ -765,6 +815,30 @@ impl WorkflowBinding for AbsorbDouble {
             .push(idempotency_key.to_string());
         Ok(self.settled_update.clone())
     }
+
+    async fn deliberate_snapshot(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _max_items: u64,
+    ) -> Result<DeliberateSnapshot, SpiError> {
+        unserved()
+    }
+
+    async fn commit_cognition(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _expected_carrier_revision: u64,
+        _record: Value,
+        _cited: &[CitedRecord],
+    ) -> Result<u64, SpiError> {
+        unserved()
+    }
 }
 
 fn cited_json(cited: &[CitedRecord]) -> Value {
@@ -1303,6 +1377,14 @@ impl DomainLens for StubLens {
             redlines: &["never invent a record id"],
         }
     }
+
+    fn validate_proposal(
+        &self,
+        _draft: &ProposalDraft<'_>,
+        _admitted: &[&str],
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Promotes only when the lens block reached the prompt.
@@ -1348,4 +1430,851 @@ async fn a_lens_adds_its_domain_guidance_to_the_absorb_prompt() {
     assert!(prompt.contains("## Domain guidance"));
     assert!(prompt.contains("a gate warden"));
     assert!(prompt.contains("- never invent a record id"));
+}
+
+// ---------- deliberate ----------
+
+/// One deliberation over a fixed snapshot, recording every settlement it is
+/// asked to commit.
+struct DeliberateDouble {
+    snapshot: DeliberateSnapshot,
+    snapshots: Arc<AtomicUsize>,
+    results: Mutex<std::collections::VecDeque<Result<u64, SpiError>>>,
+    settlements: Arc<Mutex<Vec<Value>>>,
+    citations: Arc<Mutex<Vec<(String, u64)>>>,
+}
+
+impl DeliberateDouble {
+    fn new() -> Self {
+        Self {
+            snapshot: DeliberateSnapshot {
+                records: vec![record("rec_gate", "the north gate is closed", 3)],
+                cognition: Vec::new(),
+                carrier_revision: 1,
+            },
+            snapshots: Arc::new(AtomicUsize::new(0)),
+            results: Mutex::new(std::collections::VecDeque::new()),
+            settlements: Arc::new(Mutex::new(Vec::new())),
+            citations: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn failing(error: SpiError) -> Self {
+        let double = Self::new();
+        double
+            .results
+            .lock()
+            .expect("results")
+            .push_back(Err(error));
+        double
+    }
+
+    fn then_settling(self, version: u64) -> Self {
+        self.results.lock().expect("results").push_back(Ok(version));
+        self
+    }
+
+    fn snapshots(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.snapshots)
+    }
+
+    fn settlements(&self) -> Arc<Mutex<Vec<Value>>> {
+        Arc::clone(&self.settlements)
+    }
+
+    fn citations(&self) -> Arc<Mutex<Vec<(String, u64)>>> {
+        Arc::clone(&self.citations)
+    }
+}
+
+#[async_trait]
+impl WorkflowBinding for DeliberateDouble {
+    async fn recall_snapshot(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryRecallRequest,
+    ) -> Result<RecallSnapshot, SpiError> {
+        unserved()
+    }
+
+    async fn capture(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+    ) -> Result<CaptureOutcome, SpiError> {
+        unserved()
+    }
+
+    async fn absorb_snapshot(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _candidate_id: &str,
+        _max_items: u64,
+    ) -> Result<AbsorbSnapshot, SpiError> {
+        unserved()
+    }
+
+    async fn review_candidate(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCandidatesReviewRequest,
+        _cited: &[CitedRecord],
+    ) -> Result<Vec<String>, SpiError> {
+        unserved()
+    }
+
+    async fn update_candidate(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _update: &MemoryRecordsUpdateRequest,
+        _dismiss: &MemoryCandidatesDismissRequest,
+        _cited: &[CitedRecord],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
+    async fn recorded_update(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<Option<String>, SpiError> {
+        unserved()
+    }
+
+    async fn deliberate_snapshot(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _max_items: u64,
+    ) -> Result<DeliberateSnapshot, SpiError> {
+        self.snapshots.fetch_add(1, Ordering::SeqCst);
+        Ok(self.snapshot.clone())
+    }
+
+    async fn commit_cognition(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _subject_id: &str,
+        _holder: &CognitionReference,
+        _expected_carrier_revision: u64,
+        record: Value,
+        cited: &[CitedRecord],
+    ) -> Result<u64, SpiError> {
+        self.settlements.lock().expect("settlements").push(record);
+        self.citations.lock().expect("citations").extend(
+            cited
+                .iter()
+                .map(|record| (record.record_id.clone(), record.revision)),
+        );
+        let queued = self.results.lock().expect("results").pop_front();
+        match queued {
+            Some(result) => result,
+            None => Ok(self.snapshot.carrier_revision + 1),
+        }
+    }
+}
+
+fn deliberate_holder() -> CognitionReference {
+    serde_json::from_value(json!({
+        "kind": "knowledge_entry",
+        "namespace": "mindcore",
+        "id": "ke_wren"
+    }))
+    .expect("holder")
+}
+
+fn deliberate_target() -> CognitionTarget {
+    serde_json::from_value(json!({
+        "carrier": {
+            "kind": "knowledge_entry",
+            "namespace": "mindcore",
+            "id": "ke_shared_gate"
+        },
+        "target_id": "prop_gate_closed",
+        "kind": "proposition"
+    }))
+    .expect("target")
+}
+
+fn promote_verdict() -> Value {
+    json!({
+        "recommendation": { "kind": "promote", "target_kind": "adr" },
+        "rationale": "the gate test passed on the supplied evidence",
+        "evidence_ids": ["ev_test"],
+        "record_ids": ["rec_gate"],
+        "record": {
+            "kind": "belief",
+            "order": 1,
+            "q": {
+                "value": 0.8,
+                "assertion": "belief_attribution",
+                "method": "two_witness_reports",
+                "calibration": "uncalibrated"
+            },
+            "assessor_role": "holder_self_report",
+            "basis": {
+                "kind": "evidence",
+                "evidence": [
+                    { "kind": "memory_record", "namespace": "mindcore", "id": "rec_gate" }
+                ]
+            }
+        }
+    })
+}
+
+struct DeliberateReasoner {
+    verdict: Value,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Reasoner for DeliberateReasoner {
+    async fn reason_structured(
+        &self,
+        request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        assert_eq!(request.task_kind, CognitiveTaskKind::Deliberate);
+        assert!(request
+            .system_prompt
+            .starts_with("Deliberate what one cognition holder"));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.verdict.clone())
+    }
+}
+
+/// A policy that must never be reached.
+struct UnreachablePolicy;
+
+#[async_trait]
+impl PolicyHook for UnreachablePolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        panic!("this proposal must not reach the policy hook");
+    }
+}
+
+struct AutoPolicy;
+
+#[async_trait]
+impl PolicyHook for AutoPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::AutoSettle)
+    }
+}
+
+/// Records the validated draft it was handed, then refuses an ADR promotion.
+struct RefusingAdrLens(Arc<Mutex<Option<String>>>);
+
+impl DomainLens for RefusingAdrLens {
+    fn describe(&self, _task_kind: CognitiveTaskKind) -> LensOutput<'_> {
+        LensOutput {
+            persona_and_stance: "an engineering evaluator",
+            salience_criteria: "test and CI evidence",
+            evidence_bar: "reproducible on the head commit",
+            redlines: &["never promote an unverified observation to an ADR"],
+        }
+    }
+
+    fn validate_proposal(
+        &self,
+        draft: &ProposalDraft<'_>,
+        admitted: &[&str],
+    ) -> Result<(), String> {
+        let ProposalDraft::Cognition {
+            recommendation,
+            cited_ids,
+            ..
+        } = draft
+        else {
+            panic!("a deliberate proposal is a cognition draft");
+        };
+        let Recommendation::Promote { target_kind } = recommendation else {
+            panic!("expected a promotion");
+        };
+        assert_eq!(*target_kind, "adr");
+        assert_eq!(*cited_ids, ["ev_test", "rec_gate"]);
+        assert_eq!(admitted, ["ev_test", "rec_gate"]);
+        *self.0.lock().expect("draft") = Some(target_kind.clone());
+        Err("an unverified observation cannot become an ADR".to_string())
+    }
+}
+
+fn revision_conflict() -> SpiError {
+    SpiError::Settlement(spoke_operations::SpokeReject {
+        code: SpokeRejectCode::RevisionConflict,
+        message: "the snapshot moved".to_string(),
+        details: None,
+    })
+}
+
+fn uncertain_write() -> SpiError {
+    SpiError::Settlement(spoke_operations::SpokeReject {
+        code: SpokeRejectCode::InternalError,
+        message: "the commit outcome is unknown".to_string(),
+        details: None,
+    })
+}
+
+#[tokio::test]
+async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let citations = binding.citations();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("deliberate");
+
+    let DeliberateOutcome::Settled {
+        record,
+        mind_state_version,
+        ..
+    } = outcome
+    else {
+        panic!("expected a settlement, got {outcome:?}");
+    };
+    assert_eq!(mind_state_version, 2);
+    let settled = settlements.lock().expect("settlements");
+    assert_eq!(settled.len(), 1);
+    let stored = &settled[0];
+    assert_eq!(stored["holder"], json!(holder));
+    assert_eq!(stored["target"], json!(target));
+    assert_eq!(stored["view"], "current");
+    assert_eq!(stored["assessor"]["id"], "prn_1");
+    assert_eq!(stored["assessment_context"]["context_id"], "subj_1");
+    assert!(stored["record_id"]
+        .as_str()
+        .expect("stamped record id")
+        .starts_with("cog_"));
+    // The returned record is the one that was committed, stamp included.
+    assert_eq!(
+        serde_json::to_value(&record).expect("record serializes"),
+        *stored
+    );
+    assert_eq!(
+        citations.lock().expect("citations").as_slice(),
+        [("rec_gate".to_string(), 3)]
+    );
+}
+
+#[tokio::test]
+async fn deliberate_refuses_fabricated_references_before_any_write() {
+    let mut verdicts = vec![
+        {
+            let mut verdict = promote_verdict();
+            verdict["evidence_ids"] = json!(["ev_ghost"]);
+            verdict
+        },
+        {
+            let mut verdict = promote_verdict();
+            verdict["record_ids"] = json!(["rec_ghost"]);
+            verdict
+        },
+        {
+            let mut verdict = promote_verdict();
+            verdict["record"]["basis"]["evidence"][0]["id"] = json!("rec_ghost");
+            verdict
+        },
+    ];
+    for verdict in verdicts.drain(..) {
+        let binding = DeliberateDouble::new();
+        let settlements = binding.settlements();
+        let workflows = SpiMindWorkflows::new(binding);
+        let reasoner = DeliberateReasoner {
+            verdict,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let policy = AutoPolicy;
+        let caps = MindCapabilities {
+            reasoner: Some(&reasoner),
+            policy_hook: Some(&policy),
+            ..MindCapabilities::default()
+        };
+        let holder = deliberate_holder();
+        let target = deliberate_target();
+        let evidence = [Evidence {
+            id: "ev_test",
+            text: "the gate test passed on this commit",
+        }];
+        let request = DeliberateRequest {
+            space_id: "spc_1",
+            subject_id: "subj_1",
+            holder: &holder,
+            target: &target,
+            evidence: &evidence,
+            timeout: std::time::Duration::from_secs(30),
+        };
+
+        let error = workflows
+            .deliberate(&principal(), request, None, &caps)
+            .await
+            .expect_err("a fabricated reference must be refused");
+
+        assert!(
+            matches!(error, SpiError::InvalidReasonerOutput(_)),
+            "expected an invalid verdict, got {error:?}"
+        );
+        assert!(settlements.lock().expect("settlements").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn deliberate_lens_violation_refuses_before_policy_and_write() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let lens = RefusingAdrLens(Arc::new(Mutex::new(None)));
+    let policy = UnreachablePolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, Some(&lens), &caps)
+        .await
+        .expect_err("a lens redline must refuse the proposal");
+
+    assert!(
+        matches!(error, SpiError::PolicyRejected(_)),
+        "expected a policy refusal, got {error:?}"
+    );
+    assert_eq!(
+        lens.0.lock().expect("draft").as_deref(),
+        Some("adr"),
+        "the lens saw the structured recommendation"
+    );
+    assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+#[tokio::test]
+async fn deliberate_retries_a_stale_carrier_twice_then_surfaces_it() {
+    let binding = DeliberateDouble::failing(revision_conflict());
+    binding
+        .results
+        .lock()
+        .expect("results")
+        .push_back(Err(revision_conflict()));
+    binding
+        .results
+        .lock()
+        .expect("results")
+        .push_back(Err(revision_conflict()));
+    let snapshots = binding.snapshots();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::clone(&calls),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("an exhausted retry budget surfaces the conflict");
+
+    assert!(
+        matches!(error, SpiError::Settlement(ref reject) if reject.code == SpokeRejectCode::RevisionConflict),
+        "expected the conflict to surface, got {error:?}"
+    );
+    assert_eq!(
+        snapshots.load(Ordering::SeqCst),
+        3,
+        "one attempt plus two retries"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "every attempt reasons again"
+    );
+    assert_eq!(settlements.lock().expect("settlements").len(), 3);
+}
+
+#[tokio::test]
+async fn deliberate_retries_a_stale_carrier_until_the_snapshot_holds() {
+    let binding = DeliberateDouble::failing(revision_conflict()).then_settling(4);
+    let snapshots = binding.snapshots();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("the fresh snapshot settles");
+
+    assert!(matches!(
+        outcome,
+        DeliberateOutcome::Settled {
+            mind_state_version: 4,
+            ..
+        }
+    ));
+    assert_eq!(snapshots.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
+    // A snapshot refusal is terminal: nothing was reasoned and no write ran.
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+    let refusing = RefusingBinding(SpiError::Settlement(spoke_operations::SpokeReject {
+        code: SpokeRejectCode::NotAuthorized,
+        message: "no admission".to_string(),
+        details: None,
+    }));
+    let workflows = SpiMindWorkflows::new(refusing);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("a refused read does not settle");
+    assert!(matches!(
+        error,
+        SpiError::Settlement(ref reject) if reject.code == SpokeRejectCode::NotAuthorized
+    ));
+
+    // An uncertain write is surfaced once, never turned into a fresh attempt.
+    let binding = DeliberateDouble::failing(uncertain_write());
+    let snapshots = binding.snapshots();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("an uncertain outcome is not a clean refusal");
+    assert!(matches!(
+        error,
+        SpiError::Settlement(ref reject) if reject.code == SpokeRejectCode::InternalError
+    ));
+    assert_eq!(snapshots.load(Ordering::SeqCst), 1);
+    assert_eq!(settlements.lock().expect("settlements").len(), 1);
+}
+
+#[tokio::test]
+async fn deliberate_none_recommendation_writes_nothing() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: json!({
+            "recommendation": { "kind": "none" },
+            "rationale": "the evidence says nothing new",
+            "evidence_ids": ["ev_test"],
+            "record_ids": []
+        }),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = UnreachablePolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("deliberate");
+
+    assert!(matches!(outcome, DeliberateOutcome::NoChange { .. }));
+    assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+#[tokio::test]
+async fn deliberate_without_a_reasoner_is_unavailable() {
+    let binding = DeliberateDouble::new();
+    let snapshots = binding.snapshots();
+    let workflows = SpiMindWorkflows::new(binding);
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &MindCapabilities::default())
+        .await
+        .expect_err("no reasoner, no verdict");
+
+    assert!(matches!(error, SpiError::ReasonerUnavailable));
+    assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deliberate_starts_no_attempt_once_the_deadline_passed() {
+    let binding = DeliberateDouble::new();
+    let snapshots = binding.snapshots();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::ZERO,
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("no attempt starts without elapsed-time budget");
+
+    assert!(matches!(error, SpiError::DeadlineExceeded));
+    assert_eq!(
+        snapshots.load(Ordering::SeqCst),
+        0,
+        "no attempt, and so no retry, starts after the deadline"
+    );
+    assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+/// Refuses every absorb decision: prompt fragments guide, but only this
+/// deterministic check can refuse before the review write.
+struct RefusingAbsorbLens;
+
+impl DomainLens for RefusingAbsorbLens {
+    fn describe(&self, _task_kind: CognitiveTaskKind) -> LensOutput<'_> {
+        LensOutput {
+            persona_and_stance: "a gate warden",
+            salience_criteria: "anything that changes the watch",
+            evidence_bar: "one named record",
+            redlines: &["never promote without a witness"],
+        }
+    }
+
+    fn validate_proposal(
+        &self,
+        draft: &ProposalDraft<'_>,
+        admitted: &[&str],
+    ) -> Result<(), String> {
+        let ProposalDraft::Absorb {
+            action,
+            target_record_id,
+            cited_ids,
+        } = draft
+        else {
+            panic!("an absorb proposal is an absorb draft");
+        };
+        assert_eq!(*action, "promote");
+        assert_eq!(*target_record_id, None);
+        assert_eq!(*cited_ids, ["rec_gate"]);
+        assert_eq!(admitted, ["rec_gate"]);
+        Err("a promotion needs a witness the page does not hold".to_string())
+    }
+}
+
+#[tokio::test]
+async fn an_absorb_lens_violation_refuses_before_policy_and_write() {
+    let (workflows, recorded, seen) = absorb(pending_candidate());
+    let policy = RecordingPolicy {
+        decision: PolicyDecision::AutoSettle,
+        seen: Arc::clone(&seen),
+    };
+    let reasoner = FixedVerdict(json!({ "action": "promote", "evidence_ids": ["rec_gate"] }));
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture_request(),
+            Some(&RefusingAbsorbLens),
+            &caps,
+        )
+        .await
+        .expect_err("a lens redline must refuse the proposal");
+
+    assert!(
+        matches!(error, SpiError::PolicyRejected(_)),
+        "expected a policy refusal, got {error:?}"
+    );
+    assert!(seen.lock().expect("seen").is_empty(), "policy never ran");
+    assert!(recorded.reviews.lock().expect("reviews").is_empty());
 }

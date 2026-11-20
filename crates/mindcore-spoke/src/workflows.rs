@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 use spoke_operations::{GrantRequirement, SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_schemas::data::cognition::{CognitionReference, CognitionReferenceKind};
 use spoke_schemas::data::memory_candidate::PlacementScope;
 use spoke_schemas::{
     KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest, MemoryCandidatesReviewRequest,
@@ -18,13 +19,17 @@ use spoke_schemas::{
 use sqlx::SqlitePool;
 
 use mindcore_base::boundary::CallerId;
+use mindcore_base::cognition::{
+    append_cognition_record, carrier_records, derive_mind_state, CARRIER_NAMESPACE,
+};
 use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::{MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
-    AbsorbSnapshot, CaptureOutcome, CitedRecord, RecallSnapshot, SpiError, WorkflowBinding,
+    AbsorbSnapshot, CaptureOutcome, CitedRecord, DeliberateSnapshot, RecallSnapshot, SpiError,
+    WorkflowBinding,
 };
-use mindcore_sqlite::{list_entries_in, SqliteMemoryRepository};
+use mindcore_sqlite::{list_entries_in, read_entry, write_entry, SqliteMemoryRepository};
 
 use crate::admission;
 use crate::reject::Reject;
@@ -215,19 +220,23 @@ impl MemoryWorkflowBinding {
         self
     }
 
-    /// One knowledge read under the caller's own admission.
+    /// The bound collection, admitted to `principal` on `tx`: the caller must
+    /// be the one this binding serves and hold a live [`KNOWLEDGE_READ`] grant
+    /// in `space_id`.
     ///
-    /// Caller identity, live grant and collection are re-derived on every read,
-    /// so the revalidation read after provider work runs the same admission and
-    /// a revoked knowledge grant refuses the pack.
-    async fn knowledge_slot(
+    /// Caller identity, live grant and collection are re-derived on every call,
+    /// so a read after provider work runs the same admission and a revoked
+    /// knowledge grant refuses it. A memory grant never substitutes for this.
+    async fn admitted_collection(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: &MemoryRecallRequest,
-    ) -> Result<Vec<KnowledgeEntry>, SpiError> {
+        space_id: &str,
+    ) -> Result<&str, SpiError> {
         let Some(admitted) = &self.knowledge else {
-            return Ok(Vec::new());
+            return Err(not_authorized(
+                "this workflow binding serves no knowledge collection".to_string(),
+            ));
         };
         let caller = principal_id(principal);
         if caller != admitted.caller.as_str() {
@@ -236,7 +245,7 @@ impl MemoryWorkflowBinding {
                 admitted.scope.collection
             )));
         }
-        let space = SpaceId::new(request.space_id.to_string());
+        let space = SpaceId::new(space_id.to_string());
         let rows = admission::grants(&SqliteMemoryRepository, tx, &space)
             .await
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
@@ -255,7 +264,23 @@ impl MemoryWorkflowBinding {
                 space.as_str()
             )));
         }
-        match list_entries_in(tx, &admitted.scope.collection).await {
+        Ok(admitted.scope.collection.as_str())
+    }
+
+    /// Fill the pack's knowledge slot from the admitted collection.
+    async fn knowledge_slot(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        request: &MemoryRecallRequest,
+    ) -> Result<Vec<KnowledgeEntry>, SpiError> {
+        if self.knowledge.is_none() {
+            return Ok(Vec::new());
+        }
+        let collection = self
+            .admitted_collection(tx, principal, request.space_id.as_str())
+            .await?;
+        match list_entries_in(tx, collection).await {
             SpokeResult::Ok(entries) => Ok(entries),
             SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
         }
@@ -509,6 +534,136 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .and_then(Value::as_str)
             .map(str::to_string))
     }
+
+    async fn deliberate_snapshot(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        subject_id: &str,
+        holder: &CognitionReference,
+        max_items: u64,
+    ) -> Result<DeliberateSnapshot, SpiError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!(
+                "deliberation read transaction could not begin: {error}"
+            ))
+        })?;
+        let records = ready(
+            self.adapter
+                .recall(
+                    &mut transaction,
+                    principal,
+                    json!({
+                        "space_id": space_id,
+                        "subject_id": subject_id,
+                        "selection": { "mode": "subject_all" },
+                        "budget": { "max_items": max_items },
+                    }),
+                )
+                .await,
+            "memory.recall",
+        );
+        let records = decode_records(records?)?;
+        let collection = self
+            .admitted_collection(&mut transaction, principal, space_id)
+            .await?;
+        let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
+            SpokeResult::Ok(carrier) => carrier,
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        carrier_holder(holder, &carrier)?;
+        let carrier_revision = carrier.revision.ok_or_else(|| {
+            internal(format!(
+                "carrier {} holds no assigned revision",
+                carrier.entry_id
+            ))
+        })?;
+        let cognition = carrier_records(&carrier);
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "deliberation read transaction could not commit: {error}"
+            ))
+        })?;
+        Ok(DeliberateSnapshot {
+            records,
+            cognition,
+            carrier_revision,
+        })
+    }
+
+    async fn commit_cognition(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        subject_id: &str,
+        holder: &CognitionReference,
+        expected_carrier_revision: u64,
+        record: Value,
+        cited: &[CitedRecord],
+    ) -> Result<u64, SpiError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| {
+                internal(format!(
+                    "cognition settlement transaction could not begin: {error}"
+                ))
+            })?;
+        let collection = self
+            .admitted_collection(&mut transaction, principal, space_id)
+            .await?;
+        let space = SpaceId::new(space_id.to_string());
+        self.adapter
+            .withhold_if_unsettled(&mut transaction, &space, subject_id)
+            .await
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        self.revalidate_cited(&mut transaction, principal, space_id, cited)
+            .await?;
+        let carrier = match read_entry(&mut *transaction, collection, holder.id.as_str()).await {
+            SpokeResult::Ok(carrier) => carrier,
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        carrier_holder(holder, &carrier)?;
+        let current = carrier.revision.ok_or_else(|| {
+            internal(format!(
+                "carrier {} holds no assigned revision",
+                carrier.entry_id
+            ))
+        })?;
+        if current != expected_carrier_revision {
+            return Err(SpiError::Settlement(
+                Reject::retryable(
+                    SpokeRejectCode::RevisionConflict,
+                    format!(
+                        "carrier {} moved to revision {current}, the verdict was derived from \
+                         {expected_carrier_revision}; retry the deliberation",
+                        carrier.entry_id
+                    ),
+                )
+                .into_spoke(),
+            ));
+        }
+        let next = append_cognition_record(&carrier, record).map_err(|error| {
+            SpiError::InvalidInput(format!("cognition record could not be appended: {error}"))
+        })?;
+        let committed = match write_entry(&mut transaction, collection, next, Some(current)).await {
+            SpokeResult::Ok(committed) => committed,
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "cognition settlement transaction could not commit: {error}"
+            ))
+        })?;
+        let view = derive_mind_state(&committed).map_err(|error| {
+            internal(format!(
+                "committed carrier {} derives no MindState: {error}",
+                committed.entry_id
+            ))
+        })?;
+        Ok(view.carrier_revision)
+    }
 }
 
 /// The ready body of one adapter operation, or its refusal.
@@ -596,6 +751,24 @@ fn decode_records(body: Value) -> Result<Vec<RetainedRecord>, SpiError> {
 
 fn not_authorized(message: String) -> SpiError {
     SpiError::Settlement(Reject::not_authorized(message).into_spoke())
+}
+
+/// The holder must be this carrier entry in the Mindcore realm: the carrier
+/// record invariant accepts nothing else.
+fn carrier_holder(holder: &CognitionReference, carrier: &KnowledgeEntry) -> Result<(), SpiError> {
+    if holder.kind == CognitionReferenceKind::KnowledgeEntry
+        && holder.namespace.as_str() == CARRIER_NAMESPACE
+        && holder.id.as_str() == carrier.entry_id.as_str()
+    {
+        return Ok(());
+    }
+    Err(SpiError::InvalidInput(format!(
+        "holder {}:{}:{} is not the carrier knowledge_entry:{CARRIER_NAMESPACE}:{}",
+        holder.kind,
+        holder.namespace.as_str(),
+        holder.id.as_str(),
+        carrier.entry_id
+    )))
 }
 
 fn internal(message: String) -> SpiError {

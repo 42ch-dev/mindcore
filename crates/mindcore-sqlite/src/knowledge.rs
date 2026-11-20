@@ -134,135 +134,166 @@ fn stale<T>(
     )
 }
 
-#[async_trait]
-impl KnowledgeEntryPort for ScopedKnowledgeStore {
-    async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
-        let payload: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT payload FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
-        )
-        .bind(&self.scope.collection)
-        .bind(entry_id)
-        .fetch_optional(&self.pool)
-        .await;
-        let payload = match payload {
-            Ok(Some(payload)) => payload,
-            Ok(None) => {
+/// One entry of `collection`, read through the caller's executor: the scoped
+/// port and the workflow binding share this read, and a settlement reads it at
+/// the same point as the write it guards.
+pub async fn read_entry<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+) -> SpokeResult<KnowledgeEntry>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let payload: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT payload FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(executor)
+    .await;
+    match payload {
+        Ok(Some(payload)) => decode(&payload),
+        Ok(None) => spoke_reject(
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            format!("no knowledge entry {entry_id} in collection {collection}"),
+            None,
+        ),
+        Err(error) => internal(format!("knowledge entry could not be read: {error}")),
+    }
+}
+
+/// Write one entry of `collection` against `expected_base_revision` through the
+/// caller's transaction, assigning `1` on create and `stored + 1` on update.
+///
+/// The caller holds the write reservation, so the revision comparison and the
+/// write cannot interleave with another handle on the same file.
+pub async fn write_entry(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    mut entry: KnowledgeEntry,
+    expected_base_revision: Option<u64>,
+) -> SpokeResult<KnowledgeEntry> {
+    // Single persistence boundary: gate the carrier module before the revision read or any row
+    // write, so a refusal leaves the stored row untouched.
+    if let Some(module) = cognition_module(&entry) {
+        if let SpokeResult::Reject(reject) = validate_cognition_module(&module) {
+            return SpokeResult::Reject(reject);
+        }
+        // The module validator carries no entry identity; the carrier contract also requires
+        // every stored record to be held by this entry.
+        if let Some(records) = module.get("records").and_then(Value::as_array) {
+            for record in records {
+                if let Some(violation) = carrier_record_violation(record, &entry.entry_id) {
+                    return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
+                }
+            }
+        }
+    }
+
+    let stored: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(&entry.entry_id)
+    .fetch_optional(&mut **tx)
+    .await;
+    let stored = match stored {
+        Ok(stored) => stored.map(|revision| revision as u64),
+        Err(error) => return internal(format!("stored revision could not be read: {error}")),
+    };
+
+    let revision = match expected_base_revision {
+        None => match stored {
+            None => 1,
+            Some(_) => {
                 return spoke_reject(
-                    SpokeRejectCode::KnowledgeEntryNotFound,
+                    SpokeRejectCode::KnowledgeEntryAlreadyExists,
                     format!(
-                        "no knowledge entry {entry_id} in collection {}",
-                        self.scope.collection
+                        "knowledge entry {} already exists in collection {collection}",
+                        entry.entry_id
                     ),
                     None,
                 )
             }
-            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
-        };
-        decode(&payload)
+        },
+        Some(expected) => match stored {
+            Some(stored) if stored == expected => expected + 1,
+            stored => return stale(collection, &entry.entry_id, Some(expected), stored),
+        },
+    };
+
+    // Store bookkeeping stays in the SQL timestamp columns; the payload keeps the caller's.
+    let now = Utc::now();
+    entry.revision = Some(revision);
+
+    let payload = match encode(&entry) {
+        SpokeResult::Ok(payload) => payload,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    let created_at = encode_timestamp(entry.created_at.unwrap_or(now));
+    let updated_at = encode_timestamp(now);
+    let written: Result<(), sqlx::Error> = match stored {
+        Some(_) => sqlx::query(
+            "UPDATE knowledge_entries SET revision = ?, payload = ?, updated_at = ?
+             WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(revision as i64)
+        .bind(&payload)
+        .bind(&updated_at)
+        .bind(collection)
+        .bind(&entry.entry_id)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ()),
+        None => sqlx::query(
+            "INSERT INTO knowledge_entries (collection, entry_id, revision, payload, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(collection)
+        .bind(&entry.entry_id)
+        .bind(revision as i64)
+        .bind(&payload)
+        .bind(&created_at)
+        .bind(&updated_at)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ()),
+    };
+    if let Err(error) = written {
+        return internal(format!("knowledge entry could not be written: {error}"));
+    }
+    SpokeResult::Ok(entry)
+}
+
+#[async_trait]
+impl KnowledgeEntryPort for ScopedKnowledgeStore {
+    async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        read_entry(&self.pool, &self.scope.collection, entry_id).await
     }
 
     async fn put_knowledge_entry(
         &self,
-        mut entry: KnowledgeEntry,
+        entry: KnowledgeEntry,
         expected_base_revision: Option<u64>,
     ) -> SpokeResult<KnowledgeEntry> {
-        let collection = self.scope.collection.as_str();
-        // Single persistence boundary: gate the carrier module before a transaction can reserve a
-        // write, so a refusal leaves the stored row untouched.
-        if let Some(module) = cognition_module(&entry) {
-            if let SpokeResult::Reject(reject) = validate_cognition_module(&module) {
-                return SpokeResult::Reject(reject);
-            }
-            // The module validator carries no entry identity; the carrier contract also requires
-            // every stored record to be held by this entry.
-            if let Some(records) = module.get("records").and_then(Value::as_array) {
-                for record in records {
-                    if let Some(violation) = carrier_record_violation(record, &entry.entry_id) {
-                        return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
-                    }
-                }
-            }
-        }
         // Hold SQLite's write reservation across the read and the write: the revision comparison and
         // the put must not interleave with another handle on the same file.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
             Err(error) => return internal(format!("knowledge write could not begin: {error}")),
         };
-
-        let stored: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+        let written = write_entry(
+            &mut transaction,
+            &self.scope.collection,
+            entry,
+            expected_base_revision,
         )
-        .bind(collection)
-        .bind(&entry.entry_id)
-        .fetch_optional(&mut *transaction)
         .await;
-        let stored = match stored {
-            Ok(stored) => stored.map(|revision| revision as u64),
-            Err(error) => return internal(format!("stored revision could not be read: {error}")),
-        };
-
-        let revision = match expected_base_revision {
-            None => match stored {
-                None => 1,
-                Some(_) => {
-                    return spoke_reject(
-                        SpokeRejectCode::KnowledgeEntryAlreadyExists,
-                        format!(
-                            "knowledge entry {} already exists in collection {collection}",
-                            entry.entry_id
-                        ),
-                        None,
-                    )
-                }
-            },
-            Some(expected) => match stored {
-                Some(stored) if stored == expected => expected + 1,
-                stored => return stale(collection, &entry.entry_id, Some(expected), stored),
-            },
-        };
-
-        // Store bookkeeping stays in the SQL timestamp columns; the payload keeps the caller's.
-        let now = Utc::now();
-        entry.revision = Some(revision);
-
-        let payload = match encode(&entry) {
-            SpokeResult::Ok(payload) => payload,
+        let entry = match written {
+            SpokeResult::Ok(entry) => entry,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        let created_at = encode_timestamp(entry.created_at.unwrap_or(now));
-        let updated_at = encode_timestamp(now);
-        let written: Result<(), sqlx::Error> = match stored {
-            Some(_) => sqlx::query(
-                "UPDATE knowledge_entries SET revision = ?, payload = ?, updated_at = ?
-                 WHERE collection = ? AND entry_id = ?",
-            )
-            .bind(revision as i64)
-            .bind(&payload)
-            .bind(&updated_at)
-            .bind(collection)
-            .bind(&entry.entry_id)
-            .execute(&mut *transaction)
-            .await
-            .map(|_| ()),
-            None => sqlx::query(
-                "INSERT INTO knowledge_entries (collection, entry_id, revision, payload, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(collection)
-            .bind(&entry.entry_id)
-            .bind(revision as i64)
-            .bind(&payload)
-            .bind(&created_at)
-            .bind(&updated_at)
-            .execute(&mut *transaction)
-            .await
-            .map(|_| ()),
-        };
-        if let Err(error) = written {
-            return internal(format!("knowledge entry could not be written: {error}"));
-        }
-
         if let Err(error) = transaction.commit().await {
             return internal(format!("knowledge write could not commit: {error}"));
         }
