@@ -298,20 +298,15 @@ fn cognition_module(entry: &KnowledgeEntry) -> Option<Value> {
     }
 }
 
-fn stale<T>(
-    collection: &str,
-    entry_id: &str,
-    expected: Option<u64>,
-    stored: Option<u64>,
-) -> SpokeResult<T> {
+// Names no collection: a served put forwards this message to an admitted peer, and an absent
+// or foreign-only id must answer exactly like a stale visible one.
+fn stale<T>(entry_id: &str, expected: Option<u64>, stored: Option<u64>) -> SpokeResult<T> {
     let mut details = Map::new();
     details.insert("expected_base_revision".to_string(), Value::from(expected));
     details.insert("stored_revision".to_string(), Value::from(stored));
     spoke_reject(
         SpokeRejectCode::StoredRevisionStale,
-        format!(
-            "knowledge entry {entry_id} in collection {collection} does not hold the expected revision"
-        ),
+        format!("knowledge entry {entry_id} does not hold the expected revision"),
         Some(details),
     )
 }
@@ -397,17 +392,14 @@ pub async fn write_entry(
             Some(_) => {
                 return spoke_reject(
                     SpokeRejectCode::KnowledgeEntryAlreadyExists,
-                    format!(
-                        "knowledge entry {} already exists in collection {collection}",
-                        entry.entry_id
-                    ),
+                    format!("knowledge entry {} already exists", entry.entry_id),
                     None,
                 )
             }
         },
         Some(expected) => match stored {
             Some(stored) if stored == expected => expected + 1,
-            stored => return stale(collection, &entry.entry_id, Some(expected), stored),
+            stored => return stale(&entry.entry_id, Some(expected), stored),
         },
     };
 
