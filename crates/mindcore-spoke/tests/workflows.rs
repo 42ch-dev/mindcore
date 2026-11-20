@@ -5,7 +5,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -25,6 +25,9 @@ use spoke_operations::SpokeRejectCode;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
 const DDL: &str = include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
+/// The optional vector cache, exactly as the shipped migration creates it.
+const VECTORS_DDL: &str =
+    include_str!("../../mindcore-sqlite/migrations/0002_memory_embedding_vectors.sql");
 /// The knowledge tables of `migrations/0001_init.sql`; that migration's legacy
 /// memory tables have a different shape than the protocol fixture above.
 const KNOWLEDGE_DDL: &str = "
@@ -70,6 +73,14 @@ struct BoundaryEmbedder {
     identity: EmbeddingIdentity,
     side_effect: SideEffect,
     pool: SqlitePool,
+    /// Every text this embedder was asked for, in call order.
+    embedded: Arc<Mutex<Vec<String>>>,
+}
+
+impl BoundaryEmbedder {
+    fn embedded(&self) -> Vec<String> {
+        self.embedded.lock().expect("embedded texts").clone()
+    }
 }
 
 #[async_trait]
@@ -79,6 +90,10 @@ impl Embedder for BoundaryEmbedder {
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+        self.embedded
+            .lock()
+            .expect("embedded texts")
+            .extend(texts.iter().cloned());
         match self.side_effect {
             SideEffect::None => {}
             SideEffect::RevokeGrant => {
@@ -147,6 +162,10 @@ impl Harness {
             .await
             .expect("open pool");
         sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+        sqlx::raw_sql(VECTORS_DDL)
+            .execute(&pool)
+            .await
+            .expect("apply the vector DDL");
         sqlx::raw_sql(KNOWLEDGE_DDL)
             .execute(&pool)
             .await
@@ -285,14 +304,8 @@ impl Harness {
         .expect("seed knowledge entry");
     }
 
-    fn binding(
-        &self,
-        caller: &str,
-        side_effect: SideEffect,
-    ) -> (SpiMindWorkflows, BoundaryEmbedder) {
-        let binding = MemoryWorkflowBinding::new(self.pool.clone(), true)
-            .with_knowledge_collection(caller, KnowledgeScope::new("wren"));
-        let embedder = BoundaryEmbedder {
+    fn embedder(&self, side_effect: SideEffect) -> BoundaryEmbedder {
+        BoundaryEmbedder {
             identity: EmbeddingIdentity {
                 provider_id: "local".to_string(),
                 model_id: "axes".to_string(),
@@ -301,8 +314,18 @@ impl Harness {
             },
             side_effect,
             pool: self.pool.clone(),
-        };
-        (SpiMindWorkflows::new(binding), embedder)
+            embedded: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn binding(
+        &self,
+        caller: &str,
+        side_effect: SideEffect,
+    ) -> (SpiMindWorkflows, BoundaryEmbedder) {
+        let binding = MemoryWorkflowBinding::new(self.pool.clone(), true)
+            .with_knowledge_collection(caller, KnowledgeScope::new("wren"));
+        (SpiMindWorkflows::new(binding), self.embedder(side_effect))
     }
 
     /// An absorb-capable engine whose publisher writes journal targets under
@@ -369,6 +392,16 @@ impl Harness {
                 content["text"].as_str().expect("record text").to_string(),
             )
         })
+    }
+
+    async fn vector_rows(&self) -> Vec<(String, String, i64, i64, Vec<u8>)> {
+        sqlx::query_as(
+            "SELECT record_id, identity_hash, record_revision, dim, vector \
+             FROM memory_embedding_vectors ORDER BY record_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("vector rows")
     }
 }
 
@@ -2504,4 +2537,243 @@ async fn a_subject_withheld_during_reasoning_refuses_the_carrier_write() {
     let (revision, payload) = stored_carrier(&harness).await;
     assert_eq!(revision, 1);
     assert!(payload.get("modules").is_none());
+}
+
+// ---------- vector warm after settlement ----------
+
+/// One auto-settling promote of `text`, with `embedder` injected when the host
+/// supplies one.
+async fn promote_with(
+    harness: &Harness,
+    key: &str,
+    text: &str,
+    embedder: Option<&dyn Embedder>,
+) -> Vec<AbsorbCandidateOutcome> {
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        embedder,
+    };
+    workflows
+        .absorb(&principal(), &capture(key, text), None, &caps)
+        .await
+        .expect("absorb")
+}
+
+fn warming_identity_hash() -> String {
+    match mindcore_sqlite::vectors::identity_hash("local", "axes", "1", 2) {
+        spoke_operations::SpokeResult::Ok(hash) => hash,
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("the warming identity hashes: {}", reject.message)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_settled_capture_warms_one_row_for_the_live_record() {
+    let harness = granted_harness().await;
+    let embedder = harness.embedder(SideEffect::None);
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled { record_ids, .. }] = outcomes.as_slice() else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        embedder.embedded(),
+        vec!["the north gate is closed at dusk".to_string()],
+        "the warm embeds the exact live record text"
+    );
+    let rows = harness.vector_rows().await;
+    assert_eq!(rows.len(), 1, "one settled record, one row");
+    let (record_id, identity_hash, revision, dim, vector) = &rows[0];
+    assert_eq!(record_id, &record_ids[0]);
+    assert_eq!(identity_hash, &warming_identity_hash());
+    assert_eq!(*revision, 1, "the committed revision is the row's revision");
+    assert_eq!(*dim, 2);
+    assert_eq!(
+        vector,
+        &[1.0f32, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<u8>>(),
+        "the row carries the provider's little-endian components"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_capture_warms_nothing() {
+    let harness = granted_harness().await;
+    let first = promote_with(
+        &harness,
+        "cap_warm_replay",
+        "the north gate is closed at dusk",
+        None,
+    )
+    .await;
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "no embedder, no row"
+    );
+
+    let embedder = harness.embedder(SideEffect::None);
+    let replay = promote_with(
+        &harness,
+        "cap_warm_replay",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    assert_eq!(replay, first, "a replay reports the same settlement");
+    assert!(
+        embedder.embedded().is_empty(),
+        "a replay has nothing fresh to embed"
+    );
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a replay writes no vector row"
+    );
+}
+
+#[tokio::test]
+async fn an_updated_settlement_warms_the_new_revision() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "update",
+            "record_id": "rec_gate",
+            "evidence_ids": ["rec_gate"]
+        }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let embedder = harness.embedder(SideEffect::None);
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        embedder: Some(&embedder),
+    };
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_warm_update", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("absorb");
+
+    let [AbsorbCandidateOutcome::Settled { record_ids, .. }] = outcomes.as_slice() else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(record_ids, &["rec_gate".to_string()]);
+    assert_eq!(
+        embedder.embedded(),
+        vec!["the north gate is closed at dusk".to_string()],
+        "the warm embeds the updated live text"
+    );
+    let rows = harness.vector_rows().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "rec_gate");
+    assert_eq!(rows[0].2, 2, "the row carries the committed revision");
+}
+
+#[tokio::test]
+async fn a_provider_failure_after_settlement_leaves_a_miss() {
+    struct FailingEmbedder {
+        identity: EmbeddingIdentity,
+    }
+
+    #[async_trait]
+    impl Embedder for FailingEmbedder {
+        fn identity(&self) -> Option<&EmbeddingIdentity> {
+            Some(&self.identity)
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, SpiError> {
+            Err(SpiError::EmbeddingFailed("provider down".to_string()))
+        }
+    }
+
+    let harness = granted_harness().await;
+    let embedder = FailingEmbedder {
+        identity: EmbeddingIdentity {
+            provider_id: "local".to_string(),
+            model_id: "axes".to_string(),
+            model_version: "1".to_string(),
+            dim: 2,
+        },
+    };
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm_fail",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled {
+        candidate_id,
+        record_ids,
+    }] = outcomes.as_slice()
+    else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        harness.stored_record(&record_ids[0]).await,
+        Some((1, "the north gate is closed at dusk".to_string())),
+        "the durable record survives the failed warm"
+    );
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a failed warm is a cache miss, not a Memory effect"
+    );
+}
+
+#[tokio::test]
+async fn a_revision_moved_during_the_warm_keeps_no_row() {
+    let harness = granted_harness().await;
+    let embedder = harness.embedder(SideEffect::BumpRevision);
+
+    let outcomes = promote_with(
+        &harness,
+        "cap_warm_stale",
+        "the north gate is closed at dusk",
+        Some(&embedder),
+    )
+    .await;
+
+    let [AbsorbCandidateOutcome::Settled { record_ids, .. }] = outcomes.as_slice() else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(
+        harness
+            .stored_record(&record_ids[0])
+            .await
+            .expect("the promoted record")
+            .0,
+        2,
+        "the provider ran after the committed read and the record moved"
+    );
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "obsolete work cannot overwrite a newer vector"
+    );
 }

@@ -25,10 +25,12 @@ use mindcore_base::ir::{CandidateState, MemoryRepository, ReceiptKey, ReceiptRea
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
     AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, RecallSnapshot, SpiError, WorkflowBinding,
+    DeliberateSnapshot, EmbeddingIdentity, RecallSnapshot, SettledRecord, SpiError,
+    WorkflowBinding,
 };
 use mindcore_sqlite::{
-    append_cognition, list_entries_in, read_carrier_header, read_entry, SqliteMemoryRepository,
+    append_cognition, list_entries_in, read_carrier_header, read_entry, vectors,
+    SqliteMemoryRepository,
 };
 
 use crate::admission;
@@ -618,6 +620,100 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         Ok(())
     }
 
+    async fn settled_record(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!(
+                "settled record read transaction could not begin: {error}"
+            ))
+        })?;
+        let body = ready(
+            self.adapter
+                .get_record(
+                    &mut transaction,
+                    principal,
+                    json!({ "space_id": space_id, "record_id": record_id }),
+                )
+                .await,
+            "memory.records.get",
+        )?;
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "settled record read transaction could not commit: {error}"
+            ))
+        })?;
+        let record = decode_record(body)?;
+        Ok(match record {
+            RetainedRecord::LiveRecord(live) => Some(SettledRecord {
+                record_id: live.record_id.as_str().to_string(),
+                revision: live.revision.get(),
+                text: live.content.text,
+            }),
+            RetainedRecord::TombstonedRecord(_) => None,
+        })
+    }
+
+    async fn fill_record_vector(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        record: &SettledRecord,
+        identity: &EmbeddingIdentity,
+        vector: &[f32],
+    ) -> Result<(), SpiError> {
+        let identity_hash = match vectors::identity_hash(
+            &identity.provider_id,
+            &identity.model_id,
+            &identity.model_version,
+            identity.dim,
+        ) {
+            SpokeResult::Ok(hash) => hash,
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        };
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!("vector fill transaction could not begin: {error}"))
+        })?;
+        // The fill rechecks in its own transaction what the warm read saw: work
+        // that outlived a newer revision or a withheld subject writes nothing.
+        let body = ready(
+            self.adapter
+                .get_record(
+                    &mut transaction,
+                    principal,
+                    json!({ "space_id": space_id, "record_id": record.record_id }),
+                )
+                .await,
+            "memory.records.get",
+        )?;
+        let current = match decode_record(body)? {
+            RetainedRecord::LiveRecord(live) => live.revision.get(),
+            RetainedRecord::TombstonedRecord(_) => return Ok(()),
+        };
+        if current != record.revision {
+            return Ok(());
+        }
+        match vectors::upsert_record_vector(
+            &mut *transaction,
+            &record.record_id,
+            &identity_hash,
+            record.revision,
+            vector,
+        )
+        .await
+        {
+            SpokeResult::Ok(()) => {}
+            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+        }
+        transaction.commit().await.map_err(|error| {
+            internal(format!("vector fill transaction could not commit: {error}"))
+        })?;
+        Ok(())
+    }
+
     async fn recorded_update(
         &self,
         principal: &Principal,
@@ -913,6 +1009,18 @@ fn decode_records(body: Value) -> Result<Vec<RetainedRecord>, SpiError> {
         .ok_or_else(|| internal("memory.recall ready stage carries no records".to_string()))?;
     serde_json::from_value(records)
         .map_err(|error| internal(format!("memory.recall records do not decode: {error}")))
+}
+
+fn decode_record(body: Value) -> Result<RetainedRecord, SpiError> {
+    let record = body
+        .get("record")
+        .cloned()
+        .ok_or_else(|| internal("memory.records.get carries no record".to_string()))?;
+    serde_json::from_value(record).map_err(|error| {
+        internal(format!(
+            "memory.records.get record does not decode: {error}"
+        ))
+    })
 }
 
 fn not_authorized(message: String) -> SpiError {

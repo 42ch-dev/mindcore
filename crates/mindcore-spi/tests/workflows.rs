@@ -13,7 +13,8 @@ use mindcore_spi::{
     CitedRecord, CognitiveTaskKind, DeliberateOutcome, DeliberateRequest, DeliberateSnapshot,
     DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities, NoEmbeddings,
     PolicyDecision, PolicyHook, ProposalDraft, Reasoner, RecallSnapshot, Recommendation,
-    SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest, WorkflowBinding,
+    SettledRecord, SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest,
+    WorkflowBinding,
 };
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
@@ -147,6 +148,26 @@ impl WorkflowBinding for StubBinding {
         unserved()
     }
 
+    async fn settled_record(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError> {
+        unserved()
+    }
+
+    async fn fill_record_vector(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record: &SettledRecord,
+        _identity: &EmbeddingIdentity,
+        _vector: &[f32],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
     async fn recorded_update(
         &self,
         _principal: &Principal,
@@ -235,6 +256,26 @@ impl WorkflowBinding for RefusingBinding {
         _update: &MemoryRecordsUpdateRequest,
         _dismiss: &MemoryCandidatesDismissRequest,
         _cited: &[CitedRecord],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
+    async fn settled_record(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError> {
+        unserved()
+    }
+
+    async fn fill_record_vector(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record: &SettledRecord,
+        _identity: &EmbeddingIdentity,
+        _vector: &[f32],
     ) -> Result<(), SpiError> {
         unserved()
     }
@@ -784,6 +825,26 @@ impl WorkflowBinding for AbsorbDouble {
             "cited": cited_json(cited),
         }));
         Ok(())
+    }
+
+    async fn settled_record(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError> {
+        unserved()
+    }
+
+    async fn fill_record_vector(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record: &SettledRecord,
+        _identity: &EmbeddingIdentity,
+        _vector: &[f32],
+    ) -> Result<(), SpiError> {
+        unserved()
     }
 
     async fn recorded_update(
@@ -1545,6 +1606,26 @@ impl WorkflowBinding for DeliberateDouble {
         _update: &MemoryRecordsUpdateRequest,
         _dismiss: &MemoryCandidatesDismissRequest,
         _cited: &[CitedRecord],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
+    async fn settled_record(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError> {
+        unserved()
+    }
+
+    async fn fill_record_vector(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _record: &SettledRecord,
+        _identity: &EmbeddingIdentity,
+        _vector: &[f32],
     ) -> Result<(), SpiError> {
         unserved()
     }

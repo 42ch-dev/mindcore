@@ -29,9 +29,9 @@ use spoke_schemas::{
 
 use crate::{
     AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DeliberateOutcome,
-    DeliberateRequest, DomainLens, EmbeddingIdentity, Evidence, LensOutput, MindCapabilities,
-    MindWorkflows, PolicyDecision, PolicyHook, ProposalDraft, Reasoner, Recommendation,
-    SettlementDraft, SpiError, StructuredReasonRequest,
+    DeliberateRequest, DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput,
+    MindCapabilities, MindWorkflows, PolicyDecision, PolicyHook, ProposalDraft, Reasoner,
+    Recommendation, SettlementDraft, SpiError, StructuredReasonRequest,
 };
 
 /// BM25 term-frequency saturation and length normalisation (the standard
@@ -134,6 +134,33 @@ pub trait WorkflowBinding: Send + Sync {
         idempotency_key: &str,
     ) -> Result<Option<String>, SpiError>;
 
+    /// Read the live projection of one record a settlement just committed.
+    ///
+    /// `None` when the record is now a tombstone: there is nothing to warm. A
+    /// record this caller may no longer read, or whose subject became withheld,
+    /// surfaces as a refusal — the warm treats it as a miss too.
+    async fn settled_record(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        record_id: &str,
+    ) -> Result<Option<SettledRecord>, SpiError>;
+
+    /// Store one warmed vector for `record` under `identity`.
+    ///
+    /// The fill rechecks in its own transaction that the record is still live,
+    /// settled and at `record.revision`: a tombstone, a moved revision or a
+    /// withheld subject writes nothing, and an unreadable record is refused.
+    /// Either way no row is written.
+    async fn fill_record_vector(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        record: &SettledRecord,
+        identity: &EmbeddingIdentity,
+        vector: &[f32],
+    ) -> Result<(), SpiError>;
+
     /// Read one deliberation snapshot: the subject's authorized memory page
     /// and the caller's admitted holder carrier, on one transaction.
     ///
@@ -224,6 +251,18 @@ pub enum CandidateLifecycle {
     Pending,
     /// Something consumed it; read its recorded outcome under its own grants.
     Consumed,
+}
+
+/// One record a settlement just committed: the revision and the exact live
+/// text the recall path scores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRecord {
+    /// The record id the settlement named.
+    pub record_id: String,
+    /// The revision the settlement committed.
+    pub revision: u64,
+    /// The live `record_text` a warmed vector must embed.
+    pub text: String,
 }
 
 /// One record an absorb decision cited, with the revision the prompted page
@@ -400,6 +439,8 @@ impl SpiMindWorkflows {
                             .binding
                             .review_candidate(principal, &review, &cited)
                             .await?;
+                        self.warm_settled(principal, &space, &record_ids, caps)
+                            .await;
                         Ok(AbsorbCandidateOutcome::Settled {
                             candidate_id,
                             record_ids,
@@ -493,6 +534,13 @@ impl SpiMindWorkflows {
                         self.binding
                             .update_candidate(principal, &space, &update, &dismiss, &cited)
                             .await?;
+                        self.warm_settled(
+                            principal,
+                            &space,
+                            std::slice::from_ref(&record_id),
+                            caps,
+                        )
+                        .await;
                         Ok(AbsorbCandidateOutcome::Settled {
                             candidate_id,
                             record_ids: vec![record_id],
@@ -517,6 +565,62 @@ impl SpiMindWorkflows {
                 }
             }
         }
+    }
+
+    /// Warm the vector cache for records a settlement just committed.
+    ///
+    /// Runs after that settlement transaction closed and before the outcome is
+    /// reported, so the live read and the provider call hold no transaction.
+    /// Every failure is a cache miss: a post-commit warm never undoes, replays
+    /// or misreports the durable Memory effect it serves.
+    async fn warm_settled(
+        &self,
+        principal: &Principal,
+        space: &str,
+        record_ids: &[String],
+        caps: &MindCapabilities<'_>,
+    ) {
+        let Some(embedder) = caps.embedder else {
+            return;
+        };
+        let Some(identity) = embedder.identity() else {
+            return;
+        };
+        for record_id in record_ids {
+            let _ = self
+                .warm_record(principal, space, record_id, embedder, identity)
+                .await;
+        }
+    }
+
+    /// Warm one settled record: the live read, one provider call outside every
+    /// transaction, then a fill that rechecks the revision and withholding.
+    async fn warm_record(
+        &self,
+        principal: &Principal,
+        space: &str,
+        record_id: &str,
+        embedder: &dyn Embedder,
+        identity: &EmbeddingIdentity,
+    ) -> Result<(), SpiError> {
+        let Some(record) = self
+            .binding
+            .settled_record(principal, space, record_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let mut vectors = checked_vectors(
+            embedder
+                .embed_batch(std::slice::from_ref(&record.text))
+                .await?,
+            1,
+            identity,
+        )?;
+        let vector = vectors.pop().expect("one text yields one vector");
+        self.binding
+            .fill_record_vector(principal, space, &record, identity, &vector)
+            .await
     }
 
     /// What an earlier run of this exact capture recorded for one candidate

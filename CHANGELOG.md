@@ -25,4 +25,10 @@
 - `mindcore-sqlite`: optional retained-vector storage. `memory_embedding_vectors` holds one
   little-endian `f32` vector per `(record_id, identity_hash)` with its record revision and dimension,
   indexed by identity so a retired identity's whole partition is one delete. The new migration
-  applies to a database created before it; nothing reads or writes the table yet.
+  applies to a database created before it; the table starts empty.
+- `mindcore-spi` / `mindcore-spoke`: a confirmed absorb settlement warms the retained vector of each
+  fresh or updated record when the host supplies an embedder with a stable serving identity. The
+  provider call runs outside the settlement transaction, and the fill rechecks the committed
+  revision and withholding, so work that outlived its record writes nothing. A failed warm is a
+  cache miss, never a failed, rolled-back or replayed Memory mutation; no embedder, no serving
+  identity and an idempotent replay write nothing.

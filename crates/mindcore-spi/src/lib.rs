@@ -16,7 +16,7 @@ pub mod workflows;
 
 pub use workflows::{
     AbsorbSnapshot, CandidateLifecycle, CaptureOutcome, CapturedCandidate, CitedRecord,
-    DeliberateSnapshot, RecallSnapshot, SpiMindWorkflows, WorkflowBinding,
+    DeliberateSnapshot, RecallSnapshot, SettledRecord, SpiMindWorkflows, WorkflowBinding,
 };
 
 use std::future::Future;
