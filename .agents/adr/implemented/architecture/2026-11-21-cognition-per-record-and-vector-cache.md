@@ -28,5 +28,5 @@ No data migration for the cognition change: it rewrites `0001`, so a database wh
 - Append work is constant in history: measured at 126 VDBE steps for both 1 and 1000 prior records, and the current-judgment read is a constant 42-step head lookup.
 - A warm recall makes zero provider calls; a new query embeds only its query text. The persisted and fresh paths score to the same bits, proven against real SQLite BLOBs.
 - A database whose applied `0001` no longer matches its file must be recreated, by design; a host that wants continuity exports and re-imports rather than upgrading in place. The additive `0002` table applies in place wherever the earlier migrations still match.
-- Identity rotation is a host operation: drain in-flight producers, call `retire_identity` to clear the query slot, and delete the partition by `identity_hash` in one statement. The workspace has no production rotation caller yet.
+- Identity rotation is a host operation: quiesce in-flight recalls, then call `MindcoreSurface::retire_embedding_identity`, which clears the retired identity's query slot and deletes its stored partition by `identity_hash` in one statement. The workspace has no production rotation caller yet.
 - The runtime still serves protocol-shaped stores only (`I-000068`); these storage changes do not close that gap.
