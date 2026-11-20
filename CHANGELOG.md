@@ -60,3 +60,8 @@
   table untouched and keeps the adapter's lexical order. Retiring an identity clears its query slot as
   well as its stored partition. Ranking is unchanged, and the persisted path scores bit-identically to
   the in-memory one, tie order included.
+- `mindcore-runtime`: `MindcoreSurface::retire_embedding_identity` is the one supported host entry for
+  identity rotation. It clears the retired identity's in-memory query slot and deletes its stored
+  partition in one `identity_hash` statement, returning the rows deleted, and leaves another identity's
+  rows and query slot warm. Call it between recalls: it does not drain a recall already in flight, and a
+  fill that commits afterwards re-creates rows it deleted.

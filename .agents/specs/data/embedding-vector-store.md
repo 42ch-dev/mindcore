@@ -10,11 +10,7 @@ An optional SQLite cache of live retained Memory record vectors for `recall_cont
 
 `memory_embedding_vectors(record_id TEXT, identity_hash TEXT, record_revision INTEGER, dim INTEGER, vector BLOB)` has non-null columns, primary key `(record_id, identity_hash)`, revision and dimension stored as integers (`typeof` of each column is `integer`, since `INTEGER` affinity alone keeps a fractional value as REAL) and both positive, and `length(vector) = 4 * dim`. The backing Memory schema keys records by `record_id` within a database. A vector hit requires exact identity, current authorized record revision and dimension; the revision is a freshness marker, not part of the key. One row replaces any old revision for that record/identity. Encode each finite `f32` component in little-endian IEEE 754 binary32 without a header or quantization; reject malformed lengths, non-finite components and all-zero vectors. Embed the same `record_text` input that `rank` uses.
 
-Switching identity can never hit the old partition. When the host retires an identity, drain its in-flight vector producers, clear its in-memory query slot, and delete its disk partition in one transaction using the `identity_hash` index:
-
-```sql
-DELETE FROM memory_embedding_vectors WHERE identity_hash = ?1;
-```
+Switching identity can never hit the old partition. Retire an identity through the one supported host entry, `MindcoreSurface::retire_embedding_identity(&EmbeddingIdentity)` in `crates/mindcore-runtime/src/lib.rs`: it clears that identity's in-memory query slot and deletes its disk partition in one statement over the `identity_hash` index — `DELETE FROM memory_embedding_vectors WHERE identity_hash = ?1` — returning how many rows went. Call it between recalls: the surface does not drain a recall already in flight, so drain that identity's in-flight vector producers first, and a fill that commits afterwards re-creates rows the call deleted.
 
 Use the trusted retired hash, not an untrusted request value and not `<> active_identity`. Different identities may coexist until retirement; do not sweep or rebuild unrelated rows. Recompute only written records and authorized recall misses.
 
@@ -42,6 +38,7 @@ Reuse `hybrid_scores` on the same page and ordering with bit-preserving decoded 
 
 - `crates/mindcore-spi/src/{lib,workflows}.rs`: host contract, query slot, exact ranking and revalidation sequencing.
 - `crates/mindcore-spoke/src/workflows.rs`: authorized SQLite snapshot and cache-fill boundary. `crates/mindcore-sqlite/src/vectors.rs` and `crates/mindcore-sqlite/migrations/`: vector codec, scoped lookup/upsert and bulk retirement.
+- `crates/mindcore-runtime/src/lib.rs`: `MindcoreSurface::retire_embedding_identity`, the one host entry that sequences the slot clear and the partition delete.
 
 ## Change obligations
 
