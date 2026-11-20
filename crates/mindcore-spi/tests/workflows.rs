@@ -84,6 +84,36 @@ fn snapshot(records: Vec<RetainedRecord>, knowledge: Vec<KnowledgeEntry>) -> Rec
     RecallSnapshot { records, knowledge }
 }
 
+/// A retained record whose body the tombstone scrubbed: metadata only, no text left
+/// to embed.
+fn tombstoned(record_id: &str, revision: u64) -> RetainedRecord {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "record_id": record_id,
+        "space_id": "spc_1",
+        "subject_id": "subj_1",
+        "kind": "fact",
+        "content": { "text": "" },
+        "scope": { "visibility": "shared" },
+        "provenance": {
+            "source_context_ids": ["ctx_a"],
+            "anchors": [],
+            "captured_by": "prn_1",
+            "captured_at": "2026-11-20T09:00:00Z"
+        },
+        "tombstone": {
+            "deleted_at": "2026-11-20T10:00:00Z",
+            "deleted_by": "prn_1",
+            "reason": ""
+        },
+        "created_at": "2026-11-20T09:00:00Z",
+        "updated_at": "2026-11-20T10:00:00Z",
+        "revision": revision,
+        "extensions": {}
+    }))
+    .expect("tombstoned record")
+}
+
 /// Repeats its last snapshot once the list runs out, so a stable page reads
 /// back identically, and serves the vectors a warm table already holds under
 /// `(identity, record, revision)`.
@@ -623,6 +653,54 @@ async fn planted_vectors_rerank_only_the_page() {
 
     assert_eq!(ids(&pack), ["rec_a", "rec_c", "rec_b"]);
     assert_eq!(pack.records.len(), 3);
+}
+
+/// A tombstone can neither fill nor be scored by a vector: the page's miss set
+/// holds live records only, so a recall over a tombstoned record embeds the live
+/// page and the query, never the scrubbed body, and writes no fill for it.
+#[tokio::test]
+async fn a_tombstone_is_never_embedded_or_filled() {
+    let page = snapshot(
+        vec![
+            record("rec_live", "the north gate is closed", 1),
+            tombstoned("rec_gone", 2),
+        ],
+        Vec::new(),
+    );
+    let binding = StubBinding::new(vec![page]);
+    let workflows = SpiMindWorkflows::new(binding.clone());
+    let embedder = planted_embedder();
+    let caps = embedding_caps(&embedder);
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate")),
+            budget(4096),
+            &caps,
+        )
+        .await
+        .expect("pack");
+
+    let embedded = embedder.embedded();
+    assert_eq!(
+        embedded.len(),
+        2,
+        "one query and one live text are embedded, got {embedded:?}"
+    );
+    assert!(
+        embedded
+            .iter()
+            .any(|text| text == "the north gate is closed"),
+        "the live record is embedded: {embedded:?}"
+    );
+    let fills = binding.settled_fills();
+    let filled: Vec<&str> = fills
+        .iter()
+        .map(|fill| fill.record.record_id.as_str())
+        .collect();
+    assert_eq!(filled, ["rec_live"], "a tombstone is never filled");
+    assert_eq!(ids(&pack), ["rec_live", "rec_gone"]);
 }
 
 /// The fixture page in adapter order: the market, the closed gate and the

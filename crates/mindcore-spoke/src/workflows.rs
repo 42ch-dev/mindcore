@@ -8,7 +8,10 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
-use spoke_operations::{GrantRequirement, SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    knowledge_entry_visible_to_viewpoint, GrantRequirement, SpokeReject, SpokeRejectCode,
+    SpokeResult,
+};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionReferenceKind};
 use spoke_schemas::data::memory_candidate::PlacementScope;
 use spoke_schemas::{
@@ -407,6 +410,11 @@ impl MemoryWorkflowBinding {
     /// [`KNOWLEDGE_READ`] grant in the request's space reads the bound
     /// collection, whichever caller the carrier write is bound to.
     ///
+    /// The slot applies the same disclosure predicate as the served knowledge
+    /// list. This binding carries no admitted viewpoint, so an entry a
+    /// viewpoint-free read hides — an `owner`-private one — never reaches the
+    /// pack, however large the recall's budget.
+    ///
     /// Best effort: the slot never decides whether the recall is authorized, so
     /// a caller without that grant reads its memory records with an empty slot
     /// exactly as it would with no collection bound. Storage and list failures
@@ -431,7 +439,10 @@ impl MemoryWorkflowBinding {
             Err(error) => return Err(error),
         };
         match list_entries_in(tx, granted.scope.collection.as_str()).await {
-            SpokeResult::Ok(entries) => Ok(entries),
+            SpokeResult::Ok(entries) => Ok(entries
+                .into_iter()
+                .filter(|entry| knowledge_entry_visible_to_viewpoint(entry, None))
+                .collect()),
             SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
         }
     }

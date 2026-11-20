@@ -2001,10 +2001,15 @@ impl SpiMindWorkflows {
             stored.push(row.vector);
         }
         let texts: Vec<&str> = records.iter().map(record_text).collect();
+        // Only a live record can fill a vector row: a tombstone has no text left
+        // to embed and its row is pruned, so it is never a miss.
         let misses: Vec<usize> = stored
             .iter()
             .enumerate()
-            .filter_map(|(index, vector)| vector.is_none().then_some(index))
+            .filter_map(|(index, vector)| {
+                (vector.is_none() && matches!(records[index], RetainedRecord::LiveRecord(_)))
+                    .then_some(index)
+            })
             .collect();
         let mut fresh = Vec::new();
         if !misses.is_empty() {
@@ -2022,17 +2027,15 @@ impl SpiMindWorkflows {
             fresh = checked_vectors(vectors, misses.len(), identity)?;
         }
 
-        let mut vectors = Vec::with_capacity(texts.len());
+        let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
         let mut fills = Vec::with_capacity(misses.len());
         let mut fresh = fresh.into_iter();
         for (index, stored) in stored.into_iter().enumerate() {
             let vector = match stored {
-                Some(vector) => vector,
-                None => {
-                    let vector = fresh.next().expect("one vector per miss");
-                    // A tombstone holds no vector: replaying its text would
-                    // only refill a row the store refuses to keep.
-                    if let RetainedRecord::LiveRecord(live) = &records[index] {
+                Some(vector) => Some(vector),
+                None => match &records[index] {
+                    RetainedRecord::LiveRecord(live) => {
+                        let vector = fresh.next().expect("one vector per live miss");
                         fills.push(RecordFill {
                             record: SettledRecord {
                                 record_id: live.record_id.as_str().to_string(),
@@ -2041,9 +2044,12 @@ impl SpiMindWorkflows {
                             },
                             vector: vector.clone(),
                         });
+                        Some(vector)
                     }
-                    vector
-                }
+                    // A tombstone holds no vector: it scores without similarity
+                    // rather than paying a provider call on every recall.
+                    RetainedRecord::TombstonedRecord(_) => None,
+                },
             };
             vectors.push(vector);
         }
@@ -2104,14 +2110,15 @@ fn checked_vectors(
 /// engine sorts by it descending and keeps the adapter's order on ties, but a
 /// configured reasoner may then reorder the page.
 ///
-/// One score per text. A matching vector that is absent scores with `0`
-/// similarity, whose term still contributes `0.25`; mismatched slices never
-/// panic, so pass one vector per text for the documented formula.
+/// One score per text. `None` is a text with no serving vector — a tombstone —
+/// and scores with `0` similarity, whose term still contributes `0.25`;
+/// mismatched slices never panic, so pass one entry per text for the documented
+/// formula.
 pub(crate) fn hybrid_scores(
     texts: &[&str],
     query: &str,
     query_vector: &[f32],
-    vectors: &[Vec<f32>],
+    vectors: &[Option<Vec<f32>>],
 ) -> Vec<f64> {
     let lexical = bm25_scores(texts, query);
     let maximum = lexical.iter().copied().fold(0.0f64, f64::max);
@@ -2126,6 +2133,7 @@ pub(crate) fn hybrid_scores(
             };
             let similarity = vectors
                 .get(index)
+                .and_then(Option::as_deref)
                 .map_or(0.0, |vector| cosine(query_vector, vector));
             0.5 * normalised + 0.5 * (1.0 + similarity) / 2.0
         })
@@ -2145,7 +2153,8 @@ pub fn scored_bits_for_test(
     query_vector: &[f32],
     vectors: &[Vec<f32>],
 ) -> Vec<u64> {
-    hybrid_scores(texts, query, query_vector, vectors)
+    let vectors: Vec<Option<Vec<f32>>> = vectors.iter().cloned().map(Some).collect();
+    hybrid_scores(texts, query, query_vector, &vectors)
         .into_iter()
         .map(f64::to_bits)
         .collect()
@@ -2570,7 +2579,7 @@ mod tests {
             &["north gate", "market dawn"],
             "north gate",
             &[1.0, 0.0],
-            &[vec![1.0, 0.0]],
+            &[Some(vec![1.0, 0.0])],
         );
         assert_eq!(scores.len(), 2);
         assert!(scores.iter().all(|score| score.is_finite()));

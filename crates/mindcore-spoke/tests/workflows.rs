@@ -326,8 +326,28 @@ impl Harness {
             "body": { "summary": summary },
             "revision": 1,
             "extensions": {}
-        })
-        .to_string();
+        });
+        self.insert_entry(collection, entry_id, payload).await;
+    }
+
+    /// An `owner`-private entry: only a read whose admitted viewpoint is `owner` may see it.
+    async fn private_entry(&self, collection: &str, entry_id: &str, owner: &str, summary: &str) {
+        let payload = json!({
+            "schema_version": 1,
+            "entry_id": entry_id,
+            "entry_type": "location",
+            "canonical_name": entry_id,
+            "status": "confirmed",
+            "body": { "summary": summary },
+            "disclosure": "owner-private",
+            "owner": owner,
+            "revision": 1,
+            "extensions": {}
+        });
+        self.insert_entry(collection, entry_id, payload).await;
+    }
+
+    async fn insert_entry(&self, collection: &str, entry_id: &str, payload: Value) {
         sqlx::query(
             "INSERT INTO knowledge_entries \
              (collection, entry_id, revision, payload, created_at, updated_at) \
@@ -335,7 +355,7 @@ impl Harness {
         )
         .bind(collection)
         .bind(entry_id)
-        .bind(payload)
+        .bind(payload.to_string())
         .bind(NOW)
         .bind(NOW)
         .execute(&self.pool)
@@ -754,6 +774,113 @@ async fn knowledge_slot_refuses_a_collection_over_the_served_bound() {
             .contains(&SERVED_KNOWLEDGE_LIST_LIMIT.to_string()),
         "the refusal names the bound: {}",
         reject.message
+    );
+}
+
+/// The knowledge slot applies the served list's disclosure predicate. The binding
+/// carries no admitted viewpoint, so an `owner`-private entry must never reach the
+/// pack, however large the recall's budget.
+#[tokio::test]
+async fn knowledge_slot_hides_owner_private_entries() {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness.entry("wren", "ke_gate", "closed after dusk").await;
+    harness
+        .private_entry("wren", "ke_mira_diary", "ke_mira", "mira's private notes")
+        .await;
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(None, 10),
+            budget(),
+            &MindCapabilities {
+                embedder: Some(&embedder),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("pack");
+
+    let entries: Vec<&str> = pack
+        .knowledge
+        .iter()
+        .map(|entry| entry.entry_id.as_str())
+        .collect();
+    assert_eq!(
+        entries,
+        ["ke_gate"],
+        "an owner-private entry must not reach a pack with no admitted viewpoint"
+    );
+}
+
+/// Tombstoning a record prunes its stored vectors in the tombstone's own transaction:
+/// a row the store can never serve again must not outlive the live record.
+#[tokio::test]
+async fn tombstoning_a_record_prunes_its_vector_rows() {
+    use mindcore_spoke::{MemoryAdapter, MemoryStage};
+    use spoke_operations::SpokeResult;
+
+    let harness = Harness::open().await;
+    harness.grant(&["recall", "records_write"]).await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &MindCapabilities {
+                embedder: Some(&embedder),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("recall warms the vector");
+    assert_eq!(
+        harness.vector_rows().await.len(),
+        1,
+        "the recall fills the live record's vector"
+    );
+
+    let adapter = MemoryAdapter::new(false);
+    let mut tx = harness.pool.begin().await.expect("begin delete");
+    let staged = adapter
+        .delete_record(
+            &mut tx,
+            &principal(),
+            json!({
+                "space_id": SPACE,
+                "record_id": "rec_a",
+                "expected_revision": 1,
+                "idempotency_key": "del-v1"
+            }),
+        )
+        .await;
+    assert!(
+        matches!(staged, SpokeResult::Ok(MemoryStage::JournalPending { .. })),
+        "the delete stages its journaled tombstone: {staged:?}"
+    );
+    tx.commit().await.expect("commit the tombstone");
+
+    assert!(
+        harness.vector_rows().await.is_empty(),
+        "a tombstone keeps no vector row"
     );
 }
 

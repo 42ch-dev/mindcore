@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use mindcore_base::cognition::carrier_record_violation;
 use mindcore_base::knowledge::KnowledgeScope;
@@ -16,7 +18,7 @@ use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryMod
 use spoke_schemas::{KnowledgeEntry, Scope};
 
 use crate::cognition::{insert_record, read_records};
-use crate::store::MindStore;
+use crate::store::{MindStore, SnapshotSeam};
 
 /// Hard bound on one list of a stored collection.
 ///
@@ -62,11 +64,16 @@ pub fn validate_admission_scope(scope: &Scope) -> SpokeResult<()> {
 pub struct ScopedKnowledgeStore {
     pool: SqlitePool,
     scope: KnowledgeScope,
+    seam: Arc<SnapshotSeam>,
 }
 
 impl ScopedKnowledgeStore {
     pub fn new(pool: SqlitePool, scope: KnowledgeScope) -> Self {
-        Self { pool, scope }
+        Self {
+            pool,
+            scope,
+            seam: Arc::new(SnapshotSeam::default()),
+        }
     }
 
     pub fn scope(&self) -> &KnowledgeScope {
@@ -88,7 +95,7 @@ impl ScopedKnowledgeStore {
                 return internal(format!("knowledge entries could not be listed: {error}"))
             }
         };
-        match entries(&mut tx, &self.scope.collection).await {
+        match entries(&mut tx, &self.scope.collection, &self.seam).await {
             SpokeResult::Ok(listed) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(listed),
                 Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
@@ -107,16 +114,20 @@ pub async fn list_entries_in(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
 ) -> SpokeResult<Vec<KnowledgeEntry>> {
-    entries(&mut *tx, collection).await
+    entries(&mut *tx, collection, &SnapshotSeam::default()).await
 }
 
 /// The stored rows of `collection`, ordered by `entry_id` ASC, bounded at the
 /// query boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] rows are decoded, and
 /// an over-bound collection refuses the list instead of growing memory and work
 /// with its total size.
+///
+/// The record rows of every carrying entry are one page-shaped statement, not one
+/// statement per entry: the page's holders travel as a `json_each` list.
 async fn entries(
     connection: &mut SqliteConnection,
     collection: &str,
+    seam: &SnapshotSeam,
 ) -> SpokeResult<Vec<KnowledgeEntry>> {
     let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
     let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
@@ -132,29 +143,32 @@ async fn entries(
     };
     let mut stored = Vec::with_capacity(payloads.len());
     for payload in &payloads {
-        let mut entry = match decode(payload) {
-            SpokeResult::Ok(entry) => entry,
+        match decode(payload) {
+            SpokeResult::Ok(entry) => stored.push(entry),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-        };
-        if let SpokeResult::Reject(reject) =
-            hydrate_cognition_records(connection, collection, &mut entry).await
-        {
-            return SpokeResult::Reject(reject);
         }
-        stored.push(entry);
     }
     if stored.len() as i64 > limit {
         return internal(format!(
             "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list is bounded"
         ));
     }
+    if let SpokeResult::Reject(reject) =
+        hydrate_cognition_records(connection, collection, &mut stored, seam).await
+    {
+        return SpokeResult::Reject(reject);
+    }
     SpokeResult::Ok(stored)
 }
 
 impl MindStore {
-    /// A port for `scope`, sharing this store's single pool.
+    /// A port for `scope`, sharing this store's single pool and its read-projection seam.
     pub fn knowledge(&self, scope: KnowledgeScope) -> ScopedKnowledgeStore {
-        ScopedKnowledgeStore::new(self.pool.clone(), scope)
+        ScopedKnowledgeStore {
+            pool: self.pool.clone(),
+            scope,
+            seam: Arc::clone(&self.seam),
+        }
     }
 
     /// The connect-served knowledge port: the admitted `scope_id` selects `scope`'s collection.
@@ -212,7 +226,7 @@ impl RoutedKnowledgeStore {
                 return internal(format!("knowledge entries could not be listed: {error}"))
             }
         };
-        match entries(&mut tx, &self.scope.collection).await {
+        match entries(&mut tx, &self.scope.collection, &SnapshotSeam::default()).await {
             SpokeResult::Ok(listed) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(listed),
                 Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
@@ -416,6 +430,18 @@ pub async fn read_entry(
     collection: &str,
     entry_id: &str,
 ) -> SpokeResult<KnowledgeEntry> {
+    read_entry_seeded(tx, collection, entry_id, &SnapshotSeam::default()).await
+}
+
+/// [`read_entry`] with the caller's store seam, so a unit test can hold the read
+/// between its payload and record statements. Callers outside a store pass a
+/// fresh seam, which nothing can install.
+async fn read_entry_seeded(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+    seam: &SnapshotSeam,
+) -> SpokeResult<KnowledgeEntry> {
     let payload: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
         "SELECT payload FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
     )
@@ -429,8 +455,13 @@ pub async fn read_entry(
                 SpokeResult::Ok(entry) => entry,
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             };
-            if let SpokeResult::Reject(reject) =
-                hydrate_cognition_records(&mut *tx, collection, &mut entry).await
+            if let SpokeResult::Reject(reject) = hydrate_cognition_records(
+                &mut *tx,
+                collection,
+                std::slice::from_mut(&mut entry),
+                seam,
+            )
+            .await
             {
                 return SpokeResult::Reject(reject);
             }
@@ -445,34 +476,71 @@ pub async fn read_entry(
     }
 }
 
-/// Projects `modules.cognition.records` from the holder's record rows: the rows are
-/// the storage authority and the payload keeps only the module envelope. A present
-/// `records` member stays present (empty while there are no rows); an absent module
-/// or member stays absent.
+/// Projects `modules.cognition.records` of every `entries` member from the holder's record
+/// rows: one statement for the whole list, keyed by the page's entries, and the rows grouped in
+/// memory in `append_seq` order. A present `records` member stays present (empty while there are
+/// no rows); an absent module or member stays absent.
 async fn hydrate_cognition_records(
     connection: &mut SqliteConnection,
     collection: &str,
-    entry: &mut KnowledgeEntry,
+    entries: &mut [KnowledgeEntry],
+    seam: &SnapshotSeam,
 ) -> SpokeResult<()> {
-    let key = module_key();
-    let carries_records = matches!(
-        entry.modules.get(&key),
-        Some(KnowledgeEntryModulesValue::Object(module)) if module.contains_key("records")
-    );
-    if !carries_records {
+    let holders: Vec<&str> = entries
+        .iter()
+        .filter(|entry| carries_cognition_records(entry))
+        .map(|entry| entry.entry_id.as_str())
+        .collect();
+    if holders.is_empty() {
         return SpokeResult::Ok(());
     }
-    // Unit-test seam: suspends the projection between its two statements.
-    #[cfg(test)]
-    snapshot_seam::interleave().await;
-    let records = match read_records(&mut *connection, collection, &entry.entry_id).await {
-        SpokeResult::Ok(records) => records,
-        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    let holders = match serde_json::to_string(&holders) {
+        Ok(holders) => holders,
+        Err(error) => return internal(format!("cognition holders could not be rendered: {error}")),
     };
-    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&key) {
-        module.insert("records".to_string(), Value::Array(records));
+    // Unit-test seam: suspends the page projection between its two statements.
+    seam.interleave().await;
+    let rows: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+        "SELECT entry_id, payload FROM cognition_records \
+         WHERE collection = ? AND entry_id IN (SELECT value FROM json_each(?)) \
+         ORDER BY entry_id ASC, append_seq ASC",
+    )
+    .bind(collection)
+    .bind(holders)
+    .fetch_all(&mut *connection)
+    .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => return internal(format!("cognition records could not be listed: {error}")),
+    };
+    let mut grouped: HashMap<String, Vec<Value>> = HashMap::new();
+    for (entry_id, payload) in rows {
+        match serde_json::from_str(&payload) {
+            Ok(record) => grouped.entry(entry_id).or_default().push(record),
+            Err(error) => return internal(format!("stored cognition record is not JSON: {error}")),
+        }
+    }
+    for entry in entries
+        .iter_mut()
+        .filter(|entry| carries_cognition_records(entry))
+    {
+        let records = grouped.remove(&entry.entry_id).unwrap_or_default();
+        if let Some(KnowledgeEntryModulesValue::Object(module)) =
+            entry.modules.get_mut(&module_key())
+        {
+            module.insert("records".to_string(), Value::Array(records));
+        }
     }
     SpokeResult::Ok(())
+}
+
+/// Whether the entry's payload keeps a present `modules.cognition.records` member, the only shape
+/// the storage authority hydrates.
+fn carries_cognition_records(entry: &KnowledgeEntry) -> bool {
+    matches!(
+        entry.modules.get(&module_key()),
+        Some(KnowledgeEntryModulesValue::Object(module)) if module.contains_key("records")
+    )
 }
 
 /// One holder's assigned revision and current-judgment pointer, read without hydrating its
@@ -854,7 +922,7 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
             Ok(tx) => tx,
             Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
         };
-        match read_entry(&mut tx, &self.scope.collection, entry_id).await {
+        match read_entry_seeded(&mut tx, &self.scope.collection, entry_id, &self.seam).await {
             SpokeResult::Ok(entry) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(entry),
                 Err(error) => internal(format!("knowledge entry could not be read: {error}")),
@@ -889,47 +957,6 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
             return internal(format!("knowledge write could not commit: {error}"));
         }
         SpokeResult::Ok(entry)
-    }
-}
-
-// Unit-test seam for the full-DTO read regression: when a test installs its channels,
-// the projection suspends here — after the carrier payload statement, before the
-// records statement — until the test reports that a second connection committed an
-// append in that window. That is the exact interleave the snapshot contract forbids
-// pairing. Without an installed seam this falls through immediately.
-#[cfg(test)]
-mod snapshot_seam {
-    use std::sync::Mutex;
-
-    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-
-    static SEAM: Mutex<
-        Option<(
-            UnboundedSender<&'static str>,
-            UnboundedReceiver<&'static str>,
-        )>,
-    > = Mutex::new(None);
-
-    pub(super) fn install(
-        to_test: UnboundedSender<&'static str>,
-        from_test: UnboundedReceiver<&'static str>,
-    ) {
-        *SEAM.lock().expect("snapshot seam lock") = Some((to_test, from_test));
-    }
-
-    pub(super) fn uninstall() {
-        *SEAM.lock().expect("snapshot seam lock") = None;
-    }
-
-    pub(super) async fn interleave() {
-        let (to_test, mut from_test) = match SEAM.lock().expect("snapshot seam lock").take() {
-            Some(pair) => pair,
-            None => return,
-        };
-        if to_test.send("at_records_seam").is_err() {
-            return;
-        }
-        let _ = from_test.recv().await;
     }
 }
 
@@ -1112,7 +1139,7 @@ mod tests {
         // The entry read: revision 1's payload pairs with revision 1's records.
         let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
-        snapshot_seam::install(hook_to_test, hook_rx);
+        store.seam.install(hook_to_test, hook_rx);
         let read_port = store.knowledge(KnowledgeScope::new("wren"));
         let reader = tokio::spawn(async move { read_port.get_knowledge_entry("ke_wren").await });
         wait_for_seam(&mut test_rx).await;
@@ -1153,7 +1180,7 @@ mod tests {
         // the listing reaches its records statement.
         let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
-        snapshot_seam::install(hook_to_test, hook_rx);
+        store.seam.install(hook_to_test, hook_rx);
         let list_port = store.knowledge(KnowledgeScope::new("wren"));
         let reader = tokio::spawn(async move { list_port.list_entries().await });
         wait_for_seam(&mut test_rx).await;
@@ -1202,8 +1229,65 @@ mod tests {
         assert_eq!(fresh.revision, Some(3));
         assert_eq!(record_ids(&fresh), vec!["cog_hearsay", "cog_newer"]);
 
-        snapshot_seam::uninstall();
         second.close().await;
+        store.close().await;
+    }
+
+    /// The seam belongs to one store rather than the process: a hydration running on
+    /// another store can never consume it, so the interleave test always attaches to its
+    /// own reader even when the test binary runs other reads concurrently.
+    #[tokio::test]
+    async fn the_snapshot_seam_belongs_to_its_own_store() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = MindStore::open(&temp.path().join("seam.db"))
+            .await
+            .expect("open store");
+        let other = MindStore::open(&temp.path().join("other.db"))
+            .await
+            .expect("open other store");
+        expect_ok(
+            store
+                .knowledge(KnowledgeScope::new("wren"))
+                .put_knowledge_entry(cognition_carrier("ke_wren"), None)
+                .await,
+            "create the seam store's carrier",
+        );
+        expect_ok(
+            other
+                .knowledge(KnowledgeScope::new("wren"))
+                .put_knowledge_entry(cognition_carrier("ke_wren"), None)
+                .await,
+            "create the other store's carrier",
+        );
+
+        let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
+        let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
+        store.seam.install(hook_to_test, hook_rx);
+
+        // The other store's read completes without suspending on this store's seam.
+        let other_port = other.knowledge(KnowledgeScope::new("wren"));
+        let dto = timeout(
+            Duration::from_secs(10),
+            other_port.get_knowledge_entry("ke_wren"),
+        )
+        .await
+        .expect("another store's read suspended on this store's seam");
+        expect_ok(dto, "other store read");
+
+        // The seam is still installed for the store that owns it.
+        let read_port = store.knowledge(KnowledgeScope::new("wren"));
+        let reader = tokio::spawn(async move { read_port.get_knowledge_entry("ke_wren").await });
+        wait_for_seam(&mut test_rx).await;
+        test_to_hook.send("release").expect("reader alive");
+        expect_ok(
+            timeout(Duration::from_secs(10), reader)
+                .await
+                .expect("seam store read did not finish in time")
+                .expect("reader task"),
+            "seam store read",
+        );
+
+        other.close().await;
         store.close().await;
     }
 }

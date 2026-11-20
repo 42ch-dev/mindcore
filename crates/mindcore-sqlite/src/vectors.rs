@@ -236,6 +236,25 @@ where
     }
 }
 
+/// Deletes every stored vector of one record: a tombstone keeps no vector, so the record's rows
+/// are pruned inside the tombstone's own transaction.
+///
+/// One statement over the `(record_id, identity_hash)` primary key; other records' rows and the
+/// other identities of this record are untouched.
+pub async fn delete_record_vectors<'e, E>(executor: E, record_id: &str) -> SpokeResult<u64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let deleted = sqlx::query("DELETE FROM memory_embedding_vectors WHERE record_id = ?1")
+        .bind(record_id)
+        .execute(executor)
+        .await;
+    match deleted {
+        Ok(deleted) => SpokeResult::Ok(deleted.rows_affected()),
+        Err(error) => internal(format!("record vectors could not be deleted: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
