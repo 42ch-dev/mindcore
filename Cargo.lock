@@ -2089,6 +2089,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mindcore-spi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "spoke-operations",
+ "spoke-schemas",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mindcore-spoke"
 version = "0.1.0"
 dependencies = [
