@@ -22,3 +22,7 @@
   there is no upgrade path until the first release. A database whose applied migrations still match
   opens normally, whatever commit created it — but cross-commit compatibility is unsupported and
   untested.
+- `mindcore-sqlite`: optional retained-vector storage. `memory_embedding_vectors` holds one
+  little-endian `f32` vector per `(record_id, identity_hash)` with its record revision and dimension,
+  indexed by identity so a retired identity's whole partition is one delete. The new migration
+  applies to a database created before it; nothing reads or writes the table yet.
