@@ -40,6 +40,7 @@ const NOW: &str = "2026-11-20T09:00:00.000Z";
 enum SideEffect {
     None,
     RevokeGrant,
+    RevokeKnowledgeGrant,
     BumpRevision,
     PendingIntent,
 }
@@ -66,6 +67,15 @@ impl Embedder for BoundaryEmbedder {
                     .execute(&self.pool)
                     .await
                     .expect("revoke the grant");
+            }
+            SideEffect::RevokeKnowledgeGrant => {
+                // Only the knowledge admission is revoked; the recall grant stays live.
+                sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = ?")
+                    .bind(NOW)
+                    .bind("grt_knowledge")
+                    .execute(&self.pool)
+                    .await
+                    .expect("revoke the knowledge grant");
             }
             SideEffect::BumpRevision => {
                 sqlx::query("UPDATE memory_records SET revision = revision + 1")
@@ -160,6 +170,22 @@ impl Harness {
         .expect("seed grant");
     }
 
+    /// The principal's knowledge admission: a space-wide `knowledge_read` grant.
+    async fn knowledge_grant(&self, principal: &str) {
+        sqlx::query(
+            "INSERT INTO memory_grants \
+             (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+              shared_access, expires_at, revoked_at, revision, created_at) \
+             VALUES ('grt_knowledge', ?, NULL, ?, '[\"knowledge_read\"]', '[]', 0, NULL, NULL, 1, ?)",
+        )
+        .bind(SPACE)
+        .bind(principal)
+        .bind(NOW)
+        .execute(&self.pool)
+        .await
+        .expect("seed knowledge grant");
+    }
+
     async fn record(&self, record_id: &str, text: &str, created_at: &str) {
         sqlx::query(
             "INSERT INTO memory_records \
@@ -215,9 +241,13 @@ impl Harness {
         .expect("seed knowledge entry");
     }
 
-    fn binding(&self, side_effect: SideEffect) -> (SpiMindWorkflows, BoundaryEmbedder) {
+    fn binding(
+        &self,
+        caller: &str,
+        side_effect: SideEffect,
+    ) -> (SpiMindWorkflows, BoundaryEmbedder) {
         let binding = MemoryWorkflowBinding::new(self.pool.clone(), true)
-            .with_knowledge_collection(KnowledgeScope::new("wren"));
+            .with_knowledge_collection(caller, KnowledgeScope::new("wren"));
         let embedder = BoundaryEmbedder {
             identity: EmbeddingIdentity {
                 provider_id: "local".to_string(),
@@ -327,6 +357,7 @@ async fn one_recall_page_is_packed_whole_with_its_provenance() {
 async fn knowledge_slot_reads_only_the_bound_collection() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
     harness
         .record(
             "rec_a",
@@ -339,7 +370,7 @@ async fn knowledge_slot_reads_only_the_bound_collection() {
     harness
         .entry("wanderer", "ke_elsewhere", "not this holder's")
         .await;
-    let (workflows, embedder) = harness.binding(SideEffect::None);
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
 
     let pack = workflows
         .recall_context(
@@ -371,6 +402,7 @@ async fn knowledge_slot_reads_only_the_bound_collection() {
 async fn revoked_grant_during_provider_work_refuses_the_pack() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
     harness
         .record(
             "rec_a",
@@ -378,7 +410,7 @@ async fn revoked_grant_during_provider_work_refuses_the_pack() {
             "2026-11-20T09:00:01.000Z",
         )
         .await;
-    let (workflows, embedder) = harness.binding(SideEffect::RevokeGrant);
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::RevokeGrant);
 
     let error = workflows
         .recall_context(
@@ -403,6 +435,7 @@ async fn revoked_grant_during_provider_work_refuses_the_pack() {
 async fn pending_intent_during_provider_work_refuses_the_pack() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
     harness
         .record(
             "rec_a",
@@ -410,7 +443,7 @@ async fn pending_intent_during_provider_work_refuses_the_pack() {
             "2026-11-20T09:00:01.000Z",
         )
         .await;
-    let (workflows, embedder) = harness.binding(SideEffect::PendingIntent);
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::PendingIntent);
 
     let error = workflows
         .recall_context(
@@ -443,6 +476,7 @@ async fn pending_intent_during_provider_work_refuses_the_pack() {
 async fn changed_revision_during_provider_work_refuses_the_pack() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
     harness
         .record(
             "rec_a",
@@ -450,7 +484,7 @@ async fn changed_revision_during_provider_work_refuses_the_pack() {
             "2026-11-20T09:00:01.000Z",
         )
         .await;
-    let (workflows, embedder) = harness.binding(SideEffect::BumpRevision);
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::BumpRevision);
 
     let error = workflows
         .recall_context(
@@ -469,4 +503,107 @@ async fn changed_revision_during_provider_work_refuses_the_pack() {
         panic!("expected a settlement refusal, got {error:?}");
     };
     assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+}
+
+#[tokio::test]
+async fn memory_grant_alone_does_not_admit_knowledge() {
+    let harness = Harness::open().await;
+    // `recall` is a memory capability; it admits no knowledge read.
+    harness.grant(&["recall"]).await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness.entry("wren", "ke_gate", "closed after dusk").await;
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(None, 10),
+            budget(),
+            &MindCapabilities {
+                embedder: Some(&embedder),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect_err("a memory grant must not release the bound collection");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+}
+
+#[tokio::test]
+async fn another_principal_is_refused_the_bound_collection() {
+    let harness = Harness::open().await;
+    // The caller's own admission is complete — only the bound caller differs.
+    harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness.entry("wren", "ke_gate", "closed after dusk").await;
+    let (workflows, embedder) = harness.binding("prn_2", SideEffect::None);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(None, 10),
+            budget(),
+            &MindCapabilities {
+                embedder: Some(&embedder),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect_err("another caller's collection must not be served");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+}
+
+#[tokio::test]
+async fn revoked_knowledge_admission_during_provider_work_refuses_the_pack() {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness.entry("wren", "ke_gate", "closed after dusk").await;
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::RevokeKnowledgeGrant);
+
+    let error = workflows
+        .recall_context(
+            &principal(),
+            &request(Some("north gate"), 10),
+            budget(),
+            &MindCapabilities {
+                embedder: Some(&embedder),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect_err("a revoked knowledge admission must not release a pack");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
 }
