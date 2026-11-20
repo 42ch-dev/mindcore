@@ -34,4 +34,9 @@ jobs:
           SQLX_OFFLINE=false DATABASE_URL="sqlite://$fixture_dir/settlement.db" \
             cargo sqlx prepare --workspace -- --locked --workspace --all-targets
           cache_changes="$(git status --porcelain --untracked-files=all -- .sqlx/)"
-          test -z "$cache_changes"
+          if [ -n "$cache_changes" ]; then
+            echo "::error::.sqlx offline cache is stale — drifted entries:"
+            printf '%s\n' "$cache_changes"
+            git diff --stat -- .sqlx/
+            exit 1
+          fi
