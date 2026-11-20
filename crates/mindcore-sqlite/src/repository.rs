@@ -1357,6 +1357,27 @@ impl MemoryRepository for SqliteMemoryRepository {
         .collect()
     }
 
+    async fn principal_grants(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        principal: &str,
+    ) -> RepoResult<Vec<MemoryGrantRow>> {
+        sqlx::query_as!(
+            GrantRow,
+            "SELECT grant_id, space_id, subject_id, principal_id, \
+             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+             revision, created_at FROM memory_grants \
+             WHERE principal_id = ? ORDER BY space_id, grant_id",
+            principal,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .into_iter()
+        .map(grant_row)
+        .collect()
+    }
+
     async fn grant(
         &self,
         tx: &mut Self::Tx<'_>,

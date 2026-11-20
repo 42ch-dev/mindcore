@@ -521,6 +521,15 @@ pub trait MemoryRepository: Send + Sync {
         principal_filter: Option<&str>,
     ) -> Result<Vec<MemoryGrantRow>, Self::Error>;
 
+    /// Every grant of one principal across spaces, `space_id` then `grant_id`
+    /// order, so a caller that filters spaces by grant issues one query whatever
+    /// the space count.
+    async fn principal_grants(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        principal: &str,
+    ) -> Result<Vec<MemoryGrantRow>, Self::Error>;
+
     async fn grant(
         &self,
         tx: &mut Self::Tx<'_>,
