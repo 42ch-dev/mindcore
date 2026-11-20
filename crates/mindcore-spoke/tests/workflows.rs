@@ -3,6 +3,7 @@
 //! that keeps a snapshot moved during provider work out of a released pack.
 
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -11,10 +12,14 @@ use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_spi::{Embedder, EmbeddingIdentity, MindCapabilities, SpiError, SpiMindWorkflows};
+use mindcore_spi::{
+    AbsorbCandidateOutcome, CognitiveTaskKind, Embedder, EmbeddingIdentity, MindCapabilities,
+    PolicyDecision, PolicyHook, Reasoner, SettlementDraft, SpiError, SpiMindWorkflows,
+    StructuredReasonRequest,
+};
 use mindcore_spoke::MemoryWorkflowBinding;
 use spoke_operations::SpokeRejectCode;
-use spoke_schemas::{MemoryRecallRequest, Principal};
+use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
 const DDL: &str = include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
 /// The knowledge table of `migrations/0001_init.sql`; that migration's legacy
@@ -107,12 +112,14 @@ impl Embedder for BoundaryEmbedder {
 
 struct Harness {
     _dir: TempDir,
+    root: PathBuf,
     pool: SqlitePool,
 }
 
 impl Harness {
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
+        let root = dir.path().to_path_buf();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -151,7 +158,11 @@ impl Harness {
         .execute(&pool)
         .await
         .expect("seed subject");
-        Self { _dir: dir, pool }
+        Self {
+            _dir: dir,
+            root,
+            pool,
+        }
     }
 
     async fn grant(&self, capabilities: &[&str]) {
@@ -259,6 +270,145 @@ impl Harness {
             pool: self.pool.clone(),
         };
         (SpiMindWorkflows::new(binding), embedder)
+    }
+
+    /// An absorb-capable engine whose publisher writes journal targets under
+    /// the fixture root, exactly as a host's file medium would.
+    fn absorb_binding(&self) -> SpiMindWorkflows {
+        let root = self.root.clone();
+        SpiMindWorkflows::new(
+            MemoryWorkflowBinding::new(self.pool.clone(), true).with_publisher(move |targets| {
+                for target in targets {
+                    let path = root.join(target["path"].as_str().expect("target path"));
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(publish_error)?;
+                    }
+                    std::fs::write(&path, target["content"].as_str().expect("content"))
+                        .map_err(publish_error)?;
+                }
+                Ok(())
+            }),
+        )
+    }
+
+    async fn count_from(&self, from: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {from}");
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&self.pool)
+            .await
+            .expect("count")
+    }
+
+    async fn candidate_status(&self, candidate_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM memory_candidates WHERE candidate_id = ?")
+            .bind(candidate_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("candidate status")
+    }
+
+    async fn candidate_text(&self, candidate_id: &str) -> Option<String> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT content_json FROM memory_candidates WHERE candidate_id = ?")
+                .bind(candidate_id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("candidate content");
+        raw.map(|raw| {
+            serde_json::from_str::<Value>(&raw).expect("candidate content")["text"]
+                .as_str()
+                .expect("candidate text")
+                .to_string()
+        })
+    }
+
+    async fn stored_record(&self, record_id: &str) -> Option<(i64, String)> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT revision, content_json FROM memory_records WHERE record_id = ?")
+                .bind(record_id)
+                .fetch_optional(&self.pool)
+                .await
+                .expect("stored record");
+        row.map(|(revision, content)| {
+            let content = serde_json::from_str::<Value>(&content).expect("record content");
+            (
+                revision,
+                content["text"].as_str().expect("record text").to_string(),
+            )
+        })
+    }
+}
+
+fn publish_error(error: std::io::Error) -> SpiError {
+    SpiError::InvalidInput(format!("publication failed: {error}"))
+}
+
+fn capture(key: &str, text: &str) -> MemoryCaptureRequest {
+    serde_json::from_value(json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "shared" },
+        "content": { "text": text },
+        "idempotency_key": key,
+    }))
+    .expect("capture request")
+}
+
+/// What the reasoner does to the store while it runs — outside every
+/// transaction the workflow holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReasonerEffect {
+    None,
+    BumpRecordRevision,
+}
+
+struct FixedReasoner {
+    verdict: Value,
+    effect: ReasonerEffect,
+    pool: SqlitePool,
+}
+
+impl FixedReasoner {
+    fn new(verdict: Value, pool: &SqlitePool) -> Self {
+        Self {
+            verdict,
+            effect: ReasonerEffect::None,
+            pool: pool.clone(),
+        }
+    }
+
+    fn bumping(mut self) -> Self {
+        self.effect = ReasonerEffect::BumpRecordRevision;
+        self
+    }
+}
+
+#[async_trait]
+impl Reasoner for FixedReasoner {
+    async fn reason_structured(
+        &self,
+        request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        assert_eq!(request.task_kind, CognitiveTaskKind::Absorb);
+        if self.effect == ReasonerEffect::BumpRecordRevision {
+            sqlx::query("UPDATE memory_records SET revision = revision + 1")
+                .execute(&self.pool)
+                .await
+                .expect("bump the record revision");
+        }
+        Ok(self.verdict.clone())
+    }
+}
+
+struct AutoPolicy;
+
+#[async_trait]
+impl PolicyHook for AutoPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::AutoSettle)
     }
 }
 
@@ -606,4 +756,408 @@ async fn revoked_knowledge_admission_during_provider_work_refuses_the_pack() {
         panic!("expected a settlement refusal, got {error:?}");
     };
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+}
+
+// ---------- absorb over the real adapter ----------
+
+async fn granted_harness() -> Harness {
+    let harness = Harness::open().await;
+    harness
+        .grant(&["capture", "recall", "review", "records_write"])
+        .await;
+    harness
+        .record(
+            "rec_gate",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness
+}
+
+fn promoted(record_ids: &[String]) -> AbsorbCandidateOutcome {
+    AbsorbCandidateOutcome::Settled {
+        candidate_id: "unused".to_string(),
+        record_ids: record_ids.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn promote_settles_one_record_and_consumes_the_candidate() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_promote", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("absorb");
+
+    let [AbsorbCandidateOutcome::Settled {
+        candidate_id,
+        record_ids,
+    }] = outcomes.as_slice()
+    else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(record_ids.len(), 1);
+    let (revision, text) = harness
+        .stored_record(&record_ids[0])
+        .await
+        .expect("the promoted record");
+    assert_eq!(revision, 1);
+    assert_eq!(text, "the north gate is closed at dusk");
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE state = 'pending'")
+            .await,
+        0
+    );
+    assert!(harness
+        .root
+        .join(format!("records/{}.md", record_ids[0]))
+        .exists());
+    // The seeded record is untouched.
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+}
+
+#[tokio::test]
+async fn update_replaces_the_target_in_place_and_consumes_the_candidate() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "update",
+            "record_id": "rec_gate",
+            "evidence_ids": ["rec_gate"]
+        }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_update", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("absorb");
+
+    let [AbsorbCandidateOutcome::Settled {
+        candidate_id,
+        record_ids,
+    }] = outcomes.as_slice()
+    else {
+        panic!("expected one settled candidate, got {outcomes:?}");
+    };
+    assert_eq!(promoted(record_ids), promoted(&["rec_gate".to_string()]));
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("updated record"),
+        (2, "the north gate is closed at dusk".to_string())
+    );
+    // One record in place, no second record minted, and the candidate consumed.
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE op = 'memory.records.update' AND state = 'applied'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness
+            .count_from(
+                "memory_journal WHERE op = 'memory.candidates.dismiss' AND state = 'applied'"
+            )
+            .await,
+        1
+    );
+    let published = std::fs::read_to_string(harness.root.join("records/rec_gate.md"))
+        .expect("the updated projection is published");
+    assert!(published.contains("revision: 2"));
+}
+
+#[tokio::test]
+async fn dismiss_drops_the_candidate_without_a_record() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "dismiss",
+            "rationale": "the records already say this",
+            "evidence_ids": ["rec_gate"]
+        }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_dismiss", "the north gate closes at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("absorb");
+
+    let [AbsorbCandidateOutcome::Dropped { candidate_id }] = outcomes.as_slice() else {
+        panic!("expected one dropped candidate, got {outcomes:?}");
+    };
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+}
+
+#[tokio::test]
+async fn replay_returns_the_recorded_outcome_without_a_second_write() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let first = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_replay", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("first absorb");
+    let second = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_replay", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("replayed absorb");
+
+    assert_eq!(second, first);
+    assert_eq!(harness.count_from("memory_records").await, 2);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_target_revision_rejects_without_a_second_write() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "update",
+            "record_id": "rec_gate",
+            "evidence_ids": ["rec_gate"]
+        }),
+        &harness.pool,
+    )
+    .bumping();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_stale", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect_err("a stale target revision must not settle");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+    // The reasoner's bump is the only change; the update and the dismissal
+    // both rolled back with the staging transaction.
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (2, "the north gate is closed".to_string())
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE state = 'pending'")
+            .await,
+        0
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_candidates WHERE status = 'pending'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn default_policy_leaves_the_candidate_pending() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        ..MindCapabilities::default()
+    };
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_review", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect("absorb");
+
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = outcomes.as_slice() else {
+        panic!("expected one pending candidate, got {outcomes:?}");
+    };
+    assert_eq!(harness.candidate_status(candidate_id).await, "pending");
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        0
+    );
+    assert_eq!(harness.count_from("memory_journal").await, 0);
+}
+
+#[tokio::test]
+async fn absent_reasoner_matches_deterministic_capture() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+
+    let outcomes = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_deterministic", "the north gate is closed at dusk"),
+            None,
+            &MindCapabilities::default(),
+        )
+        .await
+        .expect("absorb");
+
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = outcomes.as_slice() else {
+        panic!("expected the capture's own candidate, got {outcomes:?}");
+    };
+    assert_eq!(harness.candidate_status(candidate_id).await, "pending");
+    assert_eq!(
+        harness.candidate_text(candidate_id).await.as_deref(),
+        Some("the north gate is closed at dusk")
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(harness.count_from("memory_journal").await, 0);
+}
+
+#[tokio::test]
+async fn fabricated_evidence_leaves_the_captured_candidate_unchanged() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_ghost"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_fabricated", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect_err("a fabricated id must not settle");
+
+    assert!(matches!(error, SpiError::InvalidReasonerOutput(_)));
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(harness.count_from("memory_journal").await, 0);
+    assert_eq!(
+        harness
+            .count_from("memory_candidates WHERE status = 'pending' AND revision = 1")
+            .await,
+        1
+    );
+    let candidate_id: String =
+        sqlx::query_scalar("SELECT candidate_id FROM memory_candidates WHERE status = 'pending'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the captured candidate");
+    assert_eq!(
+        harness.candidate_text(&candidate_id).await.as_deref(),
+        Some("the north gate is closed at dusk")
+    );
 }

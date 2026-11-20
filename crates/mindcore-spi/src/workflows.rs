@@ -1,9 +1,10 @@
 //! The MIND workflow engine and its one DTO-only storage seam.
 //!
-//! [`WorkflowBinding`] keeps storage below this crate: it runs `memory.recall`
-//! and the scoped knowledge read on the caller's own transaction and returns
-//! DTOs. [`SpiMindWorkflows`] only ranks, validates and budgets that snapshot,
-//! so embedder and reasoner calls never run inside a transaction.
+//! [`WorkflowBinding`] keeps storage below this crate: it runs `memory.recall`,
+//! the scoped knowledge read and the capture/review/update operations on the
+//! caller's own transactions and returns DTOs. [`SpiMindWorkflows`] only
+//! ranks, validates and budgets that snapshot, so embedder, reasoner and
+//! policy calls never run inside a transaction.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -11,12 +12,18 @@ use std::num::NonZeroUsize;
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use spoke_operations::{SpokeReject, SpokeRejectCode};
-use spoke_schemas::{KnowledgeEntry, MemoryRecallRequest, Principal, RetainedRecord};
+use spoke_operations::{jcs_sha256_hex, SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_schemas::data::memory_candidate::{ConsumedCandidate, Outcome, PendingCandidate};
+use spoke_schemas::{
+    KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest, MemoryCandidatesReviewRequest,
+    MemoryCaptureRequest, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
+    RetainedRecord,
+};
 
 use crate::{
-    CognitiveTaskKind, ContextPack, EmbeddingIdentity, MindCapabilities, Reasoner, SpiError,
-    StructuredReasonRequest,
+    AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DomainLens,
+    EmbeddingIdentity, LensOutput, MindCapabilities, PolicyDecision, PolicyHook, Reasoner,
+    SettlementDraft, SpiError, StructuredReasonRequest,
 };
 
 /// BM25 term-frequency saturation and length normalisation (the standard
@@ -43,10 +50,12 @@ pub struct RecallSnapshot {
 
 /// The DTO-only storage seam of the workflow engine.
 ///
-/// One call is one read transaction over the caller's scope: `memory.recall`
+/// One call is one transaction over the caller's scope: `memory.recall`
 /// (ACL, withholding and the SPOKE budget applied by the adapter) and the
-/// scoped knowledge read. Nothing that leaves it is storage-shaped, so the
-/// workflow can call a provider between two calls and revalidate afterwards.
+/// scoped knowledge read, or — for absorb — the existing capture, candidate
+/// read, review and record-update operations. Nothing that leaves it is
+/// storage-shaped, so the workflow can call a provider between two calls and
+/// revalidate afterwards.
 #[async_trait]
 pub trait WorkflowBinding: Send + Sync {
     /// Read the current authorized snapshot for `request`.
@@ -55,6 +64,54 @@ pub trait WorkflowBinding: Send + Sync {
         principal: &Principal,
         request: &MemoryRecallRequest,
     ) -> Result<RecallSnapshot, SpiError>;
+
+    /// Run the existing capture path — admission, idempotency probe and the
+    /// deterministic classifier — and return the candidate ids it holds. A
+    /// replay returns the ids its recorded receipt holds.
+    async fn capture(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+    ) -> Result<Vec<String>, SpiError>;
+
+    /// Read `candidate_id` and one bounded authorized recall page over the
+    /// same subject and placement, on one transaction. The page is empty for
+    /// an already-consumed candidate.
+    async fn absorb_snapshot(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        candidate_id: &str,
+        max_items: u64,
+    ) -> Result<AbsorbSnapshot, SpiError>;
+
+    /// Submit one review decision, publish its targets and settle its receipt;
+    /// returns the record ids the review created.
+    async fn review_candidate(
+        &self,
+        principal: &Principal,
+        request: &MemoryCandidatesReviewRequest,
+    ) -> Result<Vec<String>, SpiError>;
+
+    /// Stage `memory.records.update` and `memory.candidates.dismiss` in one
+    /// transaction, publish both intents' targets and settle both receipts.
+    async fn update_candidate(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        update: &MemoryRecordsUpdateRequest,
+        dismiss: &MemoryCandidatesDismissRequest,
+    ) -> Result<(), SpiError>;
+}
+
+/// One absorb read: the candidate and the bounded evidence page it was decided
+/// against, from one transaction over the same subject and placement.
+#[derive(Debug, Clone)]
+pub struct AbsorbSnapshot {
+    /// The candidate as the authorized read served it.
+    pub candidate: MemoryCandidate,
+    /// The bounded recall page, in adapter order.
+    pub records: Vec<RetainedRecord>,
 }
 
 /// The workflow engine over one [`WorkflowBinding`].
@@ -94,6 +151,509 @@ impl SpiMindWorkflows {
         }
         pack(ranked, knowledge, max_tokens)
     }
+
+    /// Decide what each captured candidate becomes.
+    ///
+    /// The capture runs the existing admission, idempotency probe and
+    /// deterministic classifier. Without a reasoner the capture result stands:
+    /// every held candidate stays pending and no review is written. With one,
+    /// each candidate is read with one bounded authorized evidence page, the
+    /// reasoner runs outside any transaction, its reply is validated against
+    /// that exact page, and the policy hook decides whether the validated
+    /// settlement is submitted. A candidate an earlier run already consumed
+    /// reports that recorded outcome instead of being decided again.
+    pub async fn absorb(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+        lens: Option<&dyn DomainLens>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<Vec<AbsorbCandidateOutcome>, SpiError> {
+        let candidate_ids = self.binding.capture(principal, request).await?;
+        let Some(reasoner) = caps.reasoner else {
+            return Ok(candidate_ids
+                .into_iter()
+                .map(|candidate_id| AbsorbCandidateOutcome::Pending { candidate_id })
+                .collect());
+        };
+        let mut outcomes = Vec::with_capacity(candidate_ids.len());
+        for candidate_id in candidate_ids {
+            outcomes.push(
+                self.absorb_candidate(principal, request, candidate_id, reasoner, lens, caps)
+                    .await?,
+            );
+        }
+        Ok(outcomes)
+    }
+
+    async fn absorb_candidate(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+        candidate_id: String,
+        reasoner: &dyn Reasoner,
+        lens: Option<&dyn DomainLens>,
+        caps: &MindCapabilities<'_>,
+    ) -> Result<AbsorbCandidateOutcome, SpiError> {
+        let space = request.space_id.to_string();
+        let capture_key = request.idempotency_key.to_string();
+        let AbsorbSnapshot { candidate, records } = self
+            .binding
+            .absorb_snapshot(principal, &space, &candidate_id, ABSORB_PAGE_ITEMS)
+            .await?;
+        let pending = match &candidate {
+            MemoryCandidate::PendingCandidate(pending) => pending,
+            // A replay of an earlier absorb reports what that run decided.
+            MemoryCandidate::ConsumedCandidate(consumed) => return Ok(recorded_outcome(consumed)),
+        };
+        let action = decide(reasoner, pending, &records, lens).await?;
+        let expected_revision = pending.revision.get();
+        let review_key = absorb_key(&capture_key, &candidate_id, "review")?;
+        let fallback = DefaultPolicy;
+        let policy: &dyn PolicyHook = caps.policy_hook.unwrap_or(&fallback);
+        match action {
+            AbsorbAction::Promote => {
+                let review = review_request(
+                    &space,
+                    &candidate_id,
+                    expected_revision,
+                    &review_key,
+                    json!({ "action": "promote" }),
+                )?;
+                let verdict = policy
+                    .evaluate_settlement(SettlementDraft::CandidateReview {
+                        candidate: &candidate,
+                        proposed: &review.decision,
+                    })
+                    .await?;
+                match verdict {
+                    PolicyDecision::AutoSettle => {
+                        let record_ids = self.binding.review_candidate(principal, &review).await?;
+                        Ok(AbsorbCandidateOutcome::Settled {
+                            candidate_id,
+                            record_ids,
+                        })
+                    }
+                    PolicyDecision::RequireHumanReview { .. } => {
+                        Ok(AbsorbCandidateOutcome::Pending { candidate_id })
+                    }
+                    PolicyDecision::Reject { reason } => {
+                        drop_candidate(
+                            self.binding.as_ref(),
+                            principal,
+                            &space,
+                            &candidate_id,
+                            expected_revision,
+                            &review_key,
+                            reason,
+                        )
+                        .await
+                    }
+                }
+            }
+            AbsorbAction::Dismiss { rationale } => {
+                let review = review_request(
+                    &space,
+                    &candidate_id,
+                    expected_revision,
+                    &review_key,
+                    json!({ "action": "drop", "rationale": rationale }),
+                )?;
+                let verdict = policy
+                    .evaluate_settlement(SettlementDraft::CandidateReview {
+                        candidate: &candidate,
+                        proposed: &review.decision,
+                    })
+                    .await?;
+                match verdict {
+                    PolicyDecision::AutoSettle => {
+                        self.binding.review_candidate(principal, &review).await?;
+                        Ok(AbsorbCandidateOutcome::Dropped { candidate_id })
+                    }
+                    PolicyDecision::RequireHumanReview { .. } => {
+                        Ok(AbsorbCandidateOutcome::Pending { candidate_id })
+                    }
+                    PolicyDecision::Reject { reason } => {
+                        drop_candidate(
+                            self.binding.as_ref(),
+                            principal,
+                            &space,
+                            &candidate_id,
+                            expected_revision,
+                            &review_key,
+                            reason,
+                        )
+                        .await
+                    }
+                }
+            }
+            AbsorbAction::Update {
+                record_id,
+                revision: target_revision,
+            } => {
+                let content = serde_json::to_value(&pending.proposed.content)
+                    .map_err(|error| SpiError::InvalidInput(error.to_string()))?;
+                let update = update_request(
+                    &space,
+                    &record_id,
+                    target_revision,
+                    &absorb_key(&capture_key, &candidate_id, "update")?,
+                    content,
+                )?;
+                let dismiss = dismiss_request(
+                    &space,
+                    &candidate_id,
+                    expected_revision,
+                    &absorb_key(&capture_key, &candidate_id, "dismiss")?,
+                )?;
+                let verdict = policy
+                    .evaluate_settlement(SettlementDraft::CandidateUpdate {
+                        candidate: &candidate,
+                        proposed: &update,
+                    })
+                    .await?;
+                match verdict {
+                    PolicyDecision::AutoSettle => {
+                        self.binding
+                            .update_candidate(principal, &space, &update, &dismiss)
+                            .await?;
+                        Ok(AbsorbCandidateOutcome::Settled {
+                            candidate_id,
+                            record_ids: vec![record_id],
+                        })
+                    }
+                    PolicyDecision::RequireHumanReview { .. } => {
+                        Ok(AbsorbCandidateOutcome::Pending { candidate_id })
+                    }
+                    PolicyDecision::Reject { reason } => {
+                        drop_candidate(
+                            self.binding.as_ref(),
+                            principal,
+                            &space,
+                            &candidate_id,
+                            expected_revision,
+                            &review_key,
+                            reason,
+                        )
+                        .await
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Bounded evidence page one absorb decision may cite: one recall page per
+/// candidate, never a second page.
+const ABSORB_PAGE_ITEMS: u64 = 32;
+
+/// Fixed skeleton of the absorb leg; a lens only adds guidance below it.
+const ABSORB_PROMPT: &str = "Decide what one captured memory candidate becomes for its \
+     subject, against the subject's memory records supplied with it. Return exactly one \
+     decision. promote: the candidate states something the supplied records do not, so it \
+     becomes a new record. update: it restates or corrects exactly one supplied record, so \
+     record_id names that record. dismiss: it adds nothing worth keeping, so rationale says \
+     why. evidence_ids lists the supplied record ids the decision rests on: unique, never \
+     repeated, never invented; an update cites the record it targets among them. Revisions, \
+     ids and requests are fixed outside this reply; never supply them.";
+
+/// Output schema handed to the reasoner. The workflow validates the reply and
+/// every cited id itself; the schema only describes the closed shape.
+fn absorb_schema() -> Value {
+    let evidence = json!({ "type": "array", "items": { "type": "string" } });
+    json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "const": "promote" },
+                    "evidence_ids": evidence.clone(),
+                },
+                "required": ["action", "evidence_ids"],
+                "additionalProperties": false,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "const": "update" },
+                    "record_id": { "type": "string" },
+                    "evidence_ids": evidence.clone(),
+                },
+                "required": ["action", "record_id", "evidence_ids"],
+                "additionalProperties": false,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": { "const": "dismiss" },
+                    "rationale": { "type": "string" },
+                    "evidence_ids": evidence,
+                },
+                "required": ["action", "rationale", "evidence_ids"],
+                "additionalProperties": false,
+            },
+        ],
+    })
+}
+
+/// The fixed skeleton plus a lens's named domain-guidance block.
+fn absorb_prompt(lens: Option<&dyn DomainLens>) -> String {
+    let Some(lens) = lens else {
+        return ABSORB_PROMPT.to_string();
+    };
+    let LensOutput {
+        persona_and_stance,
+        salience_criteria,
+        evidence_bar,
+        redlines,
+    } = lens.describe(CognitiveTaskKind::Absorb);
+    let mut prompt = format!(
+        "{ABSORB_PROMPT}\n\n## Domain guidance\nPersona and stance: {persona_and_stance}\n\
+         Salience criteria: {salience_criteria}\nEvidence bar: {evidence_bar}\nRedlines:\n"
+    );
+    for redline in redlines {
+        prompt.push_str(&format!("- {redline}\n"));
+    }
+    prompt
+}
+
+/// One validated settle-or-not decision over the prompted page.
+enum AbsorbAction {
+    Promote,
+    Update { record_id: String, revision: u64 },
+    Dismiss { rationale: String },
+}
+
+/// Ask the reasoner once and validate its reply against `records`.
+async fn decide(
+    reasoner: &dyn Reasoner,
+    pending: &PendingCandidate,
+    records: &[RetainedRecord],
+    lens: Option<&dyn DomainLens>,
+) -> Result<AbsorbAction, SpiError> {
+    let admitted: Vec<Value> = records
+        .iter()
+        .map(|record| json!({ "record_id": record_id(record), "text": record_text(record) }))
+        .collect();
+    let payload = json!({
+        "candidate": {
+            "candidate_id": pending.candidate_id.to_string(),
+            "kind": pending.proposed.kind,
+            "text": pending.proposed.content.text,
+        },
+        "records": admitted,
+    })
+    .to_string();
+    let schema = absorb_schema();
+    let prompt = absorb_prompt(lens);
+    let verdict = reasoner
+        .reason_structured(StructuredReasonRequest {
+            task_kind: CognitiveTaskKind::Absorb,
+            system_prompt: &prompt,
+            user_payload: &payload,
+            output_schema: &schema,
+        })
+        .await?;
+    absorb_action(&verdict, records)
+}
+
+/// Validate the closed decision shape and every cited id against the exact
+/// page the prompt carried.
+fn absorb_action(verdict: &Value, records: &[RetainedRecord]) -> Result<AbsorbAction, SpiError> {
+    let object = verdict
+        .as_object()
+        .ok_or_else(|| invalid_verdict("the decision is not an object"))?;
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_verdict("the decision names no action"))?;
+    let allowed: &[&str] = match action {
+        "promote" => &["action", "evidence_ids"],
+        "update" => &["action", "record_id", "evidence_ids"],
+        "dismiss" => &["action", "rationale", "evidence_ids"],
+        other => return Err(invalid_verdict(format!("{other} is not an absorb action"))),
+    };
+    if let Some(unexpected) = object
+        .keys()
+        .find(|member| !allowed.contains(&member.as_str()))
+    {
+        return Err(invalid_verdict(format!(
+            "the decision carries {unexpected}"
+        )));
+    }
+    let cited = cited_ids(object, records)?;
+    match action {
+        "promote" => Ok(AbsorbAction::Promote),
+        "update" => {
+            let record_id = object
+                .get("record_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| invalid_verdict("an update names no record"))?;
+            let Some(revision) = records.iter().find_map(|record| match record {
+                RetainedRecord::LiveRecord(record) if record.record_id.as_str() == record_id => {
+                    Some(record.revision.get())
+                }
+                _ => None,
+            }) else {
+                return Err(invalid_verdict(format!(
+                    "record {record_id} is not a live record of the prompted page"
+                )));
+            };
+            if !cited.contains(&record_id) {
+                return Err(invalid_verdict(
+                    "an update does not cite the record it targets",
+                ));
+            }
+            Ok(AbsorbAction::Update {
+                record_id: record_id.to_string(),
+                revision,
+            })
+        }
+        _ => {
+            let rationale = object
+                .get("rationale")
+                .and_then(Value::as_str)
+                .filter(|rationale| !rationale.trim().is_empty())
+                .ok_or_else(|| invalid_verdict("a dismissal carries no rationale"))?;
+            Ok(AbsorbAction::Dismiss {
+                rationale: rationale.to_string(),
+            })
+        }
+    }
+}
+
+/// `evidence_ids`: unique nonempty ids, every one on the prompted page.
+fn cited_ids<'a>(
+    object: &'a Map<String, Value>,
+    records: &'a [RetainedRecord],
+) -> Result<Vec<&'a str>, SpiError> {
+    let ids = object
+        .get("evidence_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_verdict("the decision names no evidence_ids array"))?;
+    let mut cited = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid_verdict("an evidence id is not a nonempty string"))?;
+        if !records.iter().any(|record| record_id(record) == id) {
+            return Err(invalid_verdict(format!(
+                "evidence id {id} is not in the prompted page"
+            )));
+        }
+        if cited.contains(&id) {
+            return Err(invalid_verdict(format!("evidence id {id} appears twice")));
+        }
+        cited.push(id);
+    }
+    Ok(cited)
+}
+
+fn invalid_verdict(message: impl Into<String>) -> SpiError {
+    SpiError::InvalidReasonerOutput(message.into())
+}
+
+/// What an already-consumed candidate recorded.
+fn recorded_outcome(consumed: &ConsumedCandidate) -> AbsorbCandidateOutcome {
+    let candidate_id = consumed.candidate_id.to_string();
+    match consumed.consumed_by.outcome {
+        Outcome::Promoted | Outcome::Fragmented => AbsorbCandidateOutcome::Settled {
+            candidate_id,
+            record_ids: consumed.consumed_by.record_ids.clone(),
+        },
+        Outcome::Dropped | Outcome::Dismissed => AbsorbCandidateOutcome::Dropped { candidate_id },
+    }
+}
+
+/// The policy rejected the proposal: the candidate is dropped through the same
+/// review operation, with the policy's reason as its rationale.
+#[allow(clippy::too_many_arguments)]
+async fn drop_candidate(
+    binding: &dyn WorkflowBinding,
+    principal: &Principal,
+    space: &str,
+    candidate_id: &str,
+    expected_revision: u64,
+    review_key: &str,
+    reason: String,
+) -> Result<AbsorbCandidateOutcome, SpiError> {
+    let review = review_request(
+        space,
+        candidate_id,
+        expected_revision,
+        review_key,
+        json!({ "action": "drop", "rationale": reason }),
+    )?;
+    binding.review_candidate(principal, &review).await?;
+    Ok(AbsorbCandidateOutcome::Dropped {
+        candidate_id: candidate_id.to_string(),
+    })
+}
+
+/// A stable operation key for one absorb leg, bounded to the wire's
+/// 128-character idempotency limit whatever the capture key's own length.
+fn absorb_key(capture_key: &str, candidate_id: &str, leg: &str) -> Result<String, SpiError> {
+    match jcs_sha256_hex(&json!({
+        "capture_key": capture_key,
+        "candidate_id": candidate_id,
+        "leg": leg,
+    })) {
+        SpokeResult::Ok(digest) => Ok(format!("absorb-{digest}")),
+        SpokeResult::Reject(reject) => Err(SpiError::InvalidInput(reject.message)),
+    }
+}
+
+fn review_request(
+    space: &str,
+    candidate_id: &str,
+    expected_revision: u64,
+    idempotency_key: &str,
+    decision: Value,
+) -> Result<MemoryCandidatesReviewRequest, SpiError> {
+    serde_json::from_value(json!({
+        "space_id": space,
+        "candidate_id": candidate_id,
+        "expected_revision": expected_revision,
+        "idempotency_key": idempotency_key,
+        "decision": decision,
+    }))
+    .map_err(|error| SpiError::InvalidInput(format!("absorb review request: {error}")))
+}
+
+fn update_request(
+    space: &str,
+    record_id: &str,
+    expected_revision: u64,
+    idempotency_key: &str,
+    content: Value,
+) -> Result<MemoryRecordsUpdateRequest, SpiError> {
+    serde_json::from_value(json!({
+        "space_id": space,
+        "record_id": record_id,
+        "expected_revision": expected_revision,
+        "idempotency_key": idempotency_key,
+        "content": content,
+    }))
+    .map_err(|error| SpiError::InvalidInput(format!("absorb update request: {error}")))
+}
+
+fn dismiss_request(
+    space: &str,
+    candidate_id: &str,
+    expected_revision: u64,
+    idempotency_key: &str,
+) -> Result<MemoryCandidatesDismissRequest, SpiError> {
+    serde_json::from_value(json!({
+        "space_id": space,
+        "candidate_id": candidate_id,
+        "expected_revision": expected_revision,
+        "idempotency_key": idempotency_key,
+        "reason": "the candidate updated an existing record",
+    }))
+    .map_err(|error| SpiError::InvalidInput(format!("absorb dismiss request: {error}")))
 }
 
 /// What decides which items a snapshot holds: each item's identity and

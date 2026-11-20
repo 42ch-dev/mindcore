@@ -7,19 +7,29 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use spoke_operations::{GrantRequirement, SpokeReject, SpokeRejectCode, SpokeResult};
-use spoke_schemas::{KnowledgeEntry, MemoryRecallRequest, Principal, RetainedRecord};
+use spoke_schemas::data::memory_candidate::PlacementScope;
+use spoke_schemas::{
+    KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest, MemoryCandidatesReviewRequest,
+    MemoryCaptureRequest, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
+    RetainedRecord,
+};
 use sqlx::SqlitePool;
 
 use mindcore_base::ids::SpaceId;
+use mindcore_base::ir::MemoryRepository;
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_spi::{RecallSnapshot, SpiError, WorkflowBinding};
+use mindcore_spi::{AbsorbSnapshot, RecallSnapshot, SpiError, WorkflowBinding};
 use mindcore_sqlite::{list_entries_in, SqliteMemoryRepository};
 
 use crate::admission;
 use crate::reject::Reject;
 use crate::{principal_id, MemoryAdapter, MemoryStage, Tx};
+
+/// Publishes one intent's file targets and confirms them: `Ok(())` only when
+/// every target's exact bytes landed at its path.
+type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
 
 /// The knowledge-read capability. A grant carrying it admits its principal to
 /// knowledge reads in that grant's space; the open capability vocabulary names
@@ -37,11 +47,14 @@ struct AdmittedCollection {
 ///
 /// `knowledge` fixes the one collection this binding serves and its one caller:
 /// without it the binding serves no knowledge at all, and a collection bound to
-/// another caller is refused rather than read.
+/// another caller is refused rather than read. `publisher` is the host's file
+/// medium; it is required only by the settlement legs, which stage a journaled
+/// intent, publish its targets and then settle it.
 pub struct MemoryWorkflowBinding {
     adapter: MemoryAdapter,
     pool: SqlitePool,
     knowledge: Option<AdmittedCollection>,
+    publisher: Option<Box<JournalPublisher>>,
 }
 
 impl MemoryWorkflowBinding {
@@ -53,7 +66,78 @@ impl MemoryWorkflowBinding {
             adapter: MemoryAdapter::new(reflections_enabled),
             pool,
             knowledge: None,
+            publisher: None,
         }
+    }
+
+    /// Publish journaled file targets into the host's medium.
+    ///
+    /// The closure returns `Ok(())` only after every target's exact bytes are
+    /// durable; a settlement is staged but never settled without it.
+    #[must_use]
+    pub fn with_publisher(
+        mut self,
+        publish: impl Fn(&[Value]) -> Result<(), SpiError> + Send + Sync + 'static,
+    ) -> Self {
+        self.publisher = Some(Box::new(publish));
+        self
+    }
+
+    /// The file targets one staged intent still owes.
+    async fn intent_targets(
+        &self,
+        transaction: &mut Tx<'_>,
+        space: &SpaceId,
+        receipt_id: &str,
+    ) -> Result<Vec<Value>, SpiError> {
+        SqliteMemoryRepository
+            .journal_intent(transaction, space, receipt_id)
+            .await
+            .map_err(|error| {
+                internal(format!(
+                    "journal intent {receipt_id} could not be read: {error}"
+                ))
+            })?
+            .map(|intent| intent.targets)
+            .ok_or_else(|| internal(format!("receipt {receipt_id} has no journaled intent")))
+    }
+
+    /// Publish every staged intent's targets, then settle them together on one
+    /// fresh caller transaction. Both intents settle or neither does.
+    async fn settle_staged(
+        &self,
+        space: &SpaceId,
+        intents: &[(String, Vec<Value>)],
+    ) -> Result<Option<Value>, SpiError> {
+        let Some(publisher) = &self.publisher else {
+            return Err(SpiError::InvalidInput(
+                "this workflow binding has no publisher; its staged journal intent cannot settle"
+                    .to_string(),
+            ));
+        };
+        let targets: Vec<Value> = intents
+            .iter()
+            .flat_map(|(_, owed)| owed.iter().cloned())
+            .collect();
+        publisher(&targets)?;
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!("settlement transaction could not begin: {error}"))
+        })?;
+        let mut settled = None;
+        for (receipt_id, _) in intents {
+            match self
+                .adapter
+                .settle_journal(&mut transaction, space, receipt_id)
+                .await
+            {
+                SpokeResult::Ok(body) => settled = Some(body),
+                SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
+            }
+        }
+        transaction.commit().await.map_err(|error| {
+            internal(format!("settlement transaction could not commit: {error}"))
+        })?;
+        Ok(settled)
     }
 
     /// Fill the pack's knowledge slot from `scope`, admitted to `caller` only.
@@ -155,6 +239,233 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .map_err(|error| internal(format!("recall transaction could not commit: {error}")))?;
         Ok(RecallSnapshot { records, knowledge })
     }
+
+    async fn capture(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+    ) -> Result<Vec<String>, SpiError> {
+        let mut transaction =
+            self.pool.begin().await.map_err(|error| {
+                internal(format!("capture transaction could not begin: {error}"))
+            })?;
+        let body = ready(
+            self.adapter
+                .capture(&mut transaction, principal, render(request, "capture")?)
+                .await,
+            "memory.capture",
+        )?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| internal(format!("capture transaction could not commit: {error}")))?;
+        candidate_ids(&body)
+    }
+
+    async fn absorb_snapshot(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        candidate_id: &str,
+        max_items: u64,
+    ) -> Result<AbsorbSnapshot, SpiError> {
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!("absorb read transaction could not begin: {error}"))
+        })?;
+        let body = ready(
+            self.adapter
+                .get_candidate(
+                    &mut transaction,
+                    principal,
+                    json!({ "space_id": space_id, "candidate_id": candidate_id }),
+                )
+                .await,
+            "memory.candidates.get",
+        )?;
+        let candidate: MemoryCandidate =
+            serde_json::from_value(body.get("candidate").cloned().ok_or_else(|| {
+                internal("memory.candidates.get carries no candidate".to_string())
+            })?)
+            .map_err(|error| {
+                internal(format!(
+                    "memory.candidates.get candidate does not decode: {error}"
+                ))
+            })?;
+        // A consumed candidate owes no page: the workflow reports its recorded
+        // outcome instead of deciding again.
+        let MemoryCandidate::PendingCandidate(pending) = &candidate else {
+            transaction.commit().await.map_err(|error| {
+                internal(format!("absorb read transaction could not commit: {error}"))
+            })?;
+            return Ok(AbsorbSnapshot {
+                candidate,
+                records: Vec::new(),
+            });
+        };
+        let mut request = json!({
+            "space_id": space_id,
+            "subject_id": &pending.subject_id,
+            "selection": selection(&pending.capture_scope),
+            "budget": { "max_items": max_items },
+        });
+        let text = pending.proposed.content.text.trim();
+        if !text.is_empty() {
+            request["query"] = json!(text);
+        }
+        let records = ready(
+            self.adapter
+                .recall(&mut transaction, principal, request)
+                .await,
+            "memory.recall",
+        );
+        let records = decode_records(records?)?;
+        transaction.commit().await.map_err(|error| {
+            internal(format!("absorb read transaction could not commit: {error}"))
+        })?;
+        Ok(AbsorbSnapshot { candidate, records })
+    }
+
+    async fn review_candidate(
+        &self,
+        principal: &Principal,
+        request: &MemoryCandidatesReviewRequest,
+    ) -> Result<Vec<String>, SpiError> {
+        let space = SpaceId::new(request.space_id.to_string());
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!(
+                "review staging transaction could not begin: {error}"
+            ))
+        })?;
+        let receipt_id = journal_pending(
+            self.adapter
+                .review_candidate(&mut transaction, principal, render(request, "review")?)
+                .await,
+        )?;
+        let targets = self
+            .intent_targets(&mut transaction, &space, &receipt_id)
+            .await?;
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "review staging transaction could not commit: {error}"
+            ))
+        })?;
+        let body = self
+            .settle_staged(&space, &[(receipt_id, targets)])
+            .await?
+            .ok_or_else(|| internal("the settled review carries no receipt".to_string()))?;
+        record_ids(&body)
+    }
+
+    async fn update_candidate(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        update: &MemoryRecordsUpdateRequest,
+        dismiss: &MemoryCandidatesDismissRequest,
+    ) -> Result<(), SpiError> {
+        let space = SpaceId::new(space_id.to_string());
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!(
+                "update staging transaction could not begin: {error}"
+            ))
+        })?;
+        let update_receipt = journal_pending(
+            self.adapter
+                .update_record(&mut transaction, principal, render(update, "update")?)
+                .await,
+        )?;
+        let dismiss_receipt = journal_pending(
+            self.adapter
+                .dismiss_candidate(&mut transaction, principal, render(dismiss, "dismiss")?)
+                .await,
+        )?;
+        let mut intents = Vec::with_capacity(2);
+        for receipt_id in [update_receipt, dismiss_receipt] {
+            let targets = self
+                .intent_targets(&mut transaction, &space, &receipt_id)
+                .await?;
+            intents.push((receipt_id, targets));
+        }
+        // Both effects are in this one staging transaction: a refusal above
+        // rolls the transaction back with both of them.
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "update staging transaction could not commit: {error}"
+            ))
+        })?;
+        let _ = self.settle_staged(&space, &intents).await?;
+        Ok(())
+    }
+}
+
+/// The ready body of one adapter operation, or its refusal.
+fn ready(stage: SpokeResult<MemoryStage>, operation: &str) -> Result<Value, SpiError> {
+    match stage {
+        SpokeResult::Ok(MemoryStage::Ready(body)) => Ok(body),
+        SpokeResult::Ok(other) => Err(internal(format!(
+            "{operation} returned an unserveable stage: {other:?}"
+        ))),
+        SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
+    }
+}
+
+/// The receipt id of one staged journaled intent, or its refusal.
+fn journal_pending(stage: SpokeResult<MemoryStage>) -> Result<String, SpiError> {
+    match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => Ok(receipt_id),
+        SpokeResult::Ok(other) => Err(internal(format!(
+            "expected a journaled stage, got {other:?}"
+        ))),
+        SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
+    }
+}
+
+fn render<T: serde::Serialize>(request: &T, operation: &str) -> Result<Value, SpiError> {
+    serde_json::to_value(request).map_err(|error| {
+        internal(format!(
+            "{operation} request could not be rendered: {error}"
+        ))
+    })
+}
+
+/// The candidate's own placement, read back as the recall selection it admits.
+fn selection(scope: &PlacementScope) -> Value {
+    match scope {
+        PlacementScope::Shared => json!({ "mode": "shared_only" }),
+        PlacementScope::Context(context_id) => json!({
+            "mode": "selected_contexts",
+            "context_ids": [context_id],
+            "include_shared": true,
+        }),
+    }
+}
+
+fn candidate_ids(body: &Value) -> Result<Vec<String>, SpiError> {
+    let ids = body
+        .pointer("/result/candidate_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| internal("memory.capture carries no candidate_ids".to_string()))?;
+    ids.iter()
+        .map(|id| {
+            id.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| internal("a captured candidate id is not a string".to_string()))
+        })
+        .collect()
+}
+
+fn record_ids(body: &Value) -> Result<Vec<String>, SpiError> {
+    let ids = body
+        .pointer("/result/record_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| internal("the settled review carries no record_ids".to_string()))?;
+    ids.iter()
+        .map(|id| {
+            id.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| internal("a settled record id is not a string".to_string()))
+        })
+        .collect()
 }
 
 fn decode_records(body: Value) -> Result<Vec<RetainedRecord>, SpiError> {

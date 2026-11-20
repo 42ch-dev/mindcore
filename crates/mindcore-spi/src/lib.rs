@@ -6,16 +6,15 @@
 //! crates plus serde/async infrastructure: no `mindcore-*` storage crate,
 //! no Nexus, no network or model SDK enters the contract surface.
 //!
-//! [`MindWorkflows`]' methods are contracts for the next workflow tranche;
-//! [`SpiMindWorkflows`] implements `recall_context` over a DTO-only
-//! [`WorkflowBinding`], and `absorb`/`deliberate` remain contracts.
+//! [`SpiMindWorkflows`] implements `recall_context` and `absorb` over a
+//! DTO-only [`WorkflowBinding`]; `deliberate` remains a contract.
 //! [`PromptReasoner`] is the only included capability bridge: it adapts a
 //! text-prompt executor closure (the Nexus `PromptExecutor` seam, bound by the
 //! caller) to [`Reasoner`].
 
 pub mod workflows;
 
-pub use workflows::{RecallSnapshot, SpiMindWorkflows, WorkflowBinding};
+pub use workflows::{AbsorbSnapshot, RecallSnapshot, SpiMindWorkflows, WorkflowBinding};
 
 use std::future::Future;
 
@@ -27,7 +26,7 @@ use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::ops::memory_candidates_review_request::Decision;
 use spoke_schemas::{
     CognitionRecord, KnowledgeEntry, MemoryCandidate, MemoryCaptureRequest, MemoryRecallRequest,
-    Principal, RetainedRecord,
+    MemoryRecordsUpdateRequest, Principal, RetainedRecord,
 };
 
 /// Everything a capability call or workflow can surface, in typed form.
@@ -214,6 +213,15 @@ pub enum SettlementDraft<'a> {
         /// The proposed review decision.
         proposed: &'a Decision,
     },
+    /// A pending candidate that would replace one record's content in place.
+    /// The wire review decision has no update action, so the workflow
+    /// composes `memory.records.update` with `memory.candidates.dismiss`.
+    CandidateUpdate {
+        /// The captured pending candidate.
+        candidate: &'a MemoryCandidate,
+        /// The typed update the draft would submit.
+        proposed: &'a MemoryRecordsUpdateRequest,
+    },
     /// A proposed cognition record; review returns a proposal without
     /// claiming persistence.
     Cognition {
@@ -230,6 +238,9 @@ pub enum SettlementDraft<'a> {
 /// review operation with `action: "drop"` and the reason as rationale.
 /// Settle/drop still require current grants, CAS and a receipt on the
 /// caller's transaction — refusals propagate, never a second write route.
+/// For a candidate update draft, [`AutoSettle`] composes
+/// `memory.records.update` with `memory.candidates.dismiss`; the other two
+/// verdicts resolve exactly as they do for a review draft.
 /// For a cognition draft, rejection surfaces as [`SpiError::PolicyRejected`].
 ///
 /// [`AutoSettle`]: Self::AutoSettle
