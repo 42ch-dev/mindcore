@@ -74,30 +74,28 @@ impl Fixture {
 /// the selector calls need — seeded by the caller, never by the adapter.
 struct Harness {
     _fixture: Fixture,
+    db: PathBuf,
     pool: SqlitePool,
 }
 
 impl Harness {
     async fn open() -> Self {
         let fixture = Fixture::fresh();
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(fixture.db_path())
-                    .create_if_missing(true)
-                    .foreign_keys(false),
-            )
-            .await
-            .expect("open pool");
+        let db = fixture.db_path();
+        let pool = Self::connect(&db).await;
         sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+        let harness = Self {
+            _fixture: fixture,
+            db,
+            pool,
+        };
         sqlx::query(
             "INSERT INTO memory_spaces \
              (space_id, display_name, authority_host_id, authority_generation, status, revision, \
               created_at) \
              VALUES ('spc_parity', 'parity', 'host_1', 1, 'active', 1, '2026-11-20T09:20:01.123Z')",
         )
-        .execute(&pool)
+        .execute(&harness.pool)
         .await
         .expect("seed space");
         sqlx::query(
@@ -107,7 +105,7 @@ impl Harness {
              VALUES ('spc_parity', 'sbj_mira', 'nexus', 'character', 'active', '[]', 1, \
               '2026-11-20T09:20:01.123Z')",
         )
-        .execute(&pool)
+        .execute(&harness.pool)
         .await
         .expect("seed subject");
         // Two seeded grants: a space-wide admin grant (no subject_id) for the
@@ -120,7 +118,7 @@ impl Harness {
              VALUES ('grt_admin', 'spc_parity', NULL, 'ctr_admin', '[\"admin\"]', \
               '[]', 1, NULL, NULL, 1, '2026-11-20T09:20:01.123Z')",
         )
-        .execute(&pool)
+        .execute(&harness.pool)
         .await
         .expect("seed admin grant");
         sqlx::query(
@@ -132,15 +130,31 @@ impl Harness {
                 \"recall\",\"reflect\",\"profile_write\"]', \
               '[]', 1, NULL, NULL, 1, '2026-11-20T09:20:01.123Z')",
         )
-        .execute(&pool)
+        .execute(&harness.pool)
         .await
         .expect("seed subject grant");
-        Self {
-            _fixture: fixture,
-            pool,
-        }
+        harness
     }
 
+    async fn connect(db: &Path) -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(db)
+                    .create_if_missing(true)
+                    .foreign_keys(false),
+            )
+            .await
+            .expect("open pool")
+    }
+
+    /// Drop the current pool and attach a fresh one to the same fixture file
+    /// — the close/reopen boundary durable state must survive.
+    async fn reopen(&mut self) {
+        self.pool.close().await;
+        self.pool = Self::connect(&self.db).await;
+    }
     async fn begin(&self) -> Transaction<'_, sqlx::Sqlite> {
         self.pool.begin().await.expect("begin caller transaction")
     }
@@ -778,12 +792,23 @@ async fn every_selector_takes_the_caller_transaction() {
             .discard_import(&mut tx, &admin, json!({ "space_id": SPACE }))
             .await,
     ];
-    for result in transfer {
+    // Compare refusal code, retry class and details.op against the O2 contract.
+    let transfer_ops = [
+        "memory.exports.create",
+        "memory.exports.get",
+        "memory.imports.stage",
+        "memory.imports.activate",
+        "memory.imports.discard",
+    ];
+    for (result, op) in transfer.into_iter().zip(transfer_ops) {
         match result {
             SpokeResult::Reject(reject) => {
-                assert_eq!(reject.code, SpokeRejectCode::CapabilityPortMissing);
+                assert_eq!(reject.code, SpokeRejectCode::CapabilityPortMissing, "{op}");
+                let details = reject.details.as_ref().expect("refusal details");
+                assert_eq!(details["retry_class"], "terminal", "{op}");
+                assert_eq!(details["op"], op, "{op}");
             }
-            SpokeResult::Ok(_) => panic!("a transfer selector must refuse"),
+            SpokeResult::Ok(_) => panic!("{op} must refuse"),
         }
     }
 
@@ -943,4 +968,528 @@ async fn caller_rollback_persists_nothing() {
     ] {
         assert_eq!(harness.count(table).await, 0, "{table} must stay empty");
     }
+}
+
+/// Baseline §5 Y04: the second-grant receipt controls. A retained receipt
+/// stays readable by its requester while any live grant in the space stands —
+/// including one confined to an unrelated context — while an unparticipating
+/// caller and the space admin split as NOT_AUTHORIZED vs success. A replay
+/// under a revoked-context grant refuses before the dedup probe can serve it.
+#[tokio::test]
+async fn receipt_y04_second_grant_selector() {
+    let mut harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+    let p = principal("ctr_p");
+    let q = principal("ctr_q");
+    let mut tx = harness.begin().await;
+
+    // Y04.0: O grants P capture on ctx-a and ctx-b, Q capture on ctx-b only.
+    let mut grant_ids = Vec::new();
+    for (key, context) in [("y04-grant-a", "ctx-a"), ("y04-grant-b", "ctx-b")] {
+        let body = ready(
+            adapter
+                .grant(
+                    &mut tx,
+                    &admin,
+                    json!({
+                        "space_id": SPACE,
+                        "subject_id": SUBJECT,
+                        "principal_id": "ctr_p",
+                        "capabilities": ["capture"],
+                        "context_ids": [context],
+                        "shared_access": false,
+                        "idempotency_key": key,
+                    }),
+                )
+                .await,
+            "grants.grant",
+        );
+        grant_ids.push(
+            body["result"]["grant_id"]
+                .as_str()
+                .expect("grant id")
+                .to_string(),
+        );
+    }
+    let [grant_a, grant_b] = grant_ids.as_slice() else {
+        unreachable!()
+    };
+    ready(
+        adapter
+            .grant(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "principal_id": "ctr_q",
+                    "capabilities": ["capture"],
+                    "context_ids": ["ctx-b"],
+                    "shared_access": false,
+                    "idempotency_key": "y04-grant-q",
+                }),
+            )
+            .await,
+        "grants.grant",
+    );
+
+    // Y04.0 continued: P captures under ctx-a; the committed receipt carries
+    // the result but never the captured text.
+    let cap_request = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "context", "context_id": "ctx-a" },
+        "content": { "text": "the northern gate opens before dawn" },
+        "idempotency_key": "y04-capture-a",
+    });
+    let body = ready(
+        adapter.capture(&mut tx, &p, cap_request.clone()).await,
+        "capture",
+    );
+    let receipt_id = body["receipt_id"].as_str().expect("receipt id").to_string();
+    assert_eq!(body["status"], "committed");
+    assert_eq!(body["result"]["classified"], 1);
+    let body_json = body.to_string();
+    assert!(
+        !body_json.contains("northern gate"),
+        "receipt envelope must be content-free: {body_json}"
+    );
+
+    // Y04.1: revoking only the ctx-a grant leaves P a live participant via
+    // ctx-b; polling the receipt still returns the same retained body.
+    let body = ready(
+        adapter
+            .revoke_grant(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "grant_id": grant_a,
+                    "expected_revision": 1,
+                    "idempotency_key": "y04-revoke-a",
+                }),
+            )
+            .await,
+        "grants.revoke",
+    );
+    assert_eq!(body["result"]["revoked"], true);
+    let body = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &p,
+                json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+            )
+            .await,
+        "receipts.get",
+    );
+    let retained = &body["receipt"];
+    assert_eq!(retained["status"], "committed");
+    assert_eq!(retained["result"]["classified"], 1);
+    assert!(
+        !body.to_string().contains("northern gate"),
+        "poll must not disclose captured content: {body}"
+    );
+
+    // Y04.2: P replays the identical capture while only ctx-b is live — the
+    // placement requirement binds ctx-a, so authorization refuses before the
+    // dedup probe can serve the replay.
+    match adapter.capture(&mut tx, &p, cap_request).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+            assert_eq!(
+                reject.details.as_ref().expect("details")["retry_class"],
+                "terminal"
+            );
+        }
+        other => panic!("revoked-context replay must refuse: {other:?}"),
+    }
+
+    // Y04.3: Q (live on ctx-b but not the requester) is refused; the space
+    // admin reads the identical content-free body.
+    match adapter
+        .get_receipt(
+            &mut tx,
+            &q,
+            json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+        )
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+            assert_eq!(
+                reject.details.as_ref().expect("details")["retry_class"],
+                "terminal"
+            );
+        }
+        other => panic!("non-requester poll must refuse: {other:?}"),
+    }
+    let body = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &admin,
+                json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+            )
+            .await,
+        "receipts.get",
+    );
+    assert_eq!(body["receipt"], *retained);
+
+    // Y04.4: P's last grant is revoked; both its known-id and unissued-id
+    // polls refuse NOT_AUTHORIZED/terminal identically (no enumeration), and
+    // the admin still reads the retained receipt.
+    ready(
+        adapter
+            .revoke_grant(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "grant_id": grant_b,
+                    "expected_revision": 1,
+                    "idempotency_key": "y04-revoke-b",
+                }),
+            )
+            .await,
+        "grants.revoke",
+    );
+    for id in [receipt_id.as_str(), "rcp_y04_unknown"] {
+        match adapter
+            .get_receipt(&mut tx, &p, json!({ "space_id": SPACE, "receipt_id": id }))
+            .await
+        {
+            SpokeResult::Reject(reject) => {
+                assert_eq!(reject.code, SpokeRejectCode::NotAuthorized, "{id}");
+                assert_eq!(
+                    reject.details.as_ref().expect("details")["retry_class"],
+                    "terminal",
+                    "{id}"
+                );
+            }
+            other => panic!("non-participant poll must refuse {id}: {other:?}"),
+        }
+    }
+    let body = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &admin,
+                json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+            )
+            .await,
+        "receipts.get",
+    );
+    assert_eq!(body["receipt"], *retained);
+    tx.commit().await.expect("caller commit");
+
+    // The retained receipt and the revoked grant rows are durable across the
+    // close/reopen boundary — authorization survives reopen.
+    harness.reopen().await;
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &admin,
+                json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+            )
+            .await,
+        "receipts.get",
+    );
+    assert_eq!(body["receipt"]["status"], "committed");
+}
+
+/// L3/reopen on the embedded arm: a journaled effect committed by the caller
+/// keeps its row, pending receipt and pending intent durable across a
+/// close/reopen, and `settle_journal` — the caller's publication-complete
+/// phase — marks the intent applied, scrubs its targets and commits the
+/// receipt under one transaction.
+#[tokio::test]
+async fn journaled_effect_survives_reopen_and_settles() {
+    let mut harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+    let mut tx = harness.begin().await;
+    let pending = staged(
+        adapter
+            .create_record(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "kind": "fact",
+                    "scope": { "visibility": "shared" },
+                    "content": { "text": "a journaled record body" },
+                    "idempotency_key": "reopen-create",
+                }),
+            )
+            .await,
+        "records.create",
+    )
+    .expect("create is journaled");
+    tx.commit().await.expect("caller commit");
+
+    // After close/reopen the row, the pending receipt and the pending intent
+    // are all still there; the intent still owes its publication targets.
+    harness.reopen().await;
+    let (status, state, targets): (String, String, String) = sqlx::query_as(
+        "SELECT r.status, j.state, j.targets_json \
+         FROM memory_receipts r JOIN memory_journal j ON j.receipt_id = r.receipt_id \
+         WHERE r.receipt_id = ?1",
+    )
+    .bind(&pending)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("receipt + intent after reopen");
+    assert_eq!(status, "pending");
+    assert_eq!(state, "pending");
+    assert_ne!(targets, "[]", "an unsettled intent keeps its targets");
+    assert_eq!(harness.count("memory_records").await, 1);
+
+    // Phase 2: settle_journal in a fresh caller transaction commits the
+    // receipt and applies the intent; before it commits a poll reports
+    // OUTCOME_UNCERTAIN, after it the same id returns the committed body.
+    let mut tx = harness.begin().await;
+    match adapter
+        .get_receipt(
+            &mut tx,
+            &admin,
+            json!({ "space_id": SPACE, "receipt_id": pending }),
+        )
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+        }
+        other => panic!("a pending receipt must poll uncertain: {other:?}"),
+    }
+    let body = match adapter
+        .settle_journal(&mut tx, &pending_space(), &pending)
+        .await
+    {
+        SpokeResult::Ok(body) => body,
+        other => panic!("settle_journal failed: {other:?}"),
+    };
+    assert_eq!(body["status"], "committed");
+    tx.commit().await.expect("settle commit");
+
+    let (status, state, targets): (String, String, String) = sqlx::query_as(
+        "SELECT r.status, j.state, j.targets_json \
+         FROM memory_receipts r JOIN memory_journal j ON j.receipt_id = r.receipt_id \
+         WHERE r.receipt_id = ?1",
+    )
+    .bind(&pending)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("settled receipt + intent");
+    assert_eq!(status, "committed");
+    assert_eq!(state, "applied");
+    assert_eq!(targets, "[]", "settlement scrubs the targets");
+}
+
+/// O1: the unadvertised build refuses every Reflection selector — the same
+/// CAPABILITY_PORT_MISSING/terminal shape with the exact details.op, matching
+/// the pinned provider's open_unadvertised observable. `describe` keeps the
+/// base capability and omits spoke-memory-reflection.
+#[tokio::test]
+async fn optional_reflection_refusal() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(false);
+    let admin = principal(PRINCIPAL);
+    let mut tx = harness.begin().await;
+
+    let body = ready(
+        adapter.describe(&mut tx, &admin, json!({})).await,
+        "describe",
+    );
+    let capabilities = body["capabilities"].as_array().expect("capabilities");
+    assert!(capabilities.iter().any(|c| c == "spoke-memory"));
+    assert!(!capabilities.iter().any(|c| c == "spoke-memory-reflection"));
+
+    let selection = json!({ "mode": "subject_all" });
+    let ops: [(&'static str, SpokeResult<MemoryStage>); 3] = [
+        (
+            "memory.reflections.state",
+            adapter
+                .get_reflection_state(
+                    &mut tx,
+                    &admin,
+                    json!({ "space_id": SPACE, "subject_id": SUBJECT, "selection": selection }),
+                )
+                .await,
+        ),
+        (
+            "memory.reflections.list",
+            adapter
+                .list_reflections(
+                    &mut tx,
+                    &admin,
+                    json!({ "space_id": SPACE, "subject_id": SUBJECT, "selection": selection }),
+                )
+                .await,
+        ),
+        (
+            "memory.reflections.generate",
+            adapter
+                .generate_reflection(
+                    &mut tx,
+                    &admin,
+                    json!({
+                        "space_id": SPACE,
+                        "subject_id": SUBJECT,
+                        "selection": selection,
+                        "expected_state_digest": "0".repeat(64),
+                        "idempotency_key": "opt-reflection",
+                    }),
+                )
+                .await,
+        ),
+    ];
+    for (op, result) in ops {
+        match result {
+            SpokeResult::Reject(reject) => {
+                assert_eq!(reject.code, SpokeRejectCode::CapabilityPortMissing, "{op}");
+                let details = reject.details.as_ref().expect("refusal details");
+                assert_eq!(details["retry_class"], "terminal", "{op}");
+                assert_eq!(details["op"], op, "{op}");
+            }
+            SpokeResult::Ok(_) => panic!("{op} must refuse"),
+        }
+    }
+    // A refused optional family writes nothing: no receipt, no reflection row.
+    tx.commit().await.expect("caller commit");
+    assert_eq!(harness.count("memory_receipts").await, 0);
+    assert_eq!(harness.count("memory_reflections").await, 0);
+}
+
+fn pending_space() -> mindcore_base::ids::SpaceId {
+    mindcore_base::ids::SpaceId::new(SPACE)
+}
+
+/// F2 terminal arm: transaction 1 stages the personality profile, a live
+/// record and the leased generation receipt; transaction 2 — a fresh caller
+/// transaction — completes the lease: the envelope lands in
+/// `memory_reflections` and the receipt commits with the pinned
+/// `result.reflection_id`/`result.cost` shape.
+#[tokio::test]
+async fn reflection_lease_completes_in_second_transaction() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+
+    let mut tx = harness.begin().await;
+    staged(
+        adapter
+            .update_profile(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "profile_kind": "personality",
+                    "expected_revision": null,
+                    "document": { "format": "markdown", "body": "# Parity subject" },
+                    "idempotency_key": "f2-profile",
+                }),
+            )
+            .await,
+        "profile.update",
+    );
+    staged(
+        adapter
+            .create_record(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "kind": "fact",
+                    "scope": { "visibility": "shared" },
+                    "content": { "text": "basis record" },
+                    "idempotency_key": "f2-record",
+                }),
+            )
+            .await,
+        "records.create",
+    );
+    let body = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                }),
+            )
+            .await,
+        "reflections.state",
+    );
+    let digest = body["state_digest"]
+        .as_str()
+        .expect("state digest")
+        .to_string();
+    let work = match adapter
+        .generate_reflection(
+            &mut tx,
+            &admin,
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "selection": { "mode": "subject_all" },
+                "expected_state_digest": digest,
+                "idempotency_key": "f2-generate",
+            }),
+        )
+        .await
+    {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("generate did not stage a lease: {other:?}"),
+    };
+    tx.commit().await.expect("transaction 1 commit");
+
+    // Transaction 2: the composed deterministic effect settles the lease.
+    let mut tx = harness.begin().await;
+    let body = match adapter.complete_reflection(&mut tx, work.compose()).await {
+        SpokeResult::Ok(body) => body,
+        other => panic!("complete_reflection failed: {other:?}"),
+    };
+    assert_eq!(body["status"], "committed");
+    let reflection_id = body["result"]["reflection_id"]
+        .as_str()
+        .expect("reflection id")
+        .to_string();
+    tx.commit().await.expect("transaction 2 commit");
+
+    let body_text: String =
+        sqlx::query_scalar("SELECT body_text FROM memory_reflections WHERE reflection_id = ?1")
+            .bind(&reflection_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("envelope row");
+    assert!(!body_text.is_empty());
+    // The now-visible reflection lists and reports a fresh state.
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .list_reflections(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                }),
+            )
+            .await,
+        "reflections.list",
+    );
+    assert_eq!(
+        body["reflections"].as_array().expect("reflections").len(),
+        1
+    );
 }
