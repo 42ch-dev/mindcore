@@ -3,8 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Number, Value};
 use spoke_operations::{
-    validate_memory_grants_list, validate_memory_spaces_list, GrantRequirement, IssuedGrant,
-    SpokeRejectCode,
+    validate_memory_grants_list, validate_memory_spaces_list, validate_memory_subjects_fence,
+    GrantRequirement, IssuedGrant, SpokeRejectCode,
 };
 use spoke_schemas::{
     MemoryDescribeRequest, MemoryDescribeResponse, MemoryGrantsGrantRequest,
@@ -414,6 +414,12 @@ impl MemoryAdapter {
     ) -> AResult<MemoryStage> {
         let request: MemorySubjectsFenceRequest =
             wire::decode(&raw, "memory.subjects.fence request")?;
+        match validate_memory_subjects_fence(&request) {
+            spoke_operations::SpokeResult::Ok(()) => {}
+            spoke_operations::SpokeResult::Reject(reject) => {
+                return Err(Reject::terminal(reject.code, reject.message));
+            }
+        }
         let object = wire::object(&raw, "memory.subjects.fence request")?;
         let action = wire::required(object, "action")?.to_string();
         let target = object
@@ -791,12 +797,16 @@ fn next_fence_state(
             format!("{action} is not a valid transition from {}", current.status),
         )
     };
-    let context = match target {
-        Value::String(name) if name == "subject" => None,
-        Value::Object(object) => match object.get("context").and_then(Value::as_str) {
-            Some(context_id) => Some(context_id.to_string()),
-            None => return Err(Reject::invalid("target must name a subject or a context")),
-        },
+    let target = wire::object(target, "target")?;
+    let context = match wire::required(target, "type")? {
+        "subject" => {
+            wire::closed(target, "type", &[], "target")?;
+            None
+        }
+        "context" => {
+            wire::closed(target, "type", &["context_id"], "target")?;
+            Some(wire::required(target, "context_id")?.to_string())
+        }
         _ => return Err(Reject::invalid("target must name a subject or a context")),
     };
     match (context, action) {

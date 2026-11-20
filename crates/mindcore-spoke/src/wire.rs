@@ -35,6 +35,22 @@ pub(crate) fn optional(object: &Map<String, Value>, key: &str) -> AResult<Option
     }
 }
 
+/// A closed object member set, minus `tag`: every other key must be in
+/// `allowed`, mirroring the pinned DTO's `deny_unknown_fields`.
+pub(crate) fn closed(
+    object: &Map<String, Value>,
+    tag: &str,
+    allowed: &[&str],
+    what: &str,
+) -> AResult<()> {
+    for key in object.keys() {
+        if key != tag && !allowed.contains(&key.as_str()) {
+            return Err(Reject::invalid(format!("{what} must not carry {key}")));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn strings(object: &Map<String, Value>, key: &str) -> AResult<Vec<String>> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),

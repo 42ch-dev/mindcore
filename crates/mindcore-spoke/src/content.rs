@@ -138,42 +138,48 @@ impl Decision {
 }
 
 fn decision_of(value: &Value) -> AResult<Decision> {
-    match value {
-        Value::String(action) if action == "drop" => Ok(Decision::Drop),
-        Value::Object(map) => {
-            if let Some(promote) = map.get("promote") {
-                let promote = wire::object(promote, "decision.promote")?;
-                let kind = wire::optional(promote, "kind")?;
-                let content = match promote.get("content_override") {
-                    Some(content) => Some(content_wire(content)?),
-                    None => None,
-                };
-                return Ok(Decision::Promote { kind, content });
+    let decision = wire::object(value, "decision")?;
+    match wire::required(decision, "action")? {
+        "promote" => {
+            wire::closed(
+                decision,
+                "action",
+                &["kind", "content_override"],
+                "decision",
+            )?;
+            let kind = wire::optional(decision, "kind")?;
+            let content = match decision.get("content_override") {
+                // The DTO decodes an explicit null as absent; match it.
+                None | Some(Value::Null) => None,
+                Some(content) => Some(content_wire(content)?),
+            };
+            Ok(Decision::Promote { kind, content })
+        }
+        "fragment" => {
+            wire::closed(decision, "action", &["fragments"], "decision")?;
+            let Value::Array(items) = decision
+                .get("fragments")
+                .ok_or_else(|| Reject::invalid("decision.fragments is required"))?
+            else {
+                return Err(Reject::invalid("decision.fragments must be an array"));
+            };
+            let mut parsed = Vec::with_capacity(items.len());
+            for item in items {
+                let item = wire::object(item, "decision.fragments[]")?;
+                wire::closed(item, "", &["kind", "content"], "decision.fragments[]")?;
+                parsed.push((
+                    wire::required(item, "kind")?.to_string(),
+                    content_wire(
+                        item.get("content")
+                            .ok_or_else(|| Reject::invalid("fragment item content"))?,
+                    )?,
+                ));
             }
-            if let Some(fragment) = map.get("fragment") {
-                let fragment = wire::object(fragment, "decision.fragment")?;
-                let Value::Array(items) = fragment
-                    .get("items")
-                    .ok_or_else(|| Reject::invalid("decision.fragment.items is required"))?
-                else {
-                    return Err(Reject::invalid("decision.fragment.items must be an array"));
-                };
-                let mut parsed = Vec::with_capacity(items.len());
-                for item in items {
-                    let item = wire::object(item, "decision.fragment.items[]")?;
-                    parsed.push((
-                        wire::required(item, "kind")?.to_string(),
-                        content_wire(
-                            item.get("content")
-                                .ok_or_else(|| Reject::invalid("fragment item content"))?,
-                        )?,
-                    ));
-                }
-                return Ok(Decision::Fragment { items: parsed });
-            }
-            Err(Reject::invalid(
-                "decision must be promote, fragment or drop",
-            ))
+            Ok(Decision::Fragment { items: parsed })
+        }
+        "drop" => {
+            wire::closed(decision, "action", &["rationale"], "decision")?;
+            Ok(Decision::Drop)
         }
         _ => Err(Reject::invalid(
             "decision must be promote, fragment or drop",
@@ -1764,11 +1770,18 @@ impl MemoryAdapter {
                 ))
             }
         };
-        let content = json!({
-            "text": content.text,
-            "structured": content.structured,
-            "cognition": content.cognition,
-        });
+        // Retained-record content keeps absence semantics: optional members
+        // stay absent instead of being invented as explicit `null`
+        // (content_from_wire rejects a null cognition).
+        let mut content_members = Map::new();
+        content_members.insert("text".to_string(), json!(content.text));
+        if let Some(structured) = &content.structured {
+            content_members.insert("structured".to_string(), structured.clone());
+        }
+        if let Some(cognition) = &content.cognition {
+            content_members.insert("cognition".to_string(), Value::Array(cognition.clone()));
+        }
+        let content = Value::Object(content_members);
         let source_kind = content.get("text").map(|_| kind.clone()).unwrap_or(kind);
         let candidates: Vec<(String, Value)> = match decision {
             Decision::Promote {
@@ -1785,7 +1798,7 @@ impl MemoryAdapter {
         let mut record_ids = Vec::with_capacity(candidates.len());
         for (kind, content) in candidates {
             let record_id = mint("rec");
-            let record = record_from_wire(json!({
+            let mut record_wire = json!({
                 "schema_version": project::SCHEMA_VERSION,
                 "record_id": record_id,
                 "space_id": op.space.as_str(),
@@ -1803,8 +1816,14 @@ impl MemoryAdapter {
                 "updated_at": policy::timestamp(op.now),
                 "revision": 1,
                 "extensions": {},
-                "occurred_at": candidate.occurred_at,
-            }))?;
+            });
+            if let Some(occurred_at) = &candidate.occurred_at {
+                record_wire
+                    .as_object_mut()
+                    .expect("record wire is an object")
+                    .insert("occurred_at".to_string(), json!(occurred_at));
+            }
+            let record = record_from_wire(record_wire)?;
             self.repository.insert_record(tx, &record).await?;
             effects.push(effects::record_effect(&record, None)?);
             record_ids.push(record_id);
