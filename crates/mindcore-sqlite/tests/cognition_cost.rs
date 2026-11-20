@@ -1,12 +1,13 @@
 //! I-000011 cost evidence: appending one cognition record and reading the current
-//! judgment cost the same statements and rows with 1 record of history as with 1000 —
-//! the append never touches earlier rows and the current lookup never scans them.
-//! Counted via the driver's per-statement tracing events and SQLite's
-//! `total_changes()`, not wall-clock.
+//! judgment cost the same statements and rows — and the same number of SQLite
+//! virtual-machine instructions — with 1 record of history as with 1000. The append
+//! never touches earlier rows and the current lookup never scans them. Counted via
+//! the driver's per-statement tracing events, SQLite's `total_changes()`, and a
+//! counting VDBE progress handler (`sqlite3_progress_handler`), not wall-clock.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_sqlite::cognition::read_current_record;
@@ -15,14 +16,15 @@ use serde_json::{json, Value};
 use spoke_operations::SpokeResult;
 use spoke_schemas::knowledge_entry::{KnowledgeEntryBody, KnowledgeEntryCanonicalName};
 use spoke_schemas::KnowledgeEntry;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{ConnectOptions, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
+use sqlx::{ConnectOptions, Connection, SqlitePool};
 use tempfile::TempDir;
 
 const COLLECTION: &str = "wren";
 const CARRIER: &str = "ke_wren";
 
 static STATEMENTS: AtomicUsize = AtomicUsize::new(0);
+static VDBE_STEPS: AtomicU64 = AtomicU64::new(0);
 
 /// Counts the driver's per-statement `sqlx::query` events: sqlx gives no other
 /// statement-level counter.
@@ -48,6 +50,32 @@ impl tracing::Subscriber for StatementCounter {
     fn enter(&self, _span: &tracing::span::Id) {}
 
     fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Counts every SQLite virtual-machine instruction on this connection via the
+/// progress handler: one callback per VDBE opcode, never interrupting. A scan over
+/// N history rows adds ~N steps; an indexed lookup adds none of them. The handler
+/// lives on the connection (locked out of the worker thread only for the call).
+async fn install_step_counter(connection: &mut SqliteConnection) {
+    let mut handle = connection.lock_handle().await.expect("lock the sqlite handle");
+    // sqlx's callback contract is inverted from SQLite's: returning `true` continues.
+    handle.set_progress_handler(1, || {
+        VDBE_STEPS.fetch_add(1, Ordering::Relaxed);
+        true
+    });
+}
+
+/// Detaches the counter so unmeasured statements on the same pooled connection
+/// (filler appends, header reads) are never counted.
+async fn remove_step_counter(connection: &mut SqliteConnection) {
+    let mut handle = connection.lock_handle().await.expect("lock the sqlite handle");
+    handle.remove_progress_handler();
+}
+
+/// The pooled connection holds at most one connection, so acquiring it pins the one
+/// the pool will reuse; the measurement brackets a statement-bounded operation on it.
+async fn measured_connection(pool: &SqlitePool) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+    pool.acquire().await.expect("acquire the pooled connection")
 }
 
 /// The pinned belief record shape (the CAS suite's fixture), held by `ke_wren`.
@@ -98,10 +126,18 @@ fn belief(record_id: &str) -> Value {
     })
 }
 
-/// One measured storage append: statements issued and rows written, counted on the
-/// single pooled connection, plus the revision the append assigned.
-async fn measured_append(pool: &SqlitePool, expected: u64, record_id: &str) -> (usize, i64, u64) {
-    let mut tx = pool
+/// One measured storage append: statements issued, rows written and VDBE steps
+/// executed, counted on the single pooled connection, plus the revision the append
+/// assigned.
+async fn measured_append(
+    pool: &SqlitePool,
+    expected: u64,
+    record_id: &str,
+) -> (usize, i64, u64, u64) {
+    let mut connection = measured_connection(pool).await;
+    install_step_counter(&mut *connection).await;
+    let before_steps = VDBE_STEPS.load(Ordering::Relaxed);
+    let mut tx = (&mut *connection)
         .begin_with("BEGIN IMMEDIATE")
         .await
         .expect("begin append transaction");
@@ -121,30 +157,41 @@ async fn measured_append(pool: &SqlitePool, expected: u64, record_id: &str) -> (
         .await
         .expect("total changes after the append");
     tx.commit().await.expect("commit the measured append");
-    (statements, after_rows - before_rows, assigned)
+    let steps = VDBE_STEPS.load(Ordering::Relaxed) - before_steps;
+    remove_step_counter(&mut *connection).await;
+    (statements, after_rows - before_rows, assigned, steps)
 }
 
-/// One measured current-judgment lookup: statements issued and the record id the
-/// holder's head points at.
-async fn measured_lookup(pool: &SqlitePool) -> (usize, Option<String>) {
+/// One measured current-judgment lookup: statements issued, VDBE steps executed, and
+/// the record id the holder's head points at.
+async fn measured_lookup(pool: &SqlitePool) -> (usize, u64, Option<String>) {
+    let mut connection = measured_connection(pool).await;
+    install_step_counter(&mut *connection).await;
+    let before_steps = VDBE_STEPS.load(Ordering::Relaxed);
     let before_statements = STATEMENTS.load(Ordering::Relaxed);
-    let record = match read_current_record(pool, COLLECTION, CARRIER).await {
+    let record = match read_current_record(&mut *connection, COLLECTION, CARRIER).await {
         SpokeResult::Ok(record) => record,
         SpokeResult::Reject(reject) => panic!("current lookup rejected: {reject:?}"),
     };
     let statements = STATEMENTS.load(Ordering::Relaxed) - before_statements;
+    let steps = VDBE_STEPS.load(Ordering::Relaxed) - before_steps;
+    remove_step_counter(&mut *connection).await;
     let head = record.and_then(|record| {
         record
             .get("record_id")
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    (statements, head)
+    (statements, steps, head)
 }
 
-/// The append's and the current lookup's statement and row work is the same with one
-/// record of history as with one thousand, and every append lands: one row inserted,
-/// one carrier row advanced, revision and head moving to the newest record.
+/// The append's and the current lookup's statement, row and VDBE-step work is the
+/// same with one record of history as with one thousand, and every append lands: one
+/// row inserted, one carrier row advanced, revision and head moving to the newest
+/// record. The step budget keeps both paths out of history-scan territory even if a
+/// regression scanned a constant (size-independent) number of rows at every scale.
+const LOOKUP_STEP_BUDGET: u64 = 200;
+
 #[tokio::test]
 async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_records() {
     tracing::subscriber::set_global_default(StatementCounter).expect("install statement counter");
@@ -194,7 +241,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     tx.commit().await.expect("commit the carrier row");
 
     // Nothing to point at yet: the lookup is still one statement over no record.
-    let (headless_lookup_statements, headless) = measured_lookup(&pool).await;
+    let (headless_lookup_statements, _, headless) = measured_lookup(&pool).await;
     assert_eq!(
         headless, None,
         "a carrier without records has no current judgment"
@@ -215,9 +262,10 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         SpokeResult::Reject(reject) => panic!("first append rejected: {reject:?}"),
     }
     tx.commit().await.expect("commit the first append");
-    let (lookup_at_1, current_at_1) = measured_lookup(&pool).await;
+    let (lookup_at_1, steps_at_1, current_at_1) = measured_lookup(&pool).await;
     assert_eq!(current_at_1.as_deref(), Some("cog_first"));
-    let (append_at_1, rows_at_1, assigned_at_1) = measured_append(&pool, 2, "cog_second").await;
+    let (append_at_1, rows_at_1, assigned_at_1, append_steps_at_1) =
+        measured_append(&pool, 2, "cog_second").await;
     assert_eq!(assigned_at_1, 3);
 
     // History of one thousand: filler appends 3..=1000 in one transaction.
@@ -247,20 +295,24 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     tx.commit().await.expect("commit the filler appends");
 
     // The measured operations now run while the scope holds one thousand records.
-    let (lookup_at_1000, current_at_1000) = measured_lookup(&pool).await;
+    let (lookup_at_1000, steps_at_1000, current_at_1000) = measured_lookup(&pool).await;
     assert_eq!(
         current_at_1000.as_deref(),
         Some("cog_fill_1000"),
         "the head is the newest row whatever the history"
     );
-    let (append_at_1000, rows_at_1000, assigned_at_1000) =
+    let (append_at_1000, rows_at_1000, assigned_at_1000, append_steps_at_1000) =
         measured_append(&pool, 1001, "cog_last").await;
     assert_eq!(assigned_at_1000, 1002);
 
-    println!("append at 1 record: {append_at_1} statements, {rows_at_1} rows written");
-    println!("append at 1000 records: {append_at_1000} statements, {rows_at_1000} rows written");
-    println!("current lookup at 1 record: {lookup_at_1} statements");
-    println!("current lookup at 1000 records: {lookup_at_1000} statements");
+    println!("append at 1 record: {append_at_1} statements, {rows_at_1} rows, {append_steps_at_1} VDBE steps");
+    println!(
+        "append at 1000 records: {append_at_1000} statements, {rows_at_1000} rows, {append_steps_at_1000} VDBE steps"
+    );
+    println!("current lookup at 1 record: {lookup_at_1} statements, {steps_at_1} VDBE steps");
+    println!(
+        "current lookup at 1000 records: {lookup_at_1000} statements, {steps_at_1000} VDBE steps"
+    );
 
     assert_eq!(
         rows_at_1, 2,
@@ -279,6 +331,24 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         lookup_at_1, lookup_at_1000,
         "the current lookup issued {lookup_at_1} statements with 1 record of history and \
          {lookup_at_1000} with 1000"
+    );
+    assert_eq!(
+        append_steps_at_1, append_steps_at_1000,
+        "the append executed {append_steps_at_1} VDBE steps with 1 record of history and \
+         {append_steps_at_1000} with 1000"
+    );
+    assert_eq!(
+        steps_at_1, steps_at_1000,
+        "the current lookup executed {steps_at_1} VDBE steps with 1 record of history and \
+         {steps_at_1000} with 1000"
+    );
+    assert!(
+        steps_at_1000 <= LOOKUP_STEP_BUDGET,
+        "the current lookup must stay in indexed-lookup territory: {steps_at_1000} VDBE steps"
+    );
+    assert!(
+        append_steps_at_1000 > 0,
+        "the counter must see the append itself: {append_steps_at_1000}"
     );
     assert!(
         append_at_1 > 0,

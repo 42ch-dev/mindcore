@@ -858,6 +858,26 @@ async fn append_rejects_a_stale_revision_without_touching_rows() {
             let details = reject.details.as_ref().expect("stale details");
             assert_eq!(details.get("expected_base_revision"), Some(&json!(1)));
             assert_eq!(details.get("stored_revision"), Some(&json!(2)));
+            // Still inside the rejecting transaction, so a write-then-reject
+            // implementation cannot hide its writes behind the rollback below.
+            let header = expect_ok(
+                read_carrier_header(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction header",
+            );
+            assert_eq!(
+                (header.revision, header.head_seq),
+                (2, Some(1)),
+                "the rejection must not advance the head or the revision inside the transaction"
+            );
+            let records = expect_ok(
+                read_records(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction records",
+            );
+            assert_eq!(
+                module_keys(&records),
+                vec!["cog_hearsay"],
+                "the rejected record must not be visible inside the transaction"
+            );
         }
         SpokeResult::Ok(_) => panic!("a stale expected revision must not append"),
     }
@@ -903,6 +923,36 @@ async fn append_rejects_a_duplicate_id_at_the_current_revision() {
             assert!(
                 reject.message.contains("cog_hearsay") && reject.message.contains("already exists"),
                 "got {reject:?}"
+            );
+            // Still inside the rejecting transaction, so a write-then-reject
+            // implementation cannot hide its writes behind the rollback below.
+            let header = expect_ok(
+                read_carrier_header(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction header",
+            );
+            assert_eq!(
+                (header.revision, header.head_seq),
+                (2, Some(1)),
+                "the rejection must not advance the head or the revision inside the transaction"
+            );
+            let records = expect_ok(
+                read_records(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction records",
+            );
+            assert_eq!(
+                module_keys(&records),
+                vec!["cog_hearsay"],
+                "the duplicate must not add a second row inside the transaction"
+            );
+            let current = expect_ok(
+                read_current_record(&mut *tx, "wren", "ke_wren").await,
+                "in-transaction current",
+            )
+            .expect("the committed record is still the head");
+            assert_eq!(
+                current["q"]["value"].as_f64(),
+                Some(0.4),
+                "the duplicate must not overwrite the committed record inside the transaction"
             );
         }
         SpokeResult::Ok(_) => panic!("a duplicate scoped record_id must not append"),
@@ -1447,10 +1497,24 @@ async fn historical_records_stay_addressable_while_the_head_moves() {
     store.close().await;
 }
 
-/// The storage projection equals the pre-change composition: the same records put as
-/// rows read back as the exact full DTO the in-memory carrier holds, and the derived
-/// `MindState` — two groups here — is byte-identical, selecting within each group by
-/// append order, never by the DTO `order` field.
+/// Independent wire baselines captured from the pre-change fixture shape: the exact
+/// bytes the inline-record carrier produced before the per-row storage landed — the
+/// full `KnowledgeEntry` DTO with its assigned revision, and the derived `MindState`
+/// envelope. Fixed once under `fixtures/`, never built at test time from the
+/// production composition or projection helpers the storage path shares, so a
+/// shared-projection regression cannot pass by regressing both sides together. The
+/// `None` carrier fields (`created_at`, `disclosure`, `owner`, `source_anchor`,
+/// `updated_at`) are absent from the baselines; the write keeps them `None` and
+/// stores its timestamps in SQL columns outside the payload.
+const EXPECTED_STORED_DTO: &str = include_str!("fixtures/pre_change_dto.json");
+
+const EXPECTED_MIND_STATE: &str = include_str!("fixtures/pre_change_mind_state.json");
+
+/// The storage projection equals the pre-change composition: the records stored as
+/// rows read back as the exact full DTO bytes the pre-change inline-record carrier
+/// produced — carrier fields and revision included — and the derived `MindState`
+/// envelope is byte-identical too, selecting within each group by append order,
+/// never by the DTO `order` field.
 #[tokio::test]
 async fn projection_matches_the_pre_change_fixtures_across_groups() {
     let temp = TempDb::new();
@@ -1459,29 +1523,11 @@ async fn projection_matches_the_pre_change_fixtures_across_groups() {
         .expect("open store");
     let port = store.knowledge(KnowledgeScope::new("wren"));
 
-    // In-memory composition over inline records: the pre-change DTO path.
-    let seeded = with_module(
-        "ke_wren",
-        Some(1),
-        json!({
-            "records": [],
-            "world_facts": [world_fact()],
-            "extensions": {},
-        }),
-    );
     let north_first = with_order(belief("cog_a", 0.4), 2);
     let north_second = belief("cog_b", 0.7);
     let mut south = belief("cog_c", 0.3);
     south["target"]["target_id"] = json!("prop_south_gate_open");
 
-    let mut in_memory = seeded;
-    for record in [north_first.clone(), north_second.clone(), south.clone()] {
-        in_memory = append_cognition_record(&in_memory, record).expect("in-memory append");
-    }
-    let mem_view = derive_mind_state(&in_memory).expect("derive from the inline carrier");
-    let mem_state = mind_state_value(&mem_view, "ms_wren_fixture").expect("render the inline view");
-
-    // The same records stored as rows must project to the same DTO and view.
     let created = expect_ok(
         port.put_knowledge_entry(
             with_module(
@@ -1498,21 +1544,26 @@ async fn projection_matches_the_pre_change_fixtures_across_groups() {
         .await,
         "create carrier with three records",
     );
-    assert_eq!(created.revision, Some(1));
+    assert_eq!(created.revision, Some(1), "create assigns revision 1");
     let stored = expect_ok(read_carrier(&port, "ke_wren").await, "read stored carrier");
     assert_eq!(
-        module_of(&stored),
-        module_of(&in_memory),
-        "the row projection must equal the pre-change inline DTO"
+        stored.revision,
+        Some(1),
+        "the stored carrier carries its assigned revision"
+    );
+    assert_eq!(
+        serde_json::to_string(&stored).expect("stored entry serializes"),
+        EXPECTED_STORED_DTO,
+        "the stored full DTO must be byte-identical to the pre-change inline-record wire shape"
     );
 
     let view = derive_mind_state(&stored).expect("derive from the stored carrier");
     assert_eq!(view.holder_entry_id, "ke_wren");
     assert_eq!(view.carrier_revision, 1);
-    assert_eq!(view.records, mem_view.records);
     let state = mind_state_value(&view, "ms_wren_fixture").expect("render the stored view");
     assert_eq!(
-        state, mem_state,
+        serde_json::to_string(&state).expect("mind state serializes"),
+        EXPECTED_MIND_STATE,
         "the derived MindState must be byte-identical to the pre-change derivation"
     );
 
