@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS memory_records (
     tombstone_json TEXT,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     CHECK ((scope_visibility = 'context') = (scope_context_id IS NOT NULL))
 ) WITHOUT ROWID;
 
@@ -148,6 +149,7 @@ CREATE TABLE IF NOT EXISTS memory_receipts (
     completed_at TEXT,
     -- Generation lease (§7.0.3); NULL on terminal receipts.
     owner_id TEXT,
+    lease_expires_at TEXT,
     -- §6.10 payload contract: pending carries no payload/stamp; a settled row
     -- carries one payload (served body) or none (content-free tombstone).
     CHECK (
