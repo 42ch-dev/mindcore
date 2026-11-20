@@ -19,10 +19,10 @@ use mindcore_base::ir::wire::{
     memory_record_to_wire, review_receipt_from_wire, review_receipt_to_wire, WireVersion,
 };
 use mindcore_base::ir::{
-    CandidateState, MemoryCandidateIr, MemoryGrantRow, MemoryJournalRow, MemoryProfileRow,
-    MemoryProviderMetaRow, MemoryRecordIr, MemoryReflectionRow, MemoryRepository, MemorySpaceRow,
-    MemorySubjectRow, Placement, PlacementSelection, ReceiptKey, ReceiptLease, ReceiptRead,
-    RecordSelection, ReviewReceiptIr,
+    CandidateSelection, CandidateState, MemoryCandidateIr, MemoryGrantRow, MemoryJournalRow,
+    MemoryProfileRow, MemoryProviderMetaRow, MemoryRecordIr, MemoryReflectionRow, MemoryRepository,
+    MemorySpaceRow, MemorySubjectRow, Placement, PlacementSelection, ReceiptKey, ReceiptLease,
+    ReceiptRead, RecordSelection, ReviewReceiptIr,
 };
 use mindcore_base::memory::RecallQuery;
 
@@ -723,31 +723,42 @@ const REFLECTION_COLUMNS: &str = "seq, reflection_id, space_id, subject_id, \
      engine_policy_version, model, schema_version, revision, extensions_json, created_at, \
      body_text, body_format, cost_unit_kind, cost_units, stale_cache";
 
-/// §7.26 scope containment: does `requested` cover the reflection's pinned selection.
-fn selection_covers(pinned: &Value, requested: &PlacementSelection) -> bool {
-    let mode = pinned.get("mode").and_then(Value::as_str);
-    let pinned = match mode {
-        Some("subject_all") => PlacementSelection::SubjectAll,
-        Some("shared_only") => PlacementSelection::SharedOnly,
-        Some("selected_contexts") => PlacementSelection::SelectedContexts {
-            context_ids: pinned
+/// Parses a persisted reflection selection strictly: unknown modes and malformed members
+/// are `InvalidRow` rather than silently nonmatching or widened.
+fn pinned_selection(selection: &Value) -> RepoResult<PlacementSelection> {
+    match selection.get("mode").and_then(Value::as_str) {
+        Some("subject_all") => Ok(PlacementSelection::SubjectAll),
+        Some("shared_only") => Ok(PlacementSelection::SharedOnly),
+        Some("selected_contexts") => {
+            let ids = selection
                 .get("context_ids")
                 .and_then(Value::as_array)
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
+                .ok_or_else(|| invalid_row("selected_contexts misses context_ids array"))?
+                .iter()
+                .map(|id| {
+                    id.as_str()
                         .map(ContextId::new)
-                        .collect()
+                        .ok_or_else(|| invalid_row("selected_contexts entry is not a string"))
                 })
-                .unwrap_or_default(),
-            include_shared: pinned
+                .collect::<Result<Vec<_>, _>>()?;
+            let include_shared = selection
                 .get("include_shared")
                 .and_then(Value::as_bool)
-                .unwrap_or(false),
-        },
-        _ => return false,
-    };
-    match (&pinned, requested) {
+                .ok_or_else(|| invalid_row("selected_contexts misses include_shared bool"))?;
+            Ok(PlacementSelection::SelectedContexts {
+                context_ids: ids,
+                include_shared,
+            })
+        }
+        other => Err(invalid_row(format_args!(
+            "unknown reflection selection mode {other:?}"
+        ))),
+    }
+}
+
+/// §7.26 scope containment: does `requested` cover the reflection's pinned selection.
+fn selection_covers(pinned: &PlacementSelection, requested: &PlacementSelection) -> bool {
+    match (pinned, requested) {
         (_, PlacementSelection::SubjectAll)
         | (PlacementSelection::SharedOnly, PlacementSelection::SharedOnly) => true,
         (
@@ -817,29 +828,13 @@ fn record_predicate(
         binds.extend(selection.kinds.iter().cloned());
         sql.push(')');
     }
-    match &selection.placement {
-        PlacementSelection::SubjectAll => {}
-        PlacementSelection::SharedOnly => sql.push_str(" AND scope_visibility = 'shared'"),
-        PlacementSelection::SelectedContexts {
-            context_ids,
-            include_shared,
-        } => {
-            if context_ids.is_empty() && !include_shared {
-                sql.push_str(" AND 0");
-            } else if context_ids.is_empty() {
-                sql.push_str(" AND scope_visibility = 'shared'");
-            } else {
-                sql.push_str(" AND (");
-                if *include_shared {
-                    sql.push_str("scope_visibility = 'shared' OR ");
-                }
-                sql.push_str("scope_context_id IN (");
-                placeholders(&mut sql, context_ids.len());
-                binds.extend(context_ids.iter().map(|id| id.as_str().to_string()));
-                sql.push_str("))");
-            }
-        }
-    }
+    placement_clause(
+        &mut sql,
+        &mut binds,
+        &selection.placement,
+        "scope_visibility",
+        "scope_context_id",
+    );
     if let Some(filter) = &selection.provenance_filter {
         if filter.is_empty() {
             sql.push_str(" AND 0");
@@ -855,6 +850,42 @@ fn record_predicate(
         }
     }
     (sql, binds)
+}
+
+/// The shared admitted-placement SQL fragment plus its binds, appended to `sql`/`binds`.
+/// `visibility_column`/`context_column` name the row family's placement columns.
+fn placement_clause(
+    sql: &mut String,
+    binds: &mut Vec<String>,
+    placement: &PlacementSelection,
+    visibility_column: &str,
+    context_column: &str,
+) {
+    match placement {
+        PlacementSelection::SubjectAll => {}
+        PlacementSelection::SharedOnly => {
+            sql.push_str(&format!(" AND {visibility_column} = 'shared'"));
+        }
+        PlacementSelection::SelectedContexts {
+            context_ids,
+            include_shared,
+        } => {
+            if context_ids.is_empty() && !include_shared {
+                sql.push_str(" AND 0");
+            } else if context_ids.is_empty() {
+                sql.push_str(&format!(" AND {visibility_column} = 'shared'"));
+            } else {
+                sql.push_str(" AND (");
+                if *include_shared {
+                    sql.push_str(&format!("{visibility_column} = 'shared' OR "));
+                }
+                sql.push_str(&format!("{context_column} IN ("));
+                placeholders(sql, context_ids.len());
+                binds.extend(context_ids.iter().map(|id| id.as_str().to_string()));
+                sql.push_str("))");
+            }
+        }
+    }
 }
 
 fn placeholders(sql: &mut String, count: usize) {
@@ -1002,13 +1033,14 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> RepoResult<bool> {
         let updated = sqlx::query(
             "UPDATE memory_spaces SET display_name = ?, authority_host_id = ?, \
-             authority_generation = ?, status = ?, revision = revision + 1 \
+             authority_generation = ?, status = ?, revision = ? \
              WHERE space_id = ? AND revision = ?",
         )
         .bind(&row.display_name)
         .bind(&row.authority_host_id)
         .bind(row.authority_generation)
         .bind(&row.status)
+        .bind(revision_i64(&row.revision)?)
         .bind(row.space_id.as_str())
         .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
@@ -1112,13 +1144,14 @@ impl MemoryRepository for SqliteMemoryRepository {
         .map_err(|error| invalid_row(format_args!("fenced_contexts: {error}")))?;
         let updated = sqlx::query(
             "UPDATE memory_subjects SET kind_ns = ?, kind_id = ?, status = ?, \
-             fenced_contexts_json = ?, revision = revision + 1 \
+             fenced_contexts_json = ?, revision = ? \
              WHERE space_id = ? AND subject_id = ? AND revision = ?",
         )
         .bind(kind_ns)
         .bind(kind_id)
         .bind(&row.status)
         .bind(&fenced)
+        .bind(revision_i64(&row.revision)?)
         .bind(row.space_id.as_str())
         .bind(row.subject_id.as_str())
         .bind(revision_i64(observed_revision)?)
@@ -1218,8 +1251,8 @@ impl MemoryRepository for SqliteMemoryRepository {
         let updated = sqlx::query(
             "UPDATE memory_grants SET subject_id = ?, principal_id = ?, capabilities_json = ?, \
              context_ids_json = ?, shared_access = ?, expires_at = ?, revoked_at = ?, \
-             revision = revision + 1 \
-             WHERE grant_id = ? AND revision = ?",
+             revision = ? \
+             WHERE grant_id = ? AND space_id = ? AND revision = ?",
         )
         .bind(row.subject_id.as_ref().map(|id| id.as_str().to_string()))
         .bind(row.principal_id.as_str())
@@ -1228,7 +1261,9 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(i64::from(row.shared_access))
         .bind(&row.expires_at)
         .bind(&row.revoked_at)
+        .bind(revision_i64(&row.revision)?)
         .bind(&row.grant_id)
+        .bind(row.space_id.as_str())
         .bind(revision_i64(observed_revision)?)
         .execute(&mut **tx)
         .await?;
@@ -1240,18 +1275,30 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         space: &SpaceId,
         subject: &str,
-        selection: Option<&str>,
+        selection: &CandidateSelection,
     ) -> RepoResult<Vec<MemoryCandidateIr>> {
+        let mut where_sql = String::from(" WHERE space_id = ? AND subject_id = ?");
+        let mut binds = vec![space.as_str().to_string(), subject.to_string()];
+        placement_clause(
+            &mut where_sql,
+            &mut binds,
+            &selection.placement,
+            "capture_visibility",
+            "capture_context_id",
+        );
+        if let Some(status) = &selection.status {
+            where_sql.push_str(" AND status = ?");
+            binds.push(status.clone());
+        }
         let sql = AssertSqlSafe(format!(
-            "SELECT {CANDIDATE_COLUMNS} FROM memory_candidates \
-             WHERE space_id = ? AND subject_id = ? AND (? IS NULL OR status = ?) \
+            "SELECT {CANDIDATE_COLUMNS} FROM memory_candidates{where_sql} \
              ORDER BY created_at, candidate_id"
         ));
-        sqlx::query(sql)
-            .bind(space.as_str())
-            .bind(subject)
-            .bind(selection)
-            .bind(selection)
+        let mut query = sqlx::query(sql);
+        for bind in &binds {
+            query = query.bind(bind);
+        }
+        query
             .fetch_all(&mut **tx)
             .await?
             .iter()
@@ -1271,12 +1318,12 @@ impl MemoryRepository for SqliteMemoryRepository {
             "UPDATE memory_candidates SET subject_id = ?, capture_visibility = ?, \
              capture_context_id = ?, kind = ?, content_json = ?, provenance_json = ?, \
              classification_json = ?, status = ?, consumed_by_json = ?, content_digest = ?, \
-             occurred_at = ?, expires_at = ?, revision = revision + 1 \
+             occurred_at = ?, expires_at = ?, revision = ? \
              WHERE space_id = ? AND candidate_id = ? AND revision = ?",
         )
         .bind(&row.subject_id)
         .bind(visibility)
-        .bind(context_id)
+        .bind(&context_id)
         .bind(&columns.kind)
         .bind(&columns.content)
         .bind(&columns.provenance)
@@ -1286,6 +1333,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(&columns.content_digest)
         .bind(&row.occurred_at)
         .bind(&columns.expires_at)
+        .bind(revision_i64(&row.revision)?)
         .bind(&row.space_id)
         .bind(&row.candidate_id)
         .bind(revision_i64(observed_revision)?)
@@ -1339,19 +1387,20 @@ impl MemoryRepository for SqliteMemoryRepository {
             "UPDATE memory_records SET subject_id = ?, kind = ?, content_json = ?, \
              scope_visibility = ?, scope_context_id = ?, provenance_json = ?, \
              import_ref_json = ?, occurred_at = ?, tombstone_json = ?, updated_at = ?, \
-             revision = revision + 1 \
+             revision = ? \
              WHERE space_id = ? AND record_id = ? AND revision = ?",
         )
         .bind(&row.subject_id)
         .bind(&row.kind)
         .bind(&columns.content)
         .bind(visibility)
-        .bind(context_id)
+        .bind(&context_id)
         .bind(to_json(&provenance, "record provenance")?)
         .bind(&columns.import_ref)
         .bind(&row.occurred_at)
         .bind(&columns.tombstone)
         .bind(&row.updated_at)
+        .bind(revision_i64(&row.revision)?)
         .bind(&row.space_id)
         .bind(&row.record_id)
         .bind(revision_i64(observed_revision)?)
@@ -1412,13 +1461,14 @@ impl MemoryRepository for SqliteMemoryRepository {
         let updated = sqlx::query(
             "UPDATE memory_receipts SET status = ?, result_json = ?, error_json = ?, \
              completed_at = ? \
-             WHERE receipt_id = ? AND status = ? AND owner_id IS ?",
+             WHERE receipt_id = ? AND space_id = ? AND status = ? AND owner_id IS ?",
         )
         .bind(columns.status)
         .bind(&columns.result)
         .bind(&columns.error)
         .bind(&columns.completed_at)
         .bind(&row.receipt_id)
+        .bind(&row.space_id)
         .bind(observed_state)
         .bind(observed_owner)
         .execute(&mut **tx)
@@ -1495,12 +1545,13 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> RepoResult<bool> {
         let updated = sqlx::query(
             "UPDATE memory_profiles SET document_json = ?, updated_by = ?, updated_at = ?, \
-             revision = revision + 1 \
+             revision = ? \
              WHERE space_id = ? AND subject_id = ? AND profile_kind = ? AND revision = ?",
         )
         .bind(to_json(&row.document, "profile document")?)
         .bind(row.updated_by.as_str())
         .bind(&row.updated_at)
+        .bind(revision_i64(&row.revision)?)
         .bind(row.space_id.as_str())
         .bind(row.subject_id.as_str())
         .bind(&row.profile_kind)
@@ -1529,8 +1580,11 @@ impl MemoryRepository for SqliteMemoryRepository {
         let mut reflections = Vec::with_capacity(rows.len());
         for row in &rows {
             let reflection = reflection_row(row)?;
-            if selection.is_some_and(|scope| !selection_covers(&reflection.selection, scope)) {
-                continue;
+            if let Some(scope) = selection {
+                let pinned = pinned_selection(&reflection.selection)?;
+                if !selection_covers(&pinned, scope) {
+                    continue;
+                }
             }
             reflections.push(reflection);
         }

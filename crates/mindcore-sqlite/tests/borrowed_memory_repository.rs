@@ -494,3 +494,280 @@ async fn recall_scopes_live_records() {
     tx.commit().await.unwrap();
     pool.close().await;
 }
+
+/// F1: `list_candidates` applies the adapter-resolved placement scope in SQL before
+/// returning — a selection limited to `ctx_a` must not see a `ctx_b` candidate.
+#[tokio::test]
+async fn candidate_list_filters_by_admitted_placement() {
+    use mindcore_base::ir::{CandidateSelection, PlacementSelection};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let mut ctx_b = pending_candidate();
+    ctx_b.candidate_id = "cand_b".into();
+    ctx_b.capture_scope = Placement::Context("ctx_b".into());
+    ctx_b.created_at = LATER.into();
+    let mut shared = pending_candidate();
+    shared.candidate_id = "cand_shared".into();
+    shared.capture_scope = Placement::Shared;
+    shared.created_at = "2026-11-20T09:30:00Z".into();
+    repo.insert_candidate(&mut tx, &pending_candidate())
+        .await
+        .unwrap();
+    repo.insert_candidate(&mut tx, &ctx_b).await.unwrap();
+    repo.insert_candidate(&mut tx, &shared).await.unwrap();
+
+    let admitted = CandidateSelection {
+        placement: PlacementSelection::SelectedContexts {
+            context_ids: vec![ContextId::new("ctx_a")],
+            include_shared: false,
+        },
+        status: Some("pending".into()),
+    };
+    let rows = repo
+        .list_candidates(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            &admitted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].candidate_id, "cand_1");
+
+    // With shared included the shared row appears; ctx_b stays invisible.
+    let admitted = CandidateSelection {
+        placement: PlacementSelection::SelectedContexts {
+            context_ids: vec![ContextId::new("ctx_a")],
+            include_shared: true,
+        },
+        status: None,
+    };
+    let rows = repo
+        .list_candidates(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            &admitted,
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = rows.iter().map(|c| c.candidate_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["cand_1", "cand_shared"]);
+
+    // SharedOnly yields exactly the shared row.
+    let admitted = CandidateSelection {
+        placement: PlacementSelection::SharedOnly,
+        status: None,
+    };
+    let rows = repo
+        .list_candidates(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            &admitted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].candidate_id, "cand_shared");
+    tx.commit().await.unwrap();
+    pool.close().await;
+}
+
+/// F2: a guarded update whose replacement row carries a different space misses — no
+/// mutation, not a false success.
+#[tokio::test]
+async fn guarded_updates_do_not_cross_spaces() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, authority_host_id, authority_generation, status, revision, created_at) \
+         VALUES ('spc_other', 'host-2', 1, 'active', 1, ?)",
+    )
+    .bind(TIME)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_subjects \
+         (space_id, subject_id, status, revision, created_at) \
+         VALUES ('spc_other', 'sub_mira', 'active', 1, ?)",
+    )
+    .bind(TIME)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let grant = mindcore_base::ir::MemoryGrantRow {
+        grant_id: "gnt_1".into(),
+        space_id: SpaceId::new("spc_workshop"),
+        subject_id: Some(SubjectId::new("sub_mira")),
+        principal_id: CallerId::new("prn_mira"),
+        capabilities: vec!["read".into()],
+        context_ids: vec![ContextId::new("ctx_a")],
+        shared_access: true,
+        expires_at: None,
+        revoked_at: None,
+        revision: Number::from(1),
+        created_at: TIME.into(),
+        extensions: Map::new(),
+    };
+    repo.insert_grant(&mut tx, &grant).await.unwrap();
+
+    // A replacement row claiming the wrong space must not mutate the real row.
+    let mut forged = grant.clone();
+    forged.space_id = SpaceId::new("spc_other");
+    forged.revoked_at = Some(LATER.into());
+    forged.revision = Number::from(2);
+    assert!(!repo
+        .update_grant(&mut tx, &forged, &Number::from(1))
+        .await
+        .unwrap());
+    let kept = repo
+        .grant(&mut tx, &SpaceId::new("spc_workshop"), "gnt_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(kept.revoked_at.is_none());
+
+    // Same scoping for receipts, including the unleased (NULL owner) path.
+    repo.insert_receipt(&mut tx, &committed_receipt(), None)
+        .await
+        .unwrap();
+    let mut forged_receipt = committed_receipt();
+    forged_receipt.space_id = "spc_other".into();
+    forged_receipt.state = ReceiptState::Pending;
+    assert!(!repo
+        .update_receipt(&mut tx, &forged_receipt, "committed", None)
+        .await
+        .unwrap());
+    match repo
+        .receipt(&mut tx, &SpaceId::new("spc_workshop"), "rcp_1")
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        ReceiptRead::Retained(receipt) => {
+            assert!(matches!(receipt.state, ReceiptState::Committed { .. }))
+        }
+        ReceiptRead::Evicted { .. } => panic!("receipt body must be retained"),
+    }
+    tx.commit().await.unwrap();
+    pool.close().await;
+}
+
+/// F4: malformed persisted reflection selections fail `InvalidRow`, never silently
+/// nonmatch or widen.
+#[tokio::test]
+async fn malformed_reflection_selections_fail_invalid_row() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    for (id, selection) in [
+        ("rfl_bad_mode", json!({"mode": "everywhere"})),
+        (
+            "rfl_bad_entry",
+            json!({"mode": "selected_contexts", "context_ids": ["ctx_a", 3], "include_shared": false}),
+        ),
+        (
+            "rfl_missing_fields",
+            json!({"mode": "selected_contexts", "context_ids": ["ctx_a"]}),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO memory_reflections \
+             (seq, reflection_id, space_id, subject_id, requester_principal_id, \
+              selection_json, basis_json, engine_policy_version, schema_version, revision, \
+              extensions_json, created_at, body_text, body_format, stale_cache) \
+             VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
+               ?, 'spc_workshop', 'sub_mira', 'prn_mira', ?, '{\"digest\":\"d\"}', 'v1', 1, 1, \
+               '{}', ?, 'text', 'markdown', 0)",
+        )
+        .bind(id)
+        .bind(selection.to_string())
+        .bind(TIME)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+
+    use mindcore_base::ir::PlacementSelection;
+    // Any covers evaluation over a malformed row fails `InvalidRow`.
+    let outcome = repo
+        .list_reflections(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            Some(&PlacementSelection::SubjectAll),
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
+    ));
+    tx.commit().await.unwrap();
+    pool.close().await;
+}
+
+/// F5: the replacement row's own revision is stored under the observed-revision guard;
+/// a stale observation misses and writes nothing.
+#[tokio::test]
+async fn update_persists_supplied_revision() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    repo.insert_record(&mut tx, &live_record()).await.unwrap();
+
+    // observed=1, supplied revision=7 → stored revision is 7, not 2.
+    let mut bumped = live_record();
+    bumped.kind = "renamed_kind".into();
+    bumped.revision = Number::from(7);
+    bumped.updated_at = LATER.into();
+    assert!(repo
+        .update_record(&mut tx, &bumped, &Number::from(1))
+        .await
+        .unwrap());
+    let stored = repo
+        .record(&mut tx, &SpaceId::new("spc_workshop"), "rec_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.revision, Number::from(7));
+    assert_eq!(stored.kind, "renamed_kind");
+
+    // A stale observed revision (1 against stored 7) misses and writes nothing.
+    let mut stale = live_record();
+    stale.kind = "stale_kind".into();
+    stale.revision = Number::from(2);
+    assert!(!repo
+        .update_record(&mut tx, &stale, &Number::from(1))
+        .await
+        .unwrap());
+    let kept = repo
+        .record(&mut tx, &SpaceId::new("spc_workshop"), "rec_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.kind, "renamed_kind");
+    assert_eq!(kept.revision, Number::from(7));
+    tx.commit().await.unwrap();
+    pool.close().await;
+}

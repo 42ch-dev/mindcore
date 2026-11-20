@@ -280,6 +280,14 @@ pub struct RecordSelection {
     pub include_tombstoned: bool,
 }
 
+/// The adapter-resolved predicate of a candidate list: the admitted placement scope the
+/// caller may see plus the optional `status` filter (`"pending"`/`"consumed"`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CandidateSelection {
+    pub placement: PlacementSelection,
+    pub status: Option<String>,
+}
+
 /// The Reflection-generation lease stamped on a pending receipt (§7.0.3 liveness).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiptLease {
@@ -496,14 +504,15 @@ pub trait MemoryRepository: Send + Sync {
         observed_revision: &Number,
     ) -> Result<bool, Self::Error>;
 
-    /// Candidates of one subject, oldest first; `selection` is the optional
-    /// `status` filter the adapter resolved (`"pending"`, `"consumed"` or none).
+    /// Candidates of one subject, oldest first, filtered before any paging by the
+    /// adapter-resolved selection: only rows whose placement the admitted set covers,
+    /// optionally narrowed to one `status` (`"pending"`/`"consumed"`).
     async fn list_candidates(
         &self,
         tx: &mut Self::Tx<'_>,
         space: &SpaceId,
         subject: &str,
-        selection: Option<&str>,
+        selection: &CandidateSelection,
     ) -> Result<Vec<MemoryCandidateIr>, Self::Error>;
 
     /// Replaces a candidate row guarded by its previously observed revision.
