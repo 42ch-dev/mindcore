@@ -2089,6 +2089,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mindcore-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mindcore-base",
+ "mindcore-spi",
+ "mindcore-spoke",
+ "mindcore-sqlite",
+ "serde_json",
+ "spoke-connect",
+ "spoke-operations",
+ "spoke-schemas",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "mindcore-spi"
 version = "0.1.0"
 dependencies = [
