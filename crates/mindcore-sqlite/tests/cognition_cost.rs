@@ -57,7 +57,10 @@ impl tracing::Subscriber for StatementCounter {
 /// N history rows adds ~N steps; an indexed lookup adds none of them. The handler
 /// lives on the connection (locked out of the worker thread only for the call).
 async fn install_step_counter(connection: &mut SqliteConnection) {
-    let mut handle = connection.lock_handle().await.expect("lock the sqlite handle");
+    let mut handle = connection
+        .lock_handle()
+        .await
+        .expect("lock the sqlite handle");
     // sqlx's callback contract is inverted from SQLite's: returning `true` continues.
     handle.set_progress_handler(1, || {
         VDBE_STEPS.fetch_add(1, Ordering::Relaxed);
@@ -68,7 +71,10 @@ async fn install_step_counter(connection: &mut SqliteConnection) {
 /// Detaches the counter so unmeasured statements on the same pooled connection
 /// (filler appends, header reads) are never counted.
 async fn remove_step_counter(connection: &mut SqliteConnection) {
-    let mut handle = connection.lock_handle().await.expect("lock the sqlite handle");
+    let mut handle = connection
+        .lock_handle()
+        .await
+        .expect("lock the sqlite handle");
     handle.remove_progress_handler();
 }
 

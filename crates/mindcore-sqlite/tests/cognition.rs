@@ -853,8 +853,10 @@ async fn append_rejects_a_stale_revision_without_touching_rows() {
 
     // Complete pre-rejection snapshot: the rejected transaction is compared against
     // these bytes record-by-record, not by record ids alone.
-    let committed =
-        expect_ok(read_records(&pool, "wren", "ke_wren").await, "committed records");
+    let committed = expect_ok(
+        read_records(&pool, "wren", "ke_wren").await,
+        "committed records",
+    );
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
     match append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_newer", 0.5)).await {
@@ -923,8 +925,10 @@ async fn append_rejects_a_duplicate_id_at_the_current_revision() {
 
     // Complete pre-rejection snapshot: the rejected transaction is compared against
     // these bytes record-by-record, not by record ids alone.
-    let committed =
-        expect_ok(read_records(&pool, "wren", "ke_wren").await, "committed records");
+    let committed = expect_ok(
+        read_records(&pool, "wren", "ke_wren").await,
+        "committed records",
+    );
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
     match append_cognition(&mut tx, "wren", "ke_wren", 2, &belief("cog_hearsay", 0.9)).await {
