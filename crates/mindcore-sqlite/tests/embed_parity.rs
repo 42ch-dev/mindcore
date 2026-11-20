@@ -18,7 +18,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use spoke_operations::{SpokeRejectCode, SpokeResult};
+use spoke_operations::{jcs_sha256_hex, SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, SqlitePool, Transaction};
@@ -1211,8 +1211,12 @@ async fn journaled_effect_survives_reopen_and_settles() {
     let mut harness = Harness::open().await;
     let adapter = MemoryAdapter::new(true);
     let admin = principal(PRINCIPAL);
+
+    // Baseline L3 pre-COMMIT fault: the caller drops its transaction before
+    // committing, so no record, receipt, intent or file target is durable —
+    // including across the pool close/reopen.
     let mut tx = harness.begin().await;
-    let pending = staged(
+    staged(
         adapter
             .create_record(
                 &mut tx,
@@ -1222,10 +1226,32 @@ async fn journaled_effect_survives_reopen_and_settles() {
                     "subject_id": SUBJECT,
                     "kind": "fact",
                     "scope": { "visibility": "shared" },
-                    "content": { "text": "a journaled record body" },
-                    "idempotency_key": "reopen-create",
+                    "content": { "text": "a rolled-back record body" },
+                    "idempotency_key": "j-rollback",
                 }),
             )
+            .await,
+        "records.create",
+    );
+    tx.rollback().await.expect("pre-commit fault");
+    harness.reopen().await;
+    for table in ["memory_records", "memory_receipts", "memory_journal"] {
+        assert_eq!(harness.count(table).await, 0, "{table} must stay empty");
+    }
+
+    // Baseline L3 normal path: journaled create committed by the caller.
+    let create_request = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "kind": "fact",
+        "scope": { "visibility": "shared" },
+        "content": { "text": "a journaled record body" },
+        "idempotency_key": "reopen-create",
+    });
+    let mut tx = harness.begin().await;
+    let pending = staged(
+        adapter
+            .create_record(&mut tx, &admin, create_request.clone())
             .await,
         "records.create",
     )
@@ -1248,6 +1274,51 @@ async fn journaled_effect_survives_reopen_and_settles() {
     assert_eq!(state, "pending");
     assert_ne!(targets, "[]", "an unsettled intent keeps its targets");
     assert_eq!(harness.count("memory_records").await, 1);
+    let record_id: String = sqlx::query_scalar("SELECT record_id FROM memory_records")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("staged record row");
+
+    // Post-COMMIT fault leg: replaying the identical request while the
+    // receipt is pending reports OUTCOME_UNCERTAIN — the dedup probe finds
+    // the pending receipt and refuses before a second effect can stage.
+    let mut tx = harness.begin().await;
+    match adapter
+        .create_record(&mut tx, &admin, create_request.clone())
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+        }
+        other => panic!("pending replay must report uncertain: {other:?}"),
+    }
+    tx.rollback().await.expect("read-only replay tx");
+    assert_eq!(harness.count("memory_records").await, 1);
+    assert_eq!(harness.count("memory_journal").await, 1);
+
+    // File leg: every target the intent owes is a digest-matched file the
+    // caller publishes into `memory-store/` beside the fixture DB. The
+    // digest is JCS/SHA-256 over {"content": <bytes>} — recomputed the same
+    // way the adapter stamped it.
+    let store_dir = harness
+        .db
+        .parent()
+        .expect("fixture root")
+        .join("memory-store");
+    for target in serde_json::from_str::<Vec<Value>>(&targets).expect("targets json") {
+        let rel = target["path"].as_str().expect("target path");
+        let digest = target["digest"].as_str().expect("target digest");
+        let content = target["content"].as_str().expect("target content");
+        let file = store_dir.join(rel);
+        std::fs::create_dir_all(file.parent().expect("target dir")).expect("mkdir");
+        std::fs::write(&file, content).expect("publish target");
+        let landed = std::fs::read_to_string(&file).expect("read published target");
+        let recomputed = match jcs_sha256_hex(&json!({ "content": landed })) {
+            SpokeResult::Ok(digest) => digest,
+            SpokeResult::Reject(reject) => panic!("digest recompute rejected: {reject:?}"),
+        };
+        assert_eq!(recomputed, digest, "digest-matched file for {rel}");
+    }
 
     // Phase 2: settle_journal in a fresh caller transaction commits the
     // receipt and applies the intent; before it commits a poll reports
@@ -1288,6 +1359,36 @@ async fn journaled_effect_survives_reopen_and_settles() {
     assert_eq!(status, "committed");
     assert_eq!(state, "applied");
     assert_eq!(targets, "[]", "settlement scrubs the targets");
+
+    // Replay-does-not-duplicate-publish: a second settle of the committed
+    // receipt returns the stored outcome, and replaying the original op
+    // request serves the committed receipt — neither stages a second effect,
+    // record or intent.
+    let mut tx = harness.begin().await;
+    let body = match adapter
+        .settle_journal(&mut tx, &pending_space(), &pending)
+        .await
+    {
+        SpokeResult::Ok(body) => body,
+        other => panic!("re-settle must return the stored outcome: {other:?}"),
+    };
+    assert_eq!(body["status"], "committed");
+    let body = ready(
+        adapter.create_record(&mut tx, &admin, create_request).await,
+        "records.create replay",
+    );
+    assert_eq!(body["status"], "committed");
+    assert_eq!(body["result"]["record_id"], record_id);
+    tx.commit().await.expect("replay tx commit");
+    assert_eq!(harness.count("memory_records").await, 1);
+    assert_eq!(harness.count("memory_journal").await, 1);
+
+    // The published projection survives the settle: digest-checkable bytes
+    // on disk, durable receipt + applied intent in the reopened DB.
+    assert!(
+        store_dir.join(format!("records/{record_id}.md")).exists(),
+        "record projection file published"
+    );
 }
 
 /// O1: the unadvertised build refuses every Reflection selector — the same
@@ -1492,4 +1593,295 @@ async fn reflection_lease_completes_in_second_transaction() {
         body["reflections"].as_array().expect("reflections").len(),
         1
     );
+}
+
+/// Baseline D3: candidate visibility tracks the caller's coverage, not the
+/// caller's identity. A principal granted `review` on U restricted to ctx-a
+/// reads the ctx-a candidate but gets `NOT_FOUND` for the ctx-b one; after
+/// the review consumes the in-scope candidate, the same restricted read
+/// serves the digest-bearing shell with its receipt link and no proposed
+/// body.
+#[tokio::test]
+async fn restricted_caller_candidate_visibility() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+    let reviewer = principal("ctr_p");
+    let mut tx = harness.begin().await;
+
+    // Grant P review coverage on U confined to ctx-a, no shared access.
+    ready(
+        adapter
+            .grant(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "principal_id": "ctr_p",
+                    "capabilities": ["review"],
+                    "context_ids": [CTX_A],
+                    "shared_access": false,
+                    "idempotency_key": "d3-grant",
+                }),
+            )
+            .await,
+        "grants.grant",
+    );
+
+    let mut candidates = Vec::new();
+    for (context, key) in [(CTX_A, "d3-cap-a"), ("ctx-b", "d3-cap-b")] {
+        let body = ready(
+            adapter
+                .capture(
+                    &mut tx,
+                    &admin,
+                    json!({
+                        "space_id": SPACE,
+                        "subject_id": SUBJECT,
+                        "capture_scope": { "visibility": "context", "context_id": context },
+                        "content": { "text": "a scoped candidate body" },
+                        "idempotency_key": key,
+                    }),
+                )
+                .await,
+            "capture",
+        );
+        candidates.push(
+            body["result"]["candidate_ids"][0]
+                .as_str()
+                .expect("candidate id")
+                .to_string(),
+        );
+    }
+    let [cand_a, cand_b] = candidates.as_slice() else {
+        unreachable!()
+    };
+
+    // In-scope: the restricted caller reads its own pending candidate.
+    let body = ready(
+        adapter
+            .get_candidate(
+                &mut tx,
+                &reviewer,
+                json!({ "space_id": SPACE, "candidate_id": cand_a }),
+            )
+            .await,
+        "candidates.get",
+    );
+    assert_eq!(body["candidate"]["status"], "pending");
+
+    // Out of scope: the ctx-b candidate hides exactly as an absent id.
+    match adapter
+        .get_candidate(
+            &mut tx,
+            &reviewer,
+            json!({ "space_id": SPACE, "candidate_id": cand_b }),
+        )
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::NotFound);
+            assert_eq!(
+                reject.details.as_ref().expect("details")["retry_class"],
+                "terminal"
+            );
+        }
+        other => panic!("out-of-scope candidate must hide: {other:?}"),
+    }
+
+    // Admin consumes cand_a by review-promote; the post-consume restricted
+    // read serves the consumed shell — digest + consuming receipt, no body.
+    let receipt_id = staged(
+        adapter
+            .review_candidate(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "candidate_id": cand_a,
+                    "expected_revision": 1,
+                    "decision": { "action": "promote" },
+                    "idempotency_key": "d3-review",
+                }),
+            )
+            .await,
+        "candidates.review",
+    )
+    .expect("review is journaled");
+    let body = ready(
+        adapter
+            .get_candidate(
+                &mut tx,
+                &reviewer,
+                json!({ "space_id": SPACE, "candidate_id": cand_a }),
+            )
+            .await,
+        "candidates.get post-consume",
+    );
+    let candidate = &body["candidate"];
+    assert_eq!(candidate["status"], "consumed");
+    assert!(
+        candidate["content_digest"]
+            .as_str()
+            .is_some_and(|d| d.len() == 64),
+        "consumed shell carries a content digest: {candidate}"
+    );
+    assert_eq!(candidate["consumed_by"]["receipt_id"], receipt_id);
+    assert!(
+        candidate["proposed"]["content"].is_null(),
+        "consumed shell must not carry the proposed body: {candidate}"
+    );
+
+    tx.commit().await.expect("caller commit");
+}
+
+/// Baseline D10: `records.promote` INTO shared scope — the context-scoped
+/// record lands in `shared` at the bumped revision, its provenance survives
+/// the move, and list membership flips: shared gains the row, ctx-a loses
+/// it. The change is journaled (pending receipt + intent staged in-tx).
+#[tokio::test]
+async fn promotion_into_shared_scope() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let admin = principal(PRINCIPAL);
+    let mut tx = harness.begin().await;
+
+    // Baseline carrier: a record authored into context scope ctx-a.
+    staged(
+        adapter
+            .create_record(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "kind": "fact",
+                    "scope": { "visibility": "context", "context_id": CTX_A },
+                    "source_context_ids": ["ctx-b"],
+                    "content": { "text": "a context-scoped record body" },
+                    "idempotency_key": "d10-create",
+                }),
+            )
+            .await,
+        "records.create",
+    );
+    let rn: String = sqlx::query_scalar("SELECT record_id FROM memory_records")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("created record staged");
+    let provenance: String =
+        sqlx::query_scalar("SELECT provenance_json FROM memory_records WHERE record_id = ?1")
+            .bind(&rn)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("provenance before promote");
+
+    // Before: ctx-a sees the record, shared does not.
+    let body = ready(
+        adapter
+            .list_records(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "selected_contexts", "context_ids": [CTX_A] },
+                }),
+            )
+            .await,
+        "records.list ctx-a",
+    );
+    assert_eq!(body["records"].as_array().expect("records").len(), 1);
+    let body = ready(
+        adapter
+            .list_records(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "shared_only" },
+                }),
+            )
+            .await,
+        "records.list shared",
+    );
+    assert!(body["records"].as_array().expect("records").is_empty());
+
+    // Promote into shared scope; the row updates in the caller's tx.
+    staged(
+        adapter
+            .promote_record(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "record_id": rn,
+                    "expected_revision": 1,
+                    "target_scope": { "visibility": "shared" },
+                    "idempotency_key": "d10-promote",
+                }),
+            )
+            .await,
+        "records.promote",
+    )
+    .expect("promote is journaled");
+    let (visibility, context_id, revision, provenance_after): (
+        String,
+        Option<String>,
+        i64,
+        String,
+    ) = sqlx::query_as(
+        "SELECT scope_visibility, scope_context_id, revision, provenance_json \
+         FROM memory_records WHERE record_id = ?1",
+    )
+    .bind(&rn)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("promoted row");
+    assert_eq!(visibility, "shared");
+    assert_eq!(context_id, None);
+    assert_eq!(revision, 2);
+    assert_eq!(
+        provenance_after, provenance,
+        "provenance survives promotion"
+    );
+
+    // After: membership flips — shared serves the record, ctx-a no longer.
+    let body = ready(
+        adapter
+            .list_records(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "shared_only" },
+                }),
+            )
+            .await,
+        "records.list shared after",
+    );
+    let records = body["records"].as_array().expect("records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], rn);
+    let body = ready(
+        adapter
+            .list_records(
+                &mut tx,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "selection": { "mode": "selected_contexts", "context_ids": [CTX_A] },
+                }),
+            )
+            .await,
+        "records.list ctx-a after",
+    );
+    assert!(body["records"].as_array().expect("records").is_empty());
+
+    tx.commit().await.expect("caller commit");
+    assert_eq!(harness.count("memory_journal").await, 2);
 }
