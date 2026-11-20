@@ -182,11 +182,12 @@ fn namespace(key: &str) -> bool {
         })
 }
 
+// I-000024: an extension map is bounded by its KEYS (the namespace grammar);
+// values are opaque and never descended into — the encoder emits them verbatim.
 fn is_extension_map(value: &Value) -> bool {
-    value.as_object().is_some_and(|map| {
-        map.iter()
-            .all(|(key, value)| namespace(key) && value.is_object())
-    })
+    value
+        .as_object()
+        .is_some_and(|map| map.keys().all(|key| namespace(key)))
 }
 
 fn extensions(value: Value) -> Option<Object> {
@@ -402,8 +403,9 @@ fn modules_from_wire(value: Value) -> Result<KnowledgeModules, WireError> {
 fn cognition_from_wire(value: Value) -> Result<CognitionModule, WireError> {
     const NAME: &str = "knowledge_entry.modules.cognition";
     // Decode (and rule-check) members first so this module's extensions follow the same
-    // shared rule as every other extensions site; the pinned SPOKE gate stays as the
-    // whole-shape validation of records, facts and unknown members.
+    // shared key-only rule as every other extensions site; the pinned SPOKE gate stays as
+    // whole-shape validation of records, facts and unknown members — it still rejects
+    // non-object extension values on cognition sites.
     let mut fields = Fields::new(NAME, value.clone())?;
     let module = CognitionModule {
         records: fields.read("records", array)?,

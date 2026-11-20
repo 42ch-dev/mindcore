@@ -439,12 +439,14 @@ fn cognition_module_extensions_share_the_extension_rule() {
         Err(WireError::InvalidField { .. })
     ));
 
+    // A namespace key with a non-object value passes the codec's key-only rule but is
+    // still refused by the pinned SPOKE cognition gate.
     let mut entry = knowledge_entry();
     entry["modules"] = json!({"cognition": cognition_module()});
     entry["modules"]["cognition"]["extensions"] = json!({"vendor": "not-an-object"});
     assert!(matches!(
         knowledge_entry_from_wire(entry),
-        Err(WireError::InvalidField { .. })
+        Err(WireError::Cognition(..))
     ));
 
     let mut entry = knowledge_entry();
@@ -469,9 +471,9 @@ fn cognition_module_extensions_share_the_extension_rule() {
 }
 
 // I-000024 (member sites): schema-declared cognition record, world-fact and
-// memory-content cognition-record `extensions` go through the same namespace-keyed rule
-// before the pinned SPOKE validator. An invalid map must be `InvalidField`, not a
-// SPOKE-gated `Cognition` pass through.
+// memory-content cognition-record `extensions` go through the same key-only rule before
+// the pinned SPOKE validator. A non-namespace key is `InvalidField`; a namespace key
+// with a non-object value passes the codec and is refused by SPOKE as `Cognition`.
 #[test]
 fn cognition_member_extensions_share_the_extension_rule() {
     for site in ["records", "world_facts"] {
@@ -490,17 +492,15 @@ fn cognition_member_extensions_share_the_extension_rule() {
             "{site} member namespace key"
         );
 
-        // Non-object namespace value.
+        // A namespace key with a non-object value passes the codec's key-only rule but is
+        // still refused by the pinned SPOKE cognition gate.
         let mut entry = knowledge_entry();
         entry["modules"] = json!({"cognition": cognition_module()});
         entry["modules"]["cognition"][site][0]["extensions"] = json!({"vendor": [1, 2]});
         assert!(
             matches!(
                 knowledge_entry_from_wire(entry),
-                Err(WireError::InvalidField {
-                    field: "extensions",
-                    ..
-                })
+                Err(WireError::Cognition(..))
             ),
             "{site} member non-object value"
         );
@@ -545,4 +545,50 @@ fn modules_is_an_object_with_object_or_array_values() {
     let modules = ir.modules.as_ref().unwrap();
     assert_eq!(modules.other["array_ns"], json!([true, ["z", "a"], null]));
     assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+}
+
+// I-000024: extension values are opaque — the key grammar bounds the map, and any JSON
+// value shape round-trips losslessly at every non-SPOKE-gated extension site.
+#[test]
+fn extension_values_are_opaque_and_round_trip() {
+    for value in [json!(5), json!([1, "two", null]), json!("text")] {
+        let mut entry = knowledge_entry();
+        entry["extensions"] = json!({"md_note": value.clone()});
+        entry["source_anchor"] = anchor();
+        entry["source_anchor"]["extensions"] = json!({"md_note": value.clone()});
+        let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
+        assert_eq!(knowledge_entry_to_wire(version, ir), entry);
+
+        let mut candidate = pending_candidate();
+        candidate["extensions"] = json!({"md_note": value.clone()});
+        candidate["provenance"]["anchors"][0]["extensions"] = json!({"md_note": value.clone()});
+        let (version, ir) = memory_candidate_from_wire(candidate.clone()).unwrap();
+        assert_eq!(memory_candidate_to_wire(version, ir), candidate);
+
+        let mut receipt = failed_receipt();
+        receipt["extensions"] = json!({"md_note": value.clone()});
+        receipt["error"]["extensions"] = json!({"md_note": value.clone()});
+        let (version, ir) = review_receipt_from_wire(receipt.clone()).unwrap();
+        assert_eq!(review_receipt_to_wire(version, ir), receipt);
+    }
+
+    // A key outside the namespace grammar is still refused on every site.
+    let mut entry = knowledge_entry();
+    entry["extensions"] = json!({"md.note": 1});
+    assert!(matches!(
+        knowledge_entry_from_wire(entry),
+        Err(WireError::InvalidField {
+            field: "extensions",
+            ..
+        })
+    ));
+    let mut candidate = pending_candidate();
+    candidate["provenance"]["anchors"][1]["extensions"] = json!({"md.note": 1});
+    assert!(matches!(
+        memory_candidate_from_wire(candidate),
+        Err(WireError::InvalidField {
+            field: "extensions",
+            ..
+        })
+    ));
 }
