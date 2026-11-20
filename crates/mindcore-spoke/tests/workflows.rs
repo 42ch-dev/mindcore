@@ -3217,6 +3217,10 @@ async fn a_withheld_read_with_a_warm_page_probes_nothing() {
     let (harness, workflows) = vector_page().await;
     // Warm both caches: the query slot and every page row.
     warm_page(&workflows, &AxisEmbedder::new("1")).await;
+    // The warm recall probed the slot once; a withheld read must not add a
+    // probe, which the dropped table below cannot observe.
+    let probes = workflows.query_slot_probes();
+    assert!(probes > 0, "the warm recall exercised the slot probe");
     // Any vector probe from here is a storage error, so a refusal that still
     // probed could not be reported as the withheld guard.
     sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
@@ -3252,6 +3256,11 @@ async fn a_withheld_read_with_a_warm_page_probes_nothing() {
     assert!(
         embedder.embedded().is_empty(),
         "a warm slot does not let a refused page reach the provider"
+    );
+    assert_eq!(
+        workflows.query_slot_probes(),
+        probes,
+        "the refusal happens before the in-memory query slot is looked up"
     );
 }
 

@@ -335,6 +335,10 @@ pub struct SpiMindWorkflows {
     /// installs it only after it reauthorized the page, and [`Self::retire_identity`]
     /// clears it.
     query_slot: Mutex<Option<QuerySlot>>,
+    /// Test-only: every query-slot lookup, so a refused read can prove it
+    /// never reached the in-memory cache.
+    #[cfg(feature = "recall-probe")]
+    query_slot_probes: std::sync::atomic::AtomicUsize,
 }
 
 /// One validated query vector and the exact scope allowed to reuse it: another
@@ -352,7 +356,19 @@ impl SpiMindWorkflows {
         Self {
             binding: Box::new(binding),
             query_slot: Mutex::new(None),
+            #[cfg(feature = "recall-probe")]
+            query_slot_probes: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many recalls have looked the in-memory query slot up.
+    ///
+    /// Present only under the `recall-probe` feature the integration tests
+    /// enable; it observes the cache boundary a dropped table cannot.
+    #[cfg(feature = "recall-probe")]
+    pub fn query_slot_probes(&self) -> usize {
+        self.query_slot_probes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The slot's query vector, only for the exact scope it was validated in.
@@ -361,6 +377,9 @@ impl SpiMindWorkflows {
         scope: &(String, String, String, String),
         identity: &EmbeddingIdentity,
     ) -> Option<Vec<f32>> {
+        #[cfg(feature = "recall-probe")]
+        self.query_slot_probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let slot = self.query_slot.lock().ok()?;
         let slot = slot.as_ref()?;
         (slot.scope == *scope && slot.identity == *identity).then(|| slot.vector.clone())
