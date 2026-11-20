@@ -487,6 +487,7 @@ fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
 
 struct RecordColumns {
     content: String,
+    provenance: String,
     tombstone: Option<String>,
     import_ref: Option<String>,
 }
@@ -498,6 +499,10 @@ fn record_columns(record: &MemoryRecordIr) -> RepoResult<RecordColumns> {
         content: to_json(
             &object.remove("content").unwrap_or_default(),
             "record content",
+        )?,
+        provenance: to_json(
+            &object.remove("provenance").unwrap_or_default(),
+            "record provenance",
         )?,
         tombstone: object
             .remove("tombstone")
@@ -588,13 +593,7 @@ async fn insert_record_row(tx: &mut Tx<'_>, record: &MemoryRecordIr) -> RepoResu
         &columns.content,
         visibility,
         context_id,
-        to_json(
-            &memory_record_to_wire(version(), record.clone())
-                .get("provenance")
-                .cloned()
-                .unwrap_or_default(),
-            "record provenance",
-        )?,
+        &columns.provenance,
         &columns.import_ref,
         &record.occurred_at,
         &columns.tombstone,
@@ -1623,11 +1622,6 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> RepoResult<bool> {
         let columns = record_columns(row)?;
         let (visibility, context_id) = placement_columns(&row.scope);
-        let mut wire = memory_record_to_wire(version(), row.clone());
-        let provenance = wire
-            .as_object_mut()
-            .and_then(|wire| wire.remove("provenance"))
-            .unwrap_or_default();
         let updated = sqlx::query!(
             "UPDATE memory_records SET subject_id = ?, kind = ?, content_json = ?, \
              scope_visibility = ?, scope_context_id = ?, provenance_json = ?, \
@@ -1639,7 +1633,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             &columns.content,
             visibility,
             &context_id,
-            to_json(&provenance, "record provenance")?,
+            &columns.provenance,
             &columns.import_ref,
             &row.occurred_at,
             &columns.tombstone,
