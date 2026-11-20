@@ -577,11 +577,7 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
     for descriptor in tool.descriptors() {
         let capability_id = descriptor.capability_id.as_str();
         let input = Value::Object(descriptor.input.clone());
-        let definitions = input
-            .get("definitions")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        assert_closed(&input, &definitions, &mut Vec::new());
+        assert_closed(&input, &input, &mut Vec::new());
 
         match capability_id {
             RECALL_CONTEXT => fake.reply_recall(Ok(ContextPack {
@@ -596,7 +592,7 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
             other => panic!("unadvertised tool {other}"),
         }
 
-        let arguments = minimal(&input, &definitions);
+        let arguments = minimal(&input, &input);
         expect_ok(
             tool.call(capability_id, "peer-driver", arguments.clone())
                 .await,
@@ -671,31 +667,31 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
     );
 }
 
-/// Resolve the local `#/definitions/<name>` references the advertised subschemas use.
-fn resolve<'a>(schema: &'a Value, definitions: &'a Value) -> &'a Value {
+/// Resolve the local `#/…` references an advertised subschema uses against the advertised document.
+fn resolve<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
     match schema.get("$ref").and_then(Value::as_str) {
-        Some(reference) => {
-            let name = reference.rsplit('/').next().expect("a $ref fragment");
-            definitions
-                .get(name)
-                .unwrap_or_else(|| panic!("unresolvable $ref {reference}"))
-        }
+        Some(reference) => root
+            .pointer(&reference[1..])
+            .unwrap_or_else(|| panic!("unresolvable $ref {reference}")),
         None => schema,
     }
 }
 
 /// Every object an advertised subschema describes is closed: an `{}` object cannot pass the manifest
-/// and then fail decoding.
-fn assert_closed(schema: &Value, definitions: &Value, seen: &mut Vec<String>) {
+/// and then fail decoding. Every `$ref` must resolve inside the manifest; a manifest-only client
+/// never fetches a schema.
+fn assert_closed(schema: &Value, root: &Value, seen: &mut Vec<String>) {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        // A local definition is walked once; a `$ref` into a pinned SPOKE document is that
-        // document's shape, which this crate does not restate.
-        if !reference.starts_with('#') || seen.iter().any(|visited| visited == reference) {
+        assert!(
+            reference.starts_with('#'),
+            "an advertised $ref must stay inside the manifest: {reference}"
+        );
+        if seen.iter().any(|visited| visited == reference) {
             return;
         }
         seen.push(reference.to_string());
     }
-    let schema = resolve(schema, definitions);
+    let schema = resolve(schema, root);
 
     for key in ["oneOf", "anyOf"] {
         for branch in schema
@@ -704,12 +700,12 @@ fn assert_closed(schema: &Value, definitions: &Value, seen: &mut Vec<String>) {
             .into_iter()
             .flatten()
         {
-            assert_closed(branch, definitions, seen);
+            assert_closed(branch, root, seen);
         }
     }
     if let Some(nested) = schema.get("definitions").and_then(Value::as_object) {
         for definition in nested.values() {
-            assert_closed(definition, definitions, seen);
+            assert_closed(definition, root, seen);
         }
     }
 
@@ -725,7 +721,7 @@ fn assert_closed(schema: &Value, definitions: &Value, seen: &mut Vec<String>) {
                 return;
             };
             for property in properties.values() {
-                assert_closed(property, definitions, seen);
+                assert_closed(property, root, seen);
             }
             for name in schema
                 .get("required")
@@ -744,7 +740,7 @@ fn assert_closed(schema: &Value, definitions: &Value, seen: &mut Vec<String>) {
             schema
                 .get("items")
                 .expect("an advertised array names its items"),
-            definitions,
+            root,
             seen,
         ),
         _ => {}
@@ -753,8 +749,8 @@ fn assert_closed(schema: &Value, definitions: &Value, seen: &mut Vec<String>) {
 
 /// The smallest argument an advertised subschema admits — what a client reading only the manifest
 /// would build. Strings are `x`-repeat, which satisfies every advertised `minLength` and pattern.
-fn minimal(schema: &Value, definitions: &Value) -> Value {
-    let schema = resolve(schema, definitions);
+fn minimal(schema: &Value, root: &Value) -> Value {
+    let schema = resolve(schema, root);
     if let Some(value) = schema.get("const") {
         return value.clone();
     }
@@ -769,7 +765,7 @@ fn minimal(schema: &Value, definitions: &Value) -> Value {
         .or_else(|| schema.get("anyOf"))
         .and_then(Value::as_array)
     {
-        return minimal(&branches[0], definitions);
+        return minimal(&branches[0], root);
     }
 
     match schema.get("type").and_then(Value::as_str) {
@@ -786,7 +782,7 @@ fn minimal(schema: &Value, definitions: &Value) -> Value {
                 let member = properties
                     .and_then(|properties| properties.get(name))
                     .unwrap_or_else(|| panic!("advertised required member {name} has no schema"));
-                object.insert(name.to_string(), minimal(member, definitions));
+                object.insert(name.to_string(), minimal(member, root));
             }
             Value::Object(object)
         }
@@ -799,7 +795,7 @@ fn minimal(schema: &Value, definitions: &Value) -> Value {
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 .max(1);
-            Value::Array((0..count).map(|_| minimal(items, definitions)).collect())
+            Value::Array((0..count).map(|_| minimal(items, root)).collect())
         }
         Some("integer") => Value::from(schema.get("minimum").and_then(Value::as_i64).unwrap_or(1)),
         Some("number") => Value::from(schema.get("minimum").and_then(Value::as_f64).unwrap_or(1.0)),

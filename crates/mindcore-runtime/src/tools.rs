@@ -446,6 +446,8 @@ fn descriptor(
 /// self-contained draft-07 subschema — own `$id`, so its local `#/definitions/…` resolve inside a
 /// manifest — mirroring the pinned `spoke-schemas` request DTOs the handler decodes. A client that
 /// only reads the manifest can build a valid call; `tests/tools.rs` pins each shape against the DTO.
+/// The cognition document is too large to restate by hand, so [`absorb_input`] pins it verbatim and
+/// splices its definitions in.
 fn recall_input() -> Value {
     json!({
         "$id": "https://mindcore.invalid/schemas/tools/recall-context.input.schema.json",
@@ -550,8 +552,103 @@ fn recall_output() -> Value {
     })
 }
 
+/// The pinned `spoke-schemas` 0.17.0 cognition document, verbatim from spoke commit `470e7ad`,
+/// `schemas/data/cognition.schema.json` — the source that crate was generated from.
+const COGNITION_SCHEMA: &str = include_str!("schemas/cognition.schema.json");
+/// The same commit's `schemas/common/common.schema.json`; only the definitions the cognition
+/// document names are spliced.
+const COMMON_SCHEMA: &str = include_str!("schemas/common.schema.json");
+/// Upstream `$ref` prefixes of the pinned documents; every reference uses one of them.
+const COGNITION_REFERENCE: &str =
+    "https://spoke42.invalid/schemas/data/cognition.schema.json#/definitions/";
+const COMMON_REFERENCE: &str =
+    "https://spoke42.invalid/schemas/common/common.schema.json#/definitions/";
+
+/// The pinned cognition document as an advertised subschema's flat `definitions`.
+///
+/// Two mechanical rewrites keep the advertised manifest self-contained, and `tests/tools.rs` holds
+/// every descriptor to both: absolute `$ref`s become local, and every object states its
+/// `additionalProperties`, so openness is never an omission a client must guess at.
+fn cognition_definitions() -> Map<String, Value> {
+    let pinned: Value =
+        serde_json::from_str(COGNITION_SCHEMA).expect("the pinned cognition schema parses");
+    let common: Value =
+        serde_json::from_str(COMMON_SCHEMA).expect("the pinned common schema parses");
+
+    let mut record = pinned
+        .as_object()
+        .expect("the pinned cognition schema is an object")
+        .clone();
+    let mut definitions = record
+        .remove("definitions")
+        .and_then(|definitions| definitions.as_object().cloned())
+        .expect("the pinned cognition schema declares its definitions");
+    record.remove("$id");
+    record.remove("$schema");
+    definitions.insert("cognition_record".to_string(), Value::Object(record));
+
+    let common = common["definitions"]
+        .as_object()
+        .expect("the pinned common schema declares its definitions");
+    for name in ["ExtensionMap", "ForkId", "OpaqueJson", "Timestamp"] {
+        definitions.insert(
+            name.to_string(),
+            common
+                .get(name)
+                .unwrap_or_else(|| panic!("the pinned common schema defines {name}"))
+                .clone(),
+        );
+    }
+
+    for definition in definitions.values_mut() {
+        localize_refs(definition);
+        state_openness(definition);
+    }
+    definitions
+}
+
+/// Point a pinned definition's `$ref`s at the advertised document's own `definitions`.
+fn localize_refs(schema: &mut Value) {
+    match schema {
+        Value::Object(fields) => {
+            if let Some(reference) = fields.get("$ref").and_then(Value::as_str) {
+                let local = reference
+                    .strip_prefix(COGNITION_REFERENCE)
+                    .or_else(|| reference.strip_prefix(COMMON_REFERENCE))
+                    .unwrap_or_else(|| {
+                        panic!("the pinned cognition schema references {reference}")
+                    });
+                fields.insert("$ref".into(), Value::from(format!("#/definitions/{local}")));
+            }
+            for field in fields.values_mut() {
+                localize_refs(field);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(localize_refs),
+        _ => {}
+    }
+}
+
+/// Spell out draft-07's implicit open-object default.
+fn state_openness(schema: &mut Value) {
+    match schema {
+        Value::Object(fields) => {
+            if fields.get("type").and_then(Value::as_str) == Some("object")
+                && !fields.contains_key("additionalProperties")
+            {
+                fields.insert("additionalProperties".into(), Value::Object(Map::new()));
+            }
+            for field in fields.values_mut() {
+                state_openness(field);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(state_openness),
+        _ => {}
+    }
+}
+
 fn absorb_input() -> Value {
-    json!({
+    let mut schema = json!({
         "$id": "https://mindcore.invalid/schemas/tools/absorb.input.schema.json",
         "type": "object",
         "additionalProperties": false,
@@ -596,9 +693,7 @@ fn absorb_input() -> Value {
                         "type": "array",
                         "description": "Recorded-at-time cognition: each entry is a closed pinned \
                                         SPOKE CognitionRecord.",
-                        "items": {
-                            "$ref": "https://spoke42.invalid/schemas/data/cognition.schema.json",
-                        },
+                        "items": { "$ref": "#/definitions/cognition_record" },
                     },
                 },
             },
@@ -648,7 +743,12 @@ fn absorb_input() -> Value {
                 "additionalProperties": { "type": "object" },
             },
         },
-    })
+    });
+    schema["definitions"]
+        .as_object_mut()
+        .expect("the advertised absorb input declares its definitions")
+        .extend(cognition_definitions());
+    schema
 }
 
 fn absorb_output() -> Value {
