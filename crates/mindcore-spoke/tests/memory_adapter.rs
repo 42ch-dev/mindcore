@@ -2243,6 +2243,31 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
     let result = outcome(&harness, &receipt_id).await;
     assert_eq!(result["outcome"], "promoted");
     assert_eq!(result["record_ids"].as_array().expect("records").len(), 1);
+    // An explicit `content_override: null` decodes as absent and the staged
+    // record keeps the candidate's own content.
+    let candidate_id = capture(&harness, "cap-null-override").await;
+    let stage = review(
+        &harness,
+        &adapter,
+        &candidate_id,
+        json!({"action": "promote", "content_override": null}),
+        "rev-null-override",
+    )
+    .await;
+    let receipt_id = journaled(stage);
+    let result = outcome(&harness, &receipt_id).await;
+    assert_eq!(result["outcome"], "promoted");
+    let record_id = result["record_ids"][0].as_str().expect("record id");
+    let content_json: String =
+        sqlx::query_scalar("SELECT content_json FROM memory_records WHERE record_id = ?")
+            .bind(record_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("stored record");
+    assert_eq!(
+        serde_json::from_str::<Value>(&content_json).expect("record content")["text"],
+        "a canonical review candidate to consume"
+    );
 
     // Canonical fragment stages the two named fragments.
     let candidate_id = capture(&harness, "cap-canonical-fragment").await;
@@ -2283,11 +2308,12 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
     // Non-canonical spellings reject as INVALID_INPUT before any effect.
     let candidate_id = capture(&harness, "cap-rejected-shapes").await;
     for (index, decision) in [
-        json!("drop"),                                  // bare string variant
-        json!({"promote": {}}),                         // legacy member spelling
-        json!({"action": "promote", "bogus": 1}),       // extra member
-        json!({"action": "rewrite"}),                   // unknown action
-        json!({"action": "fragment", "fragments": []}), // validator: minItems 1
+        json!("drop"),                                        // bare string variant
+        json!({"promote": {}}),                               // legacy member spelling
+        json!({"action": "promote", "bogus": 1}),             // extra member
+        json!({"action": "promote", "content_override": 42}), // non-object override
+        json!({"action": "rewrite"}),                         // unknown action
+        json!({"action": "fragment", "fragments": []}),       // validator: minItems 1
     ]
     .into_iter()
     .enumerate()
@@ -2305,13 +2331,13 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
         assert_eq!(retry_class(refusal), "terminal");
     }
     // The rejected candidate was never consumed.
-    assert_eq!(harness.count_pool("memory_candidates").await, 4);
+    assert_eq!(harness.count_pool("memory_candidates").await, 5);
     let consumed: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM memory_candidates WHERE status = 'consumed'")
             .fetch_one(&harness.pool)
             .await
             .expect("count consumed");
-    assert_eq!(consumed, 3);
+    assert_eq!(consumed, 4);
 }
 
 /// I-000046: canonical fence targets — `{"type": "subject"}` and

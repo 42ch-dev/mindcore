@@ -149,8 +149,9 @@ fn decision_of(value: &Value) -> AResult<Decision> {
             )?;
             let kind = wire::optional(decision, "kind")?;
             let content = match decision.get("content_override") {
+                // The DTO decodes an explicit null as absent; match it.
+                None | Some(Value::Null) => None,
                 Some(content) => Some(content_wire(content)?),
-                None => None,
             };
             Ok(Decision::Promote { kind, content })
         }
