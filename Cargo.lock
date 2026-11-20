@@ -2112,6 +2112,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek 2.2.0",
  "mindcore-base",
+ "mindcore-spoke",
  "serde_json",
  "spoke-connect",
  "spoke-operations",
