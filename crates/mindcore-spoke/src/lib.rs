@@ -65,6 +65,69 @@ pub struct ReflectionWork {
     pub engine_policy_version: &'static str,
 }
 
+impl ReflectionWork {
+    /// Compose the deterministic §7.27 result outside any transaction: the
+    /// body the pinned basis renders, the cost it owes, and the receipt and
+    /// lease facts transaction 2 settles against. Composing here — after the
+    /// commit — keeps the parked window free of any unfinished envelope.
+    ///
+    /// simplify: the local engine renders the digest-pinned basis snapshot,
+    /// not record bodies; the real cognition engine plugs in at this seam.
+    pub fn compose(self) -> ReflectionEffect {
+        let record_count = self
+            .basis
+            .get("record_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let state_digest = self
+            .basis
+            .get("state_digest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let body_text = format!(
+            "# Reflection\n\nSubject `{}` reflected over {record_count} live basis \
+             records at state `{}` (engine `{}`).\n",
+            self.subject_id,
+            &state_digest[..state_digest.len().min(16)],
+            self.engine_policy_version,
+        );
+        ReflectionEffect {
+            space: self.space,
+            receipt_id: self.receipt_id,
+            owner_id: self.owner_id,
+            subject_id: self.subject_id,
+            selection: self.selection,
+            filter: self.filter,
+            basis: self.basis,
+            body_text,
+            body_format: "markdown".to_string(),
+            cost: ("basis_record".to_string(), record_count as f64),
+            engine_policy_version: self.engine_policy_version,
+        }
+    }
+}
+
+/// The composed §7.27 effect `complete_reflection` settles in transaction 2:
+/// the envelope members plus the receipt identity and lease owner it must
+/// still match.
+#[derive(Debug)]
+pub struct ReflectionEffect {
+    pub space: SpaceId,
+    pub receipt_id: String,
+    /// The lease owner transaction 2 must still find on the pending receipt;
+    /// any other owner or state rolls the envelope back with the settlement.
+    pub owner_id: String,
+    pub subject_id: String,
+    pub selection: Value,
+    pub filter: Option<Value>,
+    pub basis: Value,
+    pub body_text: String,
+    pub body_format: String,
+    /// `(unit_kind, units)` the engine charges this generation.
+    pub cost: (String, f64),
+    pub engine_policy_version: &'static str,
+}
+
 /// The in-process SPOKE memory adapter.
 pub struct MemoryAdapter {
     repository: SqliteMemoryRepository,
@@ -192,7 +255,7 @@ pub(crate) fn principal_id(principal: &Principal) -> &str {
     principal.principal_id.as_str()
 }
 
-fn recorded_failure(failure: &ReceiptFailure) -> Reject {
+pub(crate) fn recorded_failure(failure: &ReceiptFailure) -> Reject {
     let code =
         SpokeRejectCode::try_from_str(&failure.code).unwrap_or(SpokeRejectCode::InternalError);
     let class = failure

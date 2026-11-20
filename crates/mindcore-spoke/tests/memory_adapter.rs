@@ -7,6 +7,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use tempfile::TempDir;
 
+use mindcore_base::ids::SpaceId;
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
@@ -122,7 +123,7 @@ fn principal(id: &str) -> Principal {
     .expect("principal")
 }
 
-fn reject(result: &SpokeResult<MemoryStage>) -> &SpokeReject {
+fn reject<T: std::fmt::Debug>(result: &SpokeResult<T>) -> &SpokeReject {
     match result {
         SpokeResult::Reject(reject) => reject,
         SpokeResult::Ok(_) => panic!("expected a reject, got {result:?}"),
@@ -1108,4 +1109,693 @@ async fn every_named_operation(
         .activate_import(tx, principal, request.clone())
         .await;
     let _: SpokeResult<MemoryStage> = adapter.discard_import(tx, principal, request).await;
+}
+
+/// §7.0.5: the identical request under one idempotency key replays the stored
+/// receipt — one candidate, one receipt, no second effect.
+#[tokio::test]
+async fn identical_capture_key_replays_the_stored_receipt() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let request = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "shared" },
+        "content": { "text": "one effect for one key" },
+        "idempotency_key": "cap-replay"
+    });
+
+    let mut tx = harness.begin().await;
+    let first = ready(
+        adapter
+            .capture(&mut tx, &principal(PRINCIPAL), request.clone())
+            .await,
+    );
+    tx.commit().await.expect("commit");
+
+    let mut tx = harness.begin().await;
+    let replay = ready(
+        adapter
+            .capture(&mut tx, &principal(PRINCIPAL), request)
+            .await,
+    );
+    assert_eq!(replay["receipt_id"], first["receipt_id"]);
+    assert_eq!(replay["result"], first["result"]);
+    assert_eq!(harness.count(&mut tx, "memory_candidates").await, 1);
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.0.4: a stale expected revision rejects before the write path and the
+/// record keeps its stored revision — no second write under a wrong CAS.
+#[tokio::test]
+async fn stale_record_revision_rejects_without_a_second_write() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["records_read", "records_write"])
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    let stage = adapter
+        .create_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "kind": "fact",
+                "scope": { "visibility": "shared" },
+                "content": { "text": "the record a stale update must not touch" },
+                "idempotency_key": "rec-cas"
+            }),
+        )
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    tx.commit().await.expect("commit");
+    let mut tx = harness.begin().await;
+    let body = adapter
+        .settle_journal(&mut tx, &SpaceId::new(SPACE), &receipt_id)
+        .await;
+    let settled = match body {
+        SpokeResult::Ok(body) => body,
+        SpokeResult::Reject(reject) => panic!("settle rejected: {reject:?}"),
+    };
+    let record_id = settled["result"]["record_id"]
+        .as_str()
+        .expect("record id")
+        .to_string();
+    tx.commit().await.expect("commit settle");
+
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .update_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "record_id": record_id,
+                "expected_revision": 7,
+                "idempotency_key": "rec-cas-stale",
+                "content": { "text": "a stale overwrite" }
+            }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(refusal.code, SpokeRejectCode::RevisionConflict);
+    assert_eq!(retry_class(refusal), "terminal");
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    let revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM memory_records WHERE record_id = ?")
+            .bind(&record_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("record");
+    assert_eq!(revision, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.0.5/Y04: the full sequence — grant, effect, revoke A with B still live.
+/// The requester polls the receipt through B while replay of the A effect
+/// refuses `NOT_AUTHORIZED`, and a non-participant sees the same refusal for
+/// known and unknown ids.
+#[tokio::test]
+async fn revoked_coverage_blocks_replay_but_not_poll() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["capture", "records_read"])
+        .await;
+    harness.seed_grant("p_admin", &["admin"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let capture = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "shared" },
+        "content": { "text": "an effect granted under grant A" },
+        "idempotency_key": "cap-y04-seq"
+    });
+
+    // 1-2: admin issues grant A (capture) to the requester; the requester
+    // stages its effect under A.
+    let mut tx = harness.begin().await;
+    let granted = ready(
+        adapter
+            .grant(
+                &mut tx,
+                &principal("p_admin"),
+                json!({
+                    "space_id": SPACE,
+                    "principal_id": "p_grantee",
+                    "capabilities": ["capture"],
+                    "idempotency_key": "grt-a"
+                }),
+            )
+            .await,
+    );
+    let grant_a = granted["result"]["grant_id"]
+        .as_str()
+        .expect("grant id")
+        .to_string();
+    tx.commit().await.expect("commit grant");
+
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .capture(&mut tx, &principal("p_grantee"), capture.clone())
+            .await,
+    );
+    let receipt_id = body["receipt_id"].as_str().expect("receipt").to_string();
+    tx.commit().await.expect("commit capture");
+
+    // 3-4: revoke A and issue B (read-only participation) for the requester.
+    let mut tx = harness.begin().await;
+    let _ = ready(
+        adapter
+            .revoke_grant(
+                &mut tx,
+                &principal("p_admin"),
+                json!({
+                    "space_id": SPACE,
+                    "grant_id": grant_a,
+                    "expected_revision": 1,
+                    "idempotency_key": "grt-a-revoke"
+                }),
+            )
+            .await,
+    );
+    let _ = ready(
+        adapter
+            .grant(
+                &mut tx,
+                &principal("p_admin"),
+                json!({
+                    "space_id": SPACE,
+                    "principal_id": "p_grantee",
+                    "capabilities": ["records_read"],
+                    "idempotency_key": "grt-b"
+                }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit revoke+grant");
+
+    // Poll succeeds through B; replay of the A effect refuses; the stranger
+    // sees the same refusal for known and unknown ids.
+    let mut tx = harness.begin().await;
+    let poll = ready(
+        adapter
+            .get_receipt(
+                &mut tx,
+                &principal("p_grantee"),
+                json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+            )
+            .await,
+    );
+    assert_eq!(poll["receipt"]["status"], "committed");
+
+    let replay = adapter
+        .capture(&mut tx, &principal("p_grantee"), capture)
+        .await;
+    let refusal = reject(&replay);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(refusal), "terminal");
+
+    let known = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(STRANGER),
+            json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+        )
+        .await;
+    let unknown = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(STRANGER),
+            json!({ "space_id": SPACE, "receipt_id": "rct_absent" }),
+        )
+        .await;
+    let known = reject(&known);
+    let unknown = reject(&unknown);
+    assert_eq!(known.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(known.code, unknown.code);
+    assert_eq!(known.message, unknown.message);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §5.2: the caller commits the staged intent, publishes, then a fresh
+/// transaction settles intent and receipt together; a still-pending journal
+/// receipt answers `OUTCOME_UNCERTAIN` on replay and `pending` on poll.
+#[tokio::test]
+async fn settle_journal_applies_intent_and_commits_receipt() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["records_write", "records_read"])
+        .await;
+    let adapter = MemoryAdapter::new(true);
+    let request = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "kind": "fact",
+        "scope": { "visibility": "shared" },
+        "content": { "text": "a journaled record" },
+        "idempotency_key": "rec-journal"
+    });
+
+    let mut tx1 = harness.begin().await;
+    let stage = adapter
+        .create_record(&mut tx1, &principal(PRINCIPAL), request.clone())
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    // Baseline uncertainty before commit: the same key cannot re-stage.
+    let replay = adapter
+        .create_record(&mut tx1, &principal(PRINCIPAL), request.clone())
+        .await;
+    let refusal = reject(&replay);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+    tx1.commit().await.expect("commit stage");
+
+    // Committed stage, still unsettled: replay stays uncertain and the poll
+    // reports the pending status honestly.
+    let mut tx = harness.begin().await;
+    let replay = adapter
+        .create_record(&mut tx, &principal(PRINCIPAL), request.clone())
+        .await;
+    let refusal = reject(&replay);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    let poll = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+        )
+        .await;
+    let refusal = reject(&poll);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+    tx.rollback().await.expect("rollback");
+
+    // After confirmed publication the caller settles in a fresh transaction.
+    let mut tx2 = harness.begin().await;
+    let settled = adapter
+        .settle_journal(&mut tx2, &SpaceId::new(SPACE), &receipt_id)
+        .await;
+    let body = match settled {
+        SpokeResult::Ok(body) => body,
+        SpokeResult::Reject(reject) => panic!("settle rejected: {reject:?}"),
+    };
+    assert_eq!(body["status"], "committed");
+    tx2.commit().await.expect("commit settle");
+
+    let (state, targets): (String, String) =
+        sqlx::query_as("SELECT state, targets_json FROM memory_journal WHERE receipt_id = ?")
+            .bind(&receipt_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("intent");
+    assert_eq!(state, "applied");
+    assert_eq!(
+        serde_json::from_str::<Value>(&targets).expect("targets"),
+        json!([])
+    );
+
+    // Settled: the replay returns the stored result instead of a new effect.
+    let mut tx = harness.begin().await;
+    let replay = ready(
+        adapter
+            .create_record(&mut tx, &principal(PRINCIPAL), request)
+            .await,
+    );
+    assert_eq!(replay["receipt_id"], receipt_id);
+    assert_eq!(harness.count(&mut tx, "memory_records").await, 1);
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §5.2: settlement is atomic — an intent that already moved is uncertainty,
+/// and a pending receipt with no journaled intent is refused; a non-journal
+/// committed receipt settles as its own stored result.
+#[tokio::test]
+async fn settle_journal_reports_mismatch_as_uncertain() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["records_write", "records_read", "capture"])
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    let stage = adapter
+        .create_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "kind": "fact",
+                "scope": { "visibility": "shared" },
+                "content": { "text": "a journaled record" },
+                "idempotency_key": "rec-journal-mis"
+            }),
+        )
+        .await;
+    let pending_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    let capture = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a non-journal receipt" },
+                    "idempotency_key": "cap-nonjournal"
+                }),
+            )
+            .await,
+    );
+    let committed_id = capture["receipt_id"].as_str().expect("receipt").to_string();
+    sqlx::query(
+        "INSERT INTO memory_receipts \
+         (receipt_id, space_id, requester_principal_id, op, idempotency_key, \
+          payload_digest, status, created_at) \
+         VALUES ('rct_orphan', ?, ?, 'memory.records.create', 'orphan-key', ?, 'pending', ?)",
+    )
+    .bind(SPACE)
+    .bind(PRINCIPAL)
+    .bind("a".repeat(64))
+    .bind(NOW)
+    .execute(&mut *tx)
+    .await
+    .expect("seed orphan pending receipt");
+    tx.commit().await.expect("commit");
+
+    let mut tx = harness.begin().await;
+    // The pending receipt carries no intent: refusing, never a receipt/success.
+    let orphan = adapter
+        .settle_journal(&mut tx, &SpaceId::new(SPACE), "rct_orphan")
+        .await;
+    let refusal = reject(&orphan);
+    assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(retry_class(refusal), "terminal");
+
+    // An already-committed non-journal receipt returns its stored result.
+    let settled = adapter
+        .settle_journal(&mut tx, &SpaceId::new(SPACE), &committed_id)
+        .await;
+    assert!(settled.is_ok(), "committed receipt settles: {settled:?}");
+
+    // Force the pending intent ahead of its receipt: the settle pair refuses
+    // as uncertainty and the caller's rollback keeps both sides untouched.
+    sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = ?")
+        .bind(&pending_id)
+        .execute(&mut *tx)
+        .await
+        .expect("move intent");
+    let moved = adapter
+        .settle_journal(&mut tx, &SpaceId::new(SPACE), &pending_id)
+        .await;
+    let refusal = reject(&moved);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+    tx.rollback().await.expect("rollback");
+
+    let (state, status): (String, String) = sqlx::query_as(
+        "SELECT j.state, r.status FROM memory_journal j \
+         JOIN memory_receipts r ON r.receipt_id = j.receipt_id \
+         WHERE j.receipt_id = ?",
+    )
+    .bind(&pending_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("pair");
+    assert_eq!((state.as_str(), status.as_str()), ("pending", "pending"));
+}
+
+/// §7.27/F2: the caller composes the work outside the transaction, then a
+/// fresh transaction inserts the envelope and commits the receipt for the
+/// same owner; a tampered owner rolls both back.
+#[tokio::test]
+async fn complete_reflection_settles_only_for_the_same_owner() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
+        .await;
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_1', ?, ?, 'fact', '{\"text\":\"a live basis record\"}', 'shared', NULL, \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed record");
+    sqlx::query(
+        "INSERT INTO memory_profiles \
+         (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
+          updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(r#"{"body":"a real personality","format":"markdown"}"#)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed profile");
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let state = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" } }),
+            )
+            .await,
+    );
+    let digest = state["state_digest"].as_str().expect("digest").to_string();
+    let request = json!({ "space_id": SPACE, "subject_id": SUBJECT,
+        "selection": { "mode": "subject_all" },
+        "expected_state_digest": digest,
+        "idempotency_key": "gen-two-phase" });
+    let staged = adapter
+        .generate_reflection(&mut tx, &principal(PRINCIPAL), request.clone())
+        .await;
+    let work = match staged {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("expected a reflection pending stage, got {other:?}"),
+    };
+    // The parked window: a leased pending receipt, no envelope, no cost.
+    let (status, owner): (String, String) =
+        sqlx::query_as("SELECT status, owner_id FROM memory_receipts WHERE receipt_id = ?")
+            .bind(&work.receipt_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("pending receipt");
+    assert_eq!(status, "pending");
+    assert_eq!(owner, work.owner_id);
+    assert_eq!(harness.count(&mut tx, "memory_reflections").await, 0);
+    tx.commit().await.expect("commit lease");
+
+    // Phase 2: compose outside the transaction, then settle as the same owner.
+    let effect = work.compose();
+    let mut tx2 = harness.begin().await;
+    let completed = adapter.complete_reflection(&mut tx2, effect).await;
+    let body = match completed {
+        SpokeResult::Ok(body) => body,
+        SpokeResult::Reject(reject) => panic!("completion rejected: {reject:?}"),
+    };
+    assert_eq!(body["status"], "committed");
+    let reflection_id = body["result"]["reflection_id"]
+        .as_str()
+        .expect("reflection id")
+        .to_string();
+    tx2.commit().await.expect("commit completion");
+
+    let (cost_kind, cost_units): (String, f64) = sqlx::query_as(
+        "SELECT cost_unit_kind, cost_units FROM memory_reflections WHERE reflection_id = ?",
+    )
+    .bind(&reflection_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("envelope");
+    assert_eq!(cost_kind, "basis_record");
+    assert_eq!(cost_units, 1.0);
+
+    // Terminal replay returns the stored committed result.
+    let mut tx = harness.begin().await;
+    let replay = ready(
+        adapter
+            .generate_reflection(&mut tx, &principal(PRINCIPAL), request)
+            .await,
+    );
+    assert_eq!(
+        replay["result"]["reflection_id"].as_str().expect("id"),
+        reflection_id
+    );
+    assert_eq!(harness.count(&mut tx, "memory_reflections").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.27/F2: a completion whose owner no longer matches the lease settles
+/// nothing — the envelope and the receipt rollback together — and a replay of
+/// the same key still answers uncertainty.
+#[tokio::test]
+async fn cross_owner_reflection_completion_rolls_both_back() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
+        .await;
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_1', ?, ?, 'fact', '{\"text\":\"a live basis record\"}', 'shared', NULL, \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed record");
+    sqlx::query(
+        "INSERT INTO memory_profiles \
+         (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
+          updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(r#"{"body":"a real personality","format":"markdown"}"#)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed profile");
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let state = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" } }),
+            )
+            .await,
+    );
+    let digest = state["state_digest"].as_str().expect("digest").to_string();
+    let request = json!({ "space_id": SPACE, "subject_id": SUBJECT,
+        "selection": { "mode": "subject_all" },
+        "expected_state_digest": digest,
+        "idempotency_key": "gen-cross-owner" });
+    let staged = adapter
+        .generate_reflection(&mut tx, &principal(PRINCIPAL), request.clone())
+        .await;
+    let work = match staged {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("expected a reflection pending stage, got {other:?}"),
+    };
+    tx.commit().await.expect("commit lease");
+
+    // A completion carrying a different lease owner never settles.
+    let mut effect = work.compose();
+    let receipt_id = effect.receipt_id.clone();
+    effect.owner_id = "own_other".to_string();
+    let mut tx2 = harness.begin().await;
+    let completed = adapter.complete_reflection(&mut tx2, effect).await;
+    let refusal = reject(&completed);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    assert_eq!(retry_class(refusal), "uncertain");
+    tx2.rollback().await.expect("rollback");
+
+    assert_eq!(harness.count_pool("memory_reflections").await, 0);
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM memory_receipts WHERE receipt_id = ?")
+            .bind(&receipt_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("receipt");
+    assert_eq!(status, "pending");
+
+    // A same-key replay of the still-pending effect stays uncertain.
+    let mut tx = harness.begin().await;
+    let replay = adapter
+        .generate_reflection(&mut tx, &principal(PRINCIPAL), request)
+        .await;
+    let refusal = reject(&replay);
+    assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §5.2: a storage failure mid-staging surfaces as a retryable internal
+/// reject — never a receipt or success — and the caller's rollback leaves
+/// every staged row behind.
+#[tokio::test]
+async fn staging_storage_failure_is_no_receipt_or_success() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["records_write", "records_read"])
+        .await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    // The record and the intent stage, then the receipt insert finds the
+    // receipts table gone: nothing may be converted into a success.
+    sqlx::query("CREATE TEMP TABLE memory_receipts_backup AS SELECT * FROM memory_receipts")
+        .execute(&mut *tx)
+        .await
+        .expect("backup");
+    sqlx::query("DROP TABLE memory_receipts")
+        .execute(&mut *tx)
+        .await
+        .expect("drop receipts");
+    let result = adapter
+        .create_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "kind": "fact",
+                "scope": { "visibility": "shared" },
+                "content": { "text": "a record whose receipt staging fails" },
+                "idempotency_key": "rec-fault"
+            }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(refusal.code, SpokeRejectCode::InternalError);
+    assert_eq!(retry_class(refusal), "retryable");
+    tx.rollback().await.expect("rollback erases the stage");
+
+    assert_eq!(harness.count_pool("memory_records").await, 0);
+    assert_eq!(harness.count_pool("memory_receipts").await, 0);
+    assert_eq!(harness.count_pool("memory_journal").await, 0);
 }

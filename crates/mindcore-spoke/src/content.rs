@@ -33,7 +33,7 @@ use mindcore_base::ir::wire::{memory_candidate_from_wire, memory_record_from_wir
 use mindcore_base::ir::{
     CandidateSelection, CandidateState, MemoryCandidateIr, MemoryGrantRow, MemoryJournalRow,
     MemoryProfileRow, MemoryRecordIr, MemoryRepository, PlacementSelection, ReceiptRead,
-    RecordSelection, RecordState,
+    ReceiptState, RecordSelection, RecordState, ReviewReceiptIr,
 };
 
 use crate::admission::{self, Admission, Coverage, Scope};
@@ -42,7 +42,7 @@ use crate::policy;
 use crate::project;
 use crate::reject::{settle, AResult, Reject};
 use crate::wire;
-use crate::{bump, mint, principal_id, MemoryAdapter, MemoryStage, Tx};
+use crate::{bump, mint, principal_id, recorded_failure, MemoryAdapter, MemoryStage, Tx};
 
 fn validated(result: SpokeResult<()>) -> AResult<()> {
     match result {
@@ -1632,6 +1632,14 @@ impl MemoryAdapter {
                         "receipt {receipt_id} belongs to another requester"
                     )));
                 }
+                // §7.28: the poll union carries no pending variant, so a
+                // still-pending receipt answers the same uncertainty the
+                // replay probe reports.
+                if matches!(receipt.state, ReceiptState::Pending) {
+                    return Err(Reject::uncertain(format!(
+                        "receipt {receipt_id} is still pending"
+                    )));
+                }
                 Self::ready::<MemoryReceiptsGetResponse>(
                     json!({ "receipt": project::receipt_body(&receipt) }),
                 )
@@ -1880,6 +1888,100 @@ impl MemoryAdapter {
             space: op.space.clone(),
             receipt_id: receipt_id.to_string(),
         })
+    }
+
+    // ── Journal settlement (§5.2 phase 2) ──────────────────────────────
+
+    /// Settle one journaled intent and its pending receipt together in a
+    /// fresh caller transaction. The caller invokes this only after it has
+    /// confirmed the publication of every effect target the intent staged —
+    /// settlement is the point of no return: it marks the intent `applied`,
+    /// scrubs its owed targets and commits the receipt under one CAS pair.
+    /// A still-pending receipt reports `OUTCOME_UNCERTAIN` on poll/replay
+    /// until this method commits.
+    pub async fn settle_journal(
+        &self,
+        tx: &mut Tx<'_>,
+        space: &SpaceId,
+        receipt_id: &str,
+    ) -> SpokeResult<Value> {
+        settle(self.settle_journal_body(tx, space, receipt_id).await)
+    }
+
+    async fn settle_journal_body(
+        &self,
+        tx: &mut Tx<'_>,
+        space: &SpaceId,
+        receipt_id: &str,
+    ) -> AResult<Value> {
+        let receipt = match self.repository.receipt(tx, space, receipt_id).await? {
+            None => return Err(Reject::not_found(format!("receipt {receipt_id}"))),
+            Some(ReceiptRead::Evicted { status, .. }) => {
+                return Err(Reject::terminal(
+                    SpokeRejectCode::ReceiptExpired,
+                    format!("receipt {receipt_id} body was reclaimed"),
+                )
+                .detail("last_known_status", json!(status)));
+            }
+            Some(ReceiptRead::Retained(receipt)) => receipt,
+        };
+        match &receipt.state {
+            // A second settle of an already-committed receipt returns the
+            // stored outcome; only the pending-to-committed transition writes.
+            ReceiptState::Committed { .. } => {
+                return Ok(project::receipt_body(&receipt));
+            }
+            ReceiptState::Failed { error, .. } => {
+                return Err(recorded_failure(error));
+            }
+            ReceiptState::Pending => {}
+        }
+        let Some(mut intent) = self
+            .repository
+            .journal_intent(tx, space, receipt_id)
+            .await?
+        else {
+            return Err(Reject::invalid(format!(
+                "receipt {receipt_id} has no journaled intent to settle"
+            )));
+        };
+        if intent.state != "pending" {
+            return Err(Reject::uncertain(format!(
+                "journal intent for receipt {receipt_id} is {}",
+                intent.state
+            )));
+        }
+        let settled_at = policy::timestamp(Utc::now());
+        intent.state = "applied".to_string();
+        intent.targets = Vec::new();
+        intent.updated_at = settled_at.clone();
+        if !self
+            .repository
+            .update_journal_intent(tx, &intent, "pending")
+            .await?
+        {
+            return Err(Reject::uncertain(format!(
+                "journal intent for receipt {receipt_id} moved before settlement"
+            )));
+        }
+        let result = intent.result.clone().unwrap_or(Value::Null);
+        let settled = ReviewReceiptIr {
+            state: ReceiptState::Committed {
+                completed_at: settled_at,
+                result,
+            },
+            ..receipt
+        };
+        if !self
+            .repository
+            .update_receipt(tx, &settled, "pending", None)
+            .await?
+        {
+            return Err(Reject::uncertain(format!(
+                "receipt {receipt_id} moved before settlement"
+            )));
+        }
+        Ok(project::receipt_body(&settled))
     }
 }
 

@@ -13,10 +13,11 @@ use spoke_schemas::{
     MemoryReflectionsStateResponse, Principal,
 };
 
-use mindcore_base::ids::SpaceId;
+use mindcore_base::boundary::CallerId;
+use mindcore_base::ids::{SpaceId, SubjectId};
 use mindcore_base::ir::{
-    MemoryReflectionRow, MemoryRepository, PlacementSelection, ReceiptLease, RecordSelection,
-    RecordState,
+    MemoryReflectionRow, MemoryRepository, PlacementSelection, ReceiptLease, ReceiptRead,
+    ReceiptState, RecordSelection, RecordState, ReviewReceiptIr,
 };
 
 use crate::admission::{self, Admission, Coverage};
@@ -25,7 +26,10 @@ use crate::policy;
 use crate::project;
 use crate::reject::{settle, AResult, Reject};
 use crate::wire;
-use crate::{mint, principal_id, MemoryAdapter, MemoryStage, ReflectionWork, Tx};
+use crate::{
+    mint, principal_id, recorded_failure, MemoryAdapter, MemoryStage, ReflectionEffect,
+    ReflectionWork, Tx,
+};
 
 /// §7.0.3: how long a pending generation's lease stays live.
 const GENERATION_LEASE_SECONDS: i64 = 30;
@@ -407,6 +411,113 @@ impl MemoryAdapter {
             basis: basis_json,
             engine_policy_version: policy::ENGINE_POLICY_VERSION,
         }))
+    }
+
+    // ── §7.27 generate completion (transaction 2) ──────────────────────
+
+    /// Complete a leased generation in a fresh caller transaction: insert
+    /// the envelope and settle the pending receipt ONLY when that receipt
+    /// is still pending under the composed effect's owner. Any other owner
+    /// or state rolls the envelope back with the settlement, and the
+    /// completion is returned only after this transaction commits.
+    pub async fn complete_reflection(
+        &self,
+        tx: &mut Tx<'_>,
+        effect: ReflectionEffect,
+    ) -> SpokeResult<Value> {
+        settle(self.complete_reflection_body(tx, &effect).await)
+    }
+
+    async fn complete_reflection_body(
+        &self,
+        tx: &mut Tx<'_>,
+        effect: &ReflectionEffect,
+    ) -> AResult<Value> {
+        let receipt = match self
+            .repository
+            .receipt(tx, &effect.space, effect.receipt_id.as_str())
+            .await?
+        {
+            None => {
+                return Err(Reject::not_found(format!("receipt {}", effect.receipt_id)));
+            }
+            Some(ReceiptRead::Evicted { status, .. }) => {
+                return Err(Reject::terminal(
+                    SpokeRejectCode::ReceiptExpired,
+                    format!("receipt {} body was reclaimed", effect.receipt_id),
+                )
+                .detail("last_known_status", json!(status)));
+            }
+            Some(ReceiptRead::Retained(receipt)) => receipt,
+        };
+        match &receipt.state {
+            // An already-committed completion returns its stored result; only
+            // the pending transition writes the envelope.
+            ReceiptState::Committed { .. } => {
+                return project::checked::<MemoryReflectionsGenerateResponse>(
+                    project::receipt_body(&receipt),
+                );
+            }
+            ReceiptState::Failed { error, .. } => {
+                return Err(recorded_failure(error));
+            }
+            ReceiptState::Pending => {}
+        }
+        if receipt.operation != "memory.reflections.generate" {
+            return Err(Reject::invalid(format!(
+                "receipt {} belongs to {}",
+                effect.receipt_id, receipt.operation
+            )));
+        }
+        let settled_at = policy::timestamp(Utc::now());
+        let reflection_id = mint("rfl");
+        let (unit_kind, units) = effect.cost.clone();
+        let envelope = MemoryReflectionRow {
+            seq: 0,
+            reflection_id: reflection_id.clone(),
+            space_id: effect.space.clone(),
+            subject_id: SubjectId::new(effect.subject_id.clone()),
+            requester: CallerId::new(receipt.requester.clone()),
+            selection: effect.selection.clone(),
+            filter: effect.filter.clone(),
+            cognition_filter: None,
+            basis: effect.basis.clone(),
+            engine_policy_version: effect.engine_policy_version.to_string(),
+            model: None,
+            schema_version: project::SCHEMA_VERSION as i64,
+            revision: serde_json::Number::from(1),
+            extensions: Map::new(),
+            created_at: settled_at.clone(),
+            body_text: effect.body_text.clone(),
+            body_format: effect.body_format.clone(),
+            cost: Some((unit_kind.clone(), units)),
+            stale_cache: false,
+        };
+        self.repository.insert_reflection(tx, &envelope).await?;
+        let settled = ReviewReceiptIr {
+            state: ReceiptState::Committed {
+                completed_at: settled_at,
+                result: json!({
+                    "reflection_id": reflection_id,
+                    "cost": { "unit_kind": unit_kind, "units": units },
+                }),
+            },
+            ..receipt
+        };
+        // The CAS carries the lease identity: only the owner the receipt was
+        // leased to may settle it, so a cross-owner or re-settled row refuses
+        // here and the caller's rollback removes the envelope with it.
+        if !self
+            .repository
+            .update_receipt(tx, &settled, "pending", Some(effect.owner_id.as_str()))
+            .await?
+        {
+            return Err(Reject::uncertain(format!(
+                "receipt {} is not pending under the composed owner",
+                effect.receipt_id
+            )));
+        }
+        project::checked::<MemoryReflectionsGenerateResponse>(project::receipt_body(&settled))
     }
 }
 
