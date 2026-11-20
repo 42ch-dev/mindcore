@@ -24,7 +24,7 @@ use spoke_operations::SpokeRejectCode;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
 const DDL: &str = include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
-/// The knowledge table of `migrations/0001_init.sql`; that migration's legacy
+/// The knowledge tables of `migrations/0001_init.sql`; that migration's legacy
 /// memory tables have a different shape than the protocol fixture above.
 const KNOWLEDGE_DDL: &str = "
 CREATE TABLE IF NOT EXISTS knowledge_entries (
@@ -32,9 +32,22 @@ CREATE TABLE IF NOT EXISTS knowledge_entries (
   entry_id     TEXT NOT NULL,
   revision     INTEGER NOT NULL,
   payload      TEXT NOT NULL,
+  cognition_head_seq INTEGER,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
-  PRIMARY KEY (collection, entry_id)
+  PRIMARY KEY (collection, entry_id),
+  FOREIGN KEY (collection, entry_id, cognition_head_seq)
+    REFERENCES cognition_records (collection, entry_id, append_seq)
+);
+CREATE TABLE IF NOT EXISTS cognition_records (
+  collection TEXT NOT NULL,
+  entry_id   TEXT NOT NULL,
+  append_seq INTEGER NOT NULL CHECK (append_seq > 0),
+  record_id  TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  PRIMARY KEY (collection, entry_id, append_seq),
+  UNIQUE (collection, entry_id, record_id),
+  FOREIGN KEY (collection, entry_id) REFERENCES knowledge_entries (collection, entry_id)
 );";
 const SPACE: &str = "spc_1";
 const SUBJECT: &str = "subj_1";

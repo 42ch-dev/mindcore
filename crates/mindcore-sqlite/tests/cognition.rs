@@ -10,8 +10,10 @@ use mindcore_base::cognition::{
     append_cognition_record, derive_mind_state, mind_state_value, MindError, CARRIER_NAMESPACE,
 };
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_sqlite::cognition::{read_carrier, write_carrier};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::cognition::{
+    insert_record, read_carrier, read_record, read_records, write_carrier,
+};
+use mindcore_sqlite::{read_carrier_header, MindStore};
 use serde_json::{json, Value};
 use spoke_operations::{
     validate_cognition_module, validate_cognition_record, validate_mind_state, KnowledgeEntryPort,
@@ -22,6 +24,7 @@ use spoke_schemas::knowledge_entry::{
     KnowledgeEntryModulesValue,
 };
 use spoke_schemas::KnowledgeEntry;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -690,5 +693,69 @@ async fn float_order_record_is_rejected_on_direct_put() {
     let view = derive_mind_state(&stored).expect("derive integer carrier");
     let value = mind_state_value(&view, "ms_wren_dusk").expect("render mind state");
     expect_ok(validate_mind_state(&value), "integer-order mind state");
+    store.close().await;
+}
+
+/// The record rows are the storage authority: they read back in `append_seq` order rather than
+/// the records' own `order`, a scoped `record_id` addresses one row, and a duplicate id in the
+/// same holder is invalid input. The header read sees the assigned revision with no head until
+/// an append advances it.
+#[tokio::test]
+async fn record_rows_keep_append_order_and_scoped_ids() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+
+    // A second connection so the test holds the write reservation itself.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("open second connection");
+
+    let header = expect_ok(
+        read_carrier_header(&pool, "wren", "ke_wren").await,
+        "header",
+    );
+    assert_eq!((header.revision, header.head_seq), (1, None));
+
+    // The second record sorts first by its own `order`: only the storage order may decide.
+    let mut second_by_storage = belief("cog_early", 0.6);
+    second_by_storage["order"] = json!(2);
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    expect_ok(
+        insert_record(&mut tx, "wren", "ke_wren", 1, &belief("cog_late", 0.4)).await,
+        "first record",
+    );
+    expect_ok(
+        insert_record(&mut tx, "wren", "ke_wren", 2, &second_by_storage).await,
+        "second record",
+    );
+    match insert_record(&mut tx, "wren", "ke_wren", 3, &belief("cog_late", 0.9)).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        SpokeResult::Ok(()) => panic!("a duplicate scoped record_id must not be stored"),
+    }
+    tx.commit().await.expect("commit");
+
+    let records = expect_ok(read_records(&pool, "wren", "ke_wren").await, "records");
+    assert_eq!(module_keys(&records), vec!["cog_late", "cog_early"]);
+
+    let scoped = expect_ok(
+        read_record(&pool, "wren", "ke_wren", "cog_early").await,
+        "scoped read",
+    )
+    .expect("the stored record is addressable by its scoped id");
+    assert_eq!(scoped["q"]["value"].as_f64(), Some(0.6));
+
     store.close().await;
 }

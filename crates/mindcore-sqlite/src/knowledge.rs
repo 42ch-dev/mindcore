@@ -86,7 +86,7 @@ impl MindStore {
     }
 }
 
-fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
+pub(crate) fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
     spoke_reject(SpokeRejectCode::InternalError, message, None)
 }
 
@@ -161,6 +161,46 @@ where
             None,
         ),
         Err(error) => internal(format!("knowledge entry could not be read: {error}")),
+    }
+}
+
+/// One holder's assigned revision and current-judgment pointer, read without hydrating its
+/// payload or history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrierHeader {
+    pub revision: u64,
+    pub head_seq: Option<i64>,
+}
+
+/// One holder's header, read through the caller's executor: the append path compares the
+/// revision and takes the next `append_seq` from here instead of reading the carrier history.
+pub async fn read_carrier_header<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+) -> SpokeResult<CarrierHeader>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let header: Result<Option<(i64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, cognition_head_seq FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(executor)
+    .await;
+    match header {
+        Ok(Some((revision, head_seq))) => SpokeResult::Ok(CarrierHeader {
+            revision: revision as u64,
+            head_seq,
+        }),
+        Ok(None) => spoke_reject(
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            format!("no knowledge entry {entry_id} in collection {collection}"),
+            None,
+        ),
+        Err(error) => internal(format!("carrier header could not be read: {error}")),
     }
 }
 
