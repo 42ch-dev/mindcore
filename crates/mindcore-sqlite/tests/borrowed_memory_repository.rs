@@ -672,56 +672,54 @@ async fn guarded_updates_do_not_cross_spaces() {
 /// nonmatch or widen.
 #[tokio::test]
 async fn malformed_reflection_selections_fail_invalid_row() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("settlement.db");
-    let repo = SqliteMemoryRepository;
-    let pool = prepared(&path).await;
+    use mindcore_base::ir::PlacementSelection;
 
-    let mut tx = pool.begin().await.unwrap();
-    for (id, selection) in [
-        ("rfl_bad_mode", json!({"mode": "everywhere"})),
-        (
-            "rfl_bad_entry",
-            json!({"mode": "selected_contexts", "context_ids": ["ctx_a", 3], "include_shared": false}),
-        ),
-        (
-            "rfl_missing_fields",
-            json!({"mode": "selected_contexts", "context_ids": ["ctx_a"]}),
-        ),
+    // Each malformed shape gets its own record and its own evaluation so every
+    // `InvalidRow` cause is asserted independently of row order.
+    for selection in [
+        json!({"mode": "everywhere"}),
+        json!({"mode": "selected_contexts", "context_ids": ["ctx_a", 3], "include_shared": false}),
+        json!({"mode": "selected_contexts", "context_ids": ["ctx_a"]}),
     ] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settlement.db");
+        let repo = SqliteMemoryRepository;
+        let pool = prepared(&path).await;
+
+        let mut tx = pool.begin().await.unwrap();
         sqlx::query(
             "INSERT INTO memory_reflections \
              (seq, reflection_id, space_id, subject_id, requester_principal_id, \
               selection_json, basis_json, engine_policy_version, schema_version, revision, \
               extensions_json, created_at, body_text, body_format, stale_cache) \
              VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
-               ?, 'spc_workshop', 'sub_mira', 'prn_mira', ?, '{\"digest\":\"d\"}', 'v1', 1, 1, \
-               '{}', ?, 'text', 'markdown', 0)",
+               'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, '{\"digest\":\"d\"}', \
+               'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
         )
-        .bind(id)
         .bind(selection.to_string())
         .bind(TIME)
         .execute(&mut *tx)
         .await
         .unwrap();
-    }
 
-    use mindcore_base::ir::PlacementSelection;
-    // Any covers evaluation over a malformed row fails `InvalidRow`.
-    let outcome = repo
-        .list_reflections(
-            &mut tx,
-            &SpaceId::new("spc_workshop"),
-            "sub_mira",
-            Some(&PlacementSelection::SubjectAll),
-        )
-        .await;
-    assert!(matches!(
-        outcome,
-        Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
-    ));
-    tx.commit().await.unwrap();
-    pool.close().await;
+        let outcome = repo
+            .list_reflections(
+                &mut tx,
+                &SpaceId::new("spc_workshop"),
+                "sub_mira",
+                Some(&PlacementSelection::SubjectAll),
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
+            ),
+            "selection {selection} must fail InvalidRow, got {outcome:?}"
+        );
+        tx.commit().await.unwrap();
+        pool.close().await;
+    }
 }
 
 /// F5: the replacement row's own revision is stored under the observed-revision guard;
