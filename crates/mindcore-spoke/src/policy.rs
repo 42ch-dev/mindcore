@@ -268,18 +268,36 @@ pub(crate) const fn data_sufficiency(record_count: usize) -> &'static str {
     }
 }
 
-/// A subject's profile kinds and the required ones it misses.
-pub(crate) fn profile_projection(profile_revisions: &MapOfRevisions) -> (Vec<String>, Vec<String>) {
-    let kinds: Vec<String> = profile_revisions
-        .iter()
-        .map(|(kind, _)| kind.clone())
-        .collect();
+/// A subject's profile kinds and the required ones it misses. Presence alone is
+/// not completeness: a required kind whose stored document carries no content
+/// is still missing (§7.27 gates generation on authored content).
+pub(crate) fn profile_projection(profiles: &[(String, bool)]) -> (Vec<String>, Vec<String>) {
+    let kinds: Vec<String> = profiles.iter().map(|(kind, _)| kind.clone()).collect();
     let missing: Vec<String> = REQUIRED_PROFILE_KINDS
         .iter()
-        .filter(|required| !kinds.iter().any(|kind| kind == *required))
+        .filter(|required| {
+            !profiles
+                .iter()
+                .any(|(kind, has_content)| kind == *required && *has_content)
+        })
         .map(|required| (*required).to_string())
         .collect();
     (kinds, missing)
+}
+
+/// Whether one stored profile document carries authored content. The §7.24
+/// shape is `{body, format}`; an empty or whitespace-only body is no content.
+pub(crate) fn profile_document_has_content(document: &Value) -> bool {
+    match document {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(members) => match members.get("body").and_then(Value::as_str) {
+            Some(body) => !body.trim().is_empty(),
+            None => members.values().any(profile_document_has_content),
+        },
+        Value::Bool(_) | Value::Number(_) => true,
+    }
 }
 
 // ── Content policy (§6.7 advisory class, §9 ranking) ────────────────────

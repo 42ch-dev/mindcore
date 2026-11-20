@@ -46,16 +46,6 @@ fn subject_scoped<'a>(capability: &'a str, subject_id: &'a str) -> GrantRequirem
     }
 }
 
-/// A grant is live when it is unrevoked and unexpired.
-fn live(row: &MemoryGrantRow, now: DateTime<Utc>) -> bool {
-    let now = policy::timestamp(now);
-    row.revoked_at.is_none()
-        && row
-            .expires_at
-            .as_deref()
-            .is_none_or(|expires_at| expires_at > now.as_str())
-}
-
 impl MemoryAdapter {
     // ── §7.1 describe ──────────────────────────────────────────────────
 
@@ -68,8 +58,8 @@ impl MemoryAdapter {
         settle(self.describe_body(request))
     }
 
-    fn describe_body(&self, request: Value) -> AResult<MemoryStage> {
-        let _request: MemoryDescribeRequest = wire::decode(&request, "memory.describe request")?;
+    fn describe_body(&self, raw: Value) -> AResult<MemoryStage> {
+        let _request: MemoryDescribeRequest = wire::decode(&raw, "memory.describe request")?;
         Self::ready::<MemoryDescribeResponse>(policy::describe_body(self.reflections))
     }
 
@@ -88,10 +78,9 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
-        let request: MemorySpacesListRequest =
-            wire::decode(&request, "memory.spaces.list request")?;
+        let request: MemorySpacesListRequest = wire::decode(&raw, "memory.spaces.list request")?;
         match validate_memory_spaces_list(&request, policy::MAX_PAGE_SIZE_BOUND) {
             spoke_operations::SpokeResult::Ok(()) => {}
             spoke_operations::SpokeResult::Reject(reject) => {
@@ -107,7 +96,7 @@ impl MemoryAdapter {
                 .repository
                 .list_grants(tx, &row.space_id, Some(principal_id))
                 .await?;
-            if grants.iter().any(|grant| live(grant, now)) {
+            if grants.iter().any(|grant| admission::live_grant(grant, now)) {
                 grant_revisions.extend(
                     grants.iter().map(|grant| {
                         (grant.grant_id.clone(), grant.revision.as_i64().unwrap_or(0))
@@ -168,13 +157,13 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         let request: MemorySpacesFreezeRequest =
-            wire::decode(&request, "memory.spaces.freeze request")?;
+            wire::decode(&raw, "memory.spaces.freeze request")?;
         let payload = wire::canonical(&request)?;
         let stage = self
-            .space_status(
+            .space_status::<MemorySpacesFreezeResponse>(
                 tx,
                 principal,
                 "memory.spaces.freeze",
@@ -193,13 +182,13 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         let request: MemorySpacesUnfreezeRequest =
-            wire::decode(&request, "memory.spaces.unfreeze request")?;
+            wire::decode(&raw, "memory.spaces.unfreeze request")?;
         let payload = wire::canonical(&request)?;
         let stage = self
-            .space_status(
+            .space_status::<MemorySpacesUnfreezeResponse>(
                 tx,
                 principal,
                 "memory.spaces.unfreeze",
@@ -215,7 +204,7 @@ impl MemoryAdapter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn space_status(
+    async fn space_status<T: serde::de::DeserializeOwned>(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
@@ -248,7 +237,7 @@ impl MemoryAdapter {
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay(&receipt);
+            return Self::replay::<T>(&receipt);
         }
         admission::gate(&self.repository, tx, &admission).await?;
         let current = admission::space(&self.repository, tx, &op.space).await?;
@@ -305,10 +294,10 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         let request: MemorySubjectsEnsureRequest =
-            wire::decode(&request, "memory.subjects.ensure request")?;
+            wire::decode(&raw, "memory.subjects.ensure request")?;
         let payload = wire::canonical(&request)?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.as_str();
@@ -381,10 +370,9 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
-        let request: MemorySubjectsGetRequest =
-            wire::decode(&request, "memory.subjects.get request")?;
+        let request: MemorySubjectsGetRequest = wire::decode(&raw, "memory.subjects.get request")?;
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         admission::space(&self.repository, tx, &space).await?;
@@ -421,12 +409,12 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         let request: MemorySubjectsFenceRequest =
-            wire::decode(&request, "memory.subjects.fence request")?;
+            wire::decode(&raw, "memory.subjects.fence request")?;
         let payload = wire::canonical(&request)?;
-        let object = wire::object(&payload, "memory.subjects.fence request")?;
+        let object = wire::object(&raw, "memory.subjects.fence request")?;
         let action = wire::required(object, "action")?.to_string();
         let target = object
             .get("target")
@@ -455,7 +443,7 @@ impl MemoryAdapter {
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay(&receipt);
+            return Self::replay::<MemorySubjectsFenceResponse>(&receipt);
         }
         admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) =
@@ -518,10 +506,9 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
-        let request: MemoryGrantsListRequest =
-            wire::decode(&request, "memory.grants.list request")?;
+        let request: MemoryGrantsListRequest = wire::decode(&raw, "memory.grants.list request")?;
         match validate_memory_grants_list(&request, policy::MAX_PAGE_SIZE_BOUND) {
             spoke_operations::SpokeResult::Ok(()) => {}
             spoke_operations::SpokeResult::Reject(reject) => {
@@ -549,10 +536,9 @@ impl MemoryAdapter {
             requested
         } else {
             // §7.8: a non-admin sees exactly its own grants and nothing else.
-            if !rows
-                .iter()
-                .any(|row| row.principal_id.as_str() == principal_id && live(row, now))
-            {
+            if !rows.iter().any(|row| {
+                row.principal_id.as_str() == principal_id && admission::live_grant(row, now)
+            }) {
                 return Err(Reject::not_authorized(format!(
                     "principal {principal_id} holds no grant in space {}",
                     space.as_str()
@@ -622,12 +608,11 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
-        let request: MemoryGrantsGrantRequest =
-            wire::decode(&request, "memory.grants.grant request")?;
+        let request: MemoryGrantsGrantRequest = wire::decode(&raw, "memory.grants.grant request")?;
         let payload = wire::canonical(&request)?;
-        let object = wire::object(&payload, "memory.grants.grant request")?;
+        let object = wire::object(&raw, "memory.grants.grant request")?;
         let space_id = wire::required(object, "space_id")?.to_string();
         let grantee = wire::required(object, "principal_id")?.to_string();
         let capabilities = wire::strings(object, "capabilities")?;
@@ -677,7 +662,7 @@ impl MemoryAdapter {
         };
         let rows = admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay(&receipt);
+            return Self::replay::<MemoryGrantsGrantResponse>(&receipt);
         }
         admission::gate(&self.repository, tx, &admission).await?;
         admission::authorize_issuance(&rows, &admission, op.now)?;
@@ -721,10 +706,10 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         let request: MemoryGrantsRevokeRequest =
-            wire::decode(&request, "memory.grants.revoke request")?;
+            wire::decode(&raw, "memory.grants.revoke request")?;
         let payload = wire::canonical(&request)?;
         let principal_id = principal_id(principal);
         let expected_revision = request.expected_revision.get();
@@ -749,7 +734,7 @@ impl MemoryAdapter {
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay(&receipt);
+            return Self::replay::<MemoryGrantsRevokeResponse>(&receipt);
         }
         admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) = self

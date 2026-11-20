@@ -8,8 +8,9 @@ use spoke_operations::{
     validate_memory_reflections_state, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::{
-    MemoryReflectionsGenerateRequest, MemoryReflectionsListRequest, MemoryReflectionsListResponse,
-    MemoryReflectionsStateRequest, MemoryReflectionsStateResponse, Principal,
+    MemoryReflectionsGenerateRequest, MemoryReflectionsGenerateResponse,
+    MemoryReflectionsListRequest, MemoryReflectionsListResponse, MemoryReflectionsStateRequest,
+    MemoryReflectionsStateResponse, Principal,
 };
 
 use mindcore_base::ids::SpaceId;
@@ -105,16 +106,15 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.state"));
         }
         let request: MemoryReflectionsStateRequest =
-            wire::decode(&request, "memory.reflections.state request")?;
+            wire::decode(&raw, "memory.reflections.state request")?;
         validated(validate_memory_reflections_state(&request))?;
-        let payload = wire::canonical(&request)?;
-        let object = wire::object(&payload, "memory.reflections.state request")?;
+        let object = wire::object(&raw, "memory.reflections.state request")?;
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let subject_id = request.subject_id.to_string();
@@ -138,7 +138,7 @@ impl MemoryAdapter {
                 filter.as_deref(),
             )
             .await?;
-        let (profile_kinds, missing) = policy::profile_projection(&basis.profile_revisions);
+        let (profile_kinds, missing) = policy::profile_projection(&basis.profile_documents);
         let state_digest = policy::reflection_state_digest(
             &basis.records,
             &basis.profile_revisions,
@@ -187,19 +187,18 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.list"));
         }
         let request: MemoryReflectionsListRequest =
-            wire::decode(&request, "memory.reflections.list request")?;
+            wire::decode(&raw, "memory.reflections.list request")?;
         validated(validate_memory_reflections_list(
             &request,
             policy::MAX_PAGE_SIZE_BOUND,
         ))?;
-        let payload = wire::canonical(&request)?;
-        let object = wire::object(&payload, "memory.reflections.list request")?;
+        let object = wire::object(&raw, "memory.reflections.list request")?;
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let subject_id = request.subject_id.to_string();
@@ -234,9 +233,6 @@ impl MemoryAdapter {
             .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
-        let profile_revisions = self
-            .profile_revisions(tx, &space, subject_id.as_str())
-            .await?;
         let all_records = self
             .all_record_pairs(tx, &space, subject_id.as_str())
             .await?;
@@ -276,8 +272,6 @@ impl MemoryAdapter {
         let next_cursor =
             next.map(|offset| policy::encode_cursor(principal_id, &scope, offset, &marker));
         policy::verify_cursor(claimed.as_deref(), &marker)?;
-        let profile_revisions = profile_revisions.len();
-        let _ = profile_revisions;
         Self::ready::<MemoryReflectionsListResponse>(
             json!({ "reflections": bodies, "next_cursor": next_cursor }),
         )
@@ -298,16 +292,16 @@ impl MemoryAdapter {
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
-        request: Value,
+        raw: Value,
     ) -> AResult<MemoryStage> {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.generate"));
         }
         let request: MemoryReflectionsGenerateRequest =
-            wire::decode(&request, "memory.reflections.generate request")?;
+            wire::decode(&raw, "memory.reflections.generate request")?;
         validated(validate_memory_reflections_generate(&request))?;
         let payload = wire::canonical(&request)?;
-        let object = wire::object(&payload, "memory.reflections.generate request")?;
+        let object = wire::object(&raw, "memory.reflections.generate request")?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.to_string();
         let selection = wire::selection(object, "selection")?;
@@ -346,7 +340,7 @@ impl MemoryAdapter {
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
-            return Self::replay(&receipt);
+            return Self::replay::<MemoryReflectionsGenerateResponse>(&receipt);
         }
         admission::gate(&self.repository, tx, &admission).await?;
         let basis = self
@@ -371,7 +365,7 @@ impl MemoryAdapter {
             )
             .detail("current", json!(current)));
         }
-        let (_, missing) = policy::profile_projection(&basis.profile_revisions);
+        let (_, missing) = policy::profile_projection(&basis.profile_documents);
         if !missing.is_empty() {
             return Err(Reject::terminal(
                 SpokeRejectCode::ProfileIncomplete,
@@ -443,27 +437,28 @@ impl MemoryAdapter {
             .map(|record| (record.record_id, record.revision.as_i64().unwrap_or(0)))
             .collect();
         records.sort();
-        Ok(Basis {
-            records,
-            profile_revisions: self.profile_revisions(tx, space, subject_id).await?,
-        })
-    }
-
-    async fn profile_revisions(
-        &self,
-        tx: &mut Tx<'_>,
-        space: &SpaceId,
-        subject_id: &str,
-    ) -> AResult<Vec<(String, i64)>> {
-        let mut revisions: Vec<(String, i64)> = self
+        let profiles = self
             .repository
             .list_profiles(tx, space, subject_id, &[])
-            .await?
-            .into_iter()
-            .map(|profile| (profile.profile_kind, profile.revision.as_i64().unwrap_or(0)))
-            .collect();
-        revisions.sort();
-        Ok(revisions)
+            .await?;
+        let mut profile_revisions = Vec::with_capacity(profiles.len());
+        let mut profile_documents = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            profile_revisions.push((
+                profile.profile_kind.clone(),
+                profile.revision.as_i64().unwrap_or(0),
+            ));
+            profile_documents.push((
+                profile.profile_kind,
+                policy::profile_document_has_content(&profile.document),
+            ));
+        }
+        profile_revisions.sort();
+        Ok(Basis {
+            records,
+            profile_revisions,
+            profile_documents,
+        })
     }
 
     /// Every record identity of the subject, live and tombstoned, for the
@@ -552,4 +547,5 @@ impl MemoryAdapter {
 struct Basis {
     records: Vec<(String, i64)>,
     profile_revisions: Vec<(String, i64)>,
+    profile_documents: Vec<(String, bool)>,
 }

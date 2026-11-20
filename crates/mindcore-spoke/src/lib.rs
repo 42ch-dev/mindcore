@@ -102,12 +102,12 @@ impl MemoryAdapter {
         }
     }
 
-    /// §7.0.5: a receipt the dedup namespace holds resolves the key.
-    pub(crate) fn replay(receipt: &ReviewReceiptIr) -> AResult<MemoryStage> {
+    /// §7.0.5: a receipt the dedup namespace holds resolves the key. A
+    /// committed replay is a published success response, so it passes the
+    /// operation's pinned response type before it can leave the adapter.
+    pub(crate) fn replay<T: DeserializeOwned>(receipt: &ReviewReceiptIr) -> AResult<MemoryStage> {
         match &receipt.state {
-            ReceiptState::Committed { .. } => {
-                Ok(MemoryStage::Ready(project::receipt_body(receipt)))
-            }
+            ReceiptState::Committed { .. } => Self::ready::<T>(project::receipt_body(receipt)),
             ReceiptState::Failed { error, .. } => Err(recorded_failure(error)),
             ReceiptState::Pending => Err(Reject::uncertain(format!(
                 "receipt {} is still pending",

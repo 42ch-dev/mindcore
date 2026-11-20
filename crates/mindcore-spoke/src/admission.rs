@@ -293,6 +293,17 @@ pub(crate) fn one_grant_covers(
     })
 }
 
+/// A grant is live when it is unrevoked and unexpired; current participation
+/// (§7.28) is exactly this predicate, never revocation alone.
+pub(crate) fn live_grant(row: &MemoryGrantRow, now: DateTime<Utc>) -> bool {
+    let now = crate::policy::timestamp(now);
+    row.revoked_at.is_none()
+        && row
+            .expires_at
+            .as_deref()
+            .is_none_or(|expires_at| expires_at > now.as_str())
+}
+
 /// Does any live grant reach this subject at all (§7.6 "any capability")?
 pub(crate) fn any_grant_for_subject(
     rows: &[MemoryGrantRow],

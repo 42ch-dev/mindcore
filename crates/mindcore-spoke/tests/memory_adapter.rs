@@ -68,16 +68,27 @@ impl Harness {
     }
 
     async fn seed_grant(&self, principal: &str, capabilities: &[&str]) {
+        self.seed_grant_with_expiry(principal, capabilities, None)
+            .await;
+    }
+
+    async fn seed_grant_with_expiry(
+        &self,
+        principal: &str,
+        capabilities: &[&str],
+        expires_at: Option<&str>,
+    ) {
         sqlx::query(
             "INSERT INTO memory_grants \
              (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
               shared_access, expires_at, revoked_at, revision, created_at) \
-             VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+             VALUES (?, ?, NULL, ?, ?, '[]', 0, ?, NULL, 1, ?)",
         )
         .bind(format!("grt_{principal}"))
         .bind(SPACE)
         .bind(principal)
         .bind(serde_json::to_string(capabilities).expect("capabilities"))
+        .bind(expires_at)
         .bind(NOW)
         .execute(&self.pool)
         .await
@@ -468,6 +479,366 @@ async fn journaled_mutation_stages_and_the_caller_rollback_erases_it() {
     assert_eq!(harness.count_pool("memory_records").await, 0);
     assert_eq!(harness.count_pool("memory_receipts").await, 0);
     assert_eq!(harness.count_pool("memory_journal").await, 0);
+}
+
+/// §7.11/F1: the adapter keeps the caller's original subtrees — member
+/// presence, anchor extensions, offset timestamps and id order — instead of
+/// the DTO's normalized re-serialization.
+#[tokio::test]
+async fn capture_preserves_original_member_presence() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let occurred_at = "2026-11-20T09:20:01.123456+02:00";
+    let request = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "shared" },
+        "content": { "text": "present-but-null structured stays present", "structured": null },
+        "source_context_ids": ["ctx_b", "ctx_a", "ctx_a"],
+        "anchors": [{
+            "schema_version": 1,
+            "source_id": "doc-1",
+            "extensions": { "mindcore_round": { "kept": true } }
+        }],
+        "occurred_at": occurred_at,
+        "idempotency_key": "cap-presence"
+    });
+    let body = ready(
+        adapter
+            .capture(&mut tx, &principal(PRINCIPAL), request)
+            .await,
+    );
+    let candidate_id = body["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+
+    let (content, provenance, stored_occurred_at): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT content_json, provenance_json, occurred_at FROM memory_candidates \
+         WHERE space_id = ? AND candidate_id = ?",
+        )
+        .bind(SPACE)
+        .bind(&candidate_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("stored candidate");
+
+    let content: Value = serde_json::from_str(&content).expect("content json");
+    assert_eq!(content["text"], "present-but-null structured stays present");
+    assert!(
+        content.get("structured").is_some(),
+        "a present null structured member must survive: {content}"
+    );
+    assert_eq!(content["structured"], Value::Null);
+
+    let provenance: Value = serde_json::from_str(&provenance).expect("provenance json");
+    assert_eq!(
+        provenance["source_context_ids"],
+        json!(["ctx_b", "ctx_a", "ctx_a"])
+    );
+    assert_eq!(
+        provenance["anchors"],
+        json!([{
+            "schema_version": 1,
+            "source_id": "doc-1",
+            "extensions": { "mindcore_round": { "kept": true } }
+        }])
+    );
+    assert_eq!(stored_occurred_at.as_deref(), Some(occurred_at));
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.28/Y04: an expired-but-unrevoked grant is not current participation, so
+/// neither an existing nor an absent receipt id is disclosed.
+#[tokio::test]
+async fn expired_grant_is_not_participation() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture"]).await;
+    harness
+        .seed_grant_with_expiry(STRANGER, &["admin"], Some("2020-01-01T00:00:00.000Z"))
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "an existing receipt to probe" },
+                    "idempotency_key": "cap-y04"
+                }),
+            )
+            .await,
+    );
+    let receipt_id = body["receipt_id"].as_str().expect("receipt id").to_string();
+
+    let existing = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(STRANGER),
+            json!({ "space_id": SPACE, "receipt_id": receipt_id }),
+        )
+        .await;
+    let unknown = adapter
+        .get_receipt(
+            &mut tx,
+            &principal(STRANGER),
+            json!({ "space_id": SPACE, "receipt_id": "rct_absent" }),
+        )
+        .await;
+    let existing = reject(&existing);
+    let unknown = reject(&unknown);
+    assert_eq!(existing.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(existing), "terminal");
+    assert_eq!(existing.code, unknown.code);
+    assert_eq!(existing.message, unknown.message);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.27/F3: an empty required profile document is not completeness.
+#[tokio::test]
+async fn empty_required_profile_is_incomplete() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["reflect", "records_read", "records_write"])
+        .await;
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_1', ?, ?, 'fact', '{\"text\":\"a live basis record\"}', 'shared', NULL, \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed record");
+    sqlx::query(
+        "INSERT INTO memory_profiles \
+         (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
+          updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(r#"{"body":"   ","format":"markdown"}"#)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed empty profile");
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let state = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" } }),
+            )
+            .await,
+    );
+    assert_eq!(
+        state["missing_required_profile_kinds"],
+        json!(["personality"])
+    );
+    let digest = state["state_digest"].as_str().expect("digest").to_string();
+
+    let refused = adapter
+        .generate_reflection(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "expected_state_digest": digest,
+                    "idempotency_key": "gen-empty" }),
+        )
+        .await;
+    let refusal = reject(&refused);
+    assert_eq!(refusal.code, SpokeRejectCode::ProfileIncomplete);
+    assert_eq!(
+        refusal.details.as_ref().expect("details")["missing"],
+        json!(["personality"])
+    );
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
+
+    // With authored content the same basis generates: the gate refused the
+    // empty document, not the subject.
+    sqlx::query("UPDATE memory_profiles SET document_json = ? WHERE space_id = ? AND subject_id = ? AND profile_kind = 'personality'")
+        .bind(r#"{"body":"a real personality","format":"markdown"}"#)
+        .bind(SPACE)
+        .bind(SUBJECT)
+        .execute(&mut *tx)
+        .await
+        .expect("author the profile");
+    let staged = adapter
+        .generate_reflection(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "expected_state_digest": digest,
+                    "idempotency_key": "gen-authored" }),
+        )
+        .await;
+    match staged {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => {
+            assert_eq!(work.subject_id, SUBJECT);
+            assert_eq!(work.engine_policy_version, "mindcore-local-memory-v1");
+            assert!(work.basis["state_digest"].is_string());
+        }
+        other => panic!("expected a reflection pending stage, got {other:?}"),
+    }
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.24/F4: a supplied expectation for an absent profile is a revision
+/// conflict before any write, so nothing is staged.
+#[tokio::test]
+async fn absent_profile_with_expected_revision_refuses() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["profile_write"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .update_profile(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "profile_kind": "personality",
+                "document": { "body": "an authored personality", "format": "markdown" },
+                "expected_revision": 5,
+                "idempotency_key": "profile-cas"
+            }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(refusal.code, SpokeRejectCode::RevisionConflict);
+    assert_eq!(retry_class(refusal), "terminal");
+    assert_eq!(harness.count(&mut tx, "memory_profiles").await, 0);
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
+    assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.21/F5: a promotion into a fenced context is refused and stages nothing.
+#[tokio::test]
+async fn promotion_into_fenced_context_refuses() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["promote", "records_write"])
+        .await;
+    sqlx::query("UPDATE memory_subjects SET fenced_contexts_json = '[\"c1\"]' WHERE space_id = ? AND subject_id = ?")
+        .bind(SPACE)
+        .bind(SUBJECT)
+        .execute(&harness.pool)
+        .await
+        .expect("fence context");
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_1', ?, ?, 'fact', '{\"text\":\"a shared record\"}', 'shared', NULL, \
+                 '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed record");
+
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    let result = adapter
+        .promote_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "record_id": "rec_1",
+                "expected_revision": 1,
+                "target_scope": { "visibility": "context", "context_id": "c1" },
+                "idempotency_key": "promote-fenced"
+            }),
+        )
+        .await;
+    let refusal = reject(&result);
+    assert_eq!(refusal.code, SpokeRejectCode::SubjectFenced);
+    assert_eq!(retry_class(refusal), "terminal");
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
+    assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
+    let (visibility, revision): (String, i64) = sqlx::query_as(
+        "SELECT scope_visibility, revision FROM memory_records WHERE record_id = 'rec_1'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("record");
+    assert_eq!((visibility.as_str(), revision), ("shared", 1));
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.0.5/F6: a committed replay passes the operation's pinned response type;
+/// a tampered stored result is an internal error, never a wire success.
+#[tokio::test]
+async fn replayed_receipt_with_tampered_result_rejects() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["capture"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let request = json!({
+        "space_id": SPACE,
+        "subject_id": SUBJECT,
+        "capture_scope": { "visibility": "shared" },
+        "content": { "text": "a capture whose receipt result will be tampered with" },
+        "idempotency_key": "cap-tamper"
+    });
+
+    let mut tx = harness.begin().await;
+    let _ = ready(
+        adapter
+            .capture(&mut tx, &principal(PRINCIPAL), request.clone())
+            .await,
+    );
+    tx.commit().await.expect("commit");
+
+    sqlx::query("UPDATE memory_receipts SET result_json = ? WHERE idempotency_key = ?")
+        .bind(r#"{"candidate_ids":"not-an-array","classified":1}"#)
+        .bind("cap-tamper")
+        .execute(&harness.pool)
+        .await
+        .expect("tamper");
+
+    let mut tx = harness.begin().await;
+    let replay = adapter
+        .capture(&mut tx, &principal(PRINCIPAL), request)
+        .await;
+    let refusal = reject(&replay);
+    assert_eq!(refusal.code, SpokeRejectCode::InternalError);
+    assert_eq!(retry_class(refusal), "terminal");
+    assert_eq!(harness.count(&mut tx, "memory_candidates").await, 1);
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
 }
 
 /// The public surface compiles with the assignment's exact signature shape.
