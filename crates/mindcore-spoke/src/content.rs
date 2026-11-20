@@ -751,6 +751,7 @@ impl MemoryAdapter {
         principal: &Principal,
         raw: Value,
     ) -> AResult<MemoryStage> {
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryRecordsListRequest = wire::decode(&raw, "memory.records.list request")?;
         validated(validate_memory_records_list(
             &request,
@@ -928,13 +929,27 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryRecordsUpdateResponse>(&receipt);
         }
-        admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) =
             admission::record(&self.repository, tx, &op.space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
+        // §7.7/MEM-R024: the fresh-effect gate binds the persisted subject and
+        // the record's own placement before any tombstone/revision check or
+        // effect, so a fenced subject or fenced context refuses without a write.
+        let record_scope = Scope::from(&current.scope);
+        let gated = Admission {
+            operation: op.operation,
+            space: &op.space,
+            principal: principal_id,
+            coverage: admission.coverage,
+            issuance: None,
+            subject_gate: Some(subject_id.as_str()),
+            placement_gate: Some(&record_scope),
+            freeze_gated: true,
+        };
+        admission::gate(&self.repository, tx, &gated).await?;
         if matches!(current.state, RecordState::Tombstoned { .. }) {
             return Err(Reject::terminal(
                 SpokeRejectCode::InvalidStatusTransition,
@@ -1176,13 +1191,37 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryRecordsDeleteResponse>(&receipt);
         }
-        admission::gate(&self.repository, tx, &admission).await?;
         let Some(current) =
             admission::record(&self.repository, tx, &op.space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
+        // §7.7/MEM-R024: the fresh-effect gate binds the persisted subject and
+        // the record's own placement before any tombstone/revision check or
+        // effect, so a fenced subject or fenced context refuses without a write.
+        // Mindcore's selected policy applies the placement fence to delete too;
+        // SPOKE does not mandate it for erasure.
+        let record_scope = Scope::from(&current.scope);
+        let gated = Admission {
+            operation: op.operation,
+            space: &op.space,
+            principal: principal_id,
+            coverage: admission.coverage,
+            issuance: None,
+            subject_gate: Some(subject_id.as_str()),
+            placement_gate: Some(&record_scope),
+            freeze_gated: true,
+        };
+        admission::gate(&self.repository, tx, &gated).await?;
+        // §7.19: deleting a tombstone mirrors records.update: a fresh key gets
+        // INVALID_STATUS_TRANSITION; only the same key replays the old outcome.
+        if matches!(current.state, RecordState::Tombstoned { .. }) {
+            return Err(Reject::terminal(
+                SpokeRejectCode::InvalidStatusTransition,
+                format!("record {record_id} is tombstoned"),
+            ));
+        }
         if current.revision != expected_revision {
             return Err(Reject::terminal(
                 SpokeRejectCode::RevisionConflict,
@@ -1231,10 +1270,11 @@ impl MemoryAdapter {
                     .unwrap_or_default(),
             )?),
         )?;
+        // §7.19: the committed receipt's result is the pinned delete outcome,
+        // so a same-key replay decodes as a CommittedReceipt.
         let result = json!({
             "record_id": record_id,
-            "revision": updated.revision,
-            "scope": placement_wire(&Scope::from(&updated.scope)),
+            "tombstoned": true,
         });
         let receipt_id = mint("rct");
         self.stage_journal(
@@ -1265,6 +1305,7 @@ impl MemoryAdapter {
         principal: &Principal,
         raw: Value,
     ) -> AResult<MemoryStage> {
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryRecallRequest = wire::decode(&raw, "memory.recall request")?;
         validated(validate_memory_recall(
             &request,
@@ -1382,10 +1423,9 @@ impl MemoryAdapter {
             };
             bodies.push(project::record_body(record));
         }
-        // The page cut is single-sourced in `apply_budget`: `consumed` counts
-        // kept records plus one skipped oversized first candidate, so a
-        // byte-capped page still advances (or ends, when the skipped record
-        // was the last one — `truncated: false`, `overflow_record_id` set).
+        // The page cut is single-sourced in `apply_budget`: an oversized first
+        // candidate is kept whole (and named once via `overflow_record_id`),
+        // while a later overflow defers to the page the next cursor reaches.
         let consumed = start + budget.consumed;
         let truncated = consumed < ranked.len();
         let next_cursor = truncated
@@ -2035,17 +2075,9 @@ fn record_text(record: &MemoryRecordIr) -> String {
     }
 }
 
-/// The size the recall byte budget charges for one record body.
+/// §9.3/I-000061: the recall byte budget charges the serialized UTF-8 bytes of
+/// the emitted `Content` object — `text`, `structured` and `cognition` — taken
+/// from the same wire projection the response carries.
 fn record_body_size(record: &MemoryRecordIr) -> usize {
-    match &record.state {
-        RecordState::Live { content, .. } => {
-            content.text.len()
-                + content
-                    .structured
-                    .as_ref()
-                    .map(|value| value.to_string().len())
-                    .unwrap_or(0)
-        }
-        RecordState::Tombstoned { .. } => 0,
-    }
+    project::record_body(record)["content"].to_string().len()
 }

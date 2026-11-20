@@ -144,7 +144,11 @@ pub(crate) struct Admission<'a> {
 fn writes_subject_content(operation: &str) -> bool {
     matches!(
         operation,
-        "memory.capture" | "memory.records.create" | "memory.profile.update"
+        "memory.capture"
+            | "memory.records.create"
+            | "memory.records.update"
+            | "memory.records.delete"
+            | "memory.profile.update"
     )
 }
 
@@ -386,7 +390,8 @@ pub(crate) fn require_write_allowed(
                     "subject {} fenced context {context_id}",
                     subject.subject_id.as_str()
                 ),
-            ));
+            )
+            .detail("scope", json!("context")));
         }
     }
     Ok(())
@@ -459,7 +464,9 @@ pub(crate) async fn authorize(
                 }
             }
             if !one_grant_covers(&wire, admission.principal, space_id, now, &requirements) {
-                return Err(refuse_coverage(admission, &requirements));
+                // §7.13/C-102 parity: incomplete coverage hides the row exactly as
+                // an id this store never held, indistinguishable from missing.
+                return Err(Reject::not_found(format!("record {record_id}")));
             }
         }
     }

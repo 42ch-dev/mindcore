@@ -115,6 +115,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.state"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsStateRequest =
             wire::decode(&raw, "memory.reflections.state request")?;
         validated(validate_memory_reflections_state(&request))?;
@@ -196,6 +197,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.list"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsListRequest =
             wire::decode(&raw, "memory.reflections.list request")?;
         validated(validate_memory_reflections_list(
@@ -301,6 +303,7 @@ impl MemoryAdapter {
         if !self.reflections {
             return Err(Reject::unsupported("memory.reflections.generate"));
         }
+        wire::reject_cognition_filter(&raw)?;
         let request: MemoryReflectionsGenerateRequest =
             wire::decode(&raw, "memory.reflections.generate request")?;
         validated(validate_memory_reflections_generate(&request))?;
@@ -313,7 +316,12 @@ impl MemoryAdapter {
             .get("selection")
             .cloned()
             .ok_or_else(|| Reject::invalid("selection is required"))?;
-        let filter_json = object.get("filter").cloned();
+        // A request `filter: null` stages as absent — the persisted row must not
+        // carry a literal null the readers would later treat as malformed.
+        let filter_json = object
+            .get("filter")
+            .filter(|value| !value.is_null())
+            .cloned();
         let expected_state_digest = wire::required(object, "expected_state_digest")?.to_string();
         if !is_state_digest(expected_state_digest.as_str()) {
             return Err(Reject::invalid(

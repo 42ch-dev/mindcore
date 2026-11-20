@@ -814,7 +814,7 @@ async fn malformed_reflection_selections_fail_invalid_row() {
     for selection in [
         json!({"mode": "everywhere"}),
         json!({"mode": "selected_contexts", "context_ids": ["ctx_a", 3], "include_shared": false}),
-        json!({"mode": "selected_contexts", "context_ids": ["ctx_a"]}),
+        json!({"mode": "selected_contexts", "context_ids": ["ctx_a"], "include_shared": 1}),
     ] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("settlement.db");
@@ -1328,6 +1328,93 @@ async fn persisted_candidate_extension_values_are_opaque() {
     repo.insert_candidate(&mut tx, &bad).await.unwrap();
     assert!(matches!(
         repo.candidate(&mut tx, &SpaceId::new("spc_workshop"), "cand_2")
+            .await,
+        Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
+    ));
+    tx.rollback().await.unwrap();
+    pool.close().await;
+}
+
+/// I-000053/I-000054: a persisted `selected_contexts` row that omits
+/// `include_shared` decodes as `false` — and so hides shared rows — while a
+/// present non-boolean still fails `InvalidRow`; a stored literal `null`
+/// filter reads as absent rather than poisoning the row.
+#[tokio::test]
+async fn absent_include_shared_and_null_filter_decode() {
+    use mindcore_base::ir::PlacementSelection;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+    let mut tx = pool.begin().await.unwrap();
+
+    // Legacy row: `include_shared` omitted entirely, `filter_json` holds the
+    // literal text 'null'.
+    sqlx::query(
+        "INSERT INTO memory_reflections \
+         (seq, reflection_id, space_id, subject_id, requester_principal_id, \
+          selection_json, filter_json, basis_json, engine_policy_version, \
+          schema_version, revision, extensions_json, created_at, body_text, \
+          body_format, stale_cache) \
+         VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
+           'rfl_legacy', 'spc_workshop', 'sub_mira', 'prn_mira', ?, 'null', \
+           '{\"digest\":\"d\"}', 'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
+    )
+    .bind("{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"]}")
+    .bind(TIME)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // The omitted flag defaults to false: a requested selection that covers
+    // the pinned context does not widen into shared visibility.
+    let rows = repo
+        .list_reflections(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            Some(&PlacementSelection::SelectedContexts {
+                context_ids: vec![ContextId::new("ctx_a")],
+                include_shared: true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reflection_id, "rfl_legacy");
+    assert_eq!(rows[0].filter, None);
+    let invisible = repo
+        .list_reflections(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            Some(&PlacementSelection::SharedOnly),
+        )
+        .await
+        .unwrap();
+    assert!(invisible.is_empty());
+
+    // A present non-boolean `include_shared` still fails strict decode.
+    sqlx::query(
+        "INSERT INTO memory_reflections \
+         (seq, reflection_id, space_id, subject_id, requester_principal_id, \
+          selection_json, basis_json, engine_policy_version, schema_version, \
+          revision, extensions_json, created_at, body_text, body_format, \
+          stale_cache) \
+         VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM memory_reflections), \
+           'rfl_bad', 'spc_workshop', 'sub_mira', 'prn_mira', ?, \
+           '{\"digest\":\"d\"}', 'v1', 1, 1, '{}', ?, 'text', 'markdown', 0)",
+    )
+    .bind(
+        "{\"mode\":\"selected_contexts\",\"context_ids\":[\"ctx_a\"],\"include_shared\":\"yes\"}",
+    )
+    .bind(TIME)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert!(matches!(
+        repo.list_reflections(&mut tx, &SpaceId::new("spc_workshop"), "sub_mira", None)
             .await,
         Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
     ));

@@ -778,10 +778,13 @@ fn placement_predicate(placement: &PlacementSelection) -> RepoResult<(bool, bool
 }
 
 fn reflection_row(row: ReflectionRow) -> RepoResult<MemoryReflectionRow> {
+    // A stored JSON null reads as absent: a persisted `null` filter is not a
+    // malformed filter and must not poison the row.
     let filter = row
         .filter_json
         .map(|raw| from_json(&raw, "reflection filter"))
-        .transpose()?;
+        .transpose()?
+        .filter(|value| !value.is_null());
     let cognition_filter = row
         .cognition_filter_json
         .map(|raw| from_json(&raw, "reflection cognition filter"))
@@ -859,10 +862,12 @@ fn pinned_selection(selection: &Value) -> RepoResult<PlacementSelection> {
                         .ok_or_else(|| invalid_row("selected_contexts entry is not a string"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let include_shared = selection
-                .get("include_shared")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| invalid_row("selected_contexts misses include_shared bool"))?;
+            let include_shared = match selection.get("include_shared") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| invalid_row("selected_contexts include_shared is not a bool"))?,
+            };
             Ok(PlacementSelection::SelectedContexts {
                 context_ids: ids,
                 include_shared,
