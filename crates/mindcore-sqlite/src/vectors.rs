@@ -1,6 +1,8 @@
 //! Retained Memory vectors under one embedding identity: identity normalization, the vector
 //! codec, and the scoped lookup/upsert plus bulk retirement over `memory_embedding_vectors`.
 
+use std::mem::size_of;
+
 use serde_json::json;
 use spoke_operations::{jcs_sha256_hex, spoke_reject, SpokeRejectCode, SpokeResult};
 use sqlx::{Executor, Sqlite};
@@ -22,6 +24,13 @@ pub fn identity_hash(
         return spoke_reject(
             SpokeRejectCode::InvalidInput,
             "embedding identity has no dimension",
+            None,
+        );
+    }
+    if dim.checked_mul(size_of::<f32>()).is_none() {
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            format!("dimension {dim} has no representable vector blob length"),
             None,
         );
     }
@@ -257,6 +266,22 @@ mod tests {
     }
 
     #[test]
+    fn identity_hash_bounds_dimension_by_representable_blob_length() {
+        let largest = usize::MAX / size_of::<f32>();
+        assert_eq!(largest.checked_mul(4), Some(largest * 4));
+        let bounded = hash("provider", "model", "version", largest);
+        assert_eq!(bounded.len(), 64);
+
+        // One past the bound: `4 * dim` no longer fits a `usize`, so no vector can hold it.
+        let beyond = largest + 1;
+        assert_eq!(beyond.checked_mul(4), None);
+        assert_eq!(
+            expect_reject(identity_hash("provider", "model", "version", beyond)),
+            SpokeRejectCode::InvalidInput
+        );
+    }
+
+    #[test]
     fn vector_codec_round_trips_component_bits() {
         let vector = [0.5f32, -1.0, f32::MIN_POSITIVE, 3.25];
         let blob = expect_ok(encode_vector(&vector), "encode");
@@ -376,17 +401,33 @@ mod tests {
             Some(vec![3.0, 4.0])
         );
 
-        // The schema rejects a blob whose length disagrees with its dimension.
-        let malformed = sqlx::query(
-            "INSERT INTO memory_embedding_vectors \
-             (record_id, identity_hash, record_revision, dim, vector) VALUES ('rec_2', ?1, 1, 2, ?2)",
-        )
-        .bind(&active)
-        .bind(vec![0u8; 7])
-        .execute(&store.pool())
-        .await;
-        assert!(malformed.is_err(), "a 7-byte blob cannot be a 2-dim row");
+        store.close().await;
+    }
 
+    /// Direct SQL cannot store a non-integral revision or dimension, a non-integer type, or a
+    /// blob whose length disagrees with the dimension.
+    #[tokio::test]
+    async fn schema_rejects_non_integral_and_mismatched_rows() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = crate::MindStore::open(&dir.path().join("mindcore.db"))
+            .await
+            .expect("open store");
+        let rejected = [
+            // Fractional revision: affinity keeps REAL 0.5.
+            "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 0.5, 2, x'0000000000000000')",
+            // Fractional dimension: `length(vector) = 4 * 1.5` holds for six bytes.
+            "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 1, 1.5, x'000000000000')",
+            // A blob whose length disagrees with the dimension.
+            "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 1, 2, x'00000000000000')",
+            // Zero revision.
+            "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 0, 2, x'0000000000000000')",
+        ];
+        for sql in rejected {
+            assert!(
+                sqlx::query(sql).execute(&store.pool()).await.is_err(),
+                "the schema must reject: {sql}"
+            );
+        }
         store.close().await;
     }
 }

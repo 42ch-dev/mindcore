@@ -4,8 +4,10 @@
 CREATE TABLE memory_embedding_vectors (
   record_id       TEXT NOT NULL,
   identity_hash   TEXT NOT NULL,
-  record_revision INTEGER NOT NULL CHECK (record_revision > 0),
-  dim             INTEGER NOT NULL CHECK (dim > 0),
+  -- `INTEGER` affinity keeps a fractional value as REAL, so `typeof` enforces integral storage.
+  record_revision INTEGER NOT NULL
+                  CHECK (typeof(record_revision) = 'integer' AND record_revision > 0),
+  dim             INTEGER NOT NULL CHECK (typeof(dim) = 'integer' AND dim > 0),
   -- Little-endian IEEE 754 binary32 components: no header, no quantization. `typeof` guards
   -- against a text value whose `length()` would count characters instead of bytes.
   vector          BLOB NOT NULL CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim),
