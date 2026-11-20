@@ -2892,3 +2892,515 @@ async fn profile_projection_escapes_injected_front_matter() {
     );
     tx.rollback().await.expect("rollback");
 }
+
+/// §7.7/MEM-R024/I-000056: records.update and records.delete run the fresh-effect
+/// gate on the persisted row — a record inside a fenced context, or any record
+/// under a fenced subject, refuses `SUBJECT_FENCED`/terminal with no mutation,
+/// no receipt and no journal intent. A sibling placement stays writable, a
+/// missing subject fails closed like records.promote, and an authorized same-key
+/// replay still returns the stored receipt once it has committed.
+#[tokio::test]
+async fn update_and_delete_refuse_on_fenced_placement() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["records_write"]).await;
+    let adapter = MemoryAdapter::new(true);
+    for (record_id, visibility, context) in [
+        ("rec_fenced", "context", Some("c1")),
+        ("rec_sibling", "shared", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO memory_records \
+             (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+              scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+              revision, created_at, updated_at) \
+             VALUES (?, ?, ?, 'fact', '{\"text\":\"a live record\"}', ?, ?, \
+                     '{\"source_context_ids\":[],\"anchors\":[],\"captured_by\":\"adapter\",\
+                       \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                     NULL, NULL, NULL, 1, ?, ?)",
+        )
+        .bind(record_id)
+        .bind(SPACE)
+        .bind(SUBJECT)
+        .bind(visibility)
+        .bind(context)
+        .bind(NOW)
+        .bind(NOW)
+        .execute(&harness.pool)
+        .await
+        .expect("seed record");
+    }
+    sqlx::query(
+        "UPDATE memory_subjects SET fenced_contexts_json = '[\"c1\"]' \
+         WHERE space_id = ? AND subject_id = ?",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .execute(&harness.pool)
+    .await
+    .expect("fence context");
+
+    let update = |key: &str, record: &str| {
+        json!({
+            "space_id": SPACE,
+            "record_id": record,
+            "expected_revision": 1,
+            "idempotency_key": key,
+            "content": { "text": "a fenced overwrite" }
+        })
+    };
+    let delete = |key: &str, record: &str| {
+        json!({
+            "space_id": SPACE,
+            "record_id": record,
+            "expected_revision": 1,
+            "idempotency_key": key
+        })
+    };
+
+    let mut tx = harness.begin().await;
+    for result in [
+        adapter
+            .update_record(&mut tx, &principal(PRINCIPAL), update("upd-c1", "rec_fenced"))
+            .await,
+        adapter
+            .delete_record(&mut tx, &principal(PRINCIPAL), delete("del-c1", "rec_fenced"))
+            .await,
+    ] {
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::SubjectFenced);
+        assert_eq!(retry_class(refusal), "terminal");
+        assert_eq!(
+            refusal
+                .details
+                .as_ref()
+                .and_then(|details| details.get("scope"))
+                .and_then(Value::as_str),
+            Some("context")
+        );
+    }
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
+    assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
+    // The unfenced sibling placement stays writable.
+    let sibling = adapter
+        .update_record(&mut tx, &principal(PRINCIPAL), update("upd-sib", "rec_sibling"))
+        .await;
+    assert!(matches!(sibling, SpokeResult::Ok(MemoryStage::JournalPending { .. })));
+    tx.rollback().await.expect("rollback");
+
+    // A fenced/archived subject fences every record write, placement aside.
+    sqlx::query(
+        "UPDATE memory_subjects SET status = 'fenced' \
+         WHERE space_id = ? AND subject_id = ?",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .execute(&harness.pool)
+    .await
+    .expect("fence subject");
+    let mut tx = harness.begin().await;
+    for result in [
+        adapter
+            .update_record(&mut tx, &principal(PRINCIPAL), update("upd-f", "rec_sibling"))
+            .await,
+        adapter
+            .delete_record(&mut tx, &principal(PRINCIPAL), delete("del-f", "rec_sibling"))
+            .await,
+    ] {
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::SubjectFenced);
+        assert_eq!(retry_class(refusal), "terminal");
+    }
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
+    assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
+    tx.rollback().await.expect("rollback");
+
+    // Missing subject row fails closed, consistent with records.promote.
+    sqlx::query(
+        "UPDATE memory_subjects SET status = 'active' \
+         WHERE space_id = ? AND subject_id = ?",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .execute(&harness.pool)
+    .await
+    .expect("unfence subject");
+    sqlx::query("DELETE FROM memory_subjects WHERE space_id = ? AND subject_id = ?")
+        .bind(SPACE)
+        .bind(SUBJECT)
+        .execute(&harness.pool)
+        .await
+        .expect("remove subject");
+    let mut tx = harness.begin().await;
+    for result in [
+        adapter
+            .update_record(&mut tx, &principal(PRINCIPAL), update("upd-m", "rec_sibling"))
+            .await,
+        adapter
+            .delete_record(&mut tx, &principal(PRINCIPAL), delete("del-m", "rec_sibling"))
+            .await,
+    ] {
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::NotFound);
+        assert_eq!(retry_class(refusal), "terminal");
+    }
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.19/I-000059: deleting an already-tombstoned record under a fresh
+/// idempotency key is `INVALID_STATUS_TRANSITION`/terminal — the tombstone,
+/// revision and receipt/journal state are untouched — while the original key
+/// still replays its committed outcome even after the record's context is
+/// fenced (I-000056).
+#[tokio::test]
+async fn delete_of_tombstoned_rejects_and_the_key_still_replays() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["records_write"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_1", "a record to delete", NOW).await;
+    let delete = json!({
+        "space_id": SPACE,
+        "record_id": "rec_1",
+        "expected_revision": 1,
+        "idempotency_key": "del-1"
+    });
+    let stage = adapter
+        .delete_record(&mut tx, &principal(PRINCIPAL), delete.clone())
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        other => panic!("expected a journal pending stage, got {other:?}"),
+    };
+    tx.commit().await.expect("commit");
+    let mut tx = harness.begin().await;
+    let targets = harness.targets(&mut tx, &receipt_id).await;
+    tx.rollback().await.expect("rollback");
+    assert!(harness.publish(&targets).await, "publication must confirm");
+    let mut tx = harness.begin().await;
+    let settled = adapter
+        .settle_journal(&mut tx, &SpaceId::new(SPACE), &receipt_id)
+        .await;
+    assert!(matches!(settled, SpokeResult::Ok(_)), "settle: {settled:?}");
+    tx.commit().await.expect("commit settle");
+
+    // A fresh key over the tombstone refuses before any effect and leaves the
+    // stored state alone.
+    let mut tx = harness.begin().await;
+    let repeat = adapter
+        .delete_record(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "record_id": "rec_1",
+                "expected_revision": 2,
+                "idempotency_key": "del-1-repeat"
+            }),
+        )
+        .await;
+    let refusal = reject(&repeat);
+    assert_eq!(refusal.code, SpokeRejectCode::InvalidStatusTransition);
+    assert_eq!(retry_class(refusal), "terminal");
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    assert_eq!(harness.count(&mut tx, "memory_journal").await, 1);
+    let (revision, tombstone) = sqlx::query_as::<_, (i64, String)>(
+        "SELECT revision, tombstone_json FROM memory_records WHERE record_id = 'rec_1'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("record");
+    assert_eq!(revision, 2);
+    let tombstone: Value = serde_json::from_str(&tombstone).expect("tombstone json");
+    assert!(tombstone.get("deleted_at").is_some());
+    tx.rollback().await.expect("rollback");
+
+    // Fence the subject afterwards: the same key still replays the committed
+    // receipt — the fresh-effect gates never re-run on a replay (I-000056).
+    sqlx::query(
+        "UPDATE memory_subjects SET status = 'fenced' \
+         WHERE space_id = ? AND subject_id = ?",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .execute(&harness.pool)
+    .await
+    .expect("fence subject");
+    let mut tx = harness.begin().await;
+    let replay = ready(adapter.delete_record(&mut tx, &principal(PRINCIPAL), delete).await);
+    assert_eq!(replay["status"], "committed");
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.13/C-102 parity/I-000050: an existing by-id row the principal's grants do
+/// not cover answers the same terminal `NOT_FOUND` as an id the store never
+/// held — for both the candidate and the record arm — while a request-derived
+/// operation still reports `NOT_AUTHORIZED`.
+#[tokio::test]
+async fn uncovered_by_id_rows_read_as_not_found() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["capture", "records_write"])
+        .await;
+    harness.seed_grant(STRANGER, &["records_read"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_held", "a held record", NOW).await;
+    // The held candidate exists for PRINCIPAL only.
+    let captured = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a held candidate" },
+                    "idempotency_key": "cap-held"
+                }),
+            )
+            .await,
+    );
+    let candidate_id = captured["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit seeds");
+
+    // Missing and existing ids are indistinguishable in both by-id arms.
+    let mut tx = harness.begin().await;
+    for result in [
+        adapter
+            .dismiss_candidate(
+                &mut tx,
+                &principal(STRANGER),
+                json!({
+                    "space_id": SPACE,
+                    "candidate_id": "cand_absent",
+                    "expected_revision": 1,
+                    "idempotency_key": "dis-absent"
+                }),
+            )
+            .await,
+        adapter
+            .dismiss_candidate(
+                &mut tx,
+                &principal(STRANGER),
+                json!({
+                    "space_id": SPACE,
+                    "candidate_id": candidate_id,
+                    "expected_revision": 1,
+                    "idempotency_key": "dis-held"
+                }),
+            )
+            .await,
+        adapter
+            .update_record(
+                &mut tx,
+                &principal(STRANGER),
+                json!({
+                    "space_id": SPACE,
+                    "record_id": "rec_absent",
+                    "expected_revision": 1,
+                    "idempotency_key": "upd-absent",
+                    "content": { "text": "x" }
+                }),
+            )
+            .await,
+        adapter
+            .update_record(
+                &mut tx,
+                &principal(STRANGER),
+                json!({
+                    "space_id": SPACE,
+                    "record_id": "rec_held",
+                    "expected_revision": 1,
+                    "idempotency_key": "upd-held",
+                    "content": { "text": "x" }
+                }),
+            )
+            .await,
+        adapter
+            .promote_record(
+                &mut tx,
+                &principal(STRANGER),
+                json!({
+                    "space_id": SPACE,
+                    "record_id": "rec_held",
+                    "expected_revision": 1,
+                    "target_scope": { "visibility": "context", "context_id": "c9" },
+                    "idempotency_key": "pro-held"
+                }),
+            )
+            .await,
+        adapter
+            .delete_record(
+                &mut tx,
+                &principal(STRANGER),
+                json!({
+                    "space_id": SPACE,
+                    "record_id": "rec_held",
+                    "expected_revision": 1,
+                    "idempotency_key": "del-held"
+                }),
+            )
+            .await,
+    ] {
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::NotFound);
+        assert_eq!(retry_class(refusal), "terminal");
+    }
+    // A request-derived requirement keeps NOT_AUTHORIZED: the stranger knows
+    // the subject exists and only lacks the write capability.
+    let created = adapter
+        .create_record(
+            &mut tx,
+            &principal(STRANGER),
+            json!({
+                "space_id": SPACE,
+                "subject_id": SUBJECT,
+                "kind": "fact",
+                "scope": { "visibility": "shared" },
+                "content": { "text": "a stranger write" },
+                "idempotency_key": "cre-stranger"
+            }),
+        )
+        .await;
+    let refusal = reject(&created);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(refusal), "terminal");
+    tx.rollback().await.expect("rollback");
+}
+
+/// I-000053/I-000054: a request `filter: null` stages as absent and a selection
+/// that omits `include_shared` survives generate → caller commit → complete →
+/// caller commit → list; a row whose stored `filter_json` is the literal 'null'
+/// also reads back without a filter.
+#[tokio::test]
+async fn null_filter_and_omitted_include_shared_survive_reflections() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["reflect"]).await;
+    sqlx::query(
+        "INSERT INTO memory_records \
+         (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
+          scope_context_id, provenance_json, import_ref_json, occurred_at, tombstone_json, \
+          revision, created_at, updated_at) \
+         VALUES ('rec_ctx', ?, ?, 'fact', '{\"text\":\"a live basis record\"}', 'context', 'c1', \
+                 '{\"source_context_ids\":[\"c1\"],\"anchors\":[],\"captured_by\":\"adapter\",\
+                   \"captured_at\":\"2026-11-20T09:20:01.123Z\"}', \
+                 NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed record");
+    sqlx::query(
+        "INSERT INTO memory_profiles \
+         (space_id, subject_id, profile_kind, document_json, updated_by, revision, created_at, \
+          updated_at) VALUES (?, ?, 'personality', ?, 'adapter', 1, ?, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(r#"{"body":"a real personality","format":"markdown"}"#)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed profile");
+    let adapter = MemoryAdapter::new(true);
+    let selection = json!({
+        "mode": "selected_contexts",
+        "context_ids": ["c1"]
+    });
+
+    let mut tx = harness.begin().await;
+    let state = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": selection, "filter": null }),
+            )
+            .await,
+    );
+    let digest = state["state_digest"].as_str().expect("digest").to_string();
+    let staged = adapter
+        .generate_reflection(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                    "selection": selection, "filter": null,
+                    "expected_state_digest": digest,
+                    "idempotency_key": "gen-null" }),
+        )
+        .await;
+    let work = match staged {
+        SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
+        other => panic!("expected a reflection pending stage, got {other:?}"),
+    };
+    tx.commit().await.expect("commit lease");
+    let mut tx2 = harness.begin().await;
+    let completed = adapter.complete_reflection(&mut tx2, work.compose()).await;
+    let body = match completed {
+        SpokeResult::Ok(body) => body,
+        SpokeResult::Reject(reject) => panic!("completion rejected: {reject:?}"),
+    };
+    tx2.commit().await.expect("commit completion");
+    let reflection_id = body["result"]["reflection_id"]
+        .as_str()
+        .expect("reflection id")
+        .to_string();
+
+    // The stored row carries no filter member.
+    let stored_filter: Option<String> = sqlx::query_scalar(
+        "SELECT filter_json FROM memory_reflections WHERE reflection_id = ?",
+    )
+    .bind(&reflection_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("stored filter");
+    assert_eq!(stored_filter.as_deref(), None);
+
+    // Simulate a legacy literal-'null' filter: reads must treat it as absent.
+    sqlx::query("UPDATE memory_reflections SET filter_json = 'null' WHERE reflection_id = ?")
+        .bind(&reflection_id)
+        .execute(&harness.pool)
+        .await
+        .expect("null filter fixture");
+
+    let mut tx = harness.begin().await;
+    let listed = ready(
+        adapter
+            .list_reflections(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT }),
+            )
+            .await,
+    );
+    let reflections = listed["reflections"].as_array().expect("reflections");
+    assert_eq!(reflections.len(), 1);
+    assert_eq!(reflections[0]["reflection_id"], reflection_id);
+    assert!(reflections[0].get("filter").is_none());
+    assert_eq!(reflections[0]["stale"], false);
+    let state = ready(
+        adapter
+            .get_reflection_state(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": selection, "filter": null }),
+            )
+            .await,
+    );
+    assert_eq!(state["last_reflection_id"], reflection_id);
+    assert_eq!(state["stale"], false);
+    tx.rollback().await.expect("rollback");
+}
