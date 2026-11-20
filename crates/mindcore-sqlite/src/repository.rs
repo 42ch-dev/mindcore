@@ -135,19 +135,19 @@ struct CandidateRow {
     created_at: String,
 }
 
-fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
-    let status = &row.status;
+fn candidate_ir(row: CandidateRow) -> RepoResult<MemoryCandidateIr> {
+    let status = row.status;
     let mut proposed = Map::new();
     // A consumed row with an empty stored kind has no representable proposal;
     // the consumed codec accepts `proposed` absent.
     if !row.kind.is_empty() {
-        proposed.insert("kind".into(), row.kind.clone().into());
+        proposed.insert("kind".into(), row.kind.into());
     }
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert("candidate_id".into(), row.candidate_id.clone().into());
-    wire.insert("space_id".into(), row.space_id.clone().into());
-    wire.insert("subject_id".into(), row.subject_id.clone().into());
+    wire.insert("candidate_id".into(), row.candidate_id.into());
+    wire.insert("space_id".into(), row.space_id.into());
+    wire.insert("subject_id".into(), row.subject_id.into());
     wire.insert(
         "capture_scope".into(),
         placement_wire_value(
@@ -164,23 +164,21 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
         "provenance".into(),
         from_json(&row.provenance_json, "provenance")?,
     );
-    wire.insert("created_at".into(), row.created_at.clone().into());
+    wire.insert("created_at".into(), row.created_at.into());
     wire.insert("revision".into(), row.revision.into());
     wire.insert("extensions".into(), Map::new().into());
-    wire.insert("status".into(), status.clone().into());
-    if let Some(occurred_at) = &row.occurred_at {
-        wire.insert("occurred_at".into(), occurred_at.clone().into());
+    if let Some(occurred_at) = row.occurred_at {
+        wire.insert("occurred_at".into(), occurred_at.into());
     }
     match status.as_str() {
         "pending" => {
             let content = row
                 .content_json
-                .clone()
                 .ok_or_else(|| invalid_row("pending candidate has no content_json"))
                 .and_then(|raw| from_json(&raw, "candidate content"))?;
             proposed.insert("content".into(), content);
-            if let Some(expires_at) = &row.expires_at {
-                wire.insert("expires_at".into(), expires_at.clone().into());
+            if let Some(expires_at) = row.expires_at {
+                wire.insert("expires_at".into(), expires_at.into());
             }
         }
         "consumed" => {
@@ -188,7 +186,6 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
                 "consumed_by".into(),
                 from_json(
                     &row.consumed_by_json
-                        .clone()
                         .ok_or_else(|| invalid_row("consumed candidate has no consumed_by"))?,
                     "candidate outcome",
                 )?,
@@ -196,13 +193,13 @@ fn candidate_ir(row: &CandidateRow) -> RepoResult<MemoryCandidateIr> {
             wire.insert(
                 "content_digest".into(),
                 row.content_digest
-                    .clone()
                     .ok_or_else(|| invalid_row("consumed candidate has no content_digest"))?
                     .into(),
             );
         }
         other => return Err(invalid_row(format_args!("candidate status {other}"))),
     }
+    wire.insert("status".into(), status.into());
     if !proposed.is_empty() {
         wire.insert("proposed".into(), proposed.into());
     }
@@ -365,7 +362,6 @@ async fn candidate_by_key(
     .fetch_optional(&mut **tx)
     .await
     .map_err(decode_row)?
-    .as_ref()
     .map(candidate_ir)
     .transpose()
 }
@@ -436,7 +432,7 @@ struct RecordRow {
     updated_at: String,
 }
 
-fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
+fn record_ir(row: RecordRow) -> RepoResult<MemoryRecordIr> {
     let scope = placement_wire_value(
         row.scope_visibility.as_str(),
         row.scope_context_id.as_ref(),
@@ -444,10 +440,10 @@ fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
     )?;
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert("record_id".into(), row.record_id.clone().into());
-    wire.insert("space_id".into(), row.space_id.clone().into());
-    wire.insert("subject_id".into(), row.subject_id.clone().into());
-    wire.insert("kind".into(), row.kind.clone().into());
+    wire.insert("record_id".into(), row.record_id.into());
+    wire.insert("space_id".into(), row.space_id.into());
+    wire.insert("subject_id".into(), row.subject_id.into());
+    wire.insert("kind".into(), row.kind.into());
     wire.insert("scope".into(), scope);
     wire.insert(
         "content".into(),
@@ -460,25 +456,25 @@ fn record_ir(row: &RecordRow) -> RepoResult<MemoryRecordIr> {
     // Pinned projection: the tombstone marks the row dead; a surviving
     // `import_ref_json` (the native delete leaves it) is dropped, and an explicit
     // JSON null `reason` normalizes to the wire's optional-member shape.
-    if let Some(raw) = &row.tombstone_json {
-        let mut tombstone = from_json(raw, "record tombstone")?;
+    if let Some(raw) = row.tombstone_json {
+        let mut tombstone = from_json(&raw, "record tombstone")?;
         if let Some(object) = tombstone.as_object_mut() {
             if object.get("reason") == Some(&Value::Null) {
                 object.remove("reason");
             }
         }
         wire.insert("tombstone".into(), tombstone);
-    } else if let Some(import_ref) = &row.import_ref_json {
+    } else if let Some(import_ref) = row.import_ref_json {
         wire.insert(
             "import_ref".into(),
-            from_json(import_ref, "record import ref")?,
+            from_json(&import_ref, "record import ref")?,
         );
     }
-    if let Some(occurred_at) = &row.occurred_at {
-        wire.insert("occurred_at".into(), occurred_at.clone().into());
+    if let Some(occurred_at) = row.occurred_at {
+        wire.insert("occurred_at".into(), occurred_at.into());
     }
-    wire.insert("created_at".into(), row.created_at.clone().into());
-    wire.insert("updated_at".into(), row.updated_at.clone().into());
+    wire.insert("created_at".into(), row.created_at.into());
+    wire.insert("updated_at".into(), row.updated_at.into());
     wire.insert("revision".into(), row.revision.into());
     wire.insert("extensions".into(), Map::new().into());
     let (_, ir) = memory_record_from_wire(wire.into()).map_err(invalid_row)?;
@@ -572,7 +568,6 @@ async fn record_by_key(
     .fetch_optional(&mut **tx)
     .await
     .map_err(decode_row)?
-    .as_ref()
     .map(record_ir)
     .transpose()
 }
@@ -623,31 +618,31 @@ struct ReceiptRow {
     completed_at: Option<String>,
 }
 
-fn receipt_wire(row: &ReceiptRow) -> RepoResult<Value> {
+fn receipt_wire(row: ReceiptRow) -> RepoResult<Value> {
     let mut wire = Map::new();
     wire.insert("schema_version".into(), 1.into());
-    wire.insert("receipt_id".into(), row.receipt_id.clone().into());
-    wire.insert("space_id".into(), row.space_id.clone().into());
+    wire.insert("receipt_id".into(), row.receipt_id.into());
+    wire.insert("space_id".into(), row.space_id.into());
     wire.insert(
         "requester_principal_id".into(),
-        row.requester_principal_id.clone().into(),
+        row.requester_principal_id.into(),
     );
-    wire.insert("op".into(), row.op.clone().into());
-    if let Some(key) = &row.idempotency_key {
-        wire.insert("idempotency_key".into(), key.clone().into());
+    wire.insert("op".into(), row.op.into());
+    if let Some(key) = row.idempotency_key {
+        wire.insert("idempotency_key".into(), key.into());
     }
-    wire.insert("payload_digest".into(), row.payload_digest.clone().into());
-    wire.insert("created_at".into(), row.created_at.clone().into());
+    wire.insert("payload_digest".into(), row.payload_digest.into());
+    wire.insert("created_at".into(), row.created_at.into());
     wire.insert("extensions".into(), Map::new().into());
-    wire.insert("status".into(), row.status.clone().into());
-    if let Some(completed_at) = &row.completed_at {
-        wire.insert("completed_at".into(), completed_at.clone().into());
+    wire.insert("status".into(), row.status.into());
+    if let Some(completed_at) = row.completed_at {
+        wire.insert("completed_at".into(), completed_at.into());
     }
-    if let Some(result) = &row.result_json {
-        wire.insert("result".into(), from_json(result, "receipt result")?);
+    if let Some(result) = row.result_json {
+        wire.insert("result".into(), from_json(&result, "receipt result")?);
     }
-    if let Some(error) = &row.error_json {
-        wire.insert("error".into(), from_json(error, "receipt error")?);
+    if let Some(error) = row.error_json {
+        wire.insert("error".into(), from_json(&error, "receipt error")?);
     }
     Ok(wire.into())
 }
@@ -655,14 +650,14 @@ fn receipt_wire(row: &ReceiptRow) -> RepoResult<Value> {
 /// Decodes one receipt row: a settled row whose payload columns were reclaimed by
 /// retention reports `Evicted` (digest + last status survive), anything else must
 /// decode as a full retained receipt.
-fn receipt_read(row: &ReceiptRow) -> RepoResult<ReceiptRead> {
+fn receipt_read(row: ReceiptRow) -> RepoResult<ReceiptRead> {
     let evicted = row.result_json.is_none() && row.error_json.is_none() && row.status != "pending";
     if evicted {
         return Ok(ReceiptRead::Evicted {
-            requester: row.requester_principal_id.clone(),
-            operation: row.op.clone(),
-            status: row.status.clone(),
-            payload_digest: row.payload_digest.clone(),
+            requester: row.requester_principal_id,
+            operation: row.op,
+            status: row.status,
+            payload_digest: row.payload_digest,
         });
     }
     let wire = receipt_wire(row)?;
@@ -838,16 +833,17 @@ struct ProfileRow {
     updated_at: String,
 }
 
-fn profile_ir(row: &ProfileRow) -> RepoResult<MemoryProfileRow> {
+fn profile_ir(row: ProfileRow) -> RepoResult<MemoryProfileRow> {
+    let document = from_json(&row.document_json, "profile document")?;
     Ok(MemoryProfileRow {
-        space_id: SpaceId::new(row.space_id.clone()),
-        subject_id: SubjectId::new(row.subject_id.clone()),
-        profile_kind: row.profile_kind.clone(),
-        document: from_json(&row.document_json, "profile document")?,
-        updated_by: CallerId::new(row.updated_by.clone()),
+        space_id: SpaceId::new(row.space_id),
+        subject_id: SubjectId::new(row.subject_id),
+        profile_kind: row.profile_kind,
+        document,
+        updated_by: CallerId::new(row.updated_by),
         revision: row.revision.into(),
-        created_at: row.created_at.clone(),
-        updated_at: row.updated_at.clone(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
         extensions: Map::new(),
     })
 }
@@ -1108,7 +1104,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_optional(&mut **tx)
         .await
         .map_err(decode_row)?
-        .as_ref()
         .map(receipt_read)
         .transpose()
     }
@@ -1153,7 +1148,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(record_ir)
         .collect()
     }
@@ -1502,7 +1497,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(candidate_ir)
         .collect()
     }
@@ -1605,7 +1600,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(record_ir)
         .collect()
     }
@@ -1666,7 +1661,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_optional(&mut **tx)
         .await
         .map_err(decode_row)?
-        .as_ref()
         .map(receipt_read)
         .transpose()
     }
@@ -1784,7 +1778,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)?
-        .iter()
+        .into_iter()
         .map(profile_ir)
         .collect()
     }
@@ -2144,7 +2138,7 @@ mod tests {
     fn pending_candidate_content_refusal_is_defensive_reader_contract() {
         for content in [None, Some("null")] {
             assert!(matches!(
-                candidate_ir(&pending_row(content)),
+                candidate_ir(pending_row(content)),
                 Err(SqliteRepositoryError::InvalidRow(_))
             ));
         }
