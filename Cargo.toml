@@ -1,8 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/mindcore-base", "crates/mindcore-sqlite", "crates/mindcore-spoke"]
+members = [
+    "crates/mindcore-base",
+    "crates/mindcore-spi",
+    "crates/mindcore-sqlite",
+    "crates/mindcore-spoke",
+]
 default-members = [
     "crates/mindcore-base",
+    "crates/mindcore-spi",
     "crates/mindcore-sqlite",
     "crates/mindcore-spoke",
 ]
