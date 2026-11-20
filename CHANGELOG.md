@@ -14,6 +14,9 @@
   the carrier payload keeps only the cognition module envelope, and full DTO reads project
   `records` from the rows in append order. A full put must carry the committed prefix
   unchanged and appends only its validated suffix.
+- Dependencies: the SPOKE cohort is pinned to `=0.17.0` — `spoke-schemas` and `spoke-operations` in
+  `[workspace.dependencies]`, and `spoke-connect` there too, so the SQLite test dependency inherits
+  the same pin with `remote-adapter` enabled.
 - `mindcore-sqlite`: pre-release migrations are mutable. A database that already applied a migration
   whose embedded file has since changed is refused by `MindStore::open` with a checksum mismatch;
   there is no upgrade path until the first release. A database whose applied migrations still match

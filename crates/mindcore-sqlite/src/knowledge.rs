@@ -8,14 +8,44 @@ use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use mindcore_base::cognition::carrier_record_violation;
 use mindcore_base::knowledge::KnowledgeScope;
 use spoke_operations::{
-    spoke_reject, validate_cognition_module, validate_cognition_record, KnowledgeEntryPort,
-    SpokeRejectCode, SpokeResult,
+    filter_knowledge_entries_by_scope, spoke_reject, validate_cognition_module,
+    validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort, SpokeRejectCode,
+    SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
-use spoke_schemas::KnowledgeEntry;
+use spoke_schemas::{KnowledgeEntry, Scope};
 
 use crate::cognition::{insert_record, read_records};
 use crate::store::MindStore;
+
+/// Hard bound on one list of a stored collection.
+///
+/// Every list decodes the collection's stored rows before any disclosure predicate filters them,
+/// so the collection is bounded at the query boundary instead of growing memory and work with its
+/// total size. An over-bound collection refuses the list; it never truncates.
+pub const SERVED_KNOWLEDGE_LIST_LIMIT: usize = 512;
+
+/// Refuse a scope carrying a selection the knowledge face does not serve.
+///
+/// The host admission callback applies this to the scope it returns, before Connect merges it with
+/// a list request: that merge keeps only the request's cognition selection, so a cognition
+/// selection admitted but never validated would be dropped from the list scope while `get`/`put`
+/// still see it. The routed store applies the same rule to every caller-declared scope.
+pub fn validate_admission_scope(scope: &Scope) -> SpokeResult<()> {
+    if scope.cognition.is_some()
+        || scope.timeline_event_ids.is_some()
+        || scope.timeline_scale.is_some()
+        || scope.fork_id.is_some()
+        || scope.extensions.is_some()
+    {
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            "the knowledge face serves no cognition, timeline, fork or extension selection",
+            None,
+        );
+    }
+    SpokeResult::Ok(())
+}
 
 /// A knowledge port bound to one collection.
 ///
@@ -43,7 +73,8 @@ impl ScopedKnowledgeStore {
         &self.scope
     }
 
-    /// Every entry of this collection, ordered by `entry_id` ASC.
+    /// Every entry of this collection, ordered by `entry_id` ASC and bounded by
+    /// [`SERVED_KNOWLEDGE_LIST_LIMIT`].
     ///
     /// The projection runs inside one read transaction: SQLite pins the snapshot at
     /// the first statement, so an append committed by another connection between the
@@ -57,7 +88,7 @@ impl ScopedKnowledgeStore {
                 return internal(format!("knowledge entries could not be listed: {error}"))
             }
         };
-        match entries(&mut *tx, &self.scope.collection).await {
+        match entries(&mut tx, &self.scope.collection).await {
             SpokeResult::Ok(listed) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(listed),
                 Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
@@ -69,21 +100,30 @@ impl ScopedKnowledgeStore {
 
 /// Every entry of `collection`, ordered by `entry_id` ASC, read through the
 /// caller's transaction so a workflow reads one whole snapshot at one point.
+///
+/// Bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`] like the served list: the remote
+/// workflow's knowledge slot must not read and decode a collection of any size.
 pub async fn list_entries_in(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
 ) -> SpokeResult<Vec<KnowledgeEntry>> {
-    entries(&mut **tx, collection).await
+    entries(&mut *tx, collection).await
 }
 
+/// The stored rows of `collection`, ordered by `entry_id` ASC, bounded at the
+/// query boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] rows are decoded, and
+/// an over-bound collection refuses the list instead of growing memory and work
+/// with its total size.
 async fn entries(
     connection: &mut SqliteConnection,
     collection: &str,
 ) -> SpokeResult<Vec<KnowledgeEntry>> {
+    let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
     let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC",
+        "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC LIMIT ?",
     )
     .bind(collection)
+    .bind(limit + 1)
     .fetch_all(&mut *connection)
     .await;
     let payloads = match payloads {
@@ -103,6 +143,11 @@ async fn entries(
         }
         stored.push(entry);
     }
+    if stored.len() as i64 > limit {
+        return internal(format!(
+            "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list is bounded"
+        ));
+    }
     SpokeResult::Ok(stored)
 }
 
@@ -111,6 +156,208 @@ impl MindStore {
     pub fn knowledge(&self, scope: KnowledgeScope) -> ScopedKnowledgeStore {
         ScopedKnowledgeStore::new(self.pool.clone(), scope)
     }
+
+    /// The connect-served knowledge port: the admitted `scope_id` selects `scope`'s collection.
+    pub fn served_knowledge(
+        &self,
+        scope_id: impl Into<String>,
+        scope: KnowledgeScope,
+    ) -> RoutedKnowledgeStore {
+        RoutedKnowledgeStore::new(self.pool.clone(), scope_id, scope)
+    }
+}
+
+/// The connect-served knowledge face over the store's shared pool.
+///
+/// The host configures one exact route: an admitted `Scope` naming `scope_id` reads and writes
+/// `scope`'s collection, and any other id is `NotAuthorized` before a statement runs — no peer,
+/// payload or fallback picks a collection.
+///
+/// Every op applies the admitted refinements and SPOKE's disclosure predicate, so an entry hidden
+/// from the peer answers like a missing one. `put` judges the submitted entry, and the existing row
+/// in the same `BEGIN IMMEDIATE` transaction, before the common store can reveal a revision; a
+/// hidden existing row is `NotAuthorized` and never overwritten.
+pub struct RoutedKnowledgeStore {
+    pool: SqlitePool,
+    scope_id: String,
+    scope: KnowledgeScope,
+}
+
+impl RoutedKnowledgeStore {
+    fn new(pool: SqlitePool, scope_id: impl Into<String>, scope: KnowledgeScope) -> Self {
+        Self {
+            pool,
+            scope_id: scope_id.into(),
+            scope,
+        }
+    }
+
+    /// The admission every op starts with: an unconfigured `scope_id` and a selection this face
+    /// does not serve are refused instead of ignored.
+    fn admit(&self, scope: &Scope) -> SpokeResult<()> {
+        if scope.scope_id != self.scope_id {
+            return not_authorized();
+        }
+        validate_admission_scope(scope)
+    }
+
+    /// The routed collection's stored rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
+    /// over-bound collection refuses the list instead of growing memory and work with its size.
+    /// The projection runs inside one read transaction, so the carrier payloads and the
+    /// record rows project from one whole committed state.
+    async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!("knowledge entries could not be listed: {error}"))
+            }
+        };
+        match entries(&mut tx, &self.scope.collection).await {
+            SpokeResult::Ok(listed) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(listed),
+                Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
+    }
+}
+
+#[async_trait]
+impl ScopedKnowledgePort for RoutedKnowledgeStore {
+    async fn get_scoped_knowledge_entry(
+        &self,
+        scope: &Scope,
+        entry_id: &str,
+    ) -> SpokeResult<KnowledgeEntry> {
+        if let SpokeResult::Reject(reject) = self.admit(scope) {
+            return SpokeResult::Reject(reject);
+        }
+        // One read transaction pins the snapshot: the carrier payload and its record
+        // rows project from one committed state, the same whole read the scoped
+        // port's get makes. A missing row and a row hidden by the admission reach
+        // the same refusal.
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!("knowledge entry could not be read: {error}"))
+            }
+        };
+        let entry = match read_entry(&mut tx, &self.scope.collection, entry_id).await {
+            SpokeResult::Ok(entry) => match tx.commit().await {
+                Ok(()) => entry,
+                Err(error) => {
+                    return internal(format!("knowledge entry could not be read: {error}"))
+                }
+            },
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+            {
+                return not_found(entry_id)
+            }
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match visible(&entry, scope) {
+            SpokeResult::Ok(true) => SpokeResult::Ok(entry),
+            SpokeResult::Ok(false) => not_found(entry_id),
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
+    }
+
+    async fn put_scoped_knowledge_entry(
+        &self,
+        scope: &Scope,
+        entry: KnowledgeEntry,
+        expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        if let SpokeResult::Reject(reject) = self.admit(scope) {
+            return SpokeResult::Reject(reject);
+        }
+        match visible(&entry, scope) {
+            SpokeResult::Ok(true) => {}
+            SpokeResult::Ok(false) => return not_authorized(),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        }
+        // Hold SQLite's write reservation across the existing-row check and the write, like the
+        // scoped store above.
+        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => transaction,
+            Err(error) => return internal(format!("knowledge write could not begin: {error}")),
+        };
+        let existing = read_entry(&mut transaction, &self.scope.collection, &entry.entry_id).await;
+        let existing = match existing {
+            SpokeResult::Ok(existing) => Some(existing),
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+            {
+                None
+            }
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if let Some(existing) = existing {
+            match visible(&existing, scope) {
+                SpokeResult::Ok(true) => {}
+                // A hidden row is neither overwritten nor allowed to leak its revision.
+                SpokeResult::Ok(false) => return not_authorized(),
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            }
+        }
+        let written = write_entry(
+            &mut transaction,
+            &self.scope.collection,
+            entry,
+            expected_base_revision,
+        )
+        .await;
+        let entry = match written {
+            SpokeResult::Ok(entry) => entry,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if let Err(error) = transaction.commit().await {
+            return internal(format!("knowledge write could not commit: {error}"));
+        }
+        SpokeResult::Ok(entry)
+    }
+
+    async fn list_scoped_knowledge_entries(
+        &self,
+        scope: &Scope,
+    ) -> SpokeResult<Vec<KnowledgeEntry>> {
+        if let SpokeResult::Reject(reject) = self.admit(scope) {
+            return SpokeResult::Reject(reject);
+        }
+        let entries = match self.served_entries().await {
+            SpokeResult::Ok(entries) => entries,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match filter_knowledge_entries_by_scope(&entries, scope) {
+            SpokeResult::Ok(visible) => SpokeResult::Ok(visible.into_iter().cloned().collect()),
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
+    }
+}
+
+fn not_authorized<T>() -> SpokeResult<T> {
+    spoke_reject(
+        SpokeRejectCode::NotAuthorized,
+        "knowledge scope not authorized",
+        None,
+    )
+}
+
+/// One entry is visible when SPOKE's scope predicate keeps it.
+fn visible(entry: &KnowledgeEntry, scope: &Scope) -> SpokeResult<bool> {
+    match filter_knowledge_entries_by_scope(std::slice::from_ref(entry), scope) {
+        SpokeResult::Ok(visible) => SpokeResult::Ok(!visible.is_empty()),
+        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+    }
+}
+
+fn not_found<T>(entry_id: &str) -> SpokeResult<T> {
+    spoke_reject(
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        format!("no knowledge entry {entry_id} in the admitted scope"),
+        None,
+    )
 }
 
 pub(crate) fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
@@ -147,20 +394,15 @@ fn cognition_module(entry: &KnowledgeEntry) -> Option<Value> {
     }
 }
 
-fn stale<T>(
-    collection: &str,
-    entry_id: &str,
-    expected: Option<u64>,
-    stored: Option<u64>,
-) -> SpokeResult<T> {
+// Names no collection: a served put forwards this message to an admitted peer, and an absent
+// or foreign-only id must answer exactly like a stale visible one.
+fn stale<T>(entry_id: &str, expected: Option<u64>, stored: Option<u64>) -> SpokeResult<T> {
     let mut details = Map::new();
     details.insert("expected_base_revision".to_string(), Value::from(expected));
     details.insert("stored_revision".to_string(), Value::from(stored));
     spoke_reject(
         SpokeRejectCode::StoredRevisionStale,
-        format!(
-            "knowledge entry {entry_id} in collection {collection} does not hold the expected revision"
-        ),
+        format!("knowledge entry {entry_id} does not hold the expected revision"),
         Some(details),
     )
 }
@@ -190,7 +432,7 @@ pub async fn read_entry(
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             };
             if let SpokeResult::Reject(reject) =
-                hydrate_cognition_records(&mut **tx, collection, &mut entry).await
+                hydrate_cognition_records(&mut *tx, collection, &mut entry).await
             {
                 return SpokeResult::Reject(reject);
             }
@@ -347,17 +589,14 @@ pub async fn write_entry(
             Some(_) => {
                 return spoke_reject(
                     SpokeRejectCode::KnowledgeEntryAlreadyExists,
-                    format!(
-                        "knowledge entry {} already exists in collection {collection}",
-                        entry.entry_id
-                    ),
+                    format!("knowledge entry {} already exists", entry.entry_id),
                     None,
                 )
             }
         },
         Some(expected) => match stored {
             Some(stored) if stored == expected => expected + 1,
-            stored => return stale(collection, &entry.entry_id, Some(expected), stored),
+            stored => return stale(&entry.entry_id, Some(expected), stored),
         },
     };
 
@@ -552,7 +791,6 @@ pub async fn append_cognition(
     let stored_revision = stored_revision as u64;
     if stored_revision != expected_revision {
         return stale(
-            collection,
             entry_id,
             Some(expected_revision),
             Some(stored_revision),
@@ -580,18 +818,15 @@ pub async fn append_cognition(
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
     entry.revision = Some(stored_revision + 1);
-    if !entry.modules.contains_key(&module_key()) {
-        // First record of a carrier without a module: seed the same envelope a full put
-        // would have committed.
-        entry.modules.insert(
-            module_key(),
-            KnowledgeEntryModulesValue::Object(Map::from_iter([
-                ("records".to_string(), Value::Array(Vec::new())),
-                ("world_facts".to_string(), Value::Array(Vec::new())),
-                ("extensions".to_string(), Value::Object(Map::new())),
-            ])),
-        );
-    }
+    entry.modules.entry(module_key()).or_insert_with(|| {
+        // First record of a carrier without a module: seed the same envelope a full
+        // put would have committed.
+        KnowledgeEntryModulesValue::Object(Map::from_iter([
+            ("records".to_string(), Value::Array(Vec::new())),
+            ("world_facts".to_string(), Value::Array(Vec::new())),
+            ("extensions".to_string(), Value::Object(Map::new())),
+        ]))
+    });
     strip_records(&mut entry);
     let payload = match encode(&entry) {
         SpokeResult::Ok(payload) => payload,
