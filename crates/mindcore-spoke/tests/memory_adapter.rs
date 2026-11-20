@@ -2149,3 +2149,302 @@ async fn complete_reflection_storage_failure_reports_uncertain() {
     .expect("receipt");
     assert_eq!(status, "pending");
 }
+
+/// I-000045: canonical review decisions — the internally-tagged
+/// `{"action": "promote"|"fragment"|"drop", …}` spellings — pass the DTO and
+/// the internal parser end to end and journal their outcome, while every
+/// non-canonical spelling rejects as INVALID_INPUT.
+#[tokio::test]
+async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(PRINCIPAL, &["capture", "review", "records_write"])
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    async fn capture(harness: &Harness, key: &str) -> String {
+        let adapter = MemoryAdapter::new(true);
+        let mut tx = harness.begin().await;
+        let body = ready(
+            adapter
+                .capture(
+                    &mut tx,
+                    &principal(PRINCIPAL),
+                    json!({
+                        "space_id": SPACE,
+                        "subject_id": SUBJECT,
+                        "capture_scope": { "visibility": "shared" },
+                        "content": { "text": "a canonical review candidate to consume" },
+                        "idempotency_key": key
+                    }),
+                )
+                .await,
+        );
+        tx.commit().await.expect("commit capture");
+        body["result"]["candidate_ids"][0]
+            .as_str()
+            .expect("candidate id")
+            .to_string()
+    }
+
+    async fn review(
+        harness: &Harness,
+        adapter: &MemoryAdapter,
+        candidate_id: &str,
+        decision: Value,
+        key: &str,
+    ) -> SpokeResult<MemoryStage> {
+        let mut tx = harness.begin().await;
+        let result = adapter
+            .review_candidate(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "candidate_id": candidate_id,
+                    "decision": decision,
+                    "expected_revision": 1,
+                    "idempotency_key": key
+                }),
+            )
+            .await;
+        tx.commit().await.expect("commit");
+        result
+    }
+
+    async fn outcome(harness: &Harness, receipt_id: &str) -> Value {
+        let result: Option<String> =
+            sqlx::query_scalar("SELECT result_json FROM memory_journal WHERE receipt_id = ?")
+                .bind(receipt_id)
+                .fetch_one(&harness.pool)
+                .await
+                .expect("journal intent");
+        serde_json::from_str(&result.expect("result json")).expect("result json")
+    }
+
+    fn journaled(stage: SpokeResult<MemoryStage>) -> String {
+        match stage {
+            SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+            other => panic!("expected a journal-pending stage, got {other:?}"),
+        }
+    }
+
+    // Canonical promote stages one retained record.
+    let candidate_id = capture(&harness, "cap-canonical-promote").await;
+    let stage = review(
+        &harness,
+        &adapter,
+        &candidate_id,
+        json!({"action": "promote"}),
+        "rev-canonical-promote",
+    )
+    .await;
+    let receipt_id = journaled(stage);
+    let result = outcome(&harness, &receipt_id).await;
+    assert_eq!(result["outcome"], "promoted");
+    assert_eq!(result["record_ids"].as_array().expect("records").len(), 1);
+
+    // Canonical fragment stages the two named fragments.
+    let candidate_id = capture(&harness, "cap-canonical-fragment").await;
+    let stage = review(
+        &harness,
+        &adapter,
+        &candidate_id,
+        json!({
+            "action": "fragment",
+            "fragments": [
+                {"kind": "note", "content": {"text": "first fragment"}},
+                {"kind": "note", "content": {"text": "second fragment"}}
+            ]
+        }),
+        "rev-canonical-fragment",
+    )
+    .await;
+    let receipt_id = journaled(stage);
+    let result = outcome(&harness, &receipt_id).await;
+    assert_eq!(result["outcome"], "fragmented");
+    assert_eq!(result["record_ids"].as_array().expect("records").len(), 2);
+
+    // Canonical drop consumes without records; the rationale member is legal.
+    let candidate_id = capture(&harness, "cap-canonical-drop").await;
+    let stage = review(
+        &harness,
+        &adapter,
+        &candidate_id,
+        json!({"action": "drop", "rationale": "not worth keeping"}),
+        "rev-canonical-drop",
+    )
+    .await;
+    let receipt_id = journaled(stage);
+    let result = outcome(&harness, &receipt_id).await;
+    assert_eq!(result["outcome"], "dropped");
+    assert_eq!(result["record_ids"], json!([]));
+
+    // Non-canonical spellings reject as INVALID_INPUT before any effect.
+    let candidate_id = capture(&harness, "cap-rejected-shapes").await;
+    for (index, decision) in [
+        json!("drop"),                                  // bare string variant
+        json!({"promote": {}}),                         // legacy member spelling
+        json!({"action": "promote", "bogus": 1}),       // extra member
+        json!({"action": "rewrite"}),                   // unknown action
+        json!({"action": "fragment", "fragments": []}), // validator: minItems 1
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = review(
+            &harness,
+            &adapter,
+            &candidate_id,
+            decision,
+            &format!("rev-rejected-{index}"),
+        )
+        .await;
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
+        assert_eq!(retry_class(refusal), "terminal");
+    }
+    // The rejected candidate was never consumed.
+    assert_eq!(harness.count_pool("memory_candidates").await, 4);
+    let consumed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory_candidates WHERE status = 'consumed'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("count consumed");
+    assert_eq!(consumed, 3);
+}
+
+/// I-000046: canonical fence targets — `{"type": "subject"}` and
+/// `{"type": "context", "context_id": "…"}` — fence and unfence exactly as
+/// §7.7 prescribes, while every non-canonical target spelling rejects as
+/// INVALID_INPUT.
+#[tokio::test]
+async fn canonical_fence_targets_transition_and_legacy_shapes_reject() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["admin"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    async fn fence(
+        harness: &Harness,
+        adapter: &MemoryAdapter,
+        action: &str,
+        target: Value,
+        revision: u64,
+        key: &str,
+    ) -> SpokeResult<MemoryStage> {
+        let mut tx = harness.begin().await;
+        let result = adapter
+            .fence_subject(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "action": action,
+                    "target": target,
+                    "expected_revision": revision,
+                    "idempotency_key": key
+                }),
+            )
+            .await;
+        tx.commit().await.expect("commit");
+        result
+    }
+
+    // A subject target fences the whole subject.
+    let body = ready(
+        fence(
+            &harness,
+            &adapter,
+            "fence",
+            json!({"type": "subject"}),
+            1,
+            "fnc-subject",
+        )
+        .await,
+    );
+    assert_eq!(body["result"]["status"], "fenced");
+    assert_eq!(body["result"]["revision"], 2);
+
+    // A context target keeps the status and records the context.
+    let body = ready(
+        fence(
+            &harness,
+            &adapter,
+            "fence",
+            json!({"type": "context", "context_id": "ctx_1"}),
+            2,
+            "fnc-ctx-1",
+        )
+        .await,
+    );
+    assert_eq!(body["result"]["fenced_contexts"], json!(["ctx_1"]));
+    assert_eq!(body["result"]["revision"], 3);
+
+    let body = ready(
+        fence(
+            &harness,
+            &adapter,
+            "unfence",
+            json!({"type": "context", "context_id": "ctx_1"}),
+            3,
+            "fnc-ctx-1-out",
+        )
+        .await,
+    );
+    assert_eq!(body["result"]["fenced_contexts"], json!([]));
+    assert_eq!(body["result"]["revision"], 4);
+
+    // Non-canonical targets reject as INVALID_INPUT before any effect.
+    for (index, target) in [
+        json!("subject"),                              // bare string variant
+        json!({"context": "ctx_9"}),                   // legacy member spelling
+        json!({"type": "subject", "context_id": "x"}), // context_id on subject
+        json!({"type": "context"}),                    // missing context_id
+        json!({"type": "unknown"}),                    // unknown target type
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = fence(
+            &harness,
+            &adapter,
+            "fence",
+            target,
+            4,
+            &format!("fnc-rejected-{index}"),
+        )
+        .await;
+        let refusal = reject(&result);
+        assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
+        assert_eq!(retry_class(refusal), "terminal");
+    }
+
+    // The pinned validator maps context-archive to INVALID_INPUT too.
+    let result = fence(
+        &harness,
+        &adapter,
+        "archive",
+        json!({"type": "context", "context_id": "ctx_2"}),
+        4,
+        "fnc-ctx-archive",
+    )
+    .await;
+    let refusal = reject(&result);
+    assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
+
+    // Rejected targets left the subject at revision 4, status still fenced.
+    let (status, fenced, revision): (String, String, i64) = sqlx::query_as(
+        "SELECT status, fenced_contexts_json, revision FROM memory_subjects \
+         WHERE space_id = 'sp_1' AND subject_id = 's_1'",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("subject row");
+    assert_eq!(status, "fenced");
+    assert_eq!(
+        serde_json::from_str::<Value>(&fenced).expect("json"),
+        json!([])
+    );
+    assert_eq!(revision, 4);
+}
