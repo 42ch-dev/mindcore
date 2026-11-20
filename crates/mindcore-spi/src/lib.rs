@@ -340,6 +340,9 @@ pub enum ProposalDraft<'a> {
         action: &'a str,
         /// The record an `update` decision replaces.
         target_record_id: Option<&'a str>,
+        /// The validated dismissal rationale; `Some` exactly for a `dismiss`,
+        /// so a lens can key a redline on what the dismissal claims.
+        rationale: Option<&'a str>,
         /// The page ids the decision cites.
         cited_ids: &'a [&'a str],
     },

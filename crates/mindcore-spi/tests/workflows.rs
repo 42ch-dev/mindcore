@@ -2490,6 +2490,7 @@ impl DomainLens for RefusingAbsorbLens {
         let ProposalDraft::Absorb {
             action,
             target_record_id,
+            rationale,
             cited_ids,
         } = draft
         else {
@@ -2497,6 +2498,7 @@ impl DomainLens for RefusingAbsorbLens {
         };
         assert_eq!(*action, "promote");
         assert_eq!(*target_record_id, None);
+        assert_eq!(*rationale, None, "a promotion gives no dismissal rationale");
         assert_eq!(*cited_ids, ["rec_gate"]);
         assert_eq!(admitted, ["rec_gate"]);
         Err("a promotion needs a witness the page does not hold".to_string())
@@ -2526,6 +2528,79 @@ async fn an_absorb_lens_violation_refuses_before_policy_and_write() {
         )
         .await
         .expect_err("a lens redline must refuse the proposal");
+
+    assert!(
+        matches!(error, SpiError::PolicyRejected(_)),
+        "expected a policy refusal, got {error:?}"
+    );
+    assert!(seen.lock().expect("seen").is_empty(), "policy never ran");
+    assert!(recorded.reviews.lock().expect("reviews").is_empty());
+}
+
+/// Refuses a dismissal whose validated rationale the domain will not stand
+/// behind: citations alone do not tell two dismissals apart.
+struct RefusingDismissLens;
+
+impl DomainLens for RefusingDismissLens {
+    fn describe(&self, _task_kind: CognitiveTaskKind) -> LensOutput<'_> {
+        LensOutput {
+            persona_and_stance: "a gate warden",
+            salience_criteria: "anything that changes the watch",
+            evidence_bar: "one named record",
+            redlines: &["a dismissal must name what the record gets wrong"],
+        }
+    }
+
+    fn validate_proposal(
+        &self,
+        draft: &ProposalDraft<'_>,
+        admitted: &[&str],
+    ) -> Result<(), String> {
+        let ProposalDraft::Absorb {
+            action,
+            target_record_id,
+            rationale,
+            cited_ids,
+        } = draft
+        else {
+            panic!("an absorb proposal is an absorb draft");
+        };
+        assert_eq!(*action, "dismiss");
+        assert_eq!(*target_record_id, None);
+        assert_eq!(admitted, ["rec_gate"]);
+        assert_eq!(*cited_ids, ["rec_gate"]);
+        assert_eq!(*rationale, Some("this adds nothing worth keeping"));
+        Err("a dismissal needs a reason the domain accepts".to_string())
+    }
+}
+
+#[tokio::test]
+async fn an_absorb_lens_enforces_a_redline_on_the_dismissal_rationale() {
+    let (workflows, recorded, seen) = absorb(pending_candidate());
+    let policy = RecordingPolicy {
+        decision: PolicyDecision::AutoSettle,
+        seen: Arc::clone(&seen),
+    };
+    let reasoner = FixedVerdict(json!({
+        "action": "dismiss",
+        "rationale": "this adds nothing worth keeping",
+        "evidence_ids": ["rec_gate"],
+    }));
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture_request(),
+            Some(&RefusingDismissLens),
+            &caps,
+        )
+        .await
+        .expect_err("a lens redline on the rationale must refuse the proposal");
 
     assert!(
         matches!(error, SpiError::PolicyRejected(_)),

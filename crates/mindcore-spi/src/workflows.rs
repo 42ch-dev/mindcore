@@ -335,6 +335,7 @@ impl SpiMindWorkflows {
                 &ProposalDraft::Absorb {
                     action: action.kind(),
                     target_record_id: action.target(),
+                    rationale: action.rationale(),
                     cited_ids: &cited,
                 },
                 &admitted,
@@ -1266,6 +1267,14 @@ impl AbsorbAction {
     fn target(&self) -> Option<&str> {
         match self {
             Self::Update { record_id, .. } => Some(record_id),
+            _ => None,
+        }
+    }
+
+    /// The validated reason a dismissal gives.
+    fn rationale(&self) -> Option<&str> {
+        match self {
+            Self::Dismiss { rationale, .. } => Some(rationale),
             _ => None,
         }
     }
