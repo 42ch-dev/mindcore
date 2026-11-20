@@ -2272,6 +2272,20 @@ async fn recall_pagination_d12() {
         "records.delete",
     );
 
+    // The tombstone is real: the row still exists in `memory_records` with a
+    // tombstone marker, so its absence from recall pages proves recall
+    // filters tombstones rather than the query shape never matching it.
+    let tombstone: Option<String> =
+        sqlx::query_scalar("SELECT tombstone_json FROM memory_records WHERE record_id = ?1")
+            .bind(r_del)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("deleted record row");
+    assert!(
+        tombstone.is_some(),
+        "r_del must persist as a tombstoned row"
+    );
+
     // Page 1: one record, truncated, cursor continues; page 2 serves the
     // remaining record with no further cursor. The tombstone is absent.
     let body = ready(
@@ -2290,6 +2304,7 @@ async fn recall_pagination_d12() {
             .await,
         "recall page 1",
     );
+    assert_eq!(body["records"].as_array().expect("records").len(), 1);
     let page1_id = body["records"].as_array().expect("records")[0]["record_id"]
         .as_str()
         .expect("page 1 record id")
