@@ -209,12 +209,12 @@ impl MemoryAdapter {
     ) -> AResult<()> {
         let unsettled = self
             .repository
-            .list_unsettled_intents(tx, space, &SubjectId::new(subject_id))
+            .has_unsettled_intent(tx, space, &SubjectId::new(subject_id))
             .await?;
-        if unsettled.is_empty() {
-            Ok(())
-        } else {
+        if unsettled {
             Err(Reject::unreconciled(subject_id))
+        } else {
+            Ok(())
         }
     }
 

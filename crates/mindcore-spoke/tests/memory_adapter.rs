@@ -4093,6 +4093,64 @@ async fn unsettled_intent_withholds_guarded_reads() {
     tx.rollback().await.expect("rollback");
 }
 
+/// An unsettled intent whose `targets_json` cannot decode still withholds:
+/// admission probes existence, so every guarded by-ID read answers the
+/// terminal `UNRECONCILED` rather than a retryable storage failure — and the
+/// refusal precedes any content selection or projection.
+#[tokio::test]
+async fn corrupt_unsettled_payload_still_refuses_unreconciled() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(
+            PRINCIPAL,
+            &["capture", "review", "records_read", "recall", "reflect"],
+        )
+        .await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    seed_record(&mut tx, "rec_held", "a withheld record", NOW).await;
+    let captured = ready(
+        adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a withheld candidate" },
+                    "idempotency_key": "cap-corrupt"
+                }),
+            )
+            .await,
+    );
+    let candidate_id = captured["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    tx.commit().await.expect("commit seeds");
+
+    // `targets_json` is `NOT NULL` but unconstrained: a stored non-array value
+    // must not mask the withhold behind a retryable decode failure.
+    harness
+        .seed_intent("rct_corrupt", SPACE, SUBJECT, "pending")
+        .await;
+    sqlx::query(
+        "UPDATE memory_journal SET targets_json = '{\"not\":\"array\"}' \
+                 WHERE receipt_id = 'rct_corrupt'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("corrupt targets");
+
+    let mut tx = harness.begin().await;
+    for (op, result) in guarded_reads(&adapter, &mut tx, SPACE, SUBJECT, &candidate_id).await {
+        assert_unreconciled(op, &result, SUBJECT);
+    }
+    tx.rollback().await.expect("rollback");
+}
+
 /// I-000050 wins over withholding: a nonexistent id, an uncovered row and a
 /// tombstone under a non-admin read all answer the same `NOT_FOUND` without
 /// `subject_id` — the journal is never probed for them.

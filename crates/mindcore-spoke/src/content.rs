@@ -432,30 +432,34 @@ impl MemoryAdapter {
         let space = SpaceId::new(request.space_id.to_string());
         let candidate_id = request.candidate_id.to_string();
         admission::space(&self.repository, tx, &space).await?;
-        let Some(candidate) =
-            admission::candidate(&self.repository, tx, &space, candidate_id.as_str()).await?
+        // Metadata first: the row's own subject and placement admit and conceal
+        // before any payload column is selected.
+        let Some(head) =
+            admission::candidate_head(&self.repository, tx, &space, candidate_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("candidate {candidate_id}")));
         };
         let rows = admission::grants(&self.repository, tx, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
-        let subject_id = candidate.subject_id.to_string();
+        let subject_id = head.subject_id.as_str();
         if !admission::covered(
             &wire_grants,
             principal_id,
             space.as_str(),
             Utc::now(),
-            &admission::candidate_requirement(
-                "review",
-                subject_id.as_str(),
-                &candidate.capture_scope,
-            ),
+            &admission::candidate_requirement("review", subject_id, &head.capture_scope),
         ) {
             // §7.13: incomplete coverage hides the row exactly as an absent id.
             return Err(Reject::not_found(format!("candidate {candidate_id}")));
         }
-        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
-            .await?;
+        self.withhold_if_unsettled(tx, &space, subject_id).await?;
+        // Only an admitted, settled read selects and decodes the candidate's
+        // content.
+        let Some(candidate) =
+            admission::candidate(&self.repository, tx, &space, candidate_id.as_str()).await?
+        else {
+            return Err(Reject::not_found(format!("candidate {candidate_id}")));
+        };
         Self::ready::<MemoryCandidatesGetResponse>(
             json!({ "candidate": project::candidate_body(&candidate) }),
         )
@@ -696,27 +700,29 @@ impl MemoryAdapter {
         let rows = admission::grants(&self.repository, tx, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let now = Utc::now();
-        let Some(record) =
-            admission::record(&self.repository, tx, &space, record_id.as_str()).await?
+        // Metadata first: the row's own subject, scope and tombstone admit and
+        // conceal before any payload column is selected.
+        let Some(head) =
+            admission::record_head(&self.repository, tx, &space, record_id.as_str()).await?
         else {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
-        let subject_id = record.subject_id.to_string();
-        let scope = Scope::from(&record.scope);
+        let subject_id = head.subject_id.as_str();
+        let scope = Scope::from(&head.scope);
         let reads = admission::covered(
             &wire_grants,
             principal_id,
             space.as_str(),
             now,
-            &scope.requirement("records_read", subject_id.as_str()),
+            &scope.requirement("records_read", subject_id),
         ) || admission::covered(
             &wire_grants,
             principal_id,
             space.as_str(),
             now,
-            &scope.requirement("recall", subject_id.as_str()),
+            &scope.requirement("recall", subject_id),
         );
-        let tombstoned = matches!(record.state, RecordState::Tombstoned { .. });
+        let tombstoned = head.tombstoned;
         let admin = admission::covered(
             &wire_grants,
             principal_id,
@@ -724,7 +730,7 @@ impl MemoryAdapter {
             now,
             &GrantRequirement {
                 capability: "admin",
-                subject_id: Some(subject_id.as_str()),
+                subject_id: Some(subject_id),
                 context_ids: Vec::new(),
                 reads_shared: false,
                 subject_all: false,
@@ -735,8 +741,14 @@ impl MemoryAdapter {
         if !reads || (tombstoned && !admin) {
             return Err(Reject::not_found(format!("record {record_id}")));
         }
-        self.withhold_if_unsettled(tx, &space, subject_id.as_str())
-            .await?;
+        self.withhold_if_unsettled(tx, &space, subject_id).await?;
+        // Only an admitted, settled read selects and decodes the record's
+        // content.
+        let Some(record) =
+            admission::record(&self.repository, tx, &space, record_id.as_str()).await?
+        else {
+            return Err(Reject::not_found(format!("record {record_id}")));
+        };
         Self::ready::<MemoryRecordsGetResponse>(json!({ "record": project::record_body(&record) }))
     }
 
