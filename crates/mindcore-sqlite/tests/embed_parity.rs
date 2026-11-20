@@ -1394,6 +1394,11 @@ async fn journaled_effect_survives_reopen_and_settles() {
     assert_eq!(status, "pending");
     assert_eq!(state, "pending");
     assert_eq!(file_set(&store_dir), published_files);
+    assert_eq!(
+        harness.count("memory_journal").await,
+        1,
+        "the faulted settle must not create a second intent"
+    );
 
     // Poll before settlement reports OUTCOME_UNCERTAIN; republish the owed
     // targets (idempotent) and the retry settle commits receipt + intent.
@@ -1421,6 +1426,11 @@ async fn journaled_effect_survives_reopen_and_settles() {
     };
     assert_eq!(body["status"], "committed");
     tx.commit().await.expect("settle commit");
+    let settled_files = file_set(&store_dir);
+    assert_eq!(
+        settled_files, published_files,
+        "settle must not rewrite published files"
+    );
 
     let (status, state, targets): (String, String, String) = sqlx::query_as(
         "SELECT r.status, j.state, j.targets_json \
@@ -2079,7 +2089,7 @@ async fn scoped_capture_baseline_d1_d2() {
                 .to_string(),
         );
     }
-    let [cand_a, _cand_b, cand_c] = ids.as_slice() else {
+    let [cand_a, cand_b, cand_c] = ids.as_slice() else {
         unreachable!()
     };
     let body = ready(
@@ -2147,7 +2157,11 @@ async fn scoped_capture_baseline_d1_d2() {
             None => break,
         }
     }
-    assert_eq!(pages.len(), 3, "three pending U candidates: {pages:?}");
+    assert_eq!(
+        pages.as_slice(),
+        [cand_a.as_str(), cand_b.as_str(), cand_c.as_str()],
+        "pages must serve the candidates in declared capture order: {pages:?}"
+    );
     assert!(
         !pages.contains(&cand_v),
         "V candidate must not list under U"
@@ -2239,7 +2253,7 @@ async fn recall_pagination_d12() {
             .expect("record id"),
         );
     }
-    let [_r1, _r2, r_del] = records.as_slice() else {
+    let [r1, r2, r_del] = records.as_slice() else {
         unreachable!()
     };
     staged(
@@ -2276,7 +2290,15 @@ async fn recall_pagination_d12() {
             .await,
         "recall page 1",
     );
-    assert_eq!(body["records"].as_array().expect("records").len(), 1);
+    let page1_id = body["records"].as_array().expect("records")[0]["record_id"]
+        .as_str()
+        .expect("page 1 record id")
+        .to_string();
+    assert!(
+        [r1.as_str(), r2.as_str()].contains(&page1_id.as_str()),
+        "page 1 must serve a live expected record: {page1_id}"
+    );
+    assert_ne!(page1_id, r_del.as_str(), "tombstone must not appear");
     assert_eq!(body["total_authorized"], 2);
     assert_eq!(body["truncated"], true);
     let cursor = body["next_cursor"].clone();
@@ -2300,6 +2322,19 @@ async fn recall_pagination_d12() {
         "recall page 2",
     );
     assert_eq!(body["records"].as_array().expect("records").len(), 1);
+    let page2_id = body["records"].as_array().expect("records")[0]["record_id"]
+        .as_str()
+        .expect("page 2 record id")
+        .to_string();
+    assert!(
+        [r1.as_str(), r2.as_str()].contains(&page2_id.as_str()),
+        "page 2 must serve a live expected record: {page2_id}"
+    );
+    assert_ne!(page2_id, r_del.as_str(), "tombstone must not appear");
+    assert_ne!(
+        page1_id, page2_id,
+        "the two pages must serve distinct records"
+    );
     assert_eq!(body["total_authorized"], 2);
     assert_eq!(body["truncated"], false);
     assert!(body["next_cursor"].is_null());
