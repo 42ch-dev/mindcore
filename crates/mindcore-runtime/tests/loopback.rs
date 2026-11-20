@@ -5,9 +5,12 @@
 //! snapshot, a fail-closed allowlist, then the Mind tools. Handlers are installed before the
 //! dialer connects, exactly as a host must.
 //!
-//! The fixture is a protocol-shaped store: the pre-release `0001_init.sql` legacy memory tables
-//! (which predate the protocol shape the adapter reads) are dropped before the protocol DDL
-//! applies, while the migrated `knowledge_entries` table keeps its own store path.
+//! The runtime serves a **protocol-shaped** store. A freshly opened `MindStore` is not yet
+//! protocol-shaped: the pre-release `0001_init.sql` legacy memory tables predate the shape the
+//! adapter reads (issue `I-000068`), so this fixture drops them and applies the protocol DDL while
+//! the migrated `knowledge_entries` table keeps its own store path. The fixture is therefore not
+//! the production open path, and the plan's acceptance is runtime reachability on a
+//! protocol-shaped host store rather than on a `MindStore`-opened database.
 //!
 //! Advertisement honesty is the negative side: a face the host did not attach advertises nothing
 //! and denies its ops on the wire, and a tool the runtime does not serve answers `op_unsupported`.
@@ -22,19 +25,22 @@ use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
-use mindcore_runtime::{MindProviders, MindcoreServe, MindcoreSurface, ServeFaces};
+use mindcore_runtime::{
+    MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
+};
 use mindcore_spi::{CognitiveTaskKind, Reasoner, SpiError, StructuredReasonRequest};
 use mindcore_sqlite::MindStore;
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
     ConnectResponderOptions, KnowledgeAdmission, MemoryAdmission, RemoteAdapter,
-    RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService,
+    RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
 };
 use spoke_operations::{
     spoke_ok, spoke_reject, KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject,
     SpokeRejectCode, SpokeResult,
 };
+use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, MemoryRecallRequest, Principal, Scope};
 
 const SCOPE_ID: &str = "spoke-scope-001";
@@ -48,6 +54,9 @@ const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
 
 const DIALER_SEED: [u8; 32] = [0x42u8; 32];
 const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
+/// A second peer the host admits to its own principal, never the carrier route's caller.
+const PEER_TWO_SEED: [u8; 32] = [0x5Cu8; 32];
+const PEER_TWO_PRINCIPAL: &str = "prn_peer_two";
 
 const PROTOCOL_DDL: &str =
     include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
@@ -64,6 +73,8 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Open a throwaway database and make it protocol-shaped; this is not `MindStore`'s production
+    /// open path (see the module note and issue `I-000068`).
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
         let store = MindStore::open(&dir.path().join("loopback.db"))
@@ -126,6 +137,33 @@ impl Fixture {
         seed_record(&pool, "rec_north_gate", "the north gate is closed").await;
         seed_record(&pool, "rec_market", "the market opens at dawn").await;
         Self { dir, store }
+    }
+
+    /// One space-wide grant for `principal` over this fixture's space.
+    async fn grant(&self, grant_id: &str, principal: &str, capabilities: &[&str]) {
+        sqlx::query(
+            "INSERT INTO memory_grants \
+             (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+              context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+             VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+        )
+        .bind(grant_id)
+        .bind(SPACE)
+        .bind(principal)
+        .bind(json!(capabilities).to_string())
+        .bind(NOW)
+        .execute(&self.store.pool())
+        .await
+        .expect("seed grant");
+    }
+
+    /// Drop one seeded grant, as a host revoking it would.
+    async fn revoke(&self, grant_id: &str) {
+        sqlx::query("DELETE FROM memory_grants WHERE grant_id = ?")
+            .bind(grant_id)
+            .execute(&self.store.pool())
+            .await
+            .expect("drop the grant");
     }
 
     /// The carrier entry the deliberation holder names.
@@ -200,6 +238,19 @@ fn hello(host_id: &str, capabilities: &[&str]) -> HostCapabilityManifest {
     .expect("manifest JSON matches the schema")
 }
 
+/// The reserved deliberation id's descriptor, as a host could build one.
+fn deliberate_descriptor() -> ToolDescriptor {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "capability_id": DELIBERATE,
+        "op": DELIBERATE,
+        "description": "Derive a validated verdict over supplied evidence.",
+        "input": { "type": "object" },
+        "output": { "type": "object" },
+    }))
+    .expect("tool descriptor JSON matches the schema")
+}
+
 fn capabilities(surface: &MindcoreSurface) -> Vec<&str> {
     surface
         .manifest
@@ -213,17 +264,42 @@ fn scope_of(scope_id: &str) -> Scope {
     serde_json::from_value(json!({ "scope_id": scope_id })).expect("scope JSON matches the schema")
 }
 
-fn principal() -> Principal {
-    serde_json::from_value(json!({ "principal_id": PRINCIPAL, "extensions": {} }))
+fn principal_for(principal_id: &str) -> Principal {
+    serde_json::from_value(json!({ "principal_id": principal_id, "extensions": {} }))
         .expect("principal JSON matches the schema")
 }
 
+fn principal() -> Principal {
+    principal_for(PRINCIPAL)
+}
+
+fn peer_id(seed: &[u8; 32]) -> String {
+    derive_peer_id_from_ed25519_pubkey(&SigningKey::from_bytes(seed).verifying_key().to_bytes())
+}
+
 fn dialer_peer_id() -> String {
-    derive_peer_id_from_ed25519_pubkey(
-        &SigningKey::from_bytes(&DIALER_SEED)
-            .verifying_key()
-            .to_bytes(),
-    )
+    peer_id(&DIALER_SEED)
+}
+
+/// A host admission mapping two authenticated peers to their own principals: the carrier route's
+/// caller and a second peer that holds only its own grants.
+fn two_principal_admission() -> MemoryAdmission {
+    let dialer = dialer_peer_id();
+    let second = peer_id(&PEER_TWO_SEED);
+    Arc::new(move |peer: &str| {
+        let principal_id = if peer == dialer {
+            PRINCIPAL
+        } else if peer == second {
+            PEER_TWO_PRINCIPAL
+        } else {
+            return spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                format!("peer {peer} holds no workflow admission"),
+                None,
+            );
+        };
+        spoke_ok(principal_for(principal_id))
+    })
 }
 
 /// Both host admissions admit the dialer's authenticated peer id and nothing else, so a served
@@ -354,8 +430,18 @@ impl Drop for Session {
 /// Establish a real signed loopback session over `surface`, the dialer claiming exactly
 /// `dialer_capabilities` in its hello. Handlers are installed before the dialer connects.
 async fn connect(surface: &MindcoreSurface, dialer_capabilities: &[&str]) -> Session {
+    connect_as(surface, &DIALER_SEED, dialer_capabilities).await
+}
+
+/// As [`connect`], with the dialer's identity chosen by `seed`: the host's admissions decide
+/// whether the resulting peer is served, not the transport.
+async fn connect_as(
+    surface: &MindcoreSurface,
+    seed: &[u8; 32],
+    dialer_capabilities: &[&str],
+) -> Session {
     let pair = loopback_transport_pair();
-    let dialer = dialer_peer_id();
+    let dialer = peer_id(seed);
     let responder_pubkey = SigningKey::from_bytes(&RESPONDER_SEED)
         .verifying_key()
         .to_bytes();
@@ -370,9 +456,7 @@ async fn connect(surface: &MindcoreSurface, dialer_capabilities: &[&str]) -> Ses
         allowlist: vec![dialer.clone()],
         peer_keys: HashMap::from([(
             dialer.clone(),
-            SigningKey::from_bytes(&DIALER_SEED)
-                .verifying_key()
-                .to_bytes(),
+            SigningKey::from_bytes(seed).verifying_key().to_bytes(),
         )]),
         ports: Some(Arc::clone(&surface.ports)),
         invoke_timeout_ms: Some(10_000),
@@ -382,7 +466,7 @@ async fn connect(surface: &MindcoreSurface, dialer_capabilities: &[&str]) -> Ses
 
     let adapter = connect_remote_adapter(RemoteAdapterOptions {
         transport: Arc::new(pair.client),
-        local_identity: RemoteIdentity { seed: DIALER_SEED },
+        local_identity: RemoteIdentity { seed: *seed },
         local_manifest: hello("loopback-dialer", dialer_capabilities),
         remote_pubkey: responder_pubkey,
         allowlist: vec![responder_peer_id.clone()],
@@ -544,6 +628,109 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
         result["knowledge"],
         json!([]),
         "the workflow binding serves no knowledge slot of its own"
+    );
+}
+
+/// A wired deliberation route does not narrow recall: a different admitted peer holding its own
+/// knowledge grant receives its pack with the slot filled from the served collection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    fixture
+        .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    fixture
+        .grant(
+            "grt_knowledge_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["knowledge_read"],
+        )
+        .await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        Some(PRINCIPAL),
+    );
+    // Both peers are admitted; only the route's caller may deliberate.
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
+    assert!(
+        capabilities(&surface).contains(&DELIBERATE),
+        "the carrier route is wired: {:?}",
+        capabilities(&surface)
+    );
+
+    let session = connect_as(&surface, &PEER_TWO_SEED, &[RECALL_CONTEXT]).await;
+    // One token per serialized byte: two records plus the carrier entry need a wider budget than
+    // the default fixture pack.
+    let mut arguments = recall_arguments();
+    arguments["max_tokens"] = json!(4_000);
+    let result = expect_ok(
+        session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
+        "recall by a peer that is not the route's caller",
+    );
+
+    let mut ids: Vec<&str> = result["records"]
+        .as_array()
+        .expect("the pack carries a records array")
+        .iter()
+        .map(|record| {
+            record["record_id"]
+                .as_str()
+                .expect("a packed record carries its id")
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["rec_market", "rec_north_gate"]);
+    let entries: Vec<&str> = result["knowledge"]
+        .as_array()
+        .expect("the pack carries a knowledge array")
+        .iter()
+        .map(|entry| {
+            entry["entry_id"]
+                .as_str()
+                .expect("a knowledge entry carries its id")
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [CARRIER],
+        "the peer's own knowledge_read grant fills the slot"
+    );
+}
+
+/// The route's caller without `knowledge_read` is refused the slot even though it holds the
+/// memory grant: recall authority is the caller's own knowledge grant, never the route's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_route_caller_without_knowledge_read_is_refused_the_slot() {
+    let fixture = Fixture::open().await;
+    fixture.revoke("grt_knowledge").await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            Some(PRINCIPAL),
+        ),
+    );
+
+    let session = connect(&surface, &[RECALL_CONTEXT]).await;
+    let reject = expect_reject(
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, recall_arguments())
+            .await,
+        "recall by the route's caller without a knowledge grant",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        reject.message.contains("knowledge_read"),
+        "the refusal names the missing read grant: {reject:?}"
     );
 }
 
@@ -722,6 +909,48 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
         !capabilities(&surface).contains(&DELIBERATE),
         "an unwired deliberation route is never advertised: {:?}",
         capabilities(&surface)
+    );
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    assert_wire_deny(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        DELIBERATE,
+        "op_unsupported",
+    );
+}
+
+/// A host registration cannot restore the unwired route: the reserved id is dropped from the
+/// final registration set, so it is neither advertised nor installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), None);
+    faces.tools = vec![ToolRegistration::new(
+        deliberate_descriptor(),
+        |_responder| {
+            let handler: ToolHandler =
+                Arc::new(|arguments: Value| Box::pin(async move { spoke_ok(arguments) }));
+            handler
+        },
+    )];
+    let surface = surface(&serve, faces);
+
+    assert!(
+        !capabilities(&surface).contains(&DELIBERATE),
+        "a host registration cannot re-advertise the unwired route: {:?}",
+        capabilities(&surface)
+    );
+    assert!(
+        surface
+            .manifest
+            .tools
+            .iter()
+            .all(|tool| tool.capability_id.as_str() != DELIBERATE),
+        "the reserved descriptor is dropped from the manifest"
     );
 
     let session = connect(&surface, &[DELIBERATE]).await;

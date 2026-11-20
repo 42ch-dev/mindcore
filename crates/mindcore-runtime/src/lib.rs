@@ -87,12 +87,13 @@ impl MindcoreServe {
         let workflows: Arc<dyn MindWorkflows> = self.workflows(&faces);
         let mut tools =
             WorkflowTools::new(workflows, faces.principals, faces.providers).registrations();
+        tools.extend(faces.tools);
         // Deliberation settles onto the host's carrier collection; a surface without that route
-        // serves no deliberation, so it advertises none rather than a tool that can only refuse.
+        // serves no deliberation. The invariant holds over the final set, so a host registration
+        // cannot restore the tool or its handler.
         if faces.workflow_caller.is_none() {
             tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
         }
-        tools.extend(faces.tools);
         let manifest = derive_manifest(faces.manifest, faces.memory.is_some(), &tools);
         let manifest = match manifest {
             SpokeResult::Ok(manifest) => manifest,
@@ -135,11 +136,16 @@ pub struct ServeFaces {
     pub providers: MindProviders,
     /// The one principal the workflow engine admits to the served knowledge collection: the
     /// deliberation leg reads and CAS-writes its carrier entry through that route. `None` serves
-    /// no deliberation and advertises none — the tool is never installed on a surface without it.
+    /// no deliberation and advertises none — the tool is never installed on a surface without it,
+    /// and a host registration of the same id is dropped rather than advertised.
     pub workflow_caller: Option<String>,
-    /// Additional host tools: every descriptor is advertised and its handler installed.
+    /// Additional host tools: every descriptor is advertised and its handler installed, except the
+    /// reserved `tools.mindcore.deliberate` id on a surface with no carrier route.
     pub tools: Vec<ToolRegistration>,
 }
+
+/// Builds one tool's handler from the responder it serves.
+type ToolInstall = dyn Fn(&Arc<ConnectResponder>) -> ToolHandler + Send + Sync;
 
 /// One served tool: the descriptor the manifest advertises and the handler built for the responder
 /// that serves it.
@@ -149,7 +155,7 @@ pub struct ServeFaces {
 /// handler bound to one session must not be installed on another.
 pub struct ToolRegistration {
     descriptor: ToolDescriptor,
-    install: Box<dyn Fn(&Arc<ConnectResponder>) -> ToolHandler + Send + Sync>,
+    install: Box<ToolInstall>,
 }
 
 impl ToolRegistration {

@@ -228,11 +228,13 @@ impl MemoryWorkflowBinding {
         Ok(settled)
     }
 
-    /// Fill the pack's knowledge slot from `scope`, admitted to `caller` only.
+    /// Bind the collection the carrier write serves, admitted to `caller` only.
     ///
-    /// The collection is one caller's knowledge scope: every read needs that
-    /// caller to match and to hold a live [`KNOWLEDGE_READ`] grant in the
-    /// request's space, so another principal's memory grant never reaches it.
+    /// Deliberation reads and CAS-writes one caller's carrier entry, so every
+    /// deliberate call needs `caller` to be the principal and to hold a live
+    /// [`KNOWLEDGE_READ`]/[`KNOWLEDGE_WRITE`] grant in the request's space.
+    /// Recall's knowledge slot is not restricted to `caller`: any principal
+    /// holding its own live [`KNOWLEDGE_READ`] grant reads this collection.
     #[must_use]
     pub fn with_knowledge_collection(
         mut self,
@@ -259,33 +261,29 @@ impl MemoryWorkflowBinding {
         admission::wire_grants(&rows).map_err(|reject| SpiError::Settlement(reject.into_spoke()))
     }
 
-    /// The bound collection, admitted to `principal` on `tx`: the caller must
-    /// be the one this binding serves and hold a live grant for every one of
-    /// `capabilities` in `space_id`.
+    /// The one collection this binding serves, when the host bound one.
+    fn bound(&self) -> Result<&AdmittedCollection, SpiError> {
+        self.knowledge.as_ref().ok_or_else(|| {
+            not_authorized("this workflow binding serves no knowledge collection".to_string())
+        })
+    }
+
+    /// The bound collection, read under `principal`'s own live grant for every
+    /// one of `capabilities` in `space_id`.
     ///
-    /// Caller identity, live grants and collection are re-derived on every call,
-    /// so a read after provider work runs the same admission and a revoked
-    /// grant refuses it. A memory grant never substitutes for this, and a
-    /// knowledge read never stands in for [`KNOWLEDGE_WRITE`].
-    async fn admitted_collection(
+    /// Live grants are re-derived on every call, so a read after provider work
+    /// runs the same admission and a revoked grant refuses it. A memory grant
+    /// never substitutes for this, and a knowledge read never stands in for
+    /// [`KNOWLEDGE_WRITE`].
+    async fn granted_collection(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
         space_id: &str,
         capabilities: &[&str],
-    ) -> Result<&str, SpiError> {
-        let Some(admitted) = &self.knowledge else {
-            return Err(not_authorized(
-                "this workflow binding serves no knowledge collection".to_string(),
-            ));
-        };
+    ) -> Result<&AdmittedCollection, SpiError> {
+        let admitted = self.bound()?;
         let caller = principal_id(principal);
-        if caller != admitted.caller.as_str() {
-            return Err(not_authorized(format!(
-                "principal {caller} is not admitted to knowledge collection {}",
-                admitted.scope.collection
-            )));
-        }
         let space = SpaceId::new(space_id.to_string());
         let grants = self.space_grants(tx, space_id).await?;
         for capability in capabilities {
@@ -303,7 +301,34 @@ impl MemoryWorkflowBinding {
                 )));
             }
         }
-        Ok(admitted.scope.collection.as_str())
+        Ok(admitted)
+    }
+
+    /// The bound collection for the carrier write: `principal` must be the one
+    /// caller this binding serves and hold a live grant for every one of
+    /// `capabilities` in `space_id`.
+    ///
+    /// The caller match is the recorded one-caller write limit: deliberation
+    /// settles onto one principal's carrier entry, so another admitted peer
+    /// reads memory and knowledge but never writes this carrier.
+    async fn admitted_collection(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+        capabilities: &[&str],
+    ) -> Result<&str, SpiError> {
+        let admitted = self.bound()?;
+        let caller = principal_id(principal);
+        if caller != admitted.caller.as_str() {
+            return Err(not_authorized(format!(
+                "principal {caller} is not admitted to knowledge collection {}",
+                admitted.scope.collection
+            )));
+        }
+        self.granted_collection(tx, principal, space_id, capabilities)
+            .await
+            .map(|admitted| admitted.scope.collection.as_str())
     }
 
     /// The subject's own admission, rechecked inside the write transaction: the
@@ -332,7 +357,9 @@ impl MemoryWorkflowBinding {
         Ok(())
     }
 
-    /// Fill the pack's knowledge slot from the admitted collection.
+    /// Fill the pack's knowledge slot: any caller holding a live
+    /// [`KNOWLEDGE_READ`] grant in the request's space reads the bound
+    /// collection, whichever caller the carrier write is bound to.
     async fn knowledge_slot(
         &self,
         tx: &mut Tx<'_>,
@@ -343,8 +370,11 @@ impl MemoryWorkflowBinding {
             return Ok(Vec::new());
         }
         let collection = self
-            .admitted_collection(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
-            .await?;
+            .granted_collection(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
+            .await?
+            .scope
+            .collection
+            .as_str();
         match list_entries_in(tx, collection).await {
             SpokeResult::Ok(entries) => Ok(entries),
             SpokeResult::Reject(reject) => Err(SpiError::Settlement(reject)),
