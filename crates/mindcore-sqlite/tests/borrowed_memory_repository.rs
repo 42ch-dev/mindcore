@@ -1294,3 +1294,43 @@ async fn nonempty_extensions_dropped_on_write() {
     tx.rollback().await.unwrap();
     pool.close().await;
 }
+
+/// BUG-01 row path: opaque extension values (number, array, string) inside persisted
+/// provenance anchors survive the write/read round trip; a non-namespace key is refused
+/// by the reader instead of being silently dropped.
+#[tokio::test]
+async fn persisted_candidate_extension_values_are_opaque() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+    let mut tx = pool.begin().await.unwrap();
+
+    let mut candidate = pending_candidate();
+    candidate.provenance.anchors = [json!(5), json!([1, "two", null]), json!("text")]
+        .into_iter()
+        .map(|value| {
+            json!({"schema_version": 1, "source_id": "src", "extensions": {"md_note": value}})
+        })
+        .collect();
+    repo.insert_candidate(&mut tx, &candidate).await.unwrap();
+    let read = repo
+        .candidate(&mut tx, &SpaceId::new("spc_workshop"), "cand_1")
+        .await
+        .unwrap()
+        .expect("staged candidate");
+    assert_eq!(read.provenance.anchors, candidate.provenance.anchors);
+
+    let mut bad = pending_candidate();
+    bad.candidate_id = "cand_2".into();
+    bad.provenance.anchors =
+        vec![json!({"schema_version": 1, "source_id": "src", "extensions": {"md.note": 1}})];
+    repo.insert_candidate(&mut tx, &bad).await.unwrap();
+    assert!(matches!(
+        repo.candidate(&mut tx, &SpaceId::new("spc_workshop"), "cand_2")
+            .await,
+        Err(mindcore_sqlite::SqliteRepositoryError::InvalidRow(_))
+    ));
+    tx.rollback().await.unwrap();
+    pool.close().await;
+}
