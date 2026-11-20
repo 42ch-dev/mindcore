@@ -359,7 +359,9 @@ fn capture(key: &str, text: &str) -> MemoryCaptureRequest {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReasonerEffect {
     None,
-    BumpRecordRevision,
+    /// `None` bumps every record, `Some(id)` only that one.
+    BumpRecordRevision(Option<&'static str>),
+    RevokeGrant,
 }
 
 struct FixedReasoner {
@@ -378,7 +380,17 @@ impl FixedReasoner {
     }
 
     fn bumping(mut self) -> Self {
-        self.effect = ReasonerEffect::BumpRecordRevision;
+        self.effect = ReasonerEffect::BumpRecordRevision(None);
+        self
+    }
+
+    fn bumping_only(mut self, record_id: &'static str) -> Self {
+        self.effect = ReasonerEffect::BumpRecordRevision(Some(record_id));
+        self
+    }
+
+    fn revoking(mut self) -> Self {
+        self.effect = ReasonerEffect::RevokeGrant;
         self
     }
 }
@@ -390,11 +402,31 @@ impl Reasoner for FixedReasoner {
         request: StructuredReasonRequest<'_>,
     ) -> Result<Value, SpiError> {
         assert_eq!(request.task_kind, CognitiveTaskKind::Absorb);
-        if self.effect == ReasonerEffect::BumpRecordRevision {
-            sqlx::query("UPDATE memory_records SET revision = revision + 1")
+        match self.effect {
+            ReasonerEffect::None => {}
+            ReasonerEffect::BumpRecordRevision(None) => {
+                sqlx::query("UPDATE memory_records SET revision = revision + 1")
+                    .execute(&self.pool)
+                    .await
+                    .expect("bump the record revision");
+            }
+            ReasonerEffect::BumpRecordRevision(Some(record_id)) => {
+                sqlx::query(
+                    "UPDATE memory_records SET revision = revision + 1 WHERE record_id = ?",
+                )
+                .bind(record_id)
                 .execute(&self.pool)
                 .await
-                .expect("bump the record revision");
+                .expect("bump the cited record revision");
+            }
+            ReasonerEffect::RevokeGrant => {
+                sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE principal_id = ?")
+                    .bind(NOW)
+                    .bind(PRINCIPAL)
+                    .execute(&self.pool)
+                    .await
+                    .expect("revoke the grant");
+            }
         }
         Ok(self.verdict.clone())
     }
@@ -1159,5 +1191,256 @@ async fn fabricated_evidence_leaves_the_captured_candidate_unchanged() {
     assert_eq!(
         harness.candidate_text(&candidate_id).await.as_deref(),
         Some("the north gate is closed at dusk")
+    );
+}
+
+#[tokio::test]
+async fn replay_of_an_update_reports_the_record_it_settled() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "update",
+            "record_id": "rec_gate",
+            "evidence_ids": ["rec_gate"]
+        }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let request = capture("cap_update_replay", "the north gate is closed at dusk");
+
+    let first = workflows
+        .absorb(&principal(), &request, None, &caps)
+        .await
+        .expect("first absorb");
+    let replay = workflows
+        .absorb(&principal(), &request, None, &caps)
+        .await
+        .expect("replayed absorb");
+
+    // The dismissal consumes the candidate without a record id; the replay
+    // reads the update leg's own receipt instead of reporting a drop.
+    assert_eq!(replay, first);
+    assert!(matches!(
+        replay.as_slice(),
+        [AbsorbCandidateOutcome::Settled { record_ids, .. }] if record_ids.as_slice() == ["rec_gate"]
+    ));
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.records.update'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE state = 'applied'")
+            .await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn no_reasoner_replay_reports_the_recorded_outcome() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let request = capture("cap_replay_no_reasoner", "the north gate is closed at dusk");
+
+    let first = workflows
+        .absorb(&principal(), &request, None, &caps)
+        .await
+        .expect("first absorb");
+    let replay = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("replayed absorb");
+
+    assert_eq!(replay, first);
+    assert!(matches!(
+        replay.as_slice(),
+        [AbsorbCandidateOutcome::Settled { .. }]
+    ));
+    assert_eq!(harness.count_from("memory_records").await, 2);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_changed_non_target_citation_refuses_the_settlement() {
+    let harness = granted_harness().await;
+    harness
+        .record(
+            "rec_wall",
+            "the east wall is guarded",
+            "2026-11-20T09:00:02.000Z",
+        )
+        .await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({
+            "action": "update",
+            "record_id": "rec_wall",
+            "evidence_ids": ["rec_gate", "rec_wall"]
+        }),
+        &harness.pool,
+    )
+    .bumping_only("rec_gate");
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_cited_changed", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect_err("a changed citation must not settle");
+
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+    // Neither settlement effect was staged: the target, the candidate and the
+    // journal are exactly what the failed run found.
+    assert_eq!(
+        harness
+            .stored_record("rec_wall")
+            .await
+            .expect("the target record"),
+        (1, "the east wall is guarded".to_string())
+    );
+    assert_eq!(harness.count_from("memory_journal").await, 0);
+    assert_eq!(
+        harness
+            .count_from("memory_candidates WHERE status = 'pending'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_citation_that_loses_its_admission_refuses_the_settlement() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    )
+    .revoking();
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let error = workflows
+        .absorb(
+            &principal(),
+            &capture("cap_cited_revoked", "the north gate is closed at dusk"),
+            None,
+            &caps,
+        )
+        .await
+        .expect_err("an unauthorized citation must not settle");
+
+    // §7.17: the revoked record reads as absent rather than admitted.
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::NotFound);
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(harness.count_from("memory_journal").await, 0);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op != 'memory.capture'")
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_binding_without_a_publisher_refuses_before_staging_anything() {
+    let harness = granted_harness().await;
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
+    let policy = AutoPolicy;
+
+    for (verdict, key, text) in [
+        (
+            json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+            "cap_no_publisher",
+            "the north gate is closed at dusk",
+        ),
+        (
+            json!({
+                "action": "update",
+                "record_id": "rec_gate",
+                "evidence_ids": ["rec_gate"]
+            }),
+            "cap_no_publisher_update",
+            "the north gate shuts at dusk",
+        ),
+    ] {
+        let reasoner = FixedReasoner::new(verdict, &harness.pool);
+        let caps = MindCapabilities {
+            reasoner: Some(&reasoner),
+            policy_hook: Some(&policy),
+            ..MindCapabilities::default()
+        };
+
+        let error = workflows
+            .absorb(&principal(), &capture(key, text), None, &caps)
+            .await
+            .expect_err("a binding without a publisher must refuse");
+
+        assert!(matches!(error, SpiError::InvalidInput(_)));
+    }
+
+    // The refusal is a normal input error with no write at all.
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(harness.count_from("memory_journal").await, 0);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op != 'memory.capture'")
+            .await,
+        0
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_candidates WHERE status = 'pending' AND revision = 1")
+            .await,
+        2
     );
 }

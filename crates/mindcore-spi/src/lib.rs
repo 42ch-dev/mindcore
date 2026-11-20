@@ -14,7 +14,9 @@
 
 pub mod workflows;
 
-pub use workflows::{AbsorbSnapshot, RecallSnapshot, SpiMindWorkflows, WorkflowBinding};
+pub use workflows::{
+    AbsorbSnapshot, CitedRecord, RecallSnapshot, SpiMindWorkflows, WorkflowBinding,
+};
 
 use std::future::Future;
 

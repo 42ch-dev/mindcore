@@ -17,10 +17,11 @@ use spoke_schemas::{
 };
 use sqlx::SqlitePool;
 
+use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::SpaceId;
-use mindcore_base::ir::MemoryRepository;
+use mindcore_base::ir::{MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState};
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_spi::{AbsorbSnapshot, RecallSnapshot, SpiError, WorkflowBinding};
+use mindcore_spi::{AbsorbSnapshot, CitedRecord, RecallSnapshot, SpiError, WorkflowBinding};
 use mindcore_sqlite::{list_entries_in, SqliteMemoryRepository};
 
 use crate::admission;
@@ -48,8 +49,8 @@ struct AdmittedCollection {
 /// `knowledge` fixes the one collection this binding serves and its one caller:
 /// without it the binding serves no knowledge at all, and a collection bound to
 /// another caller is refused rather than read. `publisher` is the host's file
-/// medium; it is required only by the settlement legs, which stage a journaled
-/// intent, publish its targets and then settle it.
+/// medium; the settlement legs require it before they stage anything, and a
+/// binding without one refuses them with no write at all.
 pub struct MemoryWorkflowBinding {
     adapter: MemoryAdapter,
     pool: SqlitePool,
@@ -102,19 +103,73 @@ impl MemoryWorkflowBinding {
             .ok_or_else(|| internal(format!("receipt {receipt_id} has no journaled intent")))
     }
 
+    /// The host publisher, or the typed refusal a settlement leg owes before it
+    /// stages anything: a binding that cannot publish must not commit an intent.
+    fn publisher(&self) -> Result<&JournalPublisher, SpiError> {
+        self.publisher.as_deref().ok_or_else(|| {
+            SpiError::InvalidInput(
+                "this workflow binding has no publisher, so it cannot settle a journal intent"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// Revalidate every cited record on `transaction`: the same authorized,
+    /// settled record at the revision the prompt page served, or the whole
+    /// staging rolls back.
+    ///
+    /// The adapter's per-record read is the check itself — a citation that
+    /// disappeared, became withheld, lost its grant or moved its revision never
+    /// reaches the staged settlement.
+    async fn revalidate_cited(
+        &self,
+        transaction: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+        cited: &[CitedRecord],
+    ) -> Result<(), SpiError> {
+        for record in cited {
+            let body = ready(
+                self.adapter
+                    .get_record(
+                        transaction,
+                        principal,
+                        json!({ "space_id": space_id, "record_id": record.record_id }),
+                    )
+                    .await,
+                "memory.records.get",
+            )?;
+            let revision = body
+                .pointer("/record/revision")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    internal("memory.records.get carries no record revision".to_string())
+                })?;
+            if revision != record.revision {
+                return Err(SpiError::Settlement(
+                    Reject::retryable(
+                        SpokeRejectCode::RevisionConflict,
+                        format!(
+                            "cited record {} is at revision {revision}, the decision saw {}; \
+                             retry the absorb",
+                            record.record_id, record.revision
+                        ),
+                    )
+                    .into_spoke(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Publish every staged intent's targets, then settle them together on one
     /// fresh caller transaction. Both intents settle or neither does.
     async fn settle_staged(
         &self,
+        publisher: &JournalPublisher,
         space: &SpaceId,
         intents: &[(String, Vec<Value>)],
     ) -> Result<Option<Value>, SpiError> {
-        let Some(publisher) = &self.publisher else {
-            return Err(SpiError::InvalidInput(
-                "this workflow binding has no publisher; its staged journal intent cannot settle"
-                    .to_string(),
-            ));
-        };
         let targets: Vec<Value> = intents
             .iter()
             .flat_map(|(_, owed)| owed.iter().cloned())
@@ -329,13 +384,17 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         &self,
         principal: &Principal,
         request: &MemoryCandidatesReviewRequest,
+        cited: &[CitedRecord],
     ) -> Result<Vec<String>, SpiError> {
+        let publisher = self.publisher()?;
         let space = SpaceId::new(request.space_id.to_string());
         let mut transaction = self.pool.begin().await.map_err(|error| {
             internal(format!(
                 "review staging transaction could not begin: {error}"
             ))
         })?;
+        self.revalidate_cited(&mut transaction, principal, &request.space_id, cited)
+            .await?;
         let receipt_id = journal_pending(
             self.adapter
                 .review_candidate(&mut transaction, principal, render(request, "review")?)
@@ -350,7 +409,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             ))
         })?;
         let body = self
-            .settle_staged(&space, &[(receipt_id, targets)])
+            .settle_staged(publisher, &space, &[(receipt_id, targets)])
             .await?
             .ok_or_else(|| internal("the settled review carries no receipt".to_string()))?;
         record_ids(&body)
@@ -362,13 +421,17 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         space_id: &str,
         update: &MemoryRecordsUpdateRequest,
         dismiss: &MemoryCandidatesDismissRequest,
+        cited: &[CitedRecord],
     ) -> Result<(), SpiError> {
+        let publisher = self.publisher()?;
         let space = SpaceId::new(space_id.to_string());
         let mut transaction = self.pool.begin().await.map_err(|error| {
             internal(format!(
                 "update staging transaction could not begin: {error}"
             ))
         })?;
+        self.revalidate_cited(&mut transaction, principal, space_id, cited)
+            .await?;
         let update_receipt = journal_pending(
             self.adapter
                 .update_record(&mut transaction, principal, render(update, "update")?)
@@ -393,8 +456,46 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 "update staging transaction could not commit: {error}"
             ))
         })?;
-        let _ = self.settle_staged(&space, &intents).await?;
+        let _ = self.settle_staged(publisher, &space, &intents).await?;
         Ok(())
+    }
+
+    async fn recorded_update(
+        &self,
+        principal: &Principal,
+        space_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, SpiError> {
+        let key = ReceiptKey {
+            space: SpaceId::new(space_id.to_string()),
+            requester: CallerId::new(principal_id(principal)),
+            operation: "memory.records.update".to_string(),
+            idempotency_key: idempotency_key.to_string(),
+        };
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            internal(format!(
+                "update receipt transaction could not begin: {error}"
+            ))
+        })?;
+        let receipt = SqliteMemoryRepository
+            .review_receipt(&mut transaction, &key)
+            .await
+            .map_err(|error| internal(format!("update receipt could not be read: {error}")))?;
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "update receipt transaction could not commit: {error}"
+            ))
+        })?;
+        let Some(ReceiptRead::Retained(receipt)) = receipt else {
+            return Ok(None);
+        };
+        let ReceiptState::Committed { result, .. } = receipt.state else {
+            return Ok(None);
+        };
+        Ok(result
+            .get("record_id")
+            .and_then(Value::as_str)
+            .map(str::to_string))
     }
 }
 

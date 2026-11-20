@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use mindcore_spi::{
-    AbsorbCandidateOutcome, AbsorbSnapshot, CognitiveTaskKind, DomainLens, Embedder,
+    AbsorbCandidateOutcome, AbsorbSnapshot, CitedRecord, CognitiveTaskKind, DomainLens, Embedder,
     EmbeddingIdentity, LensOutput, MindCapabilities, NoEmbeddings, PolicyDecision, PolicyHook,
     Reasoner, RecallSnapshot, SettlementDraft, SpiError, SpiMindWorkflows, StructuredReasonRequest,
     WorkflowBinding,
@@ -134,6 +134,7 @@ impl WorkflowBinding for StubBinding {
         &self,
         _principal: &Principal,
         _request: &MemoryCandidatesReviewRequest,
+        _cited: &[CitedRecord],
     ) -> Result<Vec<String>, SpiError> {
         unserved()
     }
@@ -144,7 +145,17 @@ impl WorkflowBinding for StubBinding {
         _space_id: &str,
         _update: &MemoryRecordsUpdateRequest,
         _dismiss: &MemoryCandidatesDismissRequest,
+        _cited: &[CitedRecord],
     ) -> Result<(), SpiError> {
+        unserved()
+    }
+
+    async fn recorded_update(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<Option<String>, SpiError> {
         unserved()
     }
 }
@@ -191,6 +202,7 @@ impl WorkflowBinding for RefusingBinding {
         &self,
         _principal: &Principal,
         _request: &MemoryCandidatesReviewRequest,
+        _cited: &[CitedRecord],
     ) -> Result<Vec<String>, SpiError> {
         unserved()
     }
@@ -201,7 +213,17 @@ impl WorkflowBinding for RefusingBinding {
         _space_id: &str,
         _update: &MemoryRecordsUpdateRequest,
         _dismiss: &MemoryCandidatesDismissRequest,
+        _cited: &[CitedRecord],
     ) -> Result<(), SpiError> {
+        unserved()
+    }
+
+    async fn recorded_update(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<Option<String>, SpiError> {
         unserved()
     }
 }
@@ -606,6 +628,35 @@ fn consumed_candidate() -> MemoryCandidate {
     .expect("consumed candidate")
 }
 
+fn dismissed_candidate() -> MemoryCandidate {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "candidate_id": "cnd_1",
+        "space_id": "spc_1",
+        "subject_id": "subj_1",
+        "capture_scope": { "visibility": "shared" },
+        "classification": { "disposition": "promote", "rationale_codes": [] },
+        "status": "consumed",
+        "consumed_by": {
+            "op": "memory.candidates.dismiss",
+            "outcome": "dismissed",
+            "receipt_id": "rct_2",
+            "record_ids": []
+        },
+        "content_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "provenance": {
+            "source_context_ids": [],
+            "anchors": [],
+            "captured_by": "prn_1",
+            "captured_at": "2026-11-20T09:00:00Z"
+        },
+        "created_at": "2026-11-20T09:00:00Z",
+        "revision": 2,
+        "extensions": {}
+    }))
+    .expect("dismissed candidate")
+}
+
 fn capture_request() -> MemoryCaptureRequest {
     serde_json::from_value(json!({
         "space_id": "spc_1",
@@ -622,6 +673,7 @@ fn capture_request() -> MemoryCaptureRequest {
 struct Recorded {
     reviews: Arc<Mutex<Vec<Value>>>,
     updates: Arc<Mutex<Vec<Value>>>,
+    update_keys: Arc<Mutex<Vec<String>>>,
 }
 
 /// One captured candidate over a fixed page, with every submitted settlement
@@ -630,6 +682,8 @@ struct AbsorbDouble {
     candidate: MemoryCandidate,
     page: Vec<RetainedRecord>,
     recorded: Recorded,
+    /// The record id this binding's update leg already settled, if any.
+    settled_update: Option<String>,
 }
 
 #[async_trait]
@@ -667,12 +721,11 @@ impl WorkflowBinding for AbsorbDouble {
         &self,
         _principal: &Principal,
         request: &MemoryCandidatesReviewRequest,
+        cited: &[CitedRecord],
     ) -> Result<Vec<String>, SpiError> {
-        self.recorded
-            .reviews
-            .lock()
-            .expect("reviews")
-            .push(serde_json::to_value(request).expect("review request"));
+        let mut object = serde_json::to_value(request).expect("review request");
+        object["cited"] = cited_json(cited);
+        self.recorded.reviews.lock().expect("reviews").push(object);
         Ok(vec!["rec_new".to_string()])
     }
 
@@ -682,13 +735,38 @@ impl WorkflowBinding for AbsorbDouble {
         _space_id: &str,
         update: &MemoryRecordsUpdateRequest,
         dismiss: &MemoryCandidatesDismissRequest,
+        cited: &[CitedRecord],
     ) -> Result<(), SpiError> {
         self.recorded.updates.lock().expect("updates").push(json!({
             "update": serde_json::to_value(update).expect("update request"),
             "dismiss": serde_json::to_value(dismiss).expect("dismiss request"),
+            "cited": cited_json(cited),
         }));
         Ok(())
     }
+
+    async fn recorded_update(
+        &self,
+        _principal: &Principal,
+        _space_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, SpiError> {
+        self.recorded
+            .update_keys
+            .lock()
+            .expect("update keys")
+            .push(idempotency_key.to_string());
+        Ok(self.settled_update.clone())
+    }
+}
+
+fn cited_json(cited: &[CitedRecord]) -> Value {
+    Value::Array(
+        cited
+            .iter()
+            .map(|record| json!({ "record_id": record.record_id, "revision": record.revision }))
+            .collect(),
+    )
 }
 
 struct FixedVerdict(Value);
@@ -747,11 +825,20 @@ fn page() -> Vec<RetainedRecord> {
 }
 
 fn absorb(candidate: MemoryCandidate) -> (SpiMindWorkflows, Recorded, Arc<Mutex<Vec<Value>>>) {
+    absorb_after_update(candidate, None)
+}
+
+/// An absorb double whose update leg already settled `settled_update`.
+fn absorb_after_update(
+    candidate: MemoryCandidate,
+    settled_update: Option<&str>,
+) -> (SpiMindWorkflows, Recorded, Arc<Mutex<Vec<Value>>>) {
     let recorded = Recorded::default();
     let double = AbsorbDouble {
         candidate,
         page: page(),
         recorded: recorded.clone(),
+        settled_update: settled_update.map(str::to_string),
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     (SpiMindWorkflows::new(double), recorded, seen)
@@ -791,6 +878,10 @@ async fn promote_settles_through_one_review() {
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0]["candidate_id"], "cnd_1");
     assert_eq!(reviews[0]["expected_revision"], 1);
+    assert_eq!(
+        reviews[0]["cited"],
+        json!([{ "record_id": "rec_gate", "revision": 3 }])
+    );
     assert!(recorded.updates.lock().expect("updates").is_empty());
 }
 
@@ -840,6 +931,10 @@ async fn update_hands_policy_the_typed_target_and_settles_it() {
     assert_eq!(updates[0]["update"], seen[0]["proposed"]);
     assert_eq!(updates[0]["dismiss"]["candidate_id"], "cnd_1");
     assert_eq!(updates[0]["dismiss"]["expected_revision"], 1);
+    assert_eq!(
+        updates[0]["cited"],
+        json!([{ "record_id": "rec_gate", "revision": 3 }])
+    );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
 }
 
@@ -878,6 +973,10 @@ async fn dismiss_submits_a_drop_review() {
     assert_eq!(
         reviews[0]["decision"]["rationale"],
         "the records already say this"
+    );
+    assert_eq!(
+        reviews[0]["cited"],
+        json!([{ "record_id": "rec_gate", "revision": 3 }])
     );
 }
 
@@ -932,16 +1031,17 @@ async fn an_update_must_cite_the_record_it_targets() {
 #[tokio::test]
 async fn no_reasoner_keeps_the_capture_result_pending() {
     let (workflows, recorded, _) = absorb(pending_candidate());
+    let caps = MindCapabilities::default();
 
     let outcomes = workflows
-        .absorb(
-            &principal(),
-            &capture_request(),
-            None,
-            &MindCapabilities::default(),
-        )
+        .absorb(&principal(), &capture_request(), None, &caps)
         .await
         .expect("absorb");
+    // A replay reports the same pending state and still writes nothing.
+    let replay = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("replayed absorb");
 
     assert_eq!(
         outcomes,
@@ -949,6 +1049,7 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
             candidate_id: "cnd_1".to_string(),
         }]
     );
+    assert_eq!(replay, outcomes);
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
 }
 
@@ -996,6 +1097,74 @@ async fn a_consumed_candidate_reports_its_recorded_outcome() {
         }]
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
+}
+
+#[tokio::test]
+async fn no_reasoner_replay_reports_the_recorded_outcome() {
+    let (workflows, recorded, _) = absorb(consumed_candidate());
+    let caps = MindCapabilities::default();
+
+    let outcomes = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("absorb");
+
+    assert_eq!(
+        outcomes,
+        vec![AbsorbCandidateOutcome::Settled {
+            candidate_id: "cnd_1".to_string(),
+            record_ids: vec!["rec_new".to_string()],
+        }]
+    );
+    assert!(recorded.reviews.lock().expect("reviews").is_empty());
+}
+
+#[tokio::test]
+async fn a_dismissed_candidate_reports_the_record_it_updated() {
+    let (workflows, recorded, _) = absorb_after_update(dismissed_candidate(), Some("rec_gate"));
+    let caps = MindCapabilities {
+        reasoner: Some(&UnreachableReasoner),
+        ..MindCapabilities::default()
+    };
+
+    let outcomes = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("absorb");
+
+    assert_eq!(
+        outcomes,
+        vec![AbsorbCandidateOutcome::Settled {
+            candidate_id: "cnd_1".to_string(),
+            record_ids: vec!["rec_gate".to_string()],
+        }]
+    );
+    // The update leg's own receipt is read under this capture's stable key.
+    let keys = recorded.update_keys.lock().expect("update keys");
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].starts_with("absorb-"));
+}
+
+#[tokio::test]
+async fn a_dismissed_candidate_without_a_settled_update_is_dropped() {
+    let (workflows, recorded, _) = absorb(dismissed_candidate());
+    let caps = MindCapabilities {
+        reasoner: Some(&UnreachableReasoner),
+        ..MindCapabilities::default()
+    };
+
+    let outcomes = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("absorb");
+
+    assert_eq!(
+        outcomes,
+        vec![AbsorbCandidateOutcome::Dropped {
+            candidate_id: "cnd_1".to_string(),
+        }]
+    );
+    assert_eq!(recorded.update_keys.lock().expect("update keys").len(), 1);
 }
 
 struct StubLens;
