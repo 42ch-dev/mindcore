@@ -1,5 +1,6 @@
 //! I-000060: `spaces.list` costs the same statement count for one space and
-//! for five — the principal's grants are read once, not once per space.
+//! for five — the principal's grants are read once, not once per space — and a
+//! grant whose space row is gone cannot fail the listing.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -94,8 +95,10 @@ async fn list_cost(pool: &SqlitePool) -> (usize, usize) {
     (statements, listed)
 }
 
+/// One batch read whatever the space count; an orphan grant (no space row,
+/// unconstrained payload) is skipped instead of decoded and fails nothing.
 #[tokio::test]
-async fn list_spaces_statement_count_is_constant_in_space_count() {
+async fn list_spaces_reads_grants_once_and_skips_orphan_grants() {
     tracing::subscriber::set_global_default(StatementCounter).expect("install counter");
     let dir = TempDir::new().expect("temporary directory");
     let pool = SqlitePoolOptions::new()
@@ -129,5 +132,28 @@ async fn list_spaces_statement_count_is_constant_in_space_count() {
     assert_eq!(
         one_space, five_spaces,
         "spaces.list issued {one_space} statements for one space and {five_spaces} for five",
+    );
+
+    // A grant whose space row is gone still carries an unconstrained payload;
+    // decoding it would fail the whole page.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_orphan', 'spc_missing', NULL, ?, '{not json', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(PRINCIPAL)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed orphan grant");
+    let (with_orphan, listed_with_orphan) = list_cost(&pool).await;
+    assert_eq!(
+        listed_with_orphan, 5,
+        "the valid spaces still list beside an orphan grant",
+    );
+    assert_eq!(
+        with_orphan, five_spaces,
+        "the orphan grant added a statement: {with_orphan} against {five_spaces}",
     );
 }

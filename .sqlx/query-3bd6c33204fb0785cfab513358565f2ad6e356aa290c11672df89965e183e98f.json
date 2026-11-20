@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, revision, created_at FROM memory_grants WHERE principal_id = ? ORDER BY space_id, grant_id",
+  "query": "SELECT grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, revision, created_at FROM memory_grants WHERE principal_id = ? AND space_id IN (SELECT space_id FROM memory_spaces) ORDER BY space_id, grant_id",
   "describe": {
     "columns": [
       {
@@ -142,5 +142,5 @@
       false
     ]
   },
-  "hash": "42aa84021d0f62578df41bed235e3e4a6715ffec1c97badf47fd254a92ab9a7e"
+  "hash": "3bd6c33204fb0785cfab513358565f2ad6e356aa290c11672df89965e183e98f"
 }

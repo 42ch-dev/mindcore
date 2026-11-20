@@ -100,15 +100,11 @@ fn decode_row(error: sqlx::Error) -> SqliteRepositoryError {
 
 /// The `Placement` one candidate/record visibility column pair encodes, shared
 /// by the head lookups and the full-row decoders.
-fn placement_of(
-    visibility: &str,
-    context_id: Option<&String>,
-    what: &str,
-) -> RepoResult<Placement> {
+fn placement_of(visibility: &str, context_id: Option<String>, what: &str) -> RepoResult<Placement> {
     match visibility {
         "shared" => Ok(Placement::Shared),
         "context" => context_id
-            .map(|id| Placement::Context(id.clone()))
+            .map(Placement::Context)
             .ok_or_else(|| invalid_row(format_args!("{what} placement has no context id"))),
         other => Err(invalid_row(format_args!("{what} visibility {other}"))),
     }
@@ -152,7 +148,7 @@ fn candidate_ir(row: CandidateRow) -> RepoResult<MemoryCandidateIr> {
         "capture_scope".into(),
         placement_wire_value(
             row.capture_visibility.as_str(),
-            row.capture_context_id.as_ref(),
+            row.capture_context_id,
             "capture",
         )?,
     );
@@ -210,7 +206,7 @@ fn candidate_ir(row: CandidateRow) -> RepoResult<MemoryCandidateIr> {
 /// The wire `placement` document one stored visibility/context pair encodes.
 fn placement_wire_value(
     visibility: &str,
-    context_id: Option<&String>,
+    context_id: Option<String>,
     what: &str,
 ) -> RepoResult<Value> {
     match placement_of(visibility, context_id, what)? {
@@ -334,7 +330,7 @@ async fn candidate_head_by_key(
     .map(|row| {
         placement_of(
             row.capture_visibility.as_str(),
-            row.capture_context_id.as_ref(),
+            row.capture_context_id,
             "candidate capture",
         )
         .map(|capture_scope| MemoryCandidateHead {
@@ -435,7 +431,7 @@ struct RecordRow {
 fn record_ir(row: RecordRow) -> RepoResult<MemoryRecordIr> {
     let scope = placement_wire_value(
         row.scope_visibility.as_str(),
-        row.scope_context_id.as_ref(),
+        row.scope_context_id,
         "record scope",
     )?;
     let mut wire = Map::new();
@@ -539,7 +535,7 @@ async fn record_head_by_key(
     .map(|row| {
         placement_of(
             row.scope_visibility.as_str(),
-            row.scope_context_id.as_ref(),
+            row.scope_context_id,
             "record scope",
         )
         .map(|scope| MemoryRecordHead {
@@ -1358,10 +1354,14 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> RepoResult<Vec<MemoryGrantRow>> {
         sqlx::query_as!(
             GrantRow,
+            // The existing-space filter keeps an orphan grant (no space row,
+            // unconstrained payload) out of the decode: no listing can show it.
             "SELECT grant_id, space_id, subject_id, principal_id, \
              capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
              revision, created_at FROM memory_grants \
-             WHERE principal_id = ? ORDER BY space_id, grant_id",
+             WHERE principal_id = ? \
+             AND space_id IN (SELECT space_id FROM memory_spaces) \
+             ORDER BY space_id, grant_id",
             principal,
         )
         .fetch_all(&mut **tx)
