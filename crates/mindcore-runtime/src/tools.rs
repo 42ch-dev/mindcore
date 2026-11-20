@@ -18,8 +18,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use mindcore_spi::{
-    AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens, Embedder,
-    Evidence, MindCapabilities, MindWorkflows, PolicyHook, Reasoner, SpiError,
+    AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
+    Embedder, Evidence, MindCapabilities, MindWorkflows, PolicyHook, Reasoner, SpiError,
 };
 use spoke_connect::remote::{ConnectResponder, MemoryAdmission, ToolHandler};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
@@ -86,24 +86,48 @@ impl WorkflowTools {
 
     /// The three served tools, advertised and installable.
     pub fn registrations(&self) -> Vec<ToolRegistration> {
-        vec![
-            self.registration(
+        Self::advertised()
+            .into_iter()
+            .map(|(capability_id, description, input, output)| {
+                self.install(
+                    capability_id,
+                    descriptor(capability_id, description, input(), output()),
+                )
+            })
+            .collect()
+    }
+
+    /// The descriptors alone: the ABI a caller reads from the manifest.
+    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+        Self::advertised()
+            .into_iter()
+            .map(|(capability_id, description, input, output)| {
+                descriptor(capability_id, description, input(), output())
+            })
+            .collect()
+    }
+
+    /// The one list both advertisement and installation read.
+    #[allow(clippy::type_complexity)]
+    fn advertised() -> [(&'static str, &'static str, fn() -> Value, fn() -> Value); 3] {
+        [
+            (
                 RECALL_CONTEXT,
                 "Recall a context pack under a token budget.",
-                recall_input(),
-                recall_output(),
+                recall_input,
+                recall_output,
             ),
-            self.registration(
+            (
                 ABSORB,
                 "Capture candidates and settle what each one becomes.",
-                absorb_input(),
-                absorb_output(),
+                absorb_input,
+                absorb_output,
             ),
-            self.registration(
+            (
                 DELIBERATE,
                 "Derive a validated verdict over supplied evidence.",
-                deliberate_input(),
-                deliberate_output(),
+                deliberate_input,
+                deliberate_output,
             ),
         ]
     }
@@ -128,14 +152,7 @@ impl WorkflowTools {
         .await
     }
 
-    fn registration(
-        &self,
-        capability_id: &'static str,
-        description: &str,
-        input: Value,
-        output: Value,
-    ) -> ToolRegistration {
-        let descriptor = descriptor(capability_id, description, input, output);
+    fn install(&self, capability_id: &'static str, descriptor: ToolDescriptor) -> ToolRegistration {
         let workflows = Arc::clone(&self.workflows);
         let principals = Arc::clone(&self.principals);
         let providers = self.providers.clone();
@@ -425,17 +442,97 @@ fn descriptor(
     .expect("the static mindcore tool descriptor matches the schema")
 }
 
+/// The served argument shapes. This one, [`absorb_input`] and [`deliberate_input`] each build a
+/// self-contained draft-07 subschema — own `$id`, so its local `#/definitions/…` resolve inside a
+/// manifest — mirroring the pinned `spoke-schemas` request DTOs the handler decodes. A client that
+/// only reads the manifest can build a valid call; `tests/tools.rs` pins each shape against the DTO.
 fn recall_input() -> Value {
     json!({
+        "$id": "https://mindcore.invalid/schemas/tools/recall-context.input.schema.json",
         "type": "object",
         "additionalProperties": false,
         "required": ["request", "max_tokens"],
         "properties": {
             "request": {
                 "type": "object",
-                "description": "SPOKE MemoryRecallRequest.",
+                "additionalProperties": false,
+                "required": ["space_id", "subject_id", "selection", "budget"],
+                "description": "A SPOKE MemoryRecallRequest. `cognition_filter` is refused by this \
+                                provider, so it is not advertised.",
+                "properties": {
+                    "space_id": { "type": "string", "minLength": 1 },
+                    "subject_id": { "type": "string", "minLength": 1 },
+                    "selection": { "$ref": "#/definitions/read_selection" },
+                    "filter": { "$ref": "#/definitions/provenance_filter" },
+                    "query": {
+                        "type": "string",
+                        "description": "Ranking hint only; never an authorization input.",
+                    },
+                    "budget": { "$ref": "#/definitions/budget" },
+                    "cursor": { "type": "string", "minLength": 1 },
+                    "extensions": { "$ref": "#/definitions/extension_map" },
+                },
             },
             "max_tokens": { "type": "integer", "minimum": 1 },
+        },
+        "definitions": {
+            "read_selection": {
+                "description": "Placement selection (§6.12): one closed variant per mode.",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["mode"],
+                        "properties": { "mode": { "const": "subject_all" } },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["mode"],
+                        "properties": { "mode": { "const": "shared_only" } },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["mode", "context_ids"],
+                        "properties": {
+                            "mode": { "const": "selected_contexts" },
+                            "context_ids": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": { "type": "string" },
+                            },
+                            "include_shared": { "type": "boolean" },
+                        },
+                    },
+                ],
+            },
+            "provenance_filter": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source_context_ids"],
+                "properties": {
+                    "source_context_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "string" },
+                    },
+                },
+            },
+            "budget": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["max_items"],
+                "properties": {
+                    "max_items": { "type": "integer", "minimum": 1 },
+                    "max_bytes": { "type": "integer", "minimum": 1 },
+                },
+            },
+            "extension_map": {
+                "type": "object",
+                "propertyNames": { "pattern": "^[a-z][a-z0-9_-]*$" },
+                "additionalProperties": { "type": "object" },
+            },
         },
     })
 }
@@ -455,13 +552,100 @@ fn recall_output() -> Value {
 
 fn absorb_input() -> Value {
     json!({
+        "$id": "https://mindcore.invalid/schemas/tools/absorb.input.schema.json",
         "type": "object",
         "additionalProperties": false,
         "required": ["request"],
         "properties": {
             "request": {
                 "type": "object",
-                "description": "SPOKE MemoryCaptureRequest.",
+                "additionalProperties": false,
+                "required": ["space_id", "subject_id", "content", "capture_scope", "idempotency_key"],
+                "description": "A SPOKE MemoryCaptureRequest.",
+                "properties": {
+                    "space_id": { "type": "string", "minLength": 1 },
+                    "subject_id": { "type": "string", "minLength": 1 },
+                    "content": { "$ref": "#/definitions/content" },
+                    "capture_scope": { "$ref": "#/definitions/placement_scope" },
+                    "source_context_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                    },
+                    "anchors": {
+                        "type": "array",
+                        "items": { "$ref": "#/definitions/source_anchor" },
+                    },
+                    "kind_hint": { "type": "string", "minLength": 1 },
+                    "occurred_at": { "type": "string", "format": "date-time" },
+                    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "extensions": { "$ref": "#/definitions/extension_map" },
+                },
+            },
+        },
+        "definitions": {
+            "content": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text"],
+                "properties": {
+                    "text": { "type": "string" },
+                    "structured": {
+                        "description": "Opaque product JSON; stored and returned unchanged.",
+                    },
+                    "cognition": {
+                        "type": "array",
+                        "description": "Recorded-at-time cognition: each entry is a closed pinned \
+                                        SPOKE CognitionRecord.",
+                        "items": {
+                            "$ref": "https://spoke42.invalid/schemas/data/cognition.schema.json",
+                        },
+                    },
+                },
+            },
+            "placement_scope": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["visibility"],
+                        "properties": { "visibility": { "const": "shared" } },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["visibility", "context_id"],
+                        "properties": {
+                            "visibility": { "const": "context" },
+                            "context_id": { "type": "string", "minLength": 1 },
+                        },
+                    },
+                ],
+            },
+            "source_anchor": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["schema_version", "source_id", "extensions"],
+                "properties": {
+                    "schema_version": { "type": "integer", "minimum": 1 },
+                    "source_id": { "type": "string" },
+                    "span": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["start", "end"],
+                        "properties": {
+                            "start": { "type": "number" },
+                            "end": { "type": "number" },
+                        },
+                    },
+                    "label": { "type": "string" },
+                    "mime_type": { "type": "string" },
+                    "extensions": { "$ref": "#/definitions/extension_map" },
+                },
+            },
+            "extension_map": {
+                "type": "object",
+                "propertyNames": { "pattern": "^[a-z][a-z0-9_-]*$" },
+                "additionalProperties": { "type": "object" },
             },
         },
     })
@@ -485,20 +669,15 @@ fn absorb_output() -> Value {
 
 fn deliberate_input() -> Value {
     json!({
+        "$id": "https://mindcore.invalid/schemas/tools/deliberate.input.schema.json",
         "type": "object",
         "additionalProperties": false,
         "required": ["space_id", "subject_id", "holder", "target", "evidence", "timeout_ms"],
         "properties": {
-            "space_id": { "type": "string" },
-            "subject_id": { "type": "string" },
-            "holder": {
-                "type": "object",
-                "description": "SPOKE CognitionReference.",
-            },
-            "target": {
-                "type": "object",
-                "description": "SPOKE CognitionTarget.",
-            },
+            "space_id": { "type": "string", "minLength": 1 },
+            "subject_id": { "type": "string", "minLength": 1 },
+            "holder": { "$ref": "#/definitions/cognition_reference" },
+            "target": { "$ref": "#/definitions/cognition_target" },
             "evidence": {
                 "type": "array",
                 "items": {
@@ -512,6 +691,40 @@ fn deliberate_input() -> Value {
                 },
             },
             "timeout_ms": { "type": "integer", "minimum": 1 },
+        },
+        "definitions": {
+            "cognition_reference": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "id", "namespace"],
+                "properties": {
+                    "kind": {
+                        "enum": [
+                            "knowledge_entry",
+                            "timeline_event",
+                            "memory_record",
+                            "memory_subject",
+                            "principal",
+                            "world",
+                            "external",
+                        ],
+                    },
+                    "id": { "type": "string", "minLength": 1 },
+                    "namespace": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
+                },
+            },
+            "cognition_target": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["carrier", "target_id", "kind"],
+                "properties": {
+                    "carrier": { "$ref": "#/definitions/cognition_reference" },
+                    "target_id": { "type": "string", "minLength": 1 },
+                    "kind": { "enum": ["proposition", "question", "perceived_content", "episode"] },
+                    "text": { "type": "string" },
+                    "about": { "$ref": "#/definitions/cognition_target" },
+                },
+            },
         },
     })
 }

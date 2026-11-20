@@ -17,7 +17,9 @@ use mindcore_spi::{
     MindCapabilities, MindWorkflows, SpiError,
 };
 use spoke_connect::remote::MemoryAdmission;
-use spoke_operations::{spoke_reject, SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    spoke_reject, validate_tool_arguments, SpokeReject, SpokeRejectCode, SpokeResult,
+};
 use spoke_schemas::{
     CognitionRecord, KnowledgeEntry, MemoryCaptureRequest, MemoryRecallRequest, Principal,
     RetainedRecord,
@@ -440,7 +442,9 @@ async fn malformed_arguments_are_invalid_input() {
     for (case, capability_id, arguments) in cases {
         let fake = Arc::new(Fake::default());
         let reject = expect_reject(
-            tools(fake).call(capability_id, "peer-driver", arguments).await,
+            tools(fake)
+                .call(capability_id, "peer-driver", arguments)
+                .await,
             case,
         );
         assert_eq!(reject.code, SpokeRejectCode::InvalidInput, "{case}");
@@ -469,10 +473,7 @@ async fn settlement_refusals_keep_their_code_and_details() {
     let refusal = SpokeReject {
         code: SpokeRejectCode::RevisionConflict,
         message: "the record moved during provider work".into(),
-        details: Some(Map::from_iter([(
-            "retry_after_ms".to_string(),
-            json!(25),
-        )])),
+        details: Some(Map::from_iter([("retry_after_ms".to_string(), json!(25))])),
     };
     let fake = Arc::new(Fake::default());
     fake.reply_absorb(Err(SpiError::Settlement(refusal.clone())));
@@ -553,7 +554,9 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
     assert!(!reject.message.contains("domain redline"));
 
     let fake = Arc::new(Fake::default());
-    fake.reply_recall(Err(SpiError::InvalidInput("max_tokens is unsupported".into())));
+    fake.reply_recall(Err(SpiError::InvalidInput(
+        "max_tokens is unsupported".into(),
+    )));
     let reject = expect_reject(
         tools(fake)
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
@@ -562,4 +565,258 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
     );
     assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
     assert_eq!(reject.message, "max_tokens is unsupported");
+}
+
+/// The advertised ABI is the served ABI: an argument built only from the manifest decodes, and every
+/// member the manifest requires is a member the handler requires.
+#[tokio::test]
+async fn advertised_input_schemas_match_the_decoded_arguments() {
+    let fake = Arc::new(Fake::default());
+    let tool = tools(Arc::clone(&fake));
+
+    for descriptor in tool.descriptors() {
+        let capability_id = descriptor.capability_id.as_str();
+        let input = Value::Object(descriptor.input.clone());
+        let definitions = input
+            .get("definitions")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        assert_closed(&input, &definitions, &mut Vec::new());
+
+        match capability_id {
+            RECALL_CONTEXT => fake.reply_recall(Ok(ContextPack {
+                records: Vec::new(),
+                knowledge: Vec::new(),
+                tokens_used: 0,
+            })),
+            ABSORB => fake.reply_absorb(Ok(Vec::new())),
+            DELIBERATE => {
+                fake.reply_deliberate(Ok(DeliberateOutcome::NoChange { verdict: json!({}) }))
+            }
+            other => panic!("unadvertised tool {other}"),
+        }
+
+        let arguments = minimal(&input, &definitions);
+        expect_ok(
+            tool.call(capability_id, "peer-driver", arguments.clone())
+                .await,
+            &format!("{capability_id}: the manifest's own minimal argument"),
+        );
+
+        let required: Vec<String> = input["required"]
+            .as_array()
+            .expect("an advertised input lists its required members")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        for member in required {
+            let mut missing = arguments.clone();
+            missing
+                .as_object_mut()
+                .expect("the advertised argument is an object")
+                .remove(&member);
+
+            // The advertised schema refuses the argument, not only serde.
+            match validate_tool_arguments(&descriptor, &missing) {
+                SpokeResult::Reject(reject) => {
+                    assert_eq!(
+                        reject.code,
+                        SpokeRejectCode::InvalidInput,
+                        "{capability_id}: dropping {member}"
+                    );
+                    let named: Vec<&str> = reject
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("missing"))
+                        .and_then(Value::as_array)
+                        .expect("the structural gate names the missing members")
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    assert!(
+                        named.contains(&member.as_str()),
+                        "{capability_id}: dropping {member} names {named:?}"
+                    );
+                }
+                SpokeResult::Ok(()) => panic!(
+                    "{capability_id}: the advertised schema admits an argument without {member}"
+                ),
+            }
+
+            // And the handler requires it too, so advertisement and behavior agree.
+            let reject = expect_reject(
+                tool.call(capability_id, "peer-driver", missing).await,
+                &format!("{capability_id}: argument without {member}"),
+            );
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::InvalidInput,
+                "{capability_id}: dropping {member}"
+            );
+        }
+    }
+
+    // The provider refuses `cognition_filter`, so the served shape does not advertise it either.
+    let recall = tool
+        .descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.capability_id.as_str() == RECALL_CONTEXT)
+        .expect("recall context is advertised");
+    assert!(
+        recall.input["properties"]["request"]["properties"]
+            .get("cognition_filter")
+            .is_none(),
+        "a refused member is never advertised"
+    );
+}
+
+/// Resolve the local `#/definitions/<name>` references the advertised subschemas use.
+fn resolve<'a>(schema: &'a Value, definitions: &'a Value) -> &'a Value {
+    match schema.get("$ref").and_then(Value::as_str) {
+        Some(reference) => {
+            let name = reference.rsplit('/').next().expect("a $ref fragment");
+            definitions
+                .get(name)
+                .unwrap_or_else(|| panic!("unresolvable $ref {reference}"))
+        }
+        None => schema,
+    }
+}
+
+/// Every object an advertised subschema describes is closed: an `{}` object cannot pass the manifest
+/// and then fail decoding.
+fn assert_closed(schema: &Value, definitions: &Value, seen: &mut Vec<String>) {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        // A local definition is walked once; a `$ref` into a pinned SPOKE document is that
+        // document's shape, which this crate does not restate.
+        if !reference.starts_with('#') || seen.iter().any(|visited| visited == reference) {
+            return;
+        }
+        seen.push(reference.to_string());
+    }
+    let schema = resolve(schema, definitions);
+
+    for key in ["oneOf", "anyOf"] {
+        for branch in schema
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            assert_closed(branch, definitions, seen);
+        }
+    }
+    if let Some(nested) = schema.get("definitions").and_then(Value::as_object) {
+        for definition in nested.values() {
+            assert_closed(definition, definitions, seen);
+        }
+    }
+
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            assert!(
+                schema
+                    .get("additionalProperties")
+                    .is_some_and(|closed| closed == &Value::Bool(false) || closed.is_object()),
+                "an advertised object must be closed: {schema}"
+            );
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                return;
+            };
+            for property in properties.values() {
+                assert_closed(property, definitions, seen);
+            }
+            for name in schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                assert!(
+                    properties.contains_key(name),
+                    "advertised required member {name} has no schema: {schema}"
+                );
+            }
+        }
+        Some("array") => assert_closed(
+            schema
+                .get("items")
+                .expect("an advertised array names its items"),
+            definitions,
+            seen,
+        ),
+        _ => {}
+    }
+}
+
+/// The smallest argument an advertised subschema admits — what a client reading only the manifest
+/// would build. Strings are `x`-repeat, which satisfies every advertised `minLength` and pattern.
+fn minimal(schema: &Value, definitions: &Value) -> Value {
+    let schema = resolve(schema, definitions);
+    if let Some(value) = schema.get("const") {
+        return value.clone();
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values
+            .first()
+            .expect("an advertised enum has a member")
+            .clone();
+    }
+    if let Some(branches) = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return minimal(&branches[0], definitions);
+    }
+
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            let properties = schema.get("properties").and_then(Value::as_object);
+            let mut object = Map::new();
+            for name in schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                let member = properties
+                    .and_then(|properties| properties.get(name))
+                    .unwrap_or_else(|| panic!("advertised required member {name} has no schema"));
+                object.insert(name.to_string(), minimal(member, definitions));
+            }
+            Value::Object(object)
+        }
+        Some("array") => {
+            let items = schema
+                .get("items")
+                .expect("an advertised array names its items");
+            let count = schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .max(1);
+            Value::Array((0..count).map(|_| minimal(items, definitions)).collect())
+        }
+        Some("integer") => Value::from(schema.get("minimum").and_then(Value::as_i64).unwrap_or(1)),
+        Some("number") => Value::from(schema.get("minimum").and_then(Value::as_f64).unwrap_or(1.0)),
+        Some("boolean") => Value::Bool(false),
+        Some("string") => {
+            if schema.get("format").and_then(Value::as_str) == Some("date-time") {
+                return Value::from("2026-01-01T00:00:00Z");
+            }
+            let length = schema
+                .get("minLength")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .max(1);
+            Value::from("x".repeat(length as usize))
+        }
+        other => {
+            panic!("the advertised schema leaves a member unconstrained ({other:?}): {schema}")
+        }
+    }
 }
