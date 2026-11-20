@@ -1133,6 +1133,75 @@ async fn missing_and_empty_cognition_modules_stay_explicit() {
     store.close().await;
 }
 
+/// A stored cognition module without a `records` member (a payload another producer wrote) must
+/// not swallow an append: the append normalizes the member so the row is projected, and the
+/// carrier a client then reads is re-submittable — a full put no longer reports a dropped record.
+#[tokio::test]
+async fn append_onto_a_module_without_records_is_projected() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let pool = second_pool(&path).await;
+    expect_ok(
+        port.put_knowledge_entry(
+            with_module(
+                "ke_partial",
+                None,
+                json!({"records": [], "world_facts": [], "extensions": {}}),
+            ),
+            None,
+        )
+        .await,
+        "create carrier",
+    );
+
+    // Only a foreign payload write reaches this shape: the port's put gates the module.
+    let foreign = with_module(
+        "ke_partial",
+        Some(1),
+        json!({"world_facts": [], "extensions": {}}),
+    );
+    sqlx::query("UPDATE knowledge_entries SET payload = ? WHERE collection = ? AND entry_id = ?")
+        .bind(serde_json::to_string(&foreign).expect("foreign payload serializes"))
+        .bind("wren")
+        .bind("ke_partial")
+        .execute(&pool)
+        .await
+        .expect("foreign payload write");
+
+    let mut record = belief("cog_partial", 0.4);
+    record["holder"] = reference("knowledge_entry", "ke_partial");
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    let assigned = expect_ok(
+        append_cognition(&mut tx, "wren", "ke_partial", 1, &record).await,
+        "append onto a module without records",
+    );
+    assert_eq!(assigned, 2);
+    tx.commit().await.expect("commit");
+
+    let read = expect_ok(read_carrier(&port, "ke_partial").await, "read carrier");
+    let records = module_of(&read)["records"]
+        .as_array()
+        .expect("the append must leave a present records member")
+        .clone();
+    assert_eq!(module_keys(&records), vec!["cog_partial"]);
+
+    // The client re-submits exactly what it read: without the normalized member this put was
+    // refused for dropping a record it never saw.
+    let put = expect_ok(
+        port.put_knowledge_entry(read, Some(2)).await,
+        "full put carrying the appended record",
+    );
+    assert_eq!(put.revision, Some(3));
+    let reread = expect_ok(read_carrier(&port, "ke_partial").await, "reread carrier");
+    assert_eq!(
+        module_keys(module_of(&reread)["records"].as_array().expect("records")),
+        vec!["cog_partial"]
+    );
+    store.close().await;
+}
+
 /// Full-put CAS: the committed record prefix is immutable — dropping, rewriting or
 /// reordering it is invalid input, every refusal leaves the stored carrier untouched,
 /// and a put that only appends a suffix commits the new revision.
