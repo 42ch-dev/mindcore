@@ -238,7 +238,7 @@ CREATE INDEX idx_memory_reflections_subject_reflection
 CREATE TABLE knowledge_entries (
   collection   TEXT NOT NULL,
   entry_id     TEXT NOT NULL,
-  revision     INTEGER NOT NULL,
+  revision     INTEGER NOT NULL CHECK (revision >= 1),
   payload      TEXT NOT NULL,
   -- Composite pointer to the holder's newest record; NULL while it has none.
   cognition_head_seq INTEGER,
@@ -278,7 +278,7 @@ CREATE TABLE cognition_records (
 CREATE TABLE knowledge_entry_revisions (
   collection         TEXT NOT NULL,
   entry_id           TEXT NOT NULL,
-  revision           INTEGER NOT NULL,
+  revision           INTEGER NOT NULL CHECK (revision >= 1),
   payload            TEXT NOT NULL,
   cognition_head_seq INTEGER,
   recorded_at        TEXT NOT NULL,

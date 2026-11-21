@@ -2333,7 +2333,7 @@ async fn a_cycle_in_stored_markers_is_a_storage_failure() {
 }
 
 #[tokio::test]
-async fn the_list_bound_counts_superseded_rows() {
+async fn the_list_bound_counts_live_rows() {
     let path = database_path("supersede-bound");
     let store = MindStore::open(&path).await.expect("open store");
     let port = store.knowledge(KnowledgeScope::new("wren"));
@@ -2372,7 +2372,7 @@ async fn the_list_bound_counts_superseded_rows() {
     );
     assert_eq!(listed[0].entry_id, "ke_0001", "the order is unchanged");
 
-    // The bound stays on stored rows: one more row — live or marked — refuses the list.
+    // Retirement freed the budget: the stored row now sits past the bound while the live set fits.
     let mut tx = reader
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -2381,17 +2381,48 @@ async fn the_list_bound_counts_superseded_rows() {
         write_entry(
             &mut tx,
             "wren",
-            entry_with("ke_over", "one row past the bound"),
+            entry_with("ke_refill", "one live row into the freed budget"),
             None,
         )
         .await,
-        "seed one row past the bound",
+        "seed a live row into the freed budget",
+    );
+    tx.commit().await.expect("commit seed");
+    let listed = expect_ok(
+        port.list_entries().await,
+        "stored rows past the bound with the live set at it",
+    );
+    assert_eq!(
+        listed.len(),
+        SERVED_KNOWLEDGE_LIST_LIMIT,
+        "a retired row does not consume the budget"
+    );
+    assert_eq!(
+        listed.last().map(|entry| entry.entry_id.as_str()),
+        Some("ke_refill"),
+        "the order is unchanged"
+    );
+
+    // The bound still refuses a live set one row past it.
+    let mut tx = reader
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin seed");
+    expect_ok(
+        write_entry(
+            &mut tx,
+            "wren",
+            entry_with("ke_over", "one live row past the bound"),
+            None,
+        )
+        .await,
+        "seed one live row past the bound",
     );
     tx.commit().await.expect("commit seed");
     assert_eq!(
         expect_reject(
             port.list_entries().await,
-            "a collection one stored row past the bound"
+            "a live set one row past the bound"
         ),
         SpokeRejectCode::InternalError
     );
