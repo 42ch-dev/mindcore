@@ -250,17 +250,59 @@ CREATE TABLE knowledge_entries (
 );
 
 -- One row per appended cognition record: `append_seq` is the storage order the carrier reads,
--- and rows are immutable once written.
+-- and rows are immutable once written. `append_prior_shape` is NULL for a record a full-entry
+-- put committed and classifies what a dedicated append is about to replace: `0` the module kept
+-- its `records` member, `1` the module was absent, `2` the module existed without `records`.
 CREATE TABLE cognition_records (
   collection TEXT NOT NULL,
   entry_id   TEXT NOT NULL,
   append_seq INTEGER NOT NULL CHECK (append_seq > 0),
   record_id  TEXT NOT NULL,
   payload    TEXT NOT NULL,
+  append_prior_shape INTEGER CHECK (append_prior_shape IN (0, 1, 2)),
   PRIMARY KEY (collection, entry_id, append_seq),
   UNIQUE (collection, entry_id, record_id),
   FOREIGN KEY (collection, entry_id) REFERENCES knowledge_entries (collection, entry_id)
 );
+
+-- The preimage of every revision a full-entry update displaces: one row per replaced revision,
+-- keyed by it, so a range read needs no second index. `recorded_at` is the instant the replaced
+-- state was written, not the instant it was displaced. A dedicated cognition append advances the
+-- revision without a row here; its checkpoint is the next saved revision or the live row, and
+-- the appended record's `append_prior_shape` reverses the first append.
+CREATE TABLE knowledge_entry_revisions (
+  collection         TEXT NOT NULL,
+  entry_id           TEXT NOT NULL,
+  revision           INTEGER NOT NULL,
+  payload            TEXT NOT NULL,
+  cognition_head_seq INTEGER,
+  recorded_at        TEXT NOT NULL,
+  PRIMARY KEY (collection, entry_id, revision),
+  FOREIGN KEY (collection, entry_id) REFERENCES knowledge_entries (collection, entry_id)
+);
+
+-- Save what a revision-changing update replaces, unless it is a dedicated append: the head
+-- advances by exactly one and the record now indexed by that head was written by such an append
+-- (a full put stamps NULL). Insertion is unconditional otherwise — no conflict suppression, so a
+-- replayed assignment surfaces as a constraint failure instead of overwriting history.
+CREATE TRIGGER knowledge_entries_capture_revision
+BEFORE UPDATE OF revision ON knowledge_entries
+WHEN NEW.revision <> OLD.revision
+ AND NOT (
+   NEW.cognition_head_seq IS COALESCE(OLD.cognition_head_seq, 0) + 1
+   AND (
+     SELECT append_prior_shape FROM cognition_records
+     WHERE collection = OLD.collection
+       AND entry_id = OLD.entry_id
+       AND append_seq = NEW.cognition_head_seq
+   ) IS NOT NULL
+ )
+BEGIN
+  INSERT INTO knowledge_entry_revisions
+    (collection, entry_id, revision, payload, cognition_head_seq, recorded_at)
+  VALUES
+    (OLD.collection, OLD.entry_id, OLD.revision, OLD.payload, OLD.cognition_head_seq, OLD.updated_at);
+END;
 
 -- ── Retained Memory record vectors ──
 -- Optional cache of retained Memory record vectors: one row per record and embedding identity.

@@ -34,14 +34,16 @@ pub async fn write_carrier(
 /// Crate-private raw row writer: `append_cognition` and the port's full put
 /// (`write_entry`) are its only callers, and they own every invariant this helper
 /// does not check — the record's wire shape, its holder identity, the carrier
-/// revision, the head pointer and the envelope. A duplicate scoped `record_id` is
-/// invalid input, not a storage failure.
+/// revision, the head pointer and the envelope. `append_prior_shape` is `Some` only for a
+/// dedicated append and lets the preimage trigger recognize (and skip) it. A duplicate scoped
+/// `record_id` is invalid input, not a storage failure.
 pub(crate) async fn insert_record(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,
     append_seq: i64,
     record: &Value,
+    append_prior_shape: Option<i64>,
 ) -> SpokeResult<()> {
     let Some(record_id) = record.get("record_id").and_then(Value::as_str) else {
         return spoke_reject(
@@ -57,14 +59,16 @@ pub(crate) async fn insert_record(
         }
     };
     let written = sqlx::query(
-        "INSERT INTO cognition_records (collection, entry_id, append_seq, record_id, payload)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO cognition_records \
+         (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(collection)
     .bind(entry_id)
     .bind(append_seq)
     .bind(record_id)
     .bind(&payload)
+    .bind(append_prior_shape)
     .execute(&mut **tx)
     .await;
     match written {
@@ -110,6 +114,70 @@ where
         }
     }
     SpokeResult::Ok(records)
+}
+
+/// The holder's records up to and including `head_seq` in storage order: the historical
+/// projection a replay hydrates, so a record appended after that head is never read.
+pub async fn read_records_through<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+    head_seq: i64,
+) -> SpokeResult<Vec<Value>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT payload FROM cognition_records \
+         WHERE collection = ? AND entry_id = ? AND append_seq <= ? ORDER BY append_seq ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .bind(head_seq)
+    .fetch_all(executor)
+    .await;
+    let payloads = match payloads {
+        Ok(payloads) => payloads,
+        Err(error) => return internal(format!("cognition records could not be listed: {error}")),
+    };
+    let mut records = Vec::with_capacity(payloads.len());
+    for payload in &payloads {
+        match serde_json::from_str(payload) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                return internal(format!("stored cognition record is not JSON: {error}"));
+            }
+        }
+    }
+    SpokeResult::Ok(records)
+}
+
+/// What the append at `append_seq` replaced in the carrier envelope: `None` when that row has no
+/// classification (a full-put record, or no such row), which a replay must treat as missing
+/// history rather than as an empty shape.
+pub async fn read_append_prior_shape<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+    append_seq: i64,
+) -> SpokeResult<Option<i64>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let shape: Result<Option<Option<i64>>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT append_prior_shape FROM cognition_records \
+         WHERE collection = ? AND entry_id = ? AND append_seq = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .bind(append_seq)
+    .fetch_optional(executor)
+    .await;
+    match shape {
+        Ok(Some(shape)) => SpokeResult::Ok(shape),
+        Ok(None) => SpokeResult::Ok(None),
+        Err(error) => internal(format!("cognition record shape could not be read: {error}")),
+    }
 }
 
 /// One record addressed by its scoped `record_id`, independent of history size.

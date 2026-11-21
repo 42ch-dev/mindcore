@@ -406,6 +406,17 @@ fn cognition_module(entry: &KnowledgeEntry) -> Option<Value> {
     }
 }
 
+// What a dedicated append is about to change in the carrier envelope, stored on its record row so
+// a replay can reverse the first append without a preimage: 0 keeps the `records` member, 1 seeds
+// the module, 2 adds the missing member to an existing module.
+fn append_prior_shape(entry: &KnowledgeEntry) -> i64 {
+    match entry.modules.get(&module_key()) {
+        None => 1,
+        Some(KnowledgeEntryModulesValue::Object(module)) if module.contains_key("records") => 0,
+        Some(_) => 2,
+    }
+}
+
 // Names no collection: a served put forwards this message to an admitted peer, and an absent
 // or foreign-only id must answer exactly like a stale visible one.
 fn stale<T>(entry_id: &str, expected: Option<u64>, stored: Option<u64>) -> SpokeResult<T> {
@@ -761,6 +772,7 @@ pub async fn write_entry(
             &entry.entry_id,
             committed.len() as i64 + offset as i64 + 1,
             record,
+            None,
         )
         .await
         {
@@ -855,18 +867,27 @@ pub async fn append_cognition(
         return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
     }
     let append_seq = head_seq.map_or(1, |head| head + 1);
-    if let SpokeResult::Reject(reject) =
-        insert_record(tx, collection, entry_id, append_seq, record).await
+    // The classification comes from the envelope this append is about to change, so the stored
+    // payload is decoded before the row write and re-encoded once below.
+    let mut entry = match decode(&payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    if let SpokeResult::Reject(reject) = insert_record(
+        tx,
+        collection,
+        entry_id,
+        append_seq,
+        record,
+        Some(append_prior_shape(&entry)),
+    )
+    .await
     {
         return SpokeResult::Reject(reject);
     }
 
     // Re-encode the carrier envelope with the advanced revision: records live in their own
     // rows, so this touches the carrier row only — never an earlier record.
-    let mut entry = match decode(&payload) {
-        SpokeResult::Ok(entry) => entry,
-        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-    };
     entry.revision = Some(stored_revision + 1);
     let module = entry.modules.entry(module_key()).or_insert_with(|| {
         // First record of a carrier without a module: seed the same envelope a full
