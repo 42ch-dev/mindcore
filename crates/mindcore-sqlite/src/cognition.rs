@@ -175,11 +175,11 @@ where
     E: Executor<'e, Database = Sqlite>,
 {
     // Positions, not a count: `append_seq` is a non-`STRICT` `INTEGER`, so a fractional value is
-    // storable and a count would let it stand in for the position it is not.
-    let rows: Result<Vec<(i64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
-        "SELECT CAST(append_seq AS INTEGER), append_prior_shape FROM cognition_records \
+    // storable. Reading it as `REAL` keeps such a row in the result instead of letting a cast
+    // drop it, so every row in the interval reaches the position comparison below.
+    let rows: Result<Vec<(f64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT CAST(append_seq AS REAL), append_prior_shape FROM cognition_records \
          WHERE collection = ? AND entry_id = ? AND append_seq > ? AND append_seq <= ? \
-           AND append_seq = CAST(append_seq AS INTEGER) \
          ORDER BY append_seq ASC",
     )
     .bind(collection)
@@ -194,7 +194,9 @@ where
                 && rows
                     .iter()
                     .zip(after + 1..=after + gap)
-                    .all(|((position, shape), expected)| *position == expected && shape.is_some()),
+                    .all(|((position, shape), expected)| {
+                        *position == expected as f64 && shape.is_some()
+                    }),
         ),
         Err(error) => internal(format!("cognition history gap could not be read: {error}")),
     }
