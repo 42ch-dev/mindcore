@@ -15,8 +15,8 @@ mod embedded_story;
 use mindcore_base::ids::SpaceId;
 use mindcore_spoke::MemoryAdapter;
 use mindcore_sqlite::MindStore;
-use serde_json::json;
-use spoke_operations::{SpokeRejectCode, SpokeResult};
+use serde_json::{json, Value};
+use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use sqlx::{Sqlite, Transaction};
 
 use embedded_story::{
@@ -33,6 +33,17 @@ fn hearing(key: &str) -> serde_json::Value {
         "occurred_at": "2026-11-19T17:40:00Z",
         "idempotency_key": key,
     })
+}
+
+/// The retry class a refusal reports: the protocol promises every reject names its `retry_class`,
+/// so a refusal without one is itself a defect.
+fn retry_class(reject: &SpokeReject) -> &str {
+    reject
+        .details
+        .as_ref()
+        .and_then(|details| details.get("retry_class"))
+        .and_then(Value::as_str)
+        .expect("every reject names its retry_class")
 }
 
 /// The pair a settlement reads before it writes, asserted inside the caller transaction so that
@@ -92,16 +103,18 @@ async fn competing_handles_retain_one_candidate() {
         | (SpokeResult::Reject(reject), SpokeResult::Ok(retained)) => {
             // The loser's refusal depends on how far its transaction got before the winner
             // committed: a consumed candidate, a lost revision CAS, or a write SQLite refused
-            // once the sibling's commit invalidated the loser's WAL snapshot. That last case is
-            // contention, so it reports uncertainty instead of the storage catch-all.
+            // once the sibling's commit invalidated the loser's WAL snapshot. The last case is
+            // contention, and a retain loser never commits, so it is a retryable pre-commit
+            // failure — never `OUTCOME_UNCERTAIN`, which would ask the caller to resolve an
+            // outcome this transaction provably does not have.
             assert!(
                 matches!(
                     reject.code,
-                    SpokeRejectCode::CandidateConsumed
-                        | SpokeRejectCode::RevisionConflict
-                        | SpokeRejectCode::OutcomeUncertain
-                ),
-                "a competing retention must lose with a competition outcome, not {reject:?}"
+                    SpokeRejectCode::CandidateConsumed | SpokeRejectCode::RevisionConflict
+                ) || (reject.code == SpokeRejectCode::InternalError
+                    && retry_class(&reject) == "retryable"),
+                "a competing retention must lose with a competition outcome or a retryable \
+                 pre-commit failure, not {reject:?}"
             );
             retained
         }
@@ -198,6 +211,11 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
     // closed snapshot rather than a read of the winner's commit. The serialized writer refuses it
     // and the protocol reports uncertainty; any successful reply here means the pending pair was
     // replayed as a second settlement.
+    //
+    // This loser differs from the retain race above: the staged intent and its pending receipt are
+    // already durable, so the pre-commit refusal lands on `unsettled` and becomes `OUTCOME_UNCERTAIN`
+    // for the caller to resolve. A retain loser never committed anything, so its refusal stays the
+    // retryable pre-commit class.
     match adapter
         .settle_journal(&mut loser_tx, &space, &receipt)
         .await
