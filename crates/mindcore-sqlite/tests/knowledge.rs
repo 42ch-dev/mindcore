@@ -434,6 +434,55 @@ async fn create_assigns_revision_one() {
     remove_database(&path);
 }
 
+/// A direct write bypasses the ports, so the column `CHECK` is what keeps a revision integral:
+/// `INTEGER` affinity keeps a fractional value as REAL unless the constraint refuses it.
+#[tokio::test]
+async fn a_fractional_revision_is_refused_by_the_schema() {
+    let path = database_path("fractional-revision");
+    let store = MindStore::open(&path).await.expect("open store");
+    let seed = second_connection(&path).await;
+    let mut live = entry_with("ke_gate", "closed after dusk");
+    live.revision = Some(1);
+    let payload = serde_json::to_string(&live).expect("entry serializes");
+
+    let refused = sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_gate', 1.5, ?, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(&payload)
+    .execute(&seed)
+    .await;
+    assert!(refused.is_err(), "a fractional revision is refused");
+
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_gate', 1, ?, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(&payload)
+    .execute(&seed)
+    .await
+    .expect("seed the integral row");
+
+    let refused = sqlx::query(
+        "INSERT INTO knowledge_entry_revisions \
+         (collection, entry_id, revision, payload, cognition_head_seq, recorded_at) \
+         VALUES ('wren', 'ke_gate', 1.5, ?, NULL, '2026-11-21T00:00:00Z')",
+    )
+    .bind(&payload)
+    .execute(&seed)
+    .await;
+    assert!(
+        refused.is_err(),
+        "a fractional preimage revision is refused"
+    );
+
+    seed.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
 #[tokio::test]
 async fn create_twice_is_refused() {
     let path = database_path("create-twice");
@@ -1509,6 +1558,72 @@ async fn replay_refuses_a_fractional_position_masking_a_missing_one() {
         expect_reject(
             port.get_entry_at_revision("ke_gate", 2).await,
             "replay across a fractional position"
+        ),
+        SpokeRejectCode::InternalError
+    );
+
+    seed.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn replay_refuses_a_fractional_position_beside_every_expected_one() {
+    let path = database_path("replay-fractional-extra");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let seed = second_connection(&path).await;
+
+    // Every crossed position is present and classified — 1 and 2, with the head at 2 — and a
+    // classified fractional row at 1.5 sits inside the same interval. A row that is not one of
+    // the crossed positions contradicts the gap, so the interval is not a run of dedicated appends.
+    let mut live = cognition_entry("ke_gate", "current", Vec::new());
+    live.revision = Some(3);
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, cognition_head_seq, created_at, updated_at) \
+         VALUES ('wren', 'ke_gate', 3, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(serde_json::to_string(&live).expect("entry serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the live entry");
+    for (append_seq, record_id) in [(1i64, "cog_first"), (2i64, "cog_second")] {
+        sqlx::query(
+            "INSERT INTO cognition_records \
+             (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+             VALUES ('wren', 'ke_gate', ?, ?, ?, 0)",
+        )
+        .bind(append_seq)
+        .bind(record_id)
+        .bind(serde_json::to_string(&belief("ke_gate", record_id)).expect("record serializes"))
+        .execute(&seed)
+        .await
+        .expect("seed the record row");
+    }
+    sqlx::query(
+        "INSERT INTO cognition_records \
+         (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+         VALUES ('wren', 'ke_gate', ?, ?, ?, 0)",
+    )
+    .bind(1.5f64)
+    .bind("cog_fractional")
+    .bind(serde_json::to_string(&belief("ke_gate", "cog_fractional")).expect("record serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the fractional record row");
+    sqlx::query(
+        "UPDATE knowledge_entries SET cognition_head_seq = 2 \
+         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .execute(&seed)
+    .await
+    .expect("point the head at the crossed positions");
+
+    assert_eq!(
+        expect_reject(
+            port.get_entry_at_revision("ke_gate", 1).await,
+            "replay across an extra fractional position"
         ),
         SpokeRejectCode::InternalError
     );

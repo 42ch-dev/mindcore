@@ -238,7 +238,9 @@ CREATE INDEX idx_memory_reflections_subject_reflection
 CREATE TABLE knowledge_entries (
   collection   TEXT NOT NULL,
   entry_id     TEXT NOT NULL,
-  revision     INTEGER NOT NULL CHECK (revision >= 1),
+  -- `INTEGER` affinity stores a fractional value as REAL, so the cast comparison also requires
+  -- integral storage.
+  revision     INTEGER NOT NULL CHECK (revision >= 1 AND revision = CAST(revision AS INTEGER)),
   payload      TEXT NOT NULL,
   -- Composite pointer to the holder's newest record; NULL while it has none.
   cognition_head_seq INTEGER,
@@ -253,6 +255,12 @@ CREATE TABLE knowledge_entries (
   FOREIGN KEY (collection, superseded_by)
     REFERENCES knowledge_entries (collection, entry_id)
 );
+
+-- The live listing reads the current rows ordered by `entry_id`; this partial index serves that
+-- page from the live rows alone, so retired rows are never scanned for it.
+CREATE INDEX idx_knowledge_entries_live
+  ON knowledge_entries (collection, entry_id)
+  WHERE superseded_by IS NULL;
 
 -- One row per appended cognition record: `append_seq` is the storage order the carrier reads,
 -- and rows are immutable once written. `append_prior_shape` is NULL for a record a full-entry
@@ -278,7 +286,8 @@ CREATE TABLE cognition_records (
 CREATE TABLE knowledge_entry_revisions (
   collection         TEXT NOT NULL,
   entry_id           TEXT NOT NULL,
-  revision           INTEGER NOT NULL CHECK (revision >= 1),
+  revision           INTEGER NOT NULL
+                     CHECK (revision >= 1 AND revision = CAST(revision AS INTEGER)),
   payload            TEXT NOT NULL,
   cognition_head_seq INTEGER,
   recorded_at        TEXT NOT NULL,
