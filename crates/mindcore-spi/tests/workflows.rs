@@ -2767,6 +2767,52 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
 }
 
 #[tokio::test]
+async fn an_empty_explicit_assessment_context_is_a_caller_input_error() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    // A valid provider draft: only the caller's own context id is malformed.
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        assessment_context_id: Some(""),
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("an empty context id is not a context");
+    assert!(
+        matches!(error, SpiError::InvalidInput(_)),
+        "the caller's own field must not be blamed on the reasoner, got {error:?}"
+    );
+    assert!(
+        settlements.lock().expect("settlements").is_empty(),
+        "a rejected input writes nothing"
+    );
+}
+
+#[tokio::test]
 async fn deliberate_refuses_fabricated_references_before_any_write() {
     let mut verdicts = vec![
         {
