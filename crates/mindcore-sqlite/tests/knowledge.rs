@@ -3,17 +3,21 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
-use mindcore_sqlite::{append_cognition, write_entry, MindStore, ScopedKnowledgeStore};
+use mindcore_sqlite::{
+    append_cognition, write_entry, MindStore, ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
+};
 use serde_json::{json, Map, Value};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
-    ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryModulesKey,
-    KnowledgeEntryModulesValue, KnowledgeEntryOwner,
+    ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
+    KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner,
+    SourceAnchor as EntrySourceAnchor,
 };
 use spoke_schemas::source_anchor::ExtensionKey as AnchorExtensionKey;
 use spoke_schemas::KnowledgeEntry;
@@ -313,6 +317,95 @@ fn expect_revision_not_found<T: std::fmt::Debug>(result: SpokeResult<T>, context
             );
         }
     }
+}
+
+/// One marking through the local CAS operation.
+async fn supersede(
+    port: &ScopedKnowledgeStore,
+    entry_id: &str,
+    expected: u64,
+    target: &str,
+) -> SpokeResult<u64> {
+    port.supersede_entry(entry_id, expected, target).await
+}
+
+async fn stored_payload(connection: &SqlitePool, entry_id: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT payload FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
+    )
+    .bind(entry_id)
+    .fetch_one(connection)
+    .await
+    .expect("stored payload")
+}
+
+async fn stored_marker(connection: &SqlitePool, entry_id: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT superseded_by FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
+    )
+    .bind(entry_id)
+    .fetch_one(connection)
+    .await
+    .expect("stored marker")
+}
+
+async fn stored_revision(connection: &SqlitePool, entry_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
+    )
+    .bind(entry_id)
+    .fetch_one(connection)
+    .await
+    .expect("stored revision")
+}
+
+/// Everything a refused write must leave untouched: the payload, the marker, the revision, the
+/// preimages and the record rows.
+async fn stored_state(
+    connection: &SqlitePool,
+    entry_id: &str,
+) -> (
+    String,
+    Option<String>,
+    i64,
+    Vec<(i64, String, Option<i64>, String)>,
+    Vec<(i64, String, String, Option<i64>)>,
+) {
+    (
+        stored_payload(connection, entry_id).await,
+        stored_marker(connection, entry_id).await,
+        stored_revision(connection, entry_id).await,
+        revision_rows(connection, entry_id).await,
+        record_rows(connection, entry_id).await,
+    )
+}
+
+/// An owner-private entry: the viewpoint-free disclosure predicate hides it.
+fn private_entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
+    let mut entry = entry_with(entry_id, summary);
+    entry.disclosure =
+        Some(KnowledgeEntryDisclosure::from_str("owner-private").expect("non-empty disclosure"));
+    entry.owner = Some(KnowledgeEntryOwner::try_from("kb_mira").expect("non-empty owner"));
+    entry
+}
+
+/// An entry carrying an adoption anchor of the pinned wire shape; `revision` adds the versioned
+/// `source_revision` member.
+fn adopted_entry(entry_id: &str, shared_id: &str, revision: Option<u64>) -> KnowledgeEntry {
+    let mut anchor = adoption_anchor(shared_id, "hearsay");
+    if let Some(revision) = revision {
+        anchor
+            .extensions
+            .get_mut(&AnchorExtensionKey::try_from("mindcore_adoption").expect("valid key"))
+            .expect("the adoption anchor carries its namespace")
+            .insert("source_revision".to_string(), json!(revision));
+    }
+    let anchor: EntrySourceAnchor =
+        serde_json::from_value(serde_json::to_value(anchor).expect("anchor serializes"))
+            .expect("anchor wire shape matches the knowledge_entry copy");
+    let mut entry = entry_with(entry_id, "adopted copy");
+    entry.source_anchor = Some(anchor);
+    entry
 }
 
 #[tokio::test]
@@ -1536,6 +1629,842 @@ async fn deleting_a_headless_parent_with_history_is_refused() {
         saved,
         "the preimage survives the refused delete"
     );
+
+    enforcing.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn supersede_marks_only_the_source_and_saves_its_preimage() {
+    let path = database_path("supersede-mark");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_old_gate",
+                "the gate was closed",
+                vec![belief("ke_old_gate", "cog_gate")],
+            ),
+            None,
+        )
+        .await,
+        "create the source",
+    );
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_new_gate", "the gate is open"), None)
+            .await,
+        "create the target",
+    );
+    let source_payload = stored_payload(&reader, "ke_old_gate").await;
+    let source_written_at = stored_updated_at(&reader, "ke_old_gate").await;
+    let target_payload = stored_payload(&reader, "ke_new_gate").await;
+    let records = record_rows(&reader, "ke_old_gate").await;
+
+    let assigned = expect_ok(
+        supersede(&port, "ke_old_gate", 1, "ke_new_gate").await,
+        "mark the source superseded",
+    );
+    assert_eq!(assigned, 2, "marking advances the source revision");
+    assert_eq!(
+        stored_marker(&reader, "ke_old_gate").await.as_deref(),
+        Some("ke_new_gate")
+    );
+    assert_eq!(stored_revision(&reader, "ke_old_gate").await, 2);
+
+    // Only the marker, the revision and the store instant move: the payload keeps every field with
+    // the advanced DTO revision, and the cognition history is untouched.
+    let marked: KnowledgeEntry =
+        serde_json::from_str(&stored_payload(&reader, "ke_old_gate").await)
+            .expect("the marked payload is an entry");
+    assert_eq!(marked.revision, Some(2));
+    assert_eq!(summary_of(&marked), Some("the gate was closed"));
+    assert!(
+        record_ids(&marked).is_empty(),
+        "the payload keeps the envelope only"
+    );
+    assert_eq!(record_rows(&reader, "ke_old_gate").await, records);
+    assert!(stored_updated_at(&reader, "ke_old_gate").await > source_written_at);
+
+    // The revision trigger captures the displaced preimage, exactly as it does for a full put.
+    let saved = revision_rows(&reader, "ke_old_gate").await;
+    assert_eq!(saved.len(), 1, "marking saves one preimage");
+    assert_eq!(saved[0].0, 1);
+    assert_eq!(
+        saved[0].1, source_payload,
+        "the preimage is the replaced payload"
+    );
+    assert_eq!(saved[0].2, Some(1), "the preimage keeps the cognition head");
+    assert_eq!(
+        saved[0].3, source_written_at,
+        "the preimage carries the instant the replaced state was written"
+    );
+
+    // The target is not written at all.
+    assert_eq!(stored_marker(&reader, "ke_new_gate").await, None);
+    assert_eq!(stored_revision(&reader, "ke_new_gate").await, 1);
+    assert_eq!(stored_payload(&reader, "ke_new_gate").await, target_payload);
+    assert!(revision_rows(&reader, "ke_new_gate").await.is_empty());
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn supersede_refusals_change_neither_row() {
+    let path = database_path("supersede-refusals");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let studio = store.knowledge(KnowledgeScope::new("studio"));
+    let reader = second_connection(&path).await;
+
+    for entry_id in ["ke_source", "ke_target", "ke_retired"] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, entry_id), None)
+                .await,
+            "seed the served collection",
+        );
+    }
+    expect_ok(
+        studio
+            .put_knowledge_entry(entry_with("ke_studio", "elsewhere"), None)
+            .await,
+        "seed the other collection",
+    );
+    expect_ok(
+        supersede(&port, "ke_retired", 1, "ke_target").await,
+        "mark the retired entry",
+    );
+
+    let source = stored_state(&reader, "ke_source").await;
+    let target = stored_state(&reader, "ke_target").await;
+    let retired = stored_state(&reader, "ke_retired").await;
+
+    let stale = supersede(&port, "ke_source", 2, "ke_target").await;
+    assert_eq!(
+        expect_reject(stale, "stale expected revision"),
+        SpokeRejectCode::StoredRevisionStale
+    );
+    let missing = supersede(&port, "ke_absent", 1, "ke_target").await;
+    assert_eq!(
+        expect_reject(missing, "absent source"),
+        SpokeRejectCode::KnowledgeEntryNotFound
+    );
+    let foreign = supersede(&port, "ke_source", 1, "ke_studio").await;
+    assert_eq!(
+        expect_reject(foreign, "successor outside the collection"),
+        SpokeRejectCode::KnowledgeEntryNotFound
+    );
+    let itself = supersede(&port, "ke_source", 1, "ke_source").await;
+    assert_eq!(
+        expect_reject(itself, "self reference"),
+        SpokeRejectCode::InvalidInput
+    );
+    let remark = supersede(&port, "ke_retired", 2, "ke_target").await;
+    assert_eq!(
+        expect_reject(remark, "already marked source"),
+        SpokeRejectCode::InvalidInput
+    );
+    let retired_target = supersede(&port, "ke_source", 1, "ke_retired").await;
+    assert_eq!(
+        expect_reject(retired_target, "marked successor"),
+        SpokeRejectCode::InvalidInput
+    );
+
+    assert_eq!(stored_state(&reader, "ke_source").await, source);
+    assert_eq!(stored_state(&reader, "ke_target").await, target);
+    assert_eq!(stored_state(&reader, "ke_retired").await, retired);
+
+    // A cycle cannot close on write: once the source is marked, the reverse names it as a target.
+    expect_ok(
+        supersede(&port, "ke_source", 1, "ke_target").await,
+        "mark the source",
+    );
+    let cycle = supersede(&port, "ke_target", 1, "ke_source").await;
+    assert_eq!(
+        expect_reject(cycle, "cycle-closing successor"),
+        SpokeRejectCode::InvalidInput
+    );
+    assert_eq!(stored_marker(&reader, "ke_target").await, None);
+    assert_eq!(stored_revision(&reader, "ke_target").await, 1);
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_superseded_entry_refuses_puts_and_appends() {
+    let path = database_path("supersede-writes");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_source",
+                "the gate was closed",
+                vec![belief("ke_source", "cog_gate")],
+            ),
+            None,
+        )
+        .await,
+        "create the source",
+    );
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_target", "the gate is open"), None)
+            .await,
+        "create the target",
+    );
+    expect_ok(
+        supersede(&port, "ke_source", 1, "ke_target").await,
+        "mark the source",
+    );
+    let marked = stored_state(&reader, "ke_source").await;
+
+    let conditional = port
+        .put_knowledge_entry(
+            cognition_entry(
+                "ke_source",
+                "rewritten",
+                vec![
+                    belief("ke_source", "cog_gate"),
+                    belief("ke_source", "cog_after"),
+                ],
+            ),
+            Some(2),
+        )
+        .await;
+    assert_eq!(
+        expect_reject(conditional, "conditional put of a marked row"),
+        SpokeRejectCode::InvalidInput
+    );
+    let create = port
+        .put_knowledge_entry(entry_with("ke_source", "created again"), None)
+        .await;
+    assert_eq!(
+        expect_reject(create, "create-only put of a marked row"),
+        SpokeRejectCode::InvalidInput
+    );
+
+    // A dedicated append refuses the marked carrier before any record row is written.
+    let mut tx = reader
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin append");
+    let appended = append_cognition(
+        &mut tx,
+        "wren",
+        "ke_source",
+        2,
+        &belief("ke_source", "cog_after"),
+    )
+    .await;
+    assert_eq!(
+        expect_reject(appended, "append to a marked carrier"),
+        SpokeRejectCode::InvalidInput
+    );
+    tx.rollback().await.expect("roll back the refused append");
+
+    assert_eq!(
+        stored_state(&reader, "ke_source").await,
+        marked,
+        "a refused write changes no row, record or preimage"
+    );
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_failed_supersede_leaves_no_marker() {
+    let path = database_path("supersede-rollback");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_source", "the gate was closed"), None)
+            .await,
+        "create the source",
+    );
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_target", "the gate is open"), None)
+            .await,
+        "create the target",
+    );
+    // A preimage already occupies the revision the trigger would save, so the update fails after
+    // both ids were accepted — the one failure that runs past every refusal.
+    sqlx::query(
+        "INSERT INTO knowledge_entry_revisions \
+         (collection, entry_id, revision, payload, cognition_head_seq, recorded_at) \
+         VALUES ('wren', 'ke_source', 1, '{}', NULL, '2026-11-20T09:00:00.000000000Z')",
+    )
+    .execute(&reader)
+    .await
+    .expect("seed a contradictory preimage");
+
+    let before = stored_state(&reader, "ke_source").await;
+    let failed = supersede(&port, "ke_source", 1, "ke_target").await;
+    assert_eq!(
+        expect_reject(failed, "marking against a contradictory history"),
+        SpokeRejectCode::InternalError
+    );
+    assert_eq!(
+        stored_state(&reader, "ke_source").await,
+        before,
+        "the failed marking rolls back"
+    );
+    assert_eq!(stored_marker(&reader, "ke_source").await, None);
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+/// The CAS reads the stored revision column: a payload that disagrees with it is corrupt stored
+/// state and refuses before any write, so the marking cannot skip the trigger's preimage.
+#[tokio::test]
+async fn the_supersede_cas_reads_the_stored_revision_column() {
+    let path = database_path("supersede-drift");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_target", "the gate is open"), None)
+            .await,
+        "create the target",
+    );
+    // Stored drift: the column sits at revision 2 while the payload still claims revision 1.
+    let mut drifted = entry_with("ke_drift", "the gate was closed");
+    drifted.revision = Some(1);
+    let payload = serde_json::to_string(&drifted).expect("entry serializes");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_drift', 2, ?, \
+                 '2026-11-20T09:00:00.000000000Z', '2026-11-20T09:00:00.000000000Z')",
+    )
+    .bind(&payload)
+    .execute(&reader)
+    .await
+    .expect("seed a drifted row");
+
+    let before = stored_state(&reader, "ke_drift").await;
+    let refused = supersede(&port, "ke_drift", 1, "ke_target").await;
+    assert_eq!(
+        expect_reject(refused, "stored revision column and payload disagree"),
+        SpokeRejectCode::InternalError
+    );
+    assert_eq!(
+        stored_state(&reader, "ke_drift").await,
+        before,
+        "a refused marking changes nothing"
+    );
+    assert_eq!(stored_marker(&reader, "ke_drift").await, None);
+    assert_eq!(
+        stored_revision(&reader, "ke_drift").await,
+        2,
+        "the column stays as stored"
+    );
+    assert!(
+        revision_rows(&reader, "ke_drift").await.is_empty(),
+        "the refused marking saves no preimage"
+    );
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn default_reads_and_the_list_hide_a_superseded_entry() {
+    let path = database_path("supersede-visibility");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_alpha", "north gate"), None)
+            .await,
+        "seed the live successor",
+    );
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_mid",
+                "old north gate notes",
+                vec![belief("ke_mid", "cog_mid")],
+            ),
+            None,
+        )
+        .await,
+        "seed the superseded entry",
+    );
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_zulu", "mill lane"), None)
+            .await,
+        "seed the later entry",
+    );
+    expect_ok(
+        supersede(&port, "ke_mid", 1, "ke_alpha").await,
+        "mark the middle entry superseded",
+    );
+
+    // The default read hides the marked row behind the one local absence.
+    match port.get_knowledge_entry("ke_mid").await {
+        SpokeResult::Ok(value) => {
+            panic!("default read of a superseded entry returned {value:?}")
+        }
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+            assert_eq!(
+                reject.message,
+                "no knowledge entry ke_mid in collection wren"
+            );
+            assert!(reject.details.is_none());
+        }
+    }
+
+    // The list keeps its order and statement shape and simply omits the marked row.
+    let listed = expect_ok(port.list_entries().await, "list with one marked entry");
+    let ids: Vec<&str> = listed.iter().map(|entry| entry.entry_id.as_str()).collect();
+    assert_eq!(ids, ["ke_alpha", "ke_zulu"]);
+    assert_eq!(record_ids(&listed[0]), Vec::<String>::new());
+    assert_eq!(
+        expect_ok(
+            port.get_knowledge_entry("ke_alpha").await,
+            "live entry read"
+        )
+        .revision,
+        Some(1)
+    );
+    assert_eq!(
+        summary_of(&expect_ok(
+            port.get_knowledge_entry("ke_alpha").await,
+            "live entry read"
+        )),
+        Some("north gate")
+    );
+
+    // The shared transaction projection and the carrier header read are the same default view.
+    let mut tx = reader.begin().await.expect("begin read");
+    let shared = expect_ok(
+        mindcore_sqlite::list_entries_in(&mut tx, "wren").await,
+        "shared list projection",
+    );
+    tx.commit().await.expect("commit read");
+    assert_eq!(
+        shared
+            .iter()
+            .map(|entry| entry.entry_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ke_alpha", "ke_zulu"]
+    );
+    let header = mindcore_sqlite::read_carrier_header(&reader, "wren", "ke_mid").await;
+    assert_eq!(
+        expect_reject(header, "carrier header of a superseded entry"),
+        SpokeRejectCode::KnowledgeEntryNotFound
+    );
+    let live = expect_ok(
+        mindcore_sqlite::read_carrier_header(&reader, "wren", "ke_alpha").await,
+        "carrier header of a live entry",
+    );
+    assert_eq!(live.revision, 1);
+
+    // Explicit revision replay stays independent: the history it addresses does not move.
+    let replayed = expect_ok(
+        port.get_entry_at_revision("ke_mid", 1).await,
+        "replay of the superseded entry",
+    );
+    assert_eq!(summary_of(&replayed), Some("old north gate notes"));
+    assert_eq!(record_ids(&replayed), vec!["cog_mid"]);
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn the_explicit_read_returns_a_superseded_entry_with_its_marker() {
+    let path = database_path("supersede-explicit");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_alpha", "north gate"), None)
+            .await,
+        "seed the live successor",
+    );
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_mid",
+                "old north gate notes",
+                vec![belief("ke_mid", "cog_mid")],
+            ),
+            None,
+        )
+        .await,
+        "seed the superseded entry",
+    );
+    expect_ok(
+        supersede(&port, "ke_mid", 1, "ke_alpha").await,
+        "mark the middle entry superseded",
+    );
+
+    let marked = expect_ok(
+        port.get_entry_including_superseded("ke_mid").await,
+        "explicit read of a superseded entry",
+    );
+    assert_eq!(marked.superseded_by.as_deref(), Some("ke_alpha"));
+    assert_eq!(marked.entry.revision, Some(2));
+    assert_eq!(summary_of(&marked.entry), Some("old north gate notes"));
+    assert_eq!(
+        record_ids(&marked.entry),
+        vec!["cog_mid"],
+        "the explicit read projects the stored records"
+    );
+
+    let live = expect_ok(
+        port.get_entry_including_superseded("ke_alpha").await,
+        "explicit read of a live entry",
+    );
+    assert_eq!(live.superseded_by, None);
+    assert_eq!(live.entry.revision, Some(1));
+
+    match port.get_entry_including_superseded("ke_absent").await {
+        SpokeResult::Ok(value) => panic!("explicit read of a missing entry returned {value:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+            assert_eq!(
+                reject.message,
+                "no knowledge entry ke_absent in collection wren"
+            );
+            assert!(reject.details.is_none());
+        }
+    }
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn an_adoption_anchor_resolves_to_the_first_live_successor() {
+    let path = database_path("supersede-anchor");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    for entry_id in ["ke_stage_one", "ke_stage_two", "ke_stage_three"] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, entry_id), None)
+                .await,
+            "seed the chain",
+        );
+    }
+    expect_ok(
+        supersede(&port, "ke_stage_one", 1, "ke_stage_two").await,
+        "retire the first stage",
+    );
+    expect_ok(
+        supersede(&port, "ke_stage_two", 1, "ke_stage_three").await,
+        "retire the second stage",
+    );
+
+    let one_hop = adopted_entry("ke_mine_one_hop", "ke_stage_two", None);
+    assert_eq!(
+        expect_ok(
+            port.resolve_adoption_anchor(&one_hop).await,
+            "an anchor one hop from a live entry"
+        ),
+        "ke_stage_three"
+    );
+    let two_hops = adopted_entry("ke_mine_two_hops", "ke_stage_one", None);
+    assert_eq!(
+        expect_ok(
+            port.resolve_adoption_anchor(&two_hops).await,
+            "a legacy anchor two hops from a live entry"
+        ),
+        "ke_stage_three"
+    );
+    let versioned = adopted_entry("ke_mine_versioned", "ke_stage_one", Some(3));
+    assert_eq!(
+        expect_ok(
+            port.resolve_adoption_anchor(&versioned).await,
+            "a versioned anchor two hops from a live entry"
+        ),
+        "ke_stage_three"
+    );
+    let current = adopted_entry("ke_mine_current", "ke_stage_three", None);
+    assert_eq!(
+        expect_ok(
+            port.resolve_adoption_anchor(&current).await,
+            "an anchor already on a live entry"
+        ),
+        "ke_stage_three"
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn an_unresolvable_adoption_anchor_answers_one_absence() {
+    let path = database_path("supersede-anchor-absence");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_chain", "a retired entry"), None)
+            .await,
+        "seed the retired entry",
+    );
+    expect_ok(
+        port.put_knowledge_entry(private_entry("ke_private", "mira's private notes"), None)
+            .await,
+        "seed the owner-private entry",
+    );
+    expect_ok(
+        supersede(&port, "ke_chain", 1, "ke_private").await,
+        "retire the entry behind a private successor",
+    );
+
+    for (anchored_id, source, absence) in [
+        ("ke_mine_gone", "ke_gone", "ke_gone"),
+        ("ke_mine_hidden_start", "ke_private", "ke_private"),
+        ("ke_mine_hidden_hop", "ke_chain", "ke_chain"),
+    ] {
+        let anchored = adopted_entry(anchored_id, source, None);
+        match port.resolve_adoption_anchor(&anchored).await {
+            SpokeResult::Ok(resolved) => {
+                panic!("an unresolvable anchor answered {resolved}")
+            }
+            SpokeResult::Reject(reject) => {
+                assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+                assert_eq!(
+                    reject.message,
+                    format!("no knowledge entry {absence} in collection wren"),
+                    "the absence is keyed to the hop the anchor names"
+                );
+                assert!(
+                    reject.details.is_none(),
+                    "one generic absence carries no chain"
+                );
+            }
+        }
+    }
+
+    let anonymous = entry_with("ke_mine_anonymous", "no anchor");
+    assert_eq!(
+        expect_reject(
+            port.resolve_adoption_anchor(&anonymous).await,
+            "an entry without an adoption anchor"
+        ),
+        SpokeRejectCode::InvalidInput
+    );
+    let empty_locator = adopted_entry("ke_mine_empty", "", None);
+    assert_eq!(
+        expect_reject(
+            port.resolve_adoption_anchor(&empty_locator).await,
+            "an anchor naming no shared entry"
+        ),
+        SpokeRejectCode::InvalidInput
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_cycle_in_stored_markers_is_a_storage_failure() {
+    let path = database_path("supersede-cycle");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    for entry_id in ["ke_cycle_a", "ke_cycle_b"] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, entry_id), None)
+                .await,
+            "seed the cyclic pair",
+        );
+    }
+    // Marking cannot close a cycle; corrupt stored data can, and the resolver must fail rather
+    // than return a partial chain.
+    for (entry_id, successor) in [("ke_cycle_a", "ke_cycle_b"), ("ke_cycle_b", "ke_cycle_a")] {
+        sqlx::query(
+            "UPDATE knowledge_entries SET superseded_by = ? \
+             WHERE collection = 'wren' AND entry_id = ?",
+        )
+        .bind(successor)
+        .bind(entry_id)
+        .execute(&reader)
+        .await
+        .expect("seed the cyclic marker");
+    }
+    let anchored = adopted_entry("ke_mine_cycle", "ke_cycle_a", None);
+    match port.resolve_adoption_anchor(&anchored).await {
+        SpokeResult::Ok(resolved) => panic!("a cyclic chain answered {resolved}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InternalError);
+            assert!(
+                reject.message.contains("cycle"),
+                "the failure names the cycle: {}",
+                reject.message
+            );
+        }
+    }
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn the_list_bound_counts_superseded_rows() {
+    let path = database_path("supersede-bound");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let mut tx = reader
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin seed");
+    for index in 0..SERVED_KNOWLEDGE_LIST_LIMIT {
+        expect_ok(
+            write_entry(
+                &mut tx,
+                "wren",
+                entry_with(&format!("ke_{index:04}"), "seeded"),
+                None,
+            )
+            .await,
+            "seed a live entry",
+        );
+    }
+    tx.commit().await.expect("commit seed");
+
+    expect_ok(
+        supersede(&port, "ke_0000", 1, "ke_0001").await,
+        "retire the first stored row",
+    );
+    let listed = expect_ok(
+        port.list_entries().await,
+        "a collection at the bound with one marked row",
+    );
+    assert_eq!(
+        listed.len(),
+        SERVED_KNOWLEDGE_LIST_LIMIT - 1,
+        "the list serves the live entries only"
+    );
+    assert_eq!(listed[0].entry_id, "ke_0001", "the order is unchanged");
+
+    // The bound stays on stored rows: one more row — live or marked — refuses the list.
+    let mut tx = reader
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin seed");
+    expect_ok(
+        write_entry(
+            &mut tx,
+            "wren",
+            entry_with("ke_over", "one row past the bound"),
+            None,
+        )
+        .await,
+        "seed one row past the bound",
+    );
+    tx.commit().await.expect("commit seed");
+    assert_eq!(
+        expect_reject(
+            port.list_entries().await,
+            "a collection one stored row past the bound"
+        ),
+        SpokeRejectCode::InternalError
+    );
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+/// The marker's foreign key itself: a successor must exist in the same collection, and a
+/// referenced successor cannot be deleted. Removing the key or making it cascade fails this test.
+#[tokio::test]
+async fn the_marker_foreign_key_binds_successors_to_the_same_collection() {
+    let path = database_path("supersede-foreign-key");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let studio = store.knowledge(KnowledgeScope::new("studio"));
+    let enforcing = foreign_keys_connection(&path).await;
+
+    for entry_id in ["ke_source", "ke_target"] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, entry_id), None)
+                .await,
+            "seed the served collection",
+        );
+    }
+    expect_ok(
+        studio
+            .put_knowledge_entry(entry_with("ke_studio", "elsewhere"), None)
+            .await,
+        "seed the other collection",
+    );
+
+    // A direct write naming a successor that exists only in another collection fails.
+    let foreign = sqlx::query(
+        "UPDATE knowledge_entries SET superseded_by = 'ke_studio' \
+         WHERE collection = 'wren' AND entry_id = 'ke_source'",
+    )
+    .execute(&enforcing)
+    .await
+    .expect_err("a cross-collection successor violates the foreign key");
+    assert!(
+        foreign
+            .as_database_error()
+            .is_some_and(|error| error.is_foreign_key_violation()),
+        "{foreign}"
+    );
+    assert_eq!(stored_marker(&enforcing, "ke_source").await, None);
+
+    // After a valid mark, the referenced successor cannot be deleted: no cascade removes it.
+    expect_ok(
+        supersede(&port, "ke_source", 1, "ke_target").await,
+        "mark the source",
+    );
+    let deleted = sqlx::query(
+        "DELETE FROM knowledge_entries WHERE collection = 'wren' AND entry_id = 'ke_target'",
+    )
+    .execute(&enforcing)
+    .await
+    .expect_err("deleting a referenced successor violates the foreign key");
+    assert!(
+        deleted
+            .as_database_error()
+            .is_some_and(|error| error.is_foreign_key_violation()),
+        "{deleted}"
+    );
+    assert_eq!(
+        stored_marker(&enforcing, "ke_source").await.as_deref(),
+        Some("ke_target")
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries \
+         WHERE collection = 'wren' AND entry_id IN ('ke_source', 'ke_target')",
+    )
+    .fetch_one(&enforcing)
+    .await
+    .expect("both rows survive");
+    assert_eq!(rows, 2);
 
     enforcing.close().await;
     store.close().await;

@@ -1580,6 +1580,87 @@ async fn historical_records_stay_addressable_while_the_head_moves() {
     store.close().await;
 }
 
+/// A superseded carrier offers no current judgment, while its records stay addressable by scoped
+/// id and its revision replay stays available.
+#[tokio::test]
+async fn a_superseded_carrier_has_no_current_judgment() {
+    let temp = TempDb::new();
+    let path = temp.database_path();
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let pool = second_pool(&path).await;
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_wren", None), None)
+            .await,
+        "create carrier",
+    );
+    expect_ok(
+        port.put_knowledge_entry(carrier("ke_next", None), None)
+            .await,
+        "create successor",
+    );
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
+    let revision = expect_ok(
+        append_cognition(&mut tx, "wren", "ke_wren", 1, &belief("cog_last", 0.8)).await,
+        "append",
+    );
+    tx.commit().await.expect("commit");
+    assert_eq!(revision, 2);
+    let current = expect_ok(
+        read_current_record(&pool, "wren", "ke_wren").await,
+        "current before marking",
+    )
+    .expect("the live carrier has a head");
+    assert_eq!(current["record_id"].as_str(), Some("cog_last"));
+
+    let marked = expect_ok(
+        port.supersede_entry("ke_wren", 2, "ke_next").await,
+        "mark the carrier",
+    );
+    assert_eq!(marked, 3);
+
+    assert_eq!(
+        expect_ok(
+            read_current_record(&pool, "wren", "ke_wren").await,
+            "current after marking"
+        ),
+        None,
+        "a superseded carrier offers no current judgment"
+    );
+    // The explicit record lookup and revision replay stay available.
+    let historical = expect_ok(
+        read_record(&pool, "wren", "ke_wren", "cog_last").await,
+        "record lookup after marking",
+    )
+    .expect("the record stays addressable by scoped id");
+    assert_eq!(historical["record_id"].as_str(), Some("cog_last"));
+    let replayed = expect_ok(
+        port.get_entry_at_revision("ke_wren", 2).await,
+        "replay before marking",
+    );
+    assert_eq!(replayed.revision, Some(2));
+    let module = module_of(&replayed);
+    assert_eq!(
+        module_keys(
+            module["records"]
+                .as_array()
+                .expect("the replayed entry has a records member")
+        ),
+        vec!["cog_last"]
+    );
+    let header = read_carrier_header(&pool, "wren", "ke_wren").await;
+    match header {
+        SpokeResult::Ok(header) => {
+            panic!("carrier header of a superseded entry returned {header:?}")
+        }
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound)
+        }
+    }
+    store.close().await;
+}
+
 /// Independent wire baselines captured from the pre-change fixture shape: the exact
 /// bytes the inline-record carrier produced before the per-row storage landed — the
 /// full `KnowledgeEntry` DTO with its assigned revision, and the derived `MindState`

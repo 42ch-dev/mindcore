@@ -242,11 +242,16 @@ CREATE TABLE knowledge_entries (
   payload      TEXT NOT NULL,
   -- Composite pointer to the holder's newest record; NULL while it has none.
   cognition_head_seq INTEGER,
+  -- Liveness marker: the same-collection entry that replaced this one. NULL while the entry is
+  -- current; the row, its payload and its history stay, and no cascade ever removes a successor.
+  superseded_by TEXT,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (collection, entry_id),
   FOREIGN KEY (collection, entry_id, cognition_head_seq)
-    REFERENCES cognition_records (collection, entry_id, append_seq)
+    REFERENCES cognition_records (collection, entry_id, append_seq),
+  FOREIGN KEY (collection, superseded_by)
+    REFERENCES knowledge_entries (collection, entry_id)
 );
 
 -- One row per appended cognition record: `append_seq` is the storage order the carrier reads,
