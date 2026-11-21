@@ -49,3 +49,7 @@ Both mean recreate. A busy or locked database, an I/O error or a permissions pro
 ## Change obligations
 
 A migration edit lands together with this page, the reader that decodes the changed table, and the tests that open the database through `MindStore::open` — a schema without its reader, or a reader without its schema, is not a deliverable. Because a database is recreated rather than upgraded, no back-fill or compatibility shim is owed; changing that policy, or the two refusal shapes `open` reports, changes this page in the same commit.
+
+## Adoption anchor contract
+
+Adoption writes a copy of a shared entry into a personal collection. The copy is addressed by the **same `entry_id`** as its source — the collection is what distinguishes it — and it carries one Mindcore adoption anchor naming the source entry and the source revision it was taken at (`shared:{entry_id}` plus an explicit revision member). `mindcore_base::knowledge::adoption_anchor_parts` is the single parser for that anchor: the producer in `mindcore-base` and every consumer, including the SQLite resolver, read back through it. A repeated adoption returns the existing copy instead of writing a second one, and it never rewrites the source row.
