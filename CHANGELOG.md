@@ -19,9 +19,10 @@
   the same pin with `remote-adapter` enabled.
 - `mindcore-sqlite`: pre-release migrations are mutable and the embedded set is now one initial
   file: `0002` is deleted and its table lives in `0001_init.sql`. There is no upgrade path until the
-  first release, so an existing database must be recreated. The refusal names what the file already
-  applied: SQLx reports `VersionMissing(2)` when the removed `0002` was applied, and a checksum
-  mismatch when an applied version remains but its SQL changed.
+  first release: a database whose applied migrations still match the embedded file reopens normally,
+  while `MindStore::open` refuses one that applied the removed `0002` with SQLx's `VersionMissing(2)`
+  and one whose applied SQL has since changed with a checksum mismatch. Recreate only a refused file,
+  or move it aside first if you want to keep it.
 - `mindcore-sqlite`: optional retained-vector storage. `memory_embedding_vectors` holds one
   little-endian `f32` vector per `(record_id, identity_hash)` with its record revision and dimension,
   indexed by identity so a retired identity's whole partition is one delete. The table is part of the
