@@ -444,6 +444,10 @@ pub struct DeliberateRequest<'a> {
     pub space_id: &'a str,
     /// Subject the cognition belongs to.
     pub subject_id: &'a str,
+    /// Assessment context stamped onto the record. `None` derives it from
+    /// [`Self::subject_id`]; a supplied id is only validated by the record
+    /// schema and never widens admission or the storage route.
+    pub assessment_context_id: Option<&'a str>,
     /// The holder this verdict is attributed to.
     pub holder: &'a CognitionReference,
     /// The cognition target being assessed.

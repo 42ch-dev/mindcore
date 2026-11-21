@@ -2527,7 +2527,7 @@ async fn deliberate(
     caps: &MindCapabilities<'_>,
     timeout: std::time::Duration,
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
-    deliberate_as(harness, PRINCIPAL, caps, timeout).await
+    deliberate_as(harness, PRINCIPAL, caps, timeout, None).await
 }
 
 /// One deliberation under a binding whose carrier route names `caller`.
@@ -2536,6 +2536,7 @@ async fn deliberate_as(
     caller: &str,
     caps: &MindCapabilities<'_>,
     timeout: std::time::Duration,
+    assessment_context_id: Option<&str>,
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
     let workflows = SpiMindWorkflows::new(
         MemoryWorkflowBinding::new(harness.pool.clone(), true)
@@ -2557,6 +2558,7 @@ async fn deliberate_as(
     let request = mindcore_spi::DeliberateRequest {
         space_id: SPACE,
         subject_id: SUBJECT,
+        assessment_context_id,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -2636,7 +2638,7 @@ async fn another_principal_cannot_write_the_bound_carrier() {
         ..MindCapabilities::default()
     };
 
-    let error = deliberate_as(&harness, "prn_2", &caps, long_timeout())
+    let error = deliberate_as(&harness, "prn_2", &caps, long_timeout(), None)
         .await
         .expect_err("only the route's caller may write its carrier");
 
@@ -2691,9 +2693,44 @@ async fn deliberate_commits_a_cognition_record_onto_the_carrier() {
     assert_eq!(stored["target"]["target_id"], "prop_gate_closed");
     assert_eq!(stored["view"], "current");
     assert_eq!(stored["assessor"]["kind"], "principal");
+    assert_eq!(stored["assessment_context"]["context_id"], SUBJECT);
     assert_eq!(
         serde_json::to_value(&record).expect("record serializes"),
         *stored
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_assessment_context_id_reaches_the_stored_record() {
+    let harness = deliberate_harness().await;
+    let reasoner =
+        DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcome = deliberate_as(
+        &harness,
+        PRINCIPAL,
+        &caps,
+        long_timeout(),
+        Some("ctx_gate_audit"),
+    )
+    .await
+    .expect("deliberate");
+
+    assert!(matches!(
+        outcome,
+        mindcore_spi::DeliberateOutcome::Settled { .. }
+    ));
+    let records = committed_records(&harness).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["assessment_context"]["context_id"],
+        "ctx_gate_audit"
     );
 }
 
