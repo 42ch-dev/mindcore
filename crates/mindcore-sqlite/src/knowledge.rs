@@ -12,7 +12,7 @@ use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use spoke_operations::{
     filter_knowledge_entries_by_scope, knowledge_entry_visible_to_viewpoint, spoke_reject,
     validate_cognition_module, validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort,
-    SpokeRejectCode, SpokeResult,
+    SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
 use spoke_schemas::{KnowledgeEntry, Scope};
@@ -383,7 +383,7 @@ async fn entries(
         Err(error) => return internal(format!("knowledge entries could not be listed: {error}")),
     };
     if rows.len() as i64 > limit {
-        return internal(over_bound());
+        return over_bound();
     }
     let mut stored = Vec::with_capacity(rows.len());
     for payload in &rows {
@@ -674,11 +674,12 @@ fn storage_unavailable<T>() -> SpokeResult<T> {
 
 /// Replace every internal refusal a served op produced with [`storage_unavailable`], including
 /// the ones the shared store helpers build for the local port. The over-bound list refusal is the
-/// exception: it is about the peer's own collection and names no local schema.
+/// exception: it is about the peer's own collection, names no local schema and carries its
+/// capacity class, so it is forwarded unchanged.
 fn served<T>(result: SpokeResult<T>) -> SpokeResult<T> {
     match result {
         SpokeResult::Reject(reject)
-            if reject.code == SpokeRejectCode::InternalError && reject.message != over_bound() =>
+            if reject.code == SpokeRejectCode::InternalError && !over_capacity(&reject) =>
         {
             storage_unavailable()
         }
@@ -686,12 +687,40 @@ fn served<T>(result: SpokeResult<T>) -> SpokeResult<T> {
     }
 }
 
-// Names the bound, and nothing local: the served list forwards this refusal to a peer.
-fn over_bound() -> String {
-    format!(
-        "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} live entries; \
-         the list is bounded"
+/// The capacity class an over-bound list refusal carries: both faces answer it, so a caller tells
+/// a collection that is over the bound from a storage fault.
+const OVER_CAPACITY_REASON: &str = "COLLECTION_OVER_CAPACITY";
+
+/// The over-bound list refusal. It names the bound it crossed and its own class, and nothing
+/// local: the served list forwards exactly this refusal to a peer.
+fn over_bound<T>() -> SpokeResult<T> {
+    let mut details = Map::new();
+    details.insert(
+        "reason".to_string(),
+        Value::String(OVER_CAPACITY_REASON.to_string()),
+    );
+    details.insert(
+        "limit".to_string(),
+        Value::from(SERVED_KNOWLEDGE_LIST_LIMIT),
+    );
+    spoke_reject(
+        SpokeRejectCode::InternalError,
+        format!(
+            "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} live entries; \
+             the list is bounded"
+        ),
+        Some(details),
     )
+}
+
+/// Whether a refusal is the over-bound list refusal, which the served face must forward intact.
+fn over_capacity(reject: &SpokeReject) -> bool {
+    reject
+        .details
+        .as_ref()
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        == Some(OVER_CAPACITY_REASON)
 }
 
 // One absence names its collection: this is the local port, whose caller already knows it.

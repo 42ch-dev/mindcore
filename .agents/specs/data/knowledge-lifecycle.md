@@ -63,7 +63,7 @@ An unassigned revision, revision 0, a value above the representable range, and a
 
 ## Served failure messages
 
-A storage failure on the served knowledge face answers `InternalError` with the fixed text `knowledge storage is unavailable` and no details; the over-bound list refusal is the one exempt case and keeps its own message. Driver text is never forwarded to an admitted peer, because it names local tables and columns. A host that needs the underlying cause observes it in its own storage layer or its own logs — the library writes none.
+A storage failure on the served knowledge face answers `InternalError` with the fixed text `knowledge storage is unavailable` and no details. The one exempt refusal is an over-bound list: both faces answer `InternalError` with `details.reason` `COLLECTION_OVER_CAPACITY` and `details.limit` set to the bound it crossed (`SERVED_KNOWLEDGE_LIST_LIMIT`), so a caller tells capacity apart from a storage fault. The served face forwards it unchanged — it is about the peer's own collection and names no local schema. Driver text is never forwarded to an admitted peer, because it names local tables and columns. A host that needs the underlying cause observes it in its own storage layer or its own logs — the library writes none.
 
 ## Known limits
 

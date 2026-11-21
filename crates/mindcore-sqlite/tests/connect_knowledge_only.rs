@@ -1535,4 +1535,18 @@ async fn served_list_refuses_a_collection_over_the_bound() {
         "the refusal names the bound: {}",
         refused.message
     );
+    let details = refused
+        .details
+        .as_ref()
+        .expect("the served over-bound refusal forwards its class");
+    assert_eq!(
+        details.get("reason").and_then(Value::as_str),
+        Some("COLLECTION_OVER_CAPACITY"),
+        "the served face classifies capacity apart from a storage fault: {refused:?}"
+    );
+    assert_eq!(
+        details.get("limit"),
+        Some(&Value::from(SERVED_KNOWLEDGE_LIST_LIMIT)),
+        "the served refusal names the bound it crossed: {refused:?}"
+    );
 }

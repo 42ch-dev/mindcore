@@ -625,7 +625,13 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             // otherwise the state that run left, read under the receipt that
             // names it.
             let lifecycle = if replayed {
-                if matches!(&decision, Some(pending) if pending.contains(&candidate_id)) {
+                if matches!(
+                    &decision,
+                    Some(pending)
+                        if pending
+                            .iter()
+                            .any(|id| id.as_str() == Some(candidate_id.as_str()))
+                ) {
                     CandidateLifecycle::PendingDecision
                 } else {
                     replayed_lifecycle(&mut transaction, request.space_id.as_str(), &candidate_id)
@@ -1354,7 +1360,7 @@ async fn absorb_decision(
     subject_id: &str,
     body: &Value,
     capture_candidates: &[String],
-) -> Result<Option<Vec<String>>, SpiError> {
+) -> Result<Option<Vec<Value>>, SpiError> {
     let receipt_id = body
         .get("receipt_id")
         .and_then(Value::as_str)
@@ -1378,18 +1384,20 @@ async fn absorb_decision(
     let key = body.get("idempotency_key").and_then(Value::as_str);
     // The payload is exactly the receipt-ordered pending list: a right list
     // beside any other member is as malformed as a wrong one, so replay
-    // accepts no shape the repeat write refuses.
+    // accepts no shape the repeat write refuses. The array moves out of the
+    // decoded marker rather than being re-collected id by id: this read only
+    // classifies those ids against the receipt's own list.
     let pending = marker
         .result
-        .as_ref()
-        .and_then(Value::as_object)
-        .filter(|result| result.len() == 1)
-        .and_then(|result| result.get("pending_candidate_ids"))
-        .and_then(Value::as_array)
-        .and_then(|ids| {
-            ids.iter()
-                .map(|id| id.as_str().map(str::to_string))
-                .collect::<Option<Vec<_>>>()
+        .and_then(|result| match result {
+            Value::Object(mut result) if result.len() == 1 => {
+                result.remove("pending_candidate_ids")
+            }
+            _ => None,
+        })
+        .and_then(|value| match value {
+            Value::Array(ids) if ids.iter().all(Value::is_string) => Some(ids),
+            _ => None,
         });
     if marker.operation != ABSORB_DECISION_OP
         || marker.state != "applied"
@@ -1415,7 +1423,7 @@ async fn absorb_decision(
     if pending.is_empty()
         || !pending
             .iter()
-            .all(|id| held.any(|candidate| candidate == id))
+            .all(|id| held.any(|candidate| Some(candidate.as_str()) == id.as_str()))
     {
         return Err(internal(format!(
             "absorb decision {receipt_id} is not a nonempty receipt-ordered part of the capture receipt"
