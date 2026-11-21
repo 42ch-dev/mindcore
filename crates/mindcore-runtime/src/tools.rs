@@ -304,6 +304,7 @@ async fn deliberate(
     let request = DeliberateRequest {
         space_id: &arguments.space_id,
         subject_id: &arguments.subject_id,
+        assessment_context_id: None,
         holder: &arguments.holder,
         target: &arguments.target,
         evidence: &evidence,

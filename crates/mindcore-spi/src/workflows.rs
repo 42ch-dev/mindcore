@@ -1558,7 +1558,9 @@ fn stamp_cognition_record(
         ),
         (
             "assessment_context",
-            json!({ "context_id": request.subject_id }),
+            json!({
+                "context_id": request.assessment_context_id.unwrap_or(request.subject_id),
+            }),
         ),
         ("assessed_at", Value::String(now.clone())),
         ("effective_at", Value::String(now)),

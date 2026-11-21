@@ -2722,6 +2722,7 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -2832,6 +2833,7 @@ async fn deliberate_refuses_fabricated_references_before_any_write() {
         let request = DeliberateRequest {
             space_id: "spc_1",
             subject_id: "subj_1",
+            assessment_context_id: None,
             holder: &holder,
             target: &target,
             evidence: &evidence,
@@ -2876,6 +2878,7 @@ async fn deliberate_lens_violation_refuses_before_policy_and_write() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -2963,6 +2966,7 @@ async fn deliberate_lens_refuses_a_none_recommendation() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3038,6 +3042,7 @@ async fn deliberate_drops_a_hung_reasoner_at_the_deadline() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3080,6 +3085,7 @@ async fn deliberate_starts_no_write_after_the_policy_overran_the_deadline() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3134,6 +3140,7 @@ async fn deliberate_retries_a_stale_carrier_twice_then_surfaces_it() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3186,6 +3193,7 @@ async fn deliberate_retries_a_stale_carrier_until_the_snapshot_holds() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3219,6 +3227,7 @@ async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3267,6 +3276,7 @@ async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3321,6 +3331,7 @@ async fn deliberate_none_recommendation_writes_nothing() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3350,6 +3361,7 @@ async fn deliberate_without_a_reasoner_is_unavailable() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3390,6 +3402,7 @@ async fn deliberate_starts_no_attempt_once_the_deadline_passed() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3434,6 +3447,7 @@ async fn deliberate_clamps_an_absurd_timeout_and_still_settles() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3672,6 +3686,7 @@ fn lens_request<'a>(
     DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder,
         target,
         evidence,
