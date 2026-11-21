@@ -34,9 +34,13 @@ Both mean recreate. A busy or locked database, an I/O error or a permissions pro
 - A migration change and the code that reads it land together; an intermediate state where the schema moved and the readers did not is not a deliverable.
 - Column names, types and constraints are shared with the borrowed-transaction repository; changing one without the other breaks decoding at runtime, not at compile time.
 
-## References
+## Where it lives
 
-- `crates/mindcore-sqlite/migrations/0001_init.sql`
-- `crates/mindcore-sqlite/src/store.rs`
-- `crates/mindcore-sqlite/tests/store_bootstrap.rs`
-- `.agents/adr/implemented/architecture/2026-11-21-single-migration-store-bootstrap.md`
+- The whole embedded set: `crates/mindcore-sqlite/migrations/0001_init.sql`, applied by `MindStore::open` in `crates/mindcore-sqlite/src/store.rs`.
+- Readers of the tables it creates: `crates/mindcore-sqlite/src/repository.rs` (`SqliteMemoryRepository`, the `memory_*` tables), `crates/mindcore-sqlite/src/knowledge.rs` and `crates/mindcore-sqlite/src/cognition.rs` (`knowledge_entries`, `cognition_records`), `crates/mindcore-sqlite/src/vectors.rs` (`memory_embedding_vectors`).
+- Open-path tests that seed rows through `MindStore::open`: `crates/mindcore-sqlite/tests/store_bootstrap.rs` and the seed helpers beside them.
+- Decision record: `.agents/adr/implemented/architecture/2026-11-21-single-migration-store-bootstrap.md`.
+
+## Change obligations
+
+A migration edit lands together with this page, the reader that decodes the changed table, and the tests that open the database through `MindStore::open` — a schema without its reader, or a reader without its schema, is not a deliverable. Because a database is recreated rather than upgraded, no back-fill or compatibility shim is owed; changing that policy, or the two refusal shapes `open` reports, changes this page in the same commit.

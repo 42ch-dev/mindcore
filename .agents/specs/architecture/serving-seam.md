@@ -43,7 +43,7 @@ Settlement returns its original `SpokeReject` (code, message and details); malfo
 
 ### Store shape
 
-The runtime serves a **protocol-shaped** store: the memory tables the workflows read are the Nexus protocol shape, not the pre-release legacy shape. A freshly opened `MindStore` is **not yet protocol-shaped** — `0001_init.sql` creates the legacy `memory_records` / `memory_candidates` / `review_receipts` tables and no protocol tables — so such a database cannot serve `recall_context` or `deliberate` until the store migration lands (issue `I-000068`, captured and out of this plan's scope). This plan's acceptance is therefore runtime reachability on a protocol-shaped host store: the loopback fixture installs the protocol DDL over a dropped legacy shape and is **not** the production open path.
+The runtime serves a **protocol-shaped** store: the memory tables the workflows read are the Nexus protocol shape, not the pre-release legacy shape. `MindStore::open` applies the one embedded migration, so a freshly opened store already carries that shape and serves `recall_context` and `deliberate`; the loopback fixture opens that same production path and only seeds the rows the faces read, so it is no longer the only protocol-shaped store. Nexus host-only objects — the writer guards, outbox/immutability triggers, `nexus_writer_*` UDFs and the `core_*` tables — stay absent, so `open` needs no writer runtime. This plan's acceptance is therefore runtime reachability of the served tools against a store the production open path produced.
 
 ## Invariants
 

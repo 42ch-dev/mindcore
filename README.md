@@ -39,6 +39,8 @@ Requires a stable Rust toolchain, `sqlite3`, and the `sqlx-cli` version `Cargo.l
 installs that version).
 
 ```sh
+set -e  # stop at the first failing step, as a CI job does
+
 cargo fmt --all -- --check
 
 # The offline query cache must match the embedded migration and query surface.
@@ -55,8 +57,9 @@ SQLX_OFFLINE=true cargo clippy --locked --workspace --all-targets -- -D warnings
 SQLX_OFFLINE=true cargo test --locked --workspace
 ```
 
-CI runs these same steps (`.github/workflows/ci.yml`) and fails on any `.sqlx/` drift. To watch the
-story end to end:
+CI runs these same steps (`.github/workflows/ci.yml`) and fails on any `.sqlx/` drift. `set -e` is
+what makes the local run match it: a failed `sqlx prepare` stops the block before the drift test,
+which can only report a fresh cache when `prepare` itself succeeded. To watch the story end to end:
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
