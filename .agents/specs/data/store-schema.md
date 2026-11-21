@@ -6,13 +6,13 @@ The SQLite schema a host gets from `MindStore::open`, and the policy for changin
 
 ## Current state
 
-`crates/mindcore-sqlite/migrations/` holds exactly one file, `0001_init.sql`. It creates, in dependency order:
+`crates/mindcore-sqlite/migrations/` holds exactly one file, `0001_init.sql`. It creates:
 
 - the ten protocol memory tables — `memory_spaces`, `memory_subjects`, `memory_grants`, `memory_candidates`, `memory_records`, `memory_receipts`, `memory_journal`, `memory_profiles`, `memory_reflections`, `memory_provider_meta` — with the column names, types, `CHECK` clauses, `WITHOUT ROWID` declarations and indexes that `SqliteMemoryRepository` decodes;
-- `cognition_records` and `knowledge_entries`, in that order, with the composite foreign key from the holder's `cognition_head_seq` to the record primary key;
+- `knowledge_entries` then `cognition_records`, two tables that reference each other: the entry's composite foreign key from `cognition_head_seq` points at the record primary key, and each record points back at its entry. Neither orders the other, and `knowledge_entries` is created first, so its cross-reference is a forward reference SQLite accepts without resolving at creation time;
 - `memory_embedding_vectors`, keyed `(record_id, identity_hash)` with the record revision, dimension and little-endian `f32` bytes, plus the identity index.
 
-`MindStore::open` applies the embedded set with `PRAGMA foreign_keys` on, so every foreign key resolves at creation time. The protocol memory tables carry no fixture-only foreign keys: the Nexus writer guards, outbox/immutability triggers, `nexus_writer_*` UDFs and the three `core_*` tables remain caller-owned and are not installed here.
+`MindStore::open` applies the embedded set with `PRAGMA foreign_keys` on, so every foreign key is enforced from the first write. The set's one forward reference, `knowledge_entries` naming `cognition_records`, resolves when that table is created, since no row can be written before the migration finishes. The protocol memory tables carry no fixture-only foreign keys: the Nexus writer guards, outbox/immutability triggers, `nexus_writer_*` UDFs and the three `core_*` tables remain caller-owned and are not installed here.
 
 There is one schema source. Tests open a temporary database through `MindStore::open` and seed rows; no test file declares `CREATE TABLE` for a table `open` creates. SQLx preparation reads the same migration into an empty file.
 
