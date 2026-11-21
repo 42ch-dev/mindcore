@@ -2122,13 +2122,12 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
 }
 
 #[tokio::test]
-async fn a_retry_records_the_decision_its_first_run_could_not_write() {
-    let (workflows, recorded, _) = absorb(pending_candidate());
+async fn a_replay_that_finds_no_marker_writes_none() {
+    let (workflows, recorded) = absorb_two_pending();
     let caps = MindCapabilities::default();
     recorded.fail_pending_write.store(true, Ordering::SeqCst);
 
-    // The capture commits and the marker write fails: the run must not report
-    // a decision it never recorded.
+    // The capture commits and the marker write fails: the run records nothing.
     let failed = workflows
         .absorb(&principal(), &capture_request(), None, &caps)
         .await;
@@ -2138,63 +2137,15 @@ async fn a_retry_records_the_decision_its_first_run_could_not_write() {
     );
     assert!(recorded.pending.lock().expect("pending writes").is_empty());
 
-    // The retry replays that capture and still projects Pending: it records
-    // the decision before returning it.
-    let retried = workflows
-        .absorb(&principal(), &capture_request(), None, &caps)
-        .await
-        .expect("retried absorb");
-    assert_eq!(
-        retried,
-        vec![AbsorbCandidateOutcome::Pending {
-            candidate_id: "cnd_1".to_string(),
-        }]
-    );
-
-    // A further replay reports the recorded decision and writes no second
-    // marker: the Pending the retry returned is now the stable answer.
-    let replay = workflows
+    // The replay sees a wholly pending receipt and no marker, and writes none:
+    // a snapshot cannot tell this failed run from one still in flight, so the
+    // decision stays unrecorded and each candidate reports its own state.
+    let replayed = workflows
         .absorb(&principal(), &capture_request(), None, &caps)
         .await
         .expect("replayed absorb");
-    assert_eq!(replay, retried);
     assert_eq!(
-        recorded.pending.lock().expect("pending writes").as_slice(),
-        [vec!["cnd_1".to_string()]],
-        "exactly one marker records the Pending decision"
-    );
-}
-
-#[tokio::test]
-async fn a_retry_records_the_whole_list_while_every_candidate_is_pending() {
-    let (workflows, recorded) = absorb_two_pending();
-    let caps = MindCapabilities::default();
-    recorded.fail_pending_write.store(true, Ordering::SeqCst);
-
-    // The capture commits, both candidates stay pending, and the marker write
-    // fails: the run must not report a decision it never recorded.
-    let failed = workflows
-        .absorb(&principal(), &capture_request(), None, &caps)
-        .await;
-    assert!(
-        matches!(failed, Err(SpiError::Settlement(_))),
-        "a failed marker write fails the run"
-    );
-    assert!(recorded.pending.lock().expect("pending writes").is_empty());
-
-    // The retry sees a wholly pending receipt: the failed run settled nothing,
-    // so the receipt's ordered list is the decision it records.
-    let retried = workflows
-        .absorb(&principal(), &capture_request(), None, &caps)
-        .await
-        .expect("retried absorb");
-    assert_eq!(
-        recorded.pending.lock().expect("pending writes").as_slice(),
-        [vec!["cnd_1".to_string(), "cnd_2".to_string()]],
-        "one marker records the whole candidate list the decision ranged over"
-    );
-    assert_eq!(
-        retried,
+        replayed,
         vec![
             AbsorbCandidateOutcome::Pending {
                 candidate_id: "cnd_1".to_string(),
@@ -2202,79 +2153,22 @@ async fn a_retry_records_the_whole_list_while_every_candidate_is_pending() {
             AbsorbCandidateOutcome::Pending {
                 candidate_id: "cnd_2".to_string(),
             },
-        ],
-        "the retry reports the decision it records"
-    );
-
-    // A later replay reads the marker, reports both as pending, and reads no
-    // candidate back: the retry's answer is stable from here on.
-    let snapshots = recorded.snapshots.load(Ordering::SeqCst);
-    let replay = workflows
-        .absorb(&principal(), &capture_request(), None, &caps)
-        .await
-        .expect("replayed absorb");
-    assert_eq!(replay, retried);
-    assert_eq!(recorded.snapshots.load(Ordering::SeqCst), snapshots);
-    assert_eq!(
-        recorded.pending.lock().expect("pending writes").len(),
-        1,
-        "the replay writes no second marker"
-    );
-}
-
-#[tokio::test]
-async fn a_mixed_retry_records_no_decision_it_cannot_reconstruct() {
-    let (workflows, recorded) = absorb_two_pending();
-    let caps = MindCapabilities::default();
-    recorded.fail_pending_write.store(true, Ordering::SeqCst);
-
-    // The capture commits both candidates and the marker write fails.
-    let failed = workflows
-        .absorb(&principal(), &capture_request(), None, &caps)
-        .await;
-    assert!(
-        matches!(failed, Err(SpiError::Settlement(_))),
-        "a failed marker write fails the run"
-    );
-
-    // One candidate is settled elsewhere before the retry. The receipt no
-    // longer shows what the failed run decided about either candidate, so the
-    // retry can no longer reconstruct that decision.
-    recorded.candidates.lock().expect("candidates")[0] = named(consumed_candidate(), "cnd_1");
-
-    let retried = workflows
-        .absorb(&principal(), &capture_request(), None, &caps)
-        .await
-        .expect("retried absorb");
-    assert_eq!(
-        retried,
-        vec![
-            AbsorbCandidateOutcome::Settled {
-                candidate_id: "cnd_1".to_string(),
-                record_ids: vec!["rec_new".to_string()],
-            },
-            AbsorbCandidateOutcome::Pending {
-                candidate_id: "cnd_2".to_string(),
-            },
-        ],
-        "the retry reports each candidate from its own state"
+        ]
     );
     assert!(
         recorded.pending.lock().expect("pending writes").is_empty(),
-        "a mixed receipt writes no marker: recording the whole list would report \
-         the settled candidate as pending"
+        "a replay writes no marker"
     );
 
-    // A later replay is in the same position and answers the same way: the
-    // settled candidate stays reported from its state, the pending one pending.
-    let replay = workflows
+    // A second replay answers identically and still writes nothing.
+    let again = workflows
         .absorb(&principal(), &capture_request(), None, &caps)
         .await
         .expect("replayed absorb");
-    assert_eq!(replay, retried);
+    assert_eq!(again, replayed);
     assert!(
         recorded.pending.lock().expect("pending writes").is_empty(),
-        "no replay of the mixed receipt writes a marker either"
+        "no replay writes a decision marker"
     );
 }
 
