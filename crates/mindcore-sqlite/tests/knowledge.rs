@@ -1,13 +1,11 @@
 //! Behaviour of the scoped knowledge port over real SQLite files.
 
 use std::collections::HashMap;
-use std::future::poll_fn;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::task::{Poll, Waker};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -29,6 +27,7 @@ use spoke_schemas::source_anchor::ExtensionKey as AnchorExtensionKey;
 use spoke_schemas::KnowledgeEntry;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use tokio::sync::Barrier;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -2904,34 +2903,24 @@ async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
 async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
     let path = database_path("adopt-invalid-copy");
     let store = MindStore::open(&path).await.expect("open store");
-    let src = store.knowledge(KnowledgeScope::new("shared"));
     let dst = store.knowledge(KnowledgeScope::new("wren"));
-    let reader = second_connection(&path).await;
 
-    // A stored source whose cognition carrier is not the object shape the write gate accepts. The
-    // copy cannot be written, and that plain `InvalidInput` must surface as itself: only the
-    // adapter's structured superseded detail means occupancy.
-    let payload = json!({
-        "schema_version": 1,
-        "entry_id": "ke_broken_carrier",
-        "entry_type": "location",
-        "canonical_name": "ke_broken_carrier name",
-        "status": "confirmed",
-        "revision": 1,
-        "body": {"summary": "shared fact"},
-        "extensions": {},
-        "modules": {"cognition": [{"records": []}]}
-    });
-    sqlx::query(
-        "INSERT INTO knowledge_entries \
-         (collection, entry_id, revision, payload, created_at, updated_at) \
-         VALUES ('shared', 'ke_broken_carrier', 1, ?, \
-         '2026-11-01T09:00:00.000000000+00:00', '2026-11-01T09:00:00.000000000+00:00')",
-    )
-    .bind(payload.to_string())
-    .execute(&reader)
-    .await
-    .expect("seed the carrier the write gate refuses");
+    // A source whose cognition module is otherwise valid but whose `records` member is present and
+    // not an array. Only a port double can hand adoption that shape: a stored row is read back with
+    // `records` projected from the record rows. Only the narrowed branch leaves the member
+    // untouched, so the destination gate refuses the copy and that plain `InvalidInput` must
+    // surface as itself: only the adapter's structured superseded detail means occupancy. The
+    // pre-fix unconditional replacement would mask the member as `[]`, the copy would validate, and
+    // the adoption would commit — which this test rejects.
+    let mut broken = cognition_entry("ke_broken_carrier", "shared fact", Vec::new());
+    broken.revision = Some(1);
+    let Some(KnowledgeEntryModulesValue::Object(module)) =
+        broken.modules.get_mut(&cognition_module_key())
+    else {
+        panic!("the fixture entry carries an object cognition module")
+    };
+    module.insert("records".to_string(), Value::Null);
+    let src = FixedSource(broken);
 
     match adopt_knowledge_entry(&src, &dst, "ke_broken_carrier", 1).await {
         SpokeResult::Reject(reject) => {
@@ -2948,43 +2937,61 @@ async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
             dst.get_knowledge_entry("ke_broken_carrier").await,
             "the refused copy claims no destination slot",
         ),
-        SpokeRejectCode::KnowledgeEntryNotFound
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "the destination holds no adopted module, so neither `null` nor `[]` lands in the \
+         non-array slot the source carries"
     );
 
-    reader.close().await;
     store.close().await;
     remove_database(&path);
 }
 
-/// A destination port that holds its first absent slot read until its peer has made the same read,
-/// so both adoptions observe the empty slot before either can write. Later reads — the
-/// create-conflict re-read among them — pass straight through.
-struct GatedDestination {
-    inner: ScopedKnowledgeStore,
-    parked: Mutex<ParkedReads>,
-    first_read: AtomicBool,
+/// A source port answering one fixed entry: a stored row is read back with
+/// `modules.cognition.records` projected from its record rows, so only a double can hand adoption a
+/// non-array member.
+struct FixedSource(KnowledgeEntry);
+
+#[async_trait]
+impl KnowledgeEntryPort for FixedSource {
+    async fn get_knowledge_entry(&self, _entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        SpokeResult::Ok(self.0.clone())
+    }
+
+    async fn put_knowledge_entry(
+        &self,
+        _entry: KnowledgeEntry,
+        _expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        panic!("the source is only ever read")
+    }
 }
 
-/// The two-reader rendezvous behind [`GatedDestination`]: the first arrival parks, the second
-/// wakes it, and both proceed.
-#[derive(Default)]
-struct ParkedReads {
-    open: bool,
-    wakers: Vec<Waker>,
+/// A destination port that parks its first absent slot read until its peer has made the same read,
+/// so both adoptions observe the empty slot before either can write. Later reads — the
+/// create-conflict re-read among them — pass straight through.
+///
+/// The two ports share one two-party [`Barrier`]: a party that already arrived is never counted
+/// twice, so repolling one future cannot stand in for the missing peer and release it early.
+/// shortcut: a side that never reaches its first absent read leaves the join pending, add a timeout
+/// if this test ever hangs in CI.
+struct GatedDestination {
+    inner: ScopedKnowledgeStore,
+    first_absent: Arc<Barrier>,
+    saw_empty: AtomicBool,
 }
 
 impl GatedDestination {
-    fn new(inner: ScopedKnowledgeStore) -> Self {
+    fn new(inner: ScopedKnowledgeStore, first_absent: Arc<Barrier>) -> Self {
         Self {
             inner,
-            parked: Mutex::new(ParkedReads::default()),
-            first_read: AtomicBool::new(false),
+            first_absent,
+            saw_empty: AtomicBool::new(false),
         }
     }
 
     /// Whether this port has already observed the empty slot.
     fn observed_absent(&self) -> bool {
-        self.first_read.load(Ordering::SeqCst)
+        self.saw_empty.load(Ordering::SeqCst)
     }
 }
 
@@ -2997,23 +3004,10 @@ impl KnowledgeEntryPort for GatedDestination {
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound
         );
-        if absent && !self.first_read.swap(true, Ordering::SeqCst) {
-            poll_fn(|cx| {
-                let mut parked = self.parked.lock().expect("parked reads lock");
-                if parked.open {
-                    return Poll::Ready(());
-                }
-                if parked.wakers.is_empty() {
-                    parked.wakers.push(cx.waker().clone());
-                    return Poll::Pending;
-                }
-                for waker in parked.wakers.drain(..) {
-                    waker.wake();
-                }
-                parked.open = true;
-                Poll::Ready(())
-            })
-            .await;
+        // Only this port's first absent read reports; both reports must be in before either side
+        // may reach its create.
+        if absent && !self.saw_empty.swap(true, Ordering::SeqCst) {
+            self.first_absent.wait().await;
         }
         read
     }
@@ -3038,8 +3032,17 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
     let right_src = right_store.knowledge(KnowledgeScope::new("shared"));
     let left_dst = left_store.knowledge(KnowledgeScope::new("wren"));
     let right_dst = right_store.knowledge(KnowledgeScope::new("wren"));
-    let left_gated = GatedDestination::new(left_store.knowledge(KnowledgeScope::new("wren")));
-    let right_gated = GatedDestination::new(right_store.knowledge(KnowledgeScope::new("wren")));
+    // One rendezvous for both ports: a side leaves its first absent read only once its peer has
+    // reported the same absence, so neither create can precede the other read.
+    let first_absent = Arc::new(Barrier::new(2));
+    let left_gated = GatedDestination::new(
+        left_store.knowledge(KnowledgeScope::new("wren")),
+        Arc::clone(&first_absent),
+    );
+    let right_gated = GatedDestination::new(
+        right_store.knowledge(KnowledgeScope::new("wren")),
+        first_absent,
+    );
     let reader = second_connection(&path).await;
 
     let shared_id = "ke_shared_gate";
