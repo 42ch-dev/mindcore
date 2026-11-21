@@ -140,6 +140,24 @@ pub trait WorkflowBinding: Send + Sync {
         request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError>;
 
+    /// Persist the durable decision marker for one absorb run that left
+    /// `pending_candidate_ids` pending, then return.
+    ///
+    /// The marker is keyed by the validated committed capture receipt of
+    /// `request`: its space, subject, requester and idempotency key, with no
+    /// targets and the pending ids in capture receipt order. An equal marker
+    /// already present is a no-op; a mismatched or malformed one is a storage
+    /// error. It records a decision, never a settlement, and a capture replay
+    /// reads it to report the original `Pending` outcome instead of the
+    /// candidate's later state. Never call it for an empty set or a failed
+    /// decision.
+    async fn record_absorb_pending(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+        pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError>;
+
     /// Read `candidate_id` and one bounded authorized recall page over the
     /// same subject and placement, on one transaction. The page is empty for
     /// an already-consumed candidate.
@@ -326,6 +344,10 @@ pub struct CapturedCandidate {
 pub enum CandidateLifecycle {
     /// Nothing has consumed it: the receipt's own candidate, still undecided.
     Pending,
+    /// The capture's own absorb run recorded `Pending` for it: a replay reports
+    /// that decision, whatever state the candidate has reached since, and
+    /// settles nothing.
+    PendingDecision,
     /// Something consumed it; read its recorded outcome under its own grants.
     Consumed,
 }
@@ -497,7 +519,11 @@ impl SpiMindWorkflows {
     /// With a reasoner, each fresh candidate is read with one bounded
     /// authorized evidence page, the reasoner runs outside any transaction,
     /// its reply is validated against that exact page, and the policy hook
-    /// decides whether the validated settlement is submitted.
+    /// decides whether the validated settlement is submitted. Before a run
+    /// that leaves fresh candidates pending returns, the binding records one
+    /// durable decision marker for them; a replay reads that marker and
+    /// reports the original `Pending` outcome even after the candidate was
+    /// resolved elsewhere.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -510,6 +536,9 @@ impl SpiMindWorkflows {
             replayed,
         } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidates.len());
+        // Fresh candidates this run leaves pending: its durable Pending
+        // decision, recorded before success so a later replay can report it.
+        let mut held: Vec<String> = Vec::new();
         for CapturedCandidate {
             candidate_id,
             lifecycle,
@@ -517,7 +546,9 @@ impl SpiMindWorkflows {
         {
             if replayed {
                 outcomes.push(match lifecycle {
-                    CandidateLifecycle::Pending => AbsorbCandidateOutcome::Pending { candidate_id },
+                    CandidateLifecycle::Pending | CandidateLifecycle::PendingDecision => {
+                        AbsorbCandidateOutcome::Pending { candidate_id }
+                    }
                     CandidateLifecycle::Consumed => {
                         self.replay_candidate(principal, request, candidate_id)
                             .await?
@@ -526,13 +557,30 @@ impl SpiMindWorkflows {
                 continue;
             }
             let Some(reasoner) = caps.reasoner else {
+                held.push(candidate_id.clone());
                 outcomes.push(AbsorbCandidateOutcome::Pending { candidate_id });
                 continue;
             };
-            outcomes.push(
-                self.absorb_candidate(principal, request, candidate_id, reasoner, lens, caps)
-                    .await?,
-            );
+            let outcome = self
+                .absorb_candidate(
+                    principal,
+                    request,
+                    candidate_id.clone(),
+                    reasoner,
+                    lens,
+                    caps,
+                )
+                .await?;
+            if matches!(&outcome, AbsorbCandidateOutcome::Pending { .. }) {
+                held.push(candidate_id);
+            }
+            outcomes.push(outcome);
+        }
+        if !held.is_empty() {
+            let pending: Vec<&str> = held.iter().map(String::as_str).collect();
+            self.binding
+                .record_absorb_pending(principal, request, &pending)
+                .await?;
         }
         Ok(outcomes)
     }
@@ -2413,6 +2461,15 @@ mod tests {
             _principal: &Principal,
             _request: &MemoryCaptureRequest,
         ) -> Result<CaptureOutcome, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn record_absorb_pending(
+            &self,
+            _principal: &Principal,
+            _request: &MemoryCaptureRequest,
+            _pending_candidate_ids: &[&str],
+        ) -> Result<(), SpiError> {
             unreachable!("this double serves recall only")
         }
 

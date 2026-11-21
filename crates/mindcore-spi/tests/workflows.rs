@@ -247,6 +247,15 @@ impl WorkflowBinding for StubBinding {
         unserved()
     }
 
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        _pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
     async fn absorb_snapshot(
         &self,
         _principal: &Principal,
@@ -389,6 +398,15 @@ impl WorkflowBinding for RefusingBinding {
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
+        unserved()
+    }
+
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        _pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
         unserved()
     }
 
@@ -1378,6 +1396,8 @@ struct Recorded {
     snapshots: Arc<AtomicUsize>,
     /// Every vector the warm asked this binding to fill, with its revision.
     fills: Arc<Mutex<Vec<(String, u64)>>>,
+    /// Pending candidate sets the coordinator recorded as its decision.
+    pending: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 /// One captured candidate over a fixed page, with every submitted settlement
@@ -1420,11 +1440,23 @@ impl WorkflowBinding for AbsorbDouble {
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
         // The first capture commits the receipt; every later one replays it,
-        // reporting the state the double's candidate is in.
+        // reporting the state the double's candidate is in — or the Pending
+        // decision its fresh run recorded, which wins over that state.
         let call = self.captures.fetch_add(1, Ordering::SeqCst);
-        let lifecycle = match &self.candidate {
-            MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
-            MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
+        let held = self
+            .recorded
+            .pending
+            .lock()
+            .expect("pending writes")
+            .iter()
+            .any(|ids| ids.iter().any(|id| id == "cnd_1"));
+        let lifecycle = if held {
+            CandidateLifecycle::PendingDecision
+        } else {
+            match &self.candidate {
+                MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
+                MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
+            }
         };
         Ok(CaptureOutcome {
             candidates: vec![CapturedCandidate {
@@ -1433,6 +1465,20 @@ impl WorkflowBinding for AbsorbDouble {
             }],
             replayed: call > 0,
         })
+    }
+
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
+        self.recorded
+            .pending
+            .lock()
+            .expect("pending writes")
+            .push(pending_candidate_ids.iter().map(|id| id.to_string()).collect());
+        Ok(())
     }
 
     async fn absorb_snapshot(
@@ -1946,6 +1992,10 @@ async fn fabricated_evidence_never_reaches_policy_or_a_write() {
     assert!(seen.lock().expect("seen").is_empty());
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
     assert!(recorded.updates.lock().expect("updates").is_empty());
+    assert!(
+        recorded.pending.lock().expect("pending writes").is_empty(),
+        "a failed decision records no Pending marker"
+    );
 }
 
 #[tokio::test]
@@ -2002,6 +2052,11 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
         "a pending candidate is reported without a candidate read"
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
+    assert_eq!(
+        recorded.pending.lock().expect("pending writes").as_slice(),
+        [vec!["cnd_1".to_string()]],
+        "the fresh Pending decision is recorded once and its replay writes no second marker"
+    );
 }
 
 #[tokio::test]
@@ -2025,6 +2080,11 @@ async fn default_policy_leaves_the_candidate_pending() {
         }]
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
+    assert_eq!(
+        recorded.pending.lock().expect("pending writes").as_slice(),
+        [vec!["cnd_1".to_string()]],
+        "a policy hold records its Pending decision"
+    );
 }
 
 #[tokio::test]
@@ -2372,6 +2432,15 @@ impl WorkflowBinding for DeliberateDouble {
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
+        unserved()
+    }
+
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        _pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
         unserved()
     }
 

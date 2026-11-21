@@ -23,7 +23,7 @@ use sqlx::SqlitePool;
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::cognition::{carrier_records, CARRIER_NAMESPACE};
-use mindcore_base::ids::SpaceId;
+use mindcore_base::ids::{SpaceId, SubjectId};
 use mindcore_base::ir::{
     CandidateState, MemoryJournalRow, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState,
 };
@@ -61,6 +61,11 @@ const KNOWLEDGE_WRITE: &str = "knowledge_write";
 /// The memory capability the subject page was read under; the write rechecks
 /// it because a verdict over that page depends on it.
 const RECALL: &str = "recall";
+
+/// The journal op of the durable absorb-decision marker. The row is applied,
+/// carries no targets and settles nothing: it only tells a capture replay that
+/// this capture's absorb run decided `Pending` for the ids it names.
+const ABSORB_DECISION_OP: &str = "mindcore.absorb.decision";
 
 /// One collection together with the caller it is admitted to.
 struct AdmittedCollection {
@@ -585,14 +590,30 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
         let candidate_ids = candidate_ids(&body)?;
+        let decision = if replayed {
+            absorb_decision(
+                &mut transaction,
+                request.space_id.as_str(),
+                &body,
+                &candidate_ids,
+            )
+            .await?
+        } else {
+            None
+        };
         let mut candidates = Vec::with_capacity(candidate_ids.len());
         for candidate_id in candidate_ids {
-            // A fresh capture just inserted its candidate pending; a replay
-            // reports the state its recorded run left, read under the receipt
-            // that names it.
+            // A fresh capture just inserted its candidate pending. A replay
+            // reports the Pending decision its absorb run recorded, and only
+            // otherwise the state that run left, read under the receipt that
+            // names it.
             let lifecycle = if replayed {
-                replayed_lifecycle(&mut transaction, request.space_id.as_str(), &candidate_id)
-                    .await?
+                if matches!(&decision, Some(pending) if pending.contains(&candidate_id)) {
+                    CandidateLifecycle::PendingDecision
+                } else {
+                    replayed_lifecycle(&mut transaction, request.space_id.as_str(), &candidate_id)
+                        .await?
+                }
             } else {
                 CandidateLifecycle::Pending
             };
@@ -609,6 +630,125 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             candidates,
             replayed,
         })
+    }
+
+    async fn record_absorb_pending(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+        pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
+        if pending_candidate_ids.is_empty() {
+            return Ok(());
+        }
+        let op = MemoryAdapter::op(
+            request.space_id.as_str(),
+            principal_id(principal),
+            "memory.capture",
+            Some(request.idempotency_key.as_str()),
+            &render(request, "capture")?,
+        )
+        .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        let space = SpaceId::new(request.space_id.to_string());
+        // The capture transaction has already committed: take the write
+        // reservation, verify that exact receipt and insert the marker, with
+        // no provider call or settlement inside this short transaction.
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| {
+                internal(format!(
+                    "absorb decision transaction could not begin: {error}"
+                ))
+            })?;
+        let receipt = admission::probe(&SqliteMemoryRepository, &mut transaction, &op)
+            .await
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?
+            .ok_or_else(|| {
+                internal("no committed capture receipt for this absorb".to_string())
+            })?;
+        let ReceiptState::Committed { result, .. } = &receipt.state else {
+            return Err(internal(format!(
+                "capture receipt {} is not committed",
+                receipt.receipt_id
+            )));
+        };
+        let captured = result
+            .get("candidate_ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                internal(format!(
+                    "capture receipt {} carries no candidate_ids",
+                    receipt.receipt_id
+                ))
+            })?;
+        // Capture receipt order, not the caller's order, owns the marker.
+        let mut pending = Vec::with_capacity(pending_candidate_ids.len());
+        for candidate in captured {
+            let candidate = candidate.as_str().ok_or_else(|| {
+                internal(format!(
+                    "capture receipt {} holds a non-string candidate id",
+                    receipt.receipt_id
+                ))
+            })?;
+            if pending_candidate_ids.contains(&candidate) {
+                pending.push(candidate.to_string());
+            }
+        }
+        if pending.len() != pending_candidate_ids.len() {
+            return Err(internal(format!(
+                "absorb decision names a candidate capture receipt {} does not hold",
+                receipt.receipt_id
+            )));
+        }
+        let now = crate::policy::timestamp(op.now);
+        let marker = MemoryJournalRow {
+            seq: 0,
+            receipt_id: receipt.receipt_id.clone(),
+            space_id: space.clone(),
+            subject_id: SubjectId::new(request.subject_id.to_string()),
+            requester: CallerId::new(principal_id(principal)),
+            operation: ABSORB_DECISION_OP.to_string(),
+            idempotency_key: Some(request.idempotency_key.to_string()),
+            state: "applied".to_string(),
+            targets: Vec::new(),
+            result: Some(json!({ "pending_candidate_ids": pending })),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        match SqliteMemoryRepository
+            .journal_intent(&mut transaction, &space, &receipt.receipt_id)
+            .await
+            .map_err(|error| internal(format!("absorb decision could not be read: {error}")))?
+        {
+            // The journal's unique receipt id makes the write idempotent: an
+            // equal marker is authoritative, any other row is corruption.
+            Some(existing)
+                if existing.operation != marker.operation
+                    || existing.state != marker.state
+                    || !existing.targets.is_empty()
+                    || existing.result.as_ref() != marker.result.as_ref() =>
+            {
+                return Err(internal(format!(
+                    "capture receipt {} holds an inconsistent absorb decision",
+                    receipt.receipt_id
+                )))
+            }
+            Some(_) => {}
+            None => SqliteMemoryRepository
+                .insert_journal_intent(&mut transaction, &marker)
+                .await
+                .map_err(|error| {
+                    internal(format!("absorb decision could not be written: {error}"))
+                })?,
+        }
+        transaction.commit().await.map_err(|error| {
+            internal(format!(
+                "absorb decision transaction could not commit: {error}"
+            ))
+        })?;
+        Ok(())
     }
 
     async fn absorb_snapshot(
@@ -1178,6 +1318,72 @@ fn candidate_ids(body: &Value) -> Result<Vec<String>, SpiError> {
                 .ok_or_else(|| internal("a captured candidate id is not a string".to_string()))
         })
         .collect()
+}
+
+/// The durable absorb decision a replayed capture receipt holds, when its
+/// own absorb run recorded one: the candidates that run left pending, in
+/// receipt order.
+///
+/// Read on the capture's admitted transaction, keyed by the receipt id the
+/// body carries. A row under that receipt id that is not this marker, or a
+/// marker naming anything the receipt does not hold, is storage corruption:
+/// never permission to project the candidate's current state.
+async fn absorb_decision(
+    transaction: &mut Tx<'_>,
+    space_id: &str,
+    body: &Value,
+    capture_candidates: &[String],
+) -> Result<Option<Vec<String>>, SpiError> {
+    let receipt_id = body
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| internal("a replayed capture carries no receipt_id".to_string()))?;
+    let space = SpaceId::new(space_id.to_string());
+    let Some(marker) = SqliteMemoryRepository
+        .journal_intent(transaction, &space, receipt_id)
+        .await
+        .map_err(|error| {
+            internal(format!(
+                "absorb decision {receipt_id} could not be read: {error}"
+            ))
+        })?
+    else {
+        return Ok(None);
+    };
+    let requester = body.get("requester_principal_id").and_then(Value::as_str);
+    let key = body.get("idempotency_key").and_then(Value::as_str);
+    let pending = marker
+        .result
+        .as_ref()
+        .and_then(|result| result.get("pending_candidate_ids"))
+        .and_then(Value::as_array)
+        .and_then(|ids| {
+            ids.iter()
+                .map(|id| id.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        });
+    if marker.operation != ABSORB_DECISION_OP
+        || marker.state != "applied"
+        || !marker.targets.is_empty()
+        || marker.space_id.as_str() != space.as_str()
+        || Some(marker.requester.as_str()) != requester
+        || marker.idempotency_key.as_deref() != key
+    {
+        return Err(internal(format!(
+            "capture receipt {receipt_id} holds a malformed absorb decision"
+        )));
+    }
+    let Some(pending) = pending else {
+        return Err(internal(format!(
+            "capture receipt {receipt_id} holds a malformed absorb decision"
+        )));
+    };
+    if pending.iter().any(|id| !capture_candidates.contains(id)) {
+        return Err(internal(format!(
+            "absorb decision {receipt_id} names a candidate the capture receipt does not hold"
+        )));
+    }
+    Ok(Some(pending))
 }
 
 /// Whether one candidate the caller's own capture receipt holds is still

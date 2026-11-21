@@ -20,9 +20,9 @@ use mindcore_spi::{
     PolicyDecision, PolicyHook, Reasoner, SettlementDraft, SpiError, SpiMindWorkflows,
     StructuredReasonRequest,
 };
-use mindcore_spoke::MemoryWorkflowBinding;
+use mindcore_spoke::{MemoryAdapter, MemoryStage, MemoryWorkflowBinding};
 use mindcore_sqlite::{MindStore, SERVED_KNOWLEDGE_LIST_LIMIT};
-use spoke_operations::SpokeRejectCode;
+use spoke_operations::{SpokeRejectCode, SpokeResult};
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
 const SPACE: &str = "spc_1";
@@ -379,6 +379,19 @@ impl Harness {
             .expect("candidate status")
     }
 
+    /// The result of the applied absorb-decision marker this store holds, when
+    /// one absorb run recorded a Pending decision.
+    async fn decision_marker(&self) -> Option<Value> {
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT result_json FROM memory_journal \
+             WHERE op = 'mindcore.absorb.decision' AND state = 'applied'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .expect("absorb decision marker");
+        raw.map(|raw| serde_json::from_str(&raw).expect("absorb decision result"))
+    }
+
     async fn candidate_text(&self, candidate_id: &str) -> Option<String> {
         let raw: Option<String> =
             sqlx::query_scalar("SELECT content_json FROM memory_candidates WHERE candidate_id = ?")
@@ -431,6 +444,44 @@ fn retry_class(reject: &spoke_operations::SpokeReject) -> Option<&str> {
         .as_ref()
         .and_then(|details| details.get("retry_class"))
         .and_then(Value::as_str)
+}
+
+/// Resolve `candidate_id` outside absorb: the stand-alone adapter dismisses it
+/// and settles that intent on its own transaction, exactly as a host would.
+async fn resolve_externally(harness: &Harness, candidate_id: &str) {
+    let adapter = MemoryAdapter::new(true);
+    let mut transaction = harness
+        .pool
+        .begin()
+        .await
+        .expect("external settlement transaction");
+    let staged = adapter
+        .dismiss_candidate(
+            &mut transaction,
+            &principal(),
+            json!({
+                "space_id": SPACE,
+                "candidate_id": candidate_id,
+                "expected_revision": 1,
+                "idempotency_key": format!("external_{candidate_id}"),
+            }),
+        )
+        .await;
+    let (space, receipt_id) = match staged {
+        SpokeResult::Ok(MemoryStage::JournalPending { space, receipt_id }) => (space, receipt_id),
+        other => panic!("the external dismissal must stage its intent, got {other:?}"),
+    };
+    let settled = adapter
+        .settle_journal(&mut transaction, &space, &receipt_id)
+        .await;
+    assert!(
+        matches!(settled, SpokeResult::Ok(_)),
+        "the external dismissal must settle, got {settled:?}"
+    );
+    transaction
+        .commit()
+        .await
+        .expect("external settlement commit");
 }
 
 fn capture(key: &str, text: &str) -> MemoryCaptureRequest {
@@ -1415,7 +1466,27 @@ async fn default_policy_leaves_the_candidate_pending() {
             .await,
         0
     );
-    assert_eq!(harness.count_from("memory_journal").await, 0);
+    // No settlement intent: the held decision is one applied, target-free
+    // marker that names the candidate it left pending.
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE op <> 'mindcore.absorb.decision'")
+            .await,
+        0
+    );
+    assert_eq!(
+        harness
+            .count_from(
+                "memory_journal WHERE op = 'mindcore.absorb.decision' \
+                 AND state = 'applied' AND targets_json = '[]'"
+            )
+            .await,
+        1
+    );
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] }))
+    );
 }
 
 #[tokio::test]
@@ -1442,7 +1513,11 @@ async fn absent_reasoner_matches_deterministic_capture() {
         Some("the north gate is closed at dusk")
     );
     assert_eq!(harness.count_from("memory_records").await, 1);
-    assert_eq!(harness.count_from("memory_journal").await, 0);
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] })),
+        "a no-reasoner Pending run records its decision"
+    );
 }
 
 #[tokio::test]
@@ -1981,6 +2056,170 @@ async fn a_replay_never_settles_what_a_policy_left_pending() {
             .await,
         0
     );
+}
+
+#[tokio::test]
+async fn a_held_then_externally_resolved_capture_replays_as_pending() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_held_resolved", "the north gate is closed at dusk");
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+
+    let held = workflows
+        .absorb(
+            &principal(),
+            &request,
+            None,
+            &MindCapabilities {
+                reasoner: Some(&reasoner),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] })),
+        "the held decision is recorded once"
+    );
+
+    // A human resolves it outside absorb: the stand-alone adapter dismisses
+    // and settles the candidate.
+    resolve_externally(&harness, candidate_id).await;
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+
+    // The host reopens and replays twice with an auto-settle policy available,
+    // over a reasoner that marks every call it receives.
+    let reopened = harness.absorb_binding();
+    let bumping = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": [] }),
+        &harness.pool,
+    )
+    .bumping();
+    let policy = AutoPolicy;
+    for _ in 0..2 {
+        let replay = reopened
+            .absorb(
+                &principal(),
+                &request,
+                None,
+                &MindCapabilities {
+                    reasoner: Some(&bumping),
+                    policy_hook: Some(&policy),
+                    ..MindCapabilities::default()
+                },
+            )
+            .await
+            .expect("replayed absorb");
+        assert_eq!(replay, held, "the replay reports the original decision");
+    }
+
+    // The replay decided and settled nothing: no reasoner or policy call, no
+    // review, no second marker and no new settlement.
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        0
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE op = 'mindcore.absorb.decision'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE op = 'memory.candidates.dismiss'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_candidates WHERE status = 'consumed'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] }))
+    );
+}
+
+#[tokio::test]
+async fn a_direct_capture_replay_projects_the_external_resolution() {
+    let harness = granted_harness().await;
+    let request = capture("cap_external_only", "the north gate is closed at dusk");
+    let adapter = MemoryAdapter::new(true);
+    let mut transaction = harness.pool.begin().await.expect("capture transaction");
+    let staged = adapter
+        .capture(
+            &mut transaction,
+            &principal(),
+            serde_json::to_value(&request).expect("capture request"),
+        )
+        .await;
+    let body = match staged {
+        SpokeResult::Ok(MemoryStage::Ready(body)) => body,
+        other => panic!("a fresh adapter capture is ready, got {other:?}"),
+    };
+    let candidate_id = body["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    transaction.commit().await.expect("capture commit");
+    resolve_externally(&harness, &candidate_id).await;
+    assert_eq!(harness.candidate_status(&candidate_id).await, "consumed");
+
+    // No absorb run ever decided this capture, so no marker exists and the
+    // replay takes the pre-existing read-only projection of its resolution.
+    let workflows = harness.absorb_binding();
+    let bumping = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": [] }),
+        &harness.pool,
+    )
+    .bumping();
+    let policy = AutoPolicy;
+    let replay = workflows
+        .absorb(
+            &principal(),
+            &request,
+            None,
+            &MindCapabilities {
+                reasoner: Some(&bumping),
+                policy_hook: Some(&policy),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("replayed absorb");
+    assert!(matches!(
+        replay.as_slice(),
+        [AbsorbCandidateOutcome::Dropped { .. }]
+    ));
+    assert_eq!(harness.decision_marker().await, None);
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
 }
 
 #[tokio::test]
