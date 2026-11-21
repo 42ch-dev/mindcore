@@ -40,7 +40,7 @@ CREATE TABLE knowledge_entry_revisions (
   FOREIGN KEY (collection, entry_id) REFERENCES knowledge_entries(collection, entry_id)
 );
 
-CREATE TRIGGER knowledge_entries_keep_preimage
+CREATE TRIGGER knowledge_entries_capture_revision
 BEFORE UPDATE OF revision ON knowledge_entries
 WHEN NEW.revision <> OLD.revision
   AND <the dedicated-append case is excluded here>

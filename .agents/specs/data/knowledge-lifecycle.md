@@ -17,7 +17,7 @@ How a knowledge entry behaves over time: the history a write leaves behind, the 
 | `cognition_head_seq` | the head that payload was stored with, or null when it had none |
 | `recorded_at` | the replaced state's own `updated_at`, not the archiving instant |
 
-The table is written by the migration's `BEFORE UPDATE OF revision` trigger on `knowledge_entries`, not by the Rust write path: a cost contract pins the append path's statement count, so history must not add a literal statement there. The trigger is the table's only writer, and the primary key makes the write idempotent by construction. The trigger's skip predicate excludes the dedicated cognition append, which advances the carrier without replacing an entry payload.
+The table is written by `knowledge_entries_capture_revision`, the migration's `BEFORE UPDATE OF revision` trigger on `knowledge_entries`, not by the Rust write path: a cost contract pins the append path's statement count, so history must not add a literal statement there. The trigger is the table's only writer, and the primary key makes the write idempotent by construction. The trigger's skip predicate excludes the dedicated cognition append, which advances the carrier without replacing an entry payload.
 
 A create writes no history row, and a refused write (stale base revision, invalid module, missing committed record, exhausted revision space) writes none.
 
@@ -31,7 +31,7 @@ An unassigned revision, revision 0, a value above the representable range, and a
 
 - The destination is addressed by the **same `entry_id`**; the collection distinguishes the copy.
 - The copy carries one Mindcore adoption anchor naming the source entry and the source revision it was taken at. `mindcore_base::knowledge::adoption_anchor_parts` is the single parser for it — the producer and every consumer, including the SQLite resolver, read back through that one function.
-- A repeat returns the existing copy (`AlreadyPresent`) with its original anchor; it never rewrites the copy and never re-points the anchor at a newer source revision.
+- The anchor's recorded revision is the copy's identity. A repeat at that revision returns the existing copy (`AlreadyPresent`) with its original anchor; a request naming the source's current revision instead is `RevisionConflict` naming the revision the copy was adopted at, even when the source now sits at the requested one. A repeat never rewrites the copy and never re-points the anchor at a newer source revision.
 - A missing, retired or undisclosable source answers one generic `KnowledgeEntryNotFound`; a source the caller cannot see is indistinguishable from one that does not exist. An empty source id or a zero revision is refused before any I/O.
 - A destination slot occupied by anything else — including a retired entry — answers `KnowledgeEntryAlreadyExists` and is left byte-identical. The store distinguishes that case from a genuine validation failure by a structured refusal detail, never by matching a message.
 

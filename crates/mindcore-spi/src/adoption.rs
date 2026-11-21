@@ -42,7 +42,10 @@ pub enum AdoptionOutcome {
 /// A missing, superseded or undisclosable source is reported as one generic
 /// [`SpokeRejectCode::KnowledgeEntryNotFound`], repeat calls included: no anchor is ever written
 /// for a source the caller cannot see now. An occupied slot is recognized only by this adoption's
-/// own anchor; any other occupant, including a legacy anchor without a recorded revision or a
+/// own anchor, and only at the revision that anchor records: a copy adopted at another revision is
+/// [`SpokeRejectCode::RevisionConflict`] naming the revision it was adopted at, even when the
+/// source now sits at the requested one, so a stale copy is never served as the revision asked
+/// for. Any other occupant, including a legacy anchor without a recorded revision or a
 /// superseded row the live read hides, is [`SpokeRejectCode::KnowledgeEntryAlreadyExists`] and is
 /// never overwritten or refreshed. An empty `entry_id` and a zero revision name no anchor and are
 /// [`SpokeRejectCode::InvalidInput`].
@@ -76,14 +79,7 @@ pub async fn adopt_knowledge_entry(
     // The slot is the exact key. Only this adoption's own anchor is recognizable; any other
     // occupant is a conflict this helper never overwrites.
     let mut copy = match dst.get_knowledge_entry(entry_id).await {
-        SpokeResult::Ok(existing) => {
-            return classify(
-                existing,
-                entry_id,
-                expected_source_revision,
-                visible_source_revision,
-            )
-        }
+        SpokeResult::Ok(existing) => return classify(existing, entry_id, expected_source_revision),
         SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::KnowledgeEntryNotFound => {
             source
         }
@@ -110,12 +106,7 @@ pub async fn adopt_knowledge_entry(
             if reject.code == SpokeRejectCode::KnowledgeEntryAlreadyExists =>
         {
             match dst.get_knowledge_entry(entry_id).await {
-                SpokeResult::Ok(existing) => classify(
-                    existing,
-                    entry_id,
-                    expected_source_revision,
-                    visible_source_revision,
-                ),
+                SpokeResult::Ok(existing) => classify(existing, entry_id, expected_source_revision),
                 SpokeResult::Reject(_) => SpokeResult::Reject(reject),
             }
         }
@@ -125,17 +116,16 @@ pub async fn adopt_knowledge_entry(
 }
 
 /// Answers one occupancy of the destination slot by the anchor rule.
+///
+/// The revision the anchor records is the copy's identity, never the source's current revision: a
+/// request naming anything else is a stale copy, not the revision it asked for.
 fn classify(
     existing: KnowledgeEntry,
     entry_id: &str,
     expected_source_revision: u64,
-    visible_source_revision: Option<u64>,
 ) -> SpokeResult<AdoptionOutcome> {
     match adopted_revision(&existing, entry_id) {
-        Some(adopted)
-            if expected_source_revision == adopted
-                || visible_source_revision == Some(expected_source_revision) =>
-        {
+        Some(adopted) if expected_source_revision == adopted => {
             SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing))
         }
         Some(adopted) => spoke_reject(

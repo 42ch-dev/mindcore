@@ -577,3 +577,71 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
         other => panic!("the refusals must leave the slot empty, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn adoption_refuses_a_copy_from_another_source_revision() {
+    let entry_id = "ke_shared_gate";
+
+    // A copy adopted at revision 1 stays that copy after the source advances: a request naming
+    // revision 2 asks for content this slot never adopted.
+    let src = MemoryKnowledgeEntries::default();
+    let dst = MemoryKnowledgeEntries::default();
+    let first = match src.put_knowledge_entry(shared_entry(entry_id), None).await {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
+    };
+    match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+        SpokeResult::Ok(AdoptionOutcome::Created(copy)) => assert_eq!(
+            mindcore_base::knowledge::adoption_anchor_parts(&copy),
+            Some((entry_id, Some(1)))
+        ),
+        other => panic!("the first adoption must create, got {other:?}"),
+    }
+    match src.put_knowledge_entry(first, Some(1)).await {
+        SpokeResult::Ok(advanced) => assert_eq!(advanced.revision, Some(2)),
+        SpokeResult::Reject(reject) => panic!("advance refused: {reject:?}"),
+    }
+    match adopt_knowledge_entry(&src, &dst, entry_id, 2).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+            assert_eq!(
+                reject.message,
+                format!("adopted copy of {entry_id} carries source revision 1")
+            );
+        }
+        other => panic!("a newer request must not be answered by an older copy, got {other:?}"),
+    }
+
+    // The mirror: a copy adopted at 2 while the source sits at 3.
+    let src = MemoryKnowledgeEntries::default();
+    let dst = MemoryKnowledgeEntries::default();
+    let first = match src.put_knowledge_entry(shared_entry(entry_id), None).await {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
+    };
+    let second = match src.put_knowledge_entry(first, Some(1)).await {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => panic!("advance refused: {reject:?}"),
+    };
+    match adopt_knowledge_entry(&src, &dst, entry_id, 2).await {
+        SpokeResult::Ok(AdoptionOutcome::Created(copy)) => assert_eq!(
+            mindcore_base::knowledge::adoption_anchor_parts(&copy),
+            Some((entry_id, Some(2)))
+        ),
+        other => panic!("the adoption at revision 2 must create, got {other:?}"),
+    }
+    match src.put_knowledge_entry(second, Some(2)).await {
+        SpokeResult::Ok(advanced) => assert_eq!(advanced.revision, Some(3)),
+        SpokeResult::Reject(reject) => panic!("advance refused: {reject:?}"),
+    }
+    match adopt_knowledge_entry(&src, &dst, entry_id, 3).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+            assert_eq!(
+                reject.message,
+                format!("adopted copy of {entry_id} carries source revision 2")
+            );
+        }
+        other => panic!("a newer request must not be answered by an older copy, got {other:?}"),
+    }
+}
