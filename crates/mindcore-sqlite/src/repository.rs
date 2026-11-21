@@ -1030,6 +1030,26 @@ struct JournalRow {
     updated_at: String,
 }
 
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for JournalRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            seq: row.try_get("seq")?,
+            receipt_id: row.try_get("receipt_id")?,
+            space_id: row.try_get("space_id")?,
+            subject_id: row.try_get("subject_id")?,
+            requester_principal_id: row.try_get("requester_principal_id")?,
+            op: row.try_get("op")?,
+            idempotency_key: row.try_get("idempotency_key")?,
+            state: row.try_get("state")?,
+            targets_json: row.try_get("targets_json")?,
+            result_json: row.try_get("result_json")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
 /// The borrowed-transaction repository. Zero-sized: the caller's transaction is the seam.
 pub struct SqliteMemoryRepository;
 
@@ -1083,6 +1103,29 @@ impl SqliteMemoryRepository {
         .fetch_all(&mut **tx)
         .await
         .map_err(decode_row)
+    }
+
+    /// The journal row one receipt names, in whatever space it carries: the
+    /// receipt id is globally unique, so the row under it is a fact the caller
+    /// validates rather than filters away as absence.
+    pub async fn journal_by_receipt(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        receipt_id: &str,
+    ) -> RepoResult<Option<MemoryJournalRow>> {
+        // Runtime-checked rather than the compile-checked macro: this lookup
+        // owns no offline query cache entry.
+        sqlx::query_as::<_, JournalRow>(
+            "SELECT seq, receipt_id, space_id, subject_id, requester_principal_id, \
+             op, idempotency_key, state, targets_json, result_json, created_at, updated_at \
+             FROM memory_journal WHERE receipt_id = ?",
+        )
+        .bind(receipt_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(journal_row)
+        .transpose()
     }
 }
 

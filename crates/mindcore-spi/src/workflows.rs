@@ -1572,6 +1572,17 @@ fn stamp_cognition_record(
     }
     let record = Value::Object(record);
     if let SpokeResult::Reject(reject) = validate_cognition_record(&record) {
+        // The assessment context is the one validated field the caller
+        // supplies: when the record validates without it, the rejection is
+        // that input's, not the provider's draft.
+        if request.assessment_context_id.is_some()
+            && validates_with_derived_context(&record, request)
+        {
+            return Err(SpiError::InvalidInput(format!(
+                "assessment_context_id is not a valid context: {}",
+                reject.message
+            )));
+        }
         return Err(invalid_verdict(format!(
             "the proposed record was rejected ({}): {}",
             reject.code, reject.message
@@ -1579,6 +1590,23 @@ fn stamp_cognition_record(
     }
     serde_json::from_value(record)
         .map_err(|error| invalid_verdict(format!("the proposed record does not decode: {error}")))
+}
+
+/// Whether the record validates with the assessment context derived from the
+/// subject, as a request that supplied none would have stamped it.
+fn validates_with_derived_context(record: &Value, request: &DeliberateRequest<'_>) -> bool {
+    let mut derived = record.clone();
+    let Some(context) = derived
+        .get_mut("assessment_context")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    context.insert(
+        "context_id".to_string(),
+        Value::String(request.subject_id.to_string()),
+    );
+    !matches!(validate_cognition_record(&derived), SpokeResult::Reject(_))
 }
 
 /// A fresh record id: the workflow clock plus a digest of the trusted target

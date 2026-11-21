@@ -666,9 +666,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let receipt = admission::probe(&SqliteMemoryRepository, &mut transaction, &op)
             .await
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?
-            .ok_or_else(|| {
-                internal("no committed capture receipt for this absorb".to_string())
-            })?;
+            .ok_or_else(|| internal("no committed capture receipt for this absorb".to_string()))?;
         let ReceiptState::Committed { result, .. } = &receipt.state else {
             return Err(internal(format!(
                 "capture receipt {} is not committed",
@@ -1330,10 +1328,10 @@ fn candidate_ids(body: &Value) -> Result<Vec<String>, SpiError> {
 /// receipt order.
 ///
 /// Read on the capture's admitted transaction, keyed by the receipt id the
-/// body carries. A row under that receipt id that is not this marker, or a
-/// marker naming anything but a nonempty receipt-ordered part of what the
-/// receipt holds, is storage corruption: never permission to project the
-/// candidate's current state.
+/// body carries. A row under that receipt id that is not this marker, names
+/// another space than the admitted capture, or names anything but a nonempty
+/// receipt-ordered part of what the receipt holds, is storage corruption:
+/// never permission to project the candidate's current state.
 async fn absorb_decision(
     transaction: &mut Tx<'_>,
     space_id: &str,
@@ -1346,8 +1344,11 @@ async fn absorb_decision(
         .and_then(Value::as_str)
         .ok_or_else(|| internal("a replayed capture carries no receipt_id".to_string()))?;
     let space = SpaceId::new(space_id.to_string());
+    // The receipt id is globally unique, so the row under it is read whole and
+    // its space validated below: filtering by space first would hide a
+    // corrupted marker as one that was never written.
     let Some(marker) = SqliteMemoryRepository
-        .journal_intent(transaction, &space, receipt_id)
+        .journal_by_receipt(transaction, receipt_id)
         .await
         .map_err(|error| {
             internal(format!(
@@ -1359,9 +1360,14 @@ async fn absorb_decision(
     };
     let requester = body.get("requester_principal_id").and_then(Value::as_str);
     let key = body.get("idempotency_key").and_then(Value::as_str);
+    // The payload is exactly the receipt-ordered pending list: a right list
+    // beside any other member is as malformed as a wrong one, so replay
+    // accepts no shape the repeat write refuses.
     let pending = marker
         .result
         .as_ref()
+        .and_then(Value::as_object)
+        .filter(|result| result.len() == 1)
         .and_then(|result| result.get("pending_candidate_ids"))
         .and_then(Value::as_array)
         .and_then(|ids| {
@@ -1390,7 +1396,11 @@ async fn absorb_decision(
     // list: order and uniqueness come from that list, so an empty, repeated or
     // reordered decision is corruption, never the recorded one.
     let mut held = capture_candidates.iter();
-    if pending.is_empty() || !pending.iter().all(|id| held.any(|candidate| candidate == id)) {
+    if pending.is_empty()
+        || !pending
+            .iter()
+            .all(|id| held.any(|candidate| candidate == id))
+    {
         return Err(internal(format!(
             "absorb decision {receipt_id} is not a nonempty receipt-ordered part of the capture receipt"
         )));
