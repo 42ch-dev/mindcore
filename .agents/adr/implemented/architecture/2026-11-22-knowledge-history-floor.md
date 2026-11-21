@@ -13,7 +13,7 @@ Bounding it is not a delete loop. A range read answers revision N by taking the 
 
 Two things, landing together:
 
-1. **A floor on the entry row.** `knowledge_entries.history_floor_revision`, `NOT NULL DEFAULT 1`, is the earliest revision the entry can still answer — the revision just above the oldest deleted checkpoint, not the oldest surviving one. `read_entry_revision` compares the request to the floor **before** selecting a checkpoint; at or above the floor nothing changes, below it the read refuses. A dedicated append writes no preimage, so a derived revision between surviving checkpoints stays replayable from the next checkpoint; setting the floor at that survivor would refuse a revision the store answers exactly.
+1. **A floor on the entry row.** `knowledge_entries.history_floor_revision`, `NOT NULL DEFAULT 1`, is the earliest revision the entry can still answer — the revision just above the newest deleted checkpoint, not the oldest surviving one. `read_entry_revision` compares the request to the floor **before** selecting a checkpoint; at or above the floor nothing changes, below it the read refuses. A dedicated append writes no preimage, so a derived revision between surviving checkpoints stays replayable from the next checkpoint; setting the floor at that survivor would refuse a revision the store answers exactly.
 2. **A classifiable refusal.** `KnowledgeEntryNotFound` with `details.reason: "HISTORY_TRUNCATED"` and the message `knowledge entry revision was pruned`. Ordinary absence keeps `details: None`, so a caller can `match` "never existed" apart from "we removed it".
 3. **Explicit pruning only.** `ScopedKnowledgeStore::prune_history(entry_id, keep)` — an inherent method, because `KnowledgeEntryPort` belongs to the external `spoke_operations` crate and must not grow. `keep` is a call argument with no global default; nothing prunes on a write, on `MindStore::open`, or in a background task. The delete and the floor update share one `BEGIN IMMEDIATE`; the boundary is probed with two rows rather than loading every checkpoint; the floor-only update does not fire the revision-capture trigger.
 
@@ -31,7 +31,7 @@ Two things, landing together:
 ## Consequences
 
 - A read degrades from "silently wrong or internally broken" to "explicit refusal" once history is bounded — the property the whole change exists for.
-- The floor is reportable, so a caller can learn what it lost before deciding whether pruning is acceptable.
+- The floor is stored on the entry row and returned by the prune that moves it, so a caller learns what it deleted in the call that deleted it; no read API reports a stored floor.
 - Pruning is permanent. There is no undo, no archive, and no retention policy that runs on its own; a host that wants bounded history must call the operation.
 - Cost is one column and one comparison on the hottest read path. The prune probe is constant-work in rows read, at the price of a possible index walk for a very large `keep`.
 - The floor joins the schema's recreate-on-mismatch policy: no migration path, no back-fill.
