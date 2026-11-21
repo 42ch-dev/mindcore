@@ -205,6 +205,8 @@ fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
 // protocol operation.
 pub async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // One host transaction covers both rows: a failed grant must not leave an active space.
+    let mut tx = pool.begin().await.expect("begin the provisioning");
     sqlx::query(
         "INSERT INTO memory_spaces \
          (space_id, display_name, authority_host_id, authority_generation, status, revision, \
@@ -214,10 +216,9 @@ pub async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
     .bind(space)
     .bind(space)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("provision the space");
-    let mut tx = pool.begin().await.expect("begin the grant transaction");
     SqliteMemoryRepository
         .insert_grant(
             &mut tx,
@@ -246,7 +247,7 @@ pub async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
         )
         .await
         .expect("provision the grant");
-    tx.commit().await.expect("commit the grant");
+    tx.commit().await.expect("commit the provisioning");
 }
 
 /// One adapter subject registration: the story's Wren and the race tests' shared subject.
