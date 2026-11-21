@@ -40,6 +40,9 @@ const GATE_ONE: &str = "the north gate shuts after dusk";
 const GATE_TWO: &str = "the north gate shuts after dusk; a keeper walks it";
 const PERSONAL_NOTE: &str = "wren's own note: the keeper carries the key";
 const CARRIER_SUMMARY: &str = "the keeper's beliefs";
+/// The attempted rewrite's summary differs from the committed one, so the rollback probe can tell
+/// a leaked payload from the committed payload.
+const CARRIER_REWRITE_SUMMARY: &str = "the keeper's amended beliefs";
 
 fn cognition_module_key() -> KnowledgeEntryModulesKey {
     KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key")
@@ -55,8 +58,8 @@ fn knowledge_module(module: Value) -> KnowledgeEntryModulesValue {
 }
 
 /// A carrier entry holding `records` inline, the shape a full put accepts.
-fn carrier(entry_id: &str, records: usize) -> KnowledgeEntry {
-    let mut entry = entry(entry_id, "character", CARRIER_SUMMARY);
+fn carrier(entry_id: &str, records: usize, summary: &str) -> KnowledgeEntry {
+    let mut entry = entry(entry_id, "character", summary);
     let records: Vec<Value> = (1..=records)
         .map(|index| belief(entry_id, &format!("cog_{index}")))
         .collect();
@@ -379,7 +382,13 @@ async fn shared_scope_holds_the_first_five_live_facts() {
         .await
         .expect("item 5: begin immediate");
     expect_ok(
-        write_entry(&mut write, SHARED, carrier("ke_keeper_log", 2), None).await,
+        write_entry(
+            &mut write,
+            SHARED,
+            carrier("ke_keeper_log", 2, CARRIER_SUMMARY),
+            None,
+        )
+        .await,
         "item 5: create the carrier inside the reservation",
     );
     write.commit().await.expect("item 5: commit");
@@ -416,7 +425,7 @@ async fn shared_scope_holds_the_first_five_live_facts() {
         write_entry(
             &mut rewrite,
             SHARED,
-            carrier("ke_keeper_log", 3),
+            carrier("ke_keeper_log", 3, CARRIER_REWRITE_SUMMARY),
             Some(1),
         )
         .await,
@@ -440,7 +449,8 @@ async fn shared_scope_holds_the_first_five_live_facts() {
     assert_eq!(
         after.body.summary.as_deref(),
         Some(CARRIER_SUMMARY),
-        "I-000009 item 5 (carrier transaction): the rolled-back payload never became visible"
+        "I-000009 item 5 (carrier transaction): the rollback kept the committed payload, not the \
+         attempted one",
     );
     assert_eq!(
         expect_ok(
