@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{append_cognition, MindStore, PruneReport};
 use serde_json::{json, Map, Value};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
@@ -21,6 +21,7 @@ use spoke_schemas::knowledge_entry::{
     KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner,
 };
 use spoke_schemas::KnowledgeEntry;
+use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -240,6 +241,69 @@ fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
             );
         }
     }
+}
+
+fn expect_history_truncated<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) {
+    match result {
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::KnowledgeEntryNotFound,
+                "{context}"
+            );
+            assert_eq!(
+                reject.message, "knowledge entry revision was pruned",
+                "{context}"
+            );
+            assert_eq!(
+                reject
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("reason")),
+                Some(&Value::from("HISTORY_TRUNCATED")),
+                "{context}: the truncation refusal names its class"
+            );
+        }
+    }
+}
+
+async fn history_floor(pool: &SqlitePool, collection: &str, entry_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT history_floor_revision FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .expect("stored history floor")
+}
+
+// Seed a floor directly, without a prune, so the read gate is provable on its own.
+async fn seed_history_floor(pool: &SqlitePool, collection: &str, entry_id: &str, floor: i64) {
+    sqlx::query(
+        "UPDATE knowledge_entries SET history_floor_revision = ? \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(floor)
+    .bind(collection)
+    .bind(entry_id)
+    .execute(pool)
+    .await
+    .expect("seed a history floor");
+}
+
+async fn checkpoint_revisions(pool: &SqlitePool, collection: &str, entry_id: &str) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("stored checkpoint revisions")
 }
 
 const REVISION_ONE: &str = "the north gate shuts after dusk";
@@ -609,6 +673,616 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         shared.get_entry_at_revision("entry-b", 2).await,
         "a revision of a live entry that never existed",
     );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
+    let path = database_path("floor");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+
+    // Three revisions: the first carries no record, the second one, the third two.
+    let created = expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-f", REVISION_ONE), None)
+            .await,
+        "create entry-f",
+    );
+    let second = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry("entry-f", REVISION_TWO, vec![belief("entry-f", "cog_one")]),
+                Some(1),
+            )
+            .await,
+        "second revision",
+    );
+    let third = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    REVISION_THREE,
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(2),
+            )
+            .await,
+        "third revision",
+    );
+
+    // The column default starts a fresh row at 1: creation never names it, and neither update
+    // moved it.
+    let pool = store.pool();
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 1);
+
+    // At or above floor 1 every revision replays as stored: 1 and 2 from a saved checkpoint, 3
+    // from the live row.
+    for (revision, expected) in [
+        (1, as_json(&created)),
+        (2, as_json(&second)),
+        (3, as_json(&third)),
+    ] {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-f", revision).await,
+                "replay at the default floor"
+            )),
+            expected,
+            "revision {revision} replays unchanged at the default floor"
+        );
+    }
+
+    // Seed the floor directly, without a prune, so the read gate is proven on its own.
+    seed_history_floor(&pool, "shared", "entry-f", 2).await;
+
+    // Below the floor the preimage was pruned: that is not the generic absence.
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-f", 1).await,
+        "a revision below the seeded floor",
+    );
+
+    // At or above the floor replay is byte-identical to the pre-seed result: revision 2 is a
+    // checkpoint hit and revision 3 the live fallback.
+    for (revision, expected) in [(2, as_json(&second)), (3, as_json(&third))] {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-f", revision).await,
+                "replay at the seeded floor"
+            )),
+            expected,
+            "revision {revision} replays unchanged above the floor"
+        );
+    }
+
+    // A later full write leaves the floor alone: the column is storage-owned, not payload-derived.
+    let fourth = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    "the mill door is barred",
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(3),
+            )
+            .await,
+        "fourth revision",
+    );
+    assert_eq!(fourth.revision, Some(4));
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+
+    // Generic absence still covers zero, the unrepresentable range, a missing entry and a revision
+    // above the live one; a floor never turns one of those into a refusal that claims a prune.
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", 0).await,
+        "revision zero",
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", u64::MAX).await,
+        "a revision outside the representable range",
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-never-seeded", 2).await,
+        "a missing entry",
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", 5).await,
+        "a revision above the live one",
+    );
+
+    // The floor lives on the entry row, so the truncation refusal survives a close and reopen of
+    // the same file instead of being reconstructed in memory.
+    drop(pool);
+    store.close().await;
+    let store = MindStore::open(&path).await.expect("reopen the store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    assert_eq!(history_floor(&store.pool(), "shared", "entry-f").await, 2);
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-f", 1).await,
+        "a pruned revision after reopen",
+    );
+    assert_eq!(
+        as_json(&expect_ok(
+            shared.get_entry_at_revision("entry-f", 2).await,
+            "a checkpoint above the floor after reopen"
+        )),
+        as_json(&second)
+    );
+    assert_eq!(
+        as_json(&expect_ok(
+            shared.get_entry_at_revision("entry-f", 4).await,
+            "the live revision after reopen"
+        )),
+        as_json(&fourth)
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", 5).await,
+        "a revision above the live one after reopen",
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
+    let path = database_path("prune");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+
+    // Create, then three full rewrites: revisions 1..4 and one checkpoint for each replaced
+    // revision, so 1, 2 and 3 are on disk and 4 is the live row.
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-f", REVISION_ONE), None)
+            .await,
+        "create entry-f",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry("entry-f", REVISION_TWO, vec![belief("entry-f", "cog_one")]),
+                Some(1),
+            )
+            .await,
+        "second revision",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    REVISION_THREE,
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(2),
+            )
+            .await,
+        "third revision",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    "the north gate reopens at dawn",
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(3),
+            )
+            .await,
+        "fourth revision",
+    );
+
+    let pool = store.pool();
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [1, 2, 3]
+    );
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 1);
+
+    // The prune keeps revisions 2 and up. Replay every one of them now, before the prune, so the
+    // comparison after it is replay-to-replay rather than write-to-replay.
+    let mut replay_before = Vec::new();
+    for revision in 2..=4 {
+        replay_before.push((
+            revision,
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-f", revision).await,
+                "replay before the prune",
+            ))
+            .to_string(),
+        ));
+    }
+
+    let pruned: PruneReport = expect_ok(
+        shared.prune_history("entry-f", 2).await,
+        "prune to the two newest checkpoints",
+    );
+    assert_eq!(pruned.deleted, 1);
+    assert_eq!(pruned.floor, Some(2));
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3],
+        "the prune deletes exactly the checkpoints below the new floor"
+    );
+
+    // At or above the floor the replay is byte-identical to the replay snapshotted before it.
+    for (revision, expected) in replay_before {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-f", revision).await,
+                "replay above the new floor"
+            ))
+            .to_string(),
+            expected,
+            "revision {revision} replays exactly as it did before the prune"
+        );
+    }
+    // The revision just below the floor is the one the prune removed.
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-f", 1).await,
+        "the revision just below the new floor",
+    );
+
+    // A second prune with the same window has nothing to delete and leaves the floor alone.
+    let repeated = expect_ok(
+        shared.prune_history("entry-f", 2).await,
+        "a repeated prune with the same window",
+    );
+    assert_eq!(repeated.deleted, 0);
+    assert_eq!(repeated.floor, None);
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3]
+    );
+
+    // Emptying history is a different action: a zero window is refused before any transaction.
+    assert_eq!(
+        expect_reject(
+            shared.prune_history("entry-f", 0).await,
+            "a prune that keeps no checkpoint"
+        ),
+        SpokeRejectCode::InvalidInput
+    );
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3]
+    );
+
+    // A missing entry answers the current-entry absence, not a prune-shaped refusal.
+    match shared.prune_history("entry-never-seeded", 1).await {
+        SpokeResult::Ok(report) => panic!("a missing entry was pruned with {report:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+            assert_eq!(
+                reject.message,
+                "no knowledge entry entry-never-seeded in collection shared"
+            );
+            assert!(reject.details.is_none());
+        }
+    }
+
+    // A retired entry keeps its history and answers the same generic absence: the live-only
+    // predicate refuses it before any checkpoint is read or deleted.
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                entry_with("entry-g", "the mill door replaces the gate"),
+                None,
+            )
+            .await,
+        "seed entry-g",
+    );
+    expect_ok(
+        shared.supersede_entry("entry-f", 4, "entry-g").await,
+        "supersede entry-f with entry-g",
+    );
+    match shared.prune_history("entry-f", 1).await {
+        SpokeResult::Ok(report) => panic!("a retired entry was pruned with {report:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+            assert_eq!(
+                reject.message,
+                "no knowledge entry entry-f in collection shared"
+            );
+            assert!(reject.details.is_none());
+        }
+    }
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3, 4],
+        "the refused prune leaves the retired entry's history untouched"
+    );
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+
+    // A later prune with a *smaller* window cuts again: the window's K-th newest is not yet the
+    // floor, so the delete must still remove rows. This is the case a floor-only prune would fail.
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-h", REVISION_ONE), None)
+            .await,
+        "seed entry-h",
+    );
+    for (expected, summary) in [
+        (1, "the mill door opens at dawn"),
+        (2, "the mill door opens at dawn; a keeper sweeps it"),
+        (3, "the mill door opens at dawn; the miller sweeps it"),
+    ] {
+        expect_ok(
+            shared
+                .put_knowledge_entry(entry_with("entry-h", summary), Some(expected))
+                .await,
+            "rewrite entry-h",
+        );
+    }
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-h").await,
+        [1, 2, 3]
+    );
+
+    let first = expect_ok(
+        shared.prune_history("entry-h", 2).await,
+        "prune entry-h to the two newest checkpoints",
+    );
+    assert_eq!((first.deleted, first.floor), (1, Some(2)));
+
+    let second = expect_ok(
+        shared.prune_history("entry-h", 1).await,
+        "prune entry-h again with a smaller window",
+    );
+    assert!(
+        second.deleted >= 1,
+        "a smaller window deletes at least one checkpoint, got {second:?}"
+    );
+    assert_eq!(second.floor, Some(3));
+    assert_eq!(history_floor(&pool, "shared", "entry-h").await, 3);
+    assert_eq!(checkpoint_revisions(&pool, "shared", "entry-h").await, [3]);
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn knowledge_prune_keeps_revisions_derived_across_a_gap_replayable() {
+    let path = database_path("append-gap");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+
+    // Alternate full rewrites and dedicated appends: an append advances the revision without
+    // writing a preimage, so the checkpoints sit at 1, 3 and 5 and revisions 2 and 4 are derived,
+    // replaying only from the checkpoint above them.
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-p", REVISION_ONE), None)
+            .await,
+        "create entry-p",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry("entry-p", REVISION_TWO, vec![belief("entry-p", "cog_one")]),
+                Some(1),
+            )
+            .await,
+        "second revision",
+    );
+    let mut appended = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin the first dedicated append");
+    match append_cognition(
+        &mut appended,
+        "shared",
+        "entry-p",
+        2,
+        &belief("entry-p", "cog_two"),
+    )
+    .await
+    {
+        SpokeResult::Ok(assigned) => assert_eq!(assigned, 3),
+        SpokeResult::Reject(reject) => panic!("first dedicated append rejected: {reject:?}"),
+    }
+    appended
+        .commit()
+        .await
+        .expect("commit the first dedicated append");
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-p",
+                    REVISION_THREE,
+                    vec![belief("entry-p", "cog_one"), belief("entry-p", "cog_two")],
+                ),
+                Some(3),
+            )
+            .await,
+        "fourth revision",
+    );
+    let mut appended = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin the second dedicated append");
+    match append_cognition(
+        &mut appended,
+        "shared",
+        "entry-p",
+        4,
+        &belief("entry-p", "cog_three"),
+    )
+    .await
+    {
+        SpokeResult::Ok(assigned) => assert_eq!(assigned, 5),
+        SpokeResult::Reject(reject) => panic!("second dedicated append rejected: {reject:?}"),
+    }
+    appended
+        .commit()
+        .await
+        .expect("commit the second dedicated append");
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-p",
+                    "the north gate reopens at dawn",
+                    vec![
+                        belief("entry-p", "cog_one"),
+                        belief("entry-p", "cog_two"),
+                        belief("entry-p", "cog_three"),
+                    ],
+                ),
+                Some(5),
+            )
+            .await,
+        "sixth revision",
+    );
+
+    let pool = store.pool();
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-p").await,
+        [1, 3, 5]
+    );
+
+    let mut replay_before = Vec::new();
+    for revision in 2..=6 {
+        replay_before.push((
+            revision,
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-p", revision).await,
+                "replay before the prune",
+            ))
+            .to_string(),
+        ));
+    }
+    let expected_derived = replay_before
+        .iter()
+        .find(|(revision, _)| *revision == 2)
+        .map(|(_, expected)| expected.clone())
+        .expect("revision 2 was replayed before the prune");
+
+    // Keeping two checkpoints deletes only checkpoint 1. Revisions 2 and 4 lose their preimage but
+    // not their answer: the next checkpoint plus the crossed appends replays them exactly.
+    let pruned: PruneReport = expect_ok(
+        shared.prune_history("entry-p", 2).await,
+        "prune to the two newest checkpoints",
+    );
+    assert_eq!((pruned.deleted, pruned.floor), (1, Some(2)));
+    assert_eq!(history_floor(&pool, "shared", "entry-p").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-p").await,
+        [3, 5]
+    );
+
+    for (revision, expected) in &replay_before {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-p", *revision).await,
+                "replay a revision at or above the new floor",
+            ))
+            .to_string(),
+            *expected,
+            "revision {revision} answers exactly after the prune"
+        );
+    }
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-p", 1).await,
+        "the revision whose preimage the prune removed",
+    );
+
+    // The derived replay survives a reopen: it is the surviving checkpoint, not the deleted row,
+    // that keeps revision 2 answerable.
+    drop(pool);
+    store.close().await;
+    let store = MindStore::open(&path).await.expect("reopen the store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    assert_eq!(
+        as_json(&expect_ok(
+            shared.get_entry_at_revision("entry-p", 2).await,
+            "replay the derived revision after reopen",
+        ))
+        .to_string(),
+        expected_derived,
+        "revision 2 still answers exactly after the prune and a reopen"
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn knowledge_history_survives_writes_and_reopen_until_an_explicit_prune() {
+    let path = database_path("retention");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+
+    // Create plus three full rewrites: one checkpoint per replaced revision, none removed.
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-r", REVISION_ONE), None)
+            .await,
+        "create entry-r",
+    );
+    for (expected, summary) in [
+        (1, REVISION_TWO),
+        (2, REVISION_THREE),
+        (3, "the north gate reopens at dawn"),
+    ] {
+        let written = expect_ok(
+            shared
+                .put_knowledge_entry(entry_with("entry-r", summary), Some(expected))
+                .await,
+            "rewrite entry-r",
+        );
+        assert_eq!(written.revision, Some(expected + 1));
+    }
+
+    let pool = store.pool();
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-r").await,
+        [1, 2, 3],
+        "ordinary writes keep one checkpoint per replaced revision"
+    );
+    assert_eq!(history_floor(&pool, "shared", "entry-r").await, 1);
+
+    // Reopening the same file removes nothing: the checkpoints and the floor survive it.
+    drop(pool);
+    store.close().await;
+    let store = MindStore::open(&path).await.expect("reopen the store");
+    assert_eq!(
+        checkpoint_revisions(&store.pool(), "shared", "entry-r").await,
+        [1, 2, 3],
+        "reopening a store keeps every checkpoint"
+    );
+    assert_eq!(history_floor(&store.pool(), "shared", "entry-r").await, 1);
+
+    // Only an explicit prune removes history, and only what its window leaves behind.
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    let pruned: PruneReport = expect_ok(
+        shared.prune_history("entry-r", 2).await,
+        "prune to the two newest checkpoints",
+    );
+    assert_eq!(pruned.deleted, 1);
+    assert_eq!(pruned.floor, Some(2));
+    assert_eq!(
+        checkpoint_revisions(&store.pool(), "shared", "entry-r").await,
+        [2, 3],
+        "the explicit prune leaves exactly the kept window"
+    );
+    assert_eq!(history_floor(&store.pool(), "shared", "entry-r").await, 2);
 
     store.close().await;
     remove_database(&path);
