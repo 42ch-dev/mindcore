@@ -17,13 +17,17 @@ How a knowledge entry behaves over time: the history a write leaves behind, the 
 | `cognition_head_seq` | the head that payload was stored with, or null when it had none |
 | `recorded_at` | the replaced state's own `updated_at`, not the archiving instant |
 
-The table is written by `knowledge_entries_capture_revision`, the migration's `BEFORE UPDATE OF revision` trigger on `knowledge_entries`, not by the Rust write path: a cost contract pins the append path's statement count, so history must not add a literal statement there. The trigger is the table's only writer, and the primary key rejects a second row for the same revision, so a repeated capture fails as a constraint violation rather than duplicating the preimage. The trigger's skip predicate excludes the dedicated cognition append, which advances the carrier without replacing an entry payload.
+The table is written by `knowledge_entries_capture_revision`, the migration's `BEFORE UPDATE OF revision` trigger on `knowledge_entries`, not by the Rust write path: a cost contract pins the append path's statement count, so history must not add a literal statement there. The trigger is the table's only inserter, and an explicit prune its only deleter; the primary key rejects a second row for the same revision, so a repeated capture fails as a constraint violation rather than duplicating the preimage. The trigger's skip predicate excludes the dedicated cognition append, which advances the carrier without replacing an entry payload.
 
 A create writes no history row, and a refused write (stale base revision, invalid module, missing committed record, exhausted revision space) writes none.
 
-**Replay.** Reading an entry as of revision N returns the stored preimage at the first saved revision at or above N — the live row stands in when no saved revision is that recent — with cognition records truncated to that checkpoint's head minus the number of dedicated appends crossed, that is, its revision minus N. The reconstructible gap between the **requested** revision and the nearest saved checkpoint at or above it consists only of dedicated appends, so the read proves that by position: the crossed `append_seq` values must be exactly the consecutive integers in the range, each classified. A missing, extra, duplicate or non-integer position is `InternalError` — a row count is not a proof, because SQLite's non-strict columns accept a `REAL` in an integer position and a counted fractional row masks a missing one.
+**Retention.** `ScopedKnowledgeStore::prune_history(entry_id, keep)` is the one operation that removes history, and only a caller asks for it: the checkpoints it deletes are gone permanently — not archived, recoverable or replayable afterwards. `keep` counts checkpoints, newest first, and never the live row. While more than `keep` checkpoints exist, the prune deletes every checkpoint below the `keep`-th newest and records that checkpoint's revision as `history_floor_revision`; otherwise it deletes nothing, reports `deleted: 0`, and leaves the stored floor alone, so a repeated prune with the same `keep` is a no-op. A `keep` of zero is refused. Only a live entry is pruned; a retired one answers the generic absence and keeps every checkpoint.
 
-An unassigned revision, revision 0, a value above the representable range, and a missing entry all answer `KnowledgeEntryNotFound` with the message `knowledge entry revision not found` and no details.
+**Replay.** Reading an entry as of revision N is gated by the entry's persisted `history_floor_revision` before checkpoint selection: a positive revision below the floor was pruned, so it is refused rather than looked up — after selection it would be indistinguishable from "no saved revision that recent", which is the live fallback, and that fallback would answer the request with current content. At or above the floor, replay returns the stored preimage at the first saved revision at or above N — the live row stands in when no saved revision is that recent — with cognition records truncated to that checkpoint's head minus the number of dedicated appends crossed, that is, its revision minus N. The reconstructible gap between the **requested** revision and the nearest saved checkpoint at or above it consists only of dedicated appends, so the read proves that by position: the crossed `append_seq` values must be exactly the consecutive integers in the range, each classified. A missing, extra, duplicate or non-integer position is `InternalError` — a row count is not a proof, because SQLite's non-strict columns accept a `REAL` in an integer position and a counted fractional row masks a missing one.
+
+A revision below the entry's floor answers `KnowledgeEntryNotFound` with the message `knowledge entry revision was pruned` and `details.reason` `HISTORY_TRUNCATED`; a caller matches the code and that token, never the message.
+
+An unassigned revision, revision 0, a value above the representable range, a revision above the live one, and a missing entry all answer `KnowledgeEntryNotFound` with the message `knowledge entry revision not found` and no details.
 
 ### Adoption
 
@@ -49,6 +53,7 @@ An unassigned revision, revision 0, a value above the representable range, and a
 ## Invariants
 
 - History, adoption and retirement share the existing immediate-transaction discipline: the write reservation is taken before claim state is read.
+- Pruning shares that discipline: one `BEGIN IMMEDIATE` reservation covers the entry read, the window computation, the deletes and the floor update. It writes only `history_floor_revision` on the entry row — never the revision — so the capture trigger saves no checkpoint of the prune itself. A retired entry's history is never deleted, and no cognition record or live payload is touched.
 - The disclosure predicate is unchanged: hiding is one generic absence on every served path.
 - The current-row read, the header read, the default list and the scoped put keep their statement counts; the filter is an added predicate.
 - A retired row and its history are never deleted; no committed cognition record is rewritten.
@@ -57,7 +62,7 @@ An unassigned revision, revision 0, a value above the representable range, and a
 ## Where it lives
 
 - History table, trigger, retirement column: `crates/mindcore-sqlite/migrations/0001_init.sql`.
-- Write path, replay, retirement write, resolution, current-record predicate: `crates/mindcore-sqlite/src/knowledge.rs`, `cognition.rs`.
+- Write path, replay, explicit prune, retirement write, resolution, current-record predicate: `crates/mindcore-sqlite/src/knowledge.rs`, `cognition.rs`.
 - Adoption and the anchor codec: `crates/mindcore-spi/src/adoption.rs`, `crates/mindcore-base/src/knowledge.rs`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
 
@@ -67,7 +72,7 @@ A storage failure on the served knowledge face answers `InternalError` with the 
 
 ## Known limits
 
-- History has no retention or archival policy; it grows with writes.
+- History is bounded only by an explicit `prune_history` call: there is no retention schedule, no default `keep`, and no archive, so a pruned preimage cannot be recovered.
 - The append classification column distinguishes a full-put record from a dedicated append; that classification is load-bearing for replay's positional proof.
 - Adoption resolves anchors by walking same-collection markers; a host that needs cross-collection provenance resolution does not get it here.
 

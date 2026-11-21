@@ -9,7 +9,7 @@ pub mod vectors;
 
 pub use knowledge::{
     append_cognition, list_entries_in, read_carrier_header, read_entry, validate_admission_scope,
-    write_entry, CarrierHeader, KnowledgeEntryLifecycle, RoutedKnowledgeStore,
+    write_entry, CarrierHeader, KnowledgeEntryLifecycle, PruneReport, RoutedKnowledgeStore,
     ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
 };
 pub use repository::{SqliteMemoryRepository, SqliteRepositoryError};

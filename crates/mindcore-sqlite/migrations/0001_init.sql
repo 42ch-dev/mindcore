@@ -241,6 +241,9 @@ CREATE TABLE knowledge_entries (
   -- `INTEGER` affinity stores a fractional value as REAL, so the cast comparison also requires
   -- integral storage.
   revision     INTEGER NOT NULL CHECK (revision >= 1 AND revision = CAST(revision AS INTEGER)),
+  -- Oldest revision whose preimage replay can still serve; explicit pruning advances it. Every
+  -- new row starts at 1, so "nothing pruned" needs no back-fill.
+  history_floor_revision INTEGER NOT NULL DEFAULT 1 CHECK (history_floor_revision >= 1),
   payload      TEXT NOT NULL,
   -- Composite pointer to the holder's newest record; NULL while it has none.
   cognition_head_seq INTEGER,
