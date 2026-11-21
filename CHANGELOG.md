@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- `mindcore-runtime`: `ServeFaces.workflow_caller` is replaced by `workflow_routes`, a map from each
+  admitted principal id to the one knowledge collection its workflow calls reach. Each destination
+  collection belongs to exactly one principal route; a collection named by two routes is refused at
+  assembly. An unrouted principal is refused on `deliberate` and still recalls memory with an empty
+  knowledge slot. A consumer that sets `workflow_caller` does not compile and must build the map.
 - Initial workspace for `mindcore-base` and `mindcore-sqlite`.
 - `mindcore-sqlite`: cognition records now have their own table — one row per record in
   `cognition_records`, keyed by `(collection, entry_id, append_seq)` with a scoped unique

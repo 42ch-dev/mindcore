@@ -2,6 +2,7 @@
 //! costs, which knowledge collection fills the second slot, and the reread
 //! that keeps a snapshot moved during provider work out of a released pack.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,6 +30,14 @@ const SPACE: &str = "spc_1";
 const SUBJECT: &str = "subj_1";
 const PRINCIPAL: &str = "prn_1";
 const NOW: &str = "2026-11-20T09:00:00.000Z";
+
+/// A route map putting each of `principals` onto the fixture's one collection.
+fn routes(principals: &[&str]) -> BTreeMap<String, KnowledgeScope> {
+    principals
+        .iter()
+        .map(|principal| ((*principal).to_string(), KnowledgeScope::new("wren")))
+        .collect()
+}
 
 /// What the embedder does to the store while it runs — outside every
 /// transaction the workflow holds.
@@ -340,7 +349,8 @@ impl Harness {
         side_effect: SideEffect,
     ) -> (SpiMindWorkflows, BoundaryEmbedder) {
         let binding = MemoryWorkflowBinding::new(self.pool.clone(), true)
-            .with_knowledge_collection(caller, KnowledgeScope::new("wren"));
+            .with_knowledge_routes(routes(&[caller]))
+            .expect("the fixture route map is valid");
         (SpiMindWorkflows::new(binding), self.embedder(side_effect))
     }
 
@@ -1094,10 +1104,13 @@ async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
     );
 }
 
+/// The route map decides the slot per principal: a reader holding its own live `knowledge_read`
+/// grant but no route of its own reads its records with an empty slot, and the recall is never
+/// refused for it.
 #[tokio::test]
-async fn another_granted_principal_reads_the_bound_collection() {
+async fn an_unrouted_principal_recalls_with_an_empty_slot() {
     let harness = Harness::open().await;
-    // The caller's own admission is complete; the carrier write is bound to another caller.
+    // The reader's own memory admission is complete; only another principal is routed.
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
     harness
@@ -1121,16 +1134,14 @@ async fn another_granted_principal_reads_the_bound_collection() {
             },
         )
         .await
-        .expect("the caller's own knowledge grant admits the slot");
+        .expect("a reader with no route still reads its memory page");
 
-    // The route's caller is prn_2, so the slot proves the read authority is the caller's own
-    // grant against the bound collection rather than an identity match with the write caller.
-    let entries: Vec<&str> = pack
-        .knowledge
-        .iter()
-        .map(|entry| entry.entry_id.as_str())
-        .collect();
-    assert_eq!(entries, ["ke_gate"]);
+    assert_eq!(record_ids(&pack), ["rec_a"]);
+    assert!(
+        pack.knowledge.is_empty(),
+        "the routed collection is not this reader's: {:?}",
+        pack.knowledge
+    );
 }
 
 /// Recall re-derives the knowledge grant over its own transaction and compares both reads: a
@@ -2658,7 +2669,8 @@ async fn deliberate_as(
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
     let workflows = SpiMindWorkflows::new(
         MemoryWorkflowBinding::new(harness.pool.clone(), true)
-            .with_knowledge_collection(caller, KnowledgeScope::new("wren")),
+            .with_knowledge_routes(routes(&[caller]))
+            .expect("the fixture route map is valid"),
     );
     let holder_value = cognition_reference(CARRIER);
     let holder: spoke_schemas::data::cognition::CognitionReference =
@@ -2744,7 +2756,7 @@ fn long_timeout() -> std::time::Duration {
 
 #[tokio::test]
 async fn another_principal_cannot_write_the_bound_carrier() {
-    // Recall is admitted per caller; the carrier write keeps the one-caller limit.
+    // A principal with no route never reaches a carrier, whatever grants it holds.
     let harness = deliberate_harness().await;
     let reasoner =
         DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);

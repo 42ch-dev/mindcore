@@ -23,8 +23,8 @@ This iteration materialised the contract only; the SQLite read/write path was de
 
 - Adding a backend costs a repository implementation, not a protocol re-implementation.
 - Every read and write pays one central conversion. Accepted once, instead of N times per backend.
-- The store can no longer own its own transaction for an operation that a caller wants to envelope. That is exactly the constraint Nexus imposes, and it is not satisfiable by `MindStore::open` today (`I-000020`).
-- Mapping Mindcore rows onto the Nexus memory schema is a separate, still-open decision (`I-000021`).
+- No path owns a transaction for an operation a caller wants to envelope. That is exactly the constraint Nexus imposes, and `SqliteMemoryRepository` meets it by borrowing the embedding caller's `&mut Tx<'_>` — it never begins, commits or rolls back. `MindStore::open` bootstraps the standalone protocol schema and owns the pool for the standalone route; it does not take ownership of embedded mutations (`I-000020` is closed history).
+- Memory rows map onto the Nexus memory schema, so the parity selectors run unchanged against a caller-migrated database; the repository persists through the IR on that schema (`I-000021` is closed history; `.agents/specs/architecture/storage-ir-boundary.md:14,31-38`).
 
 ## Alternatives considered
 

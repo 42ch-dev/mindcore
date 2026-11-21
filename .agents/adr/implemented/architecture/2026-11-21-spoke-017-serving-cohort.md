@@ -2,6 +2,8 @@
 
 Status: implemented — 0.17 makes every Connect family optional and separates Knowledge into its own capability, so Mindcore can serve Memory and Knowledge without a baseline provider or a second accept loop
 Date: 2026-11-21
+Class: architecture
+Related: `2026-11-21-principal-routing.md`
 
 ## Problem
 
@@ -13,9 +15,9 @@ The workspace pins `spoke-schemas`, `spoke-operations` and `spoke-connect` to `=
 
 `crates/mindcore-runtime` is a library crate. `MindcoreServe` assembles the workflow engine, the knowledge face and a host-supplied `RemoteMemoryService` into `RemoteServePortsComposite::knowledge_only(face).with_memory(service)`, derives the `HostCapabilityManifest` from the faces and handlers it actually serves, and returns ports, manifest and handler registration to a host-owned `ConnectResponder`. The host supplies identity, transport, trusted peers and non-capability metadata; the crate opens no listener and owns no accept loop. A pure memory responder composes a local `RemoteServePorts` whose only override is `as_memory`, because 0.17 exposes no public memory-only composite constructor.
 
-The three Mind workflows are served as `tools.mindcore.{recall_context, absorb, deliberate}` with closed argument and status-tagged result schemas. Handlers take the peer from the authenticated responder session and resolve the `Principal` through the host admission; they never read identity from arguments. A deliberation settles onto a carrier entry, so the host names one caller principal with `ServeFaces.workflow_caller`, and an unwired route is neither advertised nor installed.
+The three Mind workflows are served as `tools.mindcore.{recall_context, absorb, deliberate}` with closed argument schemas; `absorb` and `deliberate` return status-tagged results, while `recall_context` returns a closed, untagged `{records, knowledge, tokens_used}` object (`.agents/specs/architecture/serving-seam.md` § Workflow tools; `crates/mindcore-runtime/src/tools.rs:565-575`). Handlers take the peer from the authenticated responder session and resolve the `Principal` through the host admission; they never read identity from arguments. A deliberation settles onto a carrier entry, so the host configures one workflow knowledge route per admitted principal with `ServeFaces.workflow_routes`, and a principal with no route is refused at carrier admission before any carrier access (`2026-11-21-principal-routing.md`).
 
-The runtime serves a **protocol-shaped** store. A freshly opened `MindStore` is not one yet, because `0001_init.sql` still creates the pre-protocol memory tables; that gap is tracked as `I-000068` and is out of this decision's scope.
+The runtime serves a **protocol-shaped** store, and a freshly opened `MindStore` already is one: `0001_init.sql` creates the protocol memory tables, so the production open path needs no fixture (`crates/mindcore-sqlite/src/store.rs:69-99`, `.agents/specs/architecture/serving-seam.md:46`).
 
 ## Alternatives considered
 
@@ -27,7 +29,7 @@ The runtime serves a **protocol-shaped** store. A freshly opened `MindStore` is 
 ## Consequences
 
 - The migration surface was small: the compile probe and the real build found no Rust breakage, because Mindcore implements none of the affected baseline traits. The 0.17 pin is therefore cheap to hold.
-- Runtime reachability is proven on protocol-shaped stores only; until `I-000068` lands, a host that opens a fresh store cannot serve the workflows. The seam spec states this explicitly so a green loopback is never read as production-open evidence.
-- A served `deliberate` binds one caller principal to one collection. Per-principal routing is a later shape change, not an extension of this one.
+- Runtime reachability is acceptance-tested against a store the production open path produced, not a fixture, so a green loopback is never the only evidence (`I-000068` is closed).
+- A served `deliberate` resolves its one carrier collection from the admitted principal's configured route, so one surface serves many principals; the earlier single-caller shape is history, and `2026-11-21-principal-routing.md` carries the replacement.
 - The tool descriptors carry the pinned cognition schema inline (51 KB) so a manifest-only client can build valid arguments without fetching an external document; the alternative, a remote `$ref`, was rejected because it is unusable offline.
-- Test-only observability stays inside the test graph: the scoring probe (`scored_bits_for_test`) is compiled only under `mindcore-spi`'s `test-scoring` feature, which only `mindcore-spoke`'s `[dev-dependencies]` enable, and the query-slot probe is excluded by `cfg(test)` in both directions. No CI step enforces either today.
+- Test-only observability stays inside the test graph: the scoring probe (`scored_bits_for_test`) is compiled only under `mindcore-spi`'s `test-scoring` feature, which only `mindcore-spoke`'s `[dev-dependencies]` enable (`crates/mindcore-spoke/Cargo.toml:22-24`), and the query-slot probe is excluded by `cfg(test)` in both directions. `cargo test --locked --workspace` (`.github/workflows/ci.yml:47`) executes both: the scoring probe proves fresh and reloaded vectors score to the same bits (`crates/mindcore-spoke/tests/workflows.rs:4189-4201`), and the query-slot unit tests prove a refused page never probes the slot (`crates/mindcore-spi/src/workflows.rs:2613-2622,2661-2669`).
