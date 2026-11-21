@@ -1486,7 +1486,8 @@ async fn admission_with_an_unsupported_selection_returns_no_entries() {
 
 /// The served list is bounded at the query boundary: a collection at the bound is served whole,
 /// one row over it refuses with `InternalError` naming the bound instead of truncating the result
-/// or materializing every stored row.
+/// or materializing every stored row, and a signed session forwards that capacity class and bound
+/// to the peer unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn served_list_refuses_a_collection_over_the_bound() {
     let fixture = Fixture::open().await;
@@ -1548,5 +1549,55 @@ async fn served_list_refuses_a_collection_over_the_bound() {
         details.get("limit"),
         Some(&Value::from(SERVED_KNOWLEDGE_LIST_LIMIT)),
         "the served refusal names the bound it crossed: {refused:?}"
+    );
+
+    // The same class over a signed session: the served collection crosses the same bound, so the
+    // peer must receive the capacity refusal with its reason and limit, not a generic storage fault.
+    let served_writer = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    for index in 0..SERVED_KNOWLEDGE_LIST_LIMIT {
+        expect_ok(
+            served_writer
+                .put_knowledge_entry(
+                    entry(&format!("ke_wire_{index:04}"), "over the wire bound"),
+                    None,
+                )
+                .await,
+            "seed the served collection past the bound",
+        );
+    }
+    let adapter_peer_id = derive_peer_id_from_ed25519_pubkey(
+        &SigningKey::from_bytes(&[0x42u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let session = connect_knowledge_session(
+        &fixture,
+        admission_of(&adapter_peer_id, scope.clone()),
+        &["spoke-knowledge"],
+        &["spoke-knowledge"],
+        None,
+    )
+    .await;
+    let wired = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(&*session.adapter, &scope).await,
+        "list over the bound on a signed session",
+    );
+    assert_eq!(
+        wired.code, refused.code,
+        "the peer receives the served refusal's class: {wired:?}"
+    );
+    let wired_details = wired
+        .details
+        .as_ref()
+        .expect("the peer receives the capacity details");
+    assert_eq!(
+        wired_details.get("reason").and_then(Value::as_str),
+        Some("COLLECTION_OVER_CAPACITY"),
+        "a signed session forwards the capacity class: {wired:?}"
+    );
+    assert_eq!(
+        wired_details.get("limit"),
+        Some(&Value::from(SERVED_KNOWLEDGE_LIST_LIMIT)),
+        "a signed session forwards the bound the collection crossed: {wired:?}"
     );
 }
