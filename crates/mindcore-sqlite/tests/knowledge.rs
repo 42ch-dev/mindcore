@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
-use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
+use mindcore_sqlite::{append_cognition, write_entry, MindStore, ScopedKnowledgeStore};
 use serde_json::{json, Map, Value};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
-    ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryOwner,
+    ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryModulesKey,
+    KnowledgeEntryModulesValue, KnowledgeEntryOwner,
 };
 use spoke_schemas::source_anchor::ExtensionKey as AnchorExtensionKey;
 use spoke_schemas::KnowledgeEntry;
@@ -101,6 +103,201 @@ fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> S
     match result {
         SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value:?}"),
         SpokeResult::Reject(reject) => reject.code,
+    }
+}
+
+fn cognition_module_key() -> KnowledgeEntryModulesKey {
+    KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key")
+}
+
+fn cognition_module_value(module: Value) -> KnowledgeEntryModulesValue {
+    KnowledgeEntryModulesValue::from(
+        module
+            .as_object()
+            .expect("module fixture is an object")
+            .clone(),
+    )
+}
+
+/// An entry submitting the cognition envelope with `records` inline.
+fn cognition_entry(entry_id: &str, summary: &str, records: Vec<Value>) -> KnowledgeEntry {
+    let mut entry = entry_with(entry_id, summary);
+    entry.modules.insert(
+        cognition_module_key(),
+        cognition_module_value(json!({
+            "records": records,
+            "world_facts": [],
+            "extensions": {},
+        })),
+    );
+    entry
+}
+
+// One current-view belief record held by `holder`: the shape a dedicated append accepts.
+fn belief(holder: &str, record_id: &str) -> Value {
+    json!({
+        "kind": "belief",
+        "order": 1,
+        "record_id": record_id,
+        "holder": {
+            "kind": "knowledge_entry",
+            "id": holder,
+            "namespace": CARRIER_NAMESPACE,
+        },
+        "target": {
+            "carrier": {
+                "kind": "knowledge_entry",
+                "id": "ke_shared_north_gate",
+                "namespace": CARRIER_NAMESPACE,
+            },
+            "target_id": "prop_north_gate_closed",
+            "kind": "proposition",
+        },
+        "assessor": {
+            "kind": "knowledge_entry",
+            "id": holder,
+            "namespace": CARRIER_NAMESPACE,
+        },
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [{
+                "kind": "memory_record",
+                "id": "mem_hearsay",
+                "namespace": CARRIER_NAMESPACE,
+            }],
+        },
+        "assessment_context": {"context_id": "ctx_dusk_at_the_gate"},
+        "effective_at": "2026-11-19T18:00:00Z",
+        "assessed_at": "2026-11-19T18:05:00Z",
+        "view": "current",
+        "q": {
+            "value": 0.4,
+            "assertion": "belief_attribution",
+            "method": "single_self_report",
+            "calibration": "uncalibrated",
+        },
+        "extensions": {},
+    })
+}
+
+fn module_of(entry: &KnowledgeEntry) -> Option<&Map<String, Value>> {
+    match entry.modules.get(&cognition_module_key()) {
+        Some(KnowledgeEntryModulesValue::Object(module)) => Some(module),
+        _ => None,
+    }
+}
+
+fn record_ids(entry: &KnowledgeEntry) -> Vec<String> {
+    module_of(entry)
+        .and_then(|module| module.get("records"))
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .filter_map(|record| {
+                    record
+                        .get("record_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The preimage rows of one entry, in revision order.
+async fn revision_rows(
+    connection: &SqlitePool,
+    entry_id: &str,
+) -> Vec<(i64, String, Option<i64>, String)> {
+    sqlx::query_as(
+        "SELECT revision, payload, cognition_head_seq, recorded_at \
+         FROM knowledge_entry_revisions \
+         WHERE collection = 'wren' AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(entry_id)
+    .fetch_all(connection)
+    .await
+    .expect("preimage rows")
+}
+
+/// Every cognition record row of one entry, in storage order.
+async fn record_rows(
+    connection: &SqlitePool,
+    entry_id: &str,
+) -> Vec<(i64, String, String, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT append_seq, record_id, payload, append_prior_shape FROM cognition_records \
+         WHERE collection = 'wren' AND entry_id = ? ORDER BY append_seq ASC",
+    )
+    .bind(entry_id)
+    .fetch_all(connection)
+    .await
+    .expect("record rows")
+}
+
+async fn stored_updated_at(connection: &SqlitePool, entry_id: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT updated_at FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
+    )
+    .bind(entry_id)
+    .fetch_one(connection)
+    .await
+    .expect("stored updated_at")
+}
+
+async fn stored_shape(connection: &SqlitePool, entry_id: &str, append_seq: i64) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT append_prior_shape FROM cognition_records \
+         WHERE collection = 'wren' AND entry_id = ? AND append_seq = ?",
+    )
+    .bind(entry_id)
+    .bind(append_seq)
+    .fetch_one(connection)
+    .await
+    .expect("stored append shape")
+}
+
+/// One dedicated append through its own write transaction, as the workflow's commit does.
+async fn append(connection: &SqlitePool, entry_id: &str, expected: u64, record_id: &str) -> u64 {
+    let mut tx = connection
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin append");
+    let assigned = expect_ok(
+        append_cognition(
+            &mut tx,
+            "wren",
+            entry_id,
+            expected,
+            &belief(entry_id, record_id),
+        )
+        .await,
+        "dedicated append",
+    );
+    tx.commit().await.expect("commit append");
+    assigned
+}
+
+fn expect_revision_not_found<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) {
+    match result {
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::KnowledgeEntryNotFound,
+                "{context}"
+            );
+            assert_eq!(
+                reject.message, "knowledge entry revision not found",
+                "{context}"
+            );
+            assert!(
+                reject.details.is_none(),
+                "{context}: an absent revision carries no details"
+            );
+        }
     }
 }
 
@@ -569,4 +766,516 @@ fn adoption_anchor_shape() {
         .expect("fixture entries are wire entries");
     assert_eq!(entries.len(), 1);
     assert_eq!(format!("shared:{}", entries[0].entry_id), anchor.source_id);
+}
+
+#[tokio::test]
+async fn a_create_saves_no_preimage() {
+    let path = database_path("revision-create");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_gate", "closed after dusk"), None)
+            .await,
+        "create a module-less entry",
+    );
+    // A create carrying a record only patches the head: nothing is displaced.
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_signal",
+                "lit at dusk",
+                vec![belief("ke_signal", "cog_signal")],
+            ),
+            None,
+        )
+        .await,
+        "create an entry with a record",
+    );
+
+    assert!(revision_rows(&reader, "ke_gate").await.is_empty());
+    assert!(revision_rows(&reader, "ke_signal").await.is_empty());
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn every_update_saves_the_replaced_revision_in_order() {
+    let path = database_path("revision-order");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let created = expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry("ke_gate", "closed after dusk", Vec::new()),
+            None,
+        )
+        .await,
+        "create",
+    );
+    let mut observed = vec![as_json(&created)];
+    let mut written_at = vec![stored_updated_at(&reader, "ke_gate").await];
+    for (base, summary) in [
+        (1u64, "closed from dusk to dawn"),
+        (2, "closed until the bell"),
+        (3, "open all night"),
+    ] {
+        let updated = expect_ok(
+            port.put_knowledge_entry(cognition_entry("ke_gate", summary, Vec::new()), Some(base))
+                .await,
+            "update",
+        );
+        observed.push(as_json(&updated));
+        written_at.push(stored_updated_at(&reader, "ke_gate").await);
+    }
+
+    let rows = revision_rows(&reader, "ke_gate").await;
+    assert_eq!(
+        rows.len(),
+        3,
+        "each of the three updates saves one preimage"
+    );
+    for (index, (revision, payload, head, recorded_at)) in rows.iter().enumerate() {
+        assert_eq!(
+            *revision,
+            index as i64 + 1,
+            "preimages are keyed by the revision they held"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(payload).expect("stored payload is JSON"),
+            observed[index],
+            "the preimage keeps the exact payload revision {} observed",
+            index + 1
+        );
+        assert_eq!(*head, None, "a headless revision stores no cognition head");
+        assert_eq!(
+            recorded_at, &written_at[index],
+            "recorded_at is the instant the replaced state was written"
+        );
+    }
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_full_put_with_a_record_suffix_saves_its_preimage() {
+    let path = database_path("revision-full-put");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let created = expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry("ke_gate", "closed after dusk", Vec::new()),
+            None,
+        )
+        .await,
+        "create",
+    );
+    let updated = expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_gate",
+                "closed from dusk to dawn",
+                vec![belief("ke_gate", "cog_first")],
+            ),
+            Some(1),
+        )
+        .await,
+        "update with one record",
+    );
+    assert_eq!(updated.revision, Some(2));
+    assert_eq!(record_ids(&updated), ["cog_first"]);
+
+    let rows = revision_rows(&reader, "ke_gate").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "a full put is not a dedicated append even when its head advances by one"
+    );
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&rows[0].1).expect("stored payload is JSON"),
+        as_json(&created)
+    );
+    assert_eq!(rows[0].2, None);
+    assert_eq!(
+        stored_shape(&reader, "ke_gate", 1).await,
+        None,
+        "a record a full put committed carries no append classification"
+    );
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_dedicated_append_saves_no_preimage_and_is_classified() {
+    let path = database_path("revision-append");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let writer = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry("ke_gate", "closed after dusk", Vec::new()),
+            None,
+        )
+        .await,
+        "create",
+    );
+    assert_eq!(append(&writer, "ke_gate", 1, "cog_first").await, 2);
+
+    assert!(
+        revision_rows(&writer, "ke_gate").await.is_empty(),
+        "a dedicated append displaces no revision"
+    );
+    assert_eq!(
+        stored_shape(&writer, "ke_gate", 1).await,
+        Some(0),
+        "the module kept its records member"
+    );
+    let live = expect_ok(port.get_knowledge_entry("ke_gate").await, "live entry");
+    assert_eq!(live.revision, Some(2));
+    assert_eq!(record_ids(&live), ["cog_first"]);
+
+    writer.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_refused_or_rolled_back_write_leaves_no_preimage() {
+    let path = database_path("revision-refused");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let writer = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_gate",
+                "closed after dusk",
+                vec![belief("ke_gate", "cog_first")],
+            ),
+            None,
+        )
+        .await,
+        "create with a committed record",
+    );
+
+    let invalid = port
+        .put_knowledge_entry(
+            cognition_entry("ke_gate", "drops the committed record", Vec::new()),
+            Some(1),
+        )
+        .await;
+    assert_eq!(
+        expect_reject(invalid, "update that drops a committed record"),
+        SpokeRejectCode::InvalidInput
+    );
+
+    let stale = port
+        .put_knowledge_entry(
+            cognition_entry(
+                "ke_gate",
+                "stale update",
+                vec![belief("ke_gate", "cog_first")],
+            ),
+            Some(9),
+        )
+        .await;
+    assert_eq!(
+        expect_reject(stale, "stale update"),
+        SpokeRejectCode::StoredRevisionStale
+    );
+
+    // A write that succeeded inside the caller's transaction, then rolled back, leaves nothing.
+    let mut tx = writer
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin caller transaction");
+    expect_ok(
+        write_entry(
+            &mut tx,
+            "wren",
+            cognition_entry(
+                "ke_gate",
+                "rolled back",
+                vec![belief("ke_gate", "cog_first")],
+            ),
+            Some(1),
+        )
+        .await,
+        "write inside the caller transaction",
+    );
+    tx.rollback()
+        .await
+        .expect("roll back the caller transaction");
+
+    assert!(
+        revision_rows(&writer, "ke_gate").await.is_empty(),
+        "no refused or rolled-back write leaves a preimage"
+    );
+    let live = expect_ok(port.get_knowledge_entry("ke_gate").await, "live entry");
+    assert_eq!(live.revision, Some(1));
+    assert_eq!(record_ids(&live), ["cog_first"]);
+
+    writer.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn every_assigned_revision_replays_the_dto_it_observed() {
+    let path = database_path("replay");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let writer = second_connection(&path).await;
+
+    let created = expect_ok(
+        port.put_knowledge_entry(cognition_entry("ke_gate", "first", Vec::new()), None)
+            .await,
+        "create",
+    );
+    let second = expect_ok(
+        port.put_knowledge_entry(cognition_entry("ke_gate", "second", Vec::new()), Some(1))
+            .await,
+        "second revision",
+    );
+    assert_eq!(append(&writer, "ke_gate", 2, "cog_first").await, 3);
+    let third = expect_ok(
+        port.get_knowledge_entry("ke_gate").await,
+        "read after the first append",
+    );
+    assert_eq!(append(&writer, "ke_gate", 3, "cog_second").await, 4);
+    let fourth = expect_ok(
+        port.get_knowledge_entry("ke_gate").await,
+        "read after the second append",
+    );
+    let fifth = expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry(
+                "ke_gate",
+                "fifth",
+                vec![
+                    belief("ke_gate", "cog_first"),
+                    belief("ke_gate", "cog_second"),
+                    belief("ke_gate", "cog_third"),
+                ],
+            ),
+            Some(4),
+        )
+        .await,
+        "later full-put checkpoint",
+    );
+    assert_eq!(fifth.revision, Some(5));
+
+    for (index, expected) in [&created, &second, &third, &fourth, &fifth]
+        .iter()
+        .enumerate()
+    {
+        let revision = index as u64 + 1;
+        let replayed = expect_ok(
+            port.get_entry_at_revision("ke_gate", revision).await,
+            "replay an assigned revision",
+        );
+        assert_eq!(replayed.revision, Some(revision));
+        assert_eq!(
+            as_json(&replayed),
+            as_json(expected),
+            "revision {revision} replays the DTO it observed"
+        );
+    }
+
+    // Head truncation: each replay carries only the records committed at that revision.
+    let at_three = expect_ok(
+        port.get_entry_at_revision("ke_gate", 3).await,
+        "replay revision 3",
+    );
+    assert_eq!(record_ids(&at_three), ["cog_first"]);
+    let at_four = expect_ok(
+        port.get_entry_at_revision("ke_gate", 4).await,
+        "replay revision 4",
+    );
+    assert_eq!(record_ids(&at_four), ["cog_first", "cog_second"]);
+
+    // Replaying the live revision agrees with the current read.
+    let current = expect_ok(port.get_knowledge_entry("ke_gate").await, "current");
+    let replayed_current = expect_ok(
+        port.get_entry_at_revision("ke_gate", 5).await,
+        "current replay",
+    );
+    assert_eq!(as_json(&replayed_current), as_json(&current));
+
+    let saved_revisions = revision_rows(&writer, "ke_gate").await;
+    let saved_records = record_rows(&writer, "ke_gate").await;
+    for revision in 1..=5 {
+        expect_ok(
+            port.get_entry_at_revision("ke_gate", revision).await,
+            "replay again",
+        );
+    }
+    assert_eq!(
+        revision_rows(&writer, "ke_gate").await,
+        saved_revisions,
+        "replays never rewrite saved preimages"
+    );
+    assert_eq!(
+        record_rows(&writer, "ke_gate").await,
+        saved_records,
+        "replays never rewrite committed records"
+    );
+
+    writer.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn an_absent_revision_answers_like_a_missing_entry() {
+    let path = database_path("replay-absent");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    expect_ok(
+        port.put_knowledge_entry(
+            cognition_entry("ke_gate", "closed after dusk", Vec::new()),
+            None,
+        )
+        .await,
+        "create",
+    );
+
+    for (entry_id, revision) in [("ke_gate", 0), ("ke_gate", 2), ("ke_missing", 1)] {
+        expect_revision_not_found(
+            port.get_entry_at_revision(entry_id, revision).await,
+            "an absent revision answers like a missing entry",
+        );
+    }
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn replay_reverses_the_first_append_on_a_module_less_entry() {
+    let path = database_path("replay-shape-one");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let writer = second_connection(&path).await;
+
+    let created = expect_ok(
+        port.put_knowledge_entry(entry_with("ke_gate", "closed after dusk"), None)
+            .await,
+        "create a module-less entry",
+    );
+    assert!(module_of(&created).is_none());
+    assert_eq!(append(&writer, "ke_gate", 1, "cog_first").await, 2);
+
+    let replayed = expect_ok(
+        port.get_entry_at_revision("ke_gate", 1).await,
+        "replay before the first append",
+    );
+    assert_eq!(as_json(&replayed), as_json(&created));
+    assert!(
+        module_of(&replayed).is_none(),
+        "the module the first append seeded is removed again"
+    );
+
+    let current = expect_ok(
+        port.get_entry_at_revision("ke_gate", 2).await,
+        "replay after the first append",
+    );
+    assert_eq!(record_ids(&current), ["cog_first"]);
+
+    writer.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn replay_keeps_the_other_members_when_the_first_append_added_records() {
+    let path = database_path("replay-shape-two");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let seed = second_connection(&path).await;
+
+    // The write path rejects a cognition module without `records`, so a store holding that shape
+    // is seeded directly: revision 2 is the live state after a dedicated append added the member.
+    let world_facts = json!([{"kind": "world_fact", "world_fact_id": "wf_gate"}]);
+    let extensions = json!({"mindcore_test": {"viewpoint": "studio"}});
+    let mut live = entry_with("ke_gate", "closed after dusk");
+    live.revision = Some(2);
+    live.modules.insert(
+        cognition_module_key(),
+        cognition_module_value(json!({
+            "records": [],
+            "world_facts": world_facts,
+            "extensions": extensions,
+        })),
+    );
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, cognition_head_seq, created_at, updated_at) \
+         VALUES ('wren', 'ke_gate', 2, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(serde_json::to_string(&live).expect("entry serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the live entry");
+    sqlx::query(
+        "INSERT INTO cognition_records \
+         (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+         VALUES ('wren', 'ke_gate', 1, 'cog_first', ?, 2)",
+    )
+    .bind(serde_json::to_string(&belief("ke_gate", "cog_first")).expect("record serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the first appended record");
+    sqlx::query(
+        "UPDATE knowledge_entries SET cognition_head_seq = 1 \
+         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .execute(&seed)
+    .await
+    .expect("point the head at the record");
+
+    let replayed = expect_ok(
+        port.get_entry_at_revision("ke_gate", 1).await,
+        "replay before the first append",
+    );
+    assert_eq!(replayed.revision, Some(1));
+    let module = module_of(&replayed).expect("the module survives");
+    assert!(
+        module.get("records").is_none(),
+        "only the records member the append added is removed"
+    );
+    assert_eq!(
+        module.get("world_facts"),
+        Some(&world_facts),
+        "the other members are kept"
+    );
+    assert_eq!(
+        module.get("extensions"),
+        Some(&extensions),
+        "the extensions member is kept"
+    );
+
+    let current = expect_ok(
+        port.get_entry_at_revision("ke_gate", 2).await,
+        "replay the live revision",
+    );
+    assert_eq!(record_ids(&current), ["cog_first"]);
+
+    seed.close().await;
+    store.close().await;
+    remove_database(&path);
 }

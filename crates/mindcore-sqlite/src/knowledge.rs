@@ -17,7 +17,9 @@ use spoke_operations::{
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
 use spoke_schemas::{KnowledgeEntry, Scope};
 
-use crate::cognition::{insert_record, read_records};
+use crate::cognition::{
+    insert_record, read_append_prior_shape, read_records, read_records_through,
+};
 use crate::store::{MindStore, SnapshotSeam};
 
 /// Hard bound on one list of a stored collection.
@@ -99,6 +101,37 @@ impl ScopedKnowledgeStore {
             SpokeResult::Ok(listed) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(listed),
                 Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
+    }
+
+    /// One entry as it stood at `revision`: the payload and cognition head the store held then,
+    /// projected from the records that existed at that revision.
+    ///
+    /// Checkpoint selection and record hydration share one read transaction, so the replay is a
+    /// whole committed state. Revision `0`, a revision the entry never held and a missing entry
+    /// answer with the same `KnowledgeEntryNotFound`; a superseded entry still replays from its
+    /// own history.
+    pub async fn get_entry_at_revision(
+        &self,
+        entry_id: &str,
+        revision: u64,
+    ) -> SpokeResult<KnowledgeEntry> {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!(
+                    "knowledge entry revision could not be read: {error}"
+                ))
+            }
+        };
+        match read_entry_revision(&mut tx, &self.scope.collection, entry_id, revision).await {
+            SpokeResult::Ok(entry) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(entry),
+                Err(error) => internal(format!(
+                    "knowledge entry revision could not be read: {error}"
+                )),
             },
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
@@ -372,6 +405,16 @@ fn not_found<T>(entry_id: &str) -> SpokeResult<T> {
     )
 }
 
+// One rejection for every absent revision: an unassigned revision, one outside the stored range
+// and a missing entry are indistinguishable, and the message names no collection or timestamp.
+fn revision_not_found<T>() -> SpokeResult<T> {
+    spoke_reject(
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "knowledge entry revision not found",
+        None,
+    )
+}
+
 pub(crate) fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
     spoke_reject(SpokeRejectCode::InternalError, message, None)
 }
@@ -485,6 +528,125 @@ async fn read_entry_seeded(
         ),
         Err(error) => internal(format!("knowledge entry could not be read: {error}")),
     }
+}
+
+/// One entry of `collection` as it was stored at `revision`, read through the caller's
+/// transaction so checkpoint selection and record hydration project one snapshot.
+///
+/// The newest saved checkpoint at or after `revision` supplies the payload and head; the live row
+/// stands in when no saved revision is that recent. The gap between them is advanced by dedicated
+/// appends alone, so it subtracts from the checkpoint head and the records are read only through
+/// that derived head — a later record never reaches an earlier replay.
+async fn read_entry_revision(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+    revision: u64,
+) -> SpokeResult<KnowledgeEntry> {
+    let Ok(assigned) = i64::try_from(revision) else {
+        return revision_not_found();
+    };
+    if assigned < 1 {
+        return revision_not_found();
+    }
+    let saved: Result<Option<(i64, String, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, payload, cognition_head_seq FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? AND revision >= ? \
+         ORDER BY revision ASC LIMIT 1",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .bind(assigned)
+    .fetch_optional(&mut **tx)
+    .await;
+    let checkpoint = match saved {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => {
+            let live: Result<Option<(i64, String, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+                "SELECT revision, payload, cognition_head_seq FROM knowledge_entries \
+                 WHERE collection = ? AND entry_id = ?",
+            )
+            .bind(collection)
+            .bind(entry_id)
+            .fetch_optional(&mut **tx)
+            .await;
+            match live {
+                Ok(Some((stored, payload, head))) if stored >= assigned => (stored, payload, head),
+                Ok(_) => return revision_not_found(),
+                Err(error) => {
+                    return internal(format!("knowledge entry could not be read: {error}"))
+                }
+            }
+        }
+        Err(error) => {
+            return internal(format!(
+                "knowledge revision history could not be read: {error}"
+            ))
+        }
+    };
+    let (checkpoint_revision, payload, head) = checkpoint;
+    let gap = checkpoint_revision - assigned;
+    let mut entry = match decode(&payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    entry.revision = Some(revision);
+    let head = match head {
+        Some(head) => head - gap,
+        None if gap == 0 => 0,
+        None => {
+            return internal(format!(
+                "knowledge entry {entry_id} revision {revision} has an impossible history gap"
+            ))
+        }
+    };
+    if head < 0 {
+        return internal(format!(
+            "knowledge entry {entry_id} revision {revision} has an impossible cognition head"
+        ));
+    }
+    if head > 0 {
+        let records = match read_records_through(&mut **tx, collection, entry_id, head).await {
+            SpokeResult::Ok(records) => records,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if let Some(KnowledgeEntryModulesValue::Object(module)) =
+            entry.modules.get_mut(&module_key())
+        {
+            module.insert("records".to_string(), Value::Array(records));
+        }
+    } else if gap > 0 {
+        // The checkpoint keeps the envelope the first append left; its recorded shape says which
+        // member that append added, so the pre-append envelope is restored without a saved row.
+        let shape = match read_append_prior_shape(&mut **tx, collection, entry_id, 1).await {
+            SpokeResult::Ok(shape) => shape,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match shape {
+            Some(1) => {
+                entry.modules.remove(&module_key());
+            }
+            Some(2) => {
+                if let Some(KnowledgeEntryModulesValue::Object(module)) =
+                    entry.modules.get_mut(&module_key())
+                {
+                    module.remove("records");
+                }
+            }
+            Some(0) => {}
+            Some(shape) => {
+                return internal(format!(
+                    "knowledge entry {entry_id} first append carries shape {shape}"
+                ))
+            }
+            None => {
+                return internal(format!(
+                    "knowledge entry {entry_id} history has no first-append shape"
+                ))
+            }
+        }
+    }
+    SpokeResult::Ok(entry)
 }
 
 /// Projects `modules.cognition.records` of every `entries` member from the holder's record
