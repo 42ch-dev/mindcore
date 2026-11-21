@@ -30,9 +30,12 @@ the scope by `principal_id(principal)` for both carrier admission and the recall
 
 - The route is resolved from the admitted principal inside the binding; the carrier write reads and
   CAS-writes only that collection.
-- Two principals may route to the same collection; each still writes its own carrier entry, and the
-  existing holder/assessor identity rules decide whether a write is accepted. A shared collection is
-  a configured choice, not an entry-level isolation promise.
+- The route fixes only the collection. Deliberation reads the carrier entry the request's `holder`
+  names inside it, so the existing holder/assessor identity rules decide whether a write is accepted;
+  a holder id that exists only in another collection is refused `knowledge_entry_not_found` and
+  writes nothing.
+- Two principals may route to the same collection. A shared collection is a configured choice, not an
+  entry-level isolation promise.
 - A principal with no route is refused `NotAuthorized` with no target details. The refusal never
   reveals whether another principal has a route.
 - A surface with no route does not advertise `tools.mindcore.deliberate` and installs no handler
