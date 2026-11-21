@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use serde_json::{Map, Value};
+use spoke_schemas::knowledge_entry::ExtensionKey as EntryExtensionKey;
 use spoke_schemas::source_anchor::ExtensionKey;
-use spoke_schemas::SourceAnchor;
+use spoke_schemas::{KnowledgeEntry, SourceAnchor};
 
 /// The collection a knowledge store serves; fixed when the store is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,4 +39,27 @@ pub fn adoption_anchor(shared_entry_id: &str, basis: &str) -> SourceAnchor {
         source_id: format!("shared:{shared_entry_id}"),
         span: None,
     }
+}
+
+/// The shared entry id an adoption anchor points at and, when it records one, the adopted revision.
+///
+/// Recognizes only the Mindcore namespace with a non-empty `basis` and a non-empty id after
+/// `shared:`; a legacy anchor without `source_revision` still resolves by its source id, while a
+/// present revision must be a positive integer with nothing else naming an assigned revision.
+pub fn adoption_anchor_parts(entry: &KnowledgeEntry) -> Option<(&str, Option<u64>)> {
+    let anchor = entry.source_anchor.as_ref()?;
+    let source_id = anchor.source_id.strip_prefix("shared:")?;
+    if source_id.is_empty() {
+        return None;
+    }
+    let namespace = EntryExtensionKey::try_from("mindcore_adoption").ok()?;
+    let fields = anchor.extensions.get(&namespace)?;
+    if fields.get("basis")?.as_str()?.is_empty() {
+        return None;
+    }
+    let revision = match fields.get("source_revision") {
+        Some(revision) => Some(revision.as_u64().filter(|revision| *revision > 0)?),
+        None => None,
+    };
+    Some((source_id, revision))
 }

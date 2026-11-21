@@ -259,7 +259,8 @@ where
 
 /// The holder's current judgment: the record row its head points at, one indexed
 /// lookup over two primary keys regardless of history size; none while it holds
-/// no records.
+/// no records or once it is superseded — a retired carrier offers no current judgment, while
+/// [`read_record`] and revision replay still address its history.
 pub async fn read_current_record<'e, E>(
     executor: E,
     collection: &str,
@@ -273,7 +274,7 @@ where
          JOIN knowledge_entries AS k \
            ON k.collection = r.collection AND k.entry_id = r.entry_id \
           AND k.cognition_head_seq = r.append_seq \
-         WHERE k.collection = ? AND k.entry_id = ?",
+         WHERE k.collection = ? AND k.entry_id = ? AND k.superseded_by IS NULL",
     )
     .bind(collection)
     .bind(entry_id)

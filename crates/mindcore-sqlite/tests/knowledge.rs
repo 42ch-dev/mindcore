@@ -1928,6 +1928,62 @@ async fn a_failed_supersede_leaves_no_marker() {
     remove_database(&path);
 }
 
+/// The CAS reads the stored revision column: a payload that disagrees with it is corrupt stored
+/// state and refuses before any write, so the marking cannot skip the trigger's preimage.
+#[tokio::test]
+async fn the_supersede_cas_reads_the_stored_revision_column() {
+    let path = database_path("supersede-drift");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_target", "the gate is open"), None)
+            .await,
+        "create the target",
+    );
+    // Stored drift: the column sits at revision 2 while the payload still claims revision 1.
+    let mut drifted = entry_with("ke_drift", "the gate was closed");
+    drifted.revision = Some(1);
+    let payload = serde_json::to_string(&drifted).expect("entry serializes");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_drift', 2, ?, \
+                 '2026-11-20T09:00:00.000000000Z', '2026-11-20T09:00:00.000000000Z')",
+    )
+    .bind(&payload)
+    .execute(&reader)
+    .await
+    .expect("seed a drifted row");
+
+    let before = stored_state(&reader, "ke_drift").await;
+    let refused = supersede(&port, "ke_drift", 1, "ke_target").await;
+    assert_eq!(
+        expect_reject(refused, "stored revision column and payload disagree"),
+        SpokeRejectCode::InternalError
+    );
+    assert_eq!(
+        stored_state(&reader, "ke_drift").await,
+        before,
+        "a refused marking changes nothing"
+    );
+    assert_eq!(stored_marker(&reader, "ke_drift").await, None);
+    assert_eq!(
+        stored_revision(&reader, "ke_drift").await,
+        2,
+        "the column stays as stored"
+    );
+    assert!(
+        revision_rows(&reader, "ke_drift").await.is_empty(),
+        "the refused marking saves no preimage"
+    );
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
 #[tokio::test]
 async fn default_reads_and_the_list_hide_a_superseded_entry() {
     let path = database_path("supersede-visibility");
@@ -2337,5 +2393,80 @@ async fn the_list_bound_counts_superseded_rows() {
 
     store.close().await;
     reader.close().await;
+    remove_database(&path);
+}
+
+/// The marker's foreign key itself: a successor must exist in the same collection, and a
+/// referenced successor cannot be deleted. Removing the key or making it cascade fails this test.
+#[tokio::test]
+async fn the_marker_foreign_key_binds_successors_to_the_same_collection() {
+    let path = database_path("supersede-foreign-key");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let studio = store.knowledge(KnowledgeScope::new("studio"));
+    let enforcing = foreign_keys_connection(&path).await;
+
+    for entry_id in ["ke_source", "ke_target"] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, entry_id), None)
+                .await,
+            "seed the served collection",
+        );
+    }
+    expect_ok(
+        studio
+            .put_knowledge_entry(entry_with("ke_studio", "elsewhere"), None)
+            .await,
+        "seed the other collection",
+    );
+
+    // A direct write naming a successor that exists only in another collection fails.
+    let foreign = sqlx::query(
+        "UPDATE knowledge_entries SET superseded_by = 'ke_studio' \
+         WHERE collection = 'wren' AND entry_id = 'ke_source'",
+    )
+    .execute(&enforcing)
+    .await
+    .expect_err("a cross-collection successor violates the foreign key");
+    assert!(
+        foreign
+            .as_database_error()
+            .is_some_and(|error| error.is_foreign_key_violation()),
+        "{foreign}"
+    );
+    assert_eq!(stored_marker(&enforcing, "ke_source").await, None);
+
+    // After a valid mark, the referenced successor cannot be deleted: no cascade removes it.
+    expect_ok(
+        supersede(&port, "ke_source", 1, "ke_target").await,
+        "mark the source",
+    );
+    let deleted = sqlx::query(
+        "DELETE FROM knowledge_entries WHERE collection = 'wren' AND entry_id = 'ke_target'",
+    )
+    .execute(&enforcing)
+    .await
+    .expect_err("deleting a referenced successor violates the foreign key");
+    assert!(
+        deleted
+            .as_database_error()
+            .is_some_and(|error| error.is_foreign_key_violation()),
+        "{deleted}"
+    );
+    assert_eq!(
+        stored_marker(&enforcing, "ke_source").await.as_deref(),
+        Some("ke_target")
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries \
+         WHERE collection = 'wren' AND entry_id IN ('ke_source', 'ke_target')",
+    )
+    .fetch_one(&enforcing)
+    .await
+    .expect("both rows survive");
+    assert_eq!(rows, 2);
+
+    enforcing.close().await;
+    store.close().await;
     remove_database(&path);
 }
