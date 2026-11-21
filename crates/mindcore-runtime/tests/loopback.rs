@@ -26,7 +26,8 @@ use mindcore_runtime::{
     MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
 };
 use mindcore_spi::{
-    CognitiveTaskKind, Embedder, EmbeddingIdentity, Reasoner, SpiError, StructuredReasonRequest,
+    CognitiveTaskKind, Embedder, EmbeddingIdentity, PolicyDecision, PolicyHook, Reasoner,
+    SettlementDraft, SpiError, StructuredReasonRequest,
 };
 use mindcore_sqlite::MindStore;
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
@@ -45,6 +46,9 @@ use spoke_schemas::{HostCapabilityManifest, MemoryRecallRequest, Principal, Scop
 const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
 const CARRIER: &str = "ke_wren";
+/// The second principal's own collection and carrier holder entry.
+const COLLECTION_TWO: &str = "mora";
+const CARRIER_TWO: &str = "ke_mora";
 const SPACE: &str = "spc_loopback";
 const SUBJECT: &str = "subj_loopback";
 const PRINCIPAL: &str = "prn_loopback";
@@ -154,17 +158,22 @@ impl Fixture {
 
     /// The carrier entry the deliberation holder names.
     async fn seed_carrier(&self) {
+        self.seed_carrier_in(COLLECTION, CARRIER).await;
+    }
+
+    /// The carrier entry one collection holds, as its holder names it.
+    async fn seed_carrier_in(&self, collection: &str, entry_id: &str) {
         expect_ok(
             self.store
-                .knowledge(KnowledgeScope::new(COLLECTION))
+                .knowledge(KnowledgeScope::new(collection))
                 .put_knowledge_entry(
                     serde_json::from_value(json!({
                         "schema_version": 1,
-                        "entry_id": CARRIER,
+                        "entry_id": entry_id,
                         "entry_type": "note",
-                        "canonical_name": "Wren's carrier",
+                        "canonical_name": format!("{entry_id}'s carrier"),
                         "status": "confirmed",
-                        "body": { "summary": "what Wren currently holds" },
+                        "body": { "summary": "what this holder currently holds" },
                         "extensions": {},
                     }))
                     .expect("carrier JSON matches the schema"),
@@ -389,6 +398,65 @@ impl Reasoner for NoChangeReasoner {
     }
 }
 
+/// The host's reasoner when a deliberation must write: one promotion over the evidence, so the
+/// settlement policy's `AutoSettle` appends a cognition record to the routed carrier.
+struct SettlingReasoner;
+
+#[async_trait]
+impl Reasoner for SettlingReasoner {
+    async fn reason_structured(
+        &self,
+        request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        assert_eq!(request.task_kind, CognitiveTaskKind::Deliberate);
+        let payload: Value =
+            serde_json::from_str(request.user_payload).expect("the deliberation payload is JSON");
+        assert!(
+            payload["records"].as_array().is_some_and(|records| records
+                .iter()
+                .any(|record| record["record_id"] == "rec_north_gate")),
+            "the authorized memory page reached the reasoner: {}",
+            request.user_payload
+        );
+        Ok(json!({
+            "recommendation": { "kind": "promote", "target_kind": "belief" },
+            "rationale": "the cited record carries the north gate state",
+            "evidence_ids": ["ev_gate"],
+            "record_ids": ["rec_north_gate"],
+            "record": {
+                "kind": "belief",
+                "order": 1,
+                "q": {
+                    "value": 0.8,
+                    "assertion": "belief_attribution",
+                    "method": "two_witness_reports",
+                    "calibration": "uncalibrated"
+                },
+                "assessor_role": "holder_self_report",
+                "basis": {
+                    "kind": "evidence",
+                    "evidence": [
+                        { "kind": "memory_record", "namespace": "mindcore", "id": "rec_north_gate" }
+                    ]
+                }
+            }
+        }))
+    }
+}
+
+/// The host's settlement policy: settle every validated draft, so a promotion reaches the carrier.
+struct AutoPolicy;
+
+#[async_trait]
+impl PolicyHook for AutoPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::AutoSettle)
+    }
+}
+
 /// The host's side of the surface. `workflow_routes` is the per-principal workflow route map;
 /// an empty map serves and advertises no `deliberate` at all.
 fn faces(
@@ -519,12 +587,17 @@ fn recall_request() -> MemoryRecallRequest {
 }
 
 fn deliberate_arguments() -> Value {
+    deliberate_arguments_for(CARRIER)
+}
+
+/// The same deliberation, naming `carrier` as both the holder and the target carrier.
+fn deliberate_arguments_for(carrier: &str) -> Value {
     json!({
         "space_id": SPACE,
         "subject_id": SUBJECT,
-        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER },
+        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": carrier },
         "target": {
-            "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER },
+            "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": carrier },
             "target_id": "prop_north_gate",
             "kind": "proposition",
         },
@@ -559,6 +632,45 @@ fn packed_knowledge_ids(result: &Value) -> Vec<&str> {
             entry["entry_id"]
                 .as_str()
                 .expect("a knowledge entry carries its id")
+        })
+        .collect()
+}
+
+/// The stored revision of one carrier entry, wherever its collection lives.
+async fn carrier_revision(pool: &sqlx::SqlitePool, collection: &str, entry_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the carrier revision")
+}
+
+/// The assessor ids of one carrier's committed cognition rows, in append order.
+async fn carrier_assessors(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    entry_id: &str,
+) -> Vec<String> {
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload FROM cognition_records \
+         WHERE collection = ? AND entry_id = ? ORDER BY append_seq ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("read the carrier's cognition rows");
+    payloads
+        .iter()
+        .map(|payload| {
+            let record: Value = serde_json::from_str(payload).expect("cognition row payload");
+            record["assessor"]["id"]
+                .as_str()
+                .expect("a cognition record names its assessor")
+                .to_string()
         })
         .collect()
 }
@@ -806,8 +918,109 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     );
 }
 
+/// One surface, two principals: each authenticated peer routes to its own collection and settles
+/// onto its own carrier entry, and neither call writes the other principal's carrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_routed_principals_settle_onto_their_own_carriers() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    fixture.seed_carrier_in(COLLECTION_TWO, CARRIER_TWO).await;
+    fixture
+        .grant(
+            "grt_settle_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["recall", "knowledge_read", "knowledge_write"],
+        )
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let mut workflow_routes = routes(&[PRINCIPAL]);
+    workflow_routes.insert(
+        PEER_TWO_PRINCIPAL.to_string(),
+        KnowledgeScope::new(COLLECTION_TWO),
+    );
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders {
+            reasoner: Some(Arc::new(SettlingReasoner)),
+            policy_hook: Some(Arc::new(AutoPolicy)),
+            ..MindProviders::default()
+        },
+        workflow_routes,
+    );
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
+
+    // The first principal's verdict lands on its own collection's carrier.
+    let first = connect(&surface, &[DELIBERATE]).await;
+    let settled = expect_ok(
+        first
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate by the first principal",
+    );
+    assert_eq!(settled["status"], "settled");
+    assert_eq!(settled["record"]["holder"]["id"], CARRIER);
+    assert_eq!(settled["record"]["assessor"]["id"], PRINCIPAL);
+    assert_eq!(
+        settled["mind_state_version"], 2,
+        "the write descends from its own carrier"
+    );
+    assert_eq!(carrier_revision(&pool, COLLECTION, CARRIER).await, 2);
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        1,
+        "the second principal's carrier keeps its seeded revision"
+    );
+    assert_eq!(
+        carrier_assessors(&pool, COLLECTION, CARRIER).await,
+        [PRINCIPAL]
+    );
+    assert!(
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO)
+            .await
+            .is_empty(),
+        "the second collection carries no assessment"
+    );
+
+    // The second principal settles onto its own carrier, never the first's.
+    let second = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let settled = expect_ok(
+        second
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_for(CARRIER_TWO))
+            .await,
+        "deliberate by the second principal",
+    );
+    assert_eq!(settled["status"], "settled");
+    assert_eq!(settled["record"]["holder"]["id"], CARRIER_TWO);
+    assert_eq!(settled["record"]["assessor"]["id"], PEER_TWO_PRINCIPAL);
+    assert_eq!(
+        settled["mind_state_version"], 2,
+        "the second write descends from its own carrier, never the first's"
+    );
+    assert_eq!(carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await, 2);
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION, CARRIER).await,
+        2,
+        "the first principal's carrier keeps the revision its own call left"
+    );
+    assert_eq!(
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        [PEER_TWO_PRINCIPAL]
+    );
+    assert_eq!(
+        carrier_assessors(&pool, COLLECTION, CARRIER).await,
+        [PRINCIPAL],
+        "no second assessment landed on the first principal's carrier"
+    );
+}
+
 /// A principal the host did not route reaches no carrier: a peer holding `recall` and both
-/// knowledge grants in the space is still refused, target-free, and nothing is written.
+/// knowledge grants in the space is still refused, target-free, and nothing is written; the same
+/// peer still recalls its memory, with an empty knowledge slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_without_a_route_cannot_write_the_carrier() {
     let fixture = Fixture::open().await;
@@ -833,7 +1046,7 @@ async fn a_peer_without_a_route_cannot_write_the_carrier() {
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
 
-    let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE, RECALL_CONTEXT]).await;
     let reject = expect_reject(
         session
             .adapter
@@ -864,6 +1077,21 @@ async fn a_peer_without_a_route_cannot_write_the_carrier() {
     assert_eq!(
         revision, 1,
         "a refused carrier write leaves the entry untouched"
+    );
+
+    // The same unrouted peer still recalls its memory: one token per serialized byte, so the two
+    // records need a wider budget than the default pack.
+    let mut arguments = recall_arguments();
+    arguments["max_tokens"] = json!(4_000);
+    let recalled = expect_ok(
+        session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
+        "recall by a peer without a knowledge route",
+    );
+    assert_eq!(packed_record_ids(&recalled), ["rec_market", "rec_north_gate"]);
+    assert_eq!(
+        recalled["knowledge"],
+        json!([]),
+        "an unrouted peer reads its memory with an empty knowledge slot"
     );
 }
 
