@@ -1,11 +1,12 @@
-//! The first five I-000009 live-scope facts on one isolated shared scope.
+//! The seven I-000009 facts on one isolated shared scope.
 //!
 //! One `shared:world` collection, one personal collection and two admitted viewpoints on the same
 //! shared route: revision replay, the adoption anchor and its retirement chain, holder disclosure
-//! before and after retirement, a personal write that leaves the shared row alone, and the carrier
-//! head settling with its entry inside one `BEGIN IMMEDIATE`. Nothing here changes product code;
-//! the rehearsal is the deliverable. Each block names the item it covers, so a failure maps to an
-//! acceptance line.
+//! before and after retirement, a personal write that leaves the shared row alone, the carrier
+//! head settling with its entry inside one `BEGIN IMMEDIATE`, a closed store copied as a file and
+//! reopened with every earlier fact intact, and two stores on that file with one write reservation
+//! between them. Nothing here changes product code; the rehearsal is the deliverable. Each block
+//! names the item it covers, so a failure maps to an acceptance line.
 
 use std::str::FromStr;
 
@@ -15,7 +16,7 @@ use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
 use mindcore_sqlite::cognition::read_records;
 use mindcore_sqlite::{read_carrier_header, write_entry, MindStore};
 use serde_json::{json, Value};
-use spoke_operations::{KnowledgeEntryPort, ScopedKnowledgePort, SpokeRejectCode};
+use spoke_operations::{KnowledgeEntryPort, ScopedKnowledgePort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
     KnowledgeEntryDisclosure, KnowledgeEntryModulesKey, KnowledgeEntryModulesValue,
     KnowledgeEntryOwner,
@@ -43,6 +44,8 @@ const CARRIER_SUMMARY: &str = "the keeper's beliefs";
 /// The attempted rewrite's summary differs from the committed one, so the rollback probe can tell
 /// a leaked payload from the committed payload.
 const CARRIER_REWRITE_SUMMARY: &str = "the keeper's amended beliefs";
+/// The write item 7 first attempts while refused and then repeats after the reservation is gone.
+const SWITCH_PROBE: &str = "the mill opens at dawn";
 
 fn cognition_module_key() -> KnowledgeEntryModulesKey {
     KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key")
@@ -135,28 +138,28 @@ fn viewpoint_scope(viewpoint: &str) -> Scope {
 
 /// The shared source row as stored: revision and payload bytes, read from the column because no
 /// product read hands out the bytes promotion must leave alone.
-async fn source_row(pool: &SqlitePool) -> (i64, String) {
+async fn source_row(pool: &SqlitePool, collection: &str, entry_id: &str) -> (i64, String) {
     sqlx::query_as(
         "SELECT revision, payload FROM knowledge_entries \
          WHERE collection = ? AND entry_id = ?",
     )
-    .bind(SHARED)
-    .bind("ke_gate")
+    .bind(collection)
+    .bind(entry_id)
     .fetch_one(pool)
     .await
     .expect("read the shared source row")
 }
 
-async fn carrier_header(pool: &SqlitePool) -> (u64, Option<i64>) {
+async fn carrier_header(pool: &SqlitePool, collection: &str, entry_id: &str) -> (u64, Option<i64>) {
     let header = expect_ok(
-        read_carrier_header(pool, SHARED, "ke_keeper_log").await,
-        "item 5: read the carrier header",
+        read_carrier_header(pool, collection, entry_id).await,
+        "read the carrier header",
     );
     (header.revision, header.head_seq)
 }
 
 #[tokio::test]
-async fn shared_scope_holds_the_first_five_live_facts() {
+async fn shared_scope_holds_the_seven_named_facts() {
     let temp = TempDb::new("shared-scope-rehearsal");
     let path = temp.database_path();
     let store = MindStore::open(&path).await.expect("open store");
@@ -210,7 +213,9 @@ async fn shared_scope_holds_the_first_five_live_facts() {
         "item 2: adopt ke_gate at revision 2",
     ) {
         AdoptionOutcome::Created(copy) => copy,
-        other => panic!("I-000009 item 2 (references): the first adoption must create the copy, got {other:?}"),
+        other => panic!(
+            "I-000009 item 2 (references): the first adoption must create the copy, got {other:?}"
+        ),
     };
     assert_eq!(
         adoption_anchor_parts(&copy),
@@ -260,7 +265,11 @@ async fn shared_scope_holds_the_first_five_live_facts() {
     expect_ok(
         shared
             .put_knowledge_entry(
-                owner_private("ke_gate_note", "the keeper keeps a private note", OWNER_VIEWPOINT),
+                owner_private(
+                    "ke_gate_note",
+                    "the keeper keeps a private note",
+                    OWNER_VIEWPOINT,
+                ),
                 None,
             )
             .await,
@@ -292,7 +301,11 @@ async fn shared_scope_holds_the_first_five_live_facts() {
     expect_ok(
         shared
             .put_knowledge_entry(
-                entry("ke_gate_note_successor", "note", "the note moved to the mill"),
+                entry(
+                    "ke_gate_note_successor",
+                    "note",
+                    "the note moved to the mill",
+                ),
                 None,
             )
             .await,
@@ -307,7 +320,9 @@ async fn shared_scope_holds_the_first_five_live_facts() {
     for (viewpoint, scope) in [("owner", &owner_view), ("foreign", &foreign_view)] {
         assert_eq!(
             expect_reject(
-                served.get_scoped_knowledge_entry(scope, "ke_gate_note").await,
+                served
+                    .get_scoped_knowledge_entry(scope, "ke_gate_note")
+                    .await,
                 "item 3: ordinary get of the retired entry",
             ),
             SpokeRejectCode::KnowledgeEntryNotFound,
@@ -344,13 +359,11 @@ async fn shared_scope_holds_the_first_five_live_facts() {
 
     // I-000009 item 4 — promotion: writing the personal copy leaves the shared source's revision
     // and stored payload bytes untouched.
-    let source_before = source_row(&pool).await;
+    let source_before = source_row(&pool, SHARED, "ke_gate").await;
     let mut promoted_copy = copy.clone();
     promoted_copy.body.summary = Some(PERSONAL_NOTE.to_string());
     let promoted = expect_ok(
-        personal
-            .put_knowledge_entry(promoted_copy, Some(1))
-            .await,
+        personal.put_knowledge_entry(promoted_copy, Some(1)).await,
         "item 4: write the personal copy",
     );
     assert_eq!(
@@ -369,7 +382,7 @@ async fn shared_scope_holds_the_first_five_live_facts() {
         "item 4: the personal write keeps the copy's anchor"
     );
     assert_eq!(
-        source_row(&pool).await,
+        source_row(&pool, SHARED, "ke_gate").await,
         source_before,
         "I-000009 item 4 (promotion): the personal write must leave the shared row's revision and \
          payload bytes unchanged"
@@ -393,7 +406,7 @@ async fn shared_scope_holds_the_first_five_live_facts() {
     );
     write.commit().await.expect("item 5: commit");
     assert_eq!(
-        carrier_header(&pool).await,
+        carrier_header(&pool, SHARED, "ke_keeper_log").await,
         (1, Some(2)),
         "I-000009 item 5 (carrier transaction): the committed carrier holds revision 1 and head 2 \
          together"
@@ -433,7 +446,7 @@ async fn shared_scope_holds_the_first_five_live_facts() {
     );
     rewrite.rollback().await.expect("item 5: rollback");
     assert_eq!(
-        carrier_header(&pool).await,
+        carrier_header(&pool, SHARED, "ke_keeper_log").await,
         (1, Some(2)),
         "I-000009 item 5 (carrier transaction): a rollback leaves the revision and head unchanged"
     );
@@ -462,5 +475,341 @@ async fn shared_scope_holds_the_first_five_live_facts() {
         "I-000009 item 5 (carrier transaction): the rolled-back record never became visible"
     );
 
+    // I-000009 item 6 — backup / restore: a closed store, copied as a file and reopened, carries
+    // items 1–5's persisted results, and items 3 and 5 run again on the copy.
+    //
+    // The copy happens only after `close`: a copy of a live WAL database's main file is not a
+    // consistent snapshot, because committed frames may still sit in `-wal` rather than the main
+    // file. Closing the last connection checkpoints them, so the copied file is the whole store.
     store.close().await;
+    let restored_path = temp.root().join("restored.db");
+    std::fs::copy(&path, &restored_path).expect("copy the closed store as a file");
+    let restored = MindStore::open(&restored_path)
+        .await
+        .expect("reopen the copied store");
+    // The same bindings against the copy, so the earlier probes run unchanged on it.
+    let pool = restored.pool();
+    let shared = restored.knowledge(KnowledgeScope::new(SHARED));
+    let personal = restored.knowledge(KnowledgeScope::new(PERSONAL));
+    let served = restored.served_knowledge(ROUTE, KnowledgeScope::new(SHARED));
+
+    // Persisted facts are read off the copy before any setup write lands on it.
+    assert_eq!(
+        expect_ok(
+            shared.get_entry_at_revision("ke_gate", 1).await,
+            "item 6: replay revision 1 on the copy",
+        )
+        .body
+        .summary
+        .as_deref(),
+        Some(GATE_ONE),
+        "I-000009 item 6 (backup/restore): the copy replays revision 1's own payload"
+    );
+    assert_eq!(
+        expect_ok(
+            shared.get_entry_at_revision("ke_gate", 2).await,
+            "item 6: replay revision 2 on the copy",
+        )
+        .body
+        .summary
+        .as_deref(),
+        Some(GATE_TWO),
+        "I-000009 item 6 (backup/restore): the copy replays revision 2's own payload"
+    );
+    let restored_copy = expect_ok(
+        personal.get_knowledge_entry("ke_gate").await,
+        "item 6: read the personal copy on the reopened store",
+    );
+    assert_eq!(
+        adoption_anchor_parts(&restored_copy),
+        Some(("ke_gate", Some(2))),
+        "I-000009 item 6 (backup/restore): the personal copy keeps its anchor to the shared source \
+         id and adopted revision"
+    );
+    assert_eq!(
+        restored_copy.revision,
+        Some(2),
+        "I-000009 item 6 (backup/restore): the personal copy keeps the revision it was promoted to"
+    );
+    assert_eq!(
+        restored_copy.body.summary.as_deref(),
+        Some(PERSONAL_NOTE),
+        "I-000009 item 6 (backup/restore): the personal copy keeps the payload it was promoted to"
+    );
+    assert_eq!(
+        expect_ok(
+            shared.resolve_adoption_anchor(&restored_copy).await,
+            "item 6: resolve the anchor through the retirement chain on the copy",
+        ),
+        "ke_gate_tower",
+        "I-000009 item 6 (backup/restore): the retirement chain survives the copy"
+    );
+    assert_eq!(
+        expect_ok(
+            shared.get_entry_including_superseded("ke_gate_note").await,
+            "item 6: explicit lifecycle read on the copy",
+        )
+        .superseded_by
+        .as_deref(),
+        Some("ke_gate_note_successor"),
+        "I-000009 item 6 (backup/restore): the retired row keeps its marker on the copy"
+    );
+    assert_eq!(
+        source_row(&pool, SHARED, "ke_gate").await,
+        source_before,
+        "I-000009 item 6 (backup/restore): the shared row's revision and payload bytes survive the \
+         copy"
+    );
+
+    // Item 3 is re-probed on the copy under ids this file has not written yet: the same viewpoint
+    // split for a live entry, the same ordinary absence for both viewpoints once retired, and the
+    // same viewpoint-free explicit marker read.
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                owner_private(
+                    "ke_gate_note_copy",
+                    "the keeper's copied note",
+                    OWNER_VIEWPOINT,
+                ),
+                None,
+            )
+            .await,
+        "item 6: seed a live owner-private entry on the copy",
+    );
+    assert_eq!(
+        expect_ok(
+            served
+                .get_scoped_knowledge_entry(&owner_view, "ke_gate_note_copy")
+                .await,
+            "item 6: owner viewpoint get on the copy",
+        )
+        .revision,
+        Some(1),
+        "I-000009 item 6 (backup/restore): a live entry still discloses to its owner on the copy"
+    );
+    assert_eq!(
+        expect_reject(
+            served
+                .get_scoped_knowledge_entry(&foreign_view, "ke_gate_note_copy")
+                .await,
+            "item 6: foreign viewpoint get on the copy",
+        ),
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "I-000009 item 6 (backup/restore): a foreign viewpoint still gets the same absence on the \
+         copy"
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                entry(
+                    "ke_gate_note_copy_successor",
+                    "note",
+                    "the copied note moved on",
+                ),
+                None,
+            )
+            .await,
+        "item 6: seed the copied note's successor",
+    );
+    expect_ok(
+        shared
+            .supersede_entry("ke_gate_note_copy", 1, "ke_gate_note_copy_successor")
+            .await,
+        "item 6: retire the copied note",
+    );
+    for (viewpoint, scope) in [("owner", &owner_view), ("foreign", &foreign_view)] {
+        assert_eq!(
+            expect_reject(
+                served.get_scoped_knowledge_entry(scope, "ke_gate_note_copy").await,
+                "item 6: ordinary get of the retired copy note",
+            ),
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            "I-000009 item 6 (backup/restore): a retired entry is absent from ordinary get for the \
+             {viewpoint} viewpoint on the copy"
+        );
+        let listed = expect_ok(
+            served.list_scoped_knowledge_entries(scope).await,
+            "item 6: ordinary list after retirement on the copy",
+        );
+        assert!(
+            !listed
+                .iter()
+                .any(|listed| listed.entry_id == "ke_gate_note_copy"),
+            "I-000009 item 6 (backup/restore): a retired entry is absent from ordinary list for the \
+             {viewpoint} viewpoint on the copy"
+        );
+    }
+    let marked = expect_ok(
+        shared
+            .get_entry_including_superseded("ke_gate_note_copy")
+            .await,
+        "item 6: explicit lifecycle read of the retired copy note",
+    );
+    assert_eq!(
+        marked.superseded_by.as_deref(),
+        Some("ke_gate_note_copy_successor"),
+        "I-000009 item 6 (backup/restore): the explicit lifecycle read returns the marker without \
+         a viewpoint on the copy"
+    );
+
+    // Item 5 is re-probed on the copy with a carrier id this file has not written yet.
+    let mut write = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("item 6: begin immediate on the copy");
+    expect_ok(
+        write_entry(
+            &mut write,
+            SHARED,
+            carrier("ke_keeper_log_copy", 2, CARRIER_SUMMARY),
+            None,
+        )
+        .await,
+        "item 6: create the carrier on the copy inside the reservation",
+    );
+    write.commit().await.expect("item 6: commit on the copy");
+    assert_eq!(
+        carrier_header(&pool, SHARED, "ke_keeper_log_copy").await,
+        (1, Some(2)),
+        "I-000009 item 6 (backup/restore): the carrier head and entry commit together on the copy"
+    );
+    assert_eq!(
+        expect_ok(
+            read_records(&pool, SHARED, "ke_keeper_log_copy").await,
+            "item 6: read the committed records on the copy",
+        )
+        .len(),
+        2,
+        "I-000009 item 6 (backup/restore): the committed head names the two records on the copy"
+    );
+    let mut rewrite = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("item 6: begin immediate for the rolled-back write on the copy");
+    expect_ok(
+        write_entry(
+            &mut rewrite,
+            SHARED,
+            carrier("ke_keeper_log_copy", 3, CARRIER_REWRITE_SUMMARY),
+            Some(1),
+        )
+        .await,
+        "item 6: extend the carrier on the copy inside the reservation",
+    );
+    rewrite
+        .rollback()
+        .await
+        .expect("item 6: rollback on the copy");
+    assert_eq!(
+        carrier_header(&pool, SHARED, "ke_keeper_log_copy").await,
+        (1, Some(2)),
+        "I-000009 item 6 (backup/restore): a rollback on the copy leaves revision and head unchanged"
+    );
+    let after = expect_ok(
+        shared.get_knowledge_entry("ke_keeper_log_copy").await,
+        "item 6: read the carrier after the rollback on the copy",
+    );
+    assert_eq!(
+        after.body.summary.as_deref(),
+        Some(CARRIER_SUMMARY),
+        "I-000009 item 6 (backup/restore): the rollback on the copy kept the committed payload, not \
+         the attempted one"
+    );
+    assert_eq!(
+        expect_ok(
+            read_records(&pool, SHARED, "ke_keeper_log_copy").await,
+            "item 6: read the records after the rollback on the copy",
+        )
+        .len(),
+        2,
+        "I-000009 item 6 (backup/restore): the rolled-back record never became visible on the copy"
+    );
+
+    // I-000009 item 7 — single-writer switch: two stores opened on the same file before any
+    // reservation is taken. The second store's valid write is refused while the first holds the
+    // write reservation, leaves no row, and succeeds once the first closes. This asserts SQLite
+    // exclusion, not supported simultaneous writers: `MindStore`'s invariant is one store per
+    // file, and two stores on one file are unsupported rather than refused.
+    let second = MindStore::open(&restored_path)
+        .await
+        .expect("open a second store on the restored file");
+    // Only the second store's sole connection gets a short timeout, so contention fails fast
+    // instead of paying the production five-second busy handler.
+    let mut connection = second
+        .pool()
+        .acquire()
+        .await
+        .expect("acquire the second store's single connection");
+    sqlx::query("PRAGMA busy_timeout = 0")
+        .execute(&mut *connection)
+        .await
+        .expect("shorten the second store's busy timeout");
+    drop(connection);
+    let second_shared = second.knowledge(KnowledgeScope::new(SHARED));
+
+    let reservation = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("item 7: hold the write reservation on the first store");
+    let refusal = match second_shared
+        .put_knowledge_entry(entry("ke_switch_probe", "note", SWITCH_PROBE), None)
+        .await
+    {
+        SpokeResult::Ok(written) => panic!(
+            "I-000009 item 7 (single-writer switch): the second store wrote while the first held \
+             the write reservation: {written:?}"
+        ),
+        SpokeResult::Reject(reject) => reject,
+    };
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::InternalError,
+        "I-000009 item 7 (single-writer switch): the refusal is a storage failure, not a \
+         validation answer"
+    );
+    assert!(
+        refusal.message.contains("knowledge write could not begin"),
+        "I-000009 item 7 (single-writer switch): the write must be refused at the reservation, \
+         got: {}",
+        refusal.message
+    );
+    assert!(
+        refusal.message.contains("locked"),
+        "I-000009 item 7 (single-writer switch): the refusal must carry SQLite's lock condition, \
+         got: {}",
+        refusal.message
+    );
+    assert_eq!(
+        expect_reject(
+            second_shared.get_knowledge_entry("ke_switch_probe").await,
+            "item 7: read the refused entry",
+        ),
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "I-000009 item 7 (single-writer switch): the refused write left no partial row"
+    );
+
+    reservation
+        .rollback()
+        .await
+        .expect("item 7: release the write reservation");
+    restored.close().await;
+    let landed = expect_ok(
+        second_shared
+            .put_knowledge_entry(entry("ke_switch_probe", "note", SWITCH_PROBE), None)
+            .await,
+        "item 7: the same write after the first store closes",
+    );
+    assert_eq!(
+        landed.revision,
+        Some(1),
+        "I-000009 item 7 (single-writer switch): the same write succeeds once the first store \
+         closes"
+    );
+    assert_eq!(
+        landed.body.summary.as_deref(),
+        Some(SWITCH_PROBE),
+        "I-000009 item 7 (single-writer switch): the successful write landed its own payload"
+    );
+    second.close().await;
 }

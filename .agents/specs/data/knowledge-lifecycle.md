@@ -50,6 +50,26 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 - A retired carrier has no current judgment: the current-record lookup joins the live predicate, while explicit historical reads and revision replay stay available.
 - Adoption never copies a retired source, and a repeat adoption against a source that has since been retired answers the generic absence; an existing copy keeps its original provenance.
 
+### Shared scope rehearsal
+
+A shared `World` scope carries the same lifecycle contract as any other collection. `I-000009`'s seven acceptance facts hold on one isolated `shared:world` scope, and `crates/mindcore-sqlite/tests/shared_scope_rehearsal.rs` asserts each of them against real stores rather than a served face:
+
+| Fact | Contract |
+|---|---|
+| Revisions | An entry read as of an earlier revision returns that revision's own payload. |
+| References | A personal copy carries one adoption anchor naming its shared source id and adopted revision; resolution runs from the copy outward through the same collection, following each retirement marker to the first live entry. There is no reverse lookup from source to copies. |
+| Holder / binding disclosure | Two admitted viewpoints on the same route get different answers for the same live entry. |
+| Promotion | Writing the personal copy leaves the shared source's revision and stored payload bytes unchanged. |
+| Carrier transaction invariants | The carrier head and its entry settle in one `BEGIN IMMEDIATE`; a rollback leaves neither visible. |
+| Backup / restore | A store closed, copied as a file and reopened keeps the persisted revisions, anchors, retirement markers and source bytes, and the disclosure and transaction probes still hold on the copy. |
+| Single-writer switch | A write is refused while another handle holds the write reservation, leaves no partial row, and succeeds unchanged after that handle closes. |
+
+**Disclosure.** Ordinary reads and lists omit a retired entry for every admitted viewpoint — an owner and a foreign viewpoint see the same generic absence once the entry is retired. The explicit lifecycle read (`get_entry_including_superseded`) takes only an entry id and no viewpoint, and returns the row with its `superseded_by` marker.
+
+**Backup.** A file copy is a backup only of a closed store: committed frames of a live WAL database may still sit in `-wal`, so the main file alone is not a consistent snapshot. Closing the last connection checkpoints them, and the reopened copy carries revisions, anchors, retirement markers, carrier state and payload bytes unchanged.
+
+**Single writer.** The rehearsal's two handles exercise SQLite's exclusion, not a supported concurrency mode: one store per file is the `MindStore` contract, and two stores on one file are unsupported rather than refused (`mind-model.md` § Invariants). What it guarantees is only that a held write reservation refuses the second writer — nothing partial lands — and that the same write succeeds after the holder closes.
+
 ## Invariants
 
 - History, adoption and retirement share the existing immediate-transaction discipline: the write reservation is taken before claim state is read.
