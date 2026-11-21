@@ -150,9 +150,11 @@ pub trait WorkflowBinding: Send + Sync {
     /// error. It records a decision, never a settlement, and a capture replay
     /// reads it to report the original `Pending` outcome instead of the
     /// candidate's later state. A retry that repairs a missing marker passes
-    /// the receipt's complete candidate list, in receipt order: that list is
-    /// the domain the original decision ranged over, and the replay settles
-    /// none of it. Never call it for an empty set or a failed decision.
+    /// the receipt's complete candidate list, in receipt order, and only when
+    /// every candidate in that receipt is still pending: that is the one
+    /// receipt state where the whole list is provably the decision the failed
+    /// run made. A mixed receipt records nothing. Never call it for an empty
+    /// set or a failed decision.
     async fn record_absorb_pending(
         &self,
         principal: &Principal,
@@ -525,12 +527,16 @@ impl SpiMindWorkflows {
     /// that leaves fresh candidates pending returns, the binding records one
     /// durable decision marker for them; a replay reads that marker and
     /// reports the original `Pending` outcome even after the candidate was
-    /// resolved elsewhere. A replay whose candidate is still pending and has no
-    /// marker is the retry of a run that failed between its capture commit and
-    /// that write: it records that receipt's complete candidate list — the
-    /// whole domain the decision ranged over, which a replay reasons about and
-    /// settles none of — before returning, so the `Pending` it reports now
-    /// stays the answer later replays give.
+    /// resolved elsewhere. A replay with no marker is the retry of a run that
+    /// failed between its capture commit and that write, and it repairs only a
+    /// decision the receipt still shows. When every candidate in the receipt
+    /// is still pending that run settled nothing, so the receipt's ordered list
+    /// is its decision: the retry records that list before returning, and the
+    /// `Pending` it reports stays the answer later replays give. When the
+    /// receipt is mixed — some candidates consumed, some pending — it no longer
+    /// shows what that run decided, so the retry records nothing and reports
+    /// each candidate from its own state, leaving the next replay the same
+    /// freedom.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -543,15 +549,15 @@ impl SpiMindWorkflows {
             replayed,
         } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidates.len());
-        // A replay that still reports a candidate pending holds no marker: the
-        // run that decided left it unwritten. That decision ranged over the
-        // receipt's whole candidate list — a replay reasons about none of it
-        // and settles none of it — so the repair records that complete list,
-        // in receipt order, instead of the residue this replay can observe.
+        // A replay with no marker holds the receipt of a run that failed before
+        // writing it. A receipt whose candidates are all still pending shows
+        // that run settled nothing, so its ordered list is the decision the
+        // retry records. A mixed receipt no longer shows what that run decided,
+        // so it records nothing and reports each candidate from its own state.
         let repair = (replayed
             && candidates
                 .iter()
-                .any(|candidate| candidate.lifecycle == CandidateLifecycle::Pending))
+                .all(|candidate| candidate.lifecycle == CandidateLifecycle::Pending))
         .then(|| {
             candidates
                 .iter()
@@ -567,13 +573,12 @@ impl SpiMindWorkflows {
         } in candidates
         {
             if replayed {
-                // With no marker the repair above records every candidate, so
-                // this replay reports the same decision every later one will.
-                let pending = repair.is_some()
-                    || matches!(
-                        lifecycle,
-                        CandidateLifecycle::Pending | CandidateLifecycle::PendingDecision
-                    );
+                // A pending candidate, recorded pending or not, is reported
+                // from its receipt entry; only a consumed one is read back.
+                let pending = matches!(
+                    lifecycle,
+                    CandidateLifecycle::Pending | CandidateLifecycle::PendingDecision
+                );
                 outcomes.push(if pending {
                     AbsorbCandidateOutcome::Pending { candidate_id }
                 } else {

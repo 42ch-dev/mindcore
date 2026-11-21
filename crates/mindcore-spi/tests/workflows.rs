@@ -2166,7 +2166,7 @@ async fn a_retry_records_the_decision_its_first_run_could_not_write() {
 }
 
 #[tokio::test]
-async fn a_retry_records_the_receipt_s_whole_candidate_list() {
+async fn a_retry_records_the_whole_list_while_every_candidate_is_pending() {
     let (workflows, recorded) = absorb_two_pending();
     let caps = MindCapabilities::default();
     recorded.fail_pending_write.store(true, Ordering::SeqCst);
@@ -2182,16 +2182,12 @@ async fn a_retry_records_the_receipt_s_whole_candidate_list() {
     );
     assert!(recorded.pending.lock().expect("pending writes").is_empty());
 
-    // The second candidate is resolved elsewhere before the retry, so only the
-    // first is still pending; the original decision still covered both.
-    recorded.candidates.lock().expect("candidates")[1] = named(consumed_candidate(), "cnd_2");
-
+    // The retry sees a wholly pending receipt: the failed run settled nothing,
+    // so the receipt's ordered list is the decision it records.
     let retried = workflows
         .absorb(&principal(), &capture_request(), None, &caps)
         .await
         .expect("retried absorb");
-    // The marker names both candidates in receipt order: the resolution the
-    // second one reached later is not presented as the original decision.
     assert_eq!(
         recorded.pending.lock().expect("pending writes").as_slice(),
         [vec!["cnd_1".to_string(), "cnd_2".to_string()]],
@@ -2207,7 +2203,7 @@ async fn a_retry_records_the_receipt_s_whole_candidate_list() {
                 candidate_id: "cnd_2".to_string(),
             },
         ],
-        "the retry reports the decision it records, not the later resolution"
+        "the retry reports the decision it records"
     );
 
     // A later replay reads the marker, reports both as pending, and reads no
@@ -2223,6 +2219,62 @@ async fn a_retry_records_the_receipt_s_whole_candidate_list() {
         recorded.pending.lock().expect("pending writes").len(),
         1,
         "the replay writes no second marker"
+    );
+}
+
+#[tokio::test]
+async fn a_mixed_retry_records_no_decision_it_cannot_reconstruct() {
+    let (workflows, recorded) = absorb_two_pending();
+    let caps = MindCapabilities::default();
+    recorded.fail_pending_write.store(true, Ordering::SeqCst);
+
+    // The capture commits both candidates and the marker write fails.
+    let failed = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await;
+    assert!(
+        matches!(failed, Err(SpiError::Settlement(_))),
+        "a failed marker write fails the run"
+    );
+
+    // One candidate is settled elsewhere before the retry. The receipt no
+    // longer shows what the failed run decided about either candidate, so the
+    // retry can no longer reconstruct that decision.
+    recorded.candidates.lock().expect("candidates")[0] = named(consumed_candidate(), "cnd_1");
+
+    let retried = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("retried absorb");
+    assert_eq!(
+        retried,
+        vec![
+            AbsorbCandidateOutcome::Settled {
+                candidate_id: "cnd_1".to_string(),
+                record_ids: vec!["rec_new".to_string()],
+            },
+            AbsorbCandidateOutcome::Pending {
+                candidate_id: "cnd_2".to_string(),
+            },
+        ],
+        "the retry reports each candidate from its own state"
+    );
+    assert!(
+        recorded.pending.lock().expect("pending writes").is_empty(),
+        "a mixed receipt writes no marker: recording the whole list would report \
+         the settled candidate as pending"
+    );
+
+    // A later replay is in the same position and answers the same way: the
+    // settled candidate stays reported from its state, the pending one pending.
+    let replay = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("replayed absorb");
+    assert_eq!(replay, retried);
+    assert!(
+        recorded.pending.lock().expect("pending writes").is_empty(),
+        "no replay of the mixed receipt writes a marker either"
     );
 }
 

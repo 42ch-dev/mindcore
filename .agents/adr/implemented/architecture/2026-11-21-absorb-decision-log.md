@@ -25,11 +25,14 @@ complete identity. The pending ids are stored in capture receipt order.
 
 `record_absorb_pending` writes the marker on a short `BEGIN IMMEDIATE` transaction after the capture
 commits, after verifying that exact receipt; an equal marker already present is a no-op and a
-mismatched one is a storage error. Replay reads the marker before projecting anything, and a replay
-whose candidate is still pending with no marker — the retry of a run that failed between the capture
-and that write — records the marker before returning, so the `Pending` it reports becomes the answer
-later replays give. A replay that projects a consumed candidate stays read-only and reports that
-candidate's own recorded outcome.
+mismatched one is a storage error. Replay reads the marker before projecting anything. A replay with
+no marker is the retry of a run that failed between the capture and that write, and it repairs only a
+decision the receipt still shows: when every candidate in the receipt is still pending, that run
+settled nothing, so the retry records the marker naming the whole ordered list before returning and
+the `Pending` it reports becomes the answer later replays give. A mixed receipt — some candidates
+consumed, some pending — no longer shows what that run decided, so the retry records no marker and
+reports each candidate from its own state, exactly as a marker-absent replay does. A replay that
+projects a consumed candidate stays read-only and reports that candidate's own recorded outcome.
 
 ## Alternatives considered
 
@@ -48,7 +51,9 @@ candidate's own recorded outcome.
 - One marker per capture receipt, so replay is idempotent by construction and the write is safe to
   retry.
 - The marker commits in a second transaction after the capture. A failure there fails the run
-  instead of returning a `Pending` it never recorded; the retry completes the write.
+  instead of returning a `Pending` it never recorded; the retry completes the write while the
+  receipt is still wholly pending. A receipt that changed since that failure keeps no marker: a
+  replay reports current state instead of inventing a decision the receipt can no longer prove.
 - The decision survives exactly as long as the receipt it names. A reader must validate the whole
   identity: comparing only the receipt and the payload lets a row with another subject or requester
   pass as authoritative, and a subset check accepts an empty list as "nothing pending".
