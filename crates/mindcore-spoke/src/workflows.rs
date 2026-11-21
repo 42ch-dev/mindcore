@@ -5,7 +5,7 @@
 //! call reads and returns, so an embedder, reasoner or policy hook runs with no
 //! transaction open and the workflow can revalidate afterwards.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -280,9 +280,12 @@ impl MemoryWorkflowBinding {
     /// reach.
     ///
     /// The map is the workflow collection allowlist, so a route need not name a collection that
-    /// already holds rows. An empty key or destination collection is the host's input error and
-    /// leaves the binding unrouted. Nothing else is checked here: a map cannot repeat a key, and
-    /// `KnowledgeScope` is not a wire `Scope`, so no admission call applies.
+    /// already holds rows. An empty key, an empty destination collection, or one collection named by
+    /// two routes is refused with `InvalidInput`, so surface assembly fails instead of serving a
+    /// binding whose map must still be completed. A destination collection is one principal's
+    /// carrier collection, so a repeat would let one routed principal reach another's carriers. A
+    /// map cannot repeat a key, and `KnowledgeScope` is not a wire `Scope`, so no admission call
+    /// applies.
     pub fn with_knowledge_routes(
         mut self,
         routes: BTreeMap<String, KnowledgeScope>,
@@ -302,6 +305,14 @@ impl MemoryWorkflowBinding {
                 return Err(invalid(format!(
                     "the knowledge route for principal {principal} names an empty collection"
                 )));
+            }
+        }
+        let mut destinations = BTreeSet::new();
+        for scope in routes.values() {
+            if !destinations.insert(scope.collection.as_str()) {
+                return Err(invalid(
+                    "a destination collection is routed to more than one principal".to_string(),
+                ));
             }
         }
         self.knowledge_routes = routes;

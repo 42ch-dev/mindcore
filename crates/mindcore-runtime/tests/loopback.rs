@@ -812,12 +812,13 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
     );
 }
 
-/// A route map fills recall's knowledge slot per principal: a second admitted peer routed to the
-/// same collection reads it under its own grant, whichever principal the host routed first.
+/// A route map fills recall's knowledge slot per principal: a second admitted peer routed to its own
+/// collection reads that collection's entry under its own grant, never the first principal's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() {
     let fixture = Fixture::open().await;
     fixture.seed_carrier().await;
+    fixture.seed_carrier_in(COLLECTION_TWO, CARRIER_TWO).await;
     fixture
         .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
         .await;
@@ -829,13 +830,18 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
         )
         .await;
     let (_dir, serve) = fixture.serve();
+    let mut workflow_routes = routes(&[PRINCIPAL]);
+    workflow_routes.insert(
+        PEER_TWO_PRINCIPAL.to_string(),
+        KnowledgeScope::new(COLLECTION_TWO),
+    );
     let mut faces = faces(
         hello("runtime", &[]),
         None,
         MindProviders::default(),
-        routes(&[PRINCIPAL, PEER_TWO_PRINCIPAL]),
+        workflow_routes,
     );
-    // Both peers are admitted and both route to the shared collection.
+    // Both peers are admitted; each principal's route names its own collection.
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
     assert!(
@@ -857,8 +863,8 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
     assert_eq!(packed_record_ids(&result), ["rec_market", "rec_north_gate"]);
     assert_eq!(
         packed_knowledge_ids(&result),
-        [CARRIER],
-        "the peer's own knowledge_read grant fills the slot"
+        [CARRIER_TWO],
+        "the peer's own knowledge_read grant fills the slot from its own route: {result}"
     );
 }
 

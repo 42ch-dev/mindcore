@@ -223,15 +223,19 @@ async fn manifest_follows_the_composed_faces() {
     );
 }
 
-/// The host's route map is validated once, where the surface is assembled: an empty principal key
-/// or an empty destination collection is the host's input error, refused before any port or
-/// registration exists.
+/// The host's route map is validated once, where the surface is assembled: an empty principal key,
+/// an empty destination collection, or one destination collection claimed by two routes is the
+/// host's input error, refused before any port or registration exists.
 #[tokio::test]
 async fn an_unroutable_destination_is_refused_at_assembly() {
     let serve = Fixture::open().await.serve();
     for routes in [
         BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
         BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
+        BTreeMap::from([
+            ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
+            ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
+        ]),
     ] {
         let reject = match serve.surface(ServeFaces {
             workflow_routes: routes,

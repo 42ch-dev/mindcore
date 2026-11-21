@@ -34,8 +34,9 @@ the scope by `principal_id(principal)` for both carrier admission and the recall
   names inside it, so the existing holder/assessor identity rules decide whether a write is accepted;
   a holder id that exists only in another collection is refused `knowledge_entry_not_found` and
   writes nothing.
-- Two principals may route to the same collection. A shared collection is a configured choice, not an
-  entry-level isolation promise.
+- Each destination collection belongs to exactly one principal route: assembly refuses a collection
+  named by two routes. The request's `holder` names the entry inside that one collection, so a
+  cross-principal carrier write is unreachable.
 - A principal with no route is refused `NotAuthorized` with no target details. The refusal never
   reveals whether another principal has a route.
 - A surface with no route does not advertise `tools.mindcore.deliberate` and installs no handler
