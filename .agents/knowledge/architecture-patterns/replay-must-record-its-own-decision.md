@@ -37,12 +37,14 @@ alone writes and never projects.
 ## Pattern
 
 1. **Record the decision, in the workflow's own namespace.** Absorb writes one applied, target-free
-   row (`op = mindcore.absorb.decision`) in the admitted capture transaction, keyed by the capture
-   receipt and carrying the pending candidate ids in receipt order. No new table: the journal already
-   holds workflow-owned records.
+   row (`op = mindcore.absorb.decision`) in a short `BEGIN IMMEDIATE` transaction after the admitted
+   capture commits, keyed by the capture receipt and carrying the pending candidate ids in receipt
+   order. No new table: the journal already holds workflow-owned records.
 2. **Read the record before projecting anything.** Replay looks up the decision first. Only a request
    with no record falls back to projecting current state — that fallback keeps a request that never
-   produced a decision from inheriting someone else's answer.
+   produced a decision from inheriting someone else's answer. A request with no record whose receipt
+   still holds a pending candidate is the retry of a run that failed before writing: it records the
+   receipt's complete candidate list, the whole domain the decision ranged over, before returning.
 3. **Fail closed on an inconsistent record.** Compare the complete identity the writer recorded
    (receipt, subject, requester, idempotency key) and validate the payload's shape: nonempty, unique,
    receipt-ordered candidate ids, and an object with exactly one member. A malformed or mismatched
@@ -55,8 +57,10 @@ alone writes and never projects.
 ## Why it works
 
 The decision survives exactly as long as its own record, independent of what happens to the candidate.
-Replay is idempotent by construction: it returns the recorded answer, writes nothing new, and never
-auto-settles.
+Replay is idempotent by construction: a replay that finds the record returns the recorded answer,
+writes nothing new, and never auto-settles. A replay that finds none while the receipt still holds a
+pending candidate writes the record once — the retry-repair of a run that failed between its capture
+commit and the marker write — and every later replay returns that same answer.
 
 ## Traps
 
