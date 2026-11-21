@@ -1067,11 +1067,15 @@ impl SqliteMemoryRepository {
             GrantRow,
             // The existing-space filter keeps an orphan grant (no space row,
             // unconstrained payload) out of the decode: no listing can show it.
+            // `EXISTS` rather than `IN`: SQLite then reads the index once over
+            // the principal and probes one space row per grant, instead of
+            // probing the index once per stored space.
             "SELECT grant_id, space_id, subject_id, principal_id, \
              capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
              revision, created_at FROM memory_grants \
              WHERE principal_id = ? \
-             AND space_id IN (SELECT space_id FROM memory_spaces) \
+             AND EXISTS (SELECT 1 FROM memory_spaces \
+                         WHERE memory_spaces.space_id = memory_grants.space_id) \
              ORDER BY space_id, grant_id",
             principal,
         )
@@ -1094,8 +1098,11 @@ impl SqliteMemoryRepository {
         let spaces = serde_json::to_string(visible_space_ids)
             .map_err(|error| invalid_row(format_args!("visible space ids: {error}")))?;
         sqlx::query_as::<_, (String, i64)>(
+            // `+space_id` keeps the IN list off the index, so SQLite reads the
+            // index once over the principal and tests the visible set there,
+            // instead of probing the index once per visible space.
             "SELECT grant_id, revision FROM memory_grants \
-             WHERE principal_id = ? AND space_id IN (SELECT value FROM json_each(?)) \
+             WHERE principal_id = ? AND +space_id IN (SELECT value FROM json_each(?)) \
              ORDER BY space_id, grant_id",
         )
         .bind(principal)
