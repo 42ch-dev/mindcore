@@ -7,6 +7,8 @@
 //! receipts is reconstructed empty (the pinned schema has no column for it; see
 //! `task-1-schema-map.md` §3 D-1).
 
+use std::future::poll_fn;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Number, Value};
@@ -1031,6 +1033,59 @@ struct JournalRow {
 /// The borrowed-transaction repository. Zero-sized: the caller's transaction is the seam.
 pub struct SqliteMemoryRepository;
 
+impl SqliteMemoryRepository {
+    /// The serving path's grant read: one principal's existing-space grants in
+    /// `(space_id, grant_id)` order, decoded one row at a time, so peak memory is
+    /// a row plus SQLx's delivery buffer rather than the whole grant history.
+    pub async fn scan_principal_grants(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        principal: &str,
+        mut visit: impl FnMut(MemoryGrantRow) + Send,
+    ) -> RepoResult<()> {
+        let mut rows = sqlx::query_as!(
+            GrantRow,
+            // The existing-space filter keeps an orphan grant (no space row,
+            // unconstrained payload) out of the decode: no listing can show it.
+            "SELECT grant_id, space_id, subject_id, principal_id, \
+             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+             revision, created_at FROM memory_grants \
+             WHERE principal_id = ? \
+             AND space_id IN (SELECT space_id FROM memory_spaces) \
+             ORDER BY space_id, grant_id",
+            principal,
+        )
+        .fetch(&mut **tx);
+        while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+            visit(grant_row(row.map_err(decode_row)?)?);
+        }
+        Ok(())
+    }
+
+    /// `(grant_id, revision)` for every grant of `principal` in the given spaces,
+    /// expired and revoked included: the cursor marker invalidates on any
+    /// visible-space grant change without the caller retaining grant rows.
+    pub async fn principal_grant_revisions(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        principal: &str,
+        visible_space_ids: &[&str],
+    ) -> RepoResult<Vec<(String, i64)>> {
+        let spaces = serde_json::to_string(visible_space_ids)
+            .map_err(|error| invalid_row(format_args!("visible space ids: {error}")))?;
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT grant_id, revision FROM memory_grants \
+             WHERE principal_id = ? AND space_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY space_id, grant_id",
+        )
+        .bind(principal)
+        .bind(spaces)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)
+    }
+}
+
 #[async_trait]
 impl MemoryRepository for SqliteMemoryRepository {
     type Tx<'a> = sqlx::Transaction<'a, Sqlite>;
@@ -1352,24 +1407,10 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         principal: &str,
     ) -> RepoResult<Vec<MemoryGrantRow>> {
-        sqlx::query_as!(
-            GrantRow,
-            // The existing-space filter keeps an orphan grant (no space row,
-            // unconstrained payload) out of the decode: no listing can show it.
-            "SELECT grant_id, space_id, subject_id, principal_id, \
-             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
-             revision, created_at FROM memory_grants \
-             WHERE principal_id = ? \
-             AND space_id IN (SELECT space_id FROM memory_spaces) \
-             ORDER BY space_id, grant_id",
-            principal,
-        )
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(decode_row)?
-        .into_iter()
-        .map(grant_row)
-        .collect()
+        let mut grants = Vec::new();
+        self.scan_principal_grants(tx, principal, |grant| grants.push(grant))
+            .await?;
+        Ok(grants)
     }
 
     async fn grant(
