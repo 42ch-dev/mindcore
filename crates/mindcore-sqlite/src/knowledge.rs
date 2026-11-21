@@ -383,10 +383,7 @@ async fn entries(
         Err(error) => return internal(format!("knowledge entries could not be listed: {error}")),
     };
     if rows.len() as i64 > limit {
-        return internal(format!(
-            "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} live entries; \
-             the list is bounded"
-        ));
+        return internal(over_bound());
     }
     let mut stored = Vec::with_capacity(rows.len());
     for payload in &rows {
@@ -464,27 +461,20 @@ impl RoutedKnowledgeStore {
     async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
-            Err(error) => {
-                return internal(format!("knowledge entries could not be listed: {error}"))
-            }
+            Err(_) => return storage_unavailable(),
         };
         match entries(&mut tx, &self.scope.collection, &SnapshotSeam::default()).await {
             SpokeResult::Ok(listed) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(listed),
-                Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
+                Err(_) => storage_unavailable(),
             },
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
     }
-}
 
-#[async_trait]
-impl ScopedKnowledgePort for RoutedKnowledgeStore {
-    async fn get_scoped_knowledge_entry(
-        &self,
-        scope: &Scope,
-        entry_id: &str,
-    ) -> SpokeResult<KnowledgeEntry> {
+    /// One served read: the collection's one route, the caller's admission, and the disclosure
+    /// predicate all apply before the entry leaves the store.
+    async fn served_get(&self, scope: &Scope, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
         if let SpokeResult::Reject(reject) = self.admit(scope) {
             return SpokeResult::Reject(reject);
         }
@@ -494,14 +484,12 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         // the same refusal.
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
-            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
+            Err(_) => return storage_unavailable(),
         };
         let entry = match read_entry(&mut tx, &self.scope.collection, entry_id).await {
             SpokeResult::Ok(entry) => match tx.commit().await {
                 Ok(()) => entry,
-                Err(error) => {
-                    return internal(format!("knowledge entry could not be read: {error}"))
-                }
+                Err(_) => return storage_unavailable(),
             },
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
@@ -517,7 +505,9 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         }
     }
 
-    async fn put_scoped_knowledge_entry(
+    /// One served write: the submitted entry, and the existing row, are judged before the store
+    /// can reveal a revision.
+    async fn served_put(
         &self,
         scope: &Scope,
         entry: KnowledgeEntry,
@@ -535,7 +525,7 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         // scoped store above.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
-            Err(error) => return internal(format!("knowledge write could not begin: {error}")),
+            Err(_) => return storage_unavailable(),
         };
         let existing = read_stored_row(
             &mut transaction,
@@ -582,16 +572,14 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
             SpokeResult::Ok(entry) => entry,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        if let Err(error) = transaction.commit().await {
-            return internal(format!("knowledge write could not commit: {error}"));
+        if transaction.commit().await.is_err() {
+            return storage_unavailable();
         }
         SpokeResult::Ok(entry)
     }
 
-    async fn list_scoped_knowledge_entries(
-        &self,
-        scope: &Scope,
-    ) -> SpokeResult<Vec<KnowledgeEntry>> {
+    /// The served list: the collection's live rows, filtered by the caller's disclosure predicate.
+    async fn served_list(&self, scope: &Scope) -> SpokeResult<Vec<KnowledgeEntry>> {
         if let SpokeResult::Reject(reject) = self.admit(scope) {
             return SpokeResult::Reject(reject);
         }
@@ -603,6 +591,35 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
             SpokeResult::Ok(visible) => SpokeResult::Ok(visible.into_iter().cloned().collect()),
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
+    }
+}
+
+/// Every op reports a failed statement as [`storage_unavailable`]: the store's shared helpers
+/// build their message for the local port, and it names local tables and columns.
+#[async_trait]
+impl ScopedKnowledgePort for RoutedKnowledgeStore {
+    async fn get_scoped_knowledge_entry(
+        &self,
+        scope: &Scope,
+        entry_id: &str,
+    ) -> SpokeResult<KnowledgeEntry> {
+        served(self.served_get(scope, entry_id).await)
+    }
+
+    async fn put_scoped_knowledge_entry(
+        &self,
+        scope: &Scope,
+        entry: KnowledgeEntry,
+        expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        served(self.served_put(scope, entry, expected_base_revision).await)
+    }
+
+    async fn list_scoped_knowledge_entries(
+        &self,
+        scope: &Scope,
+    ) -> SpokeResult<Vec<KnowledgeEntry>> {
+        served(self.served_list(scope).await)
     }
 }
 
@@ -646,6 +663,35 @@ pub(crate) fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
 
 fn invalid_input<T>(message: impl Into<String>) -> SpokeResult<T> {
     spoke_reject(SpokeRejectCode::InvalidInput, message, None)
+}
+
+/// The one answer a failed statement gives on the served face: a `sqlx::Error::Database` names
+/// local tables and columns, and this face forwards its message to an admitted peer. The local
+/// port keeps the detailed message for the host's own logs.
+fn storage_unavailable<T>() -> SpokeResult<T> {
+    internal("knowledge storage is unavailable")
+}
+
+/// Replace every internal refusal a served op produced with [`storage_unavailable`], including
+/// the ones the shared store helpers build for the local port. The over-bound list refusal is the
+/// exception: it is about the peer's own collection and names no local schema.
+fn served<T>(result: SpokeResult<T>) -> SpokeResult<T> {
+    match result {
+        SpokeResult::Reject(reject)
+            if reject.code == SpokeRejectCode::InternalError && reject.message != over_bound() =>
+        {
+            storage_unavailable()
+        }
+        other => other,
+    }
+}
+
+// Names the bound, and nothing local: the served list forwards this refusal to a peer.
+fn over_bound() -> String {
+    format!(
+        "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} live entries; \
+         the list is bounded"
+    )
 }
 
 // One absence names its collection: this is the local port, whose caller already knows it.

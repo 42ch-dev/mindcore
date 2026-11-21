@@ -1131,6 +1131,104 @@ async fn refused_put_names_no_collection() {
     assert_eq!(elsewhere.body.summary.as_deref(), Some("studio only"));
 }
 
+/// A storage failure on the served path crosses the trust boundary as one fixed message: the
+/// driver's text names the local table, so the peer must not receive it, while the local port keeps
+/// the detail for the host's own logs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_failure_names_no_table_to_the_peer() {
+    let fixture = Fixture::open().await;
+    let adapter_peer_id = derive_peer_id_from_ed25519_pubkey(
+        &SigningKey::from_bytes(&[0x42u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let session = connect_knowledge_session(
+        &fixture,
+        admission_of(&adapter_peer_id, scope_of(SCOPE_ID)),
+        &["spoke-knowledge"],
+        &["spoke-knowledge"],
+        None,
+    )
+    .await;
+    // A real driver failure: every knowledge statement now answers `no such table`.
+    let raw = raw_connection(&fixture._dir.path().join("knowledge_connect.db")).await;
+    sqlx::query("DROP TABLE knowledge_entries")
+        .execute(&raw)
+        .await
+        .expect("drop the carrier table");
+
+    let scope = scope_of(SCOPE_ID);
+    let rejects = [
+        (
+            "get",
+            expect_reject(
+                KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, "ke_alpha").await,
+                "get against a dropped carrier table",
+            ),
+        ),
+        (
+            "list",
+            expect_reject(
+                KnowledgeQueryPort::list_knowledge_entries(&*session.adapter, &scope).await,
+                "list against a dropped carrier table",
+            ),
+        ),
+        (
+            "put",
+            expect_reject(
+                KnowledgeEntryPort::put_knowledge_entry(
+                    &*session.adapter,
+                    entry("ke_gamma", "written"),
+                    None,
+                )
+                .await,
+                "put against a dropped carrier table",
+            ),
+        ),
+    ];
+    for (op, reject) in &rejects {
+        assert_eq!(
+            reject.code,
+            SpokeRejectCode::InternalError,
+            "{op}: a storage failure is an internal error"
+        );
+        assert_eq!(
+            reject.message, "knowledge storage is unavailable",
+            "{op}: the peer gets the fixed message"
+        );
+        assert!(reject.details.is_none(), "{op}: no detail crosses either");
+        for leaked in [
+            "knowledge_entries",
+            "collection",
+            "entry_id",
+            "UNIQUE",
+            "constraint",
+            "no such table",
+        ] {
+            assert!(
+                !reject.message.contains(leaked),
+                "{op}: the peer's message names {leaked}: {}",
+                reject.message
+            );
+        }
+    }
+
+    let local = expect_reject(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(COLLECTION))
+            .get_knowledge_entry("ke_alpha")
+            .await,
+        "the local port sees the same storage failure",
+    );
+    assert_eq!(local.code, SpokeRejectCode::InternalError);
+    assert!(
+        local.message.contains("knowledge_entries"),
+        "the local port keeps the driver detail for the host's logs: {}",
+        local.message
+    );
+}
+
 /// A declared viewpoint is served only under the negotiated `ke-ownership`
 /// flag: without it the owned list is denied on the wire, while the same list
 /// without a viewpoint is served.
