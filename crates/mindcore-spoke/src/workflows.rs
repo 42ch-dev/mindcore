@@ -310,10 +310,9 @@ impl MemoryWorkflowBinding {
         let mut destinations = BTreeSet::new();
         for scope in routes.values() {
             if !destinations.insert(scope.collection.as_str()) {
-                return Err(invalid(format!(
-                    "collection {} is routed to more than one principal",
-                    scope.collection
-                )));
+                return Err(invalid(
+                    "a destination collection is routed to more than one principal".to_string(),
+                ));
             }
         }
         self.knowledge_routes = routes;

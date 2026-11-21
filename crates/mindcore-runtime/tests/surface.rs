@@ -229,22 +229,13 @@ async fn manifest_follows_the_composed_faces() {
 #[tokio::test]
 async fn an_unroutable_destination_is_refused_at_assembly() {
     let serve = Fixture::open().await.serve();
-    for (routes, named) in [
-        (
-            BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
-            None,
-        ),
-        (
-            BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
-            None,
-        ),
-        (
-            BTreeMap::from([
-                ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
-                ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
-            ]),
-            Some(COLLECTION),
-        ),
+    for routes in [
+        BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
+        BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
+        BTreeMap::from([
+            ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
+            ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
+        ]),
     ] {
         let reject = match serve.surface(ServeFaces {
             workflow_routes: routes,
@@ -263,12 +254,6 @@ async fn an_unroutable_destination_is_refused_at_assembly() {
             reject.details.is_none(),
             "the assembly refusal carries no route details: {reject:?}"
         );
-        if let Some(named) = named {
-            assert!(
-                reject.message.contains(named),
-                "the refusal names the collection two routes claim: {reject:?}"
-            );
-        }
     }
 }
 
