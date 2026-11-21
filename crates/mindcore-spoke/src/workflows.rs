@@ -666,9 +666,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let receipt = admission::probe(&SqliteMemoryRepository, &mut transaction, &op)
             .await
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?
-            .ok_or_else(|| {
-                internal("no committed capture receipt for this absorb".to_string())
-            })?;
+            .ok_or_else(|| internal("no committed capture receipt for this absorb".to_string()))?;
         let ReceiptState::Committed { result, .. } = &receipt.state else {
             return Err(internal(format!(
                 "capture receipt {} is not committed",
@@ -1398,7 +1396,11 @@ async fn absorb_decision(
     // list: order and uniqueness come from that list, so an empty, repeated or
     // reordered decision is corruption, never the recorded one.
     let mut held = capture_candidates.iter();
-    if pending.is_empty() || !pending.iter().all(|id| held.any(|candidate| candidate == id)) {
+    if pending.is_empty()
+        || !pending
+            .iter()
+            .all(|id| held.any(|candidate| candidate == id))
+    {
         return Err(internal(format!(
             "absorb decision {receipt_id} is not a nonempty receipt-ordered part of the capture receipt"
         )));

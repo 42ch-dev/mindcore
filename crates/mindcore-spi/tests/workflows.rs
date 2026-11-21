@@ -1473,11 +1473,12 @@ impl WorkflowBinding for AbsorbDouble {
         _request: &MemoryCaptureRequest,
         pending_candidate_ids: &[&str],
     ) -> Result<(), SpiError> {
-        self.recorded
-            .pending
-            .lock()
-            .expect("pending writes")
-            .push(pending_candidate_ids.iter().map(|id| id.to_string()).collect());
+        self.recorded.pending.lock().expect("pending writes").push(
+            pending_candidate_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+        );
         Ok(())
     }
 
