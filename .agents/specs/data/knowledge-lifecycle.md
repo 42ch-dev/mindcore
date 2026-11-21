@@ -50,6 +50,32 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 - A retired carrier has no current judgment: the current-record lookup joins the live predicate, while explicit historical reads and revision replay stay available.
 - Adoption never copies a retired source, and a repeat adoption against a source that has since been retired answers the generic absence; an existing copy keeps its original provenance.
 
+### Shared scope rehearsal
+
+A shared `World` scope carries the same lifecycle contract as any other collection. `I-000009`'s seven acceptance facts hold on one isolated `shared:world` scope, and `crates/mindcore-sqlite/tests/shared_scope_rehearsal.rs` asserts each of them against real stores rather than a served face:
+
+| Fact | Contract |
+|---|---|
+| Revisions | An entry read as of an earlier revision returns that revision's own payload. |
+| References | A personal copy carries one adoption anchor naming its shared source id and adopted revision; resolution runs from the copy outward through the same collection, following each retirement marker to the first live entry. There is no reverse lookup from source to copies. § Retirement owns what a hidden, missing or cyclic hop answers; this rehearsal walks only a live chain. |
+| Holder / binding disclosure | On the same route, an entry carrying the `owner-private` disclosure is read and listed by its owner viewpoint and answers the generic absence to a foreign viewpoint; the entry's disclosure policy, not the viewpoint pair, decides visibility, and after retirement both viewpoints see the same absence. |
+| Promotion | Writing the personal copy leaves the shared source's revision and stored payload bytes unchanged. |
+| Carrier transaction invariants | The carrier head and its entry settle in one `BEGIN IMMEDIATE`; a rollback leaves neither visible. |
+| Backup / restore | A store closed, copied as a file and reopened keeps the persisted revisions, anchors, retirement markers and source bytes, and the disclosure and transaction probes still hold on the copy. |
+| Single-writer switch | With the second handle's busy timeout at zero, a write is refused without waiting while the first handle holds the write reservation and leaves no partial row; the same write succeeds on a retry after that handle released the reservation and then closed. |
+
+**Disclosure.** Ordinary reads and lists omit a retired entry for both viewpoints the rehearsal exercises — an owner and a foreign viewpoint see the same generic absence once the entry is retired. The explicit lifecycle read (`get_entry_including_superseded`) takes only an entry id and no viewpoint, and returns the row with its `superseded_by` marker.
+
+**Backup.** A file copy is a backup only of a closed store: committed frames of a live WAL database may still sit in `-wal`, so the main file alone is not a consistent snapshot. Closing the last connection checkpoints them, and the reopened copy carries revisions, anchors, retirement markers, carrier state and payload bytes unchanged.
+
+**Single writer.** The rehearsal's two handles exercise SQLite's exclusion, not a supported concurrency mode: one store per file is the `MindStore` contract, and two stores on one file are unsupported rather than refused (`mind-model.md` § Invariants). Three distinct conditions decide what a caller sees, and the rehearsal fixes all three rather than proving one implies another:
+
+- the **wait timeout** — the rehearsal sets the second store's `busy_timeout` to zero, so a contended acquisition is refused immediately instead of waiting out the production five-second handler;
+- **release of the write lock** — the first store's reservation is rolled back;
+- **closing the handle** — the first store is closed.
+
+Only one writer can hold the reservation, and an acquisition that cannot obtain it within the configured busy wait is refused without a write. The rehearsal's retry runs after both the rollback and the close, so it shows that ordered scenario, not that either step alone would let the write through.
+
 ## Invariants
 
 - History, adoption and retirement share the existing immediate-transaction discipline: the write reservation is taken before claim state is read.
