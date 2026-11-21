@@ -33,7 +33,7 @@ Keep selection host-side and make it a map:
 - Validation happens once at assembly: an empty principal id or empty collection is `InvalidInput`; an empty map is legal and means the surface serves no carrier workflow.
 - The binding resolves the route in exactly one helper, borrowed, by `principal_id(principal)`. Both consumers use it: carrier admission for `deliberate`, and the knowledge slot for `recall_context`. Nothing else reads the map.
 - A missing route at carrier admission is terminal, target-free `NotAuthorized`. A missing route at recall is not a refusal: recall returns its memory page with an empty knowledge slot, because memory authorization never depended on a knowledge route.
-- Two principals may name the same collection. Their carriers are distinct holder entries, so sharing a destination is a configured choice, not an isolation promise.
+- Each destination collection belongs to exactly one principal route; a collection named by two routes is refused at assembly. A shared destination would let one routed principal reach another principal's carrier entry, whose `holder` id comes from the request, so sharing is not an available configuration.
 - An empty map removes the tool from the final registration set, including any host registration of the same capability id.
 
 ## What did not work: proving a read never happened
