@@ -834,6 +834,97 @@ async fn owner_private_entry_stays_hidden_from_a_foreign_viewpoint() {
     assert_eq!(after.revision, Some(1));
 }
 
+/// A superseded entry is one absence on the served paths: its `get` answers exactly like a
+/// missing id and a disclosure-hidden row, the list stays live-only, and a conditional put cannot
+/// overwrite it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_superseded_entry_is_served_like_a_missing_one() {
+    let fixture = Fixture::open().await;
+    let superseded = expect_ok(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(COLLECTION))
+            .supersede_entry("ke_beta", 1, "ke_alpha")
+            .await,
+        "mark the served entry superseded",
+    );
+    assert_eq!(superseded, 2);
+    let served = fixture
+        .store
+        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let foreign = viewpoint_scope(SCOPE_ID, FOREIGN_VIEWPOINT);
+
+    let marked = expect_reject(
+        served
+            .get_scoped_knowledge_entry(&scope_of(SCOPE_ID), "ke_beta")
+            .await,
+        "get of a superseded entry",
+    );
+    let hidden = expect_reject(
+        served
+            .get_scoped_knowledge_entry(&foreign, "ke_mira_private")
+            .await,
+        "get of an entry hidden from the viewpoint",
+    );
+    let missing = expect_reject(
+        served
+            .get_scoped_knowledge_entry(&scope_of(SCOPE_ID), "ke_absent")
+            .await,
+        "get of a missing entry",
+    );
+    for (reject, entry_id) in [
+        (&marked, "ke_beta"),
+        (&hidden, "ke_mira_private"),
+        (&missing, "ke_absent"),
+    ] {
+        assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+        assert_eq!(
+            reject.message,
+            format!("no knowledge entry {entry_id} in the admitted scope")
+        );
+        assert!(reject.details.is_none(), "one absence carries no details");
+    }
+
+    let listed = expect_ok(
+        served
+            .list_scoped_knowledge_entries(&scope_of(SCOPE_ID))
+            .await,
+        "the served list stays live-only",
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .map(|entry| entry.entry_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ke_alpha"]
+    );
+
+    let overwrite = expect_reject(
+        served
+            .put_scoped_knowledge_entry(&scope_of(SCOPE_ID), entry("ke_beta", "hijacked"), Some(2))
+            .await,
+        "conditional put of a superseded row",
+    );
+    assert_eq!(
+        overwrite.code,
+        SpokeRejectCode::NotAuthorized,
+        "a superseded row is never overwritten and leaks no CAS detail"
+    );
+    assert!(overwrite.details.is_none());
+
+    let stored = expect_ok(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(COLLECTION))
+            .get_entry_including_superseded("ke_beta")
+            .await,
+        "the refused put left the row and its marker",
+    );
+    assert_eq!(stored.superseded_by.as_deref(), Some("ke_alpha"));
+    assert_eq!(stored.entry.body.summary.as_deref(), Some("beta shared"));
+    assert_eq!(stored.entry.revision, Some(2));
+}
+
 /// A refused put names neither the served collection nor whether the id exists:
 /// a conditional put of an id that is absent — including one that exists only
 /// in another collection — answers exactly like a stale visible row, and a
