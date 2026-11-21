@@ -26,8 +26,8 @@ use sqlx::{AssertSqlSafe, SqlitePool, Transaction};
 use tempfile::TempDir;
 
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
+use mindcore_sqlite::MindStore;
 
-const DDL: &str = include_str!("fixtures/settlement-prepare.sql");
 const SPACE: &str = "spc_parity";
 const SUBJECT: &str = "sbj_mira";
 const PRINCIPAL: &str = "ctr_admin";
@@ -70,9 +70,9 @@ impl Fixture {
     }
 }
 
-/// Caller harness: a pool the test owns, the Nexus-shaped memory schema the
-/// borrowed-transaction repository targets, and the space/subject/grant rows
-/// the selector calls need — seeded by the caller, never by the adapter.
+/// Caller harness: a pool the test owns, the protocol schema `MindStore::open`
+/// installs, and the space/subject/grant rows the selector calls need — seeded
+/// by the caller, never by the adapter.
 struct Harness {
     _fixture: Fixture,
     db: PathBuf,
@@ -83,8 +83,7 @@ impl Harness {
     async fn open() -> Self {
         let fixture = Fixture::fresh();
         let db = fixture.db_path();
-        let pool = Self::connect(&db).await;
-        sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+        let pool = MindStore::open(&db).await.expect("open store").pool();
         let harness = Self {
             _fixture: fixture,
             db,

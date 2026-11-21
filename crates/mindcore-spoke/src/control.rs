@@ -1,6 +1,6 @@
 //! C0–C9: self-description, space lifecycle, subjects and grants.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Number, Value};
@@ -91,28 +91,26 @@ impl MemoryAdapter {
         }
         let principal_id = principal_id(principal);
         let now = Utc::now();
-        // One grant read for every space: the visible filter is the principal's
-        // live grant, so per-space reads would scale with the space count.
-        let mut grants_by_space: HashMap<String, Vec<MemoryGrantRow>> = HashMap::new();
-        for grant in self.repository.principal_grants(tx, principal_id).await? {
-            grants_by_space
-                .entry(grant.space_id.as_str().to_string())
-                .or_default()
-                .push(grant);
-        }
+        // One streaming scan decides which spaces the principal can see; the
+        // revisions the cursor needs come from a projection over those spaces,
+        // so peak memory follows the visible grants, not the whole history.
+        let mut visible_space_ids: HashSet<String> = HashSet::new();
+        self.repository
+            .scan_principal_grants(tx, principal_id, |grant| {
+                if admission::live_grant(&grant, now) {
+                    visible_space_ids.insert(grant.space_id.as_str().to_string());
+                }
+            })
+            .await?;
+        let visible_spaces: Vec<&str> = visible_space_ids.iter().map(String::as_str).collect();
+        let grant_revisions = self
+            .repository
+            .principal_grant_revisions(tx, principal_id, &visible_spaces)
+            .await?;
         let rows = self.repository.list_spaces(tx).await?;
         let mut visible = Vec::with_capacity(rows.len());
-        let mut grant_revisions = Vec::new();
         for row in rows {
-            let Some(grants) = grants_by_space.remove(row.space_id.as_str()) else {
-                continue;
-            };
-            if grants.iter().any(|grant| admission::live_grant(grant, now)) {
-                grant_revisions.extend(
-                    grants
-                        .into_iter()
-                        .map(|grant| (grant.grant_id, grant.revision.as_i64().unwrap_or(0))),
-                );
+            if visible_space_ids.contains(row.space_id.as_str()) {
                 visible.push(row);
             }
         }

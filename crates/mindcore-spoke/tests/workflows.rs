@@ -20,40 +20,11 @@ use mindcore_spi::{
     PolicyDecision, PolicyHook, Reasoner, SettlementDraft, SpiError, SpiMindWorkflows,
     StructuredReasonRequest,
 };
-use mindcore_spoke::MemoryWorkflowBinding;
-use mindcore_sqlite::SERVED_KNOWLEDGE_LIST_LIMIT;
-use spoke_operations::SpokeRejectCode;
+use mindcore_spoke::{MemoryAdapter, MemoryStage, MemoryWorkflowBinding};
+use mindcore_sqlite::{MindStore, SERVED_KNOWLEDGE_LIST_LIMIT};
+use spoke_operations::{SpokeRejectCode, SpokeResult};
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
-const DDL: &str = include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
-/// The optional vector cache, exactly as the shipped migration creates it.
-const VECTORS_DDL: &str =
-    include_str!("../../mindcore-sqlite/migrations/0002_memory_embedding_vectors.sql");
-/// The knowledge tables of `migrations/0001_init.sql`; that migration's legacy
-/// memory tables have a different shape than the protocol fixture above.
-const KNOWLEDGE_DDL: &str = "
-CREATE TABLE IF NOT EXISTS knowledge_entries (
-  collection   TEXT NOT NULL,
-  entry_id     TEXT NOT NULL,
-  revision     INTEGER NOT NULL,
-  payload      TEXT NOT NULL,
-  cognition_head_seq INTEGER,
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL,
-  PRIMARY KEY (collection, entry_id),
-  FOREIGN KEY (collection, entry_id, cognition_head_seq)
-    REFERENCES cognition_records (collection, entry_id, append_seq)
-);
-CREATE TABLE IF NOT EXISTS cognition_records (
-  collection TEXT NOT NULL,
-  entry_id   TEXT NOT NULL,
-  append_seq INTEGER NOT NULL CHECK (append_seq > 0),
-  record_id  TEXT NOT NULL,
-  payload    TEXT NOT NULL,
-  PRIMARY KEY (collection, entry_id, append_seq),
-  UNIQUE (collection, entry_id, record_id),
-  FOREIGN KEY (collection, entry_id) REFERENCES knowledge_entries (collection, entry_id)
-);";
 const SPACE: &str = "spc_1";
 const SUBJECT: &str = "subj_1";
 const PRINCIPAL: &str = "prn_1";
@@ -190,25 +161,10 @@ impl Harness {
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
         let root = dir.path().to_path_buf();
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(dir.path().join("workflows.db"))
-                    .create_if_missing(true)
-                    .foreign_keys(false),
-            )
+        let pool = MindStore::open(&dir.path().join("workflows.db"))
             .await
-            .expect("open pool");
-        sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
-        sqlx::raw_sql(VECTORS_DDL)
-            .execute(&pool)
-            .await
-            .expect("apply the vector DDL");
-        sqlx::raw_sql(KNOWLEDGE_DDL)
-            .execute(&pool)
-            .await
-            .expect("apply knowledge DDL");
+            .expect("open store")
+            .pool();
         sqlx::query(
             "INSERT INTO memory_spaces \
              (space_id, display_name, authority_host_id, authority_generation, status, revision, \
@@ -423,6 +379,19 @@ impl Harness {
             .expect("candidate status")
     }
 
+    /// The result of the applied absorb-decision marker this store holds, when
+    /// one absorb run recorded a Pending decision.
+    async fn decision_marker(&self) -> Option<Value> {
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT result_json FROM memory_journal \
+             WHERE op = 'mindcore.absorb.decision' AND state = 'applied'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .expect("absorb decision marker");
+        raw.map(|raw| serde_json::from_str(&raw).expect("absorb decision result"))
+    }
+
     async fn candidate_text(&self, candidate_id: &str) -> Option<String> {
         let raw: Option<String> =
             sqlx::query_scalar("SELECT content_json FROM memory_candidates WHERE candidate_id = ?")
@@ -475,6 +444,53 @@ fn retry_class(reject: &spoke_operations::SpokeReject) -> Option<&str> {
         .as_ref()
         .and_then(|details| details.get("retry_class"))
         .and_then(Value::as_str)
+}
+
+/// Resolve `candidate_id` outside absorb: the stand-alone adapter dismisses it
+/// and settles that intent on its own transaction, exactly as a host would.
+async fn resolve_externally(harness: &Harness, candidate_id: &str) {
+    let adapter = MemoryAdapter::new(true);
+    let mut transaction = harness
+        .pool
+        .begin()
+        .await
+        .expect("external settlement transaction");
+    let staged = adapter
+        .dismiss_candidate(
+            &mut transaction,
+            &principal(),
+            json!({
+                "space_id": SPACE,
+                "candidate_id": candidate_id,
+                "expected_revision": 1,
+                "idempotency_key": format!("external_{candidate_id}"),
+            }),
+        )
+        .await;
+    let (space, receipt_id) = match staged {
+        SpokeResult::Ok(MemoryStage::JournalPending { space, receipt_id }) => (space, receipt_id),
+        other => panic!("the external dismissal must stage its intent, got {other:?}"),
+    };
+    let settled = adapter
+        .settle_journal(&mut transaction, &space, &receipt_id)
+        .await;
+    assert!(
+        matches!(settled, SpokeResult::Ok(_)),
+        "the external dismissal must settle, got {settled:?}"
+    );
+    transaction
+        .commit()
+        .await
+        .expect("external settlement commit");
+}
+
+/// Rewrite the recorded absorb decision, the way a corrupt row would carry it.
+async fn rewrite_decision(harness: &Harness, decision: Value) {
+    sqlx::query("UPDATE memory_journal SET result_json = ? WHERE op = 'mindcore.absorb.decision'")
+        .bind(decision.to_string())
+        .execute(&harness.pool)
+        .await
+        .expect("rewrite the absorb decision");
 }
 
 fn capture(key: &str, text: &str) -> MemoryCaptureRequest {
@@ -1459,7 +1475,27 @@ async fn default_policy_leaves_the_candidate_pending() {
             .await,
         0
     );
-    assert_eq!(harness.count_from("memory_journal").await, 0);
+    // No settlement intent: the held decision is one applied, target-free
+    // marker that names the candidate it left pending.
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE op <> 'mindcore.absorb.decision'")
+            .await,
+        0
+    );
+    assert_eq!(
+        harness
+            .count_from(
+                "memory_journal WHERE op = 'mindcore.absorb.decision' \
+                 AND state = 'applied' AND targets_json = '[]'"
+            )
+            .await,
+        1
+    );
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] }))
+    );
 }
 
 #[tokio::test]
@@ -1486,7 +1522,11 @@ async fn absent_reasoner_matches_deterministic_capture() {
         Some("the north gate is closed at dusk")
     );
     assert_eq!(harness.count_from("memory_records").await, 1);
-    assert_eq!(harness.count_from("memory_journal").await, 0);
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] })),
+        "a no-reasoner Pending run records its decision"
+    );
 }
 
 #[tokio::test]
@@ -2028,6 +2068,330 @@ async fn a_replay_never_settles_what_a_policy_left_pending() {
 }
 
 #[tokio::test]
+async fn a_held_then_externally_resolved_capture_replays_as_pending() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_held_resolved", "the north gate is closed at dusk");
+    let reasoner = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": ["rec_gate"] }),
+        &harness.pool,
+    );
+
+    let held = workflows
+        .absorb(
+            &principal(),
+            &request,
+            None,
+            &MindCapabilities {
+                reasoner: Some(&reasoner),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] })),
+        "the held decision is recorded once"
+    );
+
+    // A human resolves it outside absorb: the stand-alone adapter dismisses
+    // and settles the candidate.
+    resolve_externally(&harness, candidate_id).await;
+    assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
+
+    // The host reopens and replays twice with an auto-settle policy available,
+    // over a reasoner that marks every call it receives.
+    let reopened = harness.absorb_binding();
+    let bumping = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": [] }),
+        &harness.pool,
+    )
+    .bumping();
+    let policy = AutoPolicy;
+    for _ in 0..2 {
+        let replay = reopened
+            .absorb(
+                &principal(),
+                &request,
+                None,
+                &MindCapabilities {
+                    reasoner: Some(&bumping),
+                    policy_hook: Some(&policy),
+                    ..MindCapabilities::default()
+                },
+            )
+            .await
+            .expect("replayed absorb");
+        assert_eq!(replay, held, "the replay reports the original decision");
+    }
+
+    // The replay decided and settled nothing: no reasoner or policy call, no
+    // review, no second marker and no new settlement.
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
+    assert_eq!(
+        harness
+            .count_from("memory_receipts WHERE op = 'memory.candidates.review'")
+            .await,
+        0
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE op = 'mindcore.absorb.decision'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_journal WHERE op = 'memory.candidates.dismiss'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness
+            .count_from("memory_candidates WHERE status = 'consumed'")
+            .await,
+        1
+    );
+    assert_eq!(
+        harness.decision_marker().await,
+        Some(json!({ "pending_candidate_ids": [candidate_id] }))
+    );
+}
+
+#[tokio::test]
+async fn a_marker_under_another_subject_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_subject", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    assert!(matches!(
+        held.as_slice(),
+        [AbsorbCandidateOutcome::Pending { .. }]
+    ));
+
+    // A row under the capture receipt that keeps its decision but names another
+    // subject cannot vouch for this caller's capture.
+    sqlx::query(
+        "UPDATE memory_journal SET subject_id = 'subj_other' \
+         WHERE op = 'mindcore.absorb.decision'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("rewrite the marker subject");
+
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("a marker for another subject must not replay as Pending");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+}
+
+#[tokio::test]
+async fn a_repeated_recorded_decision_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_repeated", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+
+    // A repeated id is not the ordered set the capture receipt holds.
+    rewrite_decision(
+        &harness,
+        json!({ "pending_candidate_ids": [candidate_id, candidate_id] }),
+    )
+    .await;
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("a repeated decision must not replay as Pending");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+}
+
+#[tokio::test]
+async fn an_empty_recorded_decision_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_empty", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+
+    // An empty decision would fall back to the candidate's current state: after
+    // an external resolution that projects Dropped over a recorded Pending.
+    resolve_externally(&harness, candidate_id).await;
+    rewrite_decision(&harness, json!({ "pending_candidate_ids": [] })).await;
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("an empty decision must not project the external resolution");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+}
+
+#[tokio::test]
+async fn a_marker_under_another_space_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_space", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+    // Resolved elsewhere: a replay that cannot vouch for the marker would
+    // project this resolution instead of refusing.
+    resolve_externally(&harness, candidate_id).await;
+
+    // The receipt id is globally unique, so a row that keeps the decision but
+    // names another space is corruption, not a capture that never decided.
+    sqlx::query(
+        "UPDATE memory_journal SET space_id = 'spc_elsewhere' \
+         WHERE op = 'mindcore.absorb.decision'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("rewrite the marker space");
+
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("a marker for another space must not project the resolution");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+}
+
+#[tokio::test]
+async fn an_unexpected_decision_member_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_member", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+
+    // The repeat write refuses this shape, so the replay must refuse it too.
+    rewrite_decision(
+        &harness,
+        json!({ "pending_candidate_ids": [candidate_id], "unexpected": true }),
+    )
+    .await;
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("a decision carrying an unexpected member must not replay as Pending");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+}
+
+#[tokio::test]
+async fn a_direct_capture_replay_projects_the_external_resolution() {
+    let harness = granted_harness().await;
+    let request = capture("cap_external_only", "the north gate is closed at dusk");
+    let adapter = MemoryAdapter::new(true);
+    let mut transaction = harness.pool.begin().await.expect("capture transaction");
+    let staged = adapter
+        .capture(
+            &mut transaction,
+            &principal(),
+            serde_json::to_value(&request).expect("capture request"),
+        )
+        .await;
+    let body = match staged {
+        SpokeResult::Ok(MemoryStage::Ready(body)) => body,
+        other => panic!("a fresh adapter capture is ready, got {other:?}"),
+    };
+    let candidate_id = body["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string();
+    transaction.commit().await.expect("capture commit");
+    resolve_externally(&harness, &candidate_id).await;
+    assert_eq!(harness.candidate_status(&candidate_id).await, "consumed");
+
+    // No absorb run ever decided this capture, so no marker exists and the
+    // replay takes the pre-existing read-only projection of its resolution.
+    let workflows = harness.absorb_binding();
+    let bumping = FixedReasoner::new(
+        json!({ "action": "promote", "evidence_ids": [] }),
+        &harness.pool,
+    )
+    .bumping();
+    let policy = AutoPolicy;
+    let replay = workflows
+        .absorb(
+            &principal(),
+            &request,
+            None,
+            &MindCapabilities {
+                reasoner: Some(&bumping),
+                policy_hook: Some(&policy),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("replayed absorb");
+    assert!(matches!(
+        replay.as_slice(),
+        [AbsorbCandidateOutcome::Dropped { .. }]
+    ));
+    assert_eq!(harness.decision_marker().await, None);
+    assert_eq!(
+        harness
+            .stored_record("rec_gate")
+            .await
+            .expect("seeded record"),
+        (1, "the north gate is closed".to_string())
+    );
+    assert_eq!(harness.count_from("memory_records").await, 1);
+}
+
+#[tokio::test]
 async fn a_policy_rejection_revalidates_the_cited_evidence_it_consumes() {
     let harness = granted_harness().await;
     harness
@@ -2230,7 +2594,7 @@ async fn deliberate(
     caps: &MindCapabilities<'_>,
     timeout: std::time::Duration,
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
-    deliberate_as(harness, PRINCIPAL, caps, timeout).await
+    deliberate_as(harness, PRINCIPAL, caps, timeout, None).await
 }
 
 /// One deliberation under a binding whose carrier route names `caller`.
@@ -2239,6 +2603,7 @@ async fn deliberate_as(
     caller: &str,
     caps: &MindCapabilities<'_>,
     timeout: std::time::Duration,
+    assessment_context_id: Option<&str>,
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
     let workflows = SpiMindWorkflows::new(
         MemoryWorkflowBinding::new(harness.pool.clone(), true)
@@ -2260,6 +2625,7 @@ async fn deliberate_as(
     let request = mindcore_spi::DeliberateRequest {
         space_id: SPACE,
         subject_id: SUBJECT,
+        assessment_context_id,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -2339,7 +2705,7 @@ async fn another_principal_cannot_write_the_bound_carrier() {
         ..MindCapabilities::default()
     };
 
-    let error = deliberate_as(&harness, "prn_2", &caps, long_timeout())
+    let error = deliberate_as(&harness, "prn_2", &caps, long_timeout(), None)
         .await
         .expect_err("only the route's caller may write its carrier");
 
@@ -2394,9 +2760,44 @@ async fn deliberate_commits_a_cognition_record_onto_the_carrier() {
     assert_eq!(stored["target"]["target_id"], "prop_gate_closed");
     assert_eq!(stored["view"], "current");
     assert_eq!(stored["assessor"]["kind"], "principal");
+    assert_eq!(stored["assessment_context"]["context_id"], SUBJECT);
     assert_eq!(
         serde_json::to_value(&record).expect("record serializes"),
         *stored
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_assessment_context_id_reaches_the_stored_record() {
+    let harness = deliberate_harness().await;
+    let reasoner =
+        DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+
+    let outcome = deliberate_as(
+        &harness,
+        PRINCIPAL,
+        &caps,
+        long_timeout(),
+        Some("ctx_gate_audit"),
+    )
+    .await
+    .expect("deliberate");
+
+    assert!(matches!(
+        outcome,
+        mindcore_spi::DeliberateOutcome::Settled { .. }
+    ));
+    let records = committed_records(&harness).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["assessment_context"]["context_id"],
+        "ctx_gate_audit"
     );
 }
 

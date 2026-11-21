@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -247,6 +247,15 @@ impl WorkflowBinding for StubBinding {
         unserved()
     }
 
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        _pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
     async fn absorb_snapshot(
         &self,
         _principal: &Principal,
@@ -389,6 +398,15 @@ impl WorkflowBinding for RefusingBinding {
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
+        unserved()
+    }
+
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        _pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
         unserved()
     }
 
@@ -1357,6 +1375,21 @@ fn dismissed_candidate() -> MemoryCandidate {
     .expect("dismissed candidate")
 }
 
+/// The same candidate under another id, the way a receipt holding several
+/// candidates names them.
+fn named(candidate: MemoryCandidate, candidate_id: &str) -> MemoryCandidate {
+    let mut candidate = serde_json::to_value(candidate).expect("candidate");
+    candidate["candidate_id"] = json!(candidate_id);
+    serde_json::from_value(candidate).expect("candidate")
+}
+
+fn candidate_id_of(candidate: &MemoryCandidate) -> &str {
+    match candidate {
+        MemoryCandidate::PendingCandidate(pending) => pending.candidate_id.as_str(),
+        MemoryCandidate::ConsumedCandidate(consumed) => consumed.candidate_id.as_str(),
+    }
+}
+
 fn capture_request() -> MemoryCaptureRequest {
     serde_json::from_value(json!({
         "space_id": "spc_1",
@@ -1378,12 +1411,18 @@ struct Recorded {
     snapshots: Arc<AtomicUsize>,
     /// Every vector the warm asked this binding to fill, with its revision.
     fills: Arc<Mutex<Vec<(String, u64)>>>,
+    /// Pending candidate sets the coordinator recorded as its decision.
+    pending: Arc<Mutex<Vec<Vec<String>>>>,
+    /// The candidate rows the capture receipt holds, in receipt order; a test
+    /// moves one to consumed between runs, the way another writer would.
+    candidates: Arc<Mutex<Vec<MemoryCandidate>>>,
+    /// The next marker write refuses: the decision its run made stays unrecorded.
+    fail_pending_write: Arc<AtomicBool>,
 }
 
 /// One captured candidate over a fixed page, with every submitted settlement
 /// recorded for the assertion.
 struct AbsorbDouble {
-    candidate: MemoryCandidate,
     page: Vec<RetainedRecord>,
     recorded: Recorded,
     /// The record id this binding's update leg already settled, if any.
@@ -1420,31 +1459,85 @@ impl WorkflowBinding for AbsorbDouble {
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
         // The first capture commits the receipt; every later one replays it,
-        // reporting the state the double's candidate is in.
+        // reporting the state each candidate is in — or the Pending decision
+        // the receipt's own run recorded, which wins over that state.
         let call = self.captures.fetch_add(1, Ordering::SeqCst);
-        let lifecycle = match &self.candidate {
-            MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
-            MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
-        };
+        let decision = self
+            .recorded
+            .pending
+            .lock()
+            .expect("pending writes")
+            .clone();
+        let candidates = self.recorded.candidates.lock().expect("candidates").clone();
+        let candidates = candidates
+            .iter()
+            .map(|candidate| {
+                let candidate_id = candidate_id_of(candidate).to_string();
+                let lifecycle = if decision
+                    .iter()
+                    .flatten()
+                    .any(|named| named == &candidate_id)
+                {
+                    CandidateLifecycle::PendingDecision
+                } else {
+                    match candidate {
+                        MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
+                        MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
+                    }
+                };
+                CapturedCandidate {
+                    candidate_id,
+                    lifecycle,
+                }
+            })
+            .collect();
         Ok(CaptureOutcome {
-            candidates: vec![CapturedCandidate {
-                candidate_id: "cnd_1".to_string(),
-                lifecycle,
-            }],
+            candidates,
             replayed: call > 0,
         })
+    }
+
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
+        if self
+            .recorded
+            .fail_pending_write
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(marker_write_failed());
+        }
+        self.recorded.pending.lock().expect("pending writes").push(
+            pending_candidate_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+        );
+        Ok(())
     }
 
     async fn absorb_snapshot(
         &self,
         _principal: &Principal,
         _space_id: &str,
-        _candidate_id: &str,
+        candidate_id: &str,
         _max_items: u64,
     ) -> Result<AbsorbSnapshot, SpiError> {
         self.recorded.snapshots.fetch_add(1, Ordering::SeqCst);
+        let candidate = self
+            .recorded
+            .candidates
+            .lock()
+            .expect("candidates")
+            .iter()
+            .find(|candidate| candidate_id_of(candidate) == candidate_id)
+            .cloned()
+            .expect("a snapshot names a candidate the receipt holds");
         Ok(AbsorbSnapshot {
-            candidate: self.candidate.clone(),
+            candidate,
             records: self.page.clone(),
         })
     }
@@ -1672,8 +1765,8 @@ fn absorb_at(
     captures: usize,
 ) -> (SpiMindWorkflows, Recorded, Arc<Mutex<Vec<Value>>>) {
     let recorded = Recorded::default();
+    *recorded.candidates.lock().expect("candidates") = vec![candidate];
     let double = AbsorbDouble {
-        candidate,
         page: page(),
         recorded: recorded.clone(),
         settled_update: settled_update.map(str::to_string),
@@ -1684,11 +1777,26 @@ fn absorb_at(
     (SpiMindWorkflows::new(double), recorded, seen)
 }
 
+/// An absorb double whose capture receipt holds two pending candidates.
+fn absorb_two_pending() -> (SpiMindWorkflows, Recorded) {
+    let recorded = Recorded::default();
+    *recorded.candidates.lock().expect("candidates") =
+        vec![pending_candidate(), named(pending_candidate(), "cnd_2")];
+    let double = AbsorbDouble {
+        page: page(),
+        recorded: recorded.clone(),
+        settled_update: None,
+        captures: AtomicUsize::new(0),
+        live: None,
+    };
+    (SpiMindWorkflows::new(double), recorded)
+}
+
 /// An absorb double whose post-settlement warm reads `live`.
 fn absorb_with_live(live: SettledRecord) -> (SpiMindWorkflows, Recorded) {
     let recorded = Recorded::default();
+    *recorded.candidates.lock().expect("candidates") = vec![pending_candidate()];
     let double = AbsorbDouble {
-        candidate: pending_candidate(),
         page: page(),
         recorded: recorded.clone(),
         settled_update: None,
@@ -1946,6 +2054,10 @@ async fn fabricated_evidence_never_reaches_policy_or_a_write() {
     assert!(seen.lock().expect("seen").is_empty());
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
     assert!(recorded.updates.lock().expect("updates").is_empty());
+    assert!(
+        recorded.pending.lock().expect("pending writes").is_empty(),
+        "a failed decision records no Pending marker"
+    );
 }
 
 #[tokio::test]
@@ -2002,6 +2114,62 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
         "a pending candidate is reported without a candidate read"
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
+    assert_eq!(
+        recorded.pending.lock().expect("pending writes").as_slice(),
+        [vec!["cnd_1".to_string()]],
+        "the fresh Pending decision is recorded once and its replay writes no second marker"
+    );
+}
+
+#[tokio::test]
+async fn a_replay_that_finds_no_marker_writes_none() {
+    let (workflows, recorded) = absorb_two_pending();
+    let caps = MindCapabilities::default();
+    recorded.fail_pending_write.store(true, Ordering::SeqCst);
+
+    // The capture commits and the marker write fails: the run records nothing.
+    let failed = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await;
+    assert!(
+        matches!(failed, Err(SpiError::Settlement(_))),
+        "a failed marker write fails the run"
+    );
+    assert!(recorded.pending.lock().expect("pending writes").is_empty());
+
+    // The replay sees a wholly pending receipt and no marker, and writes none:
+    // a snapshot cannot tell this failed run from one still in flight, so the
+    // decision stays unrecorded and each candidate reports its own state.
+    let replayed = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("replayed absorb");
+    assert_eq!(
+        replayed,
+        vec![
+            AbsorbCandidateOutcome::Pending {
+                candidate_id: "cnd_1".to_string(),
+            },
+            AbsorbCandidateOutcome::Pending {
+                candidate_id: "cnd_2".to_string(),
+            },
+        ]
+    );
+    assert!(
+        recorded.pending.lock().expect("pending writes").is_empty(),
+        "a replay writes no marker"
+    );
+
+    // A second replay answers identically and still writes nothing.
+    let again = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("replayed absorb");
+    assert_eq!(again, replayed);
+    assert!(
+        recorded.pending.lock().expect("pending writes").is_empty(),
+        "no replay writes a decision marker"
+    );
 }
 
 #[tokio::test]
@@ -2025,6 +2193,11 @@ async fn default_policy_leaves_the_candidate_pending() {
         }]
     );
     assert!(recorded.reviews.lock().expect("reviews").is_empty());
+    assert_eq!(
+        recorded.pending.lock().expect("pending writes").as_slice(),
+        [vec!["cnd_1".to_string()]],
+        "a policy hold records its Pending decision"
+    );
 }
 
 #[tokio::test]
@@ -2375,6 +2548,15 @@ impl WorkflowBinding for DeliberateDouble {
         unserved()
     }
 
+    async fn record_absorb_pending(
+        &self,
+        _principal: &Principal,
+        _request: &MemoryCaptureRequest,
+        _pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError> {
+        unserved()
+    }
+
     async fn absorb_snapshot(
         &self,
         _principal: &Principal,
@@ -2610,6 +2792,16 @@ impl DomainLens for RefusingAdrLens {
     }
 }
 
+/// The refusal a binding returns when the marker its run owed could not be
+/// written, after the capture it names had already committed.
+fn marker_write_failed() -> SpiError {
+    SpiError::Settlement(spoke_operations::SpokeReject {
+        code: SpokeRejectCode::InternalError,
+        message: "the absorb decision could not be written".to_string(),
+        details: None,
+    })
+}
+
 fn revision_conflict() -> SpiError {
     SpiError::Settlement(spoke_operations::SpokeReject {
         code: SpokeRejectCode::RevisionConflict,
@@ -2653,6 +2845,7 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -2693,6 +2886,52 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
     assert_eq!(
         citations.lock().expect("citations").as_slice(),
         [("rec_gate".to_string(), 3)]
+    );
+}
+
+#[tokio::test]
+async fn an_empty_explicit_assessment_context_is_a_caller_input_error() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    // A valid provider draft: only the caller's own context id is malformed.
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        assessment_context_id: Some(""),
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("an empty context id is not a context");
+    assert!(
+        matches!(error, SpiError::InvalidInput(_)),
+        "the caller's own field must not be blamed on the reasoner, got {error:?}"
+    );
+    assert!(
+        settlements.lock().expect("settlements").is_empty(),
+        "a rejected input writes nothing"
     );
 }
 
@@ -2763,6 +3002,7 @@ async fn deliberate_refuses_fabricated_references_before_any_write() {
         let request = DeliberateRequest {
             space_id: "spc_1",
             subject_id: "subj_1",
+            assessment_context_id: None,
             holder: &holder,
             target: &target,
             evidence: &evidence,
@@ -2807,6 +3047,7 @@ async fn deliberate_lens_violation_refuses_before_policy_and_write() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -2894,6 +3135,7 @@ async fn deliberate_lens_refuses_a_none_recommendation() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -2969,6 +3211,7 @@ async fn deliberate_drops_a_hung_reasoner_at_the_deadline() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3011,6 +3254,7 @@ async fn deliberate_starts_no_write_after_the_policy_overran_the_deadline() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3065,6 +3309,7 @@ async fn deliberate_retries_a_stale_carrier_twice_then_surfaces_it() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3117,6 +3362,7 @@ async fn deliberate_retries_a_stale_carrier_until_the_snapshot_holds() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3150,6 +3396,7 @@ async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3198,6 +3445,7 @@ async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3252,6 +3500,7 @@ async fn deliberate_none_recommendation_writes_nothing() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3281,6 +3530,7 @@ async fn deliberate_without_a_reasoner_is_unavailable() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3321,6 +3571,7 @@ async fn deliberate_starts_no_attempt_once_the_deadline_passed() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3365,6 +3616,7 @@ async fn deliberate_clamps_an_absurd_timeout_and_still_settles() {
     let request = DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder: &holder,
         target: &target,
         evidence: &evidence,
@@ -3603,6 +3855,7 @@ fn lens_request<'a>(
     DeliberateRequest {
         space_id: "spc_1",
         subject_id: "subj_1",
+        assessment_context_id: None,
         holder,
         target,
         evidence,

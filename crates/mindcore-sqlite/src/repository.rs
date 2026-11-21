@@ -7,6 +7,8 @@
 //! receipts is reconstructed empty (the pinned schema has no column for it; see
 //! `task-1-schema-map.md` §3 D-1).
 
+use std::future::poll_fn;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Number, Value};
@@ -1028,8 +1030,111 @@ struct JournalRow {
     updated_at: String,
 }
 
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for JournalRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            seq: row.try_get("seq")?,
+            receipt_id: row.try_get("receipt_id")?,
+            space_id: row.try_get("space_id")?,
+            subject_id: row.try_get("subject_id")?,
+            requester_principal_id: row.try_get("requester_principal_id")?,
+            op: row.try_get("op")?,
+            idempotency_key: row.try_get("idempotency_key")?,
+            state: row.try_get("state")?,
+            targets_json: row.try_get("targets_json")?,
+            result_json: row.try_get("result_json")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
 /// The borrowed-transaction repository. Zero-sized: the caller's transaction is the seam.
 pub struct SqliteMemoryRepository;
+
+impl SqliteMemoryRepository {
+    /// The serving path's grant read: one principal's existing-space grants in
+    /// `(space_id, grant_id)` order, decoded one row at a time, so peak memory is
+    /// a row plus SQLx's delivery buffer rather than the whole grant history.
+    pub async fn scan_principal_grants(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        principal: &str,
+        mut visit: impl FnMut(MemoryGrantRow) + Send,
+    ) -> RepoResult<()> {
+        let mut rows = sqlx::query_as!(
+            GrantRow,
+            // The existing-space filter keeps an orphan grant (no space row,
+            // unconstrained payload) out of the decode: no listing can show it.
+            // `EXISTS` rather than `IN`: SQLite then reads the index once over
+            // the principal and probes one space row per grant, instead of
+            // probing the index once per stored space.
+            "SELECT grant_id, space_id, subject_id, principal_id, \
+             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+             revision, created_at FROM memory_grants \
+             WHERE principal_id = ? \
+             AND EXISTS (SELECT 1 FROM memory_spaces \
+                         WHERE memory_spaces.space_id = memory_grants.space_id) \
+             ORDER BY space_id, grant_id",
+            principal,
+        )
+        .fetch(&mut **tx);
+        while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+            visit(grant_row(row.map_err(decode_row)?)?);
+        }
+        Ok(())
+    }
+
+    /// `(grant_id, revision)` for every grant of `principal` in the given spaces,
+    /// expired and revoked included: the cursor marker invalidates on any
+    /// visible-space grant change without the caller retaining grant rows.
+    pub async fn principal_grant_revisions(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        principal: &str,
+        visible_space_ids: &[&str],
+    ) -> RepoResult<Vec<(String, i64)>> {
+        let spaces = serde_json::to_string(visible_space_ids)
+            .map_err(|error| invalid_row(format_args!("visible space ids: {error}")))?;
+        sqlx::query_as::<_, (String, i64)>(
+            // `+space_id` keeps the IN list off the index, so SQLite reads the
+            // index once over the principal and tests the visible set there,
+            // instead of probing the index once per visible space.
+            "SELECT grant_id, revision FROM memory_grants \
+             WHERE principal_id = ? AND +space_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY space_id, grant_id",
+        )
+        .bind(principal)
+        .bind(spaces)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)
+    }
+
+    /// The journal row one receipt names, in whatever space it carries: the
+    /// receipt id is globally unique, so the row under it is a fact the caller
+    /// validates rather than filters away as absence.
+    pub async fn journal_by_receipt(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        receipt_id: &str,
+    ) -> RepoResult<Option<MemoryJournalRow>> {
+        // Runtime-checked rather than the compile-checked macro: this lookup
+        // owns no offline query cache entry.
+        sqlx::query_as::<_, JournalRow>(
+            "SELECT seq, receipt_id, space_id, subject_id, requester_principal_id, \
+             op, idempotency_key, state, targets_json, result_json, created_at, updated_at \
+             FROM memory_journal WHERE receipt_id = ?",
+        )
+        .bind(receipt_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(journal_row)
+        .transpose()
+    }
+}
 
 #[async_trait]
 impl MemoryRepository for SqliteMemoryRepository {
@@ -1352,24 +1457,10 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         principal: &str,
     ) -> RepoResult<Vec<MemoryGrantRow>> {
-        sqlx::query_as!(
-            GrantRow,
-            // The existing-space filter keeps an orphan grant (no space row,
-            // unconstrained payload) out of the decode: no listing can show it.
-            "SELECT grant_id, space_id, subject_id, principal_id, \
-             capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
-             revision, created_at FROM memory_grants \
-             WHERE principal_id = ? \
-             AND space_id IN (SELECT space_id FROM memory_spaces) \
-             ORDER BY space_id, grant_id",
-            principal,
-        )
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(decode_row)?
-        .into_iter()
-        .map(grant_row)
-        .collect()
+        let mut grants = Vec::new();
+        self.scan_principal_grants(tx, principal, |grant| grants.push(grant))
+            .await?;
+        Ok(grants)
     }
 
     async fn grant(

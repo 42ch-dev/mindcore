@@ -140,6 +140,26 @@ pub trait WorkflowBinding: Send + Sync {
         request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError>;
 
+    /// Persist the durable decision marker for one absorb run that left
+    /// `pending_candidate_ids` pending, then return.
+    ///
+    /// The marker is keyed by the validated committed capture receipt of
+    /// `request`: its space, subject, requester and idempotency key, with no
+    /// targets and the pending ids in capture receipt order. An equal marker
+    /// already present is a no-op; a mismatched or malformed one is a storage
+    /// error. It records a decision, never a settlement, and a capture replay
+    /// reads it to report the original `Pending` outcome instead of the
+    /// candidate's later state. Only the run that made the decision writes it:
+    /// a replay never calls it, so a run that failed before this write leaves
+    /// its decision unrecorded and later replays project current state.
+    /// Never call it for an empty set or a failed decision.
+    async fn record_absorb_pending(
+        &self,
+        principal: &Principal,
+        request: &MemoryCaptureRequest,
+        pending_candidate_ids: &[&str],
+    ) -> Result<(), SpiError>;
+
     /// Read `candidate_id` and one bounded authorized recall page over the
     /// same subject and placement, on one transaction. The page is empty for
     /// an already-consumed candidate.
@@ -326,6 +346,10 @@ pub struct CapturedCandidate {
 pub enum CandidateLifecycle {
     /// Nothing has consumed it: the receipt's own candidate, still undecided.
     Pending,
+    /// The capture's own absorb run recorded `Pending` for it: a replay reports
+    /// that decision, whatever state the candidate has reached since, and
+    /// settles nothing.
+    PendingDecision,
     /// Something consumed it; read its recorded outcome under its own grants.
     Consumed,
 }
@@ -497,7 +521,15 @@ impl SpiMindWorkflows {
     /// With a reasoner, each fresh candidate is read with one bounded
     /// authorized evidence page, the reasoner runs outside any transaction,
     /// its reply is validated against that exact page, and the policy hook
-    /// decides whether the validated settlement is submitted.
+    /// decides whether the validated settlement is submitted. Only the run
+    /// that decided writes: before a run that leaves fresh candidates pending
+    /// returns, the binding records one durable decision marker for them, and a
+    /// replay reads that marker and reports the original `Pending` outcome even
+    /// after the candidate was resolved elsewhere. A replay never writes a
+    /// marker — without one it projects each candidate's current state and
+    /// records nothing, because a snapshot of the receipt cannot tell a run
+    /// that failed before settling from another run still in flight. A
+    /// decision that was never recorded stays unrecorded.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -510,29 +542,56 @@ impl SpiMindWorkflows {
             replayed,
         } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidates.len());
+        // Fresh candidates this run leaves pending: its durable Pending
+        // decision, recorded before success so a later replay can report it.
+        // Only the deciding run writes it; a replay's snapshot cannot prove
+        // what another run decided.
+        let mut held: Vec<String> = Vec::new();
         for CapturedCandidate {
             candidate_id,
             lifecycle,
         } in candidates
         {
             if replayed {
-                outcomes.push(match lifecycle {
-                    CandidateLifecycle::Pending => AbsorbCandidateOutcome::Pending { candidate_id },
-                    CandidateLifecycle::Consumed => {
-                        self.replay_candidate(principal, request, candidate_id)
-                            .await?
-                    }
+                // A pending candidate, recorded pending or not, is reported
+                // from its receipt entry; only a consumed one is read back.
+                let pending = matches!(
+                    lifecycle,
+                    CandidateLifecycle::Pending | CandidateLifecycle::PendingDecision
+                );
+                outcomes.push(if pending {
+                    AbsorbCandidateOutcome::Pending { candidate_id }
+                } else {
+                    self.replay_candidate(principal, request, candidate_id)
+                        .await?
                 });
                 continue;
             }
             let Some(reasoner) = caps.reasoner else {
+                held.push(candidate_id.clone());
                 outcomes.push(AbsorbCandidateOutcome::Pending { candidate_id });
                 continue;
             };
-            outcomes.push(
-                self.absorb_candidate(principal, request, candidate_id, reasoner, lens, caps)
-                    .await?,
-            );
+            let outcome = self
+                .absorb_candidate(
+                    principal,
+                    request,
+                    candidate_id.clone(),
+                    reasoner,
+                    lens,
+                    caps,
+                )
+                .await?;
+            if matches!(&outcome, AbsorbCandidateOutcome::Pending { .. }) {
+                held.push(candidate_id);
+            }
+            outcomes.push(outcome);
+        }
+        if !held.is_empty() {
+            let pending: Vec<&str> = held.iter().map(String::as_str).collect();
+            self.binding
+                .record_absorb_pending(principal, request, &pending)
+                .await?;
         }
         Ok(outcomes)
     }
@@ -1510,7 +1569,9 @@ fn stamp_cognition_record(
         ),
         (
             "assessment_context",
-            json!({ "context_id": request.subject_id }),
+            json!({
+                "context_id": request.assessment_context_id.unwrap_or(request.subject_id),
+            }),
         ),
         ("assessed_at", Value::String(now.clone())),
         ("effective_at", Value::String(now)),
@@ -1522,6 +1583,17 @@ fn stamp_cognition_record(
     }
     let record = Value::Object(record);
     if let SpokeResult::Reject(reject) = validate_cognition_record(&record) {
+        // The assessment context is the one validated field the caller
+        // supplies: when the record validates without it, the rejection is
+        // that input's, not the provider's draft.
+        if request.assessment_context_id.is_some()
+            && validates_with_derived_context(&record, request)
+        {
+            return Err(SpiError::InvalidInput(format!(
+                "assessment_context_id is not a valid context: {}",
+                reject.message
+            )));
+        }
         return Err(invalid_verdict(format!(
             "the proposed record was rejected ({}): {}",
             reject.code, reject.message
@@ -1529,6 +1601,23 @@ fn stamp_cognition_record(
     }
     serde_json::from_value(record)
         .map_err(|error| invalid_verdict(format!("the proposed record does not decode: {error}")))
+}
+
+/// Whether the record validates with the assessment context derived from the
+/// subject, as a request that supplied none would have stamped it.
+fn validates_with_derived_context(record: &Value, request: &DeliberateRequest<'_>) -> bool {
+    let mut derived = record.clone();
+    let Some(context) = derived
+        .get_mut("assessment_context")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    context.insert(
+        "context_id".to_string(),
+        Value::String(request.subject_id.to_string()),
+    );
+    !matches!(validate_cognition_record(&derived), SpokeResult::Reject(_))
 }
 
 /// A fresh record id: the workflow clock plus a digest of the trusted target
@@ -2413,6 +2502,15 @@ mod tests {
             _principal: &Principal,
             _request: &MemoryCaptureRequest,
         ) -> Result<CaptureOutcome, SpiError> {
+            unreachable!("this double serves recall only")
+        }
+
+        async fn record_absorb_pending(
+            &self,
+            _principal: &Principal,
+            _request: &MemoryCaptureRequest,
+            _pending_candidate_ids: &[&str],
+        ) -> Result<(), SpiError> {
             unreachable!("this double serves recall only")
         }
 

@@ -1,35 +1,58 @@
-//! I-000060: `spaces.list` costs the same statement count for one space and
-//! for five — the principal's grants are read once, not once per space — and a
-//! grant whose space row is gone cannot fail the listing.
+//! I-000060 / I-000066: `spaces.list` streams the principal's grants and
+//! projects the visible revisions, so it costs exactly three SELECTs — the
+//! scan, the revision projection and the spaces — whatever the space count,
+//! and it never fails on a grant whose space row is gone.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, SqlitePool};
 use tempfile::TempDir;
 
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
-use spoke_operations::SpokeResult;
+use mindcore_sqlite::MindStore;
+use spoke_operations::{SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 
-const DDL: &str = include_str!("fixtures/settlement-prepare.sql");
 const NOW: &str = "2026-11-20T09:20:01.123Z";
 const PRINCIPAL: &str = "ctr_list";
+const EXPIRED_AT: &str = "2020-01-01T00:00:00.000Z";
 
-static STATEMENTS: AtomicUsize = AtomicUsize::new(0);
+static SELECTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Counts the driver's per-statement `sqlx::query` events: sqlx gives no other
-/// statement-level counter.
+/// Counts the driver's per-statement `sqlx::query` events for SELECTs only:
+/// sqlx gives no other statement-level counter, and transaction statements
+/// share the target.
 struct StatementCounter;
+
+struct StatementText(Option<String>);
+
+impl tracing::field::Visit for StatementText {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.0 = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
 
 impl tracing::Subscriber for StatementCounter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         metadata.target() == "sqlx::query"
     }
 
-    fn event(&self, _event: &tracing::Event<'_>) {
-        STATEMENTS.fetch_add(1, Ordering::Relaxed);
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut text = StatementText(None);
+        event.record(&mut text);
+        if text
+            .0
+            .as_deref()
+            .is_some_and(|sql| sql.trim_start().starts_with("SELECT"))
+        {
+            SELECTS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -45,37 +68,76 @@ impl tracing::Subscriber for StatementCounter {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
-async fn seed_space(pool: &SqlitePool, index: usize) {
-    let space = format!("spc_{index}");
+/// One `memory_grants` row; `capabilities_json` stays raw so a test can seed a
+/// corrupt payload, and both liveness stamps stay optional so it can seed a
+/// grant that grants nothing.
+struct Grant<'a> {
+    grant_id: &'a str,
+    space_id: &'a str,
+    principal_id: &'a str,
+    capabilities_json: &'a str,
+    expires_at: Option<&'a str>,
+    revoked_at: Option<&'a str>,
+    revision: i64,
+}
+
+async fn seed_space_row(pool: &SqlitePool, space_id: &str) {
     sqlx::query(
         "INSERT INTO memory_spaces \
          (space_id, display_name, authority_host_id, authority_generation, status, revision, \
           created_at) \
          VALUES (?, ?, 'host_1', 1, 'active', 1, ?)",
     )
-    .bind(&space)
-    .bind(&space)
+    .bind(space_id)
+    .bind(space_id)
     .bind(NOW)
     .execute(pool)
     .await
     .expect("seed space");
+}
+
+async fn seed_grant(pool: &SqlitePool, grant: Grant<'_>) {
     sqlx::query(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
           shared_access, expires_at, revoked_at, revision, created_at) \
-         VALUES (?, ?, NULL, ?, '[\"admin\"]', '[]', 1, NULL, NULL, 1, ?)",
+         VALUES (?, ?, NULL, ?, ?, '[]', 1, ?, ?, ?, ?)",
     )
-    .bind(format!("grt_{index}"))
-    .bind(&space)
-    .bind(PRINCIPAL)
+    .bind(grant.grant_id)
+    .bind(grant.space_id)
+    .bind(grant.principal_id)
+    .bind(grant.capabilities_json)
+    .bind(grant.expires_at)
+    .bind(grant.revoked_at)
+    .bind(grant.revision)
     .bind(NOW)
     .execute(pool)
     .await
     .expect("seed grant");
 }
 
-/// The statement count one `spaces.list` page costs, and the page's space count.
-async fn list_cost(pool: &SqlitePool) -> (usize, usize) {
+/// A space the principal can see through one live grant.
+async fn seed_space(pool: &SqlitePool, index: usize) {
+    let space = format!("spc_{index}");
+    let grant = format!("grt_{index}");
+    seed_space_row(pool, &space).await;
+    seed_grant(
+        pool,
+        Grant {
+            grant_id: &grant,
+            space_id: &space,
+            principal_id: PRINCIPAL,
+            capabilities_json: "[\"admin\"]",
+            expires_at: None,
+            revoked_at: None,
+            revision: 1,
+        },
+    )
+    .await;
+}
+
+/// One `spaces.list` call: the SELECT count it cost and its outcome.
+async fn list_call(pool: &SqlitePool, request: Value) -> (usize, SpokeResult<MemoryStage>) {
     let adapter = MemoryAdapter::new(true);
     let principal: Principal = serde_json::from_value(json!({
         "principal_id": PRINCIPAL,
@@ -83,77 +145,236 @@ async fn list_cost(pool: &SqlitePool) -> (usize, usize) {
     }))
     .expect("principal");
     let mut tx = pool.begin().await.expect("begin");
-    let before = STATEMENTS.load(Ordering::Relaxed);
-    let stage = adapter.list_spaces(&mut tx, &principal, json!({})).await;
-    let statements = STATEMENTS.load(Ordering::Relaxed) - before;
+    let before = SELECTS.load(Ordering::Relaxed);
+    let stage = adapter.list_spaces(&mut tx, &principal, request).await;
+    let selects = SELECTS.load(Ordering::Relaxed) - before;
     tx.rollback().await.expect("rollback");
-    let body = match stage {
-        SpokeResult::Ok(MemoryStage::Ready(body)) => body,
-        other => panic!("spaces.list did not return a ready stage: {other:?}"),
-    };
-    let listed = body["spaces"].as_array().expect("spaces array").len();
-    (statements, listed)
+    (selects, stage)
 }
 
-/// One batch read whatever the space count; an orphan grant (no space row,
-/// unconstrained payload) is skipped instead of decoded and fails nothing.
+/// A ready page's space ids in served order and its next cursor.
+fn page_of(stage: &SpokeResult<MemoryStage>) -> (Vec<String>, Option<String>) {
+    let SpokeResult::Ok(MemoryStage::Ready(body)) = stage else {
+        panic!("spaces.list did not return a ready stage: {stage:?}");
+    };
+    let ids = body["spaces"]
+        .as_array()
+        .expect("spaces array")
+        .iter()
+        .map(|space| space["space_id"].as_str().expect("space_id").to_string())
+        .collect();
+    let cursor = body["next_cursor"].as_str().map(str::to_string);
+    (ids, cursor)
+}
+
+/// One full listing's SELECT count and served ids.
+async fn listing(pool: &SqlitePool) -> (usize, Vec<String>) {
+    let (selects, stage) = list_call(pool, json!({})).await;
+    let (ids, _) = page_of(&stage);
+    (selects, ids)
+}
+
+fn cursor_invalid(stage: &SpokeResult<MemoryStage>) -> bool {
+    matches!(stage, SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::CursorInvalid)
+}
+
+fn five_spaces() -> Vec<String> {
+    (1..=5).map(|index| format!("spc_{index}")).collect()
+}
+
+/// Three SELECTs whatever the space count, no retained invisible history, and
+/// the same order, visibility and cursor contract as the batched read.
 #[tokio::test]
-async fn list_spaces_reads_grants_once_and_skips_orphan_grants() {
+async fn list_spaces_streams_grants_and_costs_three_selects() {
     tracing::subscriber::set_global_default(StatementCounter).expect("install counter");
     let dir = TempDir::new().expect("temporary directory");
+    let path = dir.path().join("spaces.db");
+    MindStore::open(&path).await.expect("open store");
+    // `MindStore` offers no statement logging; reconnect to the prepared file
+    // without rerunning DDL so the counter sees the adapter's reads.
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
             SqliteConnectOptions::new()
-                .filename(dir.path().join("spaces.db"))
+                .filename(&path)
                 .create_if_missing(true)
                 .foreign_keys(false)
                 .log_statements(log::LevelFilter::Debug),
         )
         .await
         .expect("open pool");
-    sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+
+    // Zero spaces: the scan and the revision projection still run, so the count
+    // does not depend on there being anything to list.
+    assert_eq!(
+        listing(&pool).await,
+        (3, vec![]),
+        "zero spaces still cost three SELECTs",
+    );
 
     seed_space(&pool, 1).await;
-    let (one_space, listed_one) = list_cost(&pool).await;
-    assert_eq!(listed_one, 1, "one seeded space is listed");
+    assert_eq!(
+        listing(&pool).await,
+        (3, vec!["spc_1".to_string()]),
+        "one space costs the same three SELECTs",
+    );
 
     for index in 2..=5 {
         seed_space(&pool, index).await;
     }
-    let (five_spaces, listed_five) = list_cost(&pool).await;
-    assert_eq!(listed_five, 5, "every seeded space is listed");
-
-    // The counter has to see the read pair itself, or equality proves nothing.
-    assert!(
-        one_space > 1,
-        "spaces.list statement count not observed: {one_space}",
-    );
+    let five = five_spaces();
     assert_eq!(
-        one_space, five_spaces,
-        "spaces.list issued {one_space} statements for one space and {five_spaces} for five",
+        listing(&pool).await,
+        (3, five.clone()),
+        "five spaces cost the same three SELECTs",
     );
 
     // A grant whose space row is gone still carries an unconstrained payload;
-    // decoding it would fail the whole page.
-    sqlx::query(
-        "INSERT INTO memory_grants \
-         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
-          shared_access, expires_at, revoked_at, revision, created_at) \
-         VALUES ('grt_orphan', 'spc_missing', NULL, ?, '{not json', '[]', 0, NULL, NULL, 1, ?)",
+    // decoding it would fail the whole page, and the existing-space filter runs
+    // before the decode.
+    seed_grant(
+        &pool,
+        Grant {
+            grant_id: "grt_orphan",
+            space_id: "spc_missing",
+            principal_id: PRINCIPAL,
+            capabilities_json: "{not json",
+            expires_at: None,
+            revoked_at: None,
+            revision: 1,
+        },
     )
-    .bind(PRINCIPAL)
-    .bind(NOW)
-    .execute(&pool)
-    .await
-    .expect("seed orphan grant");
-    let (with_orphan, listed_with_orphan) = list_cost(&pool).await;
+    .await;
     assert_eq!(
-        listed_with_orphan, 5,
-        "the valid spaces still list beside an orphan grant",
+        listing(&pool).await,
+        (3, five.clone()),
+        "an orphan grant is skipped instead of decoded",
     );
+
+    // Grant history in a space this principal cannot see: a live grant for
+    // another principal, and an expired one of its own. The rows stream past
+    // the scan and are not retained.
+    seed_space_row(&pool, "spc_hidden").await;
+    seed_grant(
+        &pool,
+        Grant {
+            grant_id: "grt_hidden_other",
+            space_id: "spc_hidden",
+            principal_id: "ctr_other",
+            capabilities_json: "[\"admin\"]",
+            expires_at: None,
+            revoked_at: None,
+            revision: 1,
+        },
+    )
+    .await;
+    seed_grant(
+        &pool,
+        Grant {
+            grant_id: "grt_hidden_expired",
+            space_id: "spc_hidden",
+            principal_id: PRINCIPAL,
+            capabilities_json: "[\"admin\"]",
+            expires_at: Some(EXPIRED_AT),
+            revoked_at: None,
+            revision: 1,
+        },
+    )
+    .await;
     assert_eq!(
-        with_orphan, five_spaces,
-        "the orphan grant added a statement: {with_orphan} against {five_spaces}",
+        listing(&pool).await,
+        (3, five.clone()),
+        "invisible grant history neither lists a space nor costs a statement",
+    );
+
+    // The marker is equal across calls, so a cursor minted on this snapshot
+    // serves the next page.
+    let (selects, stage) = list_call(&pool, json!({ "limit": 2 })).await;
+    assert_eq!(selects, 3, "a partial page costs the same three SELECTs");
+    let (first, cursor) = page_of(&stage);
+    assert_eq!(first, ["spc_1", "spc_2"], "visible spaces keep their order");
+    let cursor = cursor.expect("the first page advances");
+    let (_, stage) = list_call(&pool, json!({ "limit": 2, "cursor": cursor })).await;
+    let (second, _) = page_of(&stage);
+    assert_eq!(
+        second,
+        ["spc_3", "spc_4"],
+        "the same snapshot serves the second page",
+    );
+
+    // A visible-space grant revision moves the marker from under the cursor.
+    sqlx::query("UPDATE memory_grants SET revision = 2 WHERE grant_id = 'grt_3'")
+        .execute(&pool)
+        .await
+        .expect("bump a visible grant");
+    let (_, stage) = list_call(&pool, json!({ "limit": 2, "cursor": cursor })).await;
+    assert!(
+        cursor_invalid(&stage),
+        "a visible-space grant revision must invalidate the cursor: {stage:?}",
+    );
+
+    // Expired and revoked grants in a visible space show nothing, but their
+    // revisions are part of the marker the cursor invalidates on.
+    seed_grant(
+        &pool,
+        Grant {
+            grant_id: "grt_5_expired",
+            space_id: "spc_5",
+            principal_id: PRINCIPAL,
+            capabilities_json: "[\"admin\"]",
+            expires_at: Some(EXPIRED_AT),
+            revoked_at: None,
+            revision: 1,
+        },
+    )
+    .await;
+    seed_grant(
+        &pool,
+        Grant {
+            grant_id: "grt_5_revoked",
+            space_id: "spc_5",
+            principal_id: PRINCIPAL,
+            capabilities_json: "[\"admin\"]",
+            expires_at: None,
+            revoked_at: Some(NOW),
+            revision: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        listing(&pool).await,
+        (3, five.clone()),
+        "expired and revoked grants list no extra space",
+    );
+    let (_, stage) = list_call(&pool, json!({ "limit": 2 })).await;
+    let cursor = page_of(&stage).1.expect("the first page advances");
+    sqlx::query("UPDATE memory_grants SET revision = 2 WHERE grant_id = 'grt_5_revoked'")
+        .execute(&pool)
+        .await
+        .expect("bump a revoked grant");
+    let (_, stage) = list_call(&pool, json!({ "limit": 2, "cursor": cursor })).await;
+    assert!(
+        cursor_invalid(&stage),
+        "a revoked grant in a visible space must invalidate the cursor: {stage:?}",
+    );
+
+    // Corruption in a space the principal can see still fails the page.
+    seed_grant(
+        &pool,
+        Grant {
+            grant_id: "grt_1_bad",
+            space_id: "spc_1",
+            principal_id: PRINCIPAL,
+            capabilities_json: "{not json",
+            expires_at: None,
+            revoked_at: None,
+            revision: 1,
+        },
+    )
+    .await;
+    let (_, stage) = list_call(&pool, json!({})).await;
+    assert!(
+        matches!(&stage, SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::InternalError),
+        "a malformed grant payload in a visible space must fail the listing: {stage:?}",
     );
 }

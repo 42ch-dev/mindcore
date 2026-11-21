@@ -23,14 +23,15 @@ jobs:
       - name: sqlx offline cache freshness
         run: |
           set -o pipefail
-          # sqlx-cli generates the .sqlx cache that the locked sqlx crate consumes;
-          # the two must share one version, so resolve sqlx-cli from Cargo.lock.
+          # sqlx-cli generates the .sqlx cache that the locked sqlx crate consumes; both
+          # ship in one release, so install sqlx-cli at the sqlx crate version the
+          # workspace resolves (cargo metadata); Cargo.lock has no sqlx-cli entry.
           SQLX_VERSION="$(cargo metadata --locked --format-version 1 \
             | jq -r '[.packages[] | select(.name == "sqlx")] | if length == 1 then .[0].version else error("expected exactly one resolved sqlx package") end')"
           cargo install sqlx-cli --version "=$SQLX_VERSION" --locked --no-default-features --features sqlite
           fixture_dir="$(mktemp -d)"
           trap 'rm -rf "$fixture_dir"' EXIT
-          sqlite3 -bail "$fixture_dir/settlement.db" < crates/mindcore-sqlite/tests/fixtures/settlement-prepare.sql
+          sqlite3 -bail "$fixture_dir/settlement.db" < crates/mindcore-sqlite/migrations/0001_init.sql
           SQLX_OFFLINE=false DATABASE_URL="sqlite://$fixture_dir/settlement.db" \
             cargo sqlx prepare --workspace -- --locked --workspace --all-targets
           cache_changes="$(git status --porcelain --untracked-files=all -- .sqlx/)"

@@ -134,7 +134,7 @@ pub struct MemoryRecordHead {
     pub tombstoned: bool,
 }
 
-/// Operation receipt, not the local `MemoryStore` review row.
+/// One operation's receipt: the outcome it committed and the request facts it binds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewReceiptIr {
     pub receipt_id: String,

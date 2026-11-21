@@ -5,12 +5,8 @@
 //! snapshot, a fail-closed allowlist, then the Mind tools. Handlers are installed before the
 //! dialer connects, exactly as a host must.
 //!
-//! The runtime serves a **protocol-shaped** store. A freshly opened `MindStore` is not yet
-//! protocol-shaped: the pre-release `0001_init.sql` legacy memory tables predate the shape the
-//! adapter reads (issue `I-000068`), so this fixture drops them and applies the protocol DDL while
-//! the migrated `knowledge_entries` table keeps its own store path. The fixture is therefore not
-//! the production open path, and the plan's acceptance is runtime reachability on a
-//! protocol-shaped host store rather than on a `MindStore`-opened database.
+//! The runtime serves a store a production `MindStore::open` produced: the embedded migration
+//! installs the protocol schema, and the fixture seeds only rows into it.
 //!
 //! Advertisement honesty is the negative side: a face the host did not attach advertises nothing
 //! and denies its ops on the wire, and a tool the runtime does not serve answers `op_unsupported`.
@@ -63,13 +59,6 @@ const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
 const PEER_TWO_SEED: [u8; 32] = [0x5Cu8; 32];
 const PEER_TWO_PRINCIPAL: &str = "prn_peer_two";
 
-const PROTOCOL_DDL: &str =
-    include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
-const LEGACY_MEMORY_TABLES: &str = "
-DROP TABLE memory_records;
-DROP TABLE review_receipts;
-DROP TABLE memory_candidates;";
-
 /// One store the runtime serves: the protocol memory shape with two retained records, the
 /// grants the workflows read, and the knowledge collection the face serves.
 struct Fixture {
@@ -78,22 +67,14 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Open a throwaway database and make it protocol-shaped; this is not `MindStore`'s production
-    /// open path (see the module note and issue `I-000068`).
+    /// Open a throwaway database through the production `MindStore::open` path (its embedded
+    /// migration installs the protocol schema), then seed the rows the faces read.
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
         let store = MindStore::open(&dir.path().join("loopback.db"))
             .await
             .expect("open store");
         let pool = store.pool();
-        sqlx::raw_sql(LEGACY_MEMORY_TABLES)
-            .execute(&pool)
-            .await
-            .expect("drop the legacy memory tables");
-        sqlx::raw_sql(PROTOCOL_DDL)
-            .execute(&pool)
-            .await
-            .expect("apply the protocol DDL");
         sqlx::query(
             "INSERT INTO memory_spaces \
              (space_id, display_name, authority_host_id, authority_generation, status, revision, \

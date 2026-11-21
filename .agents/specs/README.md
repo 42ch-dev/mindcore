@@ -9,3 +9,4 @@ Current-state specifications of the Mindcore repository. Each page describes the
 | [`architecture/serving-seam.md`](architecture/serving-seam.md) | Signed Connect serving: Knowledge face, workflow tools, and the store shape they require |
 | [`data/cognition-record-storage.md`](data/cognition-record-storage.md) | Per-record cognition storage, the carrier head, and its CAS/projection rules |
 | [`data/embedding-vector-store.md`](data/embedding-vector-store.md) | Identity-keyed record vectors, the query slot, and the exact-scoring read/fill order |
+| [`data/store-schema.md`](data/store-schema.md) | The single migration `MindStore::open` applies, the tables it creates, and the recreate-on-mismatch policy |

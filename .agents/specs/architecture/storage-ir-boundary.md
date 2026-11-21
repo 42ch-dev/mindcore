@@ -11,7 +11,7 @@ The protocol adapter that converts wire types to this model and back is written 
 
 ## Current state
 
-`mindcore-base::ir` defines the record families and the wire codec; `crates/mindcore-base/tests/ir_roundtrip.rs` proves the fidelity invariant. `mindcore-sqlite` ships `SqliteMemoryRepository`: it implements `MemoryRepository`, persists through the IR on the Nexus memory schema, and borrows the caller's transaction — `I-000020` and `I-000021` are resolved. The legacy pool-owning `MindStore`/`KnowledgeEntryPort` paths still exist alongside it.
+`mindcore-base::ir` defines the record families and the wire codec; `crates/mindcore-base/tests/ir_roundtrip.rs` proves the fidelity invariant. `mindcore-sqlite` ships `SqliteMemoryRepository`: it implements `MemoryRepository`, persists through the IR on the Nexus memory schema, and borrows the caller's transaction — `I-000020` and `I-000021` are resolved. Memory has no other path: `MindStore::open` creates the database file and applies the protocol schema this repository reads. The knowledge side still holds a `SqlitePool` instead: `ScopedKnowledgeStore` implements `KnowledgeEntryPort`, and `RoutedKnowledgeStore` adds the connect-served admission face over the same pool.
 
 ## Record and codec boundary
 
@@ -51,7 +51,7 @@ Ablation: the caller's transaction borrow is required to keep admission, persist
 ## Where it lives
 
 - Contract implementation: `crates/mindcore-base/src/ir.rs`, `crates/mindcore-base/src/ir/wire.rs`, `crates/mindcore-base/src/ir/wire/memory.rs`; round-trip proof: `crates/mindcore-base/tests/ir_roundtrip.rs`.
-- The legacy `MemoryStore`/`KnowledgeEntryPort` adapters in `mindcore-sqlite` remain separate pool-owning paths. `SqliteMemoryRepository` reads and writes through the IR on the Nexus memory schema inside the caller's transaction — both `I-000020` and `I-000021` are resolved.
+- `SqliteMemoryRepository` (`crates/mindcore-sqlite/src/repository.rs`) reads and writes through the IR on the Nexus memory schema inside the caller's transaction — both `I-000020` and `I-000021` are resolved. The knowledge ports own a clone of the store's `SqlitePool` instead: `ScopedKnowledgeStore` (`crates/mindcore-sqlite/src/knowledge.rs`) implements `KnowledgeEntryPort`, and `RoutedKnowledgeStore` layers the connect-served admission face over the same pool. `MindStore::open` is what creates the schema both sides read.
 
 ## Change obligations
 
