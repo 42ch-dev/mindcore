@@ -1,7 +1,6 @@
 //! SQLite (SQLx) backend implementing the mindcore-base storage traits over one local database file.
 
 mod knowledge;
-mod memory;
 mod repository;
 mod store;
 
