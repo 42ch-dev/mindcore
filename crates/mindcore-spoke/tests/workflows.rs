@@ -484,6 +484,15 @@ async fn resolve_externally(harness: &Harness, candidate_id: &str) {
         .expect("external settlement commit");
 }
 
+/// Rewrite the recorded absorb decision, the way a corrupt row would carry it.
+async fn rewrite_decision(harness: &Harness, decision: Value) {
+    sqlx::query("UPDATE memory_journal SET result_json = ? WHERE op = 'mindcore.absorb.decision'")
+        .bind(decision.to_string())
+        .execute(&harness.pool)
+        .await
+        .expect("rewrite the absorb decision");
+}
+
 fn capture(key: &str, text: &str) -> MemoryCaptureRequest {
     serde_json::from_value(json!({
         "space_id": SPACE,
@@ -2158,6 +2167,99 @@ async fn a_held_then_externally_resolved_capture_replays_as_pending() {
         harness.decision_marker().await,
         Some(json!({ "pending_candidate_ids": [candidate_id] }))
     );
+}
+
+#[tokio::test]
+async fn a_marker_under_another_subject_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_subject", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    assert!(matches!(
+        held.as_slice(),
+        [AbsorbCandidateOutcome::Pending { .. }]
+    ));
+
+    // A row under the capture receipt that keeps its decision but names another
+    // subject cannot vouch for this caller's capture.
+    sqlx::query(
+        "UPDATE memory_journal SET subject_id = 'subj_other' \
+         WHERE op = 'mindcore.absorb.decision'",
+    )
+    .execute(&harness.pool)
+    .await
+    .expect("rewrite the marker subject");
+
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("a marker for another subject must not replay as Pending");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+}
+
+#[tokio::test]
+async fn a_repeated_recorded_decision_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_repeated", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+
+    // A repeated id is not the ordered set the capture receipt holds.
+    rewrite_decision(
+        &harness,
+        json!({ "pending_candidate_ids": [candidate_id, candidate_id] }),
+    )
+    .await;
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("a repeated decision must not replay as Pending");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+}
+
+#[tokio::test]
+async fn an_empty_recorded_decision_fails_the_replay_closed() {
+    let harness = granted_harness().await;
+    let workflows = harness.absorb_binding();
+    let request = capture("cap_marker_empty", "the north gate is closed at dusk");
+
+    let held = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect("held absorb");
+    let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
+        panic!("expected one held candidate, got {held:?}");
+    };
+
+    // An empty decision would fall back to the candidate's current state: after
+    // an external resolution that projects Dropped over a recorded Pending.
+    resolve_externally(&harness, candidate_id).await;
+    rewrite_decision(&harness, json!({ "pending_candidate_ids": [] })).await;
+    let error = workflows
+        .absorb(&principal(), &request, None, &MindCapabilities::default())
+        .await
+        .expect_err("an empty decision must not project the external resolution");
+    let SpiError::Settlement(reject) = error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
 }
 
 #[tokio::test]

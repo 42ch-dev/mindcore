@@ -594,6 +594,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             absorb_decision(
                 &mut transaction,
                 request.space_id.as_str(),
+                request.subject_id.as_str(),
                 &body,
                 &candidate_ids,
             )
@@ -722,10 +723,14 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .await
             .map_err(|error| internal(format!("absorb decision could not be read: {error}")))?
         {
-            // The journal's unique receipt id makes the write idempotent: an
-            // equal marker is authoritative, any other row is corruption.
+            // The journal's unique receipt id makes the write idempotent: only
+            // a marker equal in its complete identity and decision is
+            // authoritative; any other row under that receipt is corruption.
             Some(existing)
-                if existing.operation != marker.operation
+                if existing.subject_id != marker.subject_id
+                    || existing.requester != marker.requester
+                    || existing.operation != marker.operation
+                    || existing.idempotency_key != marker.idempotency_key
                     || existing.state != marker.state
                     || !existing.targets.is_empty()
                     || existing.result.as_ref() != marker.result.as_ref() =>
@@ -1326,11 +1331,13 @@ fn candidate_ids(body: &Value) -> Result<Vec<String>, SpiError> {
 ///
 /// Read on the capture's admitted transaction, keyed by the receipt id the
 /// body carries. A row under that receipt id that is not this marker, or a
-/// marker naming anything the receipt does not hold, is storage corruption:
-/// never permission to project the candidate's current state.
+/// marker naming anything but a nonempty receipt-ordered part of what the
+/// receipt holds, is storage corruption: never permission to project the
+/// candidate's current state.
 async fn absorb_decision(
     transaction: &mut Tx<'_>,
     space_id: &str,
+    subject_id: &str,
     body: &Value,
     capture_candidates: &[String],
 ) -> Result<Option<Vec<String>>, SpiError> {
@@ -1366,6 +1373,7 @@ async fn absorb_decision(
         || marker.state != "applied"
         || !marker.targets.is_empty()
         || marker.space_id.as_str() != space.as_str()
+        || marker.subject_id.as_str() != subject_id
         || Some(marker.requester.as_str()) != requester
         || marker.idempotency_key.as_deref() != key
     {
@@ -1378,9 +1386,13 @@ async fn absorb_decision(
             "capture receipt {receipt_id} holds a malformed absorb decision"
         )));
     };
-    if pending.iter().any(|id| !capture_candidates.contains(id)) {
+    // The decision is a nonempty subsequence of the capture receipt's own
+    // list: order and uniqueness come from that list, so an empty, repeated or
+    // reordered decision is corruption, never the recorded one.
+    let mut held = capture_candidates.iter();
+    if pending.is_empty() || !pending.iter().all(|id| held.any(|candidate| candidate == id)) {
         return Err(internal(format!(
-            "absorb decision {receipt_id} names a candidate the capture receipt does not hold"
+            "absorb decision {receipt_id} is not a nonempty receipt-ordered part of the capture receipt"
         )));
     }
     Ok(Some(pending))
