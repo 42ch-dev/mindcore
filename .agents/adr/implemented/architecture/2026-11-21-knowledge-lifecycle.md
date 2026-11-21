@@ -20,10 +20,16 @@ Three constraints shaped the answer:
 
 - **Preimage via a `BEFORE UPDATE OF revision` trigger.** The trigger inserts the replaced row, its head and its own `updated_at` into `knowledge_entry_revisions`, keyed `(collection, entry_id, revision)`. The Rust write path is untouched, so the cost contract still measures the same statements. `cognition_records` gains a nullable `append_prior_shape` so a dedicated append is distinguishable from a full put — the classification is what makes replay's positional gap proof possible.
 - **Replay from the nearest saved checkpoint.** Reading revision N takes the first saved revision at or above N and truncates cognition records to that row's head. A gap must be proven by position (consecutive integers, each classified), not by row count: SQLite's non-strict columns admit a `REAL` in an integer position.
-- **Retirement by marker, not deletion.** `knowledge_entries.superseded_by` names a same-collection successor through a non-cascading composite foreign key. The write advances the carrier revision, so the trigger captures its preimage. Default reads and lists add a live predicate; one explicit read returns the marker; anchor resolution walks the chain to the first live entry and refuses a cycle as `InternalError`.
+- **Retirement by marker, not deletion.** `knowledge_entries.superseded_by` names a same-collection successor through a non-cascading composite foreign key. The write advances the carrier revision, so the trigger captures its preimage. Default reads and lists add a live predicate; one explicit read returns the marker; anchor resolution walks the chain to the first live entry and refuses a cycle as `InternalError`. The list's bound rides on that predicate, so the limit counts **live** rows: retiring an entry frees list budget rather than consuming it, and a collection stays listable while its live set fits. Counting stored rows instead would make a collection permanently unlistable after `SERVED_KNOWLEDGE_LIST_LIMIT` create-and-retire cycles, because nothing shrinks the stored row count.
 - **Adoption as a free function over two ports.** `mindcore_spi::adopt_knowledge_entry` takes the caller's source and destination ports, addresses the copy by the source `entry_id`, and treats the anchor's source revision as the idempotency basis. It adds no trait, no table, no index and no `MindWorkflows` change.
 - **One anchor parser.** `mindcore_base::knowledge::adoption_anchor_parts` is the only reader of the anchor shape; the SQLite resolver consumes it rather than owning a second copy.
 - **Structured refusal classification.** The store tells "the destination slot is occupied by a retired entry" from "your payload is invalid" with a structured detail on the same `InvalidInput` code, never by message matching.
+
+### Adoption is a domain operation, so the SPI consumes `mindcore-base`'s anchor codec
+
+`adopt_knowledge_entry` is a domain-level contract operation, not storage plumbing: it is declared and implemented on the SPI side of the boundary because a host composing two ports is its caller. Reading the adoption anchor is part of that contract, so the SPI consumes `mindcore_base::knowledge::adoption_anchor_parts` and `crates/mindcore-spi/Cargo.toml` now depends on `mindcore-base`. That narrows the rule the capability-boundary ADR recorded — the contract crate carrying no `mindcore-base` dependency — for this one module.
+
+The alternative, a second anchor codec inside `mindcore-spi`, was rejected during review: two parsers for one wire shape is the exact defect the change set out to remove, and the copies would drift the first time the anchor shape moved.
 
 ## Consequences
 
@@ -33,6 +39,7 @@ Three constraints shaped the answer:
 - Retirement never removes a row, so storage grows monotonically; there is no compaction or archival policy yet, and none is implied.
 - A record whose payload revision disagrees with its column is refused as inconsistent state rather than silently accepted; that is a stronger guarantee than the previous CAS, which trusted the payload.
 - The append classification column is load-bearing: removing it, or admitting a non-integer `append_seq`, weakens replay without failing a happy-path test.
+- `mindcore-spi` now depends on `mindcore-base` for the anchor codec, so a change to that helper is SPI-visible; the rest of `mindcore-base` still moves without the SPI surface.
 
 ## Alternatives considered
 

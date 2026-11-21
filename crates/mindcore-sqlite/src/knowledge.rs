@@ -25,9 +25,9 @@ use crate::store::{MindStore, SnapshotSeam};
 
 /// Hard bound on one list of a stored collection.
 ///
-/// Every list decodes the collection's stored rows before any disclosure predicate filters them,
+/// Every list decodes the collection's live rows before any disclosure predicate filters them,
 /// so the collection is bounded at the query boundary instead of growing memory and work with its
-/// total size. An over-bound collection refuses the list; it never truncates.
+/// live size. An over-bound collection refuses the list; it never truncates.
 pub const SERVED_KNOWLEDGE_LIST_LIMIT: usize = 512;
 
 /// Refuse a scope carrying a selection the knowledge face does not serve.
@@ -354,11 +354,11 @@ pub async fn list_entries_in(
 }
 
 /// The live rows of `collection`, ordered by `entry_id` ASC, bounded at the query
-/// boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] stored rows are decoded, and
-/// an over-bound collection refuses the list instead of growing memory and work
-/// with its total size. The bound counts stored rows, a superseded one included;
-/// the marker rides along in the one payload statement, so hiding it costs a
-/// predicate and no additional statement.
+/// boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] live rows are decoded, and an
+/// over-bound live set refuses the list instead of growing memory and work with its
+/// size. The live predicate rides in the one payload statement, so hiding a retired
+/// row costs a predicate and no additional statement — the bound counts live rows,
+/// so retirement frees budget rather than consuming it.
 ///
 /// The record rows of every carrying live entry are one page-shaped statement, not
 /// one statement per entry: the page's holders travel as a `json_each` list.
@@ -368,9 +368,9 @@ async fn entries(
     seam: &SnapshotSeam,
 ) -> SpokeResult<Vec<KnowledgeEntry>> {
     let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
-    let rows: Result<Vec<(String, Option<String>)>, sqlx::Error> = sqlx::query_as(
-        "SELECT payload, superseded_by FROM knowledge_entries \
-         WHERE collection = ? ORDER BY entry_id ASC LIMIT ?",
+    let rows: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT payload FROM knowledge_entries \
+         WHERE collection = ? AND superseded_by IS NULL ORDER BY entry_id ASC LIMIT ?",
     )
     .bind(collection)
     .bind(limit + 1)
@@ -382,14 +382,12 @@ async fn entries(
     };
     if rows.len() as i64 > limit {
         return internal(format!(
-            "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list is bounded"
+            "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} live entries; \
+             the list is bounded"
         ));
     }
     let mut stored = Vec::with_capacity(rows.len());
-    for (payload, superseded_by) in &rows {
-        if superseded_by.is_some() {
-            continue;
-        }
+    for payload in &rows {
         match decode(payload) {
             SpokeResult::Ok(entry) => stored.push(entry),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -457,8 +455,8 @@ impl RoutedKnowledgeStore {
         validate_admission_scope(scope)
     }
 
-    /// The routed collection's stored rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
-    /// over-bound collection refuses the list instead of growing memory and work with its size.
+    /// The routed collection's live rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
+    /// over-bound live set refuses the list instead of growing memory and work with its size.
     /// The projection runs inside one read transaction, so the carrier payloads and the
     /// record rows project from one whole committed state.
     async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
