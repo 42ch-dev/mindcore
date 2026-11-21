@@ -1195,7 +1195,19 @@ pub async fn write_entry(
         Some(KnowledgeEntryModulesValue::Object(module)) => match module.get_mut("records") {
             Some(records) => match std::mem::replace(records, Value::Array(Vec::new())) {
                 Value::Array(records) => records,
-                _ => unreachable!("validated cognition module carries a records array"),
+                // The module gate above rejects a non-array `records` member, so this arm is not
+                // reachable through the public write path. It still refuses instead of aborting:
+                // a library must not take the process down on a shape its own validator missed.
+                _ => {
+                    return spoke_reject(
+                        SpokeRejectCode::InvalidInput,
+                        format!(
+                            "knowledge entry {} cognition records must be an array",
+                            entry.entry_id
+                        ),
+                        None,
+                    )
+                }
             },
             None => Vec::new(),
         },
