@@ -61,7 +61,8 @@ pub struct KnowledgeEntryLifecycle {
 }
 
 /// What one explicit history prune did: the checkpoints it deleted for good and the floor it
-/// recorded, or `None` for both when it deleted nothing and left the stored floor alone.
+/// recorded, or `{ deleted: 0, floor: None }` when it deleted nothing and left the stored floor
+/// alone.
 #[derive(Debug)]
 pub struct PruneReport {
     pub deleted: u64,
@@ -284,23 +285,33 @@ impl ScopedKnowledgeStore {
             Err(error) => return internal(format!("history prune could not begin: {error}")),
         };
         // The live-only predicate is the current-entry read's: an absent entry and a retired one
-        // answer the same generic absence, so a prune never reaches a retired row's history.
-        if let SpokeResult::Reject(reject) =
-            read_stored_row(&mut transaction, &self.scope.collection, entry_id, true).await
-        {
-            return SpokeResult::Reject(reject);
-        }
-        // The revision column is a signed INTEGER, so an entry can never hold more checkpoints
-        // than that range: a `keep` at or above it has nothing older to cut.
-        let limit = i64::try_from(keep).map_or(i64::MAX, |keep| keep.saturating_add(1));
-        let checkpoints: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT revision FROM knowledge_entry_revisions \
-             WHERE collection = ? AND entry_id = ? \
-             ORDER BY revision DESC LIMIT ?",
+        // answer the same generic absence, so a prune never reaches a retired row's history. The
+        // probe selects no payload, so a `keep` larger than the history loads nothing but a row.
+        let live: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT 1 FROM knowledge_entries \
+             WHERE collection = ? AND entry_id = ? AND superseded_by IS NULL",
         )
         .bind(&self.scope.collection)
         .bind(entry_id)
-        .bind(limit)
+        .fetch_optional(&mut *transaction)
+        .await;
+        match live {
+            Ok(Some(_)) => {}
+            Ok(None) => return entry_not_found(&self.scope.collection, entry_id),
+            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
+        }
+        // Two rows decide the window, newest first: the `keep`-th newest is the new floor, and the
+        // row just older proves there is something to delete. The revision column is a signed
+        // INTEGER, so a `keep` past that range offsets past every row.
+        let offset = i64::try_from(keep - 1).unwrap_or(i64::MAX);
+        let checkpoints: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT revision FROM knowledge_entry_revisions \
+             WHERE collection = ? AND entry_id = ? \
+             ORDER BY revision DESC LIMIT 2 OFFSET ?",
+        )
+        .bind(&self.scope.collection)
+        .bind(entry_id)
+        .bind(offset)
         .fetch_all(&mut *transaction)
         .await;
         let checkpoints = match checkpoints {
@@ -309,8 +320,8 @@ impl ScopedKnowledgeStore {
                 return internal(format!("history checkpoints could not be read: {error}"))
             }
         };
-        // The newest `keep` checkpoints are the whole window: fewer means nothing older to cut.
-        if checkpoints.len() as u64 <= keep {
+        // Fewer than two rows means the window already holds every checkpoint: nothing older.
+        if checkpoints.len() < 2 {
             if let Err(error) = transaction.commit().await {
                 return internal(format!("history prune could not commit: {error}"));
             }
@@ -319,9 +330,9 @@ impl ScopedKnowledgeStore {
                 floor: None,
             });
         }
-        // Newest first: the `keep`-th row is the oldest checkpoint the window keeps, and every
-        // deleted preimage sits below its revision.
-        let new_floor = checkpoints[(keep - 1) as usize];
+        // Newest first: the first row is the oldest checkpoint the window keeps, and every deleted
+        // preimage sits below its revision.
+        let new_floor = checkpoints[0];
         let deleted = match sqlx::query(
             "DELETE FROM knowledge_entry_revisions \
              WHERE collection = ? AND entry_id = ? AND revision < ?",

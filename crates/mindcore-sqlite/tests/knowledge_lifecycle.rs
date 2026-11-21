@@ -1005,6 +1005,49 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
     );
     assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
 
+    // A later prune with a *smaller* window cuts again: the window's K-th newest is not yet the
+    // floor, so the delete must still remove rows. This is the case a floor-only prune would fail.
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-h", REVISION_ONE), None)
+            .await,
+        "seed entry-h",
+    );
+    for (expected, summary) in [
+        (1, "the mill door opens at dawn"),
+        (2, "the mill door opens at dawn; a keeper sweeps it"),
+        (3, "the mill door opens at dawn; the miller sweeps it"),
+    ] {
+        expect_ok(
+            shared
+                .put_knowledge_entry(entry_with("entry-h", summary), Some(expected))
+                .await,
+            "rewrite entry-h",
+        );
+    }
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-h").await,
+        [1, 2, 3]
+    );
+
+    let first = expect_ok(
+        shared.prune_history("entry-h", 2).await,
+        "prune entry-h to the two newest checkpoints",
+    );
+    assert_eq!((first.deleted, first.floor), (1, Some(2)));
+
+    let second = expect_ok(
+        shared.prune_history("entry-h", 1).await,
+        "prune entry-h again with a smaller window",
+    );
+    assert!(
+        second.deleted >= 1,
+        "a smaller window deletes at least one checkpoint, got {second:?}"
+    );
+    assert_eq!(second.floor, Some(3));
+    assert_eq!(history_floor(&pool, "shared", "entry-h").await, 3);
+    assert_eq!(checkpoint_revisions(&pool, "shared", "entry-h").await, [3]);
+
     store.close().await;
     remove_database(&path);
 }
