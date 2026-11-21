@@ -962,7 +962,8 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
 }
 
 /// One surface, two principals: each authenticated peer routes to its own collection and settles
-/// onto its own carrier entry, and neither call writes the other principal's carrier.
+/// onto its own carrier entry, and neither call writes the other principal's carrier. A holder the
+/// routed collection does not hold is refused and writes nothing anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_routed_principals_settle_onto_their_own_carriers() {
     let fixture = Fixture::open().await;
@@ -1114,6 +1115,37 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
     assert_eq!(
         second_pack["knowledge"][0]["canonical_name"], "ke_mora's carrier",
         "the slot carries this collection's entry, not the other principal's copy: {second_pack}"
+    );
+
+    // The route fixes the collection, the request's holder names the entry inside it: the first
+    // principal naming the second principal's holder is refused, and neither collection changes.
+    let first_before = collection_state(&pool, COLLECTION, CARRIER).await;
+    let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
+    let reject = expect_reject(
+        first
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_for(CARRIER_TWO))
+            .await,
+        "deliberate by the first principal naming the second principal's holder",
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "the routed collection holds no such holder: {reject:?}"
+    );
+    assert!(
+        reject.message.contains(CARRIER_TWO),
+        "the refusal answers the holder the request named: {reject:?}"
+    );
+    assert_eq!(
+        collection_state(&pool, COLLECTION, CARRIER).await,
+        first_before,
+        "a foreign holder settles nothing in the caller's own collection"
+    );
+    assert_eq!(
+        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        second_before,
+        "nor in the collection that holder lives in"
     );
 }
 
