@@ -14,7 +14,9 @@ use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
 use mindcore_sqlite::cognition::read_records;
-use mindcore_sqlite::{read_carrier_header, write_entry, MindStore};
+use mindcore_sqlite::{
+    read_carrier_header, read_entry, write_entry, MindStore, RoutedKnowledgeStore,
+};
 use serde_json::{json, Value};
 use spoke_operations::{KnowledgeEntryPort, ScopedKnowledgePort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
@@ -22,7 +24,7 @@ use spoke_schemas::knowledge_entry::{
     KnowledgeEntryOwner,
 };
 use spoke_schemas::{KnowledgeEntry, Scope};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 #[allow(dead_code)]
 #[path = "support/embedded_story.rs"]
@@ -158,6 +160,101 @@ async fn carrier_header(pool: &SqlitePool, collection: &str, entry_id: &str) -> 
     (header.revision, header.head_seq)
 }
 
+/// The pending rewrite as written inside its own reservation: revision, payload summary, record
+/// rows and carrier head must all have moved before the rollback, or the post-rollback assertions
+/// prove only that the old state is still there. Reads through the caller's transaction, so it
+/// sees the uncommitted rewrite.
+async fn expect_rewrite_written(tx: &mut Transaction<'_, Sqlite>, entry_id: &str) {
+    let written = expect_ok(
+        read_entry(tx, SHARED, entry_id).await,
+        "carrier transaction: read the pending rewrite inside its transaction",
+    );
+    assert_eq!(
+        written.revision,
+        Some(2),
+        "I-000009 (carrier transaction): the pending rewrite must be revision 2 before the rollback"
+    );
+    assert_eq!(
+        written.body.summary.as_deref(),
+        Some(CARRIER_REWRITE_SUMMARY),
+        "I-000009 (carrier transaction): the pending rewrite must hold its own payload before the \
+         rollback"
+    );
+    assert_eq!(
+        expect_ok(
+            read_records(&mut **tx, SHARED, entry_id).await,
+            "carrier transaction: read the pending rewrite's records",
+        )
+        .len(),
+        3,
+        "I-000009 (carrier transaction): the pending rewrite must carry the appended record before \
+         the rollback"
+    );
+    let header = expect_ok(
+        read_carrier_header(&mut **tx, SHARED, entry_id).await,
+        "carrier transaction: read the pending rewrite's head",
+    );
+    assert_eq!(
+        (header.revision, header.head_seq),
+        (2, Some(3)),
+        "I-000009 (carrier transaction): the pending rewrite must move the revision and head \
+         before the rollback"
+    );
+}
+
+/// Positive control for a disclosure probe: both viewpoints read and list a live, non-private
+/// entry, the owner lists its own private entry, and the foreign list omits it. Without this, a
+/// list that always answers empty or a viewpoint refused every read would pass the negative
+/// assertions below.
+async fn expect_live_disclosure(
+    served: &RoutedKnowledgeStore,
+    owner: &Scope,
+    foreign: &Scope,
+    live_id: &str,
+    private_id: &str,
+) {
+    for (viewpoint, scope) in [("owner", owner), ("foreign", foreign)] {
+        assert_eq!(
+            expect_ok(
+                served.get_scoped_knowledge_entry(scope, live_id).await,
+                "disclosure control: ordinary get of a live entry",
+            )
+            .revision,
+            Some(1),
+            "I-000009 (holder disclosure): the {viewpoint} viewpoint reads the live entry {live_id}"
+        );
+        let listed = expect_ok(
+            served.list_scoped_knowledge_entries(scope).await,
+            "disclosure control: ordinary list of the live collection",
+        );
+        assert!(
+            listed.iter().any(|listed| listed.entry_id == live_id),
+            "I-000009 (holder disclosure): the {viewpoint} viewpoint lists the live entry {live_id}"
+        );
+    }
+    let owner_listed = expect_ok(
+        served.list_scoped_knowledge_entries(owner).await,
+        "disclosure control: the owner's list of the private entry",
+    );
+    assert!(
+        owner_listed
+            .iter()
+            .any(|listed| listed.entry_id == private_id),
+        "I-000009 (holder disclosure): the owner viewpoint lists its own private entry {private_id}"
+    );
+    let foreign_listed = expect_ok(
+        served.list_scoped_knowledge_entries(foreign).await,
+        "disclosure control: the foreign list of the private entry",
+    );
+    assert!(
+        !foreign_listed
+            .iter()
+            .any(|listed| listed.entry_id == private_id),
+        "I-000009 (holder disclosure): the foreign viewpoint's list omits the private entry \
+         {private_id}"
+    );
+}
+
 #[tokio::test]
 async fn shared_scope_holds_the_seven_named_facts() {
     let temp = TempDb::new("shared-scope-rehearsal");
@@ -208,17 +305,24 @@ async fn shared_scope_holds_the_seven_named_facts() {
     // I-000009 item 2 — references: the personal copy carries an adoption anchor naming its shared
     // source id and adopted revision; resolving from that copy outward through the shared
     // collection follows retirement markers to the first live entry.
-    let copy = match expect_ok(
+    match expect_ok(
         adopt_knowledge_entry(&shared, &personal, "ke_gate", 2).await,
         "item 2: adopt ke_gate at revision 2",
     ) {
-        AdoptionOutcome::Created(copy) => copy,
+        AdoptionOutcome::Created(_) => {}
         other => panic!(
             "I-000009 item 2 (references): the first adoption must create the copy, got {other:?}"
         ),
-    };
+    }
+    // The anchor is a persisted property of the copy, so it is read back from the personal
+    // collection: a later write that added the missing anchor would pass an assertion on the
+    // adoption return value alone.
+    let adopted = expect_ok(
+        personal.get_knowledge_entry("ke_gate").await,
+        "item 2: re-read the adopted copy from the personal collection",
+    );
     assert_eq!(
-        adoption_anchor_parts(&copy),
+        adoption_anchor_parts(&adopted),
         Some(("ke_gate", Some(2))),
         "I-000009 item 2 (references): the copy anchors to its shared source id and adopted revision"
     );
@@ -252,7 +356,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     );
     assert_eq!(
         expect_ok(
-            shared.resolve_adoption_anchor(&copy).await,
+            shared.resolve_adoption_anchor(&adopted).await,
             "item 2: resolve the anchor through the retirement chain",
         ),
         "ke_gate_tower",
@@ -277,6 +381,14 @@ async fn shared_scope_holds_the_seven_named_facts() {
     );
     let owner_view = viewpoint_scope(OWNER_VIEWPOINT);
     let foreign_view = viewpoint_scope(FOREIGN_VIEWPOINT);
+    expect_live_disclosure(
+        &served,
+        &owner_view,
+        &foreign_view,
+        "ke_gate_tower",
+        "ke_gate_note",
+    )
+    .await;
     assert_eq!(
         expect_ok(
             served
@@ -360,7 +472,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     // I-000009 item 4 — promotion: writing the personal copy leaves the shared source's revision
     // and stored payload bytes untouched.
     let source_before = source_row(&pool, SHARED, "ke_gate").await;
-    let mut promoted_copy = copy.clone();
+    let mut promoted_copy = adopted.clone();
     promoted_copy.body.summary = Some(PERSONAL_NOTE.to_string());
     let promoted = expect_ok(
         personal.put_knowledge_entry(promoted_copy, Some(1)).await,
@@ -444,6 +556,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
         .await,
         "item 5: extend the carrier inside the reservation",
     );
+    expect_rewrite_written(&mut rewrite, "ke_keeper_log").await;
     rewrite.rollback().await.expect("item 5: rollback");
     assert_eq!(
         carrier_header(&pool, SHARED, "ke_keeper_log").await,
@@ -607,6 +720,14 @@ async fn shared_scope_holds_the_seven_named_facts() {
             .await,
         "item 6: seed a live owner-private entry on the copy",
     );
+    expect_live_disclosure(
+        &served,
+        &owner_view,
+        &foreign_view,
+        "ke_gate_tower",
+        "ke_gate_note_copy",
+    )
+    .await;
     assert_eq!(
         expect_ok(
             served
@@ -727,6 +848,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
         .await,
         "item 6: extend the carrier on the copy inside the reservation",
     );
+    expect_rewrite_written(&mut rewrite, "ke_keeper_log_copy").await;
     rewrite
         .rollback()
         .await
@@ -824,11 +946,16 @@ async fn shared_scope_holds_the_seven_named_facts() {
         .await
         .expect("item 7: release the write reservation");
     restored.close().await;
-    let landed = expect_ok(
+    expect_ok(
         second_shared
             .put_knowledge_entry(entry("ke_switch_probe", "note", SWITCH_PROBE), None)
             .await,
         "item 7: the same write after the first store closes",
+    );
+    // Read through the second store: the put's return value is the submission, not the row.
+    let landed = expect_ok(
+        second_shared.get_knowledge_entry("ke_switch_probe").await,
+        "item 7: read the switched entry through the second store",
     );
     assert_eq!(
         landed.revision,
