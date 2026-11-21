@@ -5,6 +5,8 @@
 //! call reads and returns, so an embedder, reasoner or policy hook runs with no
 //! transaction open and the workflow can revalidate afterwards.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
@@ -67,23 +69,16 @@ const RECALL: &str = "recall";
 /// this capture's absorb run decided `Pending` for the ids it names.
 const ABSORB_DECISION_OP: &str = "mindcore.absorb.decision";
 
-/// One collection together with the caller it is admitted to.
-struct AdmittedCollection {
-    caller: String,
-    scope: KnowledgeScope,
-}
-
 /// The in-process workflow binding over one SQLite pool.
 ///
-/// `knowledge` fixes the one collection this binding serves and its one caller:
-/// without it the binding serves no knowledge at all, and a collection bound to
-/// another caller is refused rather than read. `publisher` is the host's file
-/// medium; the settlement legs require it before they stage anything, and a
+/// `knowledge_routes` maps each admitted principal id to the one collection its workflow calls
+/// reach: a principal with no route reads no knowledge and never writes a carrier. `publisher` is
+/// the host's file medium; the settlement legs require it before they stage anything, and a
 /// binding without one refuses them with no write at all.
 pub struct MemoryWorkflowBinding {
     adapter: MemoryAdapter,
     pool: SqlitePool,
-    knowledge: Option<AdmittedCollection>,
+    knowledge_routes: BTreeMap<String, KnowledgeScope>,
     publisher: Option<Box<JournalPublisher>>,
 }
 
@@ -95,7 +90,7 @@ impl MemoryWorkflowBinding {
         Self {
             adapter: MemoryAdapter::new(reflections_enabled),
             pool,
-            knowledge: None,
+            knowledge_routes: BTreeMap::new(),
             publisher: None,
         }
     }
@@ -281,24 +276,36 @@ impl MemoryWorkflowBinding {
         Ok(settled)
     }
 
-    /// Bind the collection the carrier write serves, admitted to `caller` only.
+    /// Bind the host's route map: each exact principal id to the collection its workflow calls
+    /// reach.
     ///
-    /// Deliberation reads and CAS-writes one caller's carrier entry, so every
-    /// deliberate call needs `caller` to be the principal and to hold a live
-    /// [`KNOWLEDGE_READ`]/[`KNOWLEDGE_WRITE`] grant in the request's space.
-    /// Recall's knowledge slot is not restricted to `caller`: any principal
-    /// holding its own live [`KNOWLEDGE_READ`] grant reads this collection.
-    #[must_use]
-    pub fn with_knowledge_collection(
+    /// The map is the workflow collection allowlist, so a route need not name a collection that
+    /// already holds rows. An empty key or destination collection is the host's input error and
+    /// leaves the binding unrouted. Nothing else is checked here: a map cannot repeat a key, and
+    /// `KnowledgeScope` is not a wire `Scope`, so no admission call applies.
+    pub fn with_knowledge_routes(
         mut self,
-        caller: impl Into<String>,
-        scope: KnowledgeScope,
-    ) -> Self {
-        self.knowledge = Some(AdmittedCollection {
-            caller: caller.into(),
-            scope,
-        });
-        self
+        routes: BTreeMap<String, KnowledgeScope>,
+    ) -> Result<Self, SpokeReject> {
+        let invalid = |message: String| SpokeReject {
+            code: SpokeRejectCode::InvalidInput,
+            message,
+            details: None,
+        };
+        for (principal, scope) in &routes {
+            if principal.is_empty() {
+                return Err(invalid(
+                    "a knowledge route needs a non-empty principal id".to_string(),
+                ));
+            }
+            if scope.collection.is_empty() {
+                return Err(invalid(format!(
+                    "the knowledge route for principal {principal} names an empty collection"
+                )));
+            }
+        }
+        self.knowledge_routes = routes;
+        Ok(self)
     }
 
     /// Every live-admission candidate of `space_id`, read on `tx`.
@@ -314,28 +321,27 @@ impl MemoryWorkflowBinding {
         admission::wire_grants(&rows).map_err(|reject| SpiError::Settlement(reject.into_spoke()))
     }
 
-    /// The one collection this binding serves, when the host bound one.
-    fn bound(&self) -> Result<&AdmittedCollection, SpiError> {
-        self.knowledge.as_ref().ok_or_else(|| {
-            not_authorized("this workflow binding serves no knowledge collection".to_string())
-        })
+    /// The collection route the host configured for `principal`, by its exact id.
+    ///
+    /// The one lookup both the carrier write and the recall slot use, so two calls for the same
+    /// admitted principal can never reach different collections. Borrowed, never cloned: the
+    /// route map is immutable for the binding's lifetime.
+    fn knowledge_route(&self, principal: &Principal) -> Option<&KnowledgeScope> {
+        self.knowledge_routes.get(principal_id(principal))
     }
 
-    /// The bound collection, read under `principal`'s own live grant for every
-    /// one of `capabilities` in `space_id`.
+    /// `principal`'s own live grant for every one of `capabilities` in `space_id`, on `tx`.
     ///
-    /// Live grants are re-derived on every call, so a read after provider work
-    /// runs the same admission and a revoked grant refuses it. A memory grant
-    /// never substitutes for this, and a knowledge read never stands in for
-    /// [`KNOWLEDGE_WRITE`].
-    async fn granted_collection(
+    /// Live grants are re-derived on every call, so a read after provider work runs the same
+    /// admission and a revoked grant refuses it. A memory grant never substitutes for this, and a
+    /// knowledge read never stands in for [`KNOWLEDGE_WRITE`].
+    async fn require_knowledge_grants(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
         space_id: &str,
         capabilities: &[&str],
-    ) -> Result<&AdmittedCollection, SpiError> {
-        let admitted = self.bound()?;
+    ) -> Result<(), SpiError> {
         let caller = principal_id(principal);
         let space = SpaceId::new(space_id.to_string());
         let grants = self.space_grants(tx, space_id).await?;
@@ -354,16 +360,15 @@ impl MemoryWorkflowBinding {
                 )));
             }
         }
-        Ok(admitted)
+        Ok(())
     }
 
-    /// The bound collection for the carrier write: `principal` must be the one
-    /// caller this binding serves and hold a live grant for every one of
-    /// `capabilities` in `space_id`.
+    /// The collection the carrier write serves: `principal` must have a route and hold a live
+    /// grant for every one of `capabilities` in `space_id`.
     ///
-    /// The caller match is the recorded one-caller write limit: deliberation
-    /// settles onto one principal's carrier entry, so another admitted peer
-    /// reads memory and knowledge but never writes this carrier.
+    /// Resolved once, so the carrier read and its CAS append stay pinned to one collection. A
+    /// missing route is the terminal refusal before any carrier access: it is as target-free as a
+    /// missing grant, so a peer never learns whether another principal has a route.
     async fn admitted_collection(
         &self,
         tx: &mut Tx<'_>,
@@ -371,18 +376,15 @@ impl MemoryWorkflowBinding {
         space_id: &str,
         capabilities: &[&str],
     ) -> Result<&str, SpiError> {
-        let admitted = self.bound()?;
-        let caller = principal_id(principal);
-        if caller != admitted.caller.as_str() {
-            // Target-free: the peer learns it is not the route's caller, never which collection
-            // the host routed or bound.
-            return Err(not_authorized(format!(
-                "principal {caller} is not the admitted carrier caller"
-            )));
-        }
-        self.granted_collection(tx, principal, space_id, capabilities)
-            .await
-            .map(|admitted| admitted.scope.collection.as_str())
+        let collection = self
+            .knowledge_route(principal)
+            .map(|route| route.collection.as_str())
+            .ok_or_else(|| {
+                not_authorized("principal has no workflow knowledge route".to_string())
+            })?;
+        self.require_knowledge_grants(tx, principal, space_id, capabilities)
+            .await?;
+        Ok(collection)
     }
 
     /// The subject's own admission, rechecked inside the write transaction: the
@@ -411,39 +413,42 @@ impl MemoryWorkflowBinding {
         Ok(())
     }
 
-    /// Fill the pack's knowledge slot: any caller holding a live
-    /// [`KNOWLEDGE_READ`] grant in the request's space reads the bound
-    /// collection, whichever caller the carrier write is bound to.
+    /// Fill the pack's knowledge slot from `principal`'s own routed collection.
     ///
-    /// The slot applies the same disclosure predicate as the served knowledge
-    /// list. This binding carries no admitted viewpoint, so an entry a
-    /// viewpoint-free read hides — an `owner`-private one — never reaches the
-    /// pack, however large the recall's budget.
+    /// The slot is independent of the memory page: a principal with no route, or without a live
+    /// [`KNOWLEDGE_READ`] grant in the request's space, reads its records with an empty slot
+    /// exactly as it would with no route map. A missing route never reveals whether another
+    /// principal has one.
     ///
-    /// Best effort: the slot never decides whether the recall is authorized, so
-    /// a caller without that grant reads its memory records with an empty slot
-    /// exactly as it would with no collection bound. Storage and list failures
-    /// are not authorization, and still fail the call.
+    /// The slot applies the same disclosure predicate as the served knowledge list. This binding
+    /// carries no admitted viewpoint, so an entry a viewpoint-free read hides — an `owner`-private
+    /// one — never reaches the pack, however large the recall's budget.
+    ///
+    /// Best effort: the slot never decides whether the recall is authorized. Storage and list
+    /// failures are not authorization, and still fail the call.
     async fn knowledge_slot(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
         request: &MemoryRecallRequest,
     ) -> Result<Vec<KnowledgeEntry>, SpiError> {
-        if self.knowledge.is_none() {
+        let Some(collection) = self
+            .knowledge_route(principal)
+            .map(|route| route.collection.as_str())
+        else {
             return Ok(Vec::new());
-        }
-        let granted = match self
-            .granted_collection(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
+        };
+        match self
+            .require_knowledge_grants(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
             .await
         {
-            Ok(admitted) => admitted,
+            Ok(()) => {}
             Err(SpiError::Settlement(reject)) if reject.code == SpokeRejectCode::NotAuthorized => {
                 return Ok(Vec::new())
             }
             Err(error) => return Err(error),
-        };
-        match list_entries_in(tx, granted.scope.collection.as_str()).await {
+        }
+        match list_entries_in(tx, collection).await {
             SpokeResult::Ok(entries) => Ok(entries
                 .into_iter()
                 .filter(|entry| knowledge_entry_visible_to_viewpoint(entry, None))

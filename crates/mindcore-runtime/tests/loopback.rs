@@ -11,7 +11,7 @@
 //! Advertisement honesty is the negative side: a face the host did not attach advertises nothing
 //! and denies its ops on the wire, and a tool the runtime does not serve answers `op_unsupported`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -389,13 +389,13 @@ impl Reasoner for NoChangeReasoner {
     }
 }
 
-/// The host's side of the surface. `workflow_caller` is the one principal the deliberation route
-/// admits; without it the runtime serves and advertises no `deliberate` at all.
+/// The host's side of the surface. `workflow_routes` is the per-principal workflow route map;
+/// an empty map serves and advertises no `deliberate` at all.
 fn faces(
     manifest: HostCapabilityManifest,
     memory: Option<Arc<dyn RemoteMemoryService>>,
     providers: MindProviders,
-    workflow_caller: Option<&str>,
+    workflow_routes: BTreeMap<String, KnowledgeScope>,
 ) -> ServeFaces {
     ServeFaces {
         manifest,
@@ -405,9 +405,17 @@ fn faces(
         memory,
         principals: principal_admission(),
         providers,
-        workflow_caller: workflow_caller.map(str::to_string),
+        workflow_routes,
         tools: Vec::new(),
     }
+}
+
+/// A route map putting each of `principals` onto the fixture's one collection.
+fn routes(principals: &[&str]) -> BTreeMap<String, KnowledgeScope> {
+    principals
+        .iter()
+        .map(|principal| ((*principal).to_string(), KnowledgeScope::new(COLLECTION)))
+        .collect()
 }
 
 fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
@@ -606,7 +614,7 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
             hello("runtime", &["spoke-baseline"]),
             None,
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
 
@@ -649,8 +657,8 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
     );
 }
 
-/// A wired deliberation route does not narrow recall: a different admitted peer holding its own
-/// knowledge grant receives its pack with the slot filled from the served collection.
+/// A route map fills recall's knowledge slot per principal: a second admitted peer routed to the
+/// same collection reads it under its own grant, whichever principal the host routed first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() {
     let fixture = Fixture::open().await;
@@ -670,9 +678,9 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
         hello("runtime", &[]),
         None,
         MindProviders::default(),
-        Some(PRINCIPAL),
+        routes(&[PRINCIPAL, PEER_TWO_PRINCIPAL]),
     );
-    // Both peers are admitted; only the route's caller may deliberate.
+    // Both peers are admitted and both route to the shared collection.
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
     assert!(
@@ -714,7 +722,7 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
             hello("runtime", &[]),
             None,
             MindProviders::default(),
-            Some(PRINCIPAL),
+            routes(&[PRINCIPAL]),
         ),
     );
     assert!(
@@ -758,7 +766,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     };
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, providers, Some(PRINCIPAL)),
+        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
     );
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
@@ -798,10 +806,10 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     );
 }
 
-/// The carrier write keeps its one-caller authority: a peer holding `recall` and both knowledge
-/// grants in the space is still refused the route's carrier, and nothing is written.
+/// A principal the host did not route reaches no carrier: a peer holding `recall` and both
+/// knowledge grants in the space is still refused, target-free, and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
+async fn a_peer_without_a_route_cannot_write_the_carrier() {
     let fixture = Fixture::open().await;
     fixture.seed_carrier().await;
     fixture
@@ -820,7 +828,7 @@ async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
             reasoner: Some(Arc::new(NoChangeReasoner)),
             ..MindProviders::default()
         },
-        Some(PRINCIPAL),
+        routes(&[PRINCIPAL]),
     );
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
@@ -831,14 +839,14 @@ async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
             .adapter
             .invoke_tool(DELIBERATE, deliberate_arguments())
             .await,
-        "deliberate by a peer that is not the route's caller",
+        "deliberate by a peer without a knowledge route",
     );
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
     assert!(
         reject
             .message
-            .contains("is not the admitted carrier caller"),
-        "the refusal is the carrier's one-caller rule: {reject:?}"
+            .contains("principal has no workflow knowledge route"),
+        "the refusal is the missing-route rule: {reject:?}"
     );
     let refusal = format!("{reject:?}");
     assert!(
@@ -872,7 +880,7 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             hello("runtime", &["spoke-memory"]),
             None,
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
     assert!(
@@ -895,7 +903,7 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             hello("runtime", &["spoke-memory"]),
             Some(Arc::new(MemoryFace)),
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
     assert!(
@@ -928,7 +936,7 @@ async fn the_baseline_face_is_never_composed_or_advertised() {
             hello("runtime", &["spoke-baseline"]),
             None,
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
     assert!(
@@ -953,7 +961,7 @@ async fn an_unserved_tool_answers_op_unsupported() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, MindProviders::default(), None),
+        faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[])),
     );
     assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
 
@@ -974,7 +982,7 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, MindProviders::default(), None),
+        faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[])),
     );
     assert!(
         !capabilities(&surface).contains(&DELIBERATE),
@@ -999,7 +1007,7 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
 async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), None);
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[]));
     faces.tools = vec![ToolRegistration::new(
         deliberate_descriptor(),
         |_responder| {
@@ -1041,7 +1049,7 @@ async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
 async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), None);
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[]));
     faces.tools = vec![ToolRegistration::new(
         host_tool_descriptor(),
         |_responder| {
@@ -1180,7 +1188,7 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
                 embedder: Some(embedder.clone()),
                 ..MindProviders::default()
             },
-            None,
+            routes(&[]),
         ),
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
@@ -1290,7 +1298,7 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
                 embedder: Some(embedder.clone()),
                 ..MindProviders::default()
             },
-            None,
+            routes(&[]),
         ),
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
