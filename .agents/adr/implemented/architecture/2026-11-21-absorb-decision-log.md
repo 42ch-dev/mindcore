@@ -10,7 +10,8 @@ arrive again: a retry after a failed follow-up write, or any later replay. Repla
 decision that run made — `Pending` — rather than the candidate's current state, because a candidate
 is mutable: a human or another subsystem can settle or dismiss it between the decision and the
 replay. Without a durable record, a host cannot tell "absorb said pending" from "absorb never
-decided", and it reported the later resolution as if the original call had produced it.
+decided", and it reported the later resolution as if the original call had produced it. The record
+must come from the run itself: only that run knows what it decided.
 
 The candidate row cannot carry this record. It is state owned by the settlement path, and every
 transition that consumes the candidate rewrites it.
@@ -25,14 +26,15 @@ complete identity. The pending ids are stored in capture receipt order.
 
 `record_absorb_pending` writes the marker on a short `BEGIN IMMEDIATE` transaction after the capture
 commits, after verifying that exact receipt; an equal marker already present is a no-op and a
-mismatched one is a storage error. Replay reads the marker before projecting anything. A replay with
-no marker is the retry of a run that failed between the capture and that write, and it repairs only a
-decision the receipt still shows: when every candidate in the receipt is still pending, that run
-settled nothing, so the retry records the marker naming the whole ordered list before returning and
-the `Pending` it reports becomes the answer later replays give. A mixed receipt — some candidates
-consumed, some pending — no longer shows what that run decided, so the retry records no marker and
-reports each candidate from its own state, exactly as a marker-absent replay does. A replay that
-projects a consumed candidate stays read-only and reports that candidate's own recorded outcome.
+mismatched one is a storage error. Replay reads the marker before projecting anything. The marker is
+written once, by the run that decided, and a replay never writes one: a receipt snapshot cannot tell a
+run that failed before that write from another run still in flight on the same idempotency key, so
+inferring a decision from the receipt is unsound. Reading a wholly pending receipt as "that run
+settled nothing" reports a candidate another run settled as pending, and the marker then contradicts
+the decision the settling run goes on to record. A replay with no marker therefore projects each
+candidate's current state and writes nothing: a decision that was never recorded stays unrecorded. A
+replay that projects a consumed candidate stays read-only and reports that candidate's own recorded
+outcome.
 
 ## Alternatives considered
 
@@ -51,9 +53,9 @@ projects a consumed candidate stays read-only and reports that candidate's own r
 - One marker per capture receipt, so replay is idempotent by construction and the write is safe to
   retry.
 - The marker commits in a second transaction after the capture. A failure there fails the run
-  instead of returning a `Pending` it never recorded; the retry completes the write while the
-  receipt is still wholly pending. A receipt that changed since that failure keeps no marker: a
-  replay reports current state instead of inventing a decision the receipt can no longer prove.
+  instead of returning a `Pending` it never recorded, and no retry can recover that decision: the
+  receipt alone cannot prove what the failed run decided, so later replays project current state.
+  This is the accepted cost of never letting a replay invent a marker.
 - The decision survives exactly as long as the receipt it names. A reader must validate the whole
   identity: comparing only the receipt and the payload lets a row with another subject or requester
   pass as authoritative, and a subset check accepts an empty list as "nothing pending".

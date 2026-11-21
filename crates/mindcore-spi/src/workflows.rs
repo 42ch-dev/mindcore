@@ -149,12 +149,10 @@ pub trait WorkflowBinding: Send + Sync {
     /// already present is a no-op; a mismatched or malformed one is a storage
     /// error. It records a decision, never a settlement, and a capture replay
     /// reads it to report the original `Pending` outcome instead of the
-    /// candidate's later state. A retry that repairs a missing marker passes
-    /// the receipt's complete candidate list, in receipt order, and only when
-    /// every candidate in that receipt is still pending: that is the one
-    /// receipt state where the whole list is provably the decision the failed
-    /// run made. A mixed receipt records nothing. Never call it for an empty
-    /// set or a failed decision.
+    /// candidate's later state. Only the run that made the decision writes it:
+    /// a replay never calls it, so a run that failed before this write leaves
+    /// its decision unrecorded and later replays project current state.
+    /// Never call it for an empty set or a failed decision.
     async fn record_absorb_pending(
         &self,
         principal: &Principal,
@@ -523,20 +521,15 @@ impl SpiMindWorkflows {
     /// With a reasoner, each fresh candidate is read with one bounded
     /// authorized evidence page, the reasoner runs outside any transaction,
     /// its reply is validated against that exact page, and the policy hook
-    /// decides whether the validated settlement is submitted. Before a run
-    /// that leaves fresh candidates pending returns, the binding records one
-    /// durable decision marker for them; a replay reads that marker and
-    /// reports the original `Pending` outcome even after the candidate was
-    /// resolved elsewhere. A replay with no marker is the retry of a run that
-    /// failed between its capture commit and that write, and it repairs only a
-    /// decision the receipt still shows. When every candidate in the receipt
-    /// is still pending that run settled nothing, so the receipt's ordered list
-    /// is its decision: the retry records that list before returning, and the
-    /// `Pending` it reports stays the answer later replays give. When the
-    /// receipt is mixed — some candidates consumed, some pending — it no longer
-    /// shows what that run decided, so the retry records nothing and reports
-    /// each candidate from its own state, leaving the next replay the same
-    /// freedom.
+    /// decides whether the validated settlement is submitted. Only the run
+    /// that decided writes: before a run that leaves fresh candidates pending
+    /// returns, the binding records one durable decision marker for them, and a
+    /// replay reads that marker and reports the original `Pending` outcome even
+    /// after the candidate was resolved elsewhere. A replay never writes a
+    /// marker — without one it projects each candidate's current state and
+    /// records nothing, because a snapshot of the receipt cannot tell a run
+    /// that failed before settling from another run still in flight. A
+    /// decision that was never recorded stays unrecorded.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -549,23 +542,10 @@ impl SpiMindWorkflows {
             replayed,
         } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidates.len());
-        // A replay with no marker holds the receipt of a run that failed before
-        // writing it. A receipt whose candidates are all still pending shows
-        // that run settled nothing, so its ordered list is the decision the
-        // retry records. A mixed receipt no longer shows what that run decided,
-        // so it records nothing and reports each candidate from its own state.
-        let repair = (replayed
-            && candidates
-                .iter()
-                .all(|candidate| candidate.lifecycle == CandidateLifecycle::Pending))
-        .then(|| {
-            candidates
-                .iter()
-                .map(|candidate| candidate.candidate_id.clone())
-                .collect::<Vec<_>>()
-        });
         // Fresh candidates this run leaves pending: its durable Pending
         // decision, recorded before success so a later replay can report it.
+        // Only the deciding run writes it; a replay's snapshot cannot prove
+        // what another run decided.
         let mut held: Vec<String> = Vec::new();
         for CapturedCandidate {
             candidate_id,
@@ -607,9 +587,8 @@ impl SpiMindWorkflows {
             }
             outcomes.push(outcome);
         }
-        let decision = repair.unwrap_or(held);
-        if !decision.is_empty() {
-            let pending: Vec<&str> = decision.iter().map(String::as_str).collect();
+        if !held.is_empty() {
+            let pending: Vec<&str> = held.iter().map(String::as_str).collect();
             self.binding
                 .record_absorb_pending(principal, request, &pending)
                 .await?;
