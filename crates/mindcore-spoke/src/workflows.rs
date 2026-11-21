@@ -280,9 +280,10 @@ impl MemoryWorkflowBinding {
     /// reach.
     ///
     /// The map is the workflow collection allowlist, so a route need not name a collection that
-    /// already holds rows. An empty key or destination collection is the host's input error and
-    /// leaves the binding unrouted. Nothing else is checked here: a map cannot repeat a key, and
-    /// `KnowledgeScope` is not a wire `Scope`, so no admission call applies.
+    /// already holds rows. An empty key or destination collection is refused with `InvalidInput`,
+    /// so surface assembly fails instead of serving a binding whose map must still be completed.
+    /// Nothing else is checked here: a map cannot repeat a key, and `KnowledgeScope` is not a wire
+    /// `Scope`, so no admission call applies.
     pub fn with_knowledge_routes(
         mut self,
         routes: BTreeMap<String, KnowledgeScope>,
