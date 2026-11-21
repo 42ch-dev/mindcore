@@ -101,11 +101,35 @@ impl Reject {
 }
 
 impl From<SqliteRepositoryError> for Reject {
-    fn from(_: SqliteRepositoryError) -> Self {
+    fn from(error: SqliteRepositoryError) -> Self {
+        // A write SQLite refused because another handle holds the database —
+        // an exhausted busy timeout or the lost snapshot itself — applied
+        // nothing from this transaction, but it is contention, not a storage
+        // fault: the caller must resolve the race before retrying. Every other
+        // driver failure is the retryable pre-commit class.
+        if contended(&error) {
+            return Self::uncertain(
+                "a concurrent writer refused this transaction; resolve its outcome before retrying",
+            );
+        }
         // A driver failure before the caller's commit is retryable and its
         // diagnostics stay local: the protocol names no storage vocabulary.
         Self::internal("storage failure before commit")
     }
+}
+
+/// Whether a repository failure is SQLite write contention.
+///
+/// `SQLITE_BUSY` covers both the busy-handler timeout and the write refused
+/// because another connection's commit invalidated this transaction's WAL
+/// snapshot; the primary and extended codes are both accepted because the
+/// driver reports whichever the connection enables.
+fn contended(error: &SqliteRepositoryError) -> bool {
+    matches!(
+        error,
+        SqliteRepositoryError::Sql(sqlx::Error::Database(database))
+            if matches!(database.code().as_deref(), Some("5" | "517"))
+    )
 }
 
 /// Reclassify a phase-2 reject whose effect phase already committed: a stored
