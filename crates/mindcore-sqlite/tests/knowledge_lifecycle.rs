@@ -388,6 +388,16 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         1,
         "no repeat claimed the destination slot twice"
     );
+    // The repeat answered from the destination too: the source row is still the one both
+    // adoptions read.
+    assert_eq!(
+        as_json(&expect_ok(
+            shared.get_knowledge_entry("entry-a").await,
+            "read the source after the repeat adoption"
+        )),
+        as_json(&source_before),
+        "a repeat adoption only reads its source row"
+    );
 
     // Stage 3: supersede entry-a with entry-b. The default read omits it, the explicit read
     // returns it with its marker, and a write after the supersede is refused.
@@ -473,8 +483,9 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
 
     // Adoption against the superseded source answers the same generic absence as a missing one,
-    // and neither attempt moves the source row or the copy it once left behind. The default read
-    // hides the source now, so the explicit superseded read supplies both sides of that comparison.
+    // and neither attempt moves the source row. The default read hides the source now, so the
+    // explicit superseded read supplies both sides of that comparison; the destination copy is
+    // compared once, after the last refusal in this scenario.
     expect_source_absent(
         adopt_knowledge_entry(&shared, &personal, "entry-a", 3).await,
         "adopting a superseded source",
@@ -496,20 +507,6 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     assert_eq!(
         marked_after.superseded_by, marked.superseded_by,
         "a refused adoption never moves the source's marker"
-    );
-    let copy_after = expect_ok(
-        personal.get_knowledge_entry("entry-a").await,
-        "read the adopted copy after the refusals",
-    );
-    assert_eq!(
-        as_json(&copy_after),
-        as_json(&copy),
-        "a refused adoption leaves the destination copy unchanged"
-    );
-    assert_eq!(
-        adoption_anchor_parts(&copy_after),
-        Some(("entry-a", Some(3))),
-        "a refused adoption leaves the destination anchor unchanged"
     );
 
     // Stage 4: after the refused write, every revision still replays its whole payload and every
@@ -578,6 +575,22 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     expect_source_absent(
         adopt_knowledge_entry(&shared, &personal, "entry-p", 1).await,
         "adopting an owner-private entry",
+    );
+    // Every refusal above is covered here: the destination copy's content, its anchor and the
+    // collection's row count are asserted once, after the last refusal.
+    let copy_after = expect_ok(
+        personal.get_knowledge_entry("entry-a").await,
+        "read the adopted copy after every refusal",
+    );
+    assert_eq!(
+        as_json(&copy_after),
+        as_json(&copy),
+        "a refused adoption leaves the destination copy unchanged"
+    );
+    assert_eq!(
+        adoption_anchor_parts(&copy_after),
+        Some(("entry-a", Some(3))),
+        "a refused adoption leaves the destination anchor unchanged"
     );
     assert_eq!(
         expect_ok(
