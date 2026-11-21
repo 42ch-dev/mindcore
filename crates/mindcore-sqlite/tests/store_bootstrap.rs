@@ -36,6 +36,8 @@ fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
 /// a protocol operation through `MemoryAdapter`.
 async fn provision_space(pool: &SqlitePool, caller: &str) {
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // One host transaction covers both rows: a failed grant must not leave an active space.
+    let mut tx = pool.begin().await.expect("begin the provisioning");
     sqlx::query(
         "INSERT INTO memory_spaces \
          (space_id, display_name, authority_host_id, authority_generation, status, revision, \
@@ -45,11 +47,10 @@ async fn provision_space(pool: &SqlitePool, caller: &str) {
     .bind(SPACE)
     .bind(SPACE)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("provision the space");
 
-    let mut tx = pool.begin().await.expect("begin the grant transaction");
     SqliteMemoryRepository
         .insert_grant(
             &mut tx,
@@ -78,7 +79,7 @@ async fn provision_space(pool: &SqlitePool, caller: &str) {
         )
         .await
         .expect("provision the grant");
-    tx.commit().await.expect("commit the grant");
+    tx.commit().await.expect("commit the provisioning");
 }
 
 async fn recall(pool: &SqlitePool, adapter: &MemoryAdapter, caller: &Principal) -> Vec<Value> {
@@ -179,13 +180,14 @@ async fn production_open_serves_recall_after_bootstrap() {
 
     // The staged intent owes file targets; publish them under this test's own root and confirm
     // the published bytes before settling.
-    let targets: String =
-        sqlx::query_scalar("SELECT targets_json FROM memory_journal WHERE receipt_id = ?")
-            .bind(&receipt_id)
-            .fetch_one(&pool)
-            .await
-            .expect("journal intent");
-    let targets: Vec<Value> = serde_json::from_str(&targets).expect("journal targets");
+    let mut tx = pool.begin().await.expect("begin the journal read");
+    let intent = SqliteMemoryRepository
+        .journal_intent(&mut tx, &SpaceId::new(SPACE), &receipt_id)
+        .await
+        .expect("journal intent")
+        .expect("the staged receipt holds a journal intent");
+    tx.rollback().await.expect("rollback the journal read");
+    let targets = intent.targets;
     assert!(!targets.is_empty(), "the staged intent owes file targets");
     for target in &targets {
         let target_path = temp

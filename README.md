@@ -20,16 +20,17 @@ library you embed.
 
 Pre-release migrations are mutable: the embedded set in `crates/mindcore-sqlite/migrations/` is one
 initial file, edited in place between commits, and nothing is published yet. There is no upgrade
-path until the first release: an existing database must be recreated. `MindStore::open` runs the
-embedded migrator and compares it with the rows recorded in `_sqlx_migrations`, so the refusal
-names what the file already applied:
+path until the first release: a database whose applied migrations still match the embedded file
+reopens normally and keeps its records. `MindStore::open` runs the embedded migrator and compares it
+with the rows recorded in `_sqlx_migrations`, refusing only when the applied set no longer matches:
 
 - A database that applied the removed `0002` is refused with SQLx's `VersionMissing(2)`, because the
   embedded set no longer contains that version.
 - A database whose applied version is still embedded but whose SQL has since changed is refused with
   a migration checksum mismatch.
 
-Recreate the file, or move it aside first if you want to keep it.
+Recreate the file only when `MindStore::open` refuses it, or move it aside first if you want to keep
+it.
 
 ## Checks
 

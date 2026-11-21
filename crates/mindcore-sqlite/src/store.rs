@@ -75,10 +75,11 @@ impl MindStore {
     /// timeout is a cap, not a wait guarantee.
     ///
     /// Pre-release migrations are mutable: the schema files change in place between commits, so
-    /// there is no upgrade path until the first release. An applied migration whose file has since
-    /// changed is refused here with a checksum mismatch; a database whose applied migrations still
-    /// match the embedded files opens normally, whatever commit created it — cross-commit
-    /// compatibility is unsupported and untested.
+    /// there is no upgrade path until the first release. `open` refuses a database whose applied
+    /// migrations no longer match the embedded set — SQLx's `VersionMissing` when an applied version
+    /// is no longer embedded, and a checksum mismatch when an applied version's SQL has since
+    /// changed. A database whose applied migrations still match reopens normally, whatever commit
+    /// created it — cross-commit compatibility is unsupported and untested.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
