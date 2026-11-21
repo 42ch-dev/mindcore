@@ -2,7 +2,7 @@
 //! registrations, the knowledge admission is validated where the face is assembled, and the ports
 //! compose no baseline provider.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -123,6 +123,11 @@ impl RemoteMemoryService for RecordingMemory {
     }
 }
 
+/// The host's route map: its one admitted principal's workflow collection.
+fn routes() -> BTreeMap<String, KnowledgeScope> {
+    BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(COLLECTION))])
+}
+
 fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
     ServeFaces {
         manifest,
@@ -132,7 +137,7 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         memory: None,
         principals: principals(),
         providers: MindProviders::default(),
-        workflow_caller: Some("prn_owner".to_string()),
+        workflow_routes: routes(),
         tools: Vec::new(),
     }
 }
@@ -216,6 +221,40 @@ async fn manifest_follows_the_composed_faces() {
         surface.ports.as_memory().is_none(),
         "no memory service was attached"
     );
+}
+
+/// The host's route map is validated once, where the surface is assembled: an empty principal key,
+/// an empty destination collection, or one destination collection claimed by two routes is the
+/// host's input error, refused before any port or registration exists.
+#[tokio::test]
+async fn an_unroutable_destination_is_refused_at_assembly() {
+    let serve = Fixture::open().await.serve();
+    for routes in [
+        BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
+        BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
+        BTreeMap::from([
+            ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
+            ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
+        ]),
+    ] {
+        let reject = match serve.surface(ServeFaces {
+            workflow_routes: routes,
+            ..faces(metadata("runtime"))
+        }) {
+            SpokeResult::Reject(reject) => reject,
+            SpokeResult::Ok(surface) => {
+                panic!(
+                    "an unroutable destination assembled {:?}",
+                    capabilities(&surface)
+                )
+            }
+        };
+        assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+        assert!(
+            reject.details.is_none(),
+            "the assembly refusal carries no route details: {reject:?}"
+        );
+    }
 }
 
 /// Attaching the host's memory service adds its capability and its face, still without a baseline.

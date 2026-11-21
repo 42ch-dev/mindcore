@@ -9,6 +9,7 @@
 
 pub mod tools;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -24,7 +25,9 @@ use spoke_connect::remote::{
     ConnectResponder, KnowledgeAdmission, MemoryAdmission, RemoteKnowledgeFace,
     RemoteMemoryService, RemoteServePorts, RemoteServePortsComposite, ToolHandler,
 };
-use spoke_operations::{spoke_reject, validate_manifest_tools, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    spoke_reject, validate_manifest_tools, SpokeReject, SpokeRejectCode, SpokeResult,
+};
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
 use sqlx::SqlitePool;
@@ -68,16 +71,17 @@ impl MindcoreServe {
         }
     }
 
-    /// The engine one surface serves: the deliberation leg reads and writes a carrier entry, so the
-    /// binding needs the one caller and the one collection the host served with it.
-    fn workflows(&self, faces: &ServeFaces) -> Arc<SpiMindWorkflows> {
+    /// The engine one surface serves: each workflow call resolves the collection it reaches from
+    /// the principal its admission returns, through the host's route map.
+    fn workflows(
+        &self,
+        routes: BTreeMap<String, KnowledgeScope>,
+    ) -> Result<Arc<SpiMindWorkflows>, SpokeReject> {
         let publish = Arc::clone(&self.publish);
-        let mut binding = MemoryWorkflowBinding::new(self.store.pool(), self.reflections)
-            .with_publisher(move |targets| publish(targets));
-        if let Some(caller) = &faces.workflow_caller {
-            binding = binding.with_knowledge_collection(caller.clone(), faces.knowledge.clone());
-        }
-        Arc::new(SpiMindWorkflows::new(binding))
+        let binding = MemoryWorkflowBinding::new(self.store.pool(), self.reflections)
+            .with_publisher(move |targets| publish(targets))
+            .with_knowledge_routes(routes)?;
+        Ok(Arc::new(SpiMindWorkflows::new(binding)))
     }
 
     /// Assemble the ports, manifest and tool registrations for `ConnectResponderOptions`.
@@ -86,15 +90,22 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        let workflows = self.workflows(&faces);
+        // The route map's emptiness decides the deliberation advertisement; read it before the
+        // map moves into the binding.
+        let routed = !faces.workflow_routes.is_empty();
+        let workflows = match self.workflows(faces.workflow_routes) {
+            Ok(workflows) => workflows,
+            // The host's own configuration is refused before any port or registration exists.
+            Err(reject) => return SpokeResult::Reject(reject),
+        };
         let engine: Arc<dyn MindWorkflows> = workflows.clone();
         let mut tools =
             WorkflowTools::new(engine, faces.principals, faces.providers).registrations();
         tools.extend(faces.tools);
-        // Deliberation settles onto the host's carrier collection; a surface without that route
-        // serves no deliberation. The invariant holds over the final set, so a host registration
-        // cannot restore the tool or its handler.
-        if faces.workflow_caller.is_none() {
+        // Deliberation settles onto a routed carrier collection; a surface without a route serves
+        // no deliberation. The invariant holds over the final set, so a host registration cannot
+        // restore the tool or its handler.
+        if !routed {
             tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
         }
         let manifest = derive_manifest(faces.manifest, faces.memory.is_some(), &tools);
@@ -139,13 +150,16 @@ pub struct ServeFaces {
     pub principals: MemoryAdmission,
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
-    /// The one principal the workflow engine admits to the served knowledge collection: the
-    /// deliberation leg reads and CAS-writes its carrier entry through that route. `None` serves
-    /// no deliberation and advertises none — the tool is never installed on a surface without it,
-    /// and a host registration of the same id is dropped rather than advertised.
-    pub workflow_caller: Option<String>,
+    /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
+    /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
+    /// a route need not name a collection that already holds rows; each destination collection
+    /// belongs to exactly one principal route, and assembly refuses a collection named by two
+    /// routes. A route names the principal `principals` admits; a principal without one reads no
+    /// knowledge and never writes a carrier. Empty serves no deliberation and advertises none.
+    /// Routes are never read from the wire.
+    pub workflow_routes: BTreeMap<String, KnowledgeScope>,
     /// Additional host tools: every descriptor is advertised and its handler installed, except the
-    /// reserved `tools.mindcore.deliberate` id on a surface with no carrier route.
+    /// reserved `tools.mindcore.deliberate` id on a surface with an empty route map.
     pub tools: Vec<ToolRegistration>,
 }
 

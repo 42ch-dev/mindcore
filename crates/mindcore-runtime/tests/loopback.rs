@@ -11,7 +11,7 @@
 //! Advertisement honesty is the negative side: a face the host did not attach advertises nothing
 //! and denies its ops on the wire, and a tool the runtime does not serve answers `op_unsupported`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +26,8 @@ use mindcore_runtime::{
     MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
 };
 use mindcore_spi::{
-    CognitiveTaskKind, Embedder, EmbeddingIdentity, Reasoner, SpiError, StructuredReasonRequest,
+    CognitiveTaskKind, Embedder, EmbeddingIdentity, PolicyDecision, PolicyHook, Reasoner,
+    SettlementDraft, SpiError, StructuredReasonRequest,
 };
 use mindcore_sqlite::MindStore;
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
@@ -45,6 +46,9 @@ use spoke_schemas::{HostCapabilityManifest, MemoryRecallRequest, Principal, Scop
 const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
 const CARRIER: &str = "ke_wren";
+/// The second principal's own collection and carrier holder entry.
+const COLLECTION_TWO: &str = "mora";
+const CARRIER_TWO: &str = "ke_mora";
 const SPACE: &str = "spc_loopback";
 const SUBJECT: &str = "subj_loopback";
 const PRINCIPAL: &str = "prn_loopback";
@@ -154,17 +158,22 @@ impl Fixture {
 
     /// The carrier entry the deliberation holder names.
     async fn seed_carrier(&self) {
+        self.seed_carrier_in(COLLECTION, CARRIER).await;
+    }
+
+    /// The carrier entry one collection holds, as its holder names it.
+    async fn seed_carrier_in(&self, collection: &str, entry_id: &str) {
         expect_ok(
             self.store
-                .knowledge(KnowledgeScope::new(COLLECTION))
+                .knowledge(KnowledgeScope::new(collection))
                 .put_knowledge_entry(
                     serde_json::from_value(json!({
                         "schema_version": 1,
-                        "entry_id": CARRIER,
+                        "entry_id": entry_id,
                         "entry_type": "note",
-                        "canonical_name": "Wren's carrier",
+                        "canonical_name": format!("{entry_id}'s carrier"),
                         "status": "confirmed",
-                        "body": { "summary": "what Wren currently holds" },
+                        "body": { "summary": "what this holder currently holds" },
                         "extensions": {},
                     }))
                     .expect("carrier JSON matches the schema"),
@@ -389,13 +398,72 @@ impl Reasoner for NoChangeReasoner {
     }
 }
 
-/// The host's side of the surface. `workflow_caller` is the one principal the deliberation route
-/// admits; without it the runtime serves and advertises no `deliberate` at all.
+/// The host's reasoner when a deliberation must write: one promotion over the evidence, so the
+/// settlement policy's `AutoSettle` appends a cognition record to the routed carrier.
+struct SettlingReasoner;
+
+#[async_trait]
+impl Reasoner for SettlingReasoner {
+    async fn reason_structured(
+        &self,
+        request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        assert_eq!(request.task_kind, CognitiveTaskKind::Deliberate);
+        let payload: Value =
+            serde_json::from_str(request.user_payload).expect("the deliberation payload is JSON");
+        assert!(
+            payload["records"].as_array().is_some_and(|records| records
+                .iter()
+                .any(|record| record["record_id"] == "rec_north_gate")),
+            "the authorized memory page reached the reasoner: {}",
+            request.user_payload
+        );
+        Ok(json!({
+            "recommendation": { "kind": "promote", "target_kind": "belief" },
+            "rationale": "the cited record carries the north gate state",
+            "evidence_ids": ["ev_gate"],
+            "record_ids": ["rec_north_gate"],
+            "record": {
+                "kind": "belief",
+                "order": 1,
+                "q": {
+                    "value": 0.8,
+                    "assertion": "belief_attribution",
+                    "method": "two_witness_reports",
+                    "calibration": "uncalibrated"
+                },
+                "assessor_role": "holder_self_report",
+                "basis": {
+                    "kind": "evidence",
+                    "evidence": [
+                        { "kind": "memory_record", "namespace": "mindcore", "id": "rec_north_gate" }
+                    ]
+                }
+            }
+        }))
+    }
+}
+
+/// The host's settlement policy: settle every validated draft, so a promotion reaches the carrier.
+struct AutoPolicy;
+
+#[async_trait]
+impl PolicyHook for AutoPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::AutoSettle)
+    }
+}
+
+/// The host's side of the surface. `workflow_routes` is the per-principal workflow route map;
+/// an empty map serves and advertises no `deliberate` at all.
 fn faces(
     manifest: HostCapabilityManifest,
     memory: Option<Arc<dyn RemoteMemoryService>>,
     providers: MindProviders,
-    workflow_caller: Option<&str>,
+    workflow_routes: BTreeMap<String, KnowledgeScope>,
 ) -> ServeFaces {
     ServeFaces {
         manifest,
@@ -405,9 +473,17 @@ fn faces(
         memory,
         principals: principal_admission(),
         providers,
-        workflow_caller: workflow_caller.map(str::to_string),
+        workflow_routes,
         tools: Vec::new(),
     }
+}
+
+/// A route map putting each of `principals` onto the fixture's one collection.
+fn routes(principals: &[&str]) -> BTreeMap<String, KnowledgeScope> {
+    principals
+        .iter()
+        .map(|principal| ((*principal).to_string(), KnowledgeScope::new(COLLECTION)))
+        .collect()
 }
 
 fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
@@ -511,12 +587,17 @@ fn recall_request() -> MemoryRecallRequest {
 }
 
 fn deliberate_arguments() -> Value {
+    deliberate_arguments_for(CARRIER)
+}
+
+/// The same deliberation, naming `carrier` as both the holder and the target carrier.
+fn deliberate_arguments_for(carrier: &str) -> Value {
     json!({
         "space_id": SPACE,
         "subject_id": SUBJECT,
-        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER },
+        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": carrier },
         "target": {
-            "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER },
+            "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": carrier },
             "target_id": "prop_north_gate",
             "kind": "proposition",
         },
@@ -553,6 +634,88 @@ fn packed_knowledge_ids(result: &Value) -> Vec<&str> {
                 .expect("a knowledge entry carries its id")
         })
         .collect()
+}
+
+/// The stored revision of one carrier entry, wherever its collection lives.
+async fn carrier_revision(pool: &sqlx::SqlitePool, collection: &str, entry_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the carrier revision")
+}
+
+/// The assessor ids of one carrier's committed cognition rows, in append order.
+async fn carrier_assessors(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    entry_id: &str,
+) -> Vec<String> {
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload FROM cognition_records \
+         WHERE collection = ? AND entry_id = ? ORDER BY append_seq ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("read the carrier's cognition rows");
+    payloads
+        .iter()
+        .map(|payload| {
+            let record: Value = serde_json::from_str(payload).expect("cognition row payload");
+            record["assessor"]["id"]
+                .as_str()
+                .expect("a cognition record names its assessor")
+                .to_string()
+        })
+        .collect()
+}
+
+/// One collection's observable state: its entry and cognition row counts, plus one named carrier's
+/// revision and update stamp.
+#[derive(Debug, PartialEq, Eq)]
+struct CollectionState {
+    entries: i64,
+    cognition: i64,
+    revision: i64,
+    updated_at: String,
+}
+
+async fn collection_state(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    carrier: &str,
+) -> CollectionState {
+    let entries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")
+            .bind(collection)
+            .fetch_one(pool)
+            .await
+            .expect("count the collection's entries");
+    let cognition: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cognition_records WHERE collection = ?")
+            .bind(collection)
+            .fetch_one(pool)
+            .await
+            .expect("count the collection's cognition rows");
+    let (revision, updated_at): (i64, String) = sqlx::query_as(
+        "SELECT revision, updated_at FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(carrier)
+    .fetch_one(pool)
+    .await
+    .expect("read the carrier's revision and update stamp");
+    CollectionState {
+        entries,
+        cognition,
+        revision,
+        updated_at,
+    }
 }
 
 fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
@@ -606,7 +769,7 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
             hello("runtime", &["spoke-baseline"]),
             None,
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
 
@@ -649,12 +812,13 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
     );
 }
 
-/// A wired deliberation route does not narrow recall: a different admitted peer holding its own
-/// knowledge grant receives its pack with the slot filled from the served collection.
+/// A route map fills recall's knowledge slot per principal: a second admitted peer routed to its own
+/// collection reads that collection's entry under its own grant, never the first principal's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() {
     let fixture = Fixture::open().await;
     fixture.seed_carrier().await;
+    fixture.seed_carrier_in(COLLECTION_TWO, CARRIER_TWO).await;
     fixture
         .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
         .await;
@@ -666,13 +830,18 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
         )
         .await;
     let (_dir, serve) = fixture.serve();
+    let mut workflow_routes = routes(&[PRINCIPAL]);
+    workflow_routes.insert(
+        PEER_TWO_PRINCIPAL.to_string(),
+        KnowledgeScope::new(COLLECTION_TWO),
+    );
     let mut faces = faces(
         hello("runtime", &[]),
         None,
         MindProviders::default(),
-        Some(PRINCIPAL),
+        workflow_routes,
     );
-    // Both peers are admitted; only the route's caller may deliberate.
+    // Both peers are admitted; each principal's route names its own collection.
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
     assert!(
@@ -694,8 +863,8 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
     assert_eq!(packed_record_ids(&result), ["rec_market", "rec_north_gate"]);
     assert_eq!(
         packed_knowledge_ids(&result),
-        [CARRIER],
-        "the peer's own knowledge_read grant fills the slot"
+        [CARRIER_TWO],
+        "the peer's own knowledge_read grant fills the slot from its own route: {result}"
     );
 }
 
@@ -714,7 +883,7 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
             hello("runtime", &[]),
             None,
             MindProviders::default(),
-            Some(PRINCIPAL),
+            routes(&[PRINCIPAL]),
         ),
     );
     assert!(
@@ -758,7 +927,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     };
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, providers, Some(PRINCIPAL)),
+        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
     );
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
@@ -798,10 +967,199 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     );
 }
 
-/// The carrier write keeps its one-caller authority: a peer holding `recall` and both knowledge
-/// grants in the space is still refused the route's carrier, and nothing is written.
+/// One surface, two principals: each authenticated peer routes to its own collection and settles
+/// onto its own carrier entry, and neither call writes the other principal's carrier. A holder the
+/// routed collection does not hold is refused and writes nothing anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
+async fn two_routed_principals_settle_onto_their_own_carriers() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    fixture.seed_carrier_in(COLLECTION_TWO, CARRIER_TWO).await;
+    fixture
+        .grant(
+            "grt_settle_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["recall", "knowledge_read", "knowledge_write"],
+        )
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let mut workflow_routes = routes(&[PRINCIPAL]);
+    workflow_routes.insert(
+        PEER_TWO_PRINCIPAL.to_string(),
+        KnowledgeScope::new(COLLECTION_TWO),
+    );
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders {
+            reasoner: Some(Arc::new(SettlingReasoner)),
+            policy_hook: Some(Arc::new(AutoPolicy)),
+            ..MindProviders::default()
+        },
+        workflow_routes,
+    );
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
+
+    // The first principal's verdict lands on its own collection's carrier, and nothing in the
+    // second collection may change: capture it immediately before the call.
+    let first = connect(&surface, &[DELIBERATE, RECALL_CONTEXT]).await;
+    let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
+    let settled = expect_ok(
+        first
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate by the first principal",
+    );
+    assert_eq!(settled["status"], "settled");
+    assert_eq!(settled["record"]["holder"]["id"], CARRIER);
+    assert_eq!(settled["record"]["assessor"]["id"], PRINCIPAL);
+    assert_eq!(
+        settled["mind_state_version"], 2,
+        "the write descends from its own carrier"
+    );
+    assert_eq!(carrier_revision(&pool, COLLECTION, CARRIER).await, 2);
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        1,
+        "the second principal's carrier keeps its seeded revision"
+    );
+    assert_eq!(
+        carrier_assessors(&pool, COLLECTION, CARRIER).await,
+        [PRINCIPAL]
+    );
+    assert!(
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO)
+            .await
+            .is_empty(),
+        "the second collection carries no assessment"
+    );
+    assert_eq!(
+        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        untouched,
+        "the first call leaves the second collection's rows, carrier revision and update stamp unchanged"
+    );
+
+    // The second principal settles onto its own carrier, never the first's.
+    let second = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE, RECALL_CONTEXT]).await;
+    let untouched = collection_state(&pool, COLLECTION, CARRIER).await;
+    let settled = expect_ok(
+        second
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_for(CARRIER_TWO))
+            .await,
+        "deliberate by the second principal",
+    );
+    assert_eq!(settled["status"], "settled");
+    assert_eq!(settled["record"]["holder"]["id"], CARRIER_TWO);
+    assert_eq!(settled["record"]["assessor"]["id"], PEER_TWO_PRINCIPAL);
+    assert_eq!(
+        settled["mind_state_version"], 2,
+        "the second write descends from its own carrier, never the first's"
+    );
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        2
+    );
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION, CARRIER).await,
+        2,
+        "the first principal's carrier keeps the revision its own call left"
+    );
+    assert_eq!(
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        [PEER_TWO_PRINCIPAL]
+    );
+    assert_eq!(
+        carrier_assessors(&pool, COLLECTION, CARRIER).await,
+        [PRINCIPAL],
+        "no second assessment landed on the first principal's carrier"
+    );
+    assert_eq!(
+        collection_state(&pool, COLLECTION, CARRIER).await,
+        untouched,
+        "the second call leaves the first collection's rows, carrier revision and update stamp unchanged"
+    );
+
+    // A recall's slot is routed per principal too: each peer lists only its own collection's
+    // entry, never the other principal's, whichever route the host configured first.
+    let mut recall = recall_arguments();
+    recall["max_tokens"] = json!(4_000);
+    let first_pack = expect_ok(
+        first
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, recall.clone())
+            .await,
+        "recall by the first principal",
+    );
+    assert_eq!(
+        packed_record_ids(&first_pack),
+        ["rec_market", "rec_north_gate"],
+        "the first principal's memory page is served: {first_pack}"
+    );
+    assert_eq!(
+        packed_knowledge_ids(&first_pack),
+        [CARRIER],
+        "the first principal's slot lists only its own routed collection: {first_pack}"
+    );
+    let second_pack = expect_ok(
+        second.adapter.invoke_tool(RECALL_CONTEXT, recall).await,
+        "recall by the second principal",
+    );
+    assert_eq!(
+        packed_record_ids(&second_pack),
+        ["rec_market", "rec_north_gate"],
+        "the second principal's memory page is served: {second_pack}"
+    );
+    assert_eq!(
+        packed_knowledge_ids(&second_pack),
+        [CARRIER_TWO],
+        "the second principal's slot lists only its own routed collection: {second_pack}"
+    );
+    assert_eq!(
+        second_pack["knowledge"][0]["canonical_name"], "ke_mora's carrier",
+        "the slot carries this collection's entry, not the other principal's copy: {second_pack}"
+    );
+
+    // The route fixes the collection, the request's holder names the entry inside it: the first
+    // principal naming the second principal's holder is refused, and neither collection changes.
+    let first_before = collection_state(&pool, COLLECTION, CARRIER).await;
+    let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
+    let reject = expect_reject(
+        first
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_for(CARRIER_TWO))
+            .await,
+        "deliberate by the first principal naming the second principal's holder",
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "the routed collection holds no such holder: {reject:?}"
+    );
+    assert!(
+        reject.message.contains(CARRIER_TWO),
+        "the refusal answers the holder the request named: {reject:?}"
+    );
+    assert_eq!(
+        collection_state(&pool, COLLECTION, CARRIER).await,
+        first_before,
+        "a foreign holder settles nothing in the caller's own collection"
+    );
+    assert_eq!(
+        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        second_before,
+        "nor in the collection that holder lives in"
+    );
+}
+
+/// A principal the host did not route reaches no carrier: a peer holding `recall` and both
+/// knowledge grants in the space is still refused, target-free, and nothing is written; the same
+/// peer still recalls its memory, with an empty knowledge slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_without_a_route_cannot_write_the_carrier() {
     let fixture = Fixture::open().await;
     fixture.seed_carrier().await;
     fixture
@@ -820,25 +1178,25 @@ async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
             reasoner: Some(Arc::new(NoChangeReasoner)),
             ..MindProviders::default()
         },
-        Some(PRINCIPAL),
+        routes(&[PRINCIPAL]),
     );
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
 
-    let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE, RECALL_CONTEXT]).await;
     let reject = expect_reject(
         session
             .adapter
             .invoke_tool(DELIBERATE, deliberate_arguments())
             .await,
-        "deliberate by a peer that is not the route's caller",
+        "deliberate by a peer without a knowledge route",
     );
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
     assert!(
         reject
             .message
-            .contains("is not the admitted carrier caller"),
-        "the refusal is the carrier's one-caller rule: {reject:?}"
+            .contains("principal has no workflow knowledge route"),
+        "the refusal is the missing-route rule: {reject:?}"
     );
     let refusal = format!("{reject:?}");
     assert!(
@@ -857,6 +1215,24 @@ async fn a_peer_that_is_not_the_route_caller_cannot_write_the_carrier() {
         revision, 1,
         "a refused carrier write leaves the entry untouched"
     );
+
+    // The same unrouted peer still recalls its memory: one token per serialized byte, so the two
+    // records need a wider budget than the default pack.
+    let mut arguments = recall_arguments();
+    arguments["max_tokens"] = json!(4_000);
+    let recalled = expect_ok(
+        session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
+        "recall by a peer without a knowledge route",
+    );
+    assert_eq!(
+        packed_record_ids(&recalled),
+        ["rec_market", "rec_north_gate"]
+    );
+    assert_eq!(
+        recalled["knowledge"],
+        json!([]),
+        "an unrouted peer reads its memory with an empty knowledge slot"
+    );
 }
 
 /// Advertisement honesty for the optional face: the dialer claims `spoke-memory` in both
@@ -872,7 +1248,7 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             hello("runtime", &["spoke-memory"]),
             None,
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
     assert!(
@@ -895,7 +1271,7 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             hello("runtime", &["spoke-memory"]),
             Some(Arc::new(MemoryFace)),
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
     assert!(
@@ -928,7 +1304,7 @@ async fn the_baseline_face_is_never_composed_or_advertised() {
             hello("runtime", &["spoke-baseline"]),
             None,
             MindProviders::default(),
-            None,
+            routes(&[]),
         ),
     );
     assert!(
@@ -953,7 +1329,12 @@ async fn an_unserved_tool_answers_op_unsupported() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, MindProviders::default(), None),
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            routes(&[]),
+        ),
     );
     assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
 
@@ -974,7 +1355,12 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, MindProviders::default(), None),
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            routes(&[]),
+        ),
     );
     assert!(
         !capabilities(&surface).contains(&DELIBERATE),
@@ -999,7 +1385,12 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
 async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), None);
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
     faces.tools = vec![ToolRegistration::new(
         deliberate_descriptor(),
         |_responder| {
@@ -1041,7 +1432,12 @@ async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
 async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), None);
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
     faces.tools = vec![ToolRegistration::new(
         host_tool_descriptor(),
         |_responder| {
@@ -1180,7 +1576,7 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
                 embedder: Some(embedder.clone()),
                 ..MindProviders::default()
             },
-            None,
+            routes(&[]),
         ),
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
@@ -1290,7 +1686,7 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
                 embedder: Some(embedder.clone()),
                 ..MindProviders::default()
             },
-            None,
+            routes(&[]),
         ),
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
