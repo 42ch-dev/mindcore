@@ -151,10 +151,12 @@ pub struct ServeFaces {
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
     /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
-    /// one workflow collection its calls may reach. A route names the principal `principals`
-    /// admits; a principal without one reads no knowledge and never writes a carrier. Empty serves
-    /// no deliberation and advertises none. Repeated destination collections are valid; routes are
-    /// never read from the wire.
+    /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
+    /// a route need not name a collection that already holds rows; each destination collection
+    /// belongs to exactly one principal route, and assembly refuses a collection named by two
+    /// routes. A route names the principal `principals` admits; a principal without one reads no
+    /// knowledge and never writes a carrier. Empty serves no deliberation and advertises none.
+    /// Routes are never read from the wire.
     pub workflow_routes: BTreeMap<String, KnowledgeScope>,
     /// Additional host tools: every descriptor is advertised and its handler installed, except the
     /// reserved `tools.mindcore.deliberate` id on a surface with an empty route map.
