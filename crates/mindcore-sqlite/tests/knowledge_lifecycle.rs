@@ -200,19 +200,6 @@ fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> S
     }
 }
 
-/// The stored payload of one row, read without going through the port: adoption must not rewrite
-/// even one byte of its source.
-async fn stored_payload(store: &MindStore, collection: &str, entry_id: &str) -> String {
-    sqlx::query_scalar(
-        "SELECT payload FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
-    )
-    .bind(collection)
-    .bind(entry_id)
-    .fetch_one(&store.pool())
-    .await
-    .expect("stored payload")
-}
-
 fn expect_revision_absent<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) {
     match result {
         SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
@@ -344,7 +331,11 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
 
     // Stage 2: adopt at revision 3. The copy anchors back, the source row is untouched and a
     // repeat returns the same copy instead of writing a second one.
-    let source_before = stored_payload(&store, "shared", "entry-a").await;
+    // The whole source row through the public live read: adoption must leave every field alone.
+    let source_before = expect_ok(
+        shared.get_knowledge_entry("entry-a").await,
+        "read the source before adoption",
+    );
     let copy = match expect_ok(
         adopt_knowledge_entry(&shared, &personal, "entry-a", 3).await,
         "adoption at revision 3",
@@ -372,8 +363,11 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "entry-a"
     );
     assert_eq!(
-        stored_payload(&store, "shared", "entry-a").await,
-        source_before,
+        as_json(&expect_ok(
+            shared.get_knowledge_entry("entry-a").await,
+            "read the source after adoption"
+        )),
+        as_json(&source_before),
         "adoption only reads its source row"
     );
 
@@ -478,38 +472,72 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         Some(4)
     );
 
-    // Stage 4: every revision replays its own payload and only the records it had. Revision 4 is
-    // the superseded head, so its payload and history are the third revision's.
-    for (revision, summary, records) in [
-        (1, REVISION_ONE, Vec::<String>::new()),
-        (2, REVISION_TWO, vec!["cog_one".to_string()]),
-        (
-            3,
-            REVISION_THREE,
-            vec!["cog_one".to_string(), "cog_two".to_string()],
-        ),
-        (
-            4,
-            REVISION_THREE,
-            vec!["cog_one".to_string(), "cog_two".to_string()],
-        ),
+    // Adoption against the superseded source answers the same generic absence as a missing one,
+    // and neither attempt moves the source row or the copy it once left behind. The default read
+    // hides the source now, so the explicit superseded read supplies both sides of that comparison.
+    expect_source_absent(
+        adopt_knowledge_entry(&shared, &personal, "entry-a", 3).await,
+        "adopting a superseded source",
+    );
+    expect_source_absent(
+        adopt_knowledge_entry(&shared, &personal, "entry-never-seeded", 1).await,
+        "adopting a missing source",
+    );
+    let marked_after = expect_ok(
+        shared.get_entry_including_superseded("entry-a").await,
+        "explicit read after the refused adoption attempts",
+    );
+    assert_eq!(marked_after.entry.entry_id, "entry-a");
+    assert_eq!(
+        as_json(&marked_after.entry),
+        as_json(&marked.entry),
+        "a refused adoption never touches its superseded source"
+    );
+    assert_eq!(
+        marked_after.superseded_by, marked.superseded_by,
+        "a refused adoption never moves the source's marker"
+    );
+    let copy_after = expect_ok(
+        personal.get_knowledge_entry("entry-a").await,
+        "read the adopted copy after the refusals",
+    );
+    assert_eq!(
+        as_json(&copy_after),
+        as_json(&copy),
+        "a refused adoption leaves the destination copy unchanged"
+    );
+    assert_eq!(
+        adoption_anchor_parts(&copy_after),
+        Some(("entry-a", Some(3))),
+        "a refused adoption leaves the destination anchor unchanged"
+    );
+
+    // Stage 4: after the refused write, every revision still replays its whole payload and every
+    // cognition record it held, and the refused write left no fifth revision. Revision 4 is the
+    // superseded head, so its payload and history are the third revision's with only the revision
+    // advanced.
+    let mut marked_head = third.clone();
+    marked_head.revision = Some(4);
+    for (revision, expected) in [
+        (1, as_json(&created)),
+        (2, as_json(&second)),
+        (3, as_json(&third)),
+        (4, as_json(&marked_head)),
     ] {
         let replayed = expect_ok(
             shared.get_entry_at_revision("entry-a", revision).await,
             "replay an assigned revision",
         );
-        assert_eq!(replayed.revision, Some(revision));
         assert_eq!(
-            summary_of(&replayed),
-            Some(summary),
-            "revision {revision} replays its own payload"
-        );
-        assert_eq!(
-            record_ids(&replayed),
-            records,
-            "revision {revision} truncates the record history it did not have"
+            as_json(&replayed),
+            expected,
+            "revision {revision} replays its whole payload and every cognition record"
         );
     }
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-a", 5).await,
+        "a revision the refused write never created",
+    );
 
     // Stage 5: the adopted copy still identifies the exact revision it copied, and its anchor now
     // resolves through the supersede to the live successor.
