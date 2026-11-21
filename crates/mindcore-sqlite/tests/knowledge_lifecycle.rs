@@ -280,7 +280,7 @@ async fn history_floor(pool: &SqlitePool, collection: &str, entry_id: &str) -> i
     .expect("stored history floor")
 }
 
-// The prune method lands in Task 2; until then the floor is only reachable through its column.
+// Seed a floor directly, without a prune, so the read gate is provable on its own.
 async fn seed_history_floor(pool: &SqlitePool, collection: &str, entry_id: &str, floor: i64) {
     sqlx::query(
         "UPDATE knowledge_entries SET history_floor_revision = ? \
@@ -292,6 +292,18 @@ async fn seed_history_floor(pool: &SqlitePool, collection: &str, entry_id: &str,
     .execute(pool)
     .await
     .expect("seed a history floor");
+}
+
+async fn checkpoint_revisions(pool: &SqlitePool, collection: &str, entry_id: &str) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("stored checkpoint revisions")
 }
 
 const REVISION_ONE: &str = "the north gate shuts after dusk";
@@ -725,7 +737,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
         );
     }
 
-    // Task 2 ships the prune; seed its floor directly so the read gate is proven now.
+    // Seed the floor directly, without a prune, so the read gate is proven on its own.
     seed_history_floor(&pool, "shared", "entry-f", 2).await;
 
     // Below the floor the preimage was pruned: that is not the generic absence.
@@ -815,4 +827,197 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
 
     store.close().await;
     remove_database(&path);
+}
+
+#[tokio::test]
+async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
+    let path = database_path("prune");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+
+    // Create, then three full rewrites: revisions 1..4 and one checkpoint for each replaced
+    // revision, so 1, 2 and 3 are on disk and 4 is the live row.
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-f", REVISION_ONE), None)
+            .await,
+        "create entry-f",
+    );
+    let second = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry("entry-f", REVISION_TWO, vec![belief("entry-f", "cog_one")]),
+                Some(1),
+            )
+            .await,
+        "second revision",
+    );
+    let third = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    REVISION_THREE,
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(2),
+            )
+            .await,
+        "third revision",
+    );
+    let fourth = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    "the north gate reopens at dawn",
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(3),
+            )
+            .await,
+        "fourth revision",
+    );
+
+    let pool = store.pool();
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [1, 2, 3]
+    );
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 1);
+
+    // The pre-prune snapshot of every revision the window keeps, taken in this test: the prune
+    // must not move any of them.
+    let replay_before = [
+        (2, as_json(&second)),
+        (3, as_json(&third)),
+        (4, as_json(&fourth)),
+    ];
+
+    let pruned = expect_ok(
+        shared.prune_history("entry-f", 2).await,
+        "prune to the two newest checkpoints",
+    );
+    assert_eq!(pruned.deleted, 1);
+    assert_eq!(pruned.floor, Some(2));
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3],
+        "the prune deletes exactly the checkpoints below the new floor"
+    );
+
+    // At or above the floor the replay is byte-identical to the snapshot taken before the prune.
+    for (revision, expected) in replay_before {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-f", revision).await,
+                "replay above the new floor"
+            )),
+            expected,
+            "revision {revision} replays exactly as it did before the prune"
+        );
+    }
+    // The revision just below the floor is the one the prune removed.
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-f", 1).await,
+        "the revision just below the new floor",
+    );
+
+    // A second prune with the same window has nothing to delete and leaves the floor alone.
+    let repeated = expect_ok(
+        shared.prune_history("entry-f", 2).await,
+        "a repeated prune with the same window",
+    );
+    assert_eq!(repeated.deleted, 0);
+    assert_eq!(repeated.floor, None);
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3]
+    );
+
+    // Emptying history is a different action: a zero window is refused before any transaction.
+    assert_eq!(
+        expect_reject(
+            shared.prune_history("entry-f", 0).await,
+            "a prune that keeps no checkpoint"
+        ),
+        SpokeRejectCode::InvalidInput
+    );
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3]
+    );
+
+    // A missing entry answers the current-entry absence, not a prune-shaped refusal.
+    match shared.prune_history("entry-never-seeded", 1).await {
+        SpokeResult::Ok(report) => panic!("a missing entry was pruned with {report:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+            assert_eq!(
+                reject.message,
+                "no knowledge entry entry-never-seeded in collection shared"
+            );
+            assert!(reject.details.is_none());
+        }
+    }
+
+    // A retired entry keeps its history and answers the same generic absence: the live-only
+    // predicate refuses it before any checkpoint is read or deleted.
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                entry_with("entry-g", "the mill door replaces the gate"),
+                None,
+            )
+            .await,
+        "seed entry-g",
+    );
+    expect_ok(
+        shared.supersede_entry("entry-f", 4, "entry-g").await,
+        "supersede entry-f with entry-g",
+    );
+    match shared.prune_history("entry-f", 1).await {
+        SpokeResult::Ok(report) => panic!("a retired entry was pruned with {report:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+            assert_eq!(
+                reject.message,
+                "no knowledge entry entry-f in collection shared"
+            );
+            assert!(reject.details.is_none());
+        }
+    }
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-f").await,
+        [2, 3, 4],
+        "the refused prune leaves the retired entry's history untouched"
+    );
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[test]
+fn knowledge_prune_is_only_explicit() {
+    // The method is named exactly once in its module — its own definition — so no other function,
+    // `write_entry` included, can call it; opening a store never mentions it at all.
+    assert_eq!(
+        include_str!("../src/knowledge.rs")
+            .matches("prune_history")
+            .count(),
+        1,
+        "only the definition names prune_history, so no write path calls it"
+    );
+    assert_eq!(
+        include_str!("../src/store.rs")
+            .matches("prune_history")
+            .count(),
+        0,
+        "opening a store never prunes"
+    );
 }

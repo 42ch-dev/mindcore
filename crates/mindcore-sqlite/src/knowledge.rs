@@ -60,6 +60,14 @@ pub struct KnowledgeEntryLifecycle {
     pub superseded_by: Option<String>,
 }
 
+/// What one explicit history prune did: the checkpoints it deleted for good and the floor it
+/// recorded, or `None` for both when it deleted nothing and left the stored floor alone.
+#[derive(Debug)]
+pub struct PruneReport {
+    pub deleted: u64,
+    pub floor: Option<u64>,
+}
+
 /// A knowledge port bound to one collection.
 ///
 /// The scope is fixed at construction and never changes: every statement filters on it, so the port
@@ -255,6 +263,99 @@ impl ScopedKnowledgeStore {
             return internal(format!("knowledge supersede could not commit: {error}"));
         }
         SpokeResult::Ok(next)
+    }
+
+    /// Delete this entry's checkpoints older than its `keep` newest and advance the entry's floor
+    /// to the oldest surviving checkpoint.
+    ///
+    /// `keep` counts checkpoints, newest first; the live row is not one. The read, the delete and
+    /// the floor update share one `BEGIN IMMEDIATE` reservation, so no write can append or capture
+    /// history between the count and the cut. The deletion is permanent: the removed preimages are
+    /// not archived and can never be replayed. Only `history_floor_revision` is written on the
+    /// entry row, so the `BEFORE UPDATE OF revision` trigger saves no checkpoint of this update.
+    /// A prune that removes nothing reports `deleted: 0, floor: None` and leaves the stored floor
+    /// and every checkpoint alone.
+    pub async fn prune_history(&self, entry_id: &str, keep: u64) -> SpokeResult<PruneReport> {
+        if keep == 0 {
+            return invalid_input("a history prune keeps at least one checkpoint");
+        }
+        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => transaction,
+            Err(error) => return internal(format!("history prune could not begin: {error}")),
+        };
+        // The live-only predicate is the current-entry read's: an absent entry and a retired one
+        // answer the same generic absence, so a prune never reaches a retired row's history.
+        if let SpokeResult::Reject(reject) =
+            read_stored_row(&mut transaction, &self.scope.collection, entry_id, true).await
+        {
+            return SpokeResult::Reject(reject);
+        }
+        // The revision column is a signed INTEGER, so an entry can never hold more checkpoints
+        // than that range: a `keep` at or above it has nothing older to cut.
+        let limit = i64::try_from(keep).map_or(i64::MAX, |keep| keep.saturating_add(1));
+        let checkpoints: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT revision FROM knowledge_entry_revisions \
+             WHERE collection = ? AND entry_id = ? \
+             ORDER BY revision DESC LIMIT ?",
+        )
+        .bind(&self.scope.collection)
+        .bind(entry_id)
+        .bind(limit)
+        .fetch_all(&mut *transaction)
+        .await;
+        let checkpoints = match checkpoints {
+            Ok(checkpoints) => checkpoints,
+            Err(error) => {
+                return internal(format!("history checkpoints could not be read: {error}"))
+            }
+        };
+        // The newest `keep` checkpoints are the whole window: fewer means nothing older to cut.
+        if checkpoints.len() as u64 <= keep {
+            if let Err(error) = transaction.commit().await {
+                return internal(format!("history prune could not commit: {error}"));
+            }
+            return SpokeResult::Ok(PruneReport {
+                deleted: 0,
+                floor: None,
+            });
+        }
+        // Newest first: the `keep`-th row is the oldest checkpoint the window keeps, and every
+        // deleted preimage sits below its revision.
+        let new_floor = checkpoints[(keep - 1) as usize];
+        let deleted = match sqlx::query(
+            "DELETE FROM knowledge_entry_revisions \
+             WHERE collection = ? AND entry_id = ? AND revision < ?",
+        )
+        .bind(&self.scope.collection)
+        .bind(entry_id)
+        .bind(new_floor)
+        .execute(&mut *transaction)
+        .await
+        {
+            Ok(deleted) => deleted.rows_affected(),
+            Err(error) => {
+                return internal(format!("history checkpoints could not be deleted: {error}"))
+            }
+        };
+        let updated = sqlx::query(
+            "UPDATE knowledge_entries SET history_floor_revision = ? \
+             WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(new_floor)
+        .bind(&self.scope.collection)
+        .bind(entry_id)
+        .execute(&mut *transaction)
+        .await;
+        if let Err(error) = updated {
+            return internal(format!("history floor could not be written: {error}"));
+        }
+        if let Err(error) = transaction.commit().await {
+            return internal(format!("history prune could not commit: {error}"));
+        }
+        SpokeResult::Ok(PruneReport {
+            deleted,
+            floor: Some(new_floor as u64),
+        })
     }
 
     /// One entry of this collection whether or not it is superseded: the payload (with its
@@ -923,6 +1024,10 @@ async fn read_lifecycle(
     }
 }
 
+/// One entry-led replay selection: the stored floor, the chosen checkpoint's revision, its payload
+/// and head, and the live revision.
+type RevisionSelection = (i64, i64, String, Option<i64>, i64);
+
 /// One entry of `collection` as it was stored at `revision`, read through the caller's
 /// transaction so checkpoint selection and record hydration project one snapshot.
 ///
@@ -949,9 +1054,8 @@ async fn read_entry_revision(
     // The join is gated to the floor-to-live window, so an out-of-window request matches no saved
     // row; checkpoint fields are chosen by saved-row presence, never by the head's nullness,
     // because a checkpoint may itself have no head.
-    let selected: Result<Option<(i64, i64, String, Option<i64>, i64)>, sqlx::Error> =
-        sqlx::query_as(
-            "SELECT k.history_floor_revision, COALESCE(r.revision, k.revision), \
+    let selected: Result<Option<RevisionSelection>, sqlx::Error> = sqlx::query_as(
+        "SELECT k.history_floor_revision, COALESCE(r.revision, k.revision), \
                 COALESCE(r.payload, k.payload), \
                 CASE WHEN r.revision IS NULL THEN k.cognition_head_seq \
                      ELSE r.cognition_head_seq END, \
@@ -962,14 +1066,14 @@ async fn read_entry_revision(
           AND r.revision >= ? AND ? >= k.history_floor_revision AND ? <= k.revision \
          WHERE k.collection = ? AND k.entry_id = ? \
          ORDER BY r.revision ASC LIMIT 1",
-        )
-        .bind(assigned)
-        .bind(assigned)
-        .bind(assigned)
-        .bind(collection)
-        .bind(entry_id)
-        .fetch_optional(&mut **tx)
-        .await;
+    )
+    .bind(assigned)
+    .bind(assigned)
+    .bind(assigned)
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(&mut **tx)
+    .await;
     let (floor, checkpoint_revision, payload, head, live) = match selected {
         Ok(Some(selected)) => selected,
         Ok(None) => return revision_not_found(),
