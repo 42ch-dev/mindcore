@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
-use mindcore_sqlite::{MindStore, PruneReport};
+use mindcore_sqlite::{append_cognition, MindStore, PruneReport};
 use serde_json::{json, Map, Value};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
@@ -1047,6 +1047,176 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
     assert_eq!(second.floor, Some(3));
     assert_eq!(history_floor(&pool, "shared", "entry-h").await, 3);
     assert_eq!(checkpoint_revisions(&pool, "shared", "entry-h").await, [3]);
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn knowledge_prune_keeps_revisions_derived_across_a_gap_replayable() {
+    let path = database_path("append-gap");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+
+    // Alternate full rewrites and dedicated appends: an append advances the revision without
+    // writing a preimage, so the checkpoints sit at 1, 3 and 5 and revisions 2 and 4 are derived,
+    // replaying only from the checkpoint above them.
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-p", REVISION_ONE), None)
+            .await,
+        "create entry-p",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry("entry-p", REVISION_TWO, vec![belief("entry-p", "cog_one")]),
+                Some(1),
+            )
+            .await,
+        "second revision",
+    );
+    let mut appended = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin the first dedicated append");
+    match append_cognition(
+        &mut appended,
+        "shared",
+        "entry-p",
+        2,
+        &belief("entry-p", "cog_two"),
+    )
+    .await
+    {
+        SpokeResult::Ok(assigned) => assert_eq!(assigned, 3),
+        SpokeResult::Reject(reject) => panic!("first dedicated append rejected: {reject:?}"),
+    }
+    appended
+        .commit()
+        .await
+        .expect("commit the first dedicated append");
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-p",
+                    REVISION_THREE,
+                    vec![belief("entry-p", "cog_one"), belief("entry-p", "cog_two")],
+                ),
+                Some(3),
+            )
+            .await,
+        "fourth revision",
+    );
+    let mut appended = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin the second dedicated append");
+    match append_cognition(
+        &mut appended,
+        "shared",
+        "entry-p",
+        4,
+        &belief("entry-p", "cog_three"),
+    )
+    .await
+    {
+        SpokeResult::Ok(assigned) => assert_eq!(assigned, 5),
+        SpokeResult::Reject(reject) => panic!("second dedicated append rejected: {reject:?}"),
+    }
+    appended
+        .commit()
+        .await
+        .expect("commit the second dedicated append");
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-p",
+                    "the north gate reopens at dawn",
+                    vec![
+                        belief("entry-p", "cog_one"),
+                        belief("entry-p", "cog_two"),
+                        belief("entry-p", "cog_three"),
+                    ],
+                ),
+                Some(5),
+            )
+            .await,
+        "sixth revision",
+    );
+
+    let pool = store.pool();
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-p").await,
+        [1, 3, 5]
+    );
+
+    let mut replay_before = Vec::new();
+    for revision in 2..=6 {
+        replay_before.push((
+            revision,
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-p", revision).await,
+                "replay before the prune",
+            ))
+            .to_string(),
+        ));
+    }
+    let expected_derived = replay_before
+        .iter()
+        .find(|(revision, _)| *revision == 2)
+        .map(|(_, expected)| expected.clone())
+        .expect("revision 2 was replayed before the prune");
+
+    // Keeping two checkpoints deletes only checkpoint 1. Revisions 2 and 4 lose their preimage but
+    // not their answer: the next checkpoint plus the crossed appends replays them exactly.
+    let pruned: PruneReport = expect_ok(
+        shared.prune_history("entry-p", 2).await,
+        "prune to the two newest checkpoints",
+    );
+    assert_eq!((pruned.deleted, pruned.floor), (1, Some(2)));
+    assert_eq!(history_floor(&pool, "shared", "entry-p").await, 2);
+    assert_eq!(
+        checkpoint_revisions(&pool, "shared", "entry-p").await,
+        [3, 5]
+    );
+
+    for (revision, expected) in &replay_before {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-p", *revision).await,
+                "replay a revision at or above the new floor",
+            ))
+            .to_string(),
+            *expected,
+            "revision {revision} answers exactly after the prune"
+        );
+    }
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-p", 1).await,
+        "the revision whose preimage the prune removed",
+    );
+
+    // The derived replay survives a reopen: it is the surviving checkpoint, not the deleted row,
+    // that keeps revision 2 answerable.
+    drop(pool);
+    store.close().await;
+    let store = MindStore::open(&path).await.expect("reopen the store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    assert_eq!(
+        as_json(&expect_ok(
+            shared.get_entry_at_revision("entry-p", 2).await,
+            "replay the derived revision after reopen",
+        ))
+        .to_string(),
+        expected_derived,
+        "revision 2 still answers exactly after the prune and a reopen"
+    );
 
     store.close().await;
     remove_database(&path);
