@@ -30,7 +30,7 @@ An unassigned revision, revision 0, a value above the representable range, and a
 `mindcore_spi::adopt_knowledge_entry(src, dst, entry_id, expected_source_revision)` copies a shared entry into a personal collection through the caller's two scoped ports.
 
 - The destination is addressed by the **same `entry_id`**; the collection distinguishes the copy.
-- The copy carries one Mindcore adoption anchor naming the source entry and the source revision it was taken at. `mindcore_base::knowledge::adoption_anchor_parts` is the single parser for it — the producer and every consumer, including the SQLite resolver, read back through that one function.
+- The copy carries one Mindcore adoption anchor naming the source entry and the source revision it was taken at. The builders (`adoption_anchor`, `adoption_anchor_at_revision`) write that shape and `mindcore_base::knowledge::adoption_anchor_parts` is its single **reader** — every consumer, including the SQLite resolver and the adoption idempotency check, goes through that one function, so a shape the parser cannot read back is a defect in the builder.
 - The anchor's recorded revision is the copy's identity. A repeat at that revision returns the existing copy (`AlreadyPresent`) with its original anchor; a request naming the source's current revision instead is `RevisionConflict` naming the revision the copy was adopted at, even when the source now sits at the requested one. A repeat never rewrites the copy and never re-points the anchor at a newer source revision.
 - A missing, retired or undisclosable source answers one generic `KnowledgeEntryNotFound`; a source the caller cannot see is indistinguishable from one that does not exist. An empty source id or a zero revision is refused before any I/O.
 - A destination slot occupied by anything else — including a retired entry — answers `KnowledgeEntryAlreadyExists` and is left byte-identical. The store distinguishes that case from a genuine validation failure by a structured refusal detail, never by matching a message.
@@ -60,6 +60,10 @@ An unassigned revision, revision 0, a value above the representable range, and a
 - Write path, replay, retirement write, resolution, current-record predicate: `crates/mindcore-sqlite/src/knowledge.rs`, `cognition.rs`.
 - Adoption and the anchor codec: `crates/mindcore-spi/src/adoption.rs`, `crates/mindcore-base/src/knowledge.rs`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
+
+## Served failure messages
+
+A storage failure on the served knowledge face answers `InternalError` with the fixed text `knowledge storage is unavailable` and no details; the over-bound list refusal is the one exempt case and keeps its own message. Driver text is never forwarded to an admitted peer, because it names local tables and columns. A host that needs the underlying cause observes it in its own storage layer or its own logs — the library writes none.
 
 ## Known limits
 

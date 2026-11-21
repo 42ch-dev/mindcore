@@ -65,7 +65,7 @@ END;
 
 - Seed an `append_seq = 1.5` row plus a row at `3` and no row at `2`; a count-based check accepts the store, a positional check refuses it with `InternalError`.
 - Seed a revision and delete its parent; the non-cascading foreign key refuses and the preimage survives.
-- Assert the cost test's statement and step counts **before** the change and after: the trigger must not move them.
+- Assert the cost test's statement count **before** the change and after: the Rust write path must not gain a statement. VDBE step counts *will* move — the trigger executes bytecode inside the same statement — so a test that pins an absolute step total must be re-derived from the new plan, not demanded to stay identical.
 
 ## Pitfalls
 
