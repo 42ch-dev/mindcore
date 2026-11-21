@@ -1,6 +1,6 @@
 //! Caller-owned transaction boundary: the repository stages reads and writes inside the
-//! caller's open `sqlx::Transaction`; commit/rollback stay with the caller. Uses the Task-1
-//! prepare fixture DDL (`settlement-prepare.sql`) on a temporary database.
+//! caller's open `sqlx::Transaction`; commit/rollback stay with the caller. Uses a
+//! `MindStore::open` database on a temporary path.
 
 use serde_json::{json, Map, Number};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -14,9 +14,8 @@ use mindcore_base::ir::{
     MemoryJournalRow, MemoryRecordIr, MemoryRepository, Placement, Provenance, ReceiptRead,
     ReceiptState, RecordState, ReviewReceiptIr,
 };
-use mindcore_sqlite::SqliteMemoryRepository;
+use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 
-const DDL: &str = include_str!("fixtures/settlement-prepare.sql");
 const TIME: &str = "2026-11-20T09:20:01.123Z";
 const LATER: &str = "2026-11-20T09:24:00.456Z";
 const DIGEST: &str = "034a5c6d74a6c8fa3fa25d0e41dd2b10d1a110464c5e9e3f56e7c1a22cf48696";
@@ -35,8 +34,7 @@ async fn open(path: &std::path::Path) -> SqlitePool {
 }
 
 async fn prepared(path: &std::path::Path) -> SqlitePool {
-    let pool = open(path).await;
-    sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+    let pool = MindStore::open(path).await.expect("open store").pool();
     sqlx::query!(
         "INSERT INTO memory_spaces \
          (space_id, display_name, authority_host_id, authority_generation, status, revision, \

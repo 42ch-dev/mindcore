@@ -10,10 +10,10 @@ use sqlx::{ConnectOptions, SqlitePool};
 use tempfile::TempDir;
 
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
+use mindcore_sqlite::MindStore;
 use spoke_operations::SpokeResult;
 use spoke_schemas::Principal;
 
-const DDL: &str = include_str!("fixtures/settlement-prepare.sql");
 const NOW: &str = "2026-11-20T09:20:01.123Z";
 const PRINCIPAL: &str = "ctr_list";
 
@@ -101,18 +101,21 @@ async fn list_cost(pool: &SqlitePool) -> (usize, usize) {
 async fn list_spaces_reads_grants_once_and_skips_orphan_grants() {
     tracing::subscriber::set_global_default(StatementCounter).expect("install counter");
     let dir = TempDir::new().expect("temporary directory");
+    let path = dir.path().join("spaces.db");
+    MindStore::open(&path).await.expect("open store");
+    // `MindStore` offers no statement logging; reconnect to the prepared file
+    // without rerunning DDL so the counter sees the adapter's reads.
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
             SqliteConnectOptions::new()
-                .filename(dir.path().join("spaces.db"))
+                .filename(&path)
                 .create_if_missing(true)
                 .foreign_keys(false)
                 .log_statements(log::LevelFilter::Debug),
         )
         .await
         .expect("open pool");
-    sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
 
     seed_space(&pool, 1).await;
     let (one_space, listed_one) = list_cost(&pool).await;

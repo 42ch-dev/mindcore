@@ -3,16 +3,15 @@
 //! between what the adapter commits and what only the caller may commit.
 
 use serde_json::{json, Value};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use tempfile::TempDir;
 
 use mindcore_base::ids::SpaceId;
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
+use mindcore_sqlite::MindStore;
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 
-const DDL: &str = include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
 const SPACE: &str = "sp_1";
 const SUBJECT: &str = "s_1";
 const PRINCIPAL: &str = "p_1";
@@ -27,17 +26,10 @@ struct Harness {
 impl Harness {
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(dir.path().join("memory.db"))
-                    .create_if_missing(true)
-                    .foreign_keys(false),
-            )
+        let pool = MindStore::open(&dir.path().join("memory.db"))
             .await
-            .expect("open pool");
-        sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+            .expect("open store")
+            .pool();
         sqlx::query!(
             "INSERT INTO memory_spaces \
              (space_id, display_name, authority_host_id, authority_generation, status, revision, \
