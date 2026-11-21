@@ -24,6 +24,11 @@
   and one whose applied SQL has since changed with a checksum mismatch. Recreate the file only for one
   of those two migration mismatches, or move it aside first if you want to keep it; a busy, locked or
   unreadable database is retried, not recreated.
+- `mindcore-base` / `mindcore-sqlite`: the legacy memory port is removed, not deprecated. The public
+  `MemoryStore` trait, its `MindStore` implementation and the DTOs it carried — `MemoryCandidate`,
+  `MemoryRecord` and `MemoryError` — are gone; the borrowed-transaction `MemoryRepository` boundary
+  and the workflow settlements above replace them. `RecallQuery` stays. A consumer that implements or
+  calls `MemoryStore` does not compile against this release and must move to `MemoryRepository`.
 - `mindcore-sqlite`: optional retained-vector storage. `memory_embedding_vectors` holds one
   little-endian `f32` vector per `(record_id, identity_hash)` with its record revision and dimension,
   indexed by identity so a retired identity's whole partition is one delete. The table is part of the
