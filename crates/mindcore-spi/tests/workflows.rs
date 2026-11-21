@@ -1375,6 +1375,21 @@ fn dismissed_candidate() -> MemoryCandidate {
     .expect("dismissed candidate")
 }
 
+/// The same candidate under another id, the way a receipt holding several
+/// candidates names them.
+fn named(candidate: MemoryCandidate, candidate_id: &str) -> MemoryCandidate {
+    let mut candidate = serde_json::to_value(candidate).expect("candidate");
+    candidate["candidate_id"] = json!(candidate_id);
+    serde_json::from_value(candidate).expect("candidate")
+}
+
+fn candidate_id_of(candidate: &MemoryCandidate) -> &str {
+    match candidate {
+        MemoryCandidate::PendingCandidate(pending) => pending.candidate_id.as_str(),
+        MemoryCandidate::ConsumedCandidate(consumed) => consumed.candidate_id.as_str(),
+    }
+}
+
 fn capture_request() -> MemoryCaptureRequest {
     serde_json::from_value(json!({
         "space_id": "spc_1",
@@ -1398,6 +1413,9 @@ struct Recorded {
     fills: Arc<Mutex<Vec<(String, u64)>>>,
     /// Pending candidate sets the coordinator recorded as its decision.
     pending: Arc<Mutex<Vec<Vec<String>>>>,
+    /// The candidate rows the capture receipt holds, in receipt order; a test
+    /// moves one to consumed between runs, the way another writer would.
+    candidates: Arc<Mutex<Vec<MemoryCandidate>>>,
     /// The next marker write refuses: the decision its run made stays unrecorded.
     fail_pending_write: Arc<AtomicBool>,
 }
@@ -1405,7 +1423,6 @@ struct Recorded {
 /// One captured candidate over a fixed page, with every submitted settlement
 /// recorded for the assertion.
 struct AbsorbDouble {
-    candidate: MemoryCandidate,
     page: Vec<RetainedRecord>,
     recorded: Recorded,
     /// The record id this binding's update leg already settled, if any.
@@ -1442,29 +1459,40 @@ impl WorkflowBinding for AbsorbDouble {
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
         // The first capture commits the receipt; every later one replays it,
-        // reporting the state the double's candidate is in — or the Pending
-        // decision its fresh run recorded, which wins over that state.
+        // reporting the state each candidate is in — or the Pending decision
+        // the receipt's own run recorded, which wins over that state.
         let call = self.captures.fetch_add(1, Ordering::SeqCst);
-        let held = self
+        let decision = self
             .recorded
             .pending
             .lock()
             .expect("pending writes")
+            .clone();
+        let candidates = self.recorded.candidates.lock().expect("candidates").clone();
+        let candidates = candidates
             .iter()
-            .any(|ids| ids.iter().any(|id| id == "cnd_1"));
-        let lifecycle = if held {
-            CandidateLifecycle::PendingDecision
-        } else {
-            match &self.candidate {
-                MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
-                MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
-            }
-        };
+            .map(|candidate| {
+                let candidate_id = candidate_id_of(candidate).to_string();
+                let lifecycle = if decision
+                    .iter()
+                    .flatten()
+                    .any(|named| named == &candidate_id)
+                {
+                    CandidateLifecycle::PendingDecision
+                } else {
+                    match candidate {
+                        MemoryCandidate::PendingCandidate(_) => CandidateLifecycle::Pending,
+                        MemoryCandidate::ConsumedCandidate(_) => CandidateLifecycle::Consumed,
+                    }
+                };
+                CapturedCandidate {
+                    candidate_id,
+                    lifecycle,
+                }
+            })
+            .collect();
         Ok(CaptureOutcome {
-            candidates: vec![CapturedCandidate {
-                candidate_id: "cnd_1".to_string(),
-                lifecycle,
-            }],
+            candidates,
             replayed: call > 0,
         })
     }
@@ -1495,12 +1523,21 @@ impl WorkflowBinding for AbsorbDouble {
         &self,
         _principal: &Principal,
         _space_id: &str,
-        _candidate_id: &str,
+        candidate_id: &str,
         _max_items: u64,
     ) -> Result<AbsorbSnapshot, SpiError> {
         self.recorded.snapshots.fetch_add(1, Ordering::SeqCst);
+        let candidate = self
+            .recorded
+            .candidates
+            .lock()
+            .expect("candidates")
+            .iter()
+            .find(|candidate| candidate_id_of(candidate) == candidate_id)
+            .cloned()
+            .expect("a snapshot names a candidate the receipt holds");
         Ok(AbsorbSnapshot {
-            candidate: self.candidate.clone(),
+            candidate,
             records: self.page.clone(),
         })
     }
@@ -1728,8 +1765,8 @@ fn absorb_at(
     captures: usize,
 ) -> (SpiMindWorkflows, Recorded, Arc<Mutex<Vec<Value>>>) {
     let recorded = Recorded::default();
+    *recorded.candidates.lock().expect("candidates") = vec![candidate];
     let double = AbsorbDouble {
-        candidate,
         page: page(),
         recorded: recorded.clone(),
         settled_update: settled_update.map(str::to_string),
@@ -1740,11 +1777,26 @@ fn absorb_at(
     (SpiMindWorkflows::new(double), recorded, seen)
 }
 
+/// An absorb double whose capture receipt holds two pending candidates.
+fn absorb_two_pending() -> (SpiMindWorkflows, Recorded) {
+    let recorded = Recorded::default();
+    *recorded.candidates.lock().expect("candidates") =
+        vec![pending_candidate(), named(pending_candidate(), "cnd_2")];
+    let double = AbsorbDouble {
+        page: page(),
+        recorded: recorded.clone(),
+        settled_update: None,
+        captures: AtomicUsize::new(0),
+        live: None,
+    };
+    (SpiMindWorkflows::new(double), recorded)
+}
+
 /// An absorb double whose post-settlement warm reads `live`.
 fn absorb_with_live(live: SettledRecord) -> (SpiMindWorkflows, Recorded) {
     let recorded = Recorded::default();
+    *recorded.candidates.lock().expect("candidates") = vec![pending_candidate()];
     let double = AbsorbDouble {
-        candidate: pending_candidate(),
         page: page(),
         recorded: recorded.clone(),
         settled_update: None,
@@ -2110,6 +2162,67 @@ async fn a_retry_records_the_decision_its_first_run_could_not_write() {
         recorded.pending.lock().expect("pending writes").as_slice(),
         [vec!["cnd_1".to_string()]],
         "exactly one marker records the Pending decision"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_records_the_receipt_s_whole_candidate_list() {
+    let (workflows, recorded) = absorb_two_pending();
+    let caps = MindCapabilities::default();
+    recorded.fail_pending_write.store(true, Ordering::SeqCst);
+
+    // The capture commits, both candidates stay pending, and the marker write
+    // fails: the run must not report a decision it never recorded.
+    let failed = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await;
+    assert!(
+        matches!(failed, Err(SpiError::Settlement(_))),
+        "a failed marker write fails the run"
+    );
+    assert!(recorded.pending.lock().expect("pending writes").is_empty());
+
+    // The second candidate is resolved elsewhere before the retry, so only the
+    // first is still pending; the original decision still covered both.
+    recorded.candidates.lock().expect("candidates")[1] = named(consumed_candidate(), "cnd_2");
+
+    let retried = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("retried absorb");
+    // The marker names both candidates in receipt order: the resolution the
+    // second one reached later is not presented as the original decision.
+    assert_eq!(
+        recorded.pending.lock().expect("pending writes").as_slice(),
+        [vec!["cnd_1".to_string(), "cnd_2".to_string()]],
+        "one marker records the whole candidate list the decision ranged over"
+    );
+    assert_eq!(
+        retried,
+        vec![
+            AbsorbCandidateOutcome::Pending {
+                candidate_id: "cnd_1".to_string(),
+            },
+            AbsorbCandidateOutcome::Pending {
+                candidate_id: "cnd_2".to_string(),
+            },
+        ],
+        "the retry reports the decision it records, not the later resolution"
+    );
+
+    // A later replay reads the marker, reports both as pending, and reads no
+    // candidate back: the retry's answer is stable from here on.
+    let snapshots = recorded.snapshots.load(Ordering::SeqCst);
+    let replay = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("replayed absorb");
+    assert_eq!(replay, retried);
+    assert_eq!(recorded.snapshots.load(Ordering::SeqCst), snapshots);
+    assert_eq!(
+        recorded.pending.lock().expect("pending writes").len(),
+        1,
+        "the replay writes no second marker"
     );
 }
 
