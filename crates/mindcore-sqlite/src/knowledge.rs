@@ -761,8 +761,9 @@ async fn read_entry_seeded(
 /// `live_only` puts the live-row predicate in the query instead of checking the marker after the
 /// payload is decoded: a retired row's payload may be unreadable and must still answer as an
 /// absence on the current-entry paths. Only callers that must decide about a marked row read one —
-/// the explicit read, the routed put preflight and the marking CAS — and only the CAS reads its
-/// revision column.
+/// the explicit read, the routed put preflight and the marking CAS. The revision column has two
+/// readers, both CAS bases: [`write_entry`] and [`supersede_entry`], so a column/payload
+/// disagreement is caught on the put path and on the marking path.
 struct StoredRow {
     revision: i64,
     payload: String,

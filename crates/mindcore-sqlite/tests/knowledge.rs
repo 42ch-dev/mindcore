@@ -2598,7 +2598,7 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
         source_before
     );
 
-    // The source advances; both its old and its new visible revision name the same copy.
+    // The source advances; the copy's identity stays the revision its anchor recorded.
     let mut advanced = shared;
     advanced.body.summary = Some("The north gate reopens at dawn.".to_string());
     let advanced = expect_ok(
@@ -2607,20 +2607,23 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     );
     assert_eq!(advanced.revision, Some(2));
 
-    for (expected, context) in [
-        (1, "repeat at the adopted revision"),
-        (2, "repeat at the current visible revision"),
-    ] {
-        let repeat = match expect_ok(
-            adopt_knowledge_entry(&src, &dst, shared_id, expected).await,
-            context,
-        ) {
-            AdoptionOutcome::AlreadyPresent(existing) => existing,
-            other => panic!("{context}: expected the existing copy, got {other:?}"),
-        };
-        assert_eq!(as_json(&repeat), as_json(&created), "{context}");
-        assert_eq!(anchor_source_revision(&repeat), Some(1), "{context}");
-    }
+    // A repeat at the adopted revision is idempotent; the source's newer revision is not this copy.
+    let repeat = match expect_ok(
+        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        "repeat at the adopted revision",
+    ) {
+        AdoptionOutcome::AlreadyPresent(existing) => existing,
+        other => panic!("a repeat at the adopted revision must return the copy, got {other:?}"),
+    };
+    assert_eq!(as_json(&repeat), as_json(&created));
+    assert_eq!(anchor_source_revision(&repeat), Some(1));
+    assert_eq!(
+        expect_reject(
+            adopt_knowledge_entry(&src, &dst, shared_id, 2).await,
+            "a request naming the advanced source revision rather than the adopted one",
+        ),
+        SpokeRejectCode::RevisionConflict
+    );
 
     // A request naming neither revision is a conflict, never a second write.
     assert_eq!(
