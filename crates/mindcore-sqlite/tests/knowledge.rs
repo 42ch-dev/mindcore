@@ -435,7 +435,8 @@ async fn create_assigns_revision_one() {
 }
 
 /// A direct write bypasses the ports, so the column `CHECK` is what keeps a revision integral:
-/// `INTEGER` affinity keeps a fractional value as REAL unless the constraint refuses it.
+/// `INTEGER` affinity keeps a fractional value as REAL unless the constraint refuses it. The
+/// history floor carries the same guard.
 #[tokio::test]
 async fn a_fractional_revision_is_refused_by_the_schema() {
     let path = database_path("fractional-revision");
@@ -477,6 +478,14 @@ async fn a_fractional_revision_is_refused_by_the_schema() {
         refused.is_err(),
         "a fractional preimage revision is refused"
     );
+
+    let refused = sqlx::query(
+        "UPDATE knowledge_entries SET history_floor_revision = 1.5 \
+         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .execute(&seed)
+    .await;
+    assert!(refused.is_err(), "a fractional history floor is refused");
 
     seed.close().await;
     store.close().await;

@@ -267,7 +267,7 @@ impl ScopedKnowledgeStore {
     }
 
     /// Delete this entry's checkpoints older than its `keep` newest and move the entry's floor to
-    /// the earliest revision it can still answer: the revision just above the oldest deleted
+    /// the earliest revision it can still answer: the revision just above the newest deleted
     /// checkpoint. That floor need not be a stored checkpoint — a dedicated append advances the
     /// revision without writing a preimage, so a revision between surviving checkpoints is still
     /// replayed from the next one.
