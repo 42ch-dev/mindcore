@@ -13,15 +13,15 @@ The collection cannot come from the request either. A caller-supplied principal,
 
 ## Decision
 
-One surface serves many principals through a host-configured route map. `ServeFaces.workflow_routes: BTreeMap<String, KnowledgeScope>` maps each exact principal id — not a peer id, and never a value read from the wire — to the collection the routed workflow calls reach for that principal (`crates/mindcore-runtime/src/lib.rs:158`). `MemoryWorkflowBinding::with_knowledge_routes` validates the whole map once at assembly and takes ownership of it (`crates/mindcore-spoke/src/workflows.rs:286-311`); the map is immutable for the binding's lifetime, and repeated destination collections are valid.
+One surface serves many principals through a host-configured route map. `ServeFaces.workflow_routes: BTreeMap<String, KnowledgeScope>` maps each exact principal id — not a peer id, and never a value read from the wire — to the collection the routed workflow calls reach for that principal (`crates/mindcore-runtime/src/lib.rs:158`). `MemoryWorkflowBinding::with_knowledge_routes` validates the whole map once at assembly and takes ownership of it (`crates/mindcore-spoke/src/workflows.rs:279-321`); the map is immutable for the binding's lifetime, and each destination collection belongs to exactly one principal route: a collection named by two routes is refused at assembly, because a shared destination would let one routed principal reach another principal's carrier entry.
 
-Both consumers resolve the route through the one lookup `MemoryWorkflowBinding::knowledge_route` (`crates/mindcore-spoke/src/workflows.rs:329-331`), so the carrier read and its CAS append stay pinned to one collection and recall's slot can never resolve a different one. `absorb` consults no route.
+Both consumers resolve the route through the one lookup `MemoryWorkflowBinding::knowledge_route` (`crates/mindcore-spoke/src/workflows.rs:336-343`), so the carrier read and its CAS append stay pinned to one collection and recall's slot can never resolve a different one. `absorb` consults no route.
 
-A principal with no route is refused at carrier admission before any carrier access, as terminal `NotAuthorized` carrying the fixed message `principal has no workflow knowledge route` and no route detail (`crates/mindcore-spoke/src/workflows.rs:372-388`). Recall's slot is independent of the memory page and best effort: a missing route, or a missing live `knowledge_read` grant in the request's space, returns the memory result with `knowledge: []` rather than a refusal, while a grant-store or collection-list failure still fails the call (`crates/mindcore-spoke/src/workflows.rs:429-450`).
+A principal with no route is refused at carrier admission before any carrier access, as terminal `NotAuthorized` carrying the fixed message `principal has no workflow knowledge route` and no route detail (`crates/mindcore-spoke/src/workflows.rs:391-396`). Recall's slot is independent of the memory page and best effort: a missing route, or a missing live `knowledge_read` grant in the request's space, returns the memory result with `knowledge: []` rather than a refusal, while a grant-store or collection-list failure still fails the call (`crates/mindcore-spoke/src/workflows.rs:428-470`).
 
-An empty map is valid and serves no deliberation: the surface advertises neither `tools.mindcore.deliberate` nor its handler, including a host registration with that reserved id (`crates/mindcore-runtime/src/lib.rs:95-109`). An assembly with an empty principal key or an empty destination collection is the host's input error and returns `InvalidInput` before any port or registration exists.
+An empty map is valid and serves no deliberation: the surface advertises neither `tools.mindcore.deliberate` nor its handler, including a host registration with that reserved id (`crates/mindcore-runtime/src/lib.rs:95-109`). An assembly with an empty principal key, an empty destination collection, or a destination collection named by two routes is the host's input error and returns `InvalidInput` before any port or registration exists.
 
-The route is a collection allowlist, not an authorization grant: every carrier write and knowledge read still re-derives the caller's own live grants on its own transaction, so two principals may share a collection without per-holder isolation inside it.
+The route is a collection allowlist, not an authorization grant: every carrier write and knowledge read still re-derives the caller's own live grants on its own transaction. One destination collection per principal carries isolation the grants cannot: `deliberate` compares the request's wire-named `holder` with the entry it read from the routed collection, so a shared destination would let one routed principal's call append cognition to another principal's carrier; refusing the shared route makes that shape unreachable at assembly.
 
 ## Alternatives considered
 
@@ -36,7 +36,7 @@ The route is a collection allowlist, not an authorization grant: every carrier w
 - `ServeFaces.workflow_caller` is deleted; a served `deliberate` resolves its carrier collection from the admitted principal's route.
 - An empty route map leaves Memory-face availability unchanged — Memory is served only when `faces.memory` is configured — and `absorb` and `recall_context` keep serving with no routed knowledge slot; only `deliberate` is suppressed from the advertisement and the handler set.
 - No refusal discloses another principal's route, collection or entry, and no workflow reaches a collection outside its own admitted principal's route.
-- Hosts that need carrier isolation between principals configure distinct collections; a shared destination grants no per-holder isolation.
+- Carrier isolation between principals is structural, not configured per holder: each destination collection belongs to one route, so two principals need two collections and a shared one is refused at assembly.
 
 ## References
 

@@ -223,15 +223,28 @@ async fn manifest_follows_the_composed_faces() {
     );
 }
 
-/// The host's route map is validated once, where the surface is assembled: an empty principal key
-/// or an empty destination collection is the host's input error, refused before any port or
-/// registration exists.
+/// The host's route map is validated once, where the surface is assembled: an empty principal key,
+/// an empty destination collection, or one destination collection claimed by two routes is the
+/// host's input error, refused before any port or registration exists.
 #[tokio::test]
 async fn an_unroutable_destination_is_refused_at_assembly() {
     let serve = Fixture::open().await.serve();
-    for routes in [
-        BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
-        BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
+    for (routes, named) in [
+        (
+            BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
+            None,
+        ),
+        (
+            BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
+            None,
+        ),
+        (
+            BTreeMap::from([
+                ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
+                ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
+            ]),
+            Some(COLLECTION),
+        ),
     ] {
         let reject = match serve.surface(ServeFaces {
             workflow_routes: routes,
@@ -250,6 +263,12 @@ async fn an_unroutable_destination_is_refused_at_assembly() {
             reject.details.is_none(),
             "the assembly refusal carries no route details: {reject:?}"
         );
+        if let Some(named) = named {
+            assert!(
+                reject.message.contains(named),
+                "the refusal names the collection two routes claim: {reject:?}"
+            );
+        }
     }
 }
 
