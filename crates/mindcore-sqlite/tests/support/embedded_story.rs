@@ -9,21 +9,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use mindcore_base::boundary::{CallerId, TrustedScope};
+use mindcore_base::boundary::CallerId;
 use mindcore_base::cognition::{
     append_cognition_record, derive_mind_state, mind_state_value, MindError,
 };
-use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
+use mindcore_base::ids::SpaceId;
+use mindcore_base::ir::{MemoryGrantRow, MemoryRepository};
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
-use mindcore_base::memory::{MemoryCandidate, MemoryStore, RecallQuery};
+use mindcore_spoke::{MemoryAdapter, MemoryStage};
 use mindcore_sqlite::cognition::{read_carrier, write_carrier};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use serde_json::{json, Map, Value};
 use spoke_operations::{validate_mind_state, KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
     ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryOwner,
 };
-use spoke_schemas::KnowledgeEntry;
+use spoke_schemas::{KnowledgeEntry, Principal};
+use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -50,6 +52,11 @@ impl TempDb {
 
     pub fn database_path(&self) -> PathBuf {
         self.dir.join("mindcore.db")
+    }
+
+    /// The scratch root the protocol's journaled file effects are published under.
+    pub fn root(&self) -> &Path {
+        &self.dir
     }
 }
 
@@ -159,7 +166,7 @@ pub fn json_of(entry: &KnowledgeEntry) -> Value {
     serde_json::to_value(entry).expect("entry serializes")
 }
 
-fn record_ids(records: &[Value]) -> Vec<&str> {
+pub fn record_ids(records: &[Value]) -> Vec<&str> {
     records
         .iter()
         .filter_map(|record| record.get("record_id").and_then(Value::as_str))
@@ -180,11 +187,264 @@ fn assert_holder_consistency(value: &Value) {
     }
 }
 
-fn recall_in(scope: &TrustedScope, context: Option<&str>) -> RecallQuery {
-    RecallQuery {
-        space: scope.space().clone(),
-        subject: SubjectId::new("wren"),
-        context: context.map(ContextId::new),
+/// The authenticated caller the host supplies; never payload-asserted.
+pub fn principal(id: &str) -> Principal {
+    serde_json::from_value(json!({ "principal_id": id, "extensions": {} }))
+        .expect("principal wire shape")
+}
+
+fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
+    match expect_ok(stage, context) {
+        MemoryStage::Ready(body) => body,
+        other => panic!("{context}: expected a ready stage, got {other:?}"),
+    }
+}
+
+// Host control-plane provisioning: the protocol has no create-space or first-grant operation, so
+// the host writes one active space and one space-wide grant per space. Everything after this is a
+// protocol operation.
+pub async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+          created_at) \
+         VALUES (?, ?, 'host_story', 1, 'active', 1, ?)",
+    )
+    .bind(space)
+    .bind(space)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("provision the space");
+    let mut tx = pool.begin().await.expect("begin the grant transaction");
+    SqliteMemoryRepository
+        .insert_grant(
+            &mut tx,
+            &MemoryGrantRow {
+                grant_id: format!("grt_{space}"),
+                space_id: SpaceId::new(space),
+                subject_id: None,
+                principal_id: CallerId::new(caller),
+                capabilities: [
+                    "capture",
+                    "review",
+                    "records_read",
+                    "records_write",
+                    "recall",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+                context_ids: Vec::new(),
+                shared_access: false,
+                expires_at: None,
+                revoked_at: None,
+                revision: serde_json::Number::from(1),
+                created_at: now,
+                extensions: Map::new(),
+            },
+        )
+        .await
+        .expect("provision the grant");
+    tx.commit().await.expect("commit the grant");
+}
+
+/// One adapter subject registration: the story's Wren and the race tests' shared subject.
+pub async fn ensure_subject(pool: &SqlitePool, adapter: &MemoryAdapter, caller: &Principal) {
+    let mut tx = pool.begin().await.expect("begin the subject");
+    ready(
+        adapter
+            .ensure_subject(
+                &mut tx,
+                caller,
+                json!({ "space_id": "wren", "subject_id": "wren" }),
+            )
+            .await,
+        "ensure the wren subject",
+    );
+    tx.commit().await.expect("commit the subject");
+}
+
+/// One adapter capture over a caller transaction; reports the pending candidate's identity.
+pub async fn capture(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    request: Value,
+) -> String {
+    let mut tx = pool.begin().await.expect("begin the capture");
+    let body = ready(adapter.capture(&mut tx, caller, request).await, "capture");
+    tx.commit().await.expect("commit the capture");
+    body["result"]["candidate_ids"][0]
+        .as_str()
+        .expect("candidate id")
+        .to_string()
+}
+
+/// One adapter recall over a caller transaction; the selection is the §6.12 wire member.
+pub async fn recalled_by(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    space: &str,
+    subject: &str,
+    selection: Value,
+) -> Vec<Value> {
+    let mut tx = pool.begin().await.expect("begin the recall");
+    let body = ready(
+        adapter
+            .recall(
+                &mut tx,
+                caller,
+                json!({
+                    "space_id": space,
+                    "subject_id": subject,
+                    "selection": selection,
+                    "budget": { "max_items": 10 },
+                }),
+            )
+            .await,
+        "recall",
+    );
+    tx.rollback().await.expect("rollback the recall");
+    body["records"].as_array().expect("records array").clone()
+}
+
+/// Wren's recall in one space: the story's own subject, other spaces included.
+pub async fn recalled(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    space: &str,
+    selection: Value,
+) -> Vec<Value> {
+    recalled_by(pool, adapter, caller, space, "wren", selection).await
+}
+
+fn in_context(context: &str) -> Value {
+    json!({ "mode": "selected_contexts", "context_ids": [context] })
+}
+
+fn review_request(candidate_id: &str, key: &str) -> Value {
+    json!({
+        "space_id": "wren",
+        "candidate_id": candidate_id,
+        "decision": { "action": "promote" },
+        "expected_revision": 1,
+        "idempotency_key": key,
+    })
+}
+
+/// Wren's review round: promote the candidate, commit the staged intent and publish every owed
+/// target into the caller's scratch root; the receipt stays pending for settlement.
+pub async fn stage_review(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    root: &Path,
+    candidate_id: &str,
+    key: &str,
+) -> SpokeResult<String> {
+    let mut tx = pool.begin().await.expect("begin the review");
+    let stage = adapter
+        .review_candidate(&mut tx, caller, review_request(candidate_id, key))
+        .await;
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        SpokeResult::Ok(other) => panic!("review must stage a journal intent, got {other:?}"),
+        SpokeResult::Reject(reject) => {
+            tx.rollback().await.expect("rollback the refused review");
+            return SpokeResult::Reject(reject);
+        }
+    };
+    tx.commit().await.expect("commit the review");
+
+    let owed: String =
+        sqlx::query_scalar("SELECT targets_json FROM memory_journal WHERE receipt_id = ?")
+            .bind(&receipt_id)
+            .fetch_one(pool)
+            .await
+            .expect("journal intent");
+    let owed: Vec<Value> = serde_json::from_str(&owed).expect("journal targets");
+    assert!(!owed.is_empty(), "the staged intent owes file targets");
+    for target in &owed {
+        let path = root.join(target["path"].as_str().expect("target path"));
+        std::fs::create_dir_all(path.parent().expect("target directory"))
+            .expect("create the target directory");
+        std::fs::write(&path, target["content"].as_str().expect("target content"))
+            .expect("publish the target");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the published target"),
+            target["content"].as_str().expect("target content"),
+            "the published bytes are the intent's"
+        );
+    }
+    SpokeResult::Ok(receipt_id)
+}
+
+/// Settle one staged receipt in its own caller transaction and report the receipt body.
+pub async fn settle_receipt(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    space: &str,
+    receipt_id: &str,
+) -> SpokeResult<Value> {
+    let mut tx = pool.begin().await.expect("begin the settlement");
+    let settled = adapter
+        .settle_journal(&mut tx, &SpaceId::new(space), receipt_id)
+        .await;
+    match settled {
+        SpokeResult::Ok(receipt) => {
+            tx.commit().await.expect("commit the settlement");
+            SpokeResult::Ok(receipt)
+        }
+        SpokeResult::Reject(reject) => {
+            tx.rollback().await.expect("rollback the refused settlement");
+            SpokeResult::Reject(reject)
+        }
+    }
+}
+
+/// One full retain attempt: stage, publish, settle. A refusal is returned instead of panicking so
+/// competing callers can report which side lost.
+pub async fn attempt_retain(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    root: &Path,
+    candidate_id: &str,
+    key: &str,
+) -> SpokeResult<(String, String)> {
+    let receipt_id = match stage_review(pool, adapter, caller, root, candidate_id, key).await {
+        SpokeResult::Ok(receipt_id) => receipt_id,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    let receipt = match settle_receipt(pool, adapter, "wren", &receipt_id).await {
+        SpokeResult::Ok(receipt) => receipt,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    assert_eq!(receipt["status"], json!("committed"));
+    let record_id = receipt["result"]["record_ids"][0]
+        .as_str()
+        .expect("retained record id")
+        .to_string();
+    SpokeResult::Ok((receipt_id, record_id))
+}
+
+/// The story's single-threaded retain: an unexpected refusal fails the run.
+async fn retain(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    root: &Path,
+    candidate_id: &str,
+    key: &str,
+) -> (String, String) {
+    match attempt_retain(pool, adapter, caller, root, candidate_id, key).await {
+        SpokeResult::Ok(identities) => identities,
+        SpokeResult::Reject(reject) => {
+            panic!("review the candidate: unexpectedly rejected with {reject:?}")
+        }
     }
 }
 
@@ -213,9 +473,15 @@ pub async fn run_story(label: &str) {
     let path = temp.database_path();
     let store = MindStore::open(&path).await.expect("open store");
 
-    // Setup: three collections, two trusted scopes, one shared fixture entry.
-    let wren_scope = TrustedScope::new(SpaceId::new("wren"), CallerId::new("caller_wren"));
-    let studio_scope = TrustedScope::new(SpaceId::new("studio"), CallerId::new("caller_studio"));
+    // Setup: three collections, two principals, two protocol spaces, one shared fixture entry.
+    let wren_caller = principal("caller_wren");
+    let studio_caller = principal("caller_studio");
+    let pool = store.pool();
+    let adapter = MemoryAdapter::new(false);
+    provision_space(&pool, "wren", "caller_wren").await;
+    provision_space(&pool, "studio", "caller_studio").await;
+    ensure_subject(&pool, &adapter, &wren_caller).await;
+
     let wren = store.knowledge(KnowledgeScope::new("wren"));
     let studio = store.knowledge(KnowledgeScope::new("studio"));
     let facts = store.knowledge(KnowledgeScope::new("village-facts"));
@@ -238,28 +504,34 @@ pub async fn run_story(label: &str) {
     );
 
     // S1: Wren hears about the gate; hearing is not yet knowledge.
-    let hearing = MemoryCandidate {
-        candidate_id: "cnd_wren_hearsay".to_string(),
-        space: wren_scope.space().clone(),
-        subject: SubjectId::new("wren"),
-        context: ContextId::new("tavern"),
-        content: "A traveller says the north gate is shut once the dusk bell rings.".to_string(),
-        observed_at: timestamp("2026-11-19T17:40:00Z"),
-    };
-    store
-        .capture(hearing.clone())
-        .await
-        .expect("capture the hearing");
-    assert!(store
-        .recall(&recall_in(&wren_scope, Some("tavern")))
-        .await
-        .expect("recall the tavern")
-        .is_empty());
-    assert!(store
-        .recall(&recall_in(&studio_scope, None))
-        .await
-        .expect("recall Studio's space")
-        .is_empty());
+    let hearing = capture(
+        &pool,
+        &adapter,
+        &wren_caller,
+        json!({
+            "space_id": "wren",
+            "subject_id": "wren",
+            "capture_scope": { "visibility": "context", "context_id": "tavern" },
+            "content": { "text": "A traveller says the north gate is shut once the dusk bell rings." },
+            "occurred_at": "2026-11-19T17:40:00Z",
+            "idempotency_key": "cap-wren-hearsay",
+        }),
+    )
+    .await;
+    assert!(
+        recalled(&pool, &adapter, &wren_caller, "wren", in_context("tavern"))
+            .await
+            .is_empty()
+    );
+    assert!(recalled(
+        &pool,
+        &adapter,
+        &studio_caller,
+        "studio",
+        json!({ "mode": "subject_all" })
+    )
+    .await
+    .is_empty());
     assert_eq!(
         expect_reject(
             wren.get_knowledge_entry("ke_wren_north_gate").await,
@@ -269,7 +541,7 @@ pub async fn run_story(label: &str) {
     );
     step(
         1,
-        "hearing: captured cnd_wren_hearsay in wren/tavern; recall empty; no personal entry",
+        &format!("hearing: captured {hearing} in wren/tavern; recall empty; no personal entry"),
     );
 
     // S2: a catalog read through the shared scope changes nothing on Wren's side.
@@ -317,15 +589,85 @@ pub async fn run_story(label: &str) {
         json!("hearsay")
     );
 
-    let hearsay = store
-        .retain(&hearing.candidate_id, "req-wren-hearsay")
-        .await
-        .expect("retain the hearing");
-    let replayed = store
-        .retain(&hearing.candidate_id, "req-wren-hearsay")
-        .await
-        .expect("replay the same review request");
-    assert_eq!(replayed, hearsay);
+    let (hearsay_receipt, hearsay) = retain(
+        &pool,
+        &adapter,
+        &wren_caller,
+        temp.root(),
+        &hearing,
+        "rev-wren-hearsay",
+    )
+    .await;
+
+    // The same review key replays its committed receipt instead of staging a second record.
+    let mut tx = pool.begin().await.expect("begin the review replay");
+    let replay = ready(
+        adapter
+            .review_candidate(
+                &mut tx,
+                &wren_caller,
+                review_request(&hearing, "rev-wren-hearsay"),
+            )
+            .await,
+        "replay the same review request",
+    );
+    tx.rollback().await.expect("rollback the review replay");
+    assert_eq!(replay["receipt_id"], json!(hearsay_receipt));
+    assert_eq!(replay["result"]["record_ids"], json!([hearsay.clone()]));
+
+    // A second review of the same candidate under a fresh key is refused: one candidate yields
+    // one retained record.
+    let mut tx = pool.begin().await.expect("begin the second review");
+    assert_eq!(
+        expect_reject(
+            adapter
+                .review_candidate(
+                    &mut tx,
+                    &wren_caller,
+                    review_request(&hearing, "rev-wren-hearsay-again"),
+                )
+                .await,
+            "second review of the retained candidate",
+        ),
+        SpokeRejectCode::CandidateConsumed
+    );
+    tx.rollback().await.expect("rollback the second review");
+
+    // Scoped isolation, now that a record exists: the record is recallable in its own scope and
+    // must not answer another space's or another subject's recall. S1's cross-space recall ran
+    // while both spaces were empty, so it could not tell a filtered recall from an unfiltered one;
+    // the positive control below keeps these refusals from being vacuous in turn.
+    let own_scope = recalled(&pool, &adapter, &wren_caller, "wren", in_context("tavern")).await;
+    assert_eq!(
+        record_ids(&own_scope),
+        vec![hearsay.as_str()],
+        "positive control: the retained record is recallable in Wren's own scope"
+    );
+    let other_space = recalled(
+        &pool,
+        &adapter,
+        &studio_caller,
+        "studio",
+        json!({ "mode": "subject_all" }),
+    )
+    .await;
+    assert!(
+        other_space.is_empty(),
+        "a Wren record must not cross into Studio's space: {other_space:?}"
+    );
+    let other_subject = recalled_by(
+        &pool,
+        &adapter,
+        &wren_caller,
+        "wren",
+        "mason",
+        json!({ "mode": "subject_all" }),
+    )
+    .await;
+    assert!(
+        other_subject.is_empty(),
+        "a Wren record must not answer another subject's recall in the same space: {other_subject:?}"
+    );
 
     let shared_after_adoption = expect_ok(
         facts.get_knowledge_entry(&shared_entry_id).await,
@@ -336,8 +678,7 @@ pub async fn run_story(label: &str) {
     step(
         3,
         &format!(
-            "adoption: ke_wren_north_gate revision 1 anchored to shared:{shared_entry_id} (hearsay); hearing retained as {}; shared entry unchanged",
-            hearsay.record_id
+            "adoption: ke_wren_north_gate revision 1 anchored to shared:{shared_entry_id} (hearsay); hearing retained as {hearsay} in receipt {hearsay_receipt}; shared entry unchanged"
         ),
     );
 
@@ -363,7 +704,7 @@ pub async fn run_story(label: &str) {
             "cog_hearsay",
             "Unknown",
             "Testimony",
-            &hearsay.record_id,
+            &hearsay,
             doubt_assessed_at,
         ),
     )
@@ -384,41 +725,44 @@ pub async fn run_story(label: &str) {
     let doubt_record = &doubt_view.records[0];
     assert_eq!(doubt_record["truth"], json!("Unknown"));
     assert_eq!(doubt_record["basis"]["acquisition"], json!("Testimony"));
-    assert_eq!(
-        doubt_record["basis"]["evidence"][0]["id"],
-        json!(hearsay.record_id)
-    );
+    assert_eq!(doubt_record["basis"]["evidence"][0]["id"], json!(hearsay));
     step(
         4,
         "doubt: cog_hearsay persisted (truth Unknown, Testimony) at carrier revision 2; mind state valid",
     );
 
     // S5: perception at the gate revises the judgment; the revision is conditional.
-    let observation = MemoryCandidate {
-        candidate_id: "cnd_wren_gate".to_string(),
-        space: wren_scope.space().clone(),
-        subject: SubjectId::new("wren"),
-        context: ContextId::new("gate"),
-        content: "At the gate after dusk: the bar is lifted and the north gate stands open."
-            .to_string(),
-        observed_at: timestamp("2026-11-19T19:30:00Z"),
-    };
-    store
-        .capture(observation.clone())
-        .await
-        .expect("capture the observation");
-    let observed = store
-        .retain("cnd_wren_gate", "req-wren-gate")
-        .await
-        .expect("retain the observation");
-    assert_eq!(observed.context.as_str(), "gate");
+    let gate_observed_at = "2026-11-19T19:30:00Z";
+    let observation = capture(
+        &pool,
+        &adapter,
+        &wren_caller,
+        json!({
+            "space_id": "wren",
+            "subject_id": "wren",
+            "capture_scope": { "visibility": "context", "context_id": "gate" },
+            "content": { "text": "At the gate after dusk: the bar is lifted and the north gate stands open." },
+            "occurred_at": gate_observed_at,
+            "idempotency_key": "cap-wren-gate",
+        }),
+    )
+    .await;
+    let (_, observed) = retain(
+        &pool,
+        &adapter,
+        &wren_caller,
+        temp.root(),
+        &observation,
+        "rev-wren-gate",
+    )
+    .await;
+    let at_the_gate = recalled(&pool, &adapter, &wren_caller, "wren", in_context("gate")).await;
+    assert_eq!(record_ids(&at_the_gate), vec![observed.as_str()]);
     assert_eq!(
-        store
-            .recall(&recall_in(&wren_scope, Some("gate")))
-            .await
-            .expect("recall the gate"),
-        vec![observed.clone()]
+        at_the_gate[0]["scope"],
+        json!({ "visibility": "context", "context_id": "gate" })
     );
+    assert_eq!(at_the_gate[0]["occurred_at"], json!(gate_observed_at));
 
     let carrier = expect_ok(
         read_carrier(&wren, "ke_wren_cognition").await,
@@ -434,7 +778,7 @@ pub async fn run_story(label: &str) {
             "cog_observed",
             "False",
             "Perception",
-            &observed.record_id,
+            &observed,
             revision_assessed_at,
         ),
     )
@@ -470,7 +814,7 @@ pub async fn run_story(label: &str) {
     assert_eq!(assessments[1]["basis"]["acquisition"], json!("Perception"));
     assert_eq!(
         assessments[1]["basis"]["evidence"][0]["id"],
-        json!(observed.record_id)
+        json!(observed)
     );
     assert_eq!(revised_value["holder_entry_id"], json!(carrier.entry_id));
     assert_holder_consistency(&revised_value);
@@ -502,12 +846,12 @@ pub async fn run_story(label: &str) {
             .as_str()
             .expect("the doubt carries its assessment time"),
     );
-    // Story times only: the store-assigned `recorded_at` is wall-clock, so comparing against it
+    // Story times only: the store-assigned `created_at` is wall-clock, so comparing against it
     // would fail as soon as real time passes the story's fixed instant.
+    let gate_observed = timestamp(gate_observed_at);
     assert!(
-        revision_assessed >= observation.observed_at,
-        "the revision was assessed at {revision_assessed}, before the observation it cites (observed at {})",
-        observation.observed_at
+        revision_assessed >= gate_observed,
+        "the revision was assessed at {revision_assessed}, before the observation it cites (observed at {gate_observed})"
     );
     assert!(
         revision_assessed >= doubt_assessed,
@@ -519,16 +863,12 @@ pub async fn run_story(label: &str) {
         "read the adopted entry after the revision",
     );
     assert_eq!(json_of(&personal_after_revision), json_of(&adopted));
-    let tavern = store
-        .recall(&recall_in(&wren_scope, Some("tavern")))
-        .await
-        .expect("recall the earlier memory");
-    assert_eq!(tavern, vec![hearsay.clone()]);
+    let tavern = recalled(&pool, &adapter, &wren_caller, "wren", in_context("tavern")).await;
+    assert_eq!(record_ids(&tavern), vec![hearsay.as_str()]);
     step(
         5,
         &format!(
-            "evidence: cog_observed persisted (truth False, Perception, evidence {}) at carrier revision 3; selected cog_observed; adopted entry unchanged; hearsay still recallable",
-            observed.record_id
+            "evidence: cog_observed persisted (truth False, Perception, evidence {observed}) at carrier revision 3; selected cog_observed; adopted entry unchanged; hearsay still recallable"
         ),
     );
 
@@ -593,6 +933,8 @@ pub async fn run_story(label: &str) {
     store.close().await;
 
     let store = MindStore::open(&path).await.expect("reopen the store");
+    let pool = store.pool();
+    let adapter = MemoryAdapter::new(false);
     let wren = store.knowledge(KnowledgeScope::new("wren"));
     let studio = store.knowledge(KnowledgeScope::new("studio"));
     let carrier_reopened = expect_ok(
@@ -608,10 +950,13 @@ pub async fn run_story(label: &str) {
         expected_value
     );
     assert!(expect_ok(studio.list_entries().await, "list studio after reopen").is_empty());
+    let reopened_tavern =
+        recalled(&pool, &adapter, &wren_caller, "wren", in_context("tavern")).await;
+    assert_eq!(record_ids(&reopened_tavern), vec![hearsay.as_str()]);
     step(
         7,
         &format!(
-            "reopen: derived state equals the pre-close state (holder {}, revision 3, records cog_hearsay, cog_observed); studio empty",
+            "reopen: derived state equals the pre-close state (holder {}, revision 3, records cog_hearsay, cog_observed); {hearsay} still recallable; studio empty",
             reopened_view.holder_entry_id
         ),
     );
