@@ -1001,7 +1001,10 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         settled["mind_state_version"], 2,
         "the second write descends from its own carrier, never the first's"
     );
-    assert_eq!(carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await, 2);
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        2
+    );
     assert_eq!(
         carrier_revision(&pool, COLLECTION, CARRIER).await,
         2,
@@ -1087,7 +1090,10 @@ async fn a_peer_without_a_route_cannot_write_the_carrier() {
         session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
         "recall by a peer without a knowledge route",
     );
-    assert_eq!(packed_record_ids(&recalled), ["rec_market", "rec_north_gate"]);
+    assert_eq!(
+        packed_record_ids(&recalled),
+        ["rec_market", "rec_north_gate"]
+    );
     assert_eq!(
         recalled["knowledge"],
         json!([]),
@@ -1189,7 +1195,12 @@ async fn an_unserved_tool_answers_op_unsupported() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[])),
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            routes(&[]),
+        ),
     );
     assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
 
@@ -1210,7 +1221,12 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[])),
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            routes(&[]),
+        ),
     );
     assert!(
         !capabilities(&surface).contains(&DELIBERATE),
@@ -1235,7 +1251,12 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
 async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[]));
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
     faces.tools = vec![ToolRegistration::new(
         deliberate_descriptor(),
         |_responder| {
@@ -1277,7 +1298,12 @@ async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
 async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default(), routes(&[]));
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
     faces.tools = vec![ToolRegistration::new(
         host_tool_descriptor(),
         |_responder| {
