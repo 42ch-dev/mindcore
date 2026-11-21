@@ -47,10 +47,16 @@ pub fn adoption_anchor(shared_entry_id: &str, basis: &str) -> SourceAnchor {
 ///
 /// Returns the entry's own anchor type directly: the copy's `source_anchor` field is assigned the
 /// result, so no wire round trip is needed between the two generated copies of the type.
+///
+/// Answers `None` for the two shapes [`adoption_anchor_parts`] cannot read back — an empty shared
+/// id and a zero revision — so a caller refuses before a copy is anchored on them.
 pub fn adoption_anchor_at_revision(
     shared_entry_id: &str,
     source_revision: u64,
-) -> EntrySourceAnchor {
+) -> Option<EntrySourceAnchor> {
+    if shared_entry_id.is_empty() || source_revision == 0 {
+        return None;
+    }
     // Both constants satisfy the pinned wire pattern `^[a-z][a-z0-9_-]*$` and the `>= 1` bound.
     let namespace = EntryExtensionKey::try_from("mindcore_adoption").expect("valid extension key");
     let extension = Map::from_iter([
@@ -60,14 +66,14 @@ pub fn adoption_anchor_at_revision(
         ),
         ("source_revision".to_string(), Value::from(source_revision)),
     ]);
-    EntrySourceAnchor {
+    Some(EntrySourceAnchor {
         extensions: Shared2::from(HashMap::from([(namespace, extension)])),
         label: None,
         mime_type: None,
         schema_version: Shared1::from(NonZeroU64::new(1).expect("non-zero wire baseline")),
         source_id: format!("shared:{shared_entry_id}"),
         span: None,
-    }
+    })
 }
 
 /// The shared entry id an adoption anchor points at and, when it records one, the adopted revision.

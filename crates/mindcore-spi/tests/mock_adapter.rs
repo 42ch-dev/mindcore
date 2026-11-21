@@ -504,6 +504,11 @@ async fn adoption_over_a_port_double_creates_once_and_refuses_an_absent_source()
         anchor["extensions"]["mindcore_adoption"]["source_revision"],
         json!(1)
     );
+    assert_eq!(
+        mindcore_base::knowledge::adoption_anchor_parts(&created),
+        Some((entry_id, Some(1))),
+        "every created anchor round-trips through the shared parser"
+    );
 
     let repeat = match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
         SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing)) => existing,
@@ -529,5 +534,46 @@ async fn adoption_over_a_port_double_creates_once_and_refuses_an_absent_source()
             assert!(reject.details.is_none());
         }
         other => panic!("an absent source must be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
+    let src = MemoryKnowledgeEntries::default();
+    let dst = MemoryKnowledgeEntries::default();
+
+    // A store may hold an empty key: the create path binds the id as given. Anchoring that copy
+    // would write the bare `shared:` locator the parser rejects, so the call refuses first.
+    let empty_source = match src.put_knowledge_entry(shared_entry(""), None).await {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
+    };
+    assert_eq!(empty_source.revision, Some(1));
+    match adopt_knowledge_entry(&src, &dst, "", 1).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert_eq!(
+                reject.message,
+                "an adoption anchors a non-empty entry id at a positive source revision"
+            );
+        }
+        other => panic!("an empty entry id must be refused, got {other:?}"),
+    }
+
+    // Revision zero names no assigned revision either.
+    let entry_id = "ke_shared_gate";
+    match src.put_knowledge_entry(shared_entry(entry_id), None).await {
+        SpokeResult::Ok(entry) => assert_eq!(entry.revision, Some(1)),
+        SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
+    }
+    match adopt_knowledge_entry(&src, &dst, entry_id, 0).await {
+        SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
+        other => panic!("a zero revision must be refused, got {other:?}"),
+    }
+
+    // Neither refusal claimed the slot: the first anchored adoption still creates.
+    match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+        SpokeResult::Ok(AdoptionOutcome::Created(created)) => assert_eq!(created.revision, Some(1)),
+        other => panic!("the refusals must leave the slot empty, got {other:?}"),
     }
 }

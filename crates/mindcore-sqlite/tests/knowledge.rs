@@ -1,12 +1,17 @@
 //! Behaviour of the scoped knowledge port over real SQLite files.
 
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
@@ -17,7 +22,7 @@ use serde_json::{json, Map, Value};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
     ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
-    KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner,
+    KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner, Shared3,
     SourceAnchor as EntrySourceAnchor,
 };
 use spoke_schemas::source_anchor::ExtensionKey as AnchorExtensionKey;
@@ -2500,6 +2505,13 @@ fn anchor_source_revision(entry: &KnowledgeEntry) -> Option<u64> {
     adoption_anchor_json(entry)["extensions"]["mindcore_adoption"]["source_revision"].as_u64()
 }
 
+/// A fixed instant, so a copy that inherited its source's timestamps would show one.
+fn instant(text: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(text)
+        .expect("valid instant")
+        .with_timezone(&Utc)
+}
+
 fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
     match result {
         SpokeResult::Ok(outcome) => panic!("{context}: unexpectedly adopted {outcome:?}"),
@@ -2530,14 +2542,20 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     let reader = second_connection(&path).await;
 
     let shared_id = "ke_shared_north_gate";
-    let shared = cognition_entry(
+    let mut shared = cognition_entry(
         shared_id,
         "The north gate is shut after dusk.",
         vec![belief(shared_id, "cog_shared_gate")],
     );
-    expect_ok(
+    shared.created_at = Some(instant("2026-11-01T09:00:00Z"));
+    shared.updated_at = Some(Shared3(instant("2026-11-02T09:00:00Z")));
+    let seeded = expect_ok(
         src.put_knowledge_entry(shared.clone(), None).await,
         "seed the shared source",
+    );
+    assert!(
+        seeded.created_at.is_some() && seeded.updated_at.is_some(),
+        "the source carries both timestamps, so the copy's cleared ones mean something"
     );
     let source_before = stored_row(&reader, "shared", shared_id).await;
 
@@ -2568,6 +2586,11 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     assert!(
         record_ids(&created).is_empty(),
         "the source's judgments must not become personal committed records"
+    );
+    assert_eq!(
+        module_of(&created).and_then(|module| module.get("records")),
+        Some(&json!([])),
+        "the copy's cognition history is an explicit empty array, not a dropped member"
     );
 
     // The source is only ever read: payload and revision are byte-identical afterwards.
@@ -2619,6 +2642,63 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     .await
     .expect("destination row count");
     assert_eq!(rows, 1);
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded() {
+    let path = database_path("adopt-superseded-source");
+    let store = MindStore::open(&path).await.expect("open store");
+    let src = store.knowledge(KnowledgeScope::new("shared"));
+    let dst = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let shared_id = "ke_shared_gate";
+    expect_ok(
+        src.put_knowledge_entry(entry_with(shared_id, "shut after dusk"), None)
+            .await,
+        "seed the source",
+    );
+    let adopted = match expect_ok(
+        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        "first adoption",
+    ) {
+        AdoptionOutcome::Created(created) => created,
+        other => panic!("the first adoption must create the copy, got {other:?}"),
+    };
+
+    expect_ok(
+        src.put_knowledge_entry(entry_with("ke_shared_successor", "open again"), None)
+            .await,
+        "seed the successor",
+    );
+    expect_ok(
+        supersede(&src, shared_id, 1, "ke_shared_successor").await,
+        "mark the source superseded",
+    );
+    let copy_before = stored_row(&reader, "wren", shared_id).await;
+
+    // The source gate runs before the repeat path: an adopted source that is now hidden answers
+    // the same generic absence as a missing one, and the stored copy stays exactly as adopted.
+    expect_source_absent(
+        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        "a repeat whose source turned superseded",
+    );
+    assert_eq!(
+        stored_row(&reader, "wren", shared_id).await,
+        copy_before,
+        "the refused repeat leaves the adopted copy untouched"
+    );
+    assert_eq!(
+        as_json(&expect_ok(
+            dst.get_knowledge_entry(shared_id).await,
+            "read the adopted copy back"
+        )),
+        as_json(&adopted)
+    );
 
     reader.close().await;
     store.close().await;
@@ -2771,6 +2851,185 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
 }
 
 #[tokio::test]
+async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
+    let path = database_path("adopt-superseded-occupant");
+    let store = MindStore::open(&path).await.expect("open store");
+    let src = store.knowledge(KnowledgeScope::new("shared"));
+    let dst = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        src.put_knowledge_entry(entry_with("ke_shared_gate", "shared fact"), None)
+            .await,
+        "seed the source",
+    );
+    for entry_id in ["ke_shared_gate", "ke_wren_successor"] {
+        expect_ok(
+            dst.put_knowledge_entry(entry_with(entry_id, entry_id), None)
+                .await,
+            "seed the wren occupant pair",
+        );
+    }
+    expect_ok(
+        supersede(&dst, "ke_shared_gate", 1, "ke_wren_successor").await,
+        "mark the wren occupant superseded",
+    );
+    let occupant_before = stored_state(&reader, "ke_shared_gate").await;
+
+    // The live read hides the marked row, but the slot is occupied: a superseded occupant answers
+    // the same occupancy refusal as any unrelated one, and it is never overwritten.
+    match adopt_knowledge_entry(&src, &dst, "ke_shared_gate", 1).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
+            assert_eq!(
+                reject.message, "knowledge entry ke_shared_gate already exists",
+                "the occupancy refusal carries no supersede diagnostic"
+            );
+            assert!(reject.details.is_none());
+        }
+        other => panic!("a superseded occupant must refuse the adoption, got {other:?}"),
+    }
+    assert_eq!(
+        stored_state(&reader, "ke_shared_gate").await,
+        occupant_before,
+        "the superseded occupant keeps its marker, payload, revision, preimages and records"
+    );
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
+    let path = database_path("adopt-invalid-copy");
+    let store = MindStore::open(&path).await.expect("open store");
+    let src = store.knowledge(KnowledgeScope::new("shared"));
+    let dst = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    // A stored source whose cognition carrier is not the object shape the write gate accepts. The
+    // copy cannot be written, and that plain `InvalidInput` must surface as itself: only the
+    // adapter's structured superseded detail means occupancy.
+    let payload = json!({
+        "schema_version": 1,
+        "entry_id": "ke_broken_carrier",
+        "entry_type": "location",
+        "canonical_name": "ke_broken_carrier name",
+        "status": "confirmed",
+        "revision": 1,
+        "body": {"summary": "shared fact"},
+        "extensions": {},
+        "modules": {"cognition": [{"records": []}]}
+    });
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('shared', 'ke_broken_carrier', 1, ?, \
+         '2026-11-01T09:00:00.000000000+00:00', '2026-11-01T09:00:00.000000000+00:00')",
+    )
+    .bind(payload.to_string())
+    .execute(&reader)
+    .await
+    .expect("seed the carrier the write gate refuses");
+
+    match adopt_knowledge_entry(&src, &dst, "ke_broken_carrier", 1).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert!(
+                reject.details.is_none(),
+                "a validation refusal is not the structured occupancy detail"
+            );
+        }
+        other => panic!("an unwritable copy must refuse the adoption, got {other:?}"),
+    }
+    assert_eq!(
+        expect_reject(
+            dst.get_knowledge_entry("ke_broken_carrier").await,
+            "the refused copy claims no destination slot",
+        ),
+        SpokeRejectCode::KnowledgeEntryNotFound
+    );
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+/// A destination port that holds its first absent slot read until its peer has made the same read,
+/// so both adoptions observe the empty slot before either can write. Later reads — the
+/// create-conflict re-read among them — pass straight through.
+struct GatedDestination {
+    inner: ScopedKnowledgeStore,
+    parked: Mutex<ParkedReads>,
+    first_read: AtomicBool,
+}
+
+/// The two-reader rendezvous behind [`GatedDestination`]: the first arrival parks, the second
+/// wakes it, and both proceed.
+#[derive(Default)]
+struct ParkedReads {
+    open: bool,
+    wakers: Vec<Waker>,
+}
+
+impl GatedDestination {
+    fn new(inner: ScopedKnowledgeStore) -> Self {
+        Self {
+            inner,
+            parked: Mutex::new(ParkedReads::default()),
+            first_read: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether this port has already observed the empty slot.
+    fn observed_absent(&self) -> bool {
+        self.first_read.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl KnowledgeEntryPort for GatedDestination {
+    async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        let read = self.inner.get_knowledge_entry(entry_id).await;
+        let absent = matches!(
+            &read,
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound
+        );
+        if absent && !self.first_read.swap(true, Ordering::SeqCst) {
+            poll_fn(|cx| {
+                let mut parked = self.parked.lock().expect("parked reads lock");
+                if parked.open {
+                    return Poll::Ready(());
+                }
+                if parked.wakers.is_empty() {
+                    parked.wakers.push(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                for waker in parked.wakers.drain(..) {
+                    waker.wake();
+                }
+                parked.open = true;
+                Poll::Ready(())
+            })
+            .await;
+        }
+        read
+    }
+
+    async fn put_knowledge_entry(
+        &self,
+        entry: KnowledgeEntry,
+        expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        self.inner
+            .put_knowledge_entry(entry, expected_base_revision)
+            .await
+    }
+}
+
+#[tokio::test]
 async fn two_handles_adopt_one_copy_and_agree_on_it() {
     let path = database_path("adopt-cross-handle");
     let left_store = MindStore::open(&path).await.expect("open left store");
@@ -2779,6 +3038,8 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
     let right_src = right_store.knowledge(KnowledgeScope::new("shared"));
     let left_dst = left_store.knowledge(KnowledgeScope::new("wren"));
     let right_dst = right_store.knowledge(KnowledgeScope::new("wren"));
+    let left_gated = GatedDestination::new(left_store.knowledge(KnowledgeScope::new("wren")));
+    let right_gated = GatedDestination::new(right_store.knowledge(KnowledgeScope::new("wren")));
     let reader = second_connection(&path).await;
 
     let shared_id = "ke_shared_gate";
@@ -2789,9 +3050,15 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
         "seed the source",
     );
 
+    // Both destination reads see the empty slot before either write starts, so the create that
+    // loses the claim can only answer `AlreadyPresent` through the post-conflict re-read.
     let (left, right) = tokio::join!(
-        adopt_knowledge_entry(&left_src, &left_dst, shared_id, 1),
-        adopt_knowledge_entry(&right_src, &right_dst, shared_id, 1),
+        adopt_knowledge_entry(&left_src, &left_gated, shared_id, 1),
+        adopt_knowledge_entry(&right_src, &right_gated, shared_id, 1),
+    );
+    assert!(
+        left_gated.observed_absent() && right_gated.observed_absent(),
+        "both adoptions must have read the destination slot as empty"
     );
     let (created, present) = match (
         expect_ok(left, "left adoption"),
