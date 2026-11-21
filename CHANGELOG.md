@@ -17,17 +17,15 @@
 - Dependencies: the SPOKE cohort is pinned to `=0.17.0` — `spoke-schemas` and `spoke-operations` in
   `[workspace.dependencies]`, and `spoke-connect` there too, so the SQLite test dependency inherits
   the same pin with `remote-adapter` enabled.
-- `mindcore-sqlite`: pre-release migrations are mutable. A database that already applied a migration
-  whose embedded file has since changed is refused by `MindStore::open` with a checksum mismatch;
-  there is no upgrade path until the first release. A database whose applied migrations still match
-  opens normally, whatever commit created it — but cross-commit compatibility is unsupported and
-  untested.
+- `mindcore-sqlite`: pre-release migrations are mutable and the embedded set is now one initial
+  file: `0002` is deleted and its table lives in `0001_init.sql`. There is no upgrade path until the
+  first release, so an existing database must be recreated. The refusal names what the file already
+  applied: SQLx reports `VersionMissing(2)` when the removed `0002` was applied, and a checksum
+  mismatch when an applied version remains but its SQL changed.
 - `mindcore-sqlite`: optional retained-vector storage. `memory_embedding_vectors` holds one
   little-endian `f32` vector per `(record_id, identity_hash)` with its record revision and dimension,
-  indexed by identity so a retired identity's whole partition is one delete. `0002` is additive and
-  applies at open to an existing database whose earlier migrations still match; only a database whose
-  applied `0001` no longer matches its file is refused by the checksum and must be recreated. The
-  table starts empty.
+  indexed by identity so a retired identity's whole partition is one delete. The table is part of the
+  single initial migration and starts empty.
 - `mindcore-sqlite`: a knowledge list hydrates its page's cognition records in one statement keyed
   by the page's entries, not one statement per entry.
 - `mindcore-spoke`: the recall knowledge slot applies the served list's disclosure predicate. The
