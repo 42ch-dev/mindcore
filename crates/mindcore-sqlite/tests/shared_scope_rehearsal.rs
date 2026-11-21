@@ -560,6 +560,36 @@ async fn shared_scope_holds_the_seven_named_facts() {
         "I-000009 item 6 (backup/restore): the shared row's revision and payload bytes survive the \
          copy"
     );
+    assert_eq!(
+        carrier_header(&pool, SHARED, "ke_keeper_log").await,
+        (1, Some(2)),
+        "I-000009 item 6 (backup/restore): the original carrier keeps its revision and head on the \
+         copy"
+    );
+    assert_eq!(
+        expect_ok(
+            shared.get_knowledge_entry("ke_keeper_log").await,
+            "item 6: read the original carrier on the copy",
+        )
+        .body
+        .summary
+        .as_deref(),
+        Some(CARRIER_SUMMARY),
+        "I-000009 item 6 (backup/restore): the original carrier keeps its committed payload on the \
+         copy"
+    );
+    assert_eq!(
+        expect_ok(
+            read_records(&pool, SHARED, "ke_keeper_log").await,
+            "item 6: read the original carrier's records on the copy",
+        )
+        .iter()
+        .filter_map(|record| record["record_id"].as_str())
+        .collect::<Vec<_>>(),
+        ["cog_1", "cog_2"],
+        "I-000009 item 6 (backup/restore): the original carrier keeps its committed records on the \
+         copy"
+    );
 
     // Item 3 is re-probed on the copy under ids this file has not written yet: the same viewpoint
     // split for a live entry, the same ordinary absence for both viewpoints once retired, and the
