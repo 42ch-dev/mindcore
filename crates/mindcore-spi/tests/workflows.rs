@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -1398,6 +1398,8 @@ struct Recorded {
     fills: Arc<Mutex<Vec<(String, u64)>>>,
     /// Pending candidate sets the coordinator recorded as its decision.
     pending: Arc<Mutex<Vec<Vec<String>>>>,
+    /// The next marker write refuses: the decision its run made stays unrecorded.
+    fail_pending_write: Arc<AtomicBool>,
 }
 
 /// One captured candidate over a fixed page, with every submitted settlement
@@ -1473,6 +1475,13 @@ impl WorkflowBinding for AbsorbDouble {
         _request: &MemoryCaptureRequest,
         pending_candidate_ids: &[&str],
     ) -> Result<(), SpiError> {
+        if self
+            .recorded
+            .fail_pending_write
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(marker_write_failed());
+        }
         self.recorded.pending.lock().expect("pending writes").push(
             pending_candidate_ids
                 .iter()
@@ -2057,6 +2066,50 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
         recorded.pending.lock().expect("pending writes").as_slice(),
         [vec!["cnd_1".to_string()]],
         "the fresh Pending decision is recorded once and its replay writes no second marker"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_records_the_decision_its_first_run_could_not_write() {
+    let (workflows, recorded, _) = absorb(pending_candidate());
+    let caps = MindCapabilities::default();
+    recorded.fail_pending_write.store(true, Ordering::SeqCst);
+
+    // The capture commits and the marker write fails: the run must not report
+    // a decision it never recorded.
+    let failed = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await;
+    assert!(
+        matches!(failed, Err(SpiError::Settlement(_))),
+        "a failed marker write fails the run"
+    );
+    assert!(recorded.pending.lock().expect("pending writes").is_empty());
+
+    // The retry replays that capture and still projects Pending: it records
+    // the decision before returning it.
+    let retried = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("retried absorb");
+    assert_eq!(
+        retried,
+        vec![AbsorbCandidateOutcome::Pending {
+            candidate_id: "cnd_1".to_string(),
+        }]
+    );
+
+    // A further replay reports the recorded decision and writes no second
+    // marker: the Pending the retry returned is now the stable answer.
+    let replay = workflows
+        .absorb(&principal(), &capture_request(), None, &caps)
+        .await
+        .expect("replayed absorb");
+    assert_eq!(replay, retried);
+    assert_eq!(
+        recorded.pending.lock().expect("pending writes").as_slice(),
+        [vec!["cnd_1".to_string()]],
+        "exactly one marker records the Pending decision"
     );
 }
 
@@ -2678,6 +2731,16 @@ impl DomainLens for RefusingAdrLens {
         *self.0.lock().expect("draft") = Some(target_kind.clone());
         Err("an unverified observation cannot become an ADR".to_string())
     }
+}
+
+/// The refusal a binding returns when the marker its run owed could not be
+/// written, after the capture it names had already committed.
+fn marker_write_failed() -> SpiError {
+    SpiError::Settlement(spoke_operations::SpokeReject {
+        code: SpokeRejectCode::InternalError,
+        message: "the absorb decision could not be written".to_string(),
+        details: None,
+    })
 }
 
 fn revision_conflict() -> SpiError {

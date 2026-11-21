@@ -523,7 +523,10 @@ impl SpiMindWorkflows {
     /// that leaves fresh candidates pending returns, the binding records one
     /// durable decision marker for them; a replay reads that marker and
     /// reports the original `Pending` outcome even after the candidate was
-    /// resolved elsewhere.
+    /// resolved elsewhere. A replay whose candidate is still pending and has no
+    /// marker is the retry of a run that failed between its capture commit and
+    /// that write: it records the marker before returning, so the `Pending` it
+    /// reports now stays the answer later replays give.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -545,6 +548,12 @@ impl SpiMindWorkflows {
         } in candidates
         {
             if replayed {
+                // Pending with no marker is a retry of the run whose marker
+                // write failed after its capture committed: without this write
+                // a later replay would report the resolution, not the decision.
+                if lifecycle == CandidateLifecycle::Pending {
+                    held.push(candidate_id.clone());
+                }
                 outcomes.push(match lifecycle {
                     CandidateLifecycle::Pending | CandidateLifecycle::PendingDecision => {
                         AbsorbCandidateOutcome::Pending { candidate_id }
