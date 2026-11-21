@@ -42,9 +42,12 @@ alone writes and never projects.
    order. No new table: the journal already holds workflow-owned records.
 2. **Read the record before projecting anything.** Replay looks up the decision first. Only a request
    with no record falls back to projecting current state — that fallback keeps a request that never
-   produced a decision from inheriting someone else's answer. A request with no record whose receipt
-   still holds a pending candidate is the retry of a run that failed before writing: it records the
-   receipt's complete candidate list, the whole domain the decision ranged over, before returning.
+   produced a decision from inheriting someone else's answer. A request with no record is the retry of
+   a run that failed before writing, and it repairs only what the receipt still shows: a receipt whose
+   candidates are all still pending proves that run settled nothing, so the retry records the receipt's
+   complete candidate list — the whole domain the decision ranged over — before returning. A receipt
+   that is already mixed (some consumed, some pending) proves nothing about that decision, so the retry
+   records no marker and reports each candidate from its own state.
 3. **Fail closed on an inconsistent record.** Compare the complete identity the writer recorded
    (receipt, subject, requester, idempotency key) and validate the payload's shape: nonempty, unique,
    receipt-ordered candidate ids, and an object with exactly one member. A malformed or mismatched
@@ -58,9 +61,9 @@ alone writes and never projects.
 
 The decision survives exactly as long as its own record, independent of what happens to the candidate.
 Replay is idempotent by construction: a replay that finds the record returns the recorded answer,
-writes nothing new, and never auto-settles. A replay that finds none while the receipt still holds a
-pending candidate writes the record once — the retry-repair of a run that failed between its capture
-commit and the marker write — and every later replay returns that same answer.
+writes nothing new, and never auto-settles. A replay that finds none while the receipt is still wholly
+pending writes the record once — the retry-repair of a run that failed between its capture commit and
+the marker write — and every later replay returns that same answer.
 
 ## Traps
 
@@ -70,6 +73,9 @@ commit and the marker write — and every later replay returns that same answer.
   with a different subject pass as authoritative.
 - **Subset checks accept empty lists.** "All listed ids are in the receipt" is satisfied by `[]`, and
   an empty list then means "no pending work" — the opposite of the recorded decision.
+- **A repair the receipt cannot prove.** A receipt with some candidates consumed and some pending no
+  longer shows what the failed run decided. Recording the whole list there permanently reports a
+  candidate that already produced a record as pending. Repair only a wholly pending receipt.
 - **Classifying caller input as provider failure.** When a caller-supplied field fails a schema the
   provider draft would also be checked against, reporting `InvalidReasonerOutput` blames the wrong
   side; classify it as an input error and leave provider rejections untouched.
