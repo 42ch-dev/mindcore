@@ -54,6 +54,11 @@ CREATE INDEX idx_memory_grants_space_principal
 CREATE INDEX idx_memory_grants_space_subject
     ON memory_grants (space_id, subject_id);
 
+-- The serving path lists one principal's grants, so this index drives from the principal and the
+-- cost follows that principal's grants rather than the total number of spaces.
+CREATE INDEX idx_memory_grants_principal_space
+    ON memory_grants (principal_id, space_id);
+
 -- ── Content plane ──
 CREATE TABLE memory_candidates (
     candidate_id TEXT PRIMARY KEY,
