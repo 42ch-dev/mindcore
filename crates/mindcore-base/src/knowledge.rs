@@ -24,8 +24,8 @@ impl KnowledgeScope {
     }
 }
 
-/// Builds the provenance pointer from a personal entry back to the shared entry it was adopted from.
-/// Build an adoption anchor **without** a source revision.
+/// Build an adoption anchor **without** a source revision — the legacy provenance pointer from a
+/// personal entry back to the shared entry it was adopted from.
 ///
 /// This shape cannot be recognized by `mindcore_spi::adopt_knowledge_entry`: an anchor with no
 /// recorded revision answers as an unrelated occupant on a repeat. New callers use
