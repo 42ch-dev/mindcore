@@ -21,6 +21,7 @@ use spoke_schemas::knowledge_entry::{
     KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner,
 };
 use spoke_schemas::KnowledgeEntry;
+use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -240,6 +241,57 @@ fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
             );
         }
     }
+}
+
+fn expect_history_truncated<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) {
+    match result {
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::KnowledgeEntryNotFound,
+                "{context}"
+            );
+            assert_eq!(
+                reject.message, "knowledge entry revision was pruned",
+                "{context}"
+            );
+            assert_eq!(
+                reject
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("reason")),
+                Some(&Value::from("HISTORY_TRUNCATED")),
+                "{context}: the truncation refusal names its class"
+            );
+        }
+    }
+}
+
+async fn history_floor(pool: &SqlitePool, collection: &str, entry_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT history_floor_revision FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .expect("stored history floor")
+}
+
+// The prune method lands in Task 2; until then the floor is only reachable through its column.
+async fn seed_history_floor(pool: &SqlitePool, collection: &str, entry_id: &str, floor: i64) {
+    sqlx::query(
+        "UPDATE knowledge_entries SET history_floor_revision = ? \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(floor)
+    .bind(collection)
+    .bind(entry_id)
+    .execute(pool)
+    .await
+    .expect("seed a history floor");
 }
 
 const REVISION_ONE: &str = "the north gate shuts after dusk";
@@ -608,6 +660,157 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     expect_revision_absent(
         shared.get_entry_at_revision("entry-b", 2).await,
         "a revision of a live entry that never existed",
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
+    let path = database_path("floor");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+
+    // Three revisions: the first carries no record, the second one, the third two.
+    let created = expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-f", REVISION_ONE), None)
+            .await,
+        "create entry-f",
+    );
+    let second = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry("entry-f", REVISION_TWO, vec![belief("entry-f", "cog_one")]),
+                Some(1),
+            )
+            .await,
+        "second revision",
+    );
+    let third = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    REVISION_THREE,
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(2),
+            )
+            .await,
+        "third revision",
+    );
+
+    // The column default starts a fresh row at 1: creation never names it, and neither update
+    // moved it.
+    let pool = store.pool();
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 1);
+
+    // At or above floor 1 every revision replays as stored: 1 and 2 from a saved checkpoint, 3
+    // from the live row.
+    for (revision, expected) in [
+        (1, as_json(&created)),
+        (2, as_json(&second)),
+        (3, as_json(&third)),
+    ] {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-f", revision).await,
+                "replay at the default floor"
+            )),
+            expected,
+            "revision {revision} replays unchanged at the default floor"
+        );
+    }
+
+    // Task 2 ships the prune; seed its floor directly so the read gate is proven now.
+    seed_history_floor(&pool, "shared", "entry-f", 2).await;
+
+    // Below the floor the preimage was pruned: that is not the generic absence.
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-f", 1).await,
+        "a revision below the seeded floor",
+    );
+
+    // At or above the floor replay is byte-identical to the pre-seed result: revision 2 is a
+    // checkpoint hit and revision 3 the live fallback.
+    for (revision, expected) in [(2, as_json(&second)), (3, as_json(&third))] {
+        assert_eq!(
+            as_json(&expect_ok(
+                shared.get_entry_at_revision("entry-f", revision).await,
+                "replay at the seeded floor"
+            )),
+            expected,
+            "revision {revision} replays unchanged above the floor"
+        );
+    }
+
+    // A later full write leaves the floor alone: the column is storage-owned, not payload-derived.
+    let fourth = expect_ok(
+        shared
+            .put_knowledge_entry(
+                cognition_entry(
+                    "entry-f",
+                    "the mill door is barred",
+                    vec![belief("entry-f", "cog_one"), belief("entry-f", "cog_two")],
+                ),
+                Some(3),
+            )
+            .await,
+        "fourth revision",
+    );
+    assert_eq!(fourth.revision, Some(4));
+    assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
+
+    // Generic absence still covers zero, the unrepresentable range, a missing entry and a revision
+    // above the live one; a floor never turns one of those into a refusal that claims a prune.
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", 0).await,
+        "revision zero",
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", u64::MAX).await,
+        "a revision outside the representable range",
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-never-seeded", 2).await,
+        "a missing entry",
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", 5).await,
+        "a revision above the live one",
+    );
+
+    // The floor lives on the entry row, so the truncation refusal survives a close and reopen of
+    // the same file instead of being reconstructed in memory.
+    drop(pool);
+    store.close().await;
+    let store = MindStore::open(&path).await.expect("reopen the store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    assert_eq!(history_floor(&store.pool(), "shared", "entry-f").await, 2);
+    expect_history_truncated(
+        shared.get_entry_at_revision("entry-f", 1).await,
+        "a pruned revision after reopen",
+    );
+    assert_eq!(
+        as_json(&expect_ok(
+            shared.get_entry_at_revision("entry-f", 2).await,
+            "a checkpoint above the floor after reopen"
+        )),
+        as_json(&second)
+    );
+    assert_eq!(
+        as_json(&expect_ok(
+            shared.get_entry_at_revision("entry-f", 4).await,
+            "the live revision after reopen"
+        )),
+        as_json(&fourth)
+    );
+    expect_revision_absent(
+        shared.get_entry_at_revision("entry-f", 5).await,
+        "a revision above the live one after reopen",
     );
 
     store.close().await;

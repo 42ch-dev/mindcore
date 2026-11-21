@@ -120,8 +120,9 @@ impl ScopedKnowledgeStore {
     ///
     /// Checkpoint selection and record hydration share one read transaction, so the replay is a
     /// whole committed state. Revision `0`, a revision the entry never held and a missing entry
-    /// answer with the same `KnowledgeEntryNotFound`; a superseded entry still replays from its
-    /// own history.
+    /// answer the same generic `KnowledgeEntryNotFound`; a revision below the entry's persisted
+    /// floor answers `KnowledgeEntryNotFound` with `details.reason` `HISTORY_TRUNCATED`. A
+    /// superseded entry still replays from its own history.
     pub async fn get_entry_at_revision(
         &self,
         entry_id: &str,
@@ -657,6 +658,22 @@ fn revision_not_found<T>() -> SpokeResult<T> {
     )
 }
 
+// One rejection for a revision below the entry's persisted floor: its preimage was pruned, and
+// the entry still exists, so this is not the generic absence above. The code is shared with that
+// absence; the `reason` token is what a caller matches.
+fn revision_pruned<T>() -> SpokeResult<T> {
+    let mut details = Map::new();
+    details.insert(
+        "reason".to_string(),
+        Value::String("HISTORY_TRUNCATED".to_string()),
+    );
+    spoke_reject(
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "knowledge entry revision was pruned",
+        Some(details),
+    )
+}
+
 pub(crate) fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
     spoke_reject(SpokeRejectCode::InternalError, message, None)
 }
@@ -909,6 +926,9 @@ async fn read_lifecycle(
 /// One entry of `collection` as it was stored at `revision`, read through the caller's
 /// transaction so checkpoint selection and record hydration project one snapshot.
 ///
+/// The entry row leads the read: it carries the live revision and the floor below which preimages
+/// were pruned, and the first saved checkpoint at or above the request joins it. A request below
+/// the floor is refused as pruned before the live fallback can answer it with current content.
 /// The first saved checkpoint at or above the requested revision supplies the payload and head;
 /// the live row stands in when no saved revision is that recent. The gap between them is advanced
 /// by dedicated appends alone, so it subtracts from the checkpoint head and the records are read
@@ -925,42 +945,49 @@ async fn read_entry_revision(
     if assigned < 1 {
         return revision_not_found();
     }
-    let saved: Result<Option<(i64, String, Option<i64>)>, sqlx::Error> = sqlx::query_as(
-        "SELECT revision, payload, cognition_head_seq FROM knowledge_entry_revisions \
-         WHERE collection = ? AND entry_id = ? AND revision >= ? \
-         ORDER BY revision ASC LIMIT 1",
-    )
-    .bind(collection)
-    .bind(entry_id)
-    .bind(assigned)
-    .fetch_optional(&mut **tx)
-    .await;
-    let checkpoint = match saved {
-        Ok(Some(checkpoint)) => checkpoint,
-        Ok(None) => {
-            let live: Result<Option<(i64, String, Option<i64>)>, sqlx::Error> = sqlx::query_as(
-                "SELECT revision, payload, cognition_head_seq FROM knowledge_entries \
-                 WHERE collection = ? AND entry_id = ?",
-            )
-            .bind(collection)
-            .bind(entry_id)
-            .fetch_optional(&mut **tx)
-            .await;
-            match live {
-                Ok(Some((stored, payload, head))) if stored >= assigned => (stored, payload, head),
-                Ok(_) => return revision_not_found(),
-                Err(error) => {
-                    return internal(format!("knowledge entry could not be read: {error}"))
-                }
-            }
-        }
+    // One entry-led statement carries the floor and live revision that decide the two refusals.
+    // The join is gated to the floor-to-live window, so an out-of-window request matches no saved
+    // row; checkpoint fields are chosen by saved-row presence, never by the head's nullness,
+    // because a checkpoint may itself have no head.
+    let selected: Result<Option<(i64, i64, String, Option<i64>, i64)>, sqlx::Error> =
+        sqlx::query_as(
+            "SELECT k.history_floor_revision, COALESCE(r.revision, k.revision), \
+                COALESCE(r.payload, k.payload), \
+                CASE WHEN r.revision IS NULL THEN k.cognition_head_seq \
+                     ELSE r.cognition_head_seq END, \
+                k.revision \
+         FROM knowledge_entries AS k \
+         LEFT JOIN knowledge_entry_revisions AS r \
+           ON r.collection = k.collection AND r.entry_id = k.entry_id \
+          AND r.revision >= ? AND ? >= k.history_floor_revision AND ? <= k.revision \
+         WHERE k.collection = ? AND k.entry_id = ? \
+         ORDER BY r.revision ASC LIMIT 1",
+        )
+        .bind(assigned)
+        .bind(assigned)
+        .bind(assigned)
+        .bind(collection)
+        .bind(entry_id)
+        .fetch_optional(&mut **tx)
+        .await;
+    let (floor, checkpoint_revision, payload, head, live) = match selected {
+        Ok(Some(selected)) => selected,
+        Ok(None) => return revision_not_found(),
         Err(error) => {
             return internal(format!(
                 "knowledge revision history could not be read: {error}"
             ))
         }
     };
-    let (checkpoint_revision, payload, head) = checkpoint;
+    // The floor gate runs before any checkpoint is used: the live fallback would otherwise answer
+    // a pruned revision with current content.
+    if assigned < floor {
+        return revision_pruned();
+    }
+    // Above the live revision no checkpoint exists; that stays the generic absence.
+    if assigned > live {
+        return revision_not_found();
+    }
     let gap = checkpoint_revision - assigned;
     let mut entry = match decode(&payload) {
         SpokeResult::Ok(entry) => entry,
