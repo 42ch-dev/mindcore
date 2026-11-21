@@ -35,15 +35,28 @@ mismatch: fix the cause and retry `open` instead of recreating the file.
 
 ## Checks
 
-Requires a stable Rust toolchain.
+Requires a stable Rust toolchain, `sqlite3`, and the `sqlx-cli` version `Cargo.lock` resolves (CI
+installs that version).
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
+
+# The offline query cache must match the embedded migration and query surface.
+fixture_dir="$(mktemp -d)"
+sqlite3 -bail "$fixture_dir/settlement.db" < crates/mindcore-sqlite/migrations/0001_init.sql
+SQLX_OFFLINE=false DATABASE_URL="sqlite://$fixture_dir/settlement.db" \
+  cargo sqlx prepare --workspace -- --locked --workspace --all-targets
+if [ -n "$(git status --porcelain --untracked-files=all -- .sqlx/)" ]; then
+  echo ".sqlx offline cache is stale"
+  exit 1
+fi
+
+SQLX_OFFLINE=true cargo clippy --locked --workspace --all-targets -- -D warnings
+SQLX_OFFLINE=true cargo test --locked --workspace
 ```
 
-CI runs these same three commands (`.github/workflows/ci.yml`). To watch the story end to end:
+CI runs these same steps (`.github/workflows/ci.yml`) and fails on any `.sqlx/` drift. To watch the
+story end to end:
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
