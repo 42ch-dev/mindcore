@@ -4,6 +4,7 @@
 //! relies on test-double logic), then drives the shipped `PromptReasoner`,
 //! `NoEmbeddings` and `DefaultPolicy` implementations.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,14 +13,16 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use mindcore_spi::{
-    AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DeliberateOutcome,
-    DeliberateRequest, DomainLens, Embedder, EmbeddingIdentity, LensOutput, MindCapabilities,
-    MindWorkflows, NoEmbeddings, PolicyDecision, PolicyHook, PromptReasoner, ProposalDraft,
-    Reasoner, SettlementDraft, SpiError, StructuredReasonRequest,
+    adopt_knowledge_entry, AbsorbCandidateOutcome, AdoptionOutcome, CognitiveTaskKind, ContextPack,
+    DefaultPolicy, DeliberateOutcome, DeliberateRequest, DomainLens, Embedder, EmbeddingIdentity,
+    LensOutput, MindCapabilities, MindWorkflows, NoEmbeddings, PolicyDecision, PolicyHook,
+    PromptReasoner, ProposalDraft, Reasoner, SettlementDraft, SpiError, StructuredReasonRequest,
 };
+use spoke_operations::{spoke_reject, KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::ops::memory_candidates_review_request::Decision;
 use spoke_schemas::{
-    CognitionRecord, MemoryCandidate, MemoryCaptureRequest, MemoryRecallRequest, Principal,
+    CognitionRecord, KnowledgeEntry, MemoryCandidate, MemoryCaptureRequest, MemoryRecallRequest,
+    Principal,
 };
 
 // ---------- wire fixtures (same shapes the SPOKE schema tests pin) ----------
@@ -410,4 +413,121 @@ async fn prompt_reasoner_propagates_transport_refusals() {
         other => panic!("expected ReasonerFailed, got {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one prompt call");
+}
+
+// ---------- adoption helper over an in-memory port double ----------
+
+#[derive(Default)]
+struct MemoryKnowledgeEntries {
+    entries: Mutex<HashMap<String, KnowledgeEntry>>,
+}
+
+#[async_trait]
+impl KnowledgeEntryPort for MemoryKnowledgeEntries {
+    async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        match self.entries.lock().expect("entries lock").get(entry_id) {
+            Some(entry) => SpokeResult::Ok(entry.clone()),
+            None => spoke_reject(
+                SpokeRejectCode::KnowledgeEntryNotFound,
+                "knowledge entry not found",
+                None,
+            ),
+        }
+    }
+
+    async fn put_knowledge_entry(
+        &self,
+        mut entry: KnowledgeEntry,
+        expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        let mut entries = self.entries.lock().expect("entries lock");
+        let current = entries
+            .get(&entry.entry_id)
+            .and_then(|stored| stored.revision);
+        let next = match expected_base_revision {
+            None if current.is_none() => 1,
+            None => {
+                return spoke_reject(
+                    SpokeRejectCode::KnowledgeEntryAlreadyExists,
+                    format!("knowledge entry {} already exists", entry.entry_id),
+                    None,
+                )
+            }
+            Some(expected) if current == Some(expected) => expected + 1,
+            Some(_) => {
+                return spoke_reject(
+                    SpokeRejectCode::StoredRevisionStale,
+                    "stored revision is stale",
+                    None,
+                )
+            }
+        };
+        entry.revision = Some(next);
+        entries.insert(entry.entry_id.clone(), entry.clone());
+        SpokeResult::Ok(entry)
+    }
+}
+
+fn shared_entry(entry_id: &str) -> KnowledgeEntry {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "entry_id": entry_id,
+        "entry_type": "location",
+        "canonical_name": format!("{entry_id} name"),
+        "status": "confirmed",
+        "body": { "summary": "the north gate is shut after dusk" },
+        "extensions": {},
+        "modules": { "cognition": { "records": [] } }
+    }))
+    .expect("knowledge entry fixture parses")
+}
+
+#[tokio::test]
+async fn adoption_over_a_port_double_creates_once_and_refuses_an_absent_source() {
+    let src = MemoryKnowledgeEntries::default();
+    let dst = MemoryKnowledgeEntries::default();
+    let entry_id = "ke_shared_gate";
+    let source = match src.put_knowledge_entry(shared_entry(entry_id), None).await {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
+    };
+
+    let created = match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+        SpokeResult::Ok(AdoptionOutcome::Created(created)) => created,
+        other => panic!("the first adoption must create, got {other:?}"),
+    };
+    assert_eq!(created.revision, Some(1));
+    let anchor = serde_json::to_value(created.source_anchor.as_ref().expect("anchor"))
+        .expect("anchor serializes");
+    assert_eq!(anchor["source_id"], json!("shared:ke_shared_gate"));
+    assert_eq!(
+        anchor["extensions"]["mindcore_adoption"]["source_revision"],
+        json!(1)
+    );
+
+    let repeat = match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+        SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing)) => existing,
+        other => panic!("a repeat must return the existing copy, got {other:?}"),
+    };
+    assert_eq!(
+        serde_json::to_value(&repeat).expect("copy serializes"),
+        serde_json::to_value(&created).expect("copy serializes")
+    );
+
+    // The source is untouched: same revision, still no anchor.
+    let source_after = match src.get_knowledge_entry(entry_id).await {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => panic!("source read refused: {reject:?}"),
+    };
+    assert_eq!(source_after.revision, source.revision);
+    assert!(source_after.source_anchor.is_none());
+
+    match adopt_knowledge_entry(&src, &dst, "ke_absent", 1).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+            assert_eq!(reject.message, "source knowledge entry not found");
+            assert!(reject.details.is_none());
+        }
+        other => panic!("an absent source must be refused, got {other:?}"),
+    }
 }

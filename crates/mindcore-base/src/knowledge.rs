@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use serde_json::{Map, Value};
-use spoke_schemas::knowledge_entry::ExtensionKey as EntryExtensionKey;
+use spoke_schemas::knowledge_entry::{
+    ExtensionKey as EntryExtensionKey, Shared1, Shared2, SourceAnchor as EntrySourceAnchor,
+};
 use spoke_schemas::source_anchor::ExtensionKey;
 use spoke_schemas::{KnowledgeEntry, SourceAnchor};
 
@@ -36,6 +38,33 @@ pub fn adoption_anchor(shared_entry_id: &str, basis: &str) -> SourceAnchor {
         label: None,
         mime_type: None,
         schema_version: NonZeroU64::new(1).expect("non-zero wire baseline"),
+        source_id: format!("shared:{shared_entry_id}"),
+        span: None,
+    }
+}
+
+/// Builds the adoption anchor of a copy taken at `source_revision`.
+///
+/// Returns the entry's own anchor type directly: the copy's `source_anchor` field is assigned the
+/// result, so no wire round trip is needed between the two generated copies of the type.
+pub fn adoption_anchor_at_revision(
+    shared_entry_id: &str,
+    source_revision: u64,
+) -> EntrySourceAnchor {
+    // Both constants satisfy the pinned wire pattern `^[a-z][a-z0-9_-]*$` and the `>= 1` bound.
+    let namespace = EntryExtensionKey::try_from("mindcore_adoption").expect("valid extension key");
+    let extension = Map::from_iter([
+        (
+            "basis".to_string(),
+            Value::String("shared-entry".to_string()),
+        ),
+        ("source_revision".to_string(), Value::from(source_revision)),
+    ]);
+    EntrySourceAnchor {
+        extensions: Shared2::from(HashMap::from([(namespace, extension)])),
+        label: None,
+        mime_type: None,
+        schema_version: Shared1::from(NonZeroU64::new(1).expect("non-zero wire baseline")),
         source_id: format!("shared:{shared_entry_id}"),
         span: None,
     }

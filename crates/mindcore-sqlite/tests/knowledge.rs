@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
+use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
 use mindcore_sqlite::{
     append_cognition, write_entry, MindStore, ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
 };
@@ -2468,5 +2469,358 @@ async fn the_marker_foreign_key_binds_successors_to_the_same_collection() {
 
     enforcing.close().await;
     store.close().await;
+    remove_database(&path);
+}
+
+// ---------- supported adoption of a shared entry into a personal collection ----------
+
+async fn stored_row(connection: &SqlitePool, collection: &str, entry_id: &str) -> (i64, String) {
+    sqlx::query_as(
+        "SELECT revision, payload FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_one(connection)
+    .await
+    .expect("stored row")
+}
+
+fn adoption_anchor_json(entry: &KnowledgeEntry) -> Value {
+    serde_json::to_value(
+        entry
+            .source_anchor
+            .as_ref()
+            .expect("the adopted copy carries its anchor"),
+    )
+    .expect("anchor serializes")
+}
+
+fn anchor_source_revision(entry: &KnowledgeEntry) -> Option<u64> {
+    adoption_anchor_json(entry)["extensions"]["mindcore_adoption"]["source_revision"].as_u64()
+}
+
+fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
+    match result {
+        SpokeResult::Ok(outcome) => panic!("{context}: unexpectedly adopted {outcome:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::KnowledgeEntryNotFound,
+                "{context}"
+            );
+            assert_eq!(
+                reject.message, "source knowledge entry not found",
+                "{context}"
+            );
+            assert!(
+                reject.details.is_none(),
+                "{context}: a generic absence carries no details"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
+    let path = database_path("adopt-repeat");
+    let store = MindStore::open(&path).await.expect("open store");
+    let src = store.knowledge(KnowledgeScope::new("shared"));
+    let dst = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let shared_id = "ke_shared_north_gate";
+    let shared = cognition_entry(
+        shared_id,
+        "The north gate is shut after dusk.",
+        vec![belief(shared_id, "cog_shared_gate")],
+    );
+    expect_ok(
+        src.put_knowledge_entry(shared.clone(), None).await,
+        "seed the shared source",
+    );
+    let source_before = stored_row(&reader, "shared", shared_id).await;
+
+    let created = match expect_ok(
+        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        "first adoption",
+    ) {
+        AdoptionOutcome::Created(created) => created,
+        other => panic!("the first adoption must create the copy, got {other:?}"),
+    };
+    assert_eq!(created.entry_id, shared_id);
+    assert_eq!(created.revision, Some(1));
+    assert_eq!(created.created_at, None);
+    assert!(created.updated_at.is_none());
+    assert_eq!(created.entry_type, shared.entry_type);
+    assert_eq!(created.status, shared.status);
+    let anchor = adoption_anchor_json(&created);
+    assert_eq!(anchor["source_id"], json!(format!("shared:{shared_id}")));
+    assert_eq!(
+        anchor["extensions"]["mindcore_adoption"]["basis"],
+        json!("shared-entry")
+    );
+    assert_eq!(anchor_source_revision(&created), Some(1));
+    assert!(
+        module_of(&created).is_some_and(|module| module.contains_key("world_facts")),
+        "the cognition envelope and its members survive"
+    );
+    assert!(
+        record_ids(&created).is_empty(),
+        "the source's judgments must not become personal committed records"
+    );
+
+    // The source is only ever read: payload and revision are byte-identical afterwards.
+    assert_eq!(
+        stored_row(&reader, "shared", shared_id).await,
+        source_before
+    );
+
+    // The source advances; both its old and its new visible revision name the same copy.
+    let mut advanced = shared;
+    advanced.body.summary = Some("The north gate reopens at dawn.".to_string());
+    let advanced = expect_ok(
+        src.put_knowledge_entry(advanced, Some(1)).await,
+        "advance the source",
+    );
+    assert_eq!(advanced.revision, Some(2));
+
+    for (expected, context) in [
+        (1, "repeat at the adopted revision"),
+        (2, "repeat at the current visible revision"),
+    ] {
+        let repeat = match expect_ok(
+            adopt_knowledge_entry(&src, &dst, shared_id, expected).await,
+            context,
+        ) {
+            AdoptionOutcome::AlreadyPresent(existing) => existing,
+            other => panic!("{context}: expected the existing copy, got {other:?}"),
+        };
+        assert_eq!(as_json(&repeat), as_json(&created), "{context}");
+        assert_eq!(anchor_source_revision(&repeat), Some(1), "{context}");
+    }
+
+    // A request naming neither revision is a conflict, never a second write.
+    assert_eq!(
+        expect_reject(
+            adopt_knowledge_entry(&src, &dst, shared_id, 3).await,
+            "a request naming neither revision",
+        ),
+        SpokeRejectCode::RevisionConflict
+    );
+
+    // No repeat refreshed or rewrote the copy, and only that one row exists.
+    assert_eq!(stored_row(&reader, "wren", shared_id).await.0, 1);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
+    )
+    .bind(shared_id)
+    .fetch_one(&reader)
+    .await
+    .expect("destination row count");
+    assert_eq!(rows, 1);
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded_sources() {
+    let path = database_path("adopt-absence");
+    let store = MindStore::open(&path).await.expect("open store");
+    let src = store.knowledge(KnowledgeScope::new("shared"));
+    let dst = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_source_absent(
+        adopt_knowledge_entry(&src, &dst, "ke_absent", 1).await,
+        "a missing source",
+    );
+
+    expect_ok(
+        src.put_knowledge_entry(private_entry("ke_private", "wren only"), None)
+            .await,
+        "seed an owner-private source",
+    );
+    expect_source_absent(
+        adopt_knowledge_entry(&src, &dst, "ke_private", 1).await,
+        "an owner-private source",
+    );
+
+    for entry_id in ["ke_stage_one", "ke_stage_two"] {
+        expect_ok(
+            src.put_knowledge_entry(entry_with(entry_id, entry_id), None)
+                .await,
+            "seed the supersede pair",
+        );
+    }
+    expect_ok(
+        supersede(&src, "ke_stage_one", 1, "ke_stage_two").await,
+        "mark the source superseded",
+    );
+    let superseded_before = stored_row(&reader, "shared", "ke_stage_one").await;
+    expect_source_absent(
+        adopt_knowledge_entry(&src, &dst, "ke_stage_one", 1).await,
+        "a superseded source",
+    );
+    assert_eq!(
+        stored_row(&reader, "shared", "ke_stage_one").await,
+        superseded_before,
+        "a refused adoption writes nothing"
+    );
+
+    assert!(
+        expect_ok(dst.list_entries().await, "list the destination").is_empty(),
+        "no refusal claims the destination slot"
+    );
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revision() {
+    let path = database_path("adopt-collision");
+    let store = MindStore::open(&path).await.expect("open store");
+    let src = store.knowledge(KnowledgeScope::new("shared"));
+    let dst = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    expect_ok(
+        src.put_knowledge_entry(entry_with("ke_shared_gate", "shared fact"), None)
+            .await,
+        "seed the source",
+    );
+
+    // An unrelated occupant of the exact key is a conflict, never overwritten.
+    let occupant = expect_ok(
+        dst.put_knowledge_entry(entry_with("ke_shared_gate", "wren's own note"), None)
+            .await,
+        "seed an unrelated occupant",
+    );
+    assert_eq!(
+        expect_reject(
+            adopt_knowledge_entry(&src, &dst, "ke_shared_gate", 1).await,
+            "an unrelated occupant",
+        ),
+        SpokeRejectCode::KnowledgeEntryAlreadyExists
+    );
+    assert_eq!(
+        as_json(&expect_ok(
+            dst.get_knowledge_entry("ke_shared_gate").await,
+            "read the occupant back"
+        )),
+        as_json(&occupant)
+    );
+
+    // A legacy anchor without a recorded revision is still not this adoption.
+    expect_ok(
+        src.put_knowledge_entry(entry_with("ke_legacy_gate", "shared fact"), None)
+            .await,
+        "seed the legacy source",
+    );
+    let legacy = expect_ok(
+        dst.put_knowledge_entry(
+            adopted_entry("ke_legacy_gate", "ke_legacy_gate", None),
+            None,
+        )
+        .await,
+        "seed a legacy occupant",
+    );
+    assert_eq!(
+        expect_reject(
+            adopt_knowledge_entry(&src, &dst, "ke_legacy_gate", 1).await,
+            "a legacy anchor without a revision",
+        ),
+        SpokeRejectCode::KnowledgeEntryAlreadyExists
+    );
+    assert_eq!(
+        as_json(&expect_ok(
+            dst.get_knowledge_entry("ke_legacy_gate").await,
+            "read the legacy occupant back"
+        )),
+        as_json(&legacy)
+    );
+
+    // An absent slot with a stale expectation is a revision conflict and stays empty.
+    expect_ok(
+        src.put_knowledge_entry(entry_with("ke_fresh_gate", "shared fact"), None)
+            .await,
+        "seed a fresh source",
+    );
+    assert_eq!(
+        expect_reject(
+            adopt_knowledge_entry(&src, &dst, "ke_fresh_gate", 5).await,
+            "a stale expected revision",
+        ),
+        SpokeRejectCode::RevisionConflict
+    );
+    assert_eq!(
+        expect_reject(
+            dst.get_knowledge_entry("ke_fresh_gate").await,
+            "the refused slot stays empty",
+        ),
+        SpokeRejectCode::KnowledgeEntryNotFound
+    );
+
+    reader.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn two_handles_adopt_one_copy_and_agree_on_it() {
+    let path = database_path("adopt-cross-handle");
+    let left_store = MindStore::open(&path).await.expect("open left store");
+    let right_store = MindStore::open(&path).await.expect("open right store");
+    let left_src = left_store.knowledge(KnowledgeScope::new("shared"));
+    let right_src = right_store.knowledge(KnowledgeScope::new("shared"));
+    let left_dst = left_store.knowledge(KnowledgeScope::new("wren"));
+    let right_dst = right_store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let shared_id = "ke_shared_gate";
+    expect_ok(
+        left_src
+            .put_knowledge_entry(entry_with(shared_id, "shut after dusk"), None)
+            .await,
+        "seed the source",
+    );
+
+    let (left, right) = tokio::join!(
+        adopt_knowledge_entry(&left_src, &left_dst, shared_id, 1),
+        adopt_knowledge_entry(&right_src, &right_dst, shared_id, 1),
+    );
+    let (created, present) = match (
+        expect_ok(left, "left adoption"),
+        expect_ok(right, "right adoption"),
+    ) {
+        (AdoptionOutcome::Created(created), AdoptionOutcome::AlreadyPresent(present))
+        | (AdoptionOutcome::AlreadyPresent(present), AdoptionOutcome::Created(created)) => {
+            (created, present)
+        }
+        other => panic!("exactly one concurrent adoption must create, got {other:?}"),
+    };
+    assert_eq!(as_json(&created), as_json(&present));
+
+    for port in [&left_dst, &right_dst] {
+        let read = expect_ok(port.get_knowledge_entry(shared_id).await, "read the copy");
+        assert_eq!(as_json(&read), as_json(&created));
+        assert_eq!(anchor_source_revision(&read), Some(1));
+    }
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
+    )
+    .bind(shared_id)
+    .fetch_one(&reader)
+    .await
+    .expect("destination row count");
+    assert_eq!(rows, 1);
+
+    reader.close().await;
+    left_store.close().await;
+    right_store.close().await;
     remove_database(&path);
 }
