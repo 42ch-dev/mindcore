@@ -52,7 +52,7 @@ END;
 ```
 
 - **`OLD` is the preimage and carries the timestamp that state was written with.** Recording `OLD.updated_at` beats sampling the clock again: the history row says when that version lived, not when it was archived.
-- **The composite primary key makes the write idempotent by construction.** One row per assigned revision; no duplicate and no rewrite.
+- **The composite primary key admits one row per assigned revision.** A replayed assignment fails as a constraint error; it never overwrites history.
 - **The foreign key is deliberately non-cascading.** A parent cannot be deleted while its history exists, which is exactly the invariant a "keep history" feature is for.
 - **The Rust write path is untouched**, so the cost contract still measures the same statements.
 
