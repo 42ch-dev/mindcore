@@ -25,6 +25,11 @@ impl KnowledgeScope {
 }
 
 /// Builds the provenance pointer from a personal entry back to the shared entry it was adopted from.
+/// Build an adoption anchor **without** a source revision.
+///
+/// This shape cannot be recognized by `mindcore_spi::adopt_knowledge_entry`: an anchor with no
+/// recorded revision answers as an unrelated occupant on a repeat. New callers use
+/// [`adoption_anchor_at_revision`]; this builder stays for fixtures that predate it.
 pub fn adoption_anchor(shared_entry_id: &str, basis: &str) -> SourceAnchor {
     // Both constants satisfy the pinned wire pattern `^[a-z][a-z0-9_-]*$` and the `>= 1` bound.
     let namespace = ExtensionKey::try_from("mindcore_adoption").expect("valid extension key");
