@@ -60,9 +60,9 @@ pub struct KnowledgeEntryLifecycle {
     pub superseded_by: Option<String>,
 }
 
-/// What one explicit history prune did: the checkpoints it deleted for good and the floor it
-/// recorded, or `{ deleted: 0, floor: None }` when it deleted nothing and left the stored floor
-/// alone.
+/// What one explicit history prune did: the checkpoints it deleted for good and the earliest
+/// revision the entry can still answer, or `{ deleted: 0, floor: None }` when it deleted nothing
+/// and left the stored floor alone.
 #[derive(Debug)]
 pub struct PruneReport {
     pub deleted: u64,
@@ -266,8 +266,11 @@ impl ScopedKnowledgeStore {
         SpokeResult::Ok(next)
     }
 
-    /// Delete this entry's checkpoints older than its `keep` newest and advance the entry's floor
-    /// to the oldest surviving checkpoint.
+    /// Delete this entry's checkpoints older than its `keep` newest and move the entry's floor to
+    /// the earliest revision it can still answer: the revision just above the oldest deleted
+    /// checkpoint. That floor need not be a stored checkpoint — a dedicated append advances the
+    /// revision without writing a preimage, so a revision between surviving checkpoints is still
+    /// replayed from the next one.
     ///
     /// `keep` counts checkpoints, newest first; the live row is not one. The read, the delete and
     /// the floor update share one `BEGIN IMMEDIATE` reservation, so no write can append or capture
@@ -300,9 +303,9 @@ impl ScopedKnowledgeStore {
             Ok(None) => return entry_not_found(&self.scope.collection, entry_id),
             Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
         }
-        // Two rows decide the window, newest first: the `keep`-th newest is the new floor, and the
-        // row just older proves there is something to delete. The revision column is a signed
-        // INTEGER, so a `keep` past that range offsets past every row.
+        // Two rows decide the window, newest first: the `keep`-th newest is the oldest surviving
+        // checkpoint, and the row just older is the newest deleted one. The revision column is a
+        // signed INTEGER, so a `keep` past that range offsets past every row.
         let offset = i64::try_from(keep - 1).unwrap_or(i64::MAX);
         let checkpoints: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
             "SELECT revision FROM knowledge_entry_revisions \
@@ -330,9 +333,10 @@ impl ScopedKnowledgeStore {
                 floor: None,
             });
         }
-        // Newest first: the first row is the oldest checkpoint the window keeps, and every deleted
-        // preimage sits below its revision.
-        let new_floor = checkpoints[0];
+        // Newest first: the second row is the newest deleted checkpoint, so the first revision
+        // whose preimage is gone is one above it. An append leaves no preimage, so the surviving
+        // checkpoint can still replay the revisions below it and must not set the floor.
+        let new_floor = checkpoints[1] + 1;
         let deleted = match sqlx::query(
             "DELETE FROM knowledge_entry_revisions \
              WHERE collection = ? AND entry_id = ? AND revision < ?",
@@ -1096,6 +1100,7 @@ async fn read_entry_revision(
     };
     // The floor gate runs before any checkpoint is used: the live fallback would otherwise answer
     // a pruned revision with current content.
+    // A below-floor request has already scanned the retained rows: a caller error, not a hot path.
     if assigned < floor {
         return revision_pruned();
     }

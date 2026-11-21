@@ -160,6 +160,20 @@ async fn carrier_header(pool: &SqlitePool, collection: &str, entry_id: &str) -> 
     (header.revision, header.head_seq)
 }
 
+/// The checkpoint revisions stored for one entry, oldest first: the preimages its revision
+/// trigger captured. A rolled-back rewrite must leave none behind.
+async fn checkpoint_revisions(pool: &SqlitePool, collection: &str, entry_id: &str) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("stored checkpoint revisions")
+}
+
 /// The pending rewrite as written inside its own reservation: revision, payload summary, record
 /// rows and carrier head must all have moved before the rollback, or the post-rollback assertions
 /// prove only that the old state is still there. Reads through the caller's transaction, so it
@@ -587,6 +601,12 @@ async fn shared_scope_holds_the_seven_named_facts() {
         2,
         "I-000009 item 5 (carrier transaction): the rolled-back record never became visible"
     );
+    assert!(
+        checkpoint_revisions(&pool, SHARED, "ke_keeper_log")
+            .await
+            .is_empty(),
+        "I-000009 item 5 (carrier transaction): the rolled-back rewrite left no checkpoint behind"
+    );
 
     // I-000009 item 6 — backup / restore: a closed store, copied as a file and reopened, carries
     // items 1–5's persisted results, and items 3 and 5 run again on the copy.
@@ -876,6 +896,12 @@ async fn shared_scope_holds_the_seven_named_facts() {
         .len(),
         2,
         "I-000009 item 6 (backup/restore): the rolled-back record never became visible on the copy"
+    );
+    assert!(
+        checkpoint_revisions(&pool, SHARED, "ke_keeper_log_copy")
+            .await
+            .is_empty(),
+        "I-000009 item 6 (backup/restore): the rolled-back rewrite left no checkpoint on the copy"
     );
 
     // I-000009 item 7 — single-writer switch: two stores opened on the same file before any
