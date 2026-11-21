@@ -982,6 +982,19 @@ async fn a_marked_row_with_unreadable_payload_is_served_like_a_missing_one() {
     assert_eq!(overwrite.code, SpokeRejectCode::NotAuthorized);
     assert!(overwrite.details.is_none());
 
+    // The marking path settles on the marker before decoding too: an already-retired row with an
+    // unreadable payload refuses as already superseded, never as a storage failure.
+    let remark = expect_reject(
+        local.supersede_entry("ke_beta", 2, "ke_alpha").await,
+        "supersede an already-marked row with an unreadable payload",
+    );
+    assert_eq!(remark.code, SpokeRejectCode::InvalidInput);
+    assert!(
+        remark.message.contains("already superseded"),
+        "unexpected message: {}",
+        remark.message
+    );
+
     // Explicit reads and live rows keep the decode failure.
     let explicit = expect_reject(
         local.get_entry_including_superseded("ke_beta").await,

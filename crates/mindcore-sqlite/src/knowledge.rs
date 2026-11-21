@@ -186,6 +186,11 @@ impl ScopedKnowledgeStore {
                 "knowledge entry {entry_id} revision column is not a valid revision"
             ));
         };
+        // The marker settles the already-retired refusal before the payload is decoded: a retired
+        // row's payload may be unreadable, and that must not surface as a storage failure.
+        if source.superseded_by.is_some() {
+            return invalid_input(format!("knowledge entry {entry_id} is already superseded"));
+        }
         let mut marked = match decode(&source.payload) {
             SpokeResult::Ok(entry) => entry,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -194,9 +199,6 @@ impl ScopedKnowledgeStore {
             return internal(format!(
                 "knowledge entry {entry_id} revision column and payload disagree"
             ));
-        }
-        if source.superseded_by.is_some() {
-            return invalid_input(format!("knowledge entry {entry_id} is already superseded"));
         }
         if stored != expected_base_revision {
             return stale(entry_id, Some(expected_base_revision), Some(stored));
