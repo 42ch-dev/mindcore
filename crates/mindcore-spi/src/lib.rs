@@ -2,8 +2,8 @@
 //!
 //! Host-facing capability and workflow contracts for embedding, structured
 //! reasoning, settlement policy and domain lenses, pinned to the published
-//! SPOKE 0.17.0 DTOs. This crate deliberately depends only on the SPOKE base
-//! crates plus serde/async infrastructure: no `mindcore-*` storage crate,
+//! SPOKE 0.17.0 DTOs. This crate depends on the SPOKE base crates, the storage-agnostic
+//! `mindcore-base` domain core, and serde/async infrastructure: no `mindcore-*` storage crate,
 //! no Nexus, no network or model SDK enters the contract surface.
 //!
 //! [`SpiMindWorkflows`] implements `recall_context`, `absorb` and `deliberate`
@@ -12,8 +12,10 @@
 //! text-prompt executor closure (the Nexus `PromptExecutor` seam, bound by the
 //! caller) to [`Reasoner`].
 
+pub mod adoption;
 pub mod workflows;
 
+pub use adoption::{adopt_knowledge_entry, AdoptionOutcome};
 pub use workflows::{
     page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
     CapturedCandidate, CitedRecord, DeliberateSnapshot, PageFact, PageVector, PageVectors,

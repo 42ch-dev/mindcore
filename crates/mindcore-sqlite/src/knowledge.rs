@@ -1121,11 +1121,19 @@ pub async fn write_entry(
         Err(error) => return internal(format!("stored revision could not be read: {error}")),
     };
     // A superseded entry is not current: a full put may neither rewrite it nor clear its marker.
-    if stored
-        .as_ref()
-        .is_some_and(|(_, _, superseded_by)| superseded_by.is_some())
-    {
-        return invalid_input(format!("knowledge entry {} is superseded", entry.entry_id));
+    // The refusal keeps its `InvalidInput` code and names the marker as a structured detail, so a
+    // caller that must classify the occupied slot never decodes this message.
+    if let Some((_, _, Some(superseded_by))) = stored.as_ref() {
+        let mut details = Map::new();
+        details.insert(
+            "superseded_by".to_string(),
+            Value::from(superseded_by.clone()),
+        );
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            format!("knowledge entry {} is superseded", entry.entry_id),
+            Some(details),
+        );
     }
     let stored_created_at = stored.as_ref().map(|(_, created_at, _)| created_at.clone());
     let stored = stored.map(|(revision, _, _)| revision as u64);
