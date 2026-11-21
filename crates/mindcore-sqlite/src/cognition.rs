@@ -161,8 +161,9 @@ where
 }
 
 /// Whether the `gap` head positions a replay crosses are exactly the rows dedicated appends wrote:
-/// every one of them classified, so no position is missing and none was committed by a full put.
-/// A full put stamps `NULL` and saves its own preimage, so it can never leave a gap behind.
+/// the classified rows at `after + 1 ..= after + gap`, so no position is missing and none was
+/// committed by a full put. A full put stamps `NULL` and saves its own preimage, so it can never
+/// leave a gap behind.
 pub(crate) async fn gap_is_dedicated_appends<'e, E>(
     executor: E,
     collection: &str,
@@ -173,18 +174,28 @@ pub(crate) async fn gap_is_dedicated_appends<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let counts: Result<(i64, i64), sqlx::Error> = sqlx::query_as(
-        "SELECT count(*), count(append_prior_shape) FROM cognition_records \
-         WHERE collection = ? AND entry_id = ? AND append_seq > ? AND append_seq <= ?",
+    // Positions, not a count: `append_seq` is a non-`STRICT` `INTEGER`, so a fractional value is
+    // storable and a count would let it stand in for the position it is not.
+    let rows: Result<Vec<(i64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT CAST(append_seq AS INTEGER), append_prior_shape FROM cognition_records \
+         WHERE collection = ? AND entry_id = ? AND append_seq > ? AND append_seq <= ? \
+           AND append_seq = CAST(append_seq AS INTEGER) \
+         ORDER BY append_seq ASC",
     )
     .bind(collection)
     .bind(entry_id)
     .bind(after)
     .bind(after + gap)
-    .fetch_one(executor)
+    .fetch_all(executor)
     .await;
-    match counts {
-        Ok((rows, classified)) => SpokeResult::Ok(rows == gap && classified == gap),
+    match rows {
+        Ok(rows) => SpokeResult::Ok(
+            rows.len() as i64 == gap
+                && rows
+                    .iter()
+                    .zip(after + 1..=after + gap)
+                    .all(|((position, shape), expected)| *position == expected && shape.is_some()),
+        ),
         Err(error) => internal(format!("cognition history gap could not be read: {error}")),
     }
 }

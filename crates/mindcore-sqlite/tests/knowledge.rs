@@ -1357,6 +1357,70 @@ async fn replay_refuses_a_gap_its_append_metadata_contradicts() {
 }
 
 #[tokio::test]
+async fn replay_refuses_a_fractional_position_masking_a_missing_one() {
+    let path = database_path("replay-fractional-gap");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let seed = second_connection(&path).await;
+
+    // A gap of two that a count accepts: position 2 is missing, yet a classified fractional row at
+    // 1.5 sits inside the crossed interval alongside position 3, which the head points at. The
+    // positions, not their number, decide whether the interval is a run of dedicated appends.
+    let mut live = cognition_entry("ke_gate", "current", Vec::new());
+    live.revision = Some(4);
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, cognition_head_seq, created_at, updated_at) \
+         VALUES ('wren', 'ke_gate', 4, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(serde_json::to_string(&live).expect("entry serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the live entry");
+    sqlx::query(
+        "INSERT INTO cognition_records \
+         (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+         VALUES ('wren', 'ke_gate', ?, ?, ?, 0)",
+    )
+    .bind(1.5f64)
+    .bind("cog_fractional")
+    .bind(serde_json::to_string(&belief("ke_gate", "cog_fractional")).expect("record serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the fractional record row");
+    sqlx::query(
+        "INSERT INTO cognition_records \
+         (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+         VALUES ('wren', 'ke_gate', ?, ?, ?, 0)",
+    )
+    .bind(3i64)
+    .bind("cog_integral")
+    .bind(serde_json::to_string(&belief("ke_gate", "cog_integral")).expect("record serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the record row the head points at");
+    sqlx::query(
+        "UPDATE knowledge_entries SET cognition_head_seq = 3 \
+         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .execute(&seed)
+    .await
+    .expect("point the head at the integral position");
+
+    assert_eq!(
+        expect_reject(
+            port.get_entry_at_revision("ke_gate", 2).await,
+            "replay across a fractional position"
+        ),
+        SpokeRejectCode::InternalError
+    );
+
+    seed.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn an_exhausted_revision_space_is_refused_before_any_write() {
     let path = database_path("revision-exhausted");
     let store = MindStore::open(&path).await.expect("open store");
