@@ -4,27 +4,30 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use mindcore_base::cognition::carrier_record_violation;
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use spoke_operations::{
-    filter_knowledge_entries_by_scope, spoke_reject, validate_cognition_module,
-    validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort, SpokeRejectCode,
-    SpokeResult,
+    filter_knowledge_entries_by_scope, knowledge_entry_visible_to_viewpoint, spoke_reject,
+    validate_cognition_module, validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort,
+    SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
 use spoke_schemas::{KnowledgeEntry, Scope};
 
-use crate::cognition::{insert_record, read_records};
+use crate::cognition::{
+    gap_is_dedicated_appends, insert_record, read_append_prior_shape, read_records,
+    read_records_through,
+};
 use crate::store::{MindStore, SnapshotSeam};
 
 /// Hard bound on one list of a stored collection.
 ///
-/// Every list decodes the collection's stored rows before any disclosure predicate filters them,
+/// Every list decodes the collection's live rows before any disclosure predicate filters them,
 /// so the collection is bounded at the query boundary instead of growing memory and work with its
-/// total size. An over-bound collection refuses the list; it never truncates.
+/// live size. An over-bound collection refuses the list; it never truncates.
 pub const SERVED_KNOWLEDGE_LIST_LIMIT: usize = 512;
 
 /// Refuse a scope carrying a selection the knowledge face does not serve.
@@ -47,6 +50,14 @@ pub fn validate_admission_scope(scope: &Scope) -> SpokeResult<()> {
         );
     }
     SpokeResult::Ok(())
+}
+
+/// One stored entry together with the liveness marker its row carries: `superseded_by` names the
+/// same-collection entry that replaced it, and stays absent while the entry is current.
+#[derive(Debug)]
+pub struct KnowledgeEntryLifecycle {
+    pub entry: KnowledgeEntry,
+    pub superseded_by: Option<String>,
 }
 
 /// A knowledge port bound to one collection.
@@ -103,6 +114,233 @@ impl ScopedKnowledgeStore {
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
     }
+
+    /// One entry as it stood at `revision`: the payload and cognition head the store held then,
+    /// projected from the records that existed at that revision.
+    ///
+    /// Checkpoint selection and record hydration share one read transaction, so the replay is a
+    /// whole committed state. Revision `0`, a revision the entry never held and a missing entry
+    /// answer with the same `KnowledgeEntryNotFound`; a superseded entry still replays from its
+    /// own history.
+    pub async fn get_entry_at_revision(
+        &self,
+        entry_id: &str,
+        revision: u64,
+    ) -> SpokeResult<KnowledgeEntry> {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!(
+                    "knowledge entry revision could not be read: {error}"
+                ))
+            }
+        };
+        match read_entry_revision(&mut tx, &self.scope.collection, entry_id, revision).await {
+            SpokeResult::Ok(entry) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(entry),
+                Err(error) => internal(format!(
+                    "knowledge entry revision could not be read: {error}"
+                )),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
+    }
+
+    /// Mark `entry_id` superseded by another live entry of this collection, at
+    /// `expected_base_revision`, and return the source's new revision.
+    ///
+    /// One `BEGIN IMMEDIATE` reservation covers both reads and the single update: the source must
+    /// be live at the expected revision, the target a different live entry of the same collection,
+    /// so a cycle cannot close on write. The source keeps its head, payload fields and history —
+    /// only its marker, revision, DTO revision and store `updated_at` advance, and the revision
+    /// trigger saves the displaced preimage as part of that update.
+    pub async fn supersede_entry(
+        &self,
+        entry_id: &str,
+        expected_base_revision: u64,
+        superseding_entry_id: &str,
+    ) -> SpokeResult<u64> {
+        if entry_id == superseding_entry_id {
+            return invalid_input("a knowledge entry cannot be superseded by itself");
+        }
+        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => transaction,
+            Err(error) => return internal(format!("knowledge supersede could not begin: {error}")),
+        };
+        let source = match read_stored_row(
+            &mut transaction,
+            &self.scope.collection,
+            entry_id,
+            false,
+        )
+        .await
+        {
+            SpokeResult::Ok(source) => source,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        // The trigger snapshots on the revision column, so the CAS must compare that column. A
+        // payload whose DTO revision disagrees with it is corrupt stored state, not a stale caller:
+        // accepting it would write the marker without advancing the revision and skip the preimage.
+        let Ok(stored) = u64::try_from(source.revision) else {
+            return internal(format!(
+                "knowledge entry {entry_id} revision column is not a valid revision"
+            ));
+        };
+        // The marker settles the already-retired refusal before the payload is decoded: a retired
+        // row's payload may be unreadable, and that must not surface as a storage failure.
+        if source.superseded_by.is_some() {
+            return invalid_input(format!("knowledge entry {entry_id} is already superseded"));
+        }
+        let mut marked = match decode(&source.payload) {
+            SpokeResult::Ok(entry) => entry,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if marked.revision != Some(stored) {
+            return internal(format!(
+                "knowledge entry {entry_id} revision column and payload disagree"
+            ));
+        }
+        if stored != expected_base_revision {
+            return stale(entry_id, Some(expected_base_revision), Some(stored));
+        }
+        let target = match read_stored_row(
+            &mut transaction,
+            &self.scope.collection,
+            superseding_entry_id,
+            false,
+        )
+        .await
+        {
+            SpokeResult::Ok(target) => target,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if target.superseded_by.is_some() {
+            // A marked entry is no longer current, so naming it as the successor would close a
+            // cycle or point readers at another retired row.
+            return invalid_input(format!(
+                "knowledge entry {superseding_entry_id} is already superseded"
+            ));
+        }
+        let Some(next) = stored.checked_add(1) else {
+            return internal(format!("knowledge entry {entry_id} revision is exhausted"));
+        };
+        // The revision column is a signed INTEGER: refuse an unrepresentable revision before any
+        // row write, so a reported success is always a revision a replay can address.
+        let Ok(revision) = i64::try_from(next) else {
+            return internal(format!("knowledge entry {entry_id} revision is exhausted"));
+        };
+        marked.revision = Some(next);
+        let payload = match encode(&marked) {
+            SpokeResult::Ok(payload) => payload,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        let written = sqlx::query(
+            "UPDATE knowledge_entries \
+             SET superseded_by = ?, revision = ?, payload = ?, updated_at = ? \
+             WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(superseding_entry_id)
+        .bind(revision)
+        .bind(&payload)
+        .bind(encode_timestamp(Utc::now()))
+        .bind(&self.scope.collection)
+        .bind(entry_id)
+        .execute(&mut *transaction)
+        .await;
+        if let Err(error) = written {
+            return internal(format!("knowledge supersede could not be written: {error}"));
+        }
+        if let Err(error) = transaction.commit().await {
+            return internal(format!("knowledge supersede could not commit: {error}"));
+        }
+        SpokeResult::Ok(next)
+    }
+
+    /// One entry of this collection whether or not it is superseded: the payload (with its
+    /// cognition records projected) and the marker the row carries.
+    ///
+    /// [`KnowledgeEntryPort::get_knowledge_entry`] serves live rows only; this is the explicit
+    /// local request that still returns a superseded entry, and it never follows the marker.
+    pub async fn get_entry_including_superseded(
+        &self,
+        entry_id: &str,
+    ) -> SpokeResult<KnowledgeEntryLifecycle> {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
+        };
+        let mut lifecycle = match read_lifecycle(&mut tx, &self.scope.collection, entry_id).await {
+            SpokeResult::Ok(lifecycle) => lifecycle,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if let SpokeResult::Reject(reject) = hydrate_cognition_records(
+            &mut tx,
+            &self.scope.collection,
+            std::slice::from_mut(&mut lifecycle.entry),
+            &self.seam,
+        )
+        .await
+        {
+            return SpokeResult::Reject(reject);
+        }
+        match tx.commit().await {
+            Ok(()) => SpokeResult::Ok(lifecycle),
+            Err(error) => internal(format!("knowledge entry could not be read: {error}")),
+        }
+    }
+
+    /// The live entry an adoption anchor resolves to: the anchor's shared id, then each
+    /// same-collection marker until the first live entry.
+    ///
+    /// One read transaction pins the whole chain to one snapshot. Every hop passes the
+    /// viewpoint-free disclosure predicate before its successor is read, so a missing or hidden
+    /// hop answers with the one absence keyed to the id the anchor names, never a partial chain.
+    /// Ids are tracked, so a cycle in stored markers is a storage failure instead.
+    pub async fn resolve_adoption_anchor(&self, adopted: &KnowledgeEntry) -> SpokeResult<String> {
+        let Some((source_id, _)) = adoption_anchor_parts(adopted) else {
+            return invalid_input(format!(
+                "knowledge entry {} carries no mindcore adoption anchor",
+                adopted.entry_id
+            ));
+        };
+        let source_id = source_id.to_string();
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return internal(format!(
+                    "adoption anchor {source_id} could not be resolved: {error}"
+                ))
+            }
+        };
+        let mut current = source_id.clone();
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                return internal(format!(
+                    "adoption anchor {source_id} resolves through a cycle at knowledge entry \
+                     {current}"
+                ));
+            }
+            let lifecycle = match read_lifecycle(&mut tx, &self.scope.collection, &current).await {
+                SpokeResult::Ok(lifecycle) => lifecycle,
+                SpokeResult::Reject(reject)
+                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+                {
+                    return entry_not_found(&self.scope.collection, &source_id)
+                }
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+            // The binding carries no admitted viewpoint: a private hop is a generic absence, and
+            // its successor is never read or exposed.
+            if !knowledge_entry_visible_to_viewpoint(&lifecycle.entry, None) {
+                return entry_not_found(&self.scope.collection, &source_id);
+            }
+            match lifecycle.superseded_by {
+                None => return SpokeResult::Ok(current),
+                Some(successor) => current = successor,
+            }
+        }
+    }
 }
 
 /// Every entry of `collection`, ordered by `entry_id` ASC, read through the
@@ -117,41 +355,42 @@ pub async fn list_entries_in(
     entries(&mut *tx, collection, &SnapshotSeam::default()).await
 }
 
-/// The stored rows of `collection`, ordered by `entry_id` ASC, bounded at the
-/// query boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] rows are decoded, and
-/// an over-bound collection refuses the list instead of growing memory and work
-/// with its total size.
+/// The live rows of `collection`, ordered by `entry_id` ASC, bounded at the query
+/// boundary: at most [`SERVED_KNOWLEDGE_LIST_LIMIT`] live rows are decoded, and an
+/// over-bound live set refuses the list instead of growing memory and work with its
+/// size. The live predicate rides in the one payload statement, so hiding a retired
+/// row costs a predicate and no additional statement — the bound counts live rows,
+/// so retirement frees budget rather than consuming it.
 ///
-/// The record rows of every carrying entry are one page-shaped statement, not one
-/// statement per entry: the page's holders travel as a `json_each` list.
+/// The record rows of every carrying live entry are one page-shaped statement, not
+/// one statement per entry: the page's holders travel as a `json_each` list.
 async fn entries(
     connection: &mut SqliteConnection,
     collection: &str,
     seam: &SnapshotSeam,
 ) -> SpokeResult<Vec<KnowledgeEntry>> {
     let limit = SERVED_KNOWLEDGE_LIST_LIMIT as i64;
-    let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT payload FROM knowledge_entries WHERE collection = ? ORDER BY entry_id ASC LIMIT ?",
+    let rows: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT payload FROM knowledge_entries \
+         WHERE collection = ? AND superseded_by IS NULL ORDER BY entry_id ASC LIMIT ?",
     )
     .bind(collection)
     .bind(limit + 1)
     .fetch_all(&mut *connection)
     .await;
-    let payloads = match payloads {
-        Ok(payloads) => payloads,
+    let rows = match rows {
+        Ok(rows) => rows,
         Err(error) => return internal(format!("knowledge entries could not be listed: {error}")),
     };
-    let mut stored = Vec::with_capacity(payloads.len());
-    for payload in &payloads {
+    if rows.len() as i64 > limit {
+        return internal(over_bound());
+    }
+    let mut stored = Vec::with_capacity(rows.len());
+    for payload in &rows {
         match decode(payload) {
             SpokeResult::Ok(entry) => stored.push(entry),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
-    }
-    if stored.len() as i64 > limit {
-        return internal(format!(
-            "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} entries; the list is bounded"
-        ));
     }
     if let SpokeResult::Reject(reject) =
         hydrate_cognition_records(connection, collection, &mut stored, seam).await
@@ -215,34 +454,27 @@ impl RoutedKnowledgeStore {
         validate_admission_scope(scope)
     }
 
-    /// The routed collection's stored rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
-    /// over-bound collection refuses the list instead of growing memory and work with its size.
+    /// The routed collection's live rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
+    /// over-bound live set refuses the list instead of growing memory and work with its size.
     /// The projection runs inside one read transaction, so the carrier payloads and the
     /// record rows project from one whole committed state.
     async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
-            Err(error) => {
-                return internal(format!("knowledge entries could not be listed: {error}"))
-            }
+            Err(_) => return storage_unavailable(),
         };
         match entries(&mut tx, &self.scope.collection, &SnapshotSeam::default()).await {
             SpokeResult::Ok(listed) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(listed),
-                Err(error) => internal(format!("knowledge entries could not be listed: {error}")),
+                Err(_) => storage_unavailable(),
             },
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
     }
-}
 
-#[async_trait]
-impl ScopedKnowledgePort for RoutedKnowledgeStore {
-    async fn get_scoped_knowledge_entry(
-        &self,
-        scope: &Scope,
-        entry_id: &str,
-    ) -> SpokeResult<KnowledgeEntry> {
+    /// One served read: the collection's one route, the caller's admission, and the disclosure
+    /// predicate all apply before the entry leaves the store.
+    async fn served_get(&self, scope: &Scope, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
         if let SpokeResult::Reject(reject) = self.admit(scope) {
             return SpokeResult::Reject(reject);
         }
@@ -252,14 +484,12 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         // the same refusal.
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
-            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
+            Err(_) => return storage_unavailable(),
         };
         let entry = match read_entry(&mut tx, &self.scope.collection, entry_id).await {
             SpokeResult::Ok(entry) => match tx.commit().await {
                 Ok(()) => entry,
-                Err(error) => {
-                    return internal(format!("knowledge entry could not be read: {error}"))
-                }
+                Err(_) => return storage_unavailable(),
             },
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
@@ -275,7 +505,9 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         }
     }
 
-    async fn put_scoped_knowledge_entry(
+    /// One served write: the submitted entry, and the existing row, are judged before the store
+    /// can reveal a revision.
+    async fn served_put(
         &self,
         scope: &Scope,
         entry: KnowledgeEntry,
@@ -293,9 +525,15 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
         // scoped store above.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
-            Err(error) => return internal(format!("knowledge write could not begin: {error}")),
+            Err(_) => return storage_unavailable(),
         };
-        let existing = read_entry(&mut transaction, &self.scope.collection, &entry.entry_id).await;
+        let existing = read_stored_row(
+            &mut transaction,
+            &self.scope.collection,
+            &entry.entry_id,
+            false,
+        )
+        .await;
         let existing = match existing {
             SpokeResult::Ok(existing) => Some(existing),
             SpokeResult::Reject(reject)
@@ -306,6 +544,16 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         if let Some(existing) = existing {
+            // A superseded row is no more writable than a hidden one, and neither is an absent
+            // create candidate nor leaks its revision. The marker is decided before the payload:
+            // a retired row's unreadable payload must stay `NotAuthorized`, not a storage failure.
+            if existing.superseded_by.is_some() {
+                return not_authorized();
+            }
+            let existing = match decode(&existing.payload) {
+                SpokeResult::Ok(existing) => existing,
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
             match visible(&existing, scope) {
                 SpokeResult::Ok(true) => {}
                 // A hidden row is neither overwritten nor allowed to leak its revision.
@@ -324,16 +572,14 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
             SpokeResult::Ok(entry) => entry,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        if let Err(error) = transaction.commit().await {
-            return internal(format!("knowledge write could not commit: {error}"));
+        if transaction.commit().await.is_err() {
+            return storage_unavailable();
         }
         SpokeResult::Ok(entry)
     }
 
-    async fn list_scoped_knowledge_entries(
-        &self,
-        scope: &Scope,
-    ) -> SpokeResult<Vec<KnowledgeEntry>> {
+    /// The served list: the collection's live rows, filtered by the caller's disclosure predicate.
+    async fn served_list(&self, scope: &Scope) -> SpokeResult<Vec<KnowledgeEntry>> {
         if let SpokeResult::Reject(reject) = self.admit(scope) {
             return SpokeResult::Reject(reject);
         }
@@ -345,6 +591,35 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
             SpokeResult::Ok(visible) => SpokeResult::Ok(visible.into_iter().cloned().collect()),
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
+    }
+}
+
+/// Every op reports a failed statement as [`storage_unavailable`]: the store's shared helpers
+/// build their message for the local port, and it names local tables and columns.
+#[async_trait]
+impl ScopedKnowledgePort for RoutedKnowledgeStore {
+    async fn get_scoped_knowledge_entry(
+        &self,
+        scope: &Scope,
+        entry_id: &str,
+    ) -> SpokeResult<KnowledgeEntry> {
+        served(self.served_get(scope, entry_id).await)
+    }
+
+    async fn put_scoped_knowledge_entry(
+        &self,
+        scope: &Scope,
+        entry: KnowledgeEntry,
+        expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        served(self.served_put(scope, entry, expected_base_revision).await)
+    }
+
+    async fn list_scoped_knowledge_entries(
+        &self,
+        scope: &Scope,
+    ) -> SpokeResult<Vec<KnowledgeEntry>> {
+        served(self.served_list(scope).await)
     }
 }
 
@@ -372,8 +647,60 @@ fn not_found<T>(entry_id: &str) -> SpokeResult<T> {
     )
 }
 
+// One rejection for every absent revision: an unassigned revision, one outside the stored range
+// and a missing entry are indistinguishable, and the message names no collection or timestamp.
+fn revision_not_found<T>() -> SpokeResult<T> {
+    spoke_reject(
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "knowledge entry revision not found",
+        None,
+    )
+}
+
 pub(crate) fn internal<T>(message: impl Into<String>) -> SpokeResult<T> {
     spoke_reject(SpokeRejectCode::InternalError, message, None)
+}
+
+fn invalid_input<T>(message: impl Into<String>) -> SpokeResult<T> {
+    spoke_reject(SpokeRejectCode::InvalidInput, message, None)
+}
+
+/// The one answer a failed statement gives on the served face: a `sqlx::Error::Database` names
+/// local tables and columns, and this face forwards its message to an admitted peer. The local
+/// port keeps the detailed message for the host's own logs.
+fn storage_unavailable<T>() -> SpokeResult<T> {
+    internal("knowledge storage is unavailable")
+}
+
+/// Replace every internal refusal a served op produced with [`storage_unavailable`], including
+/// the ones the shared store helpers build for the local port. The over-bound list refusal is the
+/// exception: it is about the peer's own collection and names no local schema.
+fn served<T>(result: SpokeResult<T>) -> SpokeResult<T> {
+    match result {
+        SpokeResult::Reject(reject)
+            if reject.code == SpokeRejectCode::InternalError && reject.message != over_bound() =>
+        {
+            storage_unavailable()
+        }
+        other => other,
+    }
+}
+
+// Names the bound, and nothing local: the served list forwards this refusal to a peer.
+fn over_bound() -> String {
+    format!(
+        "the collection holds more than {SERVED_KNOWLEDGE_LIST_LIMIT} live entries; \
+         the list is bounded"
+    )
+}
+
+// One absence names its collection: this is the local port, whose caller already knows it.
+fn entry_not_found<T>(collection: &str, entry_id: &str) -> SpokeResult<T> {
+    spoke_reject(
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        format!("no knowledge entry {entry_id} in collection {collection}"),
+        None,
+    )
 }
 
 fn decode(payload: &str) -> SpokeResult<KnowledgeEntry> {
@@ -406,6 +733,17 @@ fn cognition_module(entry: &KnowledgeEntry) -> Option<Value> {
     }
 }
 
+// What a dedicated append is about to change in the carrier envelope, stored on its record row so
+// a replay can reverse the first append without a preimage: 0 keeps the `records` member, 1 seeds
+// the module, 2 adds the missing member to an existing module.
+fn append_prior_shape(entry: &KnowledgeEntry) -> i64 {
+    match entry.modules.get(&module_key()) {
+        None => 1,
+        Some(KnowledgeEntryModulesValue::Object(module)) if module.contains_key("records") => 0,
+        Some(_) => 2,
+    }
+}
+
 // Names no collection: a served put forwards this message to an admitted peer, and an absent
 // or foreign-only id must answer exactly like a stale visible one.
 fn stale<T>(entry_id: &str, expected: Option<u64>, stored: Option<u64>) -> SpokeResult<T> {
@@ -419,12 +757,14 @@ fn stale<T>(entry_id: &str, expected: Option<u64>, stored: Option<u64>) -> Spoke
     )
 }
 
-/// One entry of `collection`, read through the caller's transaction: the scoped
+/// One live entry of `collection`, read through the caller's transaction: the scoped
 /// port and the workflow binding share this read, and a settlement reads it at
 /// the same point as the write it guards. The cognition module's records are
 /// projected from the holder's record rows in append order. Taking the
 /// transaction pins the payload and the record rows to one snapshot — the same
-/// whole read `list_entries_in` makes.
+/// whole read `list_entries_in` makes. A superseded row answers like an absent
+/// one; explicit replay and [`ScopedKnowledgeStore::get_entry_including_superseded`]
+/// stay the paths that still see it.
 pub async fn read_entry(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
@@ -442,38 +782,234 @@ async fn read_entry_seeded(
     entry_id: &str,
     seam: &SnapshotSeam,
 ) -> SpokeResult<KnowledgeEntry> {
-    let payload: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT payload FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    // The current-entry lookup serves live rows only: the marker rides in its one payload
+    // statement, so a marked row answers like an absent one without its payload being decoded;
+    // [`get_entry_including_superseded`] is the explicit request that still reads a superseded row.
+    let stored = match read_stored_row(tx, collection, entry_id, true).await {
+        SpokeResult::Ok(stored) => stored,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    let mut entry = match decode(&stored.payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    if let SpokeResult::Reject(reject) =
+        hydrate_cognition_records(&mut *tx, collection, std::slice::from_mut(&mut entry), seam)
+            .await
+    {
+        return SpokeResult::Reject(reject);
+    }
+    SpokeResult::Ok(entry)
+}
+
+/// One stored row of `collection`, read through the caller's transaction.
+///
+/// `live_only` puts the live-row predicate in the query instead of checking the marker after the
+/// payload is decoded: a retired row's payload may be unreadable and must still answer as an
+/// absence on the current-entry paths. Only callers that must decide about a marked row read one —
+/// the explicit read, the routed put preflight and the marking CAS. The revision column has two
+/// readers, both CAS bases: [`write_entry`] and [`supersede_entry`]. Only the marking path compares
+/// the column against the payload it also reads and refuses a disagreement; `write_entry` compares
+/// the column against the caller's expected revision and never inspects the stored payload, so it
+/// cannot detect that drift.
+struct StoredRow {
+    revision: i64,
+    payload: String,
+    superseded_by: Option<String>,
+}
+
+async fn read_stored_row(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+    live_only: bool,
+) -> SpokeResult<StoredRow> {
+    let sql = if live_only {
+        "SELECT revision, payload, superseded_by FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ? AND superseded_by IS NULL"
+    } else {
+        "SELECT revision, payload, superseded_by FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?"
+    };
+    let stored: Result<Option<(i64, String, Option<String>)>, sqlx::Error> = sqlx::query_as(sql)
+        .bind(collection)
+        .bind(entry_id)
+        .fetch_optional(&mut **tx)
+        .await;
+    match stored {
+        Ok(Some((revision, payload, superseded_by))) => SpokeResult::Ok(StoredRow {
+            revision,
+            payload,
+            superseded_by,
+        }),
+        Ok(None) => entry_not_found(collection, entry_id),
+        Err(error) => internal(format!("knowledge entry could not be read: {error}")),
+    }
+}
+
+/// One stored entry of `collection` and the marker its row carries, read through the caller's
+/// transaction. The payload is returned as written — one statement selects the marker with it —
+/// so a caller that re-encodes it keeps the same cognition envelope and never copies the record
+/// rows back inline; [`read_entry`] projects those rows on top.
+async fn read_lifecycle(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+) -> SpokeResult<KnowledgeEntryLifecycle> {
+    let stored: Result<Option<(String, Option<String>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT payload, superseded_by FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
     )
     .bind(collection)
     .bind(entry_id)
     .fetch_optional(&mut **tx)
     .await;
-    match payload {
-        Ok(Some(payload)) => {
-            let mut entry = match decode(&payload) {
-                SpokeResult::Ok(entry) => entry,
-                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-            };
-            if let SpokeResult::Reject(reject) = hydrate_cognition_records(
-                &mut *tx,
-                collection,
-                std::slice::from_mut(&mut entry),
-                seam,
-            )
-            .await
-            {
-                return SpokeResult::Reject(reject);
-            }
-            SpokeResult::Ok(entry)
-        }
-        Ok(None) => spoke_reject(
-            SpokeRejectCode::KnowledgeEntryNotFound,
-            format!("no knowledge entry {entry_id} in collection {collection}"),
-            None,
-        ),
+    match stored {
+        Ok(Some((payload, superseded_by))) => match decode(&payload) {
+            SpokeResult::Ok(entry) => SpokeResult::Ok(KnowledgeEntryLifecycle {
+                entry,
+                superseded_by,
+            }),
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        },
+        Ok(None) => entry_not_found(collection, entry_id),
         Err(error) => internal(format!("knowledge entry could not be read: {error}")),
     }
+}
+
+/// One entry of `collection` as it was stored at `revision`, read through the caller's
+/// transaction so checkpoint selection and record hydration project one snapshot.
+///
+/// The first saved checkpoint at or above the requested revision supplies the payload and head;
+/// the live row stands in when no saved revision is that recent. The gap between them is advanced
+/// by dedicated appends alone, so it subtracts from the checkpoint head and the records are read
+/// only through that derived head — a later record never reaches an earlier replay.
+async fn read_entry_revision(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+    revision: u64,
+) -> SpokeResult<KnowledgeEntry> {
+    let Ok(assigned) = i64::try_from(revision) else {
+        return revision_not_found();
+    };
+    if assigned < 1 {
+        return revision_not_found();
+    }
+    let saved: Result<Option<(i64, String, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, payload, cognition_head_seq FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? AND revision >= ? \
+         ORDER BY revision ASC LIMIT 1",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .bind(assigned)
+    .fetch_optional(&mut **tx)
+    .await;
+    let checkpoint = match saved {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => {
+            let live: Result<Option<(i64, String, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+                "SELECT revision, payload, cognition_head_seq FROM knowledge_entries \
+                 WHERE collection = ? AND entry_id = ?",
+            )
+            .bind(collection)
+            .bind(entry_id)
+            .fetch_optional(&mut **tx)
+            .await;
+            match live {
+                Ok(Some((stored, payload, head))) if stored >= assigned => (stored, payload, head),
+                Ok(_) => return revision_not_found(),
+                Err(error) => {
+                    return internal(format!("knowledge entry could not be read: {error}"))
+                }
+            }
+        }
+        Err(error) => {
+            return internal(format!(
+                "knowledge revision history could not be read: {error}"
+            ))
+        }
+    };
+    let (checkpoint_revision, payload, head) = checkpoint;
+    let gap = checkpoint_revision - assigned;
+    let mut entry = match decode(&payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    entry.revision = Some(revision);
+    let checkpoint_head = head;
+    let head = match checkpoint_head {
+        Some(head) => head - gap,
+        None if gap == 0 => 0,
+        None => {
+            return internal(format!(
+                "knowledge entry {entry_id} revision {revision} has an impossible history gap"
+            ))
+        }
+    };
+    if head < 0 {
+        return internal(format!(
+            "knowledge entry {entry_id} revision {revision} has an impossible cognition head"
+        ));
+    }
+    if gap > 0 {
+        // A gap is advanced by dedicated appends alone. If the stored rows contradict that — a
+        // position missing or one a full put committed — the checkpoint cannot be this revision's
+        // successor, so that state is a storage failure rather than a replayable history.
+        let dedicated =
+            match gap_is_dedicated_appends(&mut **tx, collection, entry_id, head, gap).await {
+                SpokeResult::Ok(dedicated) => dedicated,
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+        if !dedicated {
+            return internal(format!(
+                "knowledge entry {entry_id} revision {revision} has a contradicted history gap"
+            ));
+        }
+    }
+    if head > 0 {
+        let records = match read_records_through(&mut **tx, collection, entry_id, head).await {
+            SpokeResult::Ok(records) => records,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if let Some(KnowledgeEntryModulesValue::Object(module)) =
+            entry.modules.get_mut(&module_key())
+        {
+            module.insert("records".to_string(), Value::Array(records));
+        }
+    } else if gap > 0 {
+        // The checkpoint keeps the envelope the first append left; its recorded shape says which
+        // member that append added, so the pre-append envelope is restored without a saved row.
+        let shape = match read_append_prior_shape(&mut **tx, collection, entry_id, 1).await {
+            SpokeResult::Ok(shape) => shape,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match shape {
+            Some(1) => {
+                entry.modules.remove(&module_key());
+            }
+            Some(2) => {
+                if let Some(KnowledgeEntryModulesValue::Object(module)) =
+                    entry.modules.get_mut(&module_key())
+                {
+                    module.remove("records");
+                }
+            }
+            Some(0) => {}
+            Some(shape) => {
+                return internal(format!(
+                    "knowledge entry {entry_id} first append carries shape {shape}"
+                ))
+            }
+            None => {
+                return internal(format!(
+                    "knowledge entry {entry_id} history has no first-append shape"
+                ))
+            }
+        }
+    }
+    SpokeResult::Ok(entry)
 }
 
 /// Projects `modules.cognition.records` of every `entries` member from the holder's record
@@ -543,8 +1079,9 @@ fn carries_cognition_records(entry: &KnowledgeEntry) -> bool {
     )
 }
 
-/// One holder's assigned revision and current-judgment pointer, read without hydrating its
-/// payload or history.
+/// One live holder's assigned revision and current-judgment pointer, read without hydrating its
+/// payload or history. A superseded entry has no current judgment to extend, so the marker's
+/// predicate rides in this statement and the row answers like an absent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CarrierHeader {
     pub revision: u64,
@@ -563,7 +1100,7 @@ where
 {
     let header: Result<Option<(i64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
         "SELECT revision, cognition_head_seq FROM knowledge_entries \
-         WHERE collection = ? AND entry_id = ?",
+         WHERE collection = ? AND entry_id = ? AND superseded_by IS NULL",
     )
     .bind(collection)
     .bind(entry_id)
@@ -620,8 +1157,9 @@ pub async fn write_entry(
         }
     }
 
-    let stored: Result<Option<(i64, String)>, sqlx::Error> = sqlx::query_as(
-        "SELECT revision, created_at FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    let stored: Result<Option<(i64, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, created_at, superseded_by FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
     )
     .bind(collection)
     .bind(&entry.entry_id)
@@ -631,8 +1169,23 @@ pub async fn write_entry(
         Ok(stored) => stored,
         Err(error) => return internal(format!("stored revision could not be read: {error}")),
     };
-    let stored_created_at = stored.as_ref().map(|(_, created_at)| created_at.clone());
-    let stored = stored.map(|(revision, _)| revision as u64);
+    // A superseded entry is not current: a full put may neither rewrite it nor clear its marker.
+    // The refusal keeps its `InvalidInput` code and names the marker as a structured detail, so a
+    // caller that must classify the occupied slot never decodes this message.
+    if let Some((_, _, Some(superseded_by))) = stored.as_ref() {
+        let mut details = Map::new();
+        details.insert(
+            "superseded_by".to_string(),
+            Value::from(superseded_by.clone()),
+        );
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            format!("knowledge entry {} is superseded", entry.entry_id),
+            Some(details),
+        );
+    }
+    let stored_created_at = stored.as_ref().map(|(_, created_at, _)| created_at.clone());
+    let stored = stored.map(|(revision, _, _)| revision as u64);
     // The submitted history moves out of the envelope instead of being copied: the
     // module gate above pinned `records` to an array, the replace leaves exactly the
     // empty member the stored payload requires, and the suffix inserts plus the
@@ -642,14 +1195,26 @@ pub async fn write_entry(
         Some(KnowledgeEntryModulesValue::Object(module)) => match module.get_mut("records") {
             Some(records) => match std::mem::replace(records, Value::Array(Vec::new())) {
                 Value::Array(records) => records,
-                _ => unreachable!("validated cognition module carries a records array"),
+                // The module gate above rejects a non-array `records` member, so this arm is not
+                // reachable through the public write path. It still refuses instead of aborting:
+                // a library must not take the process down on a shape its own validator missed.
+                _ => {
+                    return spoke_reject(
+                        SpokeRejectCode::InvalidInput,
+                        format!(
+                            "knowledge entry {} cognition records must be an array",
+                            entry.entry_id
+                        ),
+                        None,
+                    )
+                }
             },
             None => Vec::new(),
         },
         _ => Vec::new(),
     };
 
-    let revision = match expected_base_revision {
+    let next = match expected_base_revision {
         None => match stored {
             None => 1,
             Some(_) => {
@@ -665,11 +1230,19 @@ pub async fn write_entry(
             stored => return stale(&entry.entry_id, Some(expected), stored),
         },
     };
+    // The revision column is a signed INTEGER: refuse an unrepresentable revision before any row
+    // write, so a reported success is always a revision a replay can address.
+    let Ok(revision) = i64::try_from(next) else {
+        return internal(format!(
+            "knowledge entry {} revision is exhausted",
+            entry.entry_id
+        ));
+    };
 
     // Store bookkeeping stays in the SQL timestamp columns; the payload keeps
     // the caller's, except the creation instant an update never moves.
     let now = Utc::now();
-    entry.revision = Some(revision);
+    entry.revision = Some(next);
     if let Some(stored_created_at) = stored_created_at {
         let created_at = match DateTime::parse_from_rfc3339(&stored_created_at) {
             Ok(created_at) => created_at.with_timezone(&Utc),
@@ -744,7 +1317,7 @@ pub async fn write_entry(
         )
         .bind(collection)
         .bind(&entry.entry_id)
-        .bind(revision as i64)
+        .bind(revision)
         .bind(&payload)
         .bind(&created_at)
         .bind(&updated_at)
@@ -761,6 +1334,7 @@ pub async fn write_entry(
             &entry.entry_id,
             committed.len() as i64 + offset as i64 + 1,
             record,
+            None,
         )
         .await
         {
@@ -773,7 +1347,7 @@ pub async fn write_entry(
              SET revision = ?, cognition_head_seq = ?, payload = ?, updated_at = ? \
              WHERE collection = ? AND entry_id = ?",
         )
-        .bind(revision as i64)
+        .bind(revision)
         .bind(head)
         .bind(&payload)
         .bind(&updated_at)
@@ -808,6 +1382,9 @@ pub async fn write_entry(
     SpokeResult::Ok(entry)
 }
 
+/// One carrier row as the append reads it: revision, head, payload as written and liveness marker.
+type CarrierRow = (i64, Option<i64>, String, Option<String>);
+
 /// Append one validated cognition record inside the caller's transaction: compare the
 /// carrier revision without reading history, insert the record row at `head + 1` and
 /// advance the head and the outer revision together. Returns the assigned revision.
@@ -823,15 +1400,15 @@ pub async fn append_cognition(
     expected_revision: u64,
     record: &Value,
 ) -> SpokeResult<u64> {
-    let header: Result<Option<(i64, Option<i64>, String)>, sqlx::Error> = sqlx::query_as(
-        "SELECT revision, cognition_head_seq, payload FROM knowledge_entries \
+    let header: Result<Option<CarrierRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, cognition_head_seq, payload, superseded_by FROM knowledge_entries \
          WHERE collection = ? AND entry_id = ?",
     )
     .bind(collection)
     .bind(entry_id)
     .fetch_optional(&mut **tx)
     .await;
-    let (stored_revision, head_seq, payload) = match header {
+    let (stored_revision, head_seq, payload, superseded_by) = match header {
         Ok(Some(header)) => header,
         Ok(None) => {
             return spoke_reject(
@@ -842,6 +1419,10 @@ pub async fn append_cognition(
         }
         Err(error) => return internal(format!("carrier header could not be read: {error}")),
     };
+    // A superseded carrier takes no new judgment: refuse before the record row and the revision.
+    if superseded_by.is_some() {
+        return invalid_input(format!("knowledge entry {entry_id} is superseded"));
+    }
     let stored_revision = stored_revision as u64;
     if stored_revision != expected_revision {
         return stale(entry_id, Some(expected_revision), Some(stored_revision));
@@ -855,19 +1436,34 @@ pub async fn append_cognition(
         return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
     }
     let append_seq = head_seq.map_or(1, |head| head + 1);
-    if let SpokeResult::Reject(reject) =
-        insert_record(tx, collection, entry_id, append_seq, record).await
+    // The revision column is a signed INTEGER: refuse exhaustion before the record row and the
+    // carrier update, so a reported success is always a revision a replay can address.
+    let next = stored_revision + 1;
+    let Ok(next_revision) = i64::try_from(next) else {
+        return internal(format!("knowledge entry {entry_id} revision is exhausted"));
+    };
+    // The classification comes from the envelope this append is about to change, so the stored
+    // payload is decoded before the row write and re-encoded once below.
+    let mut entry = match decode(&payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    if let SpokeResult::Reject(reject) = insert_record(
+        tx,
+        collection,
+        entry_id,
+        append_seq,
+        record,
+        Some(append_prior_shape(&entry)),
+    )
+    .await
     {
         return SpokeResult::Reject(reject);
     }
 
     // Re-encode the carrier envelope with the advanced revision: records live in their own
     // rows, so this touches the carrier row only — never an earlier record.
-    let mut entry = match decode(&payload) {
-        SpokeResult::Ok(entry) => entry,
-        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-    };
-    entry.revision = Some(stored_revision + 1);
+    entry.revision = Some(next);
     let module = entry.modules.entry(module_key()).or_insert_with(|| {
         // First record of a carrier without a module: seed the same envelope a full
         // put would have committed.
@@ -892,7 +1488,7 @@ pub async fn append_cognition(
          SET revision = ?, cognition_head_seq = ?, payload = ?, updated_at = ? \
          WHERE collection = ? AND entry_id = ?",
     )
-    .bind((stored_revision + 1) as i64)
+    .bind(next_revision)
     .bind(append_seq)
     .bind(&payload)
     .bind(encode_timestamp(Utc::now()))
@@ -903,7 +1499,7 @@ pub async fn append_cognition(
     if let Err(error) = written {
         return internal(format!("knowledge entry could not be written: {error}"));
     }
-    SpokeResult::Ok(stored_revision + 1)
+    SpokeResult::Ok(next)
 }
 
 #[async_trait]

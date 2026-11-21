@@ -21,12 +21,15 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
@@ -92,6 +95,15 @@ impl Fixture {
         );
         Self { _dir: dir, store }
     }
+}
+
+/// A second connection on the fixture's file, so a test can corrupt a stored payload directly.
+async fn raw_connection(path: &Path) -> SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().filename(path))
+        .await
+        .expect("open raw connection")
 }
 
 fn entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
@@ -834,6 +846,178 @@ async fn owner_private_entry_stays_hidden_from_a_foreign_viewpoint() {
     assert_eq!(after.revision, Some(1));
 }
 
+/// A superseded entry is one absence on the served paths: its `get` answers exactly like a
+/// missing id and a disclosure-hidden row, the list stays live-only, and a conditional put cannot
+/// overwrite it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_superseded_entry_is_served_like_a_missing_one() {
+    let fixture = Fixture::open().await;
+    let superseded = expect_ok(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(COLLECTION))
+            .supersede_entry("ke_beta", 1, "ke_alpha")
+            .await,
+        "mark the served entry superseded",
+    );
+    assert_eq!(superseded, 2);
+    let served = fixture
+        .store
+        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let foreign = viewpoint_scope(SCOPE_ID, FOREIGN_VIEWPOINT);
+
+    let marked = expect_reject(
+        served
+            .get_scoped_knowledge_entry(&scope_of(SCOPE_ID), "ke_beta")
+            .await,
+        "get of a superseded entry",
+    );
+    let hidden = expect_reject(
+        served
+            .get_scoped_knowledge_entry(&foreign, "ke_mira_private")
+            .await,
+        "get of an entry hidden from the viewpoint",
+    );
+    let missing = expect_reject(
+        served
+            .get_scoped_knowledge_entry(&scope_of(SCOPE_ID), "ke_absent")
+            .await,
+        "get of a missing entry",
+    );
+    for (reject, entry_id) in [
+        (&marked, "ke_beta"),
+        (&hidden, "ke_mira_private"),
+        (&missing, "ke_absent"),
+    ] {
+        assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
+        assert_eq!(
+            reject.message,
+            format!("no knowledge entry {entry_id} in the admitted scope")
+        );
+        assert!(reject.details.is_none(), "one absence carries no details");
+    }
+
+    let listed = expect_ok(
+        served
+            .list_scoped_knowledge_entries(&scope_of(SCOPE_ID))
+            .await,
+        "the served list stays live-only",
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .map(|entry| entry.entry_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ke_alpha"]
+    );
+
+    let overwrite = expect_reject(
+        served
+            .put_scoped_knowledge_entry(&scope_of(SCOPE_ID), entry("ke_beta", "hijacked"), Some(2))
+            .await,
+        "conditional put of a superseded row",
+    );
+    assert_eq!(
+        overwrite.code,
+        SpokeRejectCode::NotAuthorized,
+        "a superseded row is never overwritten and leaks no CAS detail"
+    );
+    assert!(overwrite.details.is_none());
+
+    let stored = expect_ok(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(COLLECTION))
+            .get_entry_including_superseded("ke_beta")
+            .await,
+        "the refused put left the row and its marker",
+    );
+    assert_eq!(stored.superseded_by.as_deref(), Some("ke_alpha"));
+    assert_eq!(stored.entry.body.summary.as_deref(), Some("beta shared"));
+    assert_eq!(stored.entry.revision, Some(2));
+}
+
+/// A marked row is filtered in the query and its marker is checked before its payload is decoded:
+/// an unreadable retired payload is the generic absence on `get` and `NotAuthorized` on a put,
+/// while explicit reads and live rows still surface the decode failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marked_row_with_unreadable_payload_is_served_like_a_missing_one() {
+    let fixture = Fixture::open().await;
+    let local = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    expect_ok(
+        local.supersede_entry("ke_beta", 1, "ke_alpha").await,
+        "mark the served entry superseded",
+    );
+    let raw = raw_connection(&fixture._dir.path().join("knowledge_connect.db")).await;
+    sqlx::query(
+        "UPDATE knowledge_entries SET payload = '{\"broken\":' \
+         WHERE collection = ? AND entry_id = 'ke_beta'",
+    )
+    .bind(COLLECTION)
+    .execute(&raw)
+    .await
+    .expect("corrupt the marked payload");
+
+    let served = fixture
+        .store
+        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let scope = scope_of(SCOPE_ID);
+    let marked = expect_reject(
+        served.get_scoped_knowledge_entry(&scope, "ke_beta").await,
+        "get of a marked row with an unreadable payload",
+    );
+    assert_eq!(marked.code, SpokeRejectCode::KnowledgeEntryNotFound);
+    assert_eq!(
+        marked.message,
+        "no knowledge entry ke_beta in the admitted scope"
+    );
+    assert!(marked.details.is_none());
+
+    let overwrite = expect_reject(
+        served
+            .put_scoped_knowledge_entry(&scope, entry("ke_beta", "hijacked"), Some(2))
+            .await,
+        "put over a marked row with an unreadable payload",
+    );
+    assert_eq!(overwrite.code, SpokeRejectCode::NotAuthorized);
+    assert!(overwrite.details.is_none());
+
+    // The marking path settles on the marker before decoding too: an already-retired row with an
+    // unreadable payload refuses as already superseded, never as a storage failure.
+    let remark = expect_reject(
+        local.supersede_entry("ke_beta", 2, "ke_alpha").await,
+        "supersede an already-marked row with an unreadable payload",
+    );
+    assert_eq!(remark.code, SpokeRejectCode::InvalidInput);
+    assert!(
+        remark.message.contains("already superseded"),
+        "unexpected message: {}",
+        remark.message
+    );
+
+    // Explicit reads and live rows keep the decode failure.
+    let explicit = expect_reject(
+        local.get_entry_including_superseded("ke_beta").await,
+        "explicit read of the unreadable marked row",
+    );
+    assert_eq!(explicit.code, SpokeRejectCode::InternalError);
+    sqlx::query(
+        "UPDATE knowledge_entries SET payload = '{\"broken\":' \
+         WHERE collection = ? AND entry_id = 'ke_alpha'",
+    )
+    .bind(COLLECTION)
+    .execute(&raw)
+    .await
+    .expect("corrupt the live payload");
+    let live = expect_reject(
+        served.get_scoped_knowledge_entry(&scope, "ke_alpha").await,
+        "get of a live row with an unreadable payload",
+    );
+    assert_eq!(live.code, SpokeRejectCode::InternalError);
+
+    raw.close().await;
+}
+
 /// A refused put names neither the served collection nor whether the id exists:
 /// a conditional put of an id that is absent — including one that exists only
 /// in another collection — answers exactly like a stale visible row, and a
@@ -945,6 +1129,104 @@ async fn refused_put_names_no_collection() {
         "the other collection still holds its own entry",
     );
     assert_eq!(elsewhere.body.summary.as_deref(), Some("studio only"));
+}
+
+/// A storage failure on the served path crosses the trust boundary as one fixed message: the
+/// driver's text names the local table, so the peer must not receive it, while the local port keeps
+/// the detail for the host's own logs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_failure_names_no_table_to_the_peer() {
+    let fixture = Fixture::open().await;
+    let adapter_peer_id = derive_peer_id_from_ed25519_pubkey(
+        &SigningKey::from_bytes(&[0x42u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let session = connect_knowledge_session(
+        &fixture,
+        admission_of(&adapter_peer_id, scope_of(SCOPE_ID)),
+        &["spoke-knowledge"],
+        &["spoke-knowledge"],
+        None,
+    )
+    .await;
+    // A real driver failure: every knowledge statement now answers `no such table`.
+    let raw = raw_connection(&fixture._dir.path().join("knowledge_connect.db")).await;
+    sqlx::query("DROP TABLE knowledge_entries")
+        .execute(&raw)
+        .await
+        .expect("drop the carrier table");
+
+    let scope = scope_of(SCOPE_ID);
+    let rejects = [
+        (
+            "get",
+            expect_reject(
+                KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, "ke_alpha").await,
+                "get against a dropped carrier table",
+            ),
+        ),
+        (
+            "list",
+            expect_reject(
+                KnowledgeQueryPort::list_knowledge_entries(&*session.adapter, &scope).await,
+                "list against a dropped carrier table",
+            ),
+        ),
+        (
+            "put",
+            expect_reject(
+                KnowledgeEntryPort::put_knowledge_entry(
+                    &*session.adapter,
+                    entry("ke_gamma", "written"),
+                    None,
+                )
+                .await,
+                "put against a dropped carrier table",
+            ),
+        ),
+    ];
+    for (op, reject) in &rejects {
+        assert_eq!(
+            reject.code,
+            SpokeRejectCode::InternalError,
+            "{op}: a storage failure is an internal error"
+        );
+        assert_eq!(
+            reject.message, "knowledge storage is unavailable",
+            "{op}: the peer gets the fixed message"
+        );
+        assert!(reject.details.is_none(), "{op}: no detail crosses either");
+        for leaked in [
+            "knowledge_entries",
+            "collection",
+            "entry_id",
+            "UNIQUE",
+            "constraint",
+            "no such table",
+        ] {
+            assert!(
+                !reject.message.contains(leaked),
+                "{op}: the peer's message names {leaked}: {}",
+                reject.message
+            );
+        }
+    }
+
+    let local = expect_reject(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(COLLECTION))
+            .get_knowledge_entry("ke_alpha")
+            .await,
+        "the local port sees the same storage failure",
+    );
+    assert_eq!(local.code, SpokeRejectCode::InternalError);
+    assert!(
+        local.message.contains("knowledge_entries"),
+        "the local port keeps the driver detail for the host's logs: {}",
+        local.message
+    );
 }
 
 /// A declared viewpoint is served only under the negotiated `ke-ownership`

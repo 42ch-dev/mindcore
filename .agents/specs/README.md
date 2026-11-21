@@ -11,3 +11,4 @@ Current-state specifications of the Mindcore repository. Each page describes the
 | [`data/cognition-record-storage.md`](data/cognition-record-storage.md) | Per-record cognition storage, the carrier head, and its CAS/projection rules |
 | [`data/embedding-vector-store.md`](data/embedding-vector-store.md) | Identity-keyed record vectors, the query slot, and the exact-scoring read/fill order |
 | [`data/store-schema.md`](data/store-schema.md) | The single migration `MindStore::open` applies, the tables it creates, and the recreate-on-mismatch policy |
+| [`data/knowledge-lifecycle.md`](data/knowledge-lifecycle.md) | Revision history, replay by nearest checkpoint, adoption over two ports, and retirement by marker |

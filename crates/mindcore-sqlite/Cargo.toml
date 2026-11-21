@@ -25,6 +25,8 @@ tempfile = "3.27.0"
 # settle-parity Task 1: the embed_parity harness drives `MemoryAdapter` +
 # `SqliteMemoryRepository` on a caller-held transaction. Test-only edge.
 mindcore-spoke = { path = "../mindcore-spoke" }
+# Knowledge adoption regression: the SPI helper is exercised against this crate's real ports.
+mindcore-spi = { path = "../mindcore-spi" }
 # I-000060: `spaces_list_query_count` sets `log_statements` (a `log::LevelFilter`)
 # and counts the driver's `sqlx::query` tracing events. Both crates are already in
 # the graph through sqlx.

@@ -22,7 +22,7 @@ use mindcore_spi::{
     StructuredReasonRequest,
 };
 use mindcore_spoke::{MemoryAdapter, MemoryStage, MemoryWorkflowBinding};
-use mindcore_sqlite::{MindStore, SERVED_KNOWLEDGE_LIST_LIMIT};
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT};
 use spoke_operations::{SpokeRejectCode, SpokeResult};
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
@@ -846,6 +846,57 @@ async fn knowledge_slot_hides_owner_private_entries() {
         entries,
         ["ke_gate"],
         "an owner-private entry must not reach a pack with no admitted viewpoint"
+    );
+}
+
+/// A superseded entry is not current: the pack's knowledge slot omits it, while an owner-private
+/// entry stays withheld from the viewpoint-free read.
+#[tokio::test]
+async fn knowledge_slot_omits_a_superseded_entry() {
+    let harness = Harness::open().await;
+    harness.grant(&["recall"]).await;
+    harness.knowledge_grant(PRINCIPAL).await;
+    harness
+        .record(
+            "rec_a",
+            "the north gate is closed",
+            "2026-11-20T09:00:01.000Z",
+        )
+        .await;
+    harness.entry("wren", "ke_gate", "closed after dusk").await;
+    harness.entry("wren", "ke_market", "opens at dawn").await;
+    harness
+        .private_entry("wren", "ke_mira_diary", "ke_mira", "mira's private notes")
+        .await;
+    let wren = ScopedKnowledgeStore::new(harness.pool.clone(), KnowledgeScope::new("wren"));
+    match wren.supersede_entry("ke_market", 1, "ke_gate").await {
+        SpokeResult::Ok(revision) => assert_eq!(revision, 2),
+        SpokeResult::Reject(reject) => panic!("marking the slot entry failed: {reject:?}"),
+    }
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+
+    let pack = workflows
+        .recall_context(
+            &principal(),
+            &request(None, 10),
+            budget(),
+            &MindCapabilities {
+                embedder: Some(&embedder),
+                ..MindCapabilities::default()
+            },
+        )
+        .await
+        .expect("pack");
+
+    let entries: Vec<&str> = pack
+        .knowledge
+        .iter()
+        .map(|entry| entry.entry_id.as_str())
+        .collect();
+    assert_eq!(
+        entries,
+        ["ke_gate"],
+        "a superseded entry never reaches the pack, and the private one stays withheld"
     );
 }
 
