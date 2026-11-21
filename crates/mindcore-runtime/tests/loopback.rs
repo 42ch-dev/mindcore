@@ -67,8 +67,8 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Open a throwaway database and make it protocol-shaped; this is not `MindStore`'s production
-    /// open path (see the module note and issue `I-000068`).
+    /// Open a throwaway database through the production `MindStore::open` path (its embedded
+    /// migration installs the protocol schema), then seed the rows the faces read.
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
         let store = MindStore::open(&dir.path().join("loopback.db"))
