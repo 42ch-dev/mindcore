@@ -38,8 +38,8 @@ mismatch: fix the cause and retry `open` instead of recreating the file.
 
 ## Checks
 
-Requires a stable Rust toolchain, `sqlite3`, and the `sqlx-cli` version `Cargo.lock` resolves (CI
-installs that version).
+Requires a stable Rust toolchain, `sqlite3`, and `sqlx-cli` at the release of the `sqlx` crate the
+workspace resolves (CI installs that version).
 
 ```sh
 (  # the subshell keeps `set -e` from leaking into the caller's shell
@@ -63,10 +63,10 @@ SQLX_OFFLINE=true cargo test --locked --workspace
 )
 ```
 
-CI runs these same steps (`.github/workflows/ci.yml`) after installing that `sqlx-cli` version, and
-fails on any `.sqlx/` drift. `set -e` is what makes the local run match it: a failed `sqlx prepare`
-stops the block before the drift test, which can only report a fresh cache when `prepare` itself
-succeeded. To watch the story end to end:
+CI runs these same steps (`.github/workflows/ci.yml`) after installing `sqlx-cli` at that `sqlx`
+release, and fails on any `.sqlx/` drift. `set -e` is what makes the local run match it: a failed
+`sqlx prepare` stops the block before the drift test, which can only report a fresh cache when
+`prepare` itself succeeded. To watch the story end to end:
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01

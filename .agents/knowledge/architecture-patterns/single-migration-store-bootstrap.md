@@ -24,8 +24,8 @@ last_updated: 2026-11-21
 
 `MindStore::open` applied `crates/mindcore-sqlite/migrations/0001_init.sql`, which created three
 legacy memory tables with nine columns each. The recall path served by `MemoryAdapter` needed the
-ten-table protocol shape, and that shape existed only in
-`crates/mindcore-sqlite/tests/fixtures/settlement-prepare.sql` — a file every test applied itself.
+ten-table protocol shape, and that shape existed only in a test fixture which every test applied
+itself.
 
 Nothing failed, because no test ever asked the production open path to serve a request. The
 mismatch was invisible until a host tried it: a freshly opened database answered `no such table:
