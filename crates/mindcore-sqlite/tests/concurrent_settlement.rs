@@ -91,14 +91,15 @@ async fn competing_handles_retain_one_candidate() {
         (SpokeResult::Ok(retained), SpokeResult::Reject(reject))
         | (SpokeResult::Reject(reject), SpokeResult::Ok(retained)) => {
             // The loser's refusal depends on how far its transaction got before the winner
-            // committed: a consumed candidate, a lost revision CAS, or SQLite's pre-commit
-            // write refusal once the sibling's commit invalidated the loser's WAL snapshot.
+            // committed: a consumed candidate, a lost revision CAS, or a write SQLite refused
+            // once the sibling's commit invalidated the loser's WAL snapshot. That last case is
+            // contention, so it reports uncertainty instead of the storage catch-all.
             assert!(
                 matches!(
                     reject.code,
                     SpokeRejectCode::CandidateConsumed
                         | SpokeRejectCode::RevisionConflict
-                        | SpokeRejectCode::InternalError
+                        | SpokeRejectCode::OutcomeUncertain
                 ),
                 "a competing retention must lose with a competition outcome, not {reject:?}"
             );
