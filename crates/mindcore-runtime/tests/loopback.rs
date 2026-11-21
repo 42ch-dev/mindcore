@@ -675,6 +675,49 @@ async fn carrier_assessors(
         .collect()
 }
 
+/// One collection's observable state: its entry and cognition row counts, plus one named carrier's
+/// revision and update stamp.
+#[derive(Debug, PartialEq, Eq)]
+struct CollectionState {
+    entries: i64,
+    cognition: i64,
+    revision: i64,
+    updated_at: String,
+}
+
+async fn collection_state(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    carrier: &str,
+) -> CollectionState {
+    let entries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")
+            .bind(collection)
+            .fetch_one(pool)
+            .await
+            .expect("count the collection's entries");
+    let cognition: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cognition_records WHERE collection = ?")
+            .bind(collection)
+            .fetch_one(pool)
+            .await
+            .expect("count the collection's cognition rows");
+    let (revision, updated_at): (i64, String) = sqlx::query_as(
+        "SELECT revision, updated_at FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(carrier)
+    .fetch_one(pool)
+    .await
+    .expect("read the carrier's revision and update stamp");
+    CollectionState {
+        entries,
+        cognition,
+        revision,
+        updated_at,
+    }
+}
+
 fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
     match result {
         SpokeResult::Ok(value) => value,
@@ -952,8 +995,10 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
 
-    // The first principal's verdict lands on its own collection's carrier.
+    // The first principal's verdict lands on its own collection's carrier, and nothing in the
+    // second collection may change: capture it immediately before the call.
     let first = connect(&surface, &[DELIBERATE]).await;
+    let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
     let settled = expect_ok(
         first
             .adapter
@@ -984,9 +1029,15 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
             .is_empty(),
         "the second collection carries no assessment"
     );
+    assert_eq!(
+        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        untouched,
+        "the first call leaves the second collection's rows, carrier revision and update stamp unchanged"
+    );
 
     // The second principal settles onto its own carrier, never the first's.
     let second = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let untouched = collection_state(&pool, COLLECTION, CARRIER).await;
     let settled = expect_ok(
         second
             .adapter
@@ -1018,6 +1069,11 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         carrier_assessors(&pool, COLLECTION, CARRIER).await,
         [PRINCIPAL],
         "no second assessment landed on the first principal's carrier"
+    );
+    assert_eq!(
+        collection_state(&pool, COLLECTION, CARRIER).await,
+        untouched,
+        "the second call leaves the first collection's rows, carrier revision and update stamp unchanged"
     );
 }
 
