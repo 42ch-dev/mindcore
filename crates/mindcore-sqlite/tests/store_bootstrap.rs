@@ -180,13 +180,14 @@ async fn production_open_serves_recall_after_bootstrap() {
 
     // The staged intent owes file targets; publish them under this test's own root and confirm
     // the published bytes before settling.
-    let targets: String =
-        sqlx::query_scalar("SELECT targets_json FROM memory_journal WHERE receipt_id = ?")
-            .bind(&receipt_id)
-            .fetch_one(&pool)
-            .await
-            .expect("journal intent");
-    let targets: Vec<Value> = serde_json::from_str(&targets).expect("journal targets");
+    let mut tx = pool.begin().await.expect("begin the journal read");
+    let intent = SqliteMemoryRepository
+        .journal_intent(&mut tx, &SpaceId::new(SPACE), &receipt_id)
+        .await
+        .expect("journal intent")
+        .expect("the staged receipt holds a journal intent");
+    tx.rollback().await.expect("rollback the journal read");
+    let targets = intent.targets;
     assert!(!targets.is_empty(), "the staged intent owes file targets");
     for target in &targets {
         let target_path = temp

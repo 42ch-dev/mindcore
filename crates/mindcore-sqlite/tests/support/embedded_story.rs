@@ -360,13 +360,14 @@ pub async fn stage_review(
     };
     tx.commit().await.expect("commit the review");
 
-    let owed: String =
-        sqlx::query_scalar("SELECT targets_json FROM memory_journal WHERE receipt_id = ?")
-            .bind(&receipt_id)
-            .fetch_one(pool)
-            .await
-            .expect("journal intent");
-    let owed: Vec<Value> = serde_json::from_str(&owed).expect("journal targets");
+    let mut tx = pool.begin().await.expect("begin the journal read");
+    let intent = SqliteMemoryRepository
+        .journal_intent(&mut tx, &SpaceId::new("wren"), &receipt_id)
+        .await
+        .expect("journal intent")
+        .expect("the staged receipt holds a journal intent");
+    tx.rollback().await.expect("rollback the journal read");
+    let owed = intent.targets;
     assert!(!owed.is_empty(), "the staged intent owes file targets");
     for target in &owed {
         let path = root.join(target["path"].as_str().expect("target path"));
