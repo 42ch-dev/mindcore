@@ -760,8 +760,10 @@ async fn read_entry_seeded(
 /// payload is decoded: a retired row's payload may be unreadable and must still answer as an
 /// absence on the current-entry paths. Only callers that must decide about a marked row read one —
 /// the explicit read, the routed put preflight and the marking CAS. The revision column has two
-/// readers, both CAS bases: [`write_entry`] and [`supersede_entry`], so a column/payload
-/// disagreement is caught on the put path and on the marking path.
+/// readers, both CAS bases: [`write_entry`] and [`supersede_entry`]. Only the marking path compares
+/// the column against the payload it also reads and refuses a disagreement; `write_entry` compares
+/// the column against the caller's expected revision and never inspects the stored payload, so it
+/// cannot detect that drift.
 struct StoredRow {
     revision: i64,
     payload: String,
