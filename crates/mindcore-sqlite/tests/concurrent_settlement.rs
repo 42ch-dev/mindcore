@@ -7,6 +7,21 @@
 //! `tests/knowledge.rs` establishes the same shape for knowledge writes. Settlement contention is
 //! constructed rather than scheduled: both caller transactions read the pending pair before
 //! either settles, so the loser cannot be a replay of the winner's commit.
+//!
+//! What a settlement loser observes is SQLite's writer refusal, never the settlement's row
+//! predicate: the loser's read pins a snapshot the winner's commit invalidates, and SQLite refuses
+//! that connection's first write before any statement runs, so the `rows_affected == 0` branch in
+//! `settle_journal` cannot answer on a second connection. It cannot answer on one connection
+//! either — settling reads and writes the pair inside one transaction, so nothing else can move
+//! the intent between them. The predicate's reachable twin is the sequential pre-read guard
+//! asserted by `mindcore-spoke`'s `settle_journal_reports_mismatch_as_uncertain`: the same
+//! `OUTCOME_UNCERTAIN` refusal for an intent that moved before the settlement read it.
+
+/// The refusal SQLite's writer produces when it refuses a transaction whose snapshot a competing
+/// commit invalidated. `InternalError`/`retryable` is also what an unrelated pre-commit driver
+/// failure produces, so on the retain path the contention is asserted by this detail; a settlement
+/// upgrades the class to `uncertain` once the pending pair is durable, and that race asserts both.
+const REFUSED_BEFORE_COMMIT: &str = "a concurrent writer refused this transaction before commit";
 
 #[allow(dead_code)]
 #[path = "support/embedded_story.rs"]
@@ -106,15 +121,17 @@ async fn competing_handles_retain_one_candidate() {
             // once the sibling's commit invalidated the loser's WAL snapshot. The last case is
             // contention, and a retain loser never commits, so it is a retryable pre-commit
             // failure — never `OUTCOME_UNCERTAIN`, which would ask the caller to resolve an
-            // outcome this transaction provably does not have.
+            // outcome this transaction provably does not have. Only the message separates that
+            // contention from any other pre-commit driver failure, so it is asserted.
             assert!(
                 matches!(
                     reject.code,
                     SpokeRejectCode::CandidateConsumed | SpokeRejectCode::RevisionConflict
                 ) || (reject.code == SpokeRejectCode::InternalError
-                    && retry_class(&reject) == "retryable"),
-                "a competing retention must lose with a competition outcome or a retryable \
-                 pre-commit failure, not {reject:?}"
+                    && retry_class(&reject) == "retryable"
+                    && reject.message == REFUSED_BEFORE_COMMIT),
+                "a competing retention must lose with a competition outcome or the write-lock \
+                 refusal, not {reject:?}"
             );
             retained
         }
@@ -209,8 +226,9 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
 
     // The loser already observed the pending pair, so its settlement is a write against that
     // closed snapshot rather than a read of the winner's commit. The serialized writer refuses it
-    // and the protocol reports uncertainty; any successful reply here means the pending pair was
-    // replayed as a second settlement.
+    // before any statement runs — the `rows_affected == 0` predicate below never answers — and the
+    // protocol reports uncertainty; any successful reply here means the pending pair was replayed
+    // as a second settlement.
     //
     // This loser differs from the retain race above: the staged intent and its pending receipt are
     // already durable, so the pre-commit refusal lands on `unsettled` and becomes `OUTCOME_UNCERTAIN`
@@ -220,11 +238,23 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
         .settle_journal(&mut loser_tx, &space, &receipt)
         .await
     {
-        SpokeResult::Reject(reject) => assert_eq!(
-            reject.code,
-            SpokeRejectCode::OutcomeUncertain,
-            "a contended settlement loses without a terminal second outcome: {reject:?}"
-        ),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::OutcomeUncertain,
+                "a contended settlement loses without a terminal second outcome: {reject:?}"
+            );
+            assert_eq!(
+                retry_class(&reject),
+                "uncertain",
+                "the pending pair is already durable, so this is a resolve-before-retry outcome, \
+                 not the retryable pre-commit class a failure before any commit reports: {reject:?}"
+            );
+            assert_eq!(
+                reject.message, REFUSED_BEFORE_COMMIT,
+                "the write lock answered, not the settlement's row predicate: {reject:?}"
+            );
+        }
         SpokeResult::Ok(body) => panic!(
             "a settlement that observed the pending pair must not replay the winner's commit: \
              {body}"

@@ -33,6 +33,18 @@ Two `MindStore` handles opened on the same file each own a one-connection pool. 
 
 Holding `BEGIN IMMEDIATE` on a second connection and polling the write with a timeout is not a proof: a stalled worker can pass the test with a deferred transaction. The observed discriminator is the failure mode — with `pool.begin()` the write died in `~10 ms` with `database is locked (code: 5)` mapped to an internal error, while the immediate variant stayed blocked for the whole reservation window. Prefer a structural guard (a reservation-gated read path) over elapsed-time inference; if only a timing test is available, track the weakness as a residual.
 
+## Proving contention, not just failure
+
+A race test that accepts "the loser returned a retryable error" proves nothing about contention: every pre-commit driver failure — a busy lock, a lost snapshot, an I/O error — produces the same shape. The test passes whether or not the intended branch ran.
+
+Three ways to make the assertion name the branch, in order of strength:
+
+1. **A test-only interleave seam** that lets the loser observe claim state the winner then changes, so it reaches the in-transaction `rows_affected == 0` predicate deterministically. That predicate is unreachable **through the normal open path** — SQLite refuses the contended loser at the write lock before it executes, which is option 3 — and a seam is the only construct that makes it reachable. Strongest, but it costs production plumbing: an interleave hook has to reach the repository through whatever adapter sits above it.
+2. **A pinned reject detail.** If the contended path has a distinct message or class, assert the exact text alongside the code and the retry class. A generic failure cannot satisfy it. This is what `concurrent_settlement` does, and its two races show the two shapes. The retain loser commits nothing, so it may legitimately lose three ways — a consumed candidate, a lost revision CAS, or the write-lock refusal — and the assertion is a scored disjunction whose third arm pins code, class **and** message together (`InternalError` + `retryable` + `a concurrent writer refused this transaction before commit`); anything else fails. The settlement loser's pending pair is already durable, so it has one shape: `OUTCOME_UNCERTAIN`, class `uncertain`, that same message. The rule is not one shared class but that every accepted outcome names a branch the race can actually reach, and the contention arm is pinned by all three of code, class and message.
+3. **A written justification of unreachability.** When the branch genuinely cannot run (SQLite refuses the loser at the write lock before the predicate executes), state that in the module and assert the sequential case explicitly. Do not leave the branch to a race test that never reaches it and never says so.
+
+Whichever you choose, the failure mode to avoid is the same: an assertion whose condition is satisfied by an unrelated error class, so a regression into the generic fallback passes silently.
+
 ## Pitfalls
 
 - `max_connections(1)` serializes one pool, not all handles to the same file.

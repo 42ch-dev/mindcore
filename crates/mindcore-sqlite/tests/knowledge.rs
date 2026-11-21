@@ -2534,12 +2534,27 @@ async fn the_list_bound_counts_live_rows() {
         "seed one live row past the bound",
     );
     tx.commit().await.expect("commit seed");
-    assert_eq!(
-        expect_reject(
-            port.list_entries().await,
-            "a live set one row past the bound"
+    let refused = match port.list_entries().await {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(listed) => panic!(
+            "a live set one row past the bound must refuse the list, not serve {} entries",
+            listed.len()
         ),
-        SpokeRejectCode::InternalError
+    };
+    assert_eq!(refused.code, SpokeRejectCode::InternalError);
+    let details = refused
+        .details
+        .as_ref()
+        .expect("the over-bound refusal carries its class");
+    assert_eq!(
+        details.get("reason").and_then(Value::as_str),
+        Some("COLLECTION_OVER_CAPACITY"),
+        "the local face classifies capacity apart from a storage fault: {refused:?}"
+    );
+    assert_eq!(
+        details.get("limit"),
+        Some(&Value::from(SERVED_KNOWLEDGE_LIST_LIMIT)),
+        "the refusal names the bound it crossed: {refused:?}"
     );
 
     store.close().await;
