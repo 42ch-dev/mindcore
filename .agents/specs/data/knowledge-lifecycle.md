@@ -17,7 +17,7 @@ How a knowledge entry behaves over time: the history a write leaves behind, the 
 | `cognition_head_seq` | the head that payload was stored with, or null when it had none |
 | `recorded_at` | the replaced state's own `updated_at`, not the archiving instant |
 
-The table is written by `knowledge_entries_capture_revision`, the migration's `BEFORE UPDATE OF revision` trigger on `knowledge_entries`, not by the Rust write path: a cost contract pins the append path's statement count, so history must not add a literal statement there. The trigger is the table's only writer, and the primary key makes the write idempotent by construction. The trigger's skip predicate excludes the dedicated cognition append, which advances the carrier without replacing an entry payload.
+The table is written by `knowledge_entries_capture_revision`, the migration's `BEFORE UPDATE OF revision` trigger on `knowledge_entries`, not by the Rust write path: a cost contract pins the append path's statement count, so history must not add a literal statement there. The trigger is the table's only writer, and the primary key rejects a second row for the same revision, so a repeated capture fails as a constraint violation rather than duplicating the preimage. The trigger's skip predicate excludes the dedicated cognition append, which advances the carrier without replacing an entry payload.
 
 A create writes no history row, and a refused write (stale base revision, invalid module, missing committed record, exhausted revision space) writes none.
 
@@ -52,7 +52,7 @@ An unassigned revision, revision 0, a value above the representable range, and a
 - The disclosure predicate is unchanged: hiding is one generic absence on every served path.
 - The current-row read, the header read, the default list and the scoped put keep their statement counts; the filter is an added predicate.
 - A retired row and its history are never deleted; no committed cognition record is rewritten.
-- The CAS compares the stored revision **column** and refuses a column/payload disagreement before writing.
+- The CAS compares the stored revision **column** against the caller's expectation; the marking path additionally refuses a column/payload disagreement before writing, while the full put never decodes the stored payload and therefore cannot detect that drift.
 
 ## Where it lives
 
