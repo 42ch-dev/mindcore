@@ -25,7 +25,7 @@ The route is a collection allowlist, not an authorization grant: every carrier w
 
 ## Alternatives considered
 
-- **One surface per principal, each with its own configured scope.** Rejected: every surface needs its own ports, manifest, tool registrations and responder registration, so a host that serves N principals duplicates identity, transport and admission configuration N times and still cannot share one memory face.
+- **One surface per principal, each with its own configured scope.** Rejected: every surface assembles its own ports, manifest, tool registrations and responder registration, so a host that serves N principals duplicates that assembly N times. Sharing Memory is not the blocker — separate surfaces may take clones of the same host-supplied `Arc<dyn RemoteMemoryService>` — but the route map does not force a new Memory service, and duplicating the assembly per principal does.
 - **A request-time resolver consulted per call.** Rejected: it reintroduces route resolution on every call and needs state the surface must keep coherent, for a mapping that is fixed host configuration. Validating and taking the map once at assembly makes an invalid route a startup refusal instead of a per-call error.
 - **Let the request name the principal's collection.** Rejected: a caller-declared route is a caller-chosen scope. Selection must follow the authenticated peer through the host's admission, never a wire value, and the refusal must not reveal another principal's route.
 - **Fall back to a default collection when a principal has no route.** Rejected: a silent default would disclose or write into a collection the host did not configure for that principal. Carrier admission refuses instead, and recall returns an empty slot.
@@ -34,7 +34,7 @@ The route is a collection allowlist, not an authorization grant: every carrier w
 
 - One surface serves many principals with no caller-declared routes and no resolver state. The cost is immutability: changing a mapping means rebuilding the surface, and the current one neither hot-reloads nor falls back.
 - `ServeFaces.workflow_caller` is deleted; a served `deliberate` resolves its carrier collection from the admitted principal's route.
-- A surface with no routes serves memory and `absorb` and `recall_context`, with an empty knowledge slot; it serves no deliberation and advertises none.
+- An empty route map leaves Memory-face availability unchanged — Memory is served only when `faces.memory` is configured — and `absorb` and `recall_context` keep serving with no routed knowledge slot; only `deliberate` is suppressed from the advertisement and the handler set.
 - No refusal discloses another principal's route, collection or entry, and no workflow reaches a collection outside its own admitted principal's route.
 - Hosts that need carrier isolation between principals configure distinct collections; a shared destination grants no per-holder isolation.
 
