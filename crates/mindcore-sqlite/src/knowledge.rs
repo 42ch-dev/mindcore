@@ -18,7 +18,8 @@ use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryMod
 use spoke_schemas::{KnowledgeEntry, Scope};
 
 use crate::cognition::{
-    insert_record, read_append_prior_shape, read_records, read_records_through,
+    gap_is_dedicated_appends, insert_record, read_append_prior_shape, read_records,
+    read_records_through,
 };
 use crate::store::{MindStore, SnapshotSeam};
 
@@ -533,10 +534,10 @@ async fn read_entry_seeded(
 /// One entry of `collection` as it was stored at `revision`, read through the caller's
 /// transaction so checkpoint selection and record hydration project one snapshot.
 ///
-/// The newest saved checkpoint at or after `revision` supplies the payload and head; the live row
-/// stands in when no saved revision is that recent. The gap between them is advanced by dedicated
-/// appends alone, so it subtracts from the checkpoint head and the records are read only through
-/// that derived head — a later record never reaches an earlier replay.
+/// The first saved checkpoint at or above the requested revision supplies the payload and head;
+/// the live row stands in when no saved revision is that recent. The gap between them is advanced
+/// by dedicated appends alone, so it subtracts from the checkpoint head and the records are read
+/// only through that derived head — a later record never reaches an earlier replay.
 async fn read_entry_revision(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
@@ -591,7 +592,8 @@ async fn read_entry_revision(
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
     entry.revision = Some(revision);
-    let head = match head {
+    let checkpoint_head = head;
+    let head = match checkpoint_head {
         Some(head) => head - gap,
         None if gap == 0 => 0,
         None => {
@@ -604,6 +606,21 @@ async fn read_entry_revision(
         return internal(format!(
             "knowledge entry {entry_id} revision {revision} has an impossible cognition head"
         ));
+    }
+    if gap > 0 {
+        // A gap is advanced by dedicated appends alone. If the stored rows contradict that — a
+        // position missing or one a full put committed — the checkpoint cannot be this revision's
+        // successor, so that state is a storage failure rather than a replayable history.
+        let dedicated =
+            match gap_is_dedicated_appends(&mut **tx, collection, entry_id, head, gap).await {
+                SpokeResult::Ok(dedicated) => dedicated,
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+        if !dedicated {
+            return internal(format!(
+                "knowledge entry {entry_id} revision {revision} has a contradicted history gap"
+            ));
+        }
     }
     if head > 0 {
         let records = match read_records_through(&mut **tx, collection, entry_id, head).await {
@@ -822,7 +839,7 @@ pub async fn write_entry(
         _ => Vec::new(),
     };
 
-    let revision = match expected_base_revision {
+    let next = match expected_base_revision {
         None => match stored {
             None => 1,
             Some(_) => {
@@ -838,11 +855,19 @@ pub async fn write_entry(
             stored => return stale(&entry.entry_id, Some(expected), stored),
         },
     };
+    // The revision column is a signed INTEGER: refuse an unrepresentable revision before any row
+    // write, so a reported success is always a revision a replay can address.
+    let Ok(revision) = i64::try_from(next) else {
+        return internal(format!(
+            "knowledge entry {} revision is exhausted",
+            entry.entry_id
+        ));
+    };
 
     // Store bookkeeping stays in the SQL timestamp columns; the payload keeps
     // the caller's, except the creation instant an update never moves.
     let now = Utc::now();
-    entry.revision = Some(revision);
+    entry.revision = Some(next);
     if let Some(stored_created_at) = stored_created_at {
         let created_at = match DateTime::parse_from_rfc3339(&stored_created_at) {
             Ok(created_at) => created_at.with_timezone(&Utc),
@@ -917,7 +942,7 @@ pub async fn write_entry(
         )
         .bind(collection)
         .bind(&entry.entry_id)
-        .bind(revision as i64)
+        .bind(revision)
         .bind(&payload)
         .bind(&created_at)
         .bind(&updated_at)
@@ -947,7 +972,7 @@ pub async fn write_entry(
              SET revision = ?, cognition_head_seq = ?, payload = ?, updated_at = ? \
              WHERE collection = ? AND entry_id = ?",
         )
-        .bind(revision as i64)
+        .bind(revision)
         .bind(head)
         .bind(&payload)
         .bind(&updated_at)
@@ -1029,6 +1054,12 @@ pub async fn append_cognition(
         return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
     }
     let append_seq = head_seq.map_or(1, |head| head + 1);
+    // The revision column is a signed INTEGER: refuse exhaustion before the record row and the
+    // carrier update, so a reported success is always a revision a replay can address.
+    let next = stored_revision + 1;
+    let Ok(next_revision) = i64::try_from(next) else {
+        return internal(format!("knowledge entry {entry_id} revision is exhausted"));
+    };
     // The classification comes from the envelope this append is about to change, so the stored
     // payload is decoded before the row write and re-encoded once below.
     let mut entry = match decode(&payload) {
@@ -1050,7 +1081,7 @@ pub async fn append_cognition(
 
     // Re-encode the carrier envelope with the advanced revision: records live in their own
     // rows, so this touches the carrier row only — never an earlier record.
-    entry.revision = Some(stored_revision + 1);
+    entry.revision = Some(next);
     let module = entry.modules.entry(module_key()).or_insert_with(|| {
         // First record of a carrier without a module: seed the same envelope a full
         // put would have committed.
@@ -1075,7 +1106,7 @@ pub async fn append_cognition(
          SET revision = ?, cognition_head_seq = ?, payload = ?, updated_at = ? \
          WHERE collection = ? AND entry_id = ?",
     )
-    .bind((stored_revision + 1) as i64)
+    .bind(next_revision)
     .bind(append_seq)
     .bind(&payload)
     .bind(encode_timestamp(Utc::now()))
@@ -1086,7 +1117,7 @@ pub async fn append_cognition(
     if let Err(error) = written {
         return internal(format!("knowledge entry could not be written: {error}"));
     }
-    SpokeResult::Ok(stored_revision + 1)
+    SpokeResult::Ok(next)
 }
 
 #[async_trait]

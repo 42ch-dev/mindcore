@@ -33,6 +33,7 @@ Both mean recreate. A busy or locked database, an I/O error or a permissions pro
 - One schema source: the migration. Tests seed data, never tables.
 - The production open path is the only way a test obtains the schema, so a regression in the migration fails the end-to-end test instead of passing through a fixture that supplies the missing table.
 - A history preimage is written by the update that displaces it, in that update's transaction: a refused, stale or rolled-back write leaves none.
+- `revision` and `cognition_head_seq` are signed SQLite integers: a writer refuses a next revision it cannot represent before writing any row, so every committed revision stays addressable by the preimage table and replay.
 - Saved preimages and committed cognition records are immutable; replay reads them and never rewrites them.
 - A migration change and the code that reads it land together; an intermediate state where the schema moved and the readers did not is not a deliverable.
 - Column names, types and constraints are shared with the borrowed-transaction repository; changing one without the other breaks decoding at runtime, not at compile time.

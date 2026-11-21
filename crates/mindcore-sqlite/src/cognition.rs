@@ -92,33 +92,12 @@ pub async fn read_records<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT payload FROM cognition_records \
-         WHERE collection = ? AND entry_id = ? ORDER BY append_seq ASC",
-    )
-    .bind(collection)
-    .bind(entry_id)
-    .fetch_all(executor)
-    .await;
-    let payloads = match payloads {
-        Ok(payloads) => payloads,
-        Err(error) => return internal(format!("cognition records could not be listed: {error}")),
-    };
-    let mut records = Vec::with_capacity(payloads.len());
-    for payload in &payloads {
-        match serde_json::from_str(payload) {
-            Ok(record) => records.push(record),
-            Err(error) => {
-                return internal(format!("stored cognition record is not JSON: {error}"));
-            }
-        }
-    }
-    SpokeResult::Ok(records)
+    ordered_records(executor, collection, entry_id, None).await
 }
 
 /// The holder's records up to and including `head_seq` in storage order: the historical
 /// projection a replay hydrates, so a record appended after that head is never read.
-pub async fn read_records_through<'e, E>(
+pub(crate) async fn read_records_through<'e, E>(
     executor: E,
     collection: &str,
     entry_id: &str,
@@ -127,15 +106,44 @@ pub async fn read_records_through<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let payloads: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT payload FROM cognition_records \
-         WHERE collection = ? AND entry_id = ? AND append_seq <= ? ORDER BY append_seq ASC",
-    )
-    .bind(collection)
-    .bind(entry_id)
-    .bind(head_seq)
-    .fetch_all(executor)
-    .await;
+    ordered_records(executor, collection, entry_id, Some(head_seq)).await
+}
+
+// One decoder and one refusal path for both record reads: the bound differs, the storage order,
+// the JSON shape and the failure message do not.
+async fn ordered_records<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+    through: Option<i64>,
+) -> SpokeResult<Vec<Value>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let payloads: Result<Vec<String>, sqlx::Error> = match through {
+        Some(head_seq) => {
+            sqlx::query_scalar(
+                "SELECT payload FROM cognition_records \
+                 WHERE collection = ? AND entry_id = ? AND append_seq <= ? \
+                 ORDER BY append_seq ASC",
+            )
+            .bind(collection)
+            .bind(entry_id)
+            .bind(head_seq)
+            .fetch_all(executor)
+            .await
+        }
+        None => {
+            sqlx::query_scalar(
+                "SELECT payload FROM cognition_records \
+                 WHERE collection = ? AND entry_id = ? ORDER BY append_seq ASC",
+            )
+            .bind(collection)
+            .bind(entry_id)
+            .fetch_all(executor)
+            .await
+        }
+    };
     let payloads = match payloads {
         Ok(payloads) => payloads,
         Err(error) => return internal(format!("cognition records could not be listed: {error}")),
@@ -152,10 +160,39 @@ where
     SpokeResult::Ok(records)
 }
 
+/// Whether the `gap` head positions a replay crosses are exactly the rows dedicated appends wrote:
+/// every one of them classified, so no position is missing and none was committed by a full put.
+/// A full put stamps `NULL` and saves its own preimage, so it can never leave a gap behind.
+pub(crate) async fn gap_is_dedicated_appends<'e, E>(
+    executor: E,
+    collection: &str,
+    entry_id: &str,
+    after: i64,
+    gap: i64,
+) -> SpokeResult<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let counts: Result<(i64, i64), sqlx::Error> = sqlx::query_as(
+        "SELECT count(*), count(append_prior_shape) FROM cognition_records \
+         WHERE collection = ? AND entry_id = ? AND append_seq > ? AND append_seq <= ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .bind(after)
+    .bind(after + gap)
+    .fetch_one(executor)
+    .await;
+    match counts {
+        Ok((rows, classified)) => SpokeResult::Ok(rows == gap && classified == gap),
+        Err(error) => internal(format!("cognition history gap could not be read: {error}")),
+    }
+}
+
 /// What the append at `append_seq` replaced in the carrier envelope: `None` when that row has no
 /// classification (a full-put record, or no such row), which a replay must treat as missing
 /// history rather than as an empty shape.
-pub async fn read_append_prior_shape<'e, E>(
+pub(crate) async fn read_append_prior_shape<'e, E>(
     executor: E,
     collection: &str,
     entry_id: &str,

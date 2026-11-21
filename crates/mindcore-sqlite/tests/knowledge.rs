@@ -57,6 +57,20 @@ async fn second_connection(path: &Path) -> SqlitePool {
         .expect("open second connection")
 }
 
+// A connection enforcing foreign keys the way `MindStore::open` configures the production pool.
+async fn foreign_keys_connection(path: &Path) -> SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .busy_timeout(Duration::from_secs(5))
+                .foreign_keys(true),
+        )
+        .await
+        .expect("open foreign-key connection")
+}
+
 fn entry_with(entry_id: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
         body: KnowledgeEntryBody {
@@ -997,7 +1011,8 @@ async fn a_refused_or_rolled_back_write_leaves_no_preimage() {
         SpokeRejectCode::StoredRevisionStale
     );
 
-    // A write that succeeded inside the caller's transaction, then rolled back, leaves nothing.
+    // A write that succeeded inside the caller's transaction, then rolled back, leaves nothing —
+    // including the record row of the new suffix it submitted.
     let mut tx = writer
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -1009,7 +1024,10 @@ async fn a_refused_or_rolled_back_write_leaves_no_preimage() {
             cognition_entry(
                 "ke_gate",
                 "rolled back",
-                vec![belief("ke_gate", "cog_first")],
+                vec![
+                    belief("ke_gate", "cog_first"),
+                    belief("ke_gate", "cog_second"),
+                ],
             ),
             Some(1),
         )
@@ -1023,6 +1041,13 @@ async fn a_refused_or_rolled_back_write_leaves_no_preimage() {
     assert!(
         revision_rows(&writer, "ke_gate").await.is_empty(),
         "no refused or rolled-back write leaves a preimage"
+    );
+    assert!(
+        record_rows(&writer, "ke_gate")
+            .await
+            .iter()
+            .all(|(_, record_id, _, _)| record_id != "cog_second"),
+        "a rolled-back suffix leaves no record row"
     );
     let live = expect_ok(port.get_knowledge_entry("ke_gate").await, "live entry");
     assert_eq!(live.revision, Some(1));
@@ -1154,7 +1179,12 @@ async fn an_absent_revision_answers_like_a_missing_entry() {
         "create",
     );
 
-    for (entry_id, revision) in [("ke_gate", 0), ("ke_gate", 2), ("ke_missing", 1)] {
+    for (entry_id, revision) in [
+        ("ke_gate", 0),
+        ("ke_gate", 2),
+        ("ke_gate", i64::MAX as u64 + 1),
+        ("ke_missing", 1),
+    ] {
         expect_revision_not_found(
             port.get_entry_at_revision(entry_id, revision).await,
             "an absent revision answers like a missing entry",
@@ -1206,18 +1236,17 @@ async fn replay_keeps_the_other_members_when_the_first_append_added_records() {
     let path = database_path("replay-shape-two");
     let store = MindStore::open(&path).await.expect("open store");
     let port = store.knowledge(KnowledgeScope::new("wren"));
-    let seed = second_connection(&path).await;
+    let writer = second_connection(&path).await;
 
-    // The write path rejects a cognition module without `records`, so a store holding that shape
-    // is seeded directly: revision 2 is the live state after a dedicated append added the member.
+    // The write path rejects a cognition module without `records`, so only that pre-append
+    // envelope is seeded; the record row and its shape come from the real append path.
     let world_facts = json!([{"kind": "world_fact", "world_fact_id": "wf_gate"}]);
     let extensions = json!({"mindcore_test": {"viewpoint": "studio"}});
     let mut live = entry_with("ke_gate", "closed after dusk");
-    live.revision = Some(2);
+    live.revision = Some(1);
     live.modules.insert(
         cognition_module_key(),
         cognition_module_value(json!({
-            "records": [],
             "world_facts": world_facts,
             "extensions": extensions,
         })),
@@ -1225,28 +1254,19 @@ async fn replay_keeps_the_other_members_when_the_first_append_added_records() {
     sqlx::query(
         "INSERT INTO knowledge_entries \
          (collection, entry_id, revision, payload, cognition_head_seq, created_at, updated_at) \
-         VALUES ('wren', 'ke_gate', 2, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+         VALUES ('wren', 'ke_gate', 1, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
     )
     .bind(serde_json::to_string(&live).expect("entry serializes"))
-    .execute(&seed)
+    .execute(&writer)
     .await
-    .expect("seed the live entry");
-    sqlx::query(
-        "INSERT INTO cognition_records \
-         (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
-         VALUES ('wren', 'ke_gate', 1, 'cog_first', ?, 2)",
-    )
-    .bind(serde_json::to_string(&belief("ke_gate", "cog_first")).expect("record serializes"))
-    .execute(&seed)
-    .await
-    .expect("seed the first appended record");
-    sqlx::query(
-        "UPDATE knowledge_entries SET cognition_head_seq = 1 \
-         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
-    )
-    .execute(&seed)
-    .await
-    .expect("point the head at the record");
+    .expect("seed the pre-append entry");
+
+    assert_eq!(append(&writer, "ke_gate", 1, "cog_first").await, 2);
+    assert_eq!(
+        stored_shape(&writer, "ke_gate", 1).await,
+        Some(2),
+        "the append classifies the module it found without records"
+    );
 
     let replayed = expect_ok(
         port.get_entry_at_revision("ke_gate", 1).await,
@@ -1275,7 +1295,185 @@ async fn replay_keeps_the_other_members_when_the_first_append_added_records() {
     );
     assert_eq!(record_ids(&current), ["cog_first"]);
 
+    writer.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn replay_refuses_a_gap_its_append_metadata_contradicts() {
+    let path = database_path("replay-contradicted-gap");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let seed = second_connection(&path).await;
+
+    // Live revision 3 with head 2 and no saved revision 2: revision 2 is reachable only through a
+    // dedicated append at position 2, yet the row there was committed by a full put, which always
+    // saves its preimage. The store contradicts itself, so the gap is not replayable.
+    let mut live = cognition_entry("ke_gate", "current", Vec::new());
+    live.revision = Some(3);
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, cognition_head_seq, created_at, updated_at) \
+         VALUES ('wren', 'ke_gate', 3, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(serde_json::to_string(&live).expect("entry serializes"))
+    .execute(&seed)
+    .await
+    .expect("seed the live entry");
+    for (append_seq, record_id, shape) in [(1, "cog_first", Some(0)), (2, "cog_second", None)] {
+        sqlx::query(
+            "INSERT INTO cognition_records \
+             (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+             VALUES ('wren', 'ke_gate', ?, ?, ?, ?)",
+        )
+        .bind(append_seq)
+        .bind(record_id)
+        .bind(serde_json::to_string(&belief("ke_gate", record_id)).expect("record serializes"))
+        .bind(shape)
+        .execute(&seed)
+        .await
+        .expect("seed the record row");
+    }
+    sqlx::query(
+        "UPDATE knowledge_entries SET cognition_head_seq = 2 \
+         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .execute(&seed)
+    .await
+    .expect("point the head at the records");
+
+    assert_eq!(
+        expect_reject(
+            port.get_entry_at_revision("ke_gate", 2).await,
+            "replay across a contradicted gap"
+        ),
+        SpokeRejectCode::InternalError
+    );
+
     seed.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn an_exhausted_revision_space_is_refused_before_any_write() {
+    let path = database_path("revision-exhausted");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let writer = second_connection(&path).await;
+
+    expect_ok(
+        port.put_knowledge_entry(cognition_entry("ke_gate", "first", Vec::new()), None)
+            .await,
+        "create",
+    );
+    // The last storable revision: the next one is not representable in the revision column.
+    sqlx::query(
+        "UPDATE knowledge_entries SET revision = ? \
+         WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .bind(i64::MAX)
+    .execute(&writer)
+    .await
+    .expect("seed the last storable revision");
+    let preimages = revision_rows(&writer, "ke_gate").await;
+    let records = record_rows(&writer, "ke_gate").await;
+
+    let full_put = port
+        .put_knowledge_entry(
+            cognition_entry(
+                "ke_gate",
+                "unrepresentable",
+                vec![belief("ke_gate", "cog_beyond")],
+            ),
+            Some(i64::MAX as u64),
+        )
+        .await;
+    assert_eq!(
+        expect_reject(full_put, "full put at revision exhaustion"),
+        SpokeRejectCode::InternalError
+    );
+
+    let mut tx = writer
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin append");
+    let appended = append_cognition(
+        &mut tx,
+        "wren",
+        "ke_gate",
+        i64::MAX as u64,
+        &belief("ke_gate", "cog_beyond"),
+    )
+    .await;
+    assert_eq!(
+        expect_reject(appended, "append at revision exhaustion"),
+        SpokeRejectCode::InternalError
+    );
+    tx.rollback().await.expect("roll back the refused append");
+
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .fetch_one(&writer)
+    .await
+    .expect("stored revision");
+    assert_eq!(stored, i64::MAX, "a refused write leaves the revision");
+    assert_eq!(
+        revision_rows(&writer, "ke_gate").await,
+        preimages,
+        "a refused write saves no preimage"
+    );
+    assert_eq!(
+        record_rows(&writer, "ke_gate").await,
+        records,
+        "a refused write inserts no record row"
+    );
+
+    writer.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn deleting_a_headless_parent_with_history_is_refused() {
+    let path = database_path("revision-parent-delete");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let enforcing = foreign_keys_connection(&path).await;
+
+    // A headless entry: no record row references it, so only the preimage key can refuse the
+    // delete — the non-cascading foreign key D11 declares.
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_gate", "first"), None)
+            .await,
+        "create",
+    );
+    expect_ok(
+        port.put_knowledge_entry(entry_with("ke_gate", "second"), Some(1))
+            .await,
+        "second revision",
+    );
+    let saved = revision_rows(&enforcing, "ke_gate").await;
+    assert_eq!(saved.len(), 1, "the update saved one preimage");
+
+    let deleted = sqlx::query(
+        "DELETE FROM knowledge_entries WHERE collection = 'wren' AND entry_id = 'ke_gate'",
+    )
+    .execute(&enforcing)
+    .await;
+    assert!(
+        deleted.is_err(),
+        "the non-cascading parent key refuses the delete"
+    );
+    assert_eq!(
+        revision_rows(&enforcing, "ke_gate").await,
+        saved,
+        "the preimage survives the refused delete"
+    );
+
+    enforcing.close().await;
     store.close().await;
     remove_database(&path);
 }
