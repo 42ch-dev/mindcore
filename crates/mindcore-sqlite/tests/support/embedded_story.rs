@@ -166,7 +166,7 @@ pub fn json_of(entry: &KnowledgeEntry) -> Value {
     serde_json::to_value(entry).expect("entry serializes")
 }
 
-fn record_ids(records: &[Value]) -> Vec<&str> {
+pub fn record_ids(records: &[Value]) -> Vec<&str> {
     records
         .iter()
         .filter_map(|record| record.get("record_id").and_then(Value::as_str))
@@ -188,7 +188,7 @@ fn assert_holder_consistency(value: &Value) {
 }
 
 /// The authenticated caller the host supplies; never payload-asserted.
-fn principal(id: &str) -> Principal {
+pub fn principal(id: &str) -> Principal {
     serde_json::from_value(json!({ "principal_id": id, "extensions": {} }))
         .expect("principal wire shape")
 }
@@ -203,7 +203,7 @@ fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
 // Host control-plane provisioning: the protocol has no create-space or first-grant operation, so
 // the host writes one active space and one space-wide grant per space. Everything after this is a
 // protocol operation.
-async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
+pub async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     sqlx::query(
         "INSERT INTO memory_spaces \
@@ -249,8 +249,24 @@ async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
     tx.commit().await.expect("commit the grant");
 }
 
+/// One adapter subject registration: the story's Wren and the race tests' shared subject.
+pub async fn ensure_subject(pool: &SqlitePool, adapter: &MemoryAdapter, caller: &Principal) {
+    let mut tx = pool.begin().await.expect("begin the subject");
+    ready(
+        adapter
+            .ensure_subject(
+                &mut tx,
+                caller,
+                json!({ "space_id": "wren", "subject_id": "wren" }),
+            )
+            .await,
+        "ensure the wren subject",
+    );
+    tx.commit().await.expect("commit the subject");
+}
+
 /// One adapter capture over a caller transaction; reports the pending candidate's identity.
-async fn capture(
+pub async fn capture(
     pool: &SqlitePool,
     adapter: &MemoryAdapter,
     caller: &Principal,
@@ -266,11 +282,12 @@ async fn capture(
 }
 
 /// One adapter recall over a caller transaction; the selection is the §6.12 wire member.
-async fn recalled(
+pub async fn recalled_by(
     pool: &SqlitePool,
     adapter: &MemoryAdapter,
     caller: &Principal,
     space: &str,
+    subject: &str,
     selection: Value,
 ) -> Vec<Value> {
     let mut tx = pool.begin().await.expect("begin the recall");
@@ -281,7 +298,7 @@ async fn recalled(
                 caller,
                 json!({
                     "space_id": space,
-                    "subject_id": "wren",
+                    "subject_id": subject,
                     "selection": selection,
                     "budget": { "max_items": 10 },
                 }),
@@ -291,6 +308,17 @@ async fn recalled(
     );
     tx.rollback().await.expect("rollback the recall");
     body["records"].as_array().expect("records array").clone()
+}
+
+/// Wren's recall in one space: the story's own subject, other spaces included.
+pub async fn recalled(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    space: &str,
+    selection: Value,
+) -> Vec<Value> {
+    recalled_by(pool, adapter, caller, space, "wren", selection).await
 }
 
 fn in_context(context: &str) -> Value {
@@ -307,23 +335,27 @@ fn review_request(candidate_id: &str, key: &str) -> Value {
     })
 }
 
-/// Wren's review round: promote the candidate, commit the staged intent, publish every owed
-/// target into the story's scratch root, settle the receipt and report its identities.
-async fn retain(
+/// Wren's review round: promote the candidate, commit the staged intent and publish every owed
+/// target into the caller's scratch root; the receipt stays pending for settlement.
+pub async fn stage_review(
     pool: &SqlitePool,
     adapter: &MemoryAdapter,
     caller: &Principal,
     root: &Path,
     candidate_id: &str,
     key: &str,
-) -> (String, String) {
+) -> SpokeResult<String> {
     let mut tx = pool.begin().await.expect("begin the review");
     let stage = adapter
         .review_candidate(&mut tx, caller, review_request(candidate_id, key))
         .await;
-    let receipt_id = match expect_ok(stage, "review the candidate") {
-        MemoryStage::JournalPending { receipt_id, .. } => receipt_id,
-        other => panic!("review must stage a journal intent, got {other:?}"),
+    let receipt_id = match stage {
+        SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        SpokeResult::Ok(other) => panic!("review must stage a journal intent, got {other:?}"),
+        SpokeResult::Reject(reject) => {
+            tx.rollback().await.expect("rollback the refused review");
+            return SpokeResult::Reject(reject);
+        }
     };
     tx.commit().await.expect("commit the review");
 
@@ -347,21 +379,73 @@ async fn retain(
             "the published bytes are the intent's"
         );
     }
+    SpokeResult::Ok(receipt_id)
+}
 
+/// Settle one staged receipt in its own caller transaction and report the receipt body.
+pub async fn settle_receipt(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    space: &str,
+    receipt_id: &str,
+) -> SpokeResult<Value> {
     let mut tx = pool.begin().await.expect("begin the settlement");
-    let receipt = expect_ok(
-        adapter
-            .settle_journal(&mut tx, &SpaceId::new("wren"), &receipt_id)
-            .await,
-        "settle the review intent",
-    );
-    tx.commit().await.expect("commit the settlement");
+    let settled = adapter
+        .settle_journal(&mut tx, &SpaceId::new(space), receipt_id)
+        .await;
+    match settled {
+        SpokeResult::Ok(receipt) => {
+            tx.commit().await.expect("commit the settlement");
+            SpokeResult::Ok(receipt)
+        }
+        SpokeResult::Reject(reject) => {
+            tx.rollback().await.expect("rollback the refused settlement");
+            SpokeResult::Reject(reject)
+        }
+    }
+}
+
+/// One full retain attempt: stage, publish, settle. A refusal is returned instead of panicking so
+/// competing callers can report which side lost.
+pub async fn attempt_retain(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    root: &Path,
+    candidate_id: &str,
+    key: &str,
+) -> SpokeResult<(String, String)> {
+    let receipt_id = match stage_review(pool, adapter, caller, root, candidate_id, key).await {
+        SpokeResult::Ok(receipt_id) => receipt_id,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
+    let receipt = match settle_receipt(pool, adapter, "wren", &receipt_id).await {
+        SpokeResult::Ok(receipt) => receipt,
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+    };
     assert_eq!(receipt["status"], json!("committed"));
     let record_id = receipt["result"]["record_ids"][0]
         .as_str()
         .expect("retained record id")
         .to_string();
-    (receipt_id, record_id)
+    SpokeResult::Ok((receipt_id, record_id))
+}
+
+/// The story's single-threaded retain: an unexpected refusal fails the run.
+async fn retain(
+    pool: &SqlitePool,
+    adapter: &MemoryAdapter,
+    caller: &Principal,
+    root: &Path,
+    candidate_id: &str,
+    key: &str,
+) -> (String, String) {
+    match attempt_retain(pool, adapter, caller, root, candidate_id, key).await {
+        SpokeResult::Ok(identities) => identities,
+        SpokeResult::Reject(reject) => {
+            panic!("review the candidate: unexpectedly rejected with {reject:?}")
+        }
+    }
 }
 
 pub fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
@@ -396,18 +480,7 @@ pub async fn run_story(label: &str) {
     let adapter = MemoryAdapter::new(false);
     provision_space(&pool, "wren", "caller_wren").await;
     provision_space(&pool, "studio", "caller_studio").await;
-    let mut tx = pool.begin().await.expect("begin the subject");
-    ready(
-        adapter
-            .ensure_subject(
-                &mut tx,
-                &wren_caller,
-                json!({ "space_id": "wren", "subject_id": "wren" }),
-            )
-            .await,
-        "ensure the wren subject",
-    );
-    tx.commit().await.expect("commit the subject");
+    ensure_subject(&pool, &adapter, &wren_caller).await;
 
     let wren = store.knowledge(KnowledgeScope::new("wren"));
     let studio = store.knowledge(KnowledgeScope::new("studio"));
@@ -559,6 +632,42 @@ pub async fn run_story(label: &str) {
         SpokeRejectCode::CandidateConsumed
     );
     tx.rollback().await.expect("rollback the second review");
+
+    // Scoped isolation, now that a record exists: the record is recallable in its own scope and
+    // must not answer another space's or another subject's recall. S1's cross-space recall ran
+    // while both spaces were empty, so it could not tell a filtered recall from an unfiltered one;
+    // the positive control below keeps these refusals from being vacuous in turn.
+    let own_scope = recalled(&pool, &adapter, &wren_caller, "wren", in_context("tavern")).await;
+    assert_eq!(
+        record_ids(&own_scope),
+        vec![hearsay.as_str()],
+        "positive control: the retained record is recallable in Wren's own scope"
+    );
+    let other_space = recalled(
+        &pool,
+        &adapter,
+        &studio_caller,
+        "studio",
+        json!({ "mode": "subject_all" }),
+    )
+    .await;
+    assert!(
+        other_space.is_empty(),
+        "a Wren record must not cross into Studio's space: {other_space:?}"
+    );
+    let other_subject = recalled_by(
+        &pool,
+        &adapter,
+        &wren_caller,
+        "wren",
+        "mason",
+        json!({ "mode": "subject_all" }),
+    )
+    .await;
+    assert!(
+        other_subject.is_empty(),
+        "a Wren record must not answer another subject's recall in the same space: {other_subject:?}"
+    );
 
     let shared_after_adoption = expect_ok(
         facts.get_knowledge_entry(&shared_entry_id).await,
