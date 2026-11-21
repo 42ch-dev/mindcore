@@ -19,7 +19,8 @@
 
 /// The refusal SQLite's writer produces when it refuses a transaction whose snapshot a competing
 /// commit invalidated. `InternalError`/`retryable` is also what an unrelated pre-commit driver
-/// failure produces, so the contention path is asserted by this detail, not by the class.
+/// failure produces, so on the retain path the contention is asserted by this detail; a settlement
+/// upgrades the class to `uncertain` once the pending pair is durable, and that race asserts both.
 const REFUSED_BEFORE_COMMIT: &str = "a concurrent writer refused this transaction before commit";
 
 #[allow(dead_code)]
@@ -242,6 +243,12 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
                 reject.code,
                 SpokeRejectCode::OutcomeUncertain,
                 "a contended settlement loses without a terminal second outcome: {reject:?}"
+            );
+            assert_eq!(
+                retry_class(&reject),
+                "uncertain",
+                "the pending pair is already durable, so this is a resolve-before-retry outcome, \
+                 not the retryable pre-commit class a failure before any commit reports: {reject:?}"
             );
             assert_eq!(
                 reject.message, REFUSED_BEFORE_COMMIT,
