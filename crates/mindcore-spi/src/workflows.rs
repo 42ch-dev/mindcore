@@ -149,8 +149,10 @@ pub trait WorkflowBinding: Send + Sync {
     /// already present is a no-op; a mismatched or malformed one is a storage
     /// error. It records a decision, never a settlement, and a capture replay
     /// reads it to report the original `Pending` outcome instead of the
-    /// candidate's later state. Never call it for an empty set or a failed
-    /// decision.
+    /// candidate's later state. A retry that repairs a missing marker passes
+    /// the receipt's complete candidate list, in receipt order: that list is
+    /// the domain the original decision ranged over, and the replay settles
+    /// none of it. Never call it for an empty set or a failed decision.
     async fn record_absorb_pending(
         &self,
         principal: &Principal,
@@ -525,8 +527,10 @@ impl SpiMindWorkflows {
     /// reports the original `Pending` outcome even after the candidate was
     /// resolved elsewhere. A replay whose candidate is still pending and has no
     /// marker is the retry of a run that failed between its capture commit and
-    /// that write: it records the marker before returning, so the `Pending` it
-    /// reports now stays the answer later replays give.
+    /// that write: it records that receipt's complete candidate list — the
+    /// whole domain the decision ranged over, which a replay reasons about and
+    /// settles none of — before returning, so the `Pending` it reports now
+    /// stays the answer later replays give.
     pub async fn absorb(
         &self,
         principal: &Principal,
@@ -539,6 +543,21 @@ impl SpiMindWorkflows {
             replayed,
         } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidates.len());
+        // A replay that still reports a candidate pending holds no marker: the
+        // run that decided left it unwritten. That decision ranged over the
+        // receipt's whole candidate list — a replay reasons about none of it
+        // and settles none of it — so the repair records that complete list,
+        // in receipt order, instead of the residue this replay can observe.
+        let repair = (replayed
+            && candidates
+                .iter()
+                .any(|candidate| candidate.lifecycle == CandidateLifecycle::Pending))
+        .then(|| {
+            candidates
+                .iter()
+                .map(|candidate| candidate.candidate_id.clone())
+                .collect::<Vec<_>>()
+        });
         // Fresh candidates this run leaves pending: its durable Pending
         // decision, recorded before success so a later replay can report it.
         let mut held: Vec<String> = Vec::new();
@@ -548,20 +567,18 @@ impl SpiMindWorkflows {
         } in candidates
         {
             if replayed {
-                // Pending with no marker is a retry of the run whose marker
-                // write failed after its capture committed: without this write
-                // a later replay would report the resolution, not the decision.
-                if lifecycle == CandidateLifecycle::Pending {
-                    held.push(candidate_id.clone());
-                }
-                outcomes.push(match lifecycle {
-                    CandidateLifecycle::Pending | CandidateLifecycle::PendingDecision => {
-                        AbsorbCandidateOutcome::Pending { candidate_id }
-                    }
-                    CandidateLifecycle::Consumed => {
-                        self.replay_candidate(principal, request, candidate_id)
-                            .await?
-                    }
+                // With no marker the repair above records every candidate, so
+                // this replay reports the same decision every later one will.
+                let pending = repair.is_some()
+                    || matches!(
+                        lifecycle,
+                        CandidateLifecycle::Pending | CandidateLifecycle::PendingDecision
+                    );
+                outcomes.push(if pending {
+                    AbsorbCandidateOutcome::Pending { candidate_id }
+                } else {
+                    self.replay_candidate(principal, request, candidate_id)
+                        .await?
                 });
                 continue;
             }
@@ -585,8 +602,9 @@ impl SpiMindWorkflows {
             }
             outcomes.push(outcome);
         }
-        if !held.is_empty() {
-            let pending: Vec<&str> = held.iter().map(String::as_str).collect();
+        let decision = repair.unwrap_or(held);
+        if !decision.is_empty() {
+            let pending: Vec<&str> = decision.iter().map(String::as_str).collect();
             self.binding
                 .record_absorb_pending(principal, request, &pending)
                 .await?;
