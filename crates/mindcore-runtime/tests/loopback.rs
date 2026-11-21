@@ -997,7 +997,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
 
     // The first principal's verdict lands on its own collection's carrier, and nothing in the
     // second collection may change: capture it immediately before the call.
-    let first = connect(&surface, &[DELIBERATE]).await;
+    let first = connect(&surface, &[DELIBERATE, RECALL_CONTEXT]).await;
     let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
     let settled = expect_ok(
         first
@@ -1036,7 +1036,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
     );
 
     // The second principal settles onto its own carrier, never the first's.
-    let second = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let second = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE, RECALL_CONTEXT]).await;
     let untouched = collection_state(&pool, COLLECTION, CARRIER).await;
     let settled = expect_ok(
         second
@@ -1074,6 +1074,46 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         collection_state(&pool, COLLECTION, CARRIER).await,
         untouched,
         "the second call leaves the first collection's rows, carrier revision and update stamp unchanged"
+    );
+
+    // A recall's slot is routed per principal too: each peer lists only its own collection's
+    // entry, never the other principal's, whichever route the host configured first.
+    let mut recall = recall_arguments();
+    recall["max_tokens"] = json!(4_000);
+    let first_pack = expect_ok(
+        first
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, recall.clone())
+            .await,
+        "recall by the first principal",
+    );
+    assert_eq!(
+        packed_record_ids(&first_pack),
+        ["rec_market", "rec_north_gate"],
+        "the first principal's memory page is served: {first_pack}"
+    );
+    assert_eq!(
+        packed_knowledge_ids(&first_pack),
+        [CARRIER],
+        "the first principal's slot lists only its own routed collection: {first_pack}"
+    );
+    let second_pack = expect_ok(
+        second.adapter.invoke_tool(RECALL_CONTEXT, recall).await,
+        "recall by the second principal",
+    );
+    assert_eq!(
+        packed_record_ids(&second_pack),
+        ["rec_market", "rec_north_gate"],
+        "the second principal's memory page is served: {second_pack}"
+    );
+    assert_eq!(
+        packed_knowledge_ids(&second_pack),
+        [CARRIER_TWO],
+        "the second principal's slot lists only its own routed collection: {second_pack}"
+    );
+    assert_eq!(
+        second_pack["knowledge"][0]["canonical_name"], "ke_mora's carrier",
+        "the slot carries this collection's entry, not the other principal's copy: {second_pack}"
     );
 }
 
