@@ -21,39 +21,10 @@ use mindcore_spi::{
     StructuredReasonRequest,
 };
 use mindcore_spoke::MemoryWorkflowBinding;
-use mindcore_sqlite::SERVED_KNOWLEDGE_LIST_LIMIT;
+use mindcore_sqlite::{MindStore, SERVED_KNOWLEDGE_LIST_LIMIT};
 use spoke_operations::SpokeRejectCode;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
-const DDL: &str = include_str!("../../mindcore-sqlite/tests/fixtures/settlement-prepare.sql");
-/// The optional vector cache, exactly as the shipped migration creates it.
-const VECTORS_DDL: &str =
-    include_str!("../../mindcore-sqlite/migrations/0002_memory_embedding_vectors.sql");
-/// The knowledge tables of `migrations/0001_init.sql`; that migration's legacy
-/// memory tables have a different shape than the protocol fixture above.
-const KNOWLEDGE_DDL: &str = "
-CREATE TABLE IF NOT EXISTS knowledge_entries (
-  collection   TEXT NOT NULL,
-  entry_id     TEXT NOT NULL,
-  revision     INTEGER NOT NULL,
-  payload      TEXT NOT NULL,
-  cognition_head_seq INTEGER,
-  created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL,
-  PRIMARY KEY (collection, entry_id),
-  FOREIGN KEY (collection, entry_id, cognition_head_seq)
-    REFERENCES cognition_records (collection, entry_id, append_seq)
-);
-CREATE TABLE IF NOT EXISTS cognition_records (
-  collection TEXT NOT NULL,
-  entry_id   TEXT NOT NULL,
-  append_seq INTEGER NOT NULL CHECK (append_seq > 0),
-  record_id  TEXT NOT NULL,
-  payload    TEXT NOT NULL,
-  PRIMARY KEY (collection, entry_id, append_seq),
-  UNIQUE (collection, entry_id, record_id),
-  FOREIGN KEY (collection, entry_id) REFERENCES knowledge_entries (collection, entry_id)
-);";
 const SPACE: &str = "spc_1";
 const SUBJECT: &str = "subj_1";
 const PRINCIPAL: &str = "prn_1";
@@ -190,25 +161,10 @@ impl Harness {
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
         let root = dir.path().to_path_buf();
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(dir.path().join("workflows.db"))
-                    .create_if_missing(true)
-                    .foreign_keys(false),
-            )
+        let pool = MindStore::open(&dir.path().join("workflows.db"))
             .await
-            .expect("open pool");
-        sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
-        sqlx::raw_sql(VECTORS_DDL)
-            .execute(&pool)
-            .await
-            .expect("apply the vector DDL");
-        sqlx::raw_sql(KNOWLEDGE_DDL)
-            .execute(&pool)
-            .await
-            .expect("apply knowledge DDL");
+            .expect("open store")
+            .pool();
         sqlx::query(
             "INSERT INTO memory_spaces \
              (space_id, display_name, authority_host_id, authority_generation, status, revision, \

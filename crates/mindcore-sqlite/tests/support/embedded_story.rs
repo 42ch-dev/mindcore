@@ -399,7 +399,9 @@ pub async fn settle_receipt(
             SpokeResult::Ok(receipt)
         }
         SpokeResult::Reject(reject) => {
-            tx.rollback().await.expect("rollback the refused settlement");
+            tx.rollback()
+                .await
+                .expect("rollback the refused settlement");
             SpokeResult::Reject(reject)
         }
     }

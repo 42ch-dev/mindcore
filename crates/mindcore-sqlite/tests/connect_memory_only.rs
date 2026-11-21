@@ -19,11 +19,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use tempfile::TempDir;
 
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
+use mindcore_sqlite::MindStore;
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
@@ -35,7 +35,6 @@ use spoke_operations::{
 };
 use spoke_schemas::{HostCapabilityManifest, MemoryRecallRequest, Principal, Scope};
 
-const DDL: &str = include_str!("fixtures/settlement-prepare.sql");
 const SPACE: &str = "sp_connect";
 const SUBJECT: &str = "s_connect";
 const PRINCIPAL: &str = "connect-fixture-principal";
@@ -51,17 +50,10 @@ struct Fixture {
 impl Fixture {
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(dir.path().join("mem_connect.db"))
-                    .create_if_missing(true)
-                    .foreign_keys(false),
-            )
+        let pool = MindStore::open(&dir.path().join("mem_connect.db"))
             .await
-            .expect("open pool");
-        sqlx::raw_sql(DDL).execute(&pool).await.expect("apply DDL");
+            .expect("open store")
+            .pool();
 
         sqlx::query(
             "INSERT INTO memory_spaces \

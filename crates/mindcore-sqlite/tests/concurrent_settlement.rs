@@ -47,7 +47,10 @@ async fn assert_pending_pair(tx: &mut Transaction<'_, Sqlite>, receipt_id: &str)
     .fetch_one(&mut **tx)
     .await
     .expect("the pending pair");
-    assert_eq!(status, "pending", "receipt pending before either settlement");
+    assert_eq!(
+        status, "pending",
+        "receipt pending before either settlement"
+    );
     assert_eq!(state, "pending", "intent pending before either settlement");
 }
 
@@ -119,12 +122,11 @@ async fn competing_handles_retain_one_candidate() {
             vec![winner.as_str()],
             "the race must leave exactly the winner's record"
         );
-        let applied: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM memory_journal WHERE state = 'applied'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count applied intents");
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_journal WHERE state = 'applied'")
+                .fetch_one(&pool)
+                .await
+                .expect("count applied intents");
         assert_eq!(applied, 1, "exactly one journal intent is applied");
         let pending: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM memory_receipts WHERE status = 'pending'")
@@ -169,14 +171,19 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
     // writes. Each read is awaited in turn, so the overlap is built, not sampled: the winner only
     // commits after both snapshots hold the pending receipt over the pending intent.
     let mut winner_tx = left_pool.begin().await.expect("begin the left settlement");
-    let mut loser_tx = right_pool.begin().await.expect("begin the right settlement");
+    let mut loser_tx = right_pool
+        .begin()
+        .await
+        .expect("begin the right settlement");
     for tx in [&mut winner_tx, &mut loser_tx] {
         assert_pending_pair(tx, &receipt).await;
     }
     let space = SpaceId::new("wren");
 
     let settled = expect_ok(
-        adapter.settle_journal(&mut winner_tx, &space, &receipt).await,
+        adapter
+            .settle_journal(&mut winner_tx, &space, &receipt)
+            .await,
         "settle on the left handle",
     );
     assert_eq!(settled["status"], json!("committed"));
@@ -190,7 +197,10 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
     // closed snapshot rather than a read of the winner's commit. The serialized writer refuses it
     // and the protocol reports uncertainty; any successful reply here means the pending pair was
     // replayed as a second settlement.
-    match adapter.settle_journal(&mut loser_tx, &space, &receipt).await {
+    match adapter
+        .settle_journal(&mut loser_tx, &space, &receipt)
+        .await
+    {
         SpokeResult::Reject(reject) => assert_eq!(
             reject.code,
             SpokeRejectCode::OutcomeUncertain,
