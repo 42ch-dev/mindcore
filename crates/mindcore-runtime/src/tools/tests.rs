@@ -5,6 +5,8 @@
 //! loopback task; here the serving path is driven with an already authenticated peer id. The
 //! mapping is crate-internal, so these assertions live beside it rather than behind a public API.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -1218,11 +1220,13 @@ async fn adoption_refusals_carry_no_raw_diagnostics() {
     );
 }
 
-/// A sink that refuses every write, the way a closed stderr descriptor does.
-struct ClosedSink;
+/// A sink that refuses every write, the way a closed stderr descriptor does, and counts the
+/// attempts it was offered.
+struct ClosedSink(Rc<Cell<usize>>);
 
 impl std::io::Write for ClosedSink {
     fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        self.0.set(self.0.get() + 1);
         Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
     }
 
@@ -1235,7 +1239,13 @@ impl std::io::Write for ClosedSink {
 /// the contractual refusal instead of unwinding out of the handler.
 #[test]
 fn an_unwritable_fault_diagnostic_still_yields_the_refusal() {
-    let reject = adoption_fault(ClosedSink, "store", "boom");
+    let attempts = Rc::new(Cell::new(0));
+    let reject = adoption_fault(ClosedSink(Rc::clone(&attempts)), "store", "boom");
+    // why: the refusal alone also holds for a handler that never offers the diagnostic to the sink.
+    assert!(
+        attempts.get() > 0,
+        "the fault diagnostic was never offered to the host sink: {reject:?}"
+    );
     assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
     assert_eq!(reject.message, "knowledge adoption could not complete");
     assert_eq!(
