@@ -35,8 +35,8 @@ use crate::reject::{settle, AResult, Reject};
 use crate::wire;
 use crate::{bump, mint, principal_id, MemoryAdapter, MemoryStage, Tx};
 
-const ACTIVATE: &str = "memory.imports.activate";
-const DISCARD: &str = "memory.imports.discard";
+pub(crate) const ACTIVATE: &str = "memory.imports.activate";
+pub(crate) const DISCARD: &str = "memory.imports.discard";
 
 /// One cognition reference: the complete `(kind, namespace, id)` identity tuple.
 type Reference = (String, String, String);

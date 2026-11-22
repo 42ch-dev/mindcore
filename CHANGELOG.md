@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- `mindcore-spoke` / `mindcore-runtime`: `ServeFaces.memory` takes an `Arc<dyn ServedMemory>` — a
+  `RemoteMemoryService` that reports the `memory.*` operations it dispatches — and the runtime
+  advertises `spoke-memory-transfer` exactly when the attached service reports all five §7.29–§7.33
+  operations. A bare `RemoteMemoryService` gains an empty `impl ServedMemory for … {}` and keeps
+  advertising `spoke-memory` only. `mindcore_spoke::TransferService` binds the five transfer
+  operations to the host's pool and peer-to-principal admission, owning one transaction per invoke.
 - `mindcore-runtime`: `ServeFaces.workflow_caller` is replaced by `workflow_routes`, a map from each
   admitted principal id to the one knowledge collection its workflow calls reach. Each destination
   collection belongs to exactly one principal route; a collection named by two routes is refused at

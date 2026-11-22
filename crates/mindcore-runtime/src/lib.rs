@@ -16,10 +16,11 @@ use serde_json::Value;
 
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
-use mindcore_spoke::MemoryWorkflowBinding;
+use mindcore_spoke::{MemoryWorkflowBinding, ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::{validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
     CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_MEMORY,
+    CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
     ConnectResponder, KnowledgeAdmission, MemoryAdmission, RemoteKnowledgeFace,
@@ -108,7 +109,7 @@ impl MindcoreServe {
         if !routed {
             tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
         }
-        let manifest = derive_manifest(faces.manifest, faces.memory.as_ref(), &tools);
+        let manifest = derive_manifest(faces.manifest, faces.memory.as_deref(), &tools);
         let manifest = match manifest {
             SpokeResult::Ok(manifest) => manifest,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -119,7 +120,8 @@ impl MindcoreServe {
         };
         let mut ports = RemoteServePortsComposite::knowledge_only(Arc::new(face));
         if let Some(memory) = faces.memory {
-            ports = ports.with_memory(memory);
+            let service: Arc<dyn RemoteMemoryService> = memory;
+            ports = ports.with_memory(service);
         }
         SpokeResult::Ok(MindcoreSurface {
             ports: Arc::new(ports),
@@ -145,11 +147,12 @@ pub struct ServeFaces {
     pub admission: KnowledgeAdmission,
     /// The host's memory family service. `None` composes no memory face and advertises none.
     ///
-    /// `RemoteMemoryService` reports no operations — one `invoke` answers every `memory.*` name —
-    /// so installing it proves only that the `spoke-memory` family is served. The runtime therefore
-    /// never advertises `spoke-memory-transfer` from this seam: a signed manifest must not claim a
-    /// family the bound service cannot show it dispatches.
-    pub memory: Option<Arc<dyn RemoteMemoryService>>,
+    /// Installing the service proves the `spoke-memory` family. It earns
+    /// `spoke-memory-transfer` only by reporting all five §7.29–§7.33 operations through
+    /// [`ServedMemory::operations`]: a signed manifest must not claim a family the bound service
+    /// cannot show it dispatches. A bare `RemoteMemoryService` takes the trait's default and
+    /// reports none.
+    pub memory: Option<Arc<dyn ServedMemory>>,
     /// Maps the authenticated peer to the `Principal` the workflows admit. The same host mapping
     /// the memory face uses; never read from the wire.
     pub principals: MemoryAdmission,
@@ -255,19 +258,27 @@ impl MindcoreSurface {
     }
 }
 
-/// The advertised capabilities follow the composed faces: the knowledge face always, and the
-/// memory family flag only when a memory service is attached.
+/// The advertised capabilities follow the composed faces: the knowledge face always, the memory
+/// family flag when a memory service is attached, and the transfer family flag when that service
+/// reports every one of [`TRANSFER_OPERATIONS`].
 ///
 /// The knowledge face applies SPOKE's owner-private disclosure, so a viewpoint-scoped list is
 /// served and the supplemental ownership capability is truthful; it never stands in for peer or
 /// entry admission.
-fn face_capabilities(memory: Option<&Arc<dyn RemoteMemoryService>>) -> Vec<String> {
+fn face_capabilities(memory: Option<&dyn ServedMemory>) -> Vec<String> {
     let mut capabilities = vec![
         CAPABILITY_SPOKE_KNOWLEDGE.to_string(),
         CAPABILITY_KE_OWNERSHIP.to_string(),
     ];
-    if memory.is_some() {
+    if let Some(memory) = memory {
         capabilities.push(CAPABILITY_SPOKE_MEMORY.to_string());
+        let reported = memory.operations();
+        if TRANSFER_OPERATIONS
+            .iter()
+            .all(|operation| reported.contains(operation))
+        {
+            capabilities.push(CAPABILITY_SPOKE_MEMORY_TRANSFER.to_string());
+        }
     }
     capabilities
 }
@@ -276,7 +287,7 @@ fn face_capabilities(memory: Option<&Arc<dyn RemoteMemoryService>>) -> Vec<Strin
 /// manifest the responder will sign.
 fn derive_manifest(
     mut manifest: HostCapabilityManifest,
-    memory: Option<&Arc<dyn RemoteMemoryService>>,
+    memory: Option<&dyn ServedMemory>,
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
     manifest.capabilities = face_capabilities(memory);

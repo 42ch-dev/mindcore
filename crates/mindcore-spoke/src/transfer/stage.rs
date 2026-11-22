@@ -28,7 +28,7 @@ use crate::reject::{settle, AResult, Reject};
 use crate::wire;
 use crate::{mint, principal_id, MemoryAdapter, MemoryStage, Tx};
 
-const STAGE: &str = "memory.imports.stage";
+pub(crate) const STAGE: &str = "memory.imports.stage";
 
 /// The space-wide coverage every import mutation needs.
 pub(super) fn space_requirement(capability: &str) -> GrantRequirement<'_> {

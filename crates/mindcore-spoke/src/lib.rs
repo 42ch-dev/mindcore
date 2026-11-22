@@ -16,10 +16,13 @@ mod policy;
 mod project;
 mod reflection;
 mod reject;
+mod serve;
 mod transfer;
 mod wire;
 mod workflows;
 
+pub use serve::{ServedMemory, TransferService};
+pub use transfer::OPERATIONS as TRANSFER_OPERATIONS;
 pub use workflows::MemoryWorkflowBinding;
 
 use std::sync::atomic::{AtomicU64, Ordering};

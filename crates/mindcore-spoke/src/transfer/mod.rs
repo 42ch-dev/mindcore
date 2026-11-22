@@ -24,6 +24,14 @@ use crate::policy;
 use crate::reject::{AResult, Reject};
 use crate::Tx;
 
+pub(crate) use activate::{ACTIVATE, DISCARD};
+pub(crate) use exports::{CREATE, GET};
+pub(crate) use stage::STAGE;
+
+/// The five §7.29–§7.33 operations this crate dispatches. One list: the serving seam reports it
+/// as the family it serves, and the manifest derivation asks whether every one of them is there.
+pub const OPERATIONS: [&str; 5] = [CREATE, GET, STAGE, ACTIVATE, DISCARD];
+
 /// One export request, with the scope already admitted by the caller.
 pub(crate) struct ExportSpec {
     /// Freshly minted for the first execution; a replay returns the stored one.

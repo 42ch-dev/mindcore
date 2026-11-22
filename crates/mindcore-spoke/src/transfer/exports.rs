@@ -22,8 +22,8 @@ use crate::reject::{settle, AResult, Reject};
 use crate::wire;
 use crate::{mint, principal_id, MemoryAdapter, MemoryStage, Tx};
 
-const CREATE: &str = "memory.exports.create";
-const GET: &str = "memory.exports.get";
+pub(crate) const CREATE: &str = "memory.exports.create";
+pub(crate) const GET: &str = "memory.exports.get";
 
 /// The coverage one export names. A whole-space export has no subject and needs
 /// a space-wide grant; a subject export needs the selection's own coverage.
