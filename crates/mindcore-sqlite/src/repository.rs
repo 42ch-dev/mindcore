@@ -1484,9 +1484,11 @@ impl SqliteMemoryRepository {
         Ok(())
     }
 
-    /// The one live import for a target space, requester and source export: the key
-    /// the partial index makes single-valued while the import is `staging` or
-    /// `staged`, so a second idempotency key cannot open a second import.
+    /// The one import holding a target space, requester and source export: the live one
+    /// if there is one, else the latest reclaimed one. The partial index makes a live
+    /// import single-valued, so a second idempotency key cannot open a second import;
+    /// an `expired` row only names its own death, so a late chunk is refused with its
+    /// expiry while a fresh header may still start the sequence again.
     pub async fn import_by_source(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
@@ -1500,7 +1502,8 @@ impl SqliteMemoryRepository {
              reference_translations_json, staged_payload_json, state, created_at, expires_at \
              FROM memory_imports \
              WHERE space_id = ? AND requester_principal_id = ? AND source_export_id = ? \
-             AND state IN ('staging', 'staged')",
+             AND state IN ('staging', 'staged', 'expired') \
+             ORDER BY state = 'expired', created_at DESC",
         )
         .bind(space.as_str())
         .bind(requester)

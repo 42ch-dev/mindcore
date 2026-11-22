@@ -1578,9 +1578,11 @@ async fn an_expired_import_is_reclaimed_by_the_next_stage_of_its_source_export()
 
 /// An abandoned import is reclaimed by any later successful transfer write of its space,
 /// not only by a stage of the same source export: the expired row keeps no payload, no
-/// report and no chunks.
+/// report and no chunks — and it still names its own expiry. A late chunk of the dead
+/// import is refused as expired, not as a forgotten import, while a fresh header for the
+/// same source export still starts a new sequence.
 #[tokio::test]
-async fn an_expired_import_is_reclaimed_by_an_unrelated_transfer_write() {
+async fn an_unrelated_reclaim_names_the_dead_import_and_frees_its_source_export() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
     seed_big_record(&fixture).await;
@@ -1627,6 +1629,39 @@ async fn an_expired_import_is_reclaimed_by_an_unrelated_transfer_write() {
         staged_chunk_count(&fixture, &import_id).await,
         0,
         "the expired chunks are released"
+    );
+
+    // A late chunk names the dead import and its expiry: a timed-out import is not the
+    // same answer as an import this store never held.
+    let late = stage_chunk(&fixture, chunks[1].clone(), "sweep-late").await;
+    let reject = rejected(&late);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("expired"));
+    assert_eq!(detail(reject, "import_id"), &json!(import_id));
+    assert_eq!(
+        detail(reject, "expires_at"),
+        &json!("2000-01-01T00:00:00.000Z")
+    );
+
+    // The expired predecessor does not hold the source export: its header stages again
+    // under a fresh import.
+    let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "sweep-0b").await);
+    let restarted_id = restarted["result"]["import_id"]
+        .as_str()
+        .expect("restarted import id")
+        .to_string();
+    assert_ne!(restarted_id, import_id);
+    assert_eq!(
+        import_state(&fixture, &restarted_id).await,
+        ("staging".to_string(), 1)
+    );
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("expired".to_string(), 3),
+        "the dead import stays a content-free marker"
     );
 }
 
