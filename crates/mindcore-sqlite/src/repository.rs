@@ -830,6 +830,7 @@ type ExportColumns = (
     i64,
     String,
     String,
+    String,
 );
 
 fn export_row(row: ExportColumns) -> RepoResult<MemoryExportRow> {
@@ -844,6 +845,7 @@ fn export_row(row: ExportColumns) -> RepoResult<MemoryExportRow> {
         chunk_count,
         created_at,
         expires_at,
+        state,
     ) = row;
     Ok(MemoryExportRow {
         export_id,
@@ -857,6 +859,7 @@ fn export_row(row: ExportColumns) -> RepoResult<MemoryExportRow> {
             .map_err(|_| invalid_row("negative export chunk_count"))?,
         created_at,
         expires_at,
+        expired: state == "expired",
     })
 }
 
@@ -1215,6 +1218,8 @@ pub struct MemoryExportRow {
     pub chunk_count: u64,
     pub created_at: String,
     pub expires_at: String,
+    /// Reclaimed: the payload is gone and a page read answers `EXPORT_EXPIRED`.
+    pub expired: bool,
 }
 
 /// One staged import: the immutable header facts fixed by ordinal zero, the
@@ -1381,7 +1386,7 @@ impl SqliteMemoryRepository {
     ) -> RepoResult<Option<MemoryExportRow>> {
         sqlx::query_as::<_, ExportColumns>(
             "SELECT export_id, space_id, requester_principal_id, subject_id, selection_json, \
-             include_tombstoned, bundle_digest, chunk_count, created_at, expires_at \
+             include_tombstoned, bundle_digest, chunk_count, created_at, expires_at, state \
              FROM memory_exports WHERE space_id = ? AND export_id = ?",
         )
         .bind(space.as_str())
@@ -1724,9 +1729,10 @@ impl SqliteMemoryRepository {
         Ok(())
     }
 
-    /// Reclaim every export of one space past its fixed retention: the metadata row stays
-    /// (so a later read still answers `EXPORT_EXPIRED`), while the chunk payloads are deleted
-    /// once any transfer write of that space succeeds.
+    /// Reclaim every export of one space past its fixed retention: the header is marked
+    /// `expired` (so a later read answers `EXPORT_EXPIRED` from that state, not from a clock
+    /// that may have rolled back), and the chunk payloads are deleted once any transfer write
+    /// of that space succeeds.
     pub async fn expire_exports(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
@@ -1737,6 +1743,15 @@ impl SqliteMemoryRepository {
             "DELETE FROM memory_export_chunks \
              WHERE export_id IN (SELECT export_id FROM memory_exports \
              WHERE space_id = ? AND expires_at <= ?)",
+        )
+        .bind(space.as_str())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        sqlx::query(
+            "UPDATE memory_exports SET state = 'expired' \
+             WHERE space_id = ? AND state = 'live' AND expires_at <= ?",
         )
         .bind(space.as_str())
         .bind(now)

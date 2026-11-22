@@ -225,9 +225,12 @@ fn credential_shaped(value: &str) -> bool {
             return true;
         }
     }
-    // JWT: three base64url segments, the header starting `eyJ`.
+    // JWT/JWE compact serialisation: a base64url header starting `eyJ` (the base64url of `{"`)
+    // ahead of the form's other segments — three for a JWS, five for a JWE, two with the
+    // signature stripped, three with it empty. A dotless `eyJ…` value is a prefix, not a shape,
+    // so it stays an opaque label.
     let segments: Vec<&str> = value.split('.').collect();
-    segments.len() == 3
+    (2..=5).contains(&segments.len())
         && value.starts_with("eyJ")
         && segments.iter().all(|segment| {
             segment

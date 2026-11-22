@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use mindcore_base::ir::{
@@ -16,6 +18,10 @@ use mindcore_base::ir::{
     MemorySubjectRow, Placement, PlacementSelection, RecordState,
 };
 use mindcore_sqlite::MemoryReceiptSummary;
+use spoke_schemas::data::memory_export_bundle::{
+    GrantSummary, MemoryCandidate, ProfileDocument, ReceiptSummary, Reflection, RetainedRecord,
+    Source, Subject,
+};
 
 use crate::admission;
 use crate::policy;
@@ -34,6 +40,25 @@ pub(super) fn digest_excluding(value: &Value, field: &str) -> AResult<String> {
         spoke_operations::SpokeResult::Ok(digest) => Ok(digest),
         spoke_operations::SpokeResult::Reject(reject) => Err(Reject::invalid(reject.message)),
     }
+}
+
+/// A bundle member in the typed encoding a receiving client re-serialises it to. The client parses
+/// timestamps back into `DateTime` and writes chrono's `AutoSi` spelling, so a stored `…:00.000Z`
+/// sealed verbatim would make the chunk it sends back fail the digest this store sealed.
+fn typed<T: DeserializeOwned + Serialize>(value: Value) -> AResult<Value> {
+    let member: T = serde_json::from_value(value).map_err(|error| {
+        Reject::internal(format!("a stored bundle member is unreadable: {error}"))
+    })?;
+    serde_json::to_value(member)
+        .map_err(|error| Reject::internal(format!("a bundled member is unencodable: {error}")))
+}
+
+fn typed_array<T: DeserializeOwned + Serialize>(values: Vec<Value>) -> AResult<Value> {
+    values
+        .into_iter()
+        .map(typed::<T>)
+        .collect::<AResult<Vec<Value>>>()
+        .map(Value::Array)
 }
 
 /// A bundle-local opaque label for one principal. Salted with the export id, so the
@@ -172,30 +197,45 @@ pub(super) fn assemble(
     );
     members.insert("export_id".to_string(), json!(spec.export_id));
     members.insert("space_id".to_string(), json!(space.space_id.as_str()));
-    members.insert(
-        "created_at".to_string(),
-        json!(policy::timestamp(spec.created_at)),
-    );
+    members.insert("created_at".to_string(), json!(spec.created_at));
     members.insert(
         "source".to_string(),
-        json!({
+        typed::<Source>(json!({
             "authority_host_id": space.authority_host_id,
             "authority_generation": space.authority_generation,
             "engine_policy_version": policy::ENGINE_POLICY_VERSION,
-        }),
+        }))?,
     );
-    members.insert("subjects".to_string(), Value::Array(subject_values));
-    members.insert("records".to_string(), Value::Array(record_values));
-    members.insert("profiles".to_string(), Value::Array(profile_values));
+    members.insert(
+        "subjects".to_string(),
+        typed_array::<Subject>(subject_values)?,
+    );
+    members.insert(
+        "records".to_string(),
+        typed_array::<RetainedRecord>(record_values)?,
+    );
+    members.insert(
+        "profiles".to_string(),
+        typed_array::<ProfileDocument>(profile_values)?,
+    );
     if spec.include_reflections {
-        members.insert("reflections".to_string(), Value::Array(reflection_values));
+        members.insert(
+            "reflections".to_string(),
+            typed_array::<Reflection>(reflection_values)?,
+        );
     }
-    members.insert("candidates".to_string(), Value::Array(candidate_values));
+    members.insert(
+        "candidates".to_string(),
+        typed_array::<MemoryCandidate>(candidate_values)?,
+    );
     members.insert(
         "receipt_summaries".to_string(),
-        Value::Array(receipt_values),
+        typed_array::<ReceiptSummary>(receipt_values)?,
     );
-    members.insert("grants".to_string(), Value::Array(grant_values));
+    members.insert(
+        "grants".to_string(),
+        typed_array::<GrantSummary>(grant_values)?,
+    );
     members.insert("extensions".to_string(), json!({}));
 
     let mut bundle = Value::Object(members);

@@ -186,8 +186,17 @@ CREATE TABLE memory_exports (
     chunk_count INTEGER NOT NULL CHECK (typeof(chunk_count) = 'integer' AND chunk_count >= 1),
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
+    -- Persisted expiry decision: a transfer write that reclaims the payload sets `expired`, and a
+    -- later page read answers `EXPORT_EXPIRED` from this value instead of the wall clock, which a
+    -- clock rollback would move back inside the retention window.
+    state TEXT NOT NULL DEFAULT 'live' CHECK (state IN ('live', 'expired')),
     CHECK (selection_json IS NULL OR subject_id IS NOT NULL)
 ) WITHOUT ROWID;
+
+-- The expiry decision reads exports by this key: an expired export is reclaimed
+-- (`expired`, payload released) on the next successful transfer write of its space.
+CREATE INDEX idx_memory_exports_expires
+    ON memory_exports (expires_at);
 
 -- Each complete immutable wire chunk of one export, keyed by its ordinal: ordinal zero carries the
 -- header and every later chunk carries whole elements. Paging reads this key in order.

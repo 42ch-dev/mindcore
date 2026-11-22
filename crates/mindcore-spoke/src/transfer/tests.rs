@@ -1104,6 +1104,29 @@ async fn the_next_transfer_write_reclaims_an_expired_export_payload() {
         1,
         "the metadata row stays so the expiry answer still resolves"
     );
+
+    // why: the reclaim decision is persisted, so a clock that rolls back inside the retention
+    // window cannot resurrect an export whose payload is already gone.
+    sqlx::query("UPDATE memory_exports SET expires_at = ? WHERE export_id = ?")
+        .bind("2999-01-01T00:00:00.000Z")
+        .bind(&expired_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("roll the clock back");
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let result = adapter
+        .get_export(
+            &mut tx,
+            &principal("p_1"),
+            json!({ "space_id": SPACE, "export_id": expired_id, "chunk_ordinal": 0 }),
+        )
+        .await;
+    tx.rollback().await.expect("rollback read");
+    assert_eq!(
+        rejected(&result).code,
+        spoke_operations::SpokeRejectCode::ExportExpired
+    );
 }
 
 #[tokio::test]
@@ -1352,7 +1375,7 @@ async fn a_kindless_subject_survives_the_typed_client_round_trip() {
         );
     }
 
-    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "kindless-0").await);
+    let body = ready(stage_chunk(&fixture, sent, "kindless-0").await);
     assert_eq!(
         body["result"]["staged_report"]["counts"]["subjects"],
         json!(2)
@@ -2154,7 +2177,8 @@ async fn a_grant_summary_principal_ref_is_screened_for_credentials_not_for_our_g
 
 /// The screen refuses a credential's whole shape, not a bare prefix: a short foreign
 /// label that happens to start with a known key prefix stays an opaque label, while a
-/// value carrying the provider's token length and alphabet is refused.
+/// value carrying the provider's token length and alphabet is refused. Every JWT
+/// compact serialisation is refused even though a dotless `eyJ…` label is not.
 #[tokio::test]
 async fn the_credential_screen_keeps_plain_prefixed_labels() {
     let fixture = Fixture::open().await;
@@ -2189,11 +2213,32 @@ async fn the_credential_screen_keeps_plain_prefixed_labels() {
         "ghp_batch_7",
         "pk_project_1",
         "xoxb-staging",
+        // A dotless `eyJ` value is a prefix, not a JWT's segment structure.
+        "eyJreport_42",
     ] {
         let errors = screen(label);
         assert!(
             errors.is_empty(),
             "a plain opaque label {label} is not a credential: {errors:?}"
+        );
+    }
+    // Every compact serialisation of a JWT, built here so the fixture source never carries a
+    // token-shaped literal: a JWS, the same with an empty signature, a stripped signature, and a
+    // JWE.
+    let header = "eyJhbGciOiJIUzI1NiJ9";
+    let claims = "eyJzdWIiOiIxIn0";
+    for label in [
+        format!("{header}.{claims}.{}", "c2lnbmF0dXJl"),
+        format!("{header}.{claims}."),
+        format!("{header}.{claims}"),
+        format!("{header}.{claims}.a.b.c"),
+    ] {
+        let errors = screen(&label);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("not an opaque correlation label")),
+            "{label} is a JWT: {errors:?}"
         );
     }
     // Prefix plus the provider's own token length and alphabet, built here so the
