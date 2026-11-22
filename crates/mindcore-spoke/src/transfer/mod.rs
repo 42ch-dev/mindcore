@@ -124,7 +124,7 @@ pub(crate) async fn build(
         .as_str()
         .ok_or_else(|| Reject::internal("the export bundle carries no digest"))?
         .to_string();
-    let chunks = chunk::partition(&bundle, policy::EXPORT_CHUNK_BYTES)?;
+    let chunks = chunk::partition(&bundle, &digest, policy::EXPORT_CHUNK_BYTES)?;
     Ok(ExportArtifact {
         bundle,
         digest,

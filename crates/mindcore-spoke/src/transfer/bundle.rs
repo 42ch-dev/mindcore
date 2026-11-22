@@ -6,6 +6,8 @@
 //! ordered by its stable row key, and unreadable stored data fails the export
 //! instead of being replaced with an empty projection.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
@@ -98,6 +100,11 @@ pub(super) fn assemble(
         }
     }
 
+    let kept_subjects: BTreeSet<&str> = subjects
+        .iter()
+        .map(|snapshot| snapshot.subject.subject_id.as_str())
+        .collect();
+
     // A consumed candidate names the records its review produced. An id the export
     // does not carry would disclose an excluded row and dangle at the target, so the
     // list keeps only retained ids — possibly none, which is a valid empty array.
@@ -131,6 +138,12 @@ pub(super) fn assemble(
     let mut grant_values: Vec<Value> = grants
         .iter()
         .filter(|grant| grant_in_scope(grant, spec, spec.created_at))
+        // why: a withheld subject contributes no subject-scoped summary; naming its
+        // `subject_id` would disclose it and dangle at the target's own verification.
+        .filter(|grant| match grant.subject_id.as_ref() {
+            Some(subject) => kept_subjects.contains(subject.as_str()),
+            None => true,
+        })
         .map(|grant| grant_value(grant, spec))
         .collect::<AResult<Vec<_>>>()?;
     grant_values.sort_by(|left, right| key(left, "grant_id").cmp(key(right, "grant_id")));

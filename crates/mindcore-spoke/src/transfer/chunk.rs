@@ -37,8 +37,10 @@ const BUNDLE_HEADER_FIELDS: [&str; 9] = [
     "extensions",
 ];
 
-/// Partition one sealed bundle into ordered wire chunks.
-pub(super) fn partition(bundle: &Value, limit: u64) -> AResult<Vec<Value>> {
+/// Partition one sealed bundle into ordered wire chunks. `digest` is the seal the
+/// bundle was sealed with; partitioning rejects a bundle whose own field disagrees
+/// instead of canonicalizing the whole artifact a second time.
+pub(super) fn partition(bundle: &Value, digest: &str, limit: u64) -> AResult<Vec<Value>> {
     let object = bundle
         .as_object()
         .ok_or_else(|| Reject::internal("the export bundle is not an object"))?;
@@ -47,12 +49,12 @@ pub(super) fn partition(bundle: &Value, limit: u64) -> AResult<Vec<Value>> {
         .and_then(Value::as_str)
         .ok_or_else(|| Reject::internal("the export bundle carries no export_id"))?
         .to_string();
-    // The sealed digest is recomputed here: partitioning an unsealed or tampered
-    // bundle would emit chunks whose reassembly cannot verify.
-    let bundle_digest = digest_excluding(bundle, "digest")?;
-    if object.get("digest").and_then(Value::as_str) != Some(bundle_digest.as_str()) {
+    // why: chunks whose reassembly cannot verify must never leave the adapter, so the
+    // seal the caller computed is checked against the one the bundle publishes.
+    if object.get("digest").and_then(Value::as_str) != Some(digest) {
         return Err(Reject::internal("the export bundle digest does not verify"));
     }
+    let bundle_digest = digest.to_string();
     for field in BUNDLE_HEADER_FIELDS {
         if !object.contains_key(field) {
             return Err(Reject::internal(format!(

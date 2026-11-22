@@ -237,12 +237,15 @@ CREATE TABLE memory_imports (
 ) WITHOUT ROWID;
 
 -- The tail chunk carries no import id, so each subsequent `stage` resolves one live import through
--- this key; the unique index also holds the one-live-import-per-source-export invariant.
+-- this key; the unique index also holds the one-live-import-per-source-export invariant, across
+-- both non-terminal states, so a second idempotency key cannot open a second import for the same
+-- source export while the first is `staging` or `staged`.
 CREATE UNIQUE INDEX idx_memory_imports_staging
     ON memory_imports (space_id, requester_principal_id, source_export_id)
-    WHERE state = 'staging';
+    WHERE state IN ('staging', 'staged');
 
--- Expiry purge on a later authorized transfer write reads live imports by this key.
+-- The expiry decision reads live imports by this key: an expired import is reclaimed
+-- (`expired`, payload released) on the next successful stage of the same source export.
 CREATE INDEX idx_memory_imports_expires
     ON memory_imports (expires_at);
 

@@ -20,7 +20,6 @@ use mindcore_spoke::MemoryWorkflowBinding;
 use mindcore_sqlite::{validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
     CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_MEMORY,
-    CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
     ConnectResponder, KnowledgeAdmission, MemoryAdmission, RemoteKnowledgeFace,
@@ -120,7 +119,7 @@ impl MindcoreServe {
         };
         let mut ports = RemoteServePortsComposite::knowledge_only(Arc::new(face));
         if let Some(memory) = faces.memory {
-            ports = ports.with_memory(Arc::clone(&memory.service));
+            ports = ports.with_memory(memory);
         }
         SpokeResult::Ok(MindcoreSurface {
             ports: Arc::new(ports),
@@ -129,49 +128,6 @@ impl MindcoreServe {
             workflows,
             pool: self.store.pool(),
         })
-    }
-}
-
-/// The five §7.29–§7.33 transfer operations. A memory face that registers every one of them
-/// dispatches the whole family; anything less is a base-only face and must not claim it.
-pub const MEMORY_TRANSFER_OPERATIONS: [&str; 5] = [
-    "memory.exports.create",
-    "memory.exports.get",
-    "memory.imports.stage",
-    "memory.imports.activate",
-    "memory.imports.discard",
-];
-
-/// One installed memory face: the responder's service and the `memory.*` operations that service
-/// dispatches.
-///
-/// Advertisement is derived from this registration, never from a host-supplied capability string.
-/// The face earns `spoke-memory` by being installed; it earns `spoke-memory-transfer` only when
-/// every one of [`MEMORY_TRANSFER_OPERATIONS`] is registered, so an opaque base-only service —
-/// one that answers the transfer ops with `CAPABILITY_PORT_MISSING` — cannot claim the family.
-pub struct MemoryFace {
-    service: Arc<dyn RemoteMemoryService>,
-    operations: Vec<&'static str>,
-}
-
-impl MemoryFace {
-    /// A face over `service`, which dispatches exactly `operations`. Register
-    /// [`MEMORY_TRANSFER_OPERATIONS`] when it serves the transfer family.
-    pub fn new(
-        service: Arc<dyn RemoteMemoryService>,
-        operations: impl IntoIterator<Item = &'static str>,
-    ) -> Self {
-        Self {
-            service,
-            operations: operations.into_iter().collect(),
-        }
-    }
-
-    /// Whether this registration covers the whole transfer family.
-    fn serves_transfer(&self) -> bool {
-        MEMORY_TRANSFER_OPERATIONS
-            .iter()
-            .all(|op| self.operations.contains(op))
     }
 }
 
@@ -187,9 +143,13 @@ pub struct ServeFaces {
     pub knowledge: KnowledgeScope,
     /// Maps the authenticated peer to the one scope it may read and write; never read from the wire.
     pub admission: KnowledgeAdmission,
-    /// The host's memory family service, with the operations it registers. `None` composes no
-    /// memory face and advertises none.
-    pub memory: Option<MemoryFace>,
+    /// The host's memory family service. `None` composes no memory face and advertises none.
+    ///
+    /// `RemoteMemoryService` reports no operations — one `invoke` answers every `memory.*` name —
+    /// so installing it proves only that the `spoke-memory` family is served. The runtime therefore
+    /// never advertises `spoke-memory-transfer` from this seam: a signed manifest must not claim a
+    /// family the bound service cannot show it dispatches.
+    pub memory: Option<Arc<dyn RemoteMemoryService>>,
     /// Maps the authenticated peer to the `Principal` the workflows admit. The same host mapping
     /// the memory face uses; never read from the wire.
     pub principals: MemoryAdmission,
@@ -295,23 +255,19 @@ impl MindcoreSurface {
     }
 }
 
-/// The advertised capabilities follow the composed faces: the knowledge face always, the memory
-/// face only when its service is attached, and each memory family flag from the operations that
-/// face registered.
+/// The advertised capabilities follow the composed faces: the knowledge face always, and the
+/// memory family flag only when a memory service is attached.
 ///
 /// The knowledge face applies SPOKE's owner-private disclosure, so a viewpoint-scoped list is
 /// served and the supplemental ownership capability is truthful; it never stands in for peer or
 /// entry admission.
-fn face_capabilities(memory: Option<&MemoryFace>) -> Vec<String> {
+fn face_capabilities(memory: Option<&Arc<dyn RemoteMemoryService>>) -> Vec<String> {
     let mut capabilities = vec![
         CAPABILITY_SPOKE_KNOWLEDGE.to_string(),
         CAPABILITY_KE_OWNERSHIP.to_string(),
     ];
-    if let Some(face) = memory {
+    if memory.is_some() {
         capabilities.push(CAPABILITY_SPOKE_MEMORY.to_string());
-        if face.serves_transfer() {
-            capabilities.push(CAPABILITY_SPOKE_MEMORY_TRANSFER.to_string());
-        }
     }
     capabilities
 }
@@ -320,7 +276,7 @@ fn face_capabilities(memory: Option<&MemoryFace>) -> Vec<String> {
 /// manifest the responder will sign.
 fn derive_manifest(
     mut manifest: HostCapabilityManifest,
-    memory: Option<&MemoryFace>,
+    memory: Option<&Arc<dyn RemoteMemoryService>>,
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
     manifest.capabilities = face_capabilities(memory);

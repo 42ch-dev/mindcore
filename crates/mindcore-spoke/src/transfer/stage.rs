@@ -165,16 +165,21 @@ fn key_set<'a>(bundle: &'a Value, field: &str, member: &str) -> BTreeSet<&'a str
 
 /// `GrantSummary.principal_ref` is an opaque correlation label — "never credentials
 /// or tokens" (`spoke-schemas` 0.17.0 `PrincipalRef`). The published contract states
-/// only a minimum length, so the screen is our own emission grammar: `prl_` plus 32
-/// lowercase hex digits. Anything else carries key material, a raw principal id or a
-/// foreign token, and is refused rather than echoed.
+/// only that minimum, so the screen refuses credential-shaped values — a scheme
+/// prefix carrying whitespace, a JWT, or a common key prefix — and accepts every other
+/// opaque label, including a foreign exporter's own spelling. This crate emits
+/// `prl_` plus 32 lowercase hex digits (`bundle::principal_label`); that grammar is
+/// our convention, not an inbound requirement.
 fn correlation_label(value: &str) -> bool {
-    value.strip_prefix("prl_").is_some_and(|label| {
-        label.len() == 32
-            && label
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    })
+    const CREDENTIAL_PREFIXES: [&str; 9] = [
+        "sk_", "pk_", "rk_", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AKIA",
+    ];
+    !value.is_empty()
+        && !value.chars().any(char::is_whitespace)
+        && !value.starts_with("eyJ")
+        && !CREDENTIAL_PREFIXES
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
 }
 
 /// References and grant summaries: every cross-reference resolves inside the
@@ -388,7 +393,7 @@ impl MemoryAdapter {
             // frozen space is a maintenance path, not a refusal.
             freeze_gated: false,
         };
-        admission::authorize(&self.repository, tx, &admission, op.now).await?;
+        let grants = admission::authorize(&self.repository, tx, &admission, op.now).await?;
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryImportsStageResponse>(&receipt);
         }
@@ -409,11 +414,24 @@ impl MemoryAdapter {
             .repository
             .import_by_source(tx, &op.space, principal_id, &source_export_id)
             .await?;
-        let row = if ordinal == 0 {
-            if let Some(row) = &staging {
-                if expired(row, op.now)? {
+        let mut live = staging;
+        if let Some(row) = &live {
+            if expired(row, op.now)? {
+                // why: an expired import is dead state, not a live one. Reclaiming it
+                // here — a successful, committed write — releases its payload and its
+                // source-export key, so this call can start the sequence again.
+                if ordinal > 0 {
                     return Err(expiry_conflict(row));
                 }
+                self.repository.expire_import(tx, &row.import_id).await?;
+                self.repository
+                    .delete_import_chunks(tx, &row.import_id)
+                    .await?;
+                live = None;
+            }
+        }
+        let row = if ordinal == 0 {
+            if let Some(row) = &live {
                 return Err(conflict(format!(
                     "import {} already holds this source export's header",
                     row.import_id
@@ -423,38 +441,20 @@ impl MemoryAdapter {
             }
             None
         } else {
-            let Some(row) = staging else {
+            let Some(row) = live else {
                 return Err(no_staging_import(&source_export_id));
             };
-            if expired(&row, op.now)? {
-                return Err(expiry_conflict(&row));
-            }
+            // why: `next_ordinal` alone decides what is acceptable, so a repeat and a
+            // skipped ordinal take the same refusal — and a refusal writes nothing,
+            // deletes nothing, and leaves `next_ordinal` where it was.
             if ordinal != row.next_ordinal {
-                if ordinal < row.next_ordinal {
-                    return Err(conflict(format!(
-                        "chunk {ordinal} is out of order; the import expects {}",
-                        row.next_ordinal
-                    ))
-                    .detail("reason", json!("out_of_order"))
-                    .detail("expected_ordinal", json!(row.next_ordinal))
-                    .detail("received_ordinal", json!(ordinal)));
-                }
-                // why: a skipped ordinal can never be repaired, and a refusal's writes
-                // roll back with the caller's transaction — so the gap ends the import
-                // as a committed outcome instead of being refused.
-                self.repository
-                    .mark_import_discarded(tx, &row.import_id)
-                    .await?;
-                self.repository
-                    .delete_import_chunks(tx, &row.import_id)
-                    .await?;
-                let result = json!({
-                    "chunks_received": 0,
-                    "import_id": &row.import_id,
-                });
-                let receipt = admission::committed_receipt(&op, &mint("rct"), result);
-                self.repository.insert_receipt(tx, &receipt, None).await?;
-                return Self::ready::<MemoryImportsStageResponse>(project::receipt_body(&receipt));
+                return Err(conflict(format!(
+                    "chunk {ordinal} is out of order; the import expects {}",
+                    row.next_ordinal
+                ))
+                .detail("reason", json!("out_of_order"))
+                .detail("expected_ordinal", json!(row.next_ordinal))
+                .detail("received_ordinal", json!(ordinal)));
             }
             Some(row)
         };
@@ -490,6 +490,7 @@ impl MemoryAdapter {
             .map(|row| row.import_id.clone())
             .unwrap_or_else(|| mint("imp"));
         let final_chunk = ordinal + 1 == expected_count;
+        let mut bundle = None;
         if final_chunk {
             let mut sequence = Vec::with_capacity(expected_count as usize);
             for stored in 0..ordinal {
@@ -518,40 +519,93 @@ impl MemoryAdapter {
             if !errors.is_empty() {
                 return Err(unverified(errors));
             }
+            bundle = reassemble(&sequence);
         }
 
-        if row.is_none() {
+        let fresh = if row.is_none() {
             let ttl = i64::try_from(policy::STAGED_IMPORT_TTL_SECONDS)
                 .map_err(|_| Reject::internal("staged import ttl is out of range"))?;
             let (conflict_policy, adopt_grants, reference_translations) =
                 header.expect("ordinal zero carries the header selection");
-            self.repository
-                .insert_import(
-                    tx,
-                    &MemoryImportRow {
-                        import_id: import_id.clone(),
-                        space_id: op.space.as_str().to_string(),
-                        requester: principal_id.to_string(),
-                        source_export_id: source_export_id.clone(),
-                        bundle_digest: bundle_digest.clone(),
-                        expected_count,
-                        next_ordinal: if final_chunk { expected_count } else { 1 },
-                        conflict_policy,
-                        adopt_grants,
-                        reference_translations,
-                        state: if final_chunk { "staged" } else { "staging" }.to_string(),
-                        created_at: policy::timestamp(op.now),
-                        expires_at: policy::timestamp(op.now + chrono::Duration::seconds(ttl)),
-                    },
-                )
-                .await?;
+            Some(MemoryImportRow {
+                import_id: import_id.clone(),
+                space_id: op.space.as_str().to_string(),
+                requester: principal_id.to_string(),
+                source_export_id: source_export_id.clone(),
+                bundle_digest: bundle_digest.clone(),
+                expected_count,
+                next_ordinal: if final_chunk { expected_count } else { 1 },
+                conflict_policy,
+                adopt_grants,
+                reference_translations,
+                staged_payload: None,
+                state: "staging".to_string(),
+                created_at: policy::timestamp(op.now),
+                expires_at: policy::timestamp(op.now + chrono::Duration::seconds(ttl)),
+            })
+        } else {
+            None
+        };
+        if let Some(fresh) = &fresh {
+            self.repository.insert_import(tx, fresh).await?;
         }
+
+        if final_chunk {
+            let import = fresh.or(row).ok_or_else(|| {
+                Reject::internal("a staged import carries neither a fresh nor a live header")
+            })?;
+            let bundle = bundle
+                .ok_or_else(|| Reject::internal("the verified sequence carries no header"))?;
+            // §7.31/§12.1: the final chunk is where the identity mapping, the translated
+            // payload and the report are fixed. Activation applies this frozen result.
+            let prepared = super::activate::prepare(
+                &self.repository,
+                tx,
+                &op.space,
+                &import,
+                &bundle,
+                &grants,
+                principal_id,
+                op.now,
+            )
+            .await?;
+            let encode = |value: &Value, what: &str| {
+                serde_json::to_string(value)
+                    .map_err(|error| Reject::internal(format!("{what}: {error}")))
+            };
+            if !self
+                .repository
+                .finish_import(
+                    tx,
+                    &import_id,
+                    &encode(&prepared.payload, "staged payload")?,
+                    &encode(&prepared.report, "staged report")?,
+                )
+                .await?
+            {
+                return Err(Reject::internal(
+                    "the staging import left staging under its final chunk",
+                ));
+            }
+            // The frozen result replaces the raw sequence: nothing downstream re-reads it.
+            self.repository.delete_import_chunks(tx, &import_id).await?;
+
+            let result = json!({
+                "chunks_received": ordinal + 1,
+                "import_id": &import_id,
+                "staged_report": prepared.report,
+            });
+            let receipt = admission::committed_receipt(&op, &mint("rct"), result);
+            self.repository.insert_receipt(tx, &receipt, None).await?;
+            return Self::ready::<MemoryImportsStageResponse>(project::receipt_body(&receipt));
+        }
+
         self.repository
             .insert_import_chunk(tx, &import_id, ordinal, &chunk.to_string())
             .await?;
         if row.is_some() {
             self.repository
-                .advance_import(tx, &import_id, ordinal + 1, final_chunk)
+                .advance_import(tx, &import_id, ordinal + 1)
                 .await?;
         }
 

@@ -896,7 +896,9 @@ async fn every_selector_takes_the_caller_transaction() {
     assert_eq!(chunk["chunk_count"], json!(chunk_count));
 
     // note: imports.stage takes ordinal zero of that export. The parity space exports as one
-    // chunk, so staging the final ordinal verifies the sequence and reaches `staged`.
+    // chunk, so staging the final ordinal verifies the sequence, fixes the translated rows
+    // and reaches `staged`. The import targets the same space, so the subject collision the
+    // final chunk decides is resolved by a rename.
     assert_eq!(chunk_count, 1, "the parity space exports as one chunk");
     let staged_body = ready(
         adapter
@@ -906,7 +908,7 @@ async fn every_selector_takes_the_caller_transaction() {
                 json!({
                     "space_id": SPACE,
                     "chunk": chunk,
-                    "conflict_policy": "fail",
+                    "conflict_policy": "rename_subject",
                     "idempotency_key": "par-stage",
                 }),
             )
@@ -914,6 +916,10 @@ async fn every_selector_takes_the_caller_transaction() {
         "imports.stage",
     );
     assert_eq!(staged_body["result"]["chunks_received"], json!(1));
+    assert!(
+        staged_body["result"]["staged_report"].is_object(),
+        "the final chunk freezes the identity report"
+    );
     let import_id = staged_body["result"]["import_id"]
         .as_str()
         .expect("import id")

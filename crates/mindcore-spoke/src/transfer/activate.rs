@@ -27,10 +27,7 @@ use mindcore_base::ir::{
 };
 use mindcore_sqlite::{MemoryImportRow, SqliteMemoryRepository};
 
-use super::stage::{
-    conflict, expired, expiry_conflict, reassemble, space_requirement, unverified,
-    verification_errors,
-};
+use super::stage::{conflict, expired, expiry_conflict, space_requirement};
 use crate::admission::{self, Admission, Coverage};
 use crate::policy;
 use crate::project;
@@ -222,9 +219,17 @@ fn mapped_subject(
         .ok_or_else(|| unreadable("subject mapping"))
 }
 
-/// The translated rows one activation applies, plus the durable payload and the
-/// identity report it leaves on the import.
-struct Prepared {
+/// What final verification freezes: the translated rows activation applies, and the
+/// §7.31 report that fixes the identity mapping. Staging owns every decision here.
+pub(super) struct Prepared {
+    pub(super) payload: Value,
+    pub(super) report: Value,
+}
+
+/// The translated rows a frozen `staged_payload_json` carries, decoded for the one
+/// visibility flip. Activation never re-derives a mapping, a translation or a
+/// collision decision; it rechecks these rows against the live target and applies them.
+struct Staged {
     subjects: Vec<MemorySubjectRow>,
     records: Vec<MemoryRecordIr>,
     candidates: Vec<MemoryCandidateIr>,
@@ -232,15 +237,13 @@ struct Prepared {
     reflections: Vec<MemoryReflectionRow>,
     grants: Vec<MemoryGrantRow>,
     receipt_summaries: Value,
-    payload: Value,
-    report: Value,
 }
 
-/// Build the target rows from the verified bundle: fix the identity mapping,
-/// translate references, and recheck every target collision and adopted grant
-/// before anything is written.
+/// Build the frozen result from the verified bundle: fix the identity mapping, translate
+/// references, and recheck every target collision and adopted grant before anything is
+/// written. Staging calls this once, at the final chunk.
 #[allow(clippy::too_many_arguments)]
-async fn prepare(
+pub(super) async fn prepare(
     repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
     space: &SpaceId,
@@ -312,7 +315,13 @@ async fn prepare(
                 translate_references(cognition, &translations, &record_map, &subject_map);
             }
         }
-        if fields.contains_key("content") && !fields.contains_key("tombstone") {
+        // why: an `import_ref` already on the record is the identity an earlier
+        // authority move gave it; §7.31 adopts it verbatim as historical attribution,
+        // so this hop only stamps records that carry none.
+        if !fields.contains_key("import_ref")
+            && fields.contains_key("content")
+            && !fields.contains_key("tombstone")
+        {
             fields.insert(
                 "import_ref".to_string(),
                 json!({
@@ -476,10 +485,10 @@ async fn prepare(
     // than the caller's own current coverage: no unlisted grant and no
     // amplification, and a non-expiring import needs a non-expiring cover.
     let summaries = members(bundle, "grants");
-    let caller_wire = admission::wire_grants(caller_grants)?;
     let mut grants = Vec::new();
     let mut grant_map = BTreeMap::new();
     let mut adopted = BTreeSet::new();
+    let mut dropped = 0_u64;
     for value in import
         .adopt_grants
         .as_array()
@@ -489,6 +498,7 @@ async fn prepare(
         let value = member(value, "adopted grant")?;
         let grant_id = text(value, "grant_id")?.to_string();
         if !adopted.insert(grant_id.clone()) {
+            dropped += 1;
             continue;
         }
         let target_principal = text(value, "principal_id")?.to_string();
@@ -517,39 +527,9 @@ async fn prepare(
             )),
             None => None,
         };
-        for capability in &capabilities {
-            let requirement = GrantRequirement {
-                capability,
-                subject_id: subject.as_ref().map(SubjectId::as_str),
-                context_ids: context_ids.clone(),
-                reads_shared: shared_access || context_ids.is_empty(),
-                subject_all: context_ids.is_empty(),
-            };
-            let covered = caller_grants.iter().zip(&caller_wire).any(|(row, grant)| {
-                row.expires_at.is_none()
-                    && spoke_operations::grant_covers(
-                        grant,
-                        principal,
-                        space.as_str(),
-                        now,
-                        &requirement,
-                    )
-            });
-            if !covered {
-                return Err(conflict(format!(
-                    "adopted grant {grant_id} would amplify coverage the caller does not hold"
-                ))
-                .detail("reason", json!("grant_not_subsumed"))
-                .detail("grant_id", json!(grant_id))
-                .detail("capability", json!(capability)));
-            }
-        }
-        // `grant_id` is a store-wide primary key, so an adopted grant takes a fresh
-        // target identity like any imported row; the report keeps the mapping.
-        let target_grant_id = mint("grt");
-        grant_map.insert(grant_id.clone(), target_grant_id.clone());
+        // The row keeps the source identity until the coverage check has named it.
         grants.push(MemoryGrantRow {
-            grant_id: target_grant_id,
+            grant_id: grant_id.clone(),
             space_id: space.clone(),
             subject_id: subject,
             principal_id: CallerId::new(target_principal),
@@ -562,6 +542,14 @@ async fn prepare(
             created_at: policy::timestamp(now),
             extensions: Map::new(),
         });
+    }
+    not_subsumed(&grants, caller_grants, space, principal, now)?;
+    // `grant_id` is a store-wide primary key, so an adopted grant takes a fresh
+    // target identity like any imported row; the report keeps the mapping.
+    for grant in &mut grants {
+        let target = mint("grt");
+        grant_map.insert(grant.grant_id.clone(), target.clone());
+        grant.grant_id = target;
     }
 
     let source = bundle
@@ -601,26 +589,123 @@ async fn prepare(
         "reflections": reflections.len(),
         "subjects": subjects.len(),
     });
+    // §7.31 `StagedReport`: the fixed identity mapping and what the sequence verified.
     let report = json!({
-        "candidates": candidate_map,
+        "candidate_id_map": candidate_map,
         "counts": counts,
-        "grants": grant_map,
-        "import_id": import.import_id,
-        "records": record_map,
-        "reflections": reflection_map,
-        "source_export_id": import.source_export_id,
-        "subjects": subject_map,
+        "grants_adopted": grants.len() as u64,
+        "grants_dropped": dropped,
+        "record_id_map": record_map,
+        "subject_id_map": subject_map,
+        "verification": { "bundle_digest_ok": true, "errors": [] },
     });
+    // The translated rows to apply, plus the content-free source provenance the
+    // activation retains. Every id in here is final; activation decodes and rechecks it.
     let payload = json!({
         "candidates": candidates.iter().map(project::candidate_body).collect::<Vec<_>>(),
         "grants": grants.iter().map(project::grant_body).collect::<Vec<_>>(),
         "profiles": profiles.iter().map(project::profile_body).collect::<Vec<_>>(),
+        "receipt_summaries": receipt_summaries,
         "records": records.iter().map(project::record_body).collect::<Vec<_>>(),
         "reflections": reflections.iter().map(|row| project::reflection_body(row, true)).collect::<Vec<_>>(),
         "subjects": subjects.iter().map(project::subject_body).collect::<Vec<_>>(),
     });
 
-    Ok(Prepared {
+    Ok(Prepared { payload, report })
+}
+
+/// No adopted grant may be wider than the caller's own current coverage: no
+/// amplification, and a non-expiring import needs a non-expiring cover.
+fn not_subsumed(
+    grants: &[MemoryGrantRow],
+    caller_grants: &[MemoryGrantRow],
+    space: &SpaceId,
+    principal: &str,
+    now: DateTime<Utc>,
+) -> AResult<()> {
+    let caller_wire = admission::wire_grants(caller_grants)?;
+    for grant in grants {
+        for capability in &grant.capabilities {
+            let requirement = GrantRequirement {
+                capability,
+                subject_id: grant.subject_id.as_ref().map(SubjectId::as_str),
+                context_ids: grant.context_ids.iter().map(ToString::to_string).collect(),
+                reads_shared: grant.shared_access || grant.context_ids.is_empty(),
+                subject_all: grant.context_ids.is_empty(),
+            };
+            let covered = caller_grants.iter().zip(&caller_wire).any(|(row, wire)| {
+                row.expires_at.is_none()
+                    && spoke_operations::grant_covers(
+                        wire,
+                        principal,
+                        space.as_str(),
+                        now,
+                        &requirement,
+                    )
+            });
+            if !covered {
+                return Err(conflict(format!(
+                    "adopted grant {} would amplify coverage the caller does not hold",
+                    grant.grant_id
+                ))
+                .detail("reason", json!("grant_not_subsumed"))
+                .detail("grant_id", json!(grant.grant_id))
+                .detail("capability", json!(capability)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One bundle array of the frozen payload; an absent array is a defect, not empty.
+fn rows<'a>(payload: &'a Value, field: &str) -> AResult<&'a [Value]> {
+    payload
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| unreadable(field))
+}
+
+fn count_of(value: Option<&Value>, field: &str) -> AResult<Number> {
+    value
+        .and_then(Value::as_number)
+        .cloned()
+        .ok_or_else(|| unreadable(field))
+}
+
+/// Decode the frozen translated rows. The payload is trusted only because staging
+/// wrote it in the same store; a row it cannot read is an internal defect, never a
+/// caller-visible refusal.
+fn decode_staged(payload: &Value, space: &SpaceId, requester: &str) -> AResult<Staged> {
+    let subjects = rows(payload, "subjects")?
+        .iter()
+        .map(|value| stored_subject(value, space))
+        .collect::<AResult<Vec<_>>>()?;
+    let records = rows(payload, "records")?
+        .iter()
+        .map(|value| stored_record(value, space))
+        .collect::<AResult<Vec<_>>>()?;
+    let candidates = rows(payload, "candidates")?
+        .iter()
+        .map(|value| stored_candidate(value, space))
+        .collect::<AResult<Vec<_>>>()?;
+    let profiles = rows(payload, "profiles")?
+        .iter()
+        .map(|value| stored_profile(value, space))
+        .collect::<AResult<Vec<_>>>()?;
+    let reflections = rows(payload, "reflections")?
+        .iter()
+        .map(|value| stored_reflection(value, space, requester))
+        .collect::<AResult<Vec<_>>>()?;
+    let grants = rows(payload, "grants")?
+        .iter()
+        .map(|value| stored_grant(value, space))
+        .collect::<AResult<Vec<_>>>()?;
+    let receipt_summaries = payload
+        .get("receipt_summaries")
+        .cloned()
+        .ok_or_else(|| unreadable("receipt_summaries"))?;
+    Ok(Staged {
         subjects,
         records,
         candidates,
@@ -628,9 +713,204 @@ async fn prepare(
         reflections,
         grants,
         receipt_summaries,
-        payload,
-        report,
     })
+}
+
+fn stored_subject(value: &Value, space: &SpaceId) -> AResult<MemorySubjectRow> {
+    let object = value.as_object().ok_or_else(|| unreadable("subject"))?;
+    let kind = match object.get("kind") {
+        None | Some(Value::Null) => None,
+        Some(kind) => {
+            let kind = kind.as_object().ok_or_else(|| unreadable("subject kind"))?;
+            Some((text(kind, "ns")?.to_string(), text(kind, "id")?.to_string()))
+        }
+    };
+    Ok(MemorySubjectRow {
+        space_id: space.clone(),
+        subject_id: SubjectId::new(text(object, "subject_id")?),
+        kind,
+        status: text(object, "status")?.to_string(),
+        fenced_contexts: strings(object.get("fenced_contexts"))
+            .into_iter()
+            .map(ContextId::new)
+            .collect(),
+        revision: count_of(object.get("revision"), "subject revision")?,
+        created_at: text(object, "created_at")?.to_string(),
+        extensions: Map::new(),
+    })
+}
+
+fn stored_record(value: &Value, space: &SpaceId) -> AResult<MemoryRecordIr> {
+    let (_, mut record) = memory_record_from_wire(value.clone())
+        .map_err(|error| Reject::internal(format!("staged record: {error}")))?;
+    record.space_id = space.as_str().to_string();
+    Ok(record)
+}
+
+fn stored_candidate(value: &Value, space: &SpaceId) -> AResult<MemoryCandidateIr> {
+    let (_, mut candidate) = memory_candidate_from_wire(value.clone())
+        .map_err(|error| Reject::internal(format!("staged candidate: {error}")))?;
+    candidate.space_id = space.as_str().to_string();
+    Ok(candidate)
+}
+
+fn stored_profile(value: &Value, space: &SpaceId) -> AResult<MemoryProfileRow> {
+    let object = value.as_object().ok_or_else(|| unreadable("profile"))?;
+    Ok(MemoryProfileRow {
+        space_id: space.clone(),
+        subject_id: SubjectId::new(text(object, "subject_id")?),
+        profile_kind: text(object, "profile_kind")?.to_string(),
+        document: object
+            .get("document")
+            .cloned()
+            .ok_or_else(|| unreadable("profile document"))?,
+        updated_by: CallerId::new(text(object, "updated_by")?),
+        revision: count_of(object.get("revision"), "profile revision")?,
+        created_at: text(object, "created_at")?.to_string(),
+        updated_at: text(object, "updated_at")?.to_string(),
+        extensions: Map::new(),
+    })
+}
+
+fn stored_reflection(
+    value: &Value,
+    space: &SpaceId,
+    requester: &str,
+) -> AResult<MemoryReflectionRow> {
+    let object = value.as_object().ok_or_else(|| unreadable("reflection"))?;
+    let generator = object
+        .get("generator")
+        .and_then(Value::as_object)
+        .ok_or_else(|| unreadable("reflection generator"))?;
+    let body = object
+        .get("body")
+        .and_then(Value::as_object)
+        .ok_or_else(|| unreadable("reflection body"))?;
+    let cost = match object.get("cost") {
+        None | Some(Value::Null) => None,
+        Some(cost) => {
+            let cost = cost
+                .as_object()
+                .ok_or_else(|| unreadable("reflection cost"))?;
+            Some((
+                text(cost, "unit_kind")?.to_string(),
+                cost.get("units")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| unreadable("reflection cost units"))?,
+            ))
+        }
+    };
+    Ok(MemoryReflectionRow {
+        seq: 0,
+        reflection_id: text(object, "reflection_id")?.to_string(),
+        space_id: space.clone(),
+        subject_id: SubjectId::new(text(object, "subject_id")?),
+        requester: CallerId::new(requester),
+        selection: object
+            .get("selection")
+            .cloned()
+            .ok_or_else(|| unreadable("reflection selection"))?,
+        filter: object.get("filter").cloned(),
+        cognition_filter: object.get("cognition_filter").cloned(),
+        basis: object
+            .get("basis")
+            .cloned()
+            .ok_or_else(|| unreadable("reflection basis"))?,
+        engine_policy_version: text(generator, "engine_policy_version")?.to_string(),
+        model: generator
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        schema_version: object
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| unreadable("reflection schema_version"))?,
+        revision: count_of(object.get("revision"), "reflection revision")?,
+        extensions: object
+            .get("extensions")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+        created_at: text(object, "created_at")?.to_string(),
+        body_text: text(body, "body")?.to_string(),
+        body_format: text(body, "format")?.to_string(),
+        cost,
+        // why: the target's live inputs are not the ones the source derived from.
+        stale_cache: true,
+    })
+}
+
+fn stored_grant(value: &Value, space: &SpaceId) -> AResult<MemoryGrantRow> {
+    let object = value.as_object().ok_or_else(|| unreadable("grant"))?;
+    let timestamp = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    Ok(MemoryGrantRow {
+        grant_id: text(object, "grant_id")?.to_string(),
+        space_id: space.clone(),
+        subject_id: object
+            .get("subject_id")
+            .and_then(Value::as_str)
+            .map(SubjectId::new),
+        principal_id: CallerId::new(text(object, "principal_id")?),
+        capabilities: strings(object.get("capabilities")),
+        context_ids: strings(object.get("context_ids"))
+            .into_iter()
+            .map(ContextId::new)
+            .collect(),
+        shared_access: object
+            .get("shared_access")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        expires_at: timestamp("expires_at"),
+        revoked_at: timestamp("revoked_at"),
+        revision: count_of(object.get("revision"), "grant revision")?,
+        created_at: text(object, "created_at")?.to_string(),
+        extensions: Map::new(),
+    })
+}
+
+/// Recheck the frozen rows against the live target before the flip: a subject or a
+/// profile the target gained since staging refuses the activation instead of surfacing
+/// as a storage failure. The mapping itself is never re-derived, and the caller's
+/// current coverage is rechecked by the operation's own admission before this runs.
+async fn recheck(
+    repository: &SqliteMemoryRepository,
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    staged: &Staged,
+) -> AResult<()> {
+    for subject in &staged.subjects {
+        let subject_id = subject.subject_id.as_str();
+        if repository.subject(tx, space, subject_id).await?.is_some() {
+            return Err(conflict(format!(
+                "the target space already holds subject {subject_id}"
+            ))
+            .detail("reason", json!("subject_collision"))
+            .detail("subject_id", json!(subject_id)));
+        }
+    }
+    for profile in &staged.profiles {
+        let kind = std::slice::from_ref(&profile.profile_kind);
+        if !repository
+            .list_profiles(tx, space, profile.subject_id.as_str(), kind)
+            .await?
+            .is_empty()
+        {
+            return Err(conflict(format!(
+                "the target space already holds profile {} of subject {}",
+                profile.profile_kind,
+                profile.subject_id.as_str()
+            ))
+            .detail("reason", json!("profile_collision"))
+            .detail("subject_id", json!(profile.subject_id.as_str()))
+            .detail("profile_kind", json!(profile.profile_kind)));
+        }
+    }
+    Ok(())
 }
 
 impl MemoryAdapter {
@@ -680,11 +960,9 @@ impl MemoryAdapter {
             // applies into a frozen space as a maintenance path.
             freeze_gated: false,
         };
-        let caller_grants =
-            match admission::authorize(&self.repository, tx, &admission, op.now).await {
-                Ok(grants) => grants,
-                Err(reject) => return Err(absent(reject, &import_id)),
-            };
+        if let Err(reject) = admission::authorize(&self.repository, tx, &admission, op.now).await {
+            return Err(absent(reject, &import_id));
+        }
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryImportsActivateResponse>(&receipt);
         }
@@ -699,89 +977,50 @@ impl MemoryAdapter {
             return Err(state_conflict(&import));
         }
 
-        // The staged chunks are the applied source: rebuild the bundle and verify
-        // it again, so no later statement can widen what ordinal zero accepted.
-        let mut chunks = Vec::with_capacity(import.expected_count as usize);
-        for ordinal in 0..import.expected_count {
-            let payload = self
-                .repository
-                .import_chunk(tx, &import_id, ordinal)
-                .await?
-                .ok_or_else(|| {
-                    Reject::internal("the staged import names a chunk this store does not hold")
-                })?;
-            chunks.push(
-                serde_json::from_str(&payload)
-                    .map_err(|_| Reject::internal("stored import chunk is unreadable"))?,
-            );
-        }
-        let bundle = reassemble(&chunks)
-            .ok_or_else(|| Reject::internal("the staged chunks carry no logical header"))?;
-        let errors = verification_errors(
-            &chunks,
-            import.expected_count,
-            &import.bundle_digest,
-            &import.source_export_id,
-            &import.adopt_grants,
-        );
-        if !errors.is_empty() {
-            return Err(unverified(errors));
-        }
+        // The frozen payload is the applied source: staging fixed the mapping, the
+        // translations and the report, and released the raw chunks. Activation
+        // decodes those rows and rechecks them against the live target.
+        let Some(payload) = import.staged_payload.clone() else {
+            return Err(Reject::internal(
+                "the staged import carries no translated rows",
+            ));
+        };
+        let staged = decode_staged(&payload, &op.space, principal_id)?;
+        recheck(&self.repository, tx, &op.space, &staged).await?;
 
-        let prepared = prepare(
-            &self.repository,
-            tx,
-            &op.space,
-            &import,
-            &bundle,
-            &caller_grants,
-            principal_id,
-            op.now,
-        )
-        .await?;
         let space_row = admission::space(&self.repository, tx, &op.space).await?;
         let observed = space_row.revision.clone();
         let generation = space_row.authority_generation.saturating_add(1);
 
-        for row in &prepared.subjects {
+        for row in &staged.subjects {
             self.repository.insert_subject(tx, row).await?;
         }
-        for row in &prepared.records {
+        for row in &staged.records {
             self.repository.insert_record(tx, row).await?;
         }
-        for row in &prepared.candidates {
+        for row in &staged.candidates {
             self.repository.insert_candidate(tx, row).await?;
         }
-        for row in &prepared.profiles {
+        for row in &staged.profiles {
             self.repository.insert_profile(tx, row).await?;
         }
-        for row in &prepared.reflections {
+        for row in &staged.reflections {
             self.repository.insert_reflection(tx, row).await?;
         }
-        for row in &prepared.grants {
+        for row in &staged.grants {
             self.repository.insert_grant(tx, row).await?;
         }
 
-        let encode = |value: &Value, what: &str| {
-            serde_json::to_string(value)
-                .map_err(|error| Reject::internal(format!("{what}: {error}")))
-        };
+        let provenance = serde_json::to_string(&staged.receipt_summaries)
+            .map_err(|error| Reject::internal(format!("import provenance: {error}")))?;
         if !self
             .repository
-            .mark_import_activated(
-                tx,
-                &import_id,
-                &policy::timestamp(op.now),
-                &encode(&prepared.payload, "staged payload")?,
-                &encode(&prepared.report, "staged report")?,
-                &encode(&prepared.receipt_summaries, "import provenance")?,
-            )
+            .mark_import_activated(tx, &import_id, &policy::timestamp(op.now), &provenance)
             .await?
         {
             // Another activation won the same import: refuse rather than apply twice.
             return Err(state_conflict(&import));
         }
-        self.repository.delete_import_chunks(tx, &import_id).await?;
 
         let mut flipped = space_row;
         flipped.authority_generation = generation;
@@ -798,15 +1037,15 @@ impl MemoryAdapter {
         }
 
         let counts = json!({
-            "candidates": prepared.candidates.len(),
-            "profiles": prepared.profiles.len(),
-            "receipt_summaries": prepared
+            "candidates": staged.candidates.len(),
+            "profiles": staged.profiles.len(),
+            "receipt_summaries": staged
                 .receipt_summaries
                 .as_array()
                 .map_or(0, Vec::len),
-            "records": prepared.records.len(),
-            "reflections": prepared.reflections.len(),
-            "subjects": prepared.subjects.len(),
+            "records": staged.records.len(),
+            "reflections": staged.reflections.len(),
+            "subjects": staged.subjects.len(),
         });
         let result = json!({
             "activated": counts,

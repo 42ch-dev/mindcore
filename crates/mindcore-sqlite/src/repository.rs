@@ -872,6 +872,7 @@ type ImportColumns = (
     String,
     String,
     String,
+    Option<String>,
     String,
     String,
     String,
@@ -889,6 +890,7 @@ fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
         conflict_policy,
         adopt_grants_json,
         reference_translations_json,
+        staged_payload_json,
         state,
         created_at,
         expires_at,
@@ -909,6 +911,9 @@ fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
             &reference_translations_json,
             "import reference_translations",
         )?,
+        staged_payload: staged_payload_json
+            .map(|raw| from_json(&raw, "import staged payload"))
+            .transpose()?,
         state,
         created_at,
         expires_at,
@@ -1227,6 +1232,8 @@ pub struct MemoryImportRow {
     pub adopt_grants: Value,
     /// Ordinal-zero `reference_translations`; applied on activation, never on staging.
     pub reference_translations: Value,
+    /// The translated rows final verification froze, present only for `staged`.
+    pub staged_payload: Option<Value>,
     pub state: String,
     pub created_at: String,
     pub expires_at: String,
@@ -1477,8 +1484,9 @@ impl SqliteMemoryRepository {
         Ok(())
     }
 
-    /// The one staging import for a target space, requester and source export:
-    /// the key the partial staging index makes single-valued.
+    /// The one live import for a target space, requester and source export: the key
+    /// the partial index makes single-valued while the import is `staging` or
+    /// `staged`, so a second idempotency key cannot open a second import.
     pub async fn import_by_source(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
@@ -1489,9 +1497,10 @@ impl SqliteMemoryRepository {
         sqlx::query_as::<_, ImportColumns>(
             "SELECT import_id, space_id, requester_principal_id, source_export_id, \
              bundle_digest, expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
-             reference_translations_json, state, created_at, expires_at FROM memory_imports \
+             reference_translations_json, staged_payload_json, state, created_at, expires_at \
+             FROM memory_imports \
              WHERE space_id = ? AND requester_principal_id = ? AND source_export_id = ? \
-             AND state = 'staging'",
+             AND state IN ('staging', 'staged')",
         )
         .bind(space.as_str())
         .bind(requester)
@@ -1583,24 +1592,21 @@ impl SqliteMemoryRepository {
         Ok(())
     }
 
-    /// Advance one staging import to its next ordinal, and to `staged` once the
-    /// whole sequence has verified.
+    /// Advance one staging import to its next ordinal. Only a non-final chunk calls
+    /// this; the final chunk freezes the import through `finish_import`.
     pub async fn advance_import(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         import_id: &str,
         next_ordinal: u64,
-        staged: bool,
     ) -> RepoResult<()> {
         let next_ordinal = i64::try_from(next_ordinal)
             .map_err(|_| invalid_row("import next_ordinal is out of range"))?;
         sqlx::query(
-            "UPDATE memory_imports \
-             SET next_ordinal = ?, state = CASE WHEN ? THEN 'staged' ELSE state END \
-             WHERE import_id = ?",
+            "UPDATE memory_imports SET next_ordinal = ? \
+             WHERE import_id = ? AND state = 'staging'",
         )
         .bind(next_ordinal)
-        .bind(i64::from(staged))
         .bind(import_id)
         .execute(&mut **tx)
         .await
@@ -1618,7 +1624,8 @@ impl SqliteMemoryRepository {
         sqlx::query_as::<_, ImportColumns>(
             "SELECT import_id, space_id, requester_principal_id, source_export_id, \
              bundle_digest, expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
-             reference_translations_json, state, created_at, expires_at FROM memory_imports \
+             reference_translations_json, staged_payload_json, state, created_at, expires_at \
+             FROM memory_imports \
              WHERE space_id = ? AND import_id = ?",
         )
         .bind(space.as_str())
@@ -1630,27 +1637,48 @@ impl SqliteMemoryRepository {
         .transpose()
     }
 
-    /// The one visibility flip: a `staged` import becomes `activated`, carrying the
-    /// translated rows, the identity mapping and the retained source provenance.
+    /// Freeze the translated rows final verification built: the import leaves
+    /// `staging` for `staged`, carrying the payload activation applies and the report
+    /// that fixes the identity mapping. `false` means the row was not mid-staging.
+    pub async fn finish_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        staged_payload: &str,
+        staged_report: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'staged', next_ordinal = expected_count, staged_payload_json = ?, \
+             staged_report_json = ? \
+             WHERE import_id = ? AND state = 'staging'",
+        )
+        .bind(staged_payload)
+        .bind(staged_report)
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// One visibility flip: a `staged` import becomes `activated`, carrying the
+    /// retained source provenance; the content-bearing payload it applied is released.
     /// `false` means the row had already left `staged`, so nothing is applied twice.
     pub async fn mark_import_activated(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         import_id: &str,
         activated_at: &str,
-        staged_payload: &str,
-        staged_report: &str,
         provenance: &str,
     ) -> RepoResult<bool> {
         let updated = sqlx::query(
             "UPDATE memory_imports \
-             SET state = 'activated', activated_at = ?, staged_payload_json = ?, \
-             staged_report_json = ?, provenance_json = ? \
+             SET state = 'activated', activated_at = ?, staged_payload_json = NULL, \
+             provenance_json = ? \
              WHERE import_id = ? AND state = 'staged'",
         )
         .bind(activated_at)
-        .bind(staged_payload)
-        .bind(staged_report)
         .bind(provenance)
         .bind(import_id)
         .execute(&mut **tx)
@@ -1659,14 +1687,38 @@ impl SqliteMemoryRepository {
         Ok(updated.rows_affected() == 1)
     }
 
-    /// Pre-activation rollback: only an import that never activated can be discarded.
+    /// Reclaim an import past its fixed expiry: content-free terminal state, with the
+    /// content-bearing payload released, so its source-export key stops blocking a
+    /// fresh import. `false` means it had already left the live states.
+    pub async fn expire_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'expired', staged_payload_json = NULL, staged_report_json = NULL, \
+             provenance_json = NULL \
+             WHERE import_id = ? AND state IN ('staging', 'staged')",
+        )
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Pre-activation rollback: only an import that never activated can be discarded,
+    /// and the content-bearing payload it never applied is released with it.
     pub async fn mark_import_discarded(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         import_id: &str,
     ) -> RepoResult<bool> {
         let updated = sqlx::query(
-            "UPDATE memory_imports SET state = 'discarded' \
+            "UPDATE memory_imports \
+             SET state = 'discarded', staged_payload_json = NULL, staged_report_json = NULL, \
+             provenance_json = NULL \
              WHERE import_id = ? AND state IN ('staging', 'staged', 'expired')",
         )
         .bind(import_id)

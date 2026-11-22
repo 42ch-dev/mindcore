@@ -598,6 +598,44 @@ async fn a_subject_with_an_unsettled_intent_contributes_nothing() {
     assert!(bundle.candidates.is_empty(), "no withheld candidate");
     assert!(bundle.profiles.is_empty(), "no withheld profile");
     assert!(bundle.reflections.is_empty(), "no withheld reflection");
+    // A live grant scoped to the withheld subject contributes no summary: naming its
+    // `subject_id` would disclose the subject and dangle at the target's own check.
+    let grants: Vec<&Value> = artifact.bundle["grants"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .collect();
+    assert_eq!(
+        grants
+            .iter()
+            .map(|grant| grant["grant_id"].as_str().expect("grant id"))
+            .collect::<Vec<_>>(),
+        vec!["g_1"],
+        "only the space-wide grant survives the withholding"
+    );
+    assert!(
+        !artifact.bundle.to_string().contains("s_1"),
+        "the bundle names no trace of the withheld subject"
+    );
+
+    // The provider's own artifact must pass its own final verification when it is
+    // staged into an empty target.
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let chunks = sealed_partition(&artifact.bundle);
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        let staged = ready(
+            stage_into(
+                &fixture,
+                TARGET,
+                chunk.clone(),
+                &format!("withheld-stage-{ordinal}"),
+                None,
+            )
+            .await,
+        );
+        assert_eq!(staged["result"]["chunks_received"], json!(ordinal + 1));
+    }
 }
 
 async fn seed_reflection(fixture: &Fixture, reflection_id: &str) {
@@ -683,6 +721,11 @@ fn synthetic_bundle(arrays: Value) -> Value {
     bundle
 }
 
+/// The seal a bundle publishes; partition takes it rather than recomputing it.
+fn sealed_digest(bundle: &Value) -> &str {
+    bundle["digest"].as_str().expect("the bundle is sealed")
+}
+
 fn synthetic_record(record_id: &str, text_length: usize) -> Value {
     json!({
         "schema_version": 1,
@@ -706,6 +749,21 @@ fn synthetic_record(record_id: &str, text_length: usize) -> Value {
 }
 
 #[test]
+fn a_partitioned_bundle_must_carry_the_seal_it_was_given() {
+    let bundle = synthetic_bundle(json!({ "records": [synthetic_record("r_1", 16)] }));
+    // The seal is computed once, at assembly; a bundle whose published digest
+    // disagrees with the one hand-carried here is refused, not re-hashed.
+    match super::chunk::partition(&bundle, &"0".repeat(64), policy::EXPORT_CHUNK_BYTES) {
+        Ok(chunks) => panic!("a mismatched seal emitted {} chunks", chunks.len()),
+        Err(error) => assert!(
+            error.message.contains("digest does not verify"),
+            "{}",
+            error.message
+        ),
+    }
+}
+
+#[test]
 fn one_oversized_element_travels_alone() {
     let limit = policy::EXPORT_CHUNK_BYTES;
     let bundle = synthetic_bundle(json!({
@@ -716,7 +774,10 @@ fn one_oversized_element_travels_alone() {
         ],
         "reflections": [],
     }));
-    let chunks = ok(super::chunk::partition(&bundle, limit), "partition");
+    let chunks = ok(
+        super::chunk::partition(&bundle, sealed_digest(&bundle), limit),
+        "partition",
+    );
     assert!(
         chunks.len() >= 2,
         "the small records still fill their own chunk"
@@ -766,7 +827,10 @@ fn elements_are_never_split_at_a_small_limit() {
         .map(|index| synthetic_record(&format!("r_{index:02}"), 256))
         .collect();
     let bundle = synthetic_bundle(json!({ "records": records.clone() }));
-    let chunks = ok(super::chunk::partition(&bundle, limit), "partition");
+    let chunks = ok(
+        super::chunk::partition(&bundle, sealed_digest(&bundle), limit),
+        "partition",
+    );
     assert!(chunks.len() > 1, "forty records split at a 2 KiB limit");
     let ordinals: Vec<u64> = chunks
         .iter()
@@ -794,7 +858,7 @@ fn elements_are_never_split_at_a_small_limit() {
 fn header_only_bundle_is_one_chunk() {
     let bundle = synthetic_bundle(json!({ "reflections": [] }));
     let chunks = ok(
-        super::chunk::partition(&bundle, policy::EXPORT_CHUNK_BYTES),
+        super::chunk::partition(&bundle, sealed_digest(&bundle), policy::EXPORT_CHUNK_BYTES),
         "partition",
     );
     assert_eq!(
@@ -823,7 +887,10 @@ fn an_element_the_header_cannot_hold_starts_ordinal_one() {
     let limit = 2_048;
     let header_bytes = {
         let header_only = synthetic_bundle(json!({ "reflections": [] }));
-        let chunks = ok(super::chunk::partition(&header_only, limit), "partition");
+        let chunks = ok(
+            super::chunk::partition(&header_only, sealed_digest(&header_only), limit),
+            "partition",
+        );
         assert_eq!(chunks.len(), 1, "the header alone is one chunk");
         chunks[0]["bytes"].as_u64().expect("bytes")
     };
@@ -841,7 +908,10 @@ fn an_element_the_header_cannot_hold_starts_ordinal_one() {
     );
 
     let bundle = synthetic_bundle(json!({ "records": [record], "reflections": [] }));
-    let chunks = ok(super::chunk::partition(&bundle, limit), "partition");
+    let chunks = ok(
+        super::chunk::partition(&bundle, sealed_digest(&bundle), limit),
+        "partition",
+    );
     assert_eq!(chunks.len(), 2, "the header moves to a chunk of its own");
     assert!(
         chunks[0].get("records").is_none(),
@@ -1084,7 +1154,9 @@ async fn stage_as(
         json!({
             "space_id": space,
             "chunk": chunk,
-            "conflict_policy": "fail",
+            // why: these stages import a space into itself, so the subject collision the
+            // final chunk now decides is resolved by a rename rather than a refusal.
+            "conflict_policy": "rename_subject",
             "idempotency_key": key,
         })
     } else {
@@ -1171,7 +1243,38 @@ async fn a_valid_single_chunk_sequence_reaches_staged() {
         import_state(&fixture, &import_id).await,
         ("staged".to_string(), 1)
     );
-    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+    // §7.31: the final chunk fixes the mapping and report, and consumes the raw
+    // sequence — nothing downstream re-reads the chunks.
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
+    let report = &body["result"]["staged_report"];
+    assert_eq!(report["counts"]["subjects"], json!(2));
+    assert_eq!(report["counts"]["records"], json!(3));
+    assert_eq!(report["verification"]["bundle_digest_ok"], json!(true));
+    assert_eq!(
+        report["subject_id_map"]
+            .as_object()
+            .expect("subject map")
+            .len(),
+        2,
+        "the report fixes a target identity for every subject"
+    );
+    assert_eq!(
+        report["record_id_map"]
+            .as_object()
+            .expect("record map")
+            .len(),
+        3,
+        "every transferred record has a fixed identity"
+    );
+    let (payload, stored_report): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT staged_payload_json, staged_report_json FROM memory_imports WHERE import_id = ?",
+    )
+    .bind(&import_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("import row");
+    assert!(payload.is_some(), "the translated rows are durable");
+    assert!(stored_report.is_some(), "the identity report is durable");
 }
 
 /// §7.0.5: the same key and payload replays the recorded outcome and writes
@@ -1201,14 +1304,18 @@ async fn stage_import_replays_on_the_same_key_and_conflicts_on_a_new_digest() {
         1,
         "a replay stages no second import"
     );
-    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+    assert_eq!(
+        staged_chunk_count(&fixture, &import_id).await,
+        0,
+        "the final chunk already released the raw sequence"
+    );
 
     let changed = stage_into(
         &fixture,
         SPACE,
         chunks[0].clone(),
         "stage-replay",
-        Some(json!({ "conflict_policy": "rename_subject" })),
+        Some(json!({ "conflict_policy": "fail" })),
     )
     .await;
     let reject = rejected(&changed);
@@ -1216,7 +1323,7 @@ async fn stage_import_replays_on_the_same_key_and_conflicts_on_a_new_digest() {
         reject.code,
         spoke_operations::SpokeRejectCode::IdempotencyConflict
     );
-    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
 }
 
 #[tokio::test]
@@ -1265,10 +1372,11 @@ async fn repeated_ordinals_conflict_without_ending_the_import() {
     );
 }
 
-/// A chunk that skips an ordinal ends the import: the gap is committed as a
-/// discarded import, so no later chunk can complete that sequence.
+/// `next_ordinal` alone decides what is acceptable, so an ordinal ahead of the import
+/// is the same refusal as a repeat: nothing is written, nothing is deleted, and the
+/// sequence still completes once the right chunk arrives.
 #[tokio::test]
-async fn a_gap_ends_the_import_and_only_a_new_import_can_complete() {
+async fn an_ordinal_ahead_of_the_import_is_refused_and_the_sequence_still_completes() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
     seed_big_record(&fixture).await;
@@ -1282,36 +1390,40 @@ async fn a_gap_ends_the_import_and_only_a_new_import_can_complete() {
         .to_string();
 
     // Ordinal 2 arrives while ordinal 1 is missing.
-    let gap = ready(stage_chunk(&fixture, chunks[2].clone(), "gap-2").await);
-    assert_eq!(gap["result"]["chunks_received"], json!(0));
-    assert_eq!(gap["result"]["import_id"], json!(import_id));
+    let gap = stage_chunk(&fixture, chunks[2].clone(), "gap-2").await;
+    let reject = rejected(&gap);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("out_of_order"));
+    assert_eq!(detail(reject, "expected_ordinal"), &json!(1));
+    assert_eq!(detail(reject, "received_ordinal"), &json!(2));
     assert_eq!(
         import_state(&fixture, &import_id).await,
-        ("discarded".to_string(), 1)
+        ("staging".to_string(), 1),
+        "the refusal writes nothing and leaves next_ordinal where it was"
     );
-    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
-
-    // Neither the missing ordinal nor the chunk that showed the gap can complete it.
-    for (chunk, key) in [(chunks[1].clone(), "gap-1"), (chunks[2].clone(), "gap-2b")] {
-        let result = stage_chunk(&fixture, chunk, key).await;
-        let reject = rejected(&result);
-        assert_eq!(
-            reject.code,
-            spoke_operations::SpokeRejectCode::ImportConflict
-        );
-        assert_eq!(detail(reject, "reason"), &json!("no_staging_import"));
-    }
-
-    // The only route forward is a new import of the same source export.
-    let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "gap-0b").await);
-    let restarted_id = restarted["result"]["import_id"]
-        .as_str()
-        .expect("restarted import id")
-        .to_string();
-    assert_ne!(restarted_id, import_id);
     assert_eq!(
-        import_state(&fixture, &restarted_id).await,
-        ("staging".to_string(), 1)
+        staged_chunk_count(&fixture, &import_id).await,
+        1,
+        "the refusal deletes nothing"
+    );
+
+    // The chunk that showed the gap is still a repeat, not a second chance.
+    let repeated = stage_chunk(&fixture, chunks[2].clone(), "gap-2b").await;
+    assert_eq!(
+        detail(rejected(&repeated), "reason"),
+        &json!("out_of_order")
+    );
+
+    // The missing ordinal lands and the sequence completes.
+    ready(stage_chunk(&fixture, chunks[1].clone(), "gap-1").await);
+    let body = ready(stage_chunk(&fixture, chunks[2].clone(), "gap-2c").await);
+    assert_eq!(body["result"]["chunks_received"], json!(3));
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 3)
     );
 }
 
@@ -1362,8 +1474,11 @@ async fn a_corrupt_final_chunk_conflicts_and_leaves_the_import_staging() {
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 2);
 }
 
+/// An expired import keeps no payload and no staging lookup key: the next stage of the
+/// same source export reclaims it — a committed success, not a refusal — and starts a
+/// fresh sequence, while a late chunk of the dead import is still refused.
 #[tokio::test]
-async fn an_expired_staging_import_refuses_instead_of_resuming() {
+async fn an_expired_import_is_reclaimed_by_the_next_stage_of_its_source_export() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
     seed_big_record(&fixture).await;
@@ -1382,6 +1497,7 @@ async fn an_expired_staging_import_refuses_instead_of_resuming() {
         .await
         .expect("expire the import");
 
+    // A later chunk names a dead import: refuse it and write nothing.
     let result = stage_chunk(&fixture, chunks[1].clone(), "stage-4-1").await;
     let reject = rejected(&result);
     assert_eq!(
@@ -1394,6 +1510,77 @@ async fn an_expired_staging_import_refuses_instead_of_resuming() {
         ("staging".to_string(), 1)
     );
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+
+    // The same source export stages again: the expired row is content-free and its key
+    // no longer blocks, so a fresh import starts under the same export id.
+    let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-4-0b").await);
+    let restarted_id = restarted["result"]["import_id"]
+        .as_str()
+        .expect("restarted import id")
+        .to_string();
+    assert_ne!(restarted_id, import_id);
+    let (state, payload, report): (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT state, staged_payload_json, staged_report_json \
+         FROM memory_imports WHERE import_id = ?",
+    )
+    .bind(&import_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("reclaimed import row");
+    assert_eq!(
+        state, "expired",
+        "the dead import keeps a content-free marker"
+    );
+    assert!(payload.is_none(), "the expired payload is released");
+    assert!(report.is_none());
+    assert_eq!(
+        staged_chunk_count(&fixture, &import_id).await,
+        0,
+        "the expired chunks are released"
+    );
+    assert_eq!(
+        import_state(&fixture, &restarted_id).await,
+        ("staging".to_string(), 1)
+    );
+}
+
+/// One live import per source export: once the first reaches `staged`, a second
+/// idempotency key cannot open a second import that would activate the same export twice.
+#[tokio::test]
+async fn a_staged_import_holds_its_source_export_against_a_second_key() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    let chunks = staged_source(&fixture, "one-live-export").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+
+    let first = ready(stage_chunk(&fixture, chunks[0].clone(), "live-0").await);
+    let import_id = first["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 1)
+    );
+
+    let second = stage_chunk(&fixture, chunks[0].clone(), "live-0b").await;
+    let reject = rejected(&second);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("duplicate_header"));
+    assert_eq!(detail(reject, "import_id"), &json!(import_id));
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
+            &[SPACE],
+        )
+        .await,
+        1,
+        "a second key opened no second import"
+    );
 }
 
 /// A caller who may write the target space but cannot page the named source
@@ -1462,7 +1649,7 @@ fn reseal(bundle: &mut Value) {
 
 fn sealed_partition(bundle: &Value) -> Vec<Value> {
     ok(
-        super::chunk::partition(bundle, policy::EXPORT_CHUNK_BYTES),
+        super::chunk::partition(bundle, sealed_digest(bundle), policy::EXPORT_CHUNK_BYTES),
         "partition",
     )
 }
@@ -1530,11 +1717,12 @@ async fn sequence_verification_rejects_versions_references_and_adoptions() {
     );
 }
 
-/// `GrantSummary.principal_ref` is an opaque correlation label. A value that
-/// carries key material — here a bearer token — is refused by final verification
-/// without being echoed.
+/// `GrantSummary.principal_ref` is an opaque correlation label. A value that carries
+/// key material — here a bearer token — is refused by final verification without being
+/// echoed; a foreign exporter's own opaque spelling is accepted, because this crate's
+/// `prl_…` grammar is its own convention, not a protocol rule.
 #[tokio::test]
-async fn a_grant_summary_whose_principal_ref_looks_like_a_token_is_refused() {
+async fn a_grant_summary_principal_ref_is_screened_for_credentials_not_for_our_grammar() {
     let fixture = Fixture::open().await;
     let mut tx = fixture.begin().await;
     let artifact = ok(
@@ -1555,15 +1743,28 @@ async fn a_grant_summary_whose_principal_ref_looks_like_a_token_is_refused() {
         .expect("the fixture exports a grant summary");
     let label = grant["principal_ref"].as_str().expect("principal ref");
     assert!(label.starts_with("prl_"), "the export labels the principal");
-    let token = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwXzEifQ";
-    grant["principal_ref"] = json!(token);
-    reseal(&mut bundle);
 
+    // A verified bundle with a foreign opaque label stages: the screen is not a grammar.
+    grant["principal_ref"] = json!("prn_label_9f2c");
+    reseal(&mut bundle);
     let chunks = sealed_partition(&bundle);
     let errors = super::stage::verification_errors(
         &chunks,
         chunks.len() as u64,
-        bundle["digest"].as_str().expect("digest"),
+        sealed_digest(&bundle),
+        "exp_1",
+        &json!([]),
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let token = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwXzEifQ";
+    bundle["grants"][0]["principal_ref"] = json!(token);
+    reseal(&mut bundle);
+    let chunks = sealed_partition(&bundle);
+    let errors = super::stage::verification_errors(
+        &chunks,
+        chunks.len() as u64,
+        sealed_digest(&bundle),
         "exp_1",
         &json!([]),
     );
@@ -1823,8 +2024,14 @@ async fn activation_applies_the_staged_bundle_exactly_once() {
     .expect("import row");
     assert_eq!(row.0, "activated");
     assert!(row.1.is_some(), "activation stamps activated_at");
-    assert!(row.2.is_some(), "activation records the translated rows");
-    assert!(row.3.is_some(), "activation records the identity report");
+    assert!(
+        row.2.is_none(),
+        "the content-bearing payload it applied is released"
+    );
+    assert!(
+        row.3.is_some(),
+        "the identity report stays as content-free provenance"
+    );
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
 
     // Every record carries the import provenance, and no candidate dangles.
@@ -1898,6 +2105,16 @@ async fn discard_deletes_staging_and_refuses_an_activated_import() {
         ("discarded".to_string(), 1)
     );
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
+    let payload: Option<String> =
+        sqlx::query_scalar("SELECT staged_payload_json FROM memory_imports WHERE import_id = ?")
+            .bind(&import_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("discarded import row");
+    assert!(
+        payload.is_none(),
+        "a discarded import keeps no content-bearing payload"
+    );
     assert_eq!(
         count(
             &fixture,
@@ -2141,31 +2358,71 @@ async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
         .expect("expire the target grant");
 
     let chunks = staged_source(&fixture, "adopt-export-2").await;
-    let staged = ready(
-        stage_into(
-            &fixture,
-            TARGET,
-            chunks[0].clone(),
-            "adopt-stage-1",
-            Some(json!({ "adopt_grants": [{ "grant_id": "g_1", "principal_id": "p_1" }] })),
-        )
-        .await,
-    );
-    let import_id = staged["result"]["import_id"]
-        .as_str()
-        .expect("import id")
-        .to_string();
-
-    let result = activate(&fixture, &import_id, "adopt-activate-2").await;
-    let reject = rejected(&result);
+    // Adoption is decided at the final chunk: a stated grant the caller cannot cover
+    // refuses the stage instead of freezing an import that cannot activate.
+    let refused = stage_into(
+        &fixture,
+        TARGET,
+        chunks[0].clone(),
+        "adopt-stage-1",
+        Some(json!({ "adopt_grants": [{ "grant_id": "g_1", "principal_id": "p_1" }] })),
+    )
+    .await;
+    let reject = rejected(&refused);
     assert_eq!(
         reject.code,
         spoke_operations::SpokeRejectCode::ImportConflict
     );
     assert_eq!(detail(reject, "reason"), &json!("grant_not_subsumed"));
     assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        0,
+        "a refused adoption stages nothing"
+    );
+}
+
+/// The frozen rows are rechecked against the live target: a subject the target gained
+/// after staging refuses the activation, and nothing is applied.
+#[tokio::test]
+async fn activation_rechecks_a_subject_the_target_gained_after_staging() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let chunks = staged_source(&fixture, "recheck-export-1").await;
+    let staged =
+        ready(stage_into(&fixture, TARGET, chunks[0].clone(), "recheck-stage-0", None).await);
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    // Someone ensures the staged subject id in the target between the two calls.
+    let mut row = subject("s_1", "active", &[]);
+    row.space_id = SpaceId::new(TARGET);
+    let mut tx = fixture.begin().await;
+    fixture
+        .repository
+        .insert_subject(&mut tx, &row)
+        .await
+        .expect("ensure the subject");
+    tx.commit().await.expect("commit subject");
+
+    let result = activate(&fixture, &import_id, "recheck-activate-1").await;
+    let reject = rejected(&result);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("subject_collision"));
+    assert_eq!(
         import_state(&fixture, &import_id).await,
-        ("staged".to_string(), 1)
+        ("staged".to_string(), 1),
+        "a refused recheck leaves the import staged"
     );
     assert_eq!(
         count(
@@ -2175,7 +2432,7 @@ async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
         )
         .await,
         0,
-        "a refused adoption applies nothing"
+        "a refused recheck applies nothing"
     );
 }
 
@@ -2247,20 +2504,147 @@ async fn activating_a_tombstone_inclusive_import_keeps_the_scrubbed_envelope() {
     );
 }
 
+/// §7.31: an `import_ref` already carried by a record is historical attribution and
+/// survives a later move; the new hop is recorded in that import's own report instead
+/// of overwriting the identity the first move gave the content.
+#[tokio::test]
+async fn a_second_import_keeps_the_original_import_provenance() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+
+    // First hop: SPACE -> TARGET.
+    let chunks = staged_source(&fixture, "lineage-export-1").await;
+    let staged =
+        ready(stage_into(&fixture, TARGET, chunks[0].clone(), "lineage-stage-0", None).await);
+    let first = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    ready(activate(&fixture, &first, "lineage-activate-1").await);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? \
+             AND json_extract(import_ref_json, '$.import_id') = ?",
+            &[TARGET, &first],
+        )
+        .await,
+        3,
+        "the first hop stamps its own identity"
+    );
+
+    // Second hop: TARGET -> TARGET, renamed so nothing collides.
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let created = ready(
+        adapter
+            .create_export(
+                &mut tx,
+                &principal("p_1"),
+                json!({ "space_id": TARGET, "idempotency_key": "lineage-export-2" }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit second export");
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    let chunk_count = created["result"]["chunk_count"]
+        .as_u64()
+        .expect("chunk count");
+    let mut chunks = Vec::new();
+    for ordinal in 0..chunk_count {
+        let mut tx = fixture.begin().await;
+        let page = ready(
+            adapter
+                .get_export(
+                    &mut tx,
+                    &principal("p_1"),
+                    json!({ "space_id": TARGET, "export_id": export_id, "chunk_ordinal": ordinal }),
+                )
+                .await,
+        );
+        tx.rollback().await.expect("rollback page read");
+        chunks.push(page["chunk"].clone());
+    }
+    let mut staged = None;
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        let body = ready(
+            stage_into(
+                &fixture,
+                TARGET,
+                chunk.clone(),
+                &format!("lineage-hop2-{ordinal}"),
+                Some(json!({ "conflict_policy": "rename_subject" })),
+            )
+            .await,
+        );
+        staged = Some(body);
+    }
+    let staged = staged.expect("the second export stages");
+    let second = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    ready(activate(&fixture, &second, "lineage-activate-2").await);
+
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? \
+             AND json_extract(import_ref_json, '$.import_id') = ?",
+            &[TARGET, &first],
+        )
+        .await,
+        6,
+        "the second move keeps the original provenance on both copies"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? \
+             AND json_extract(import_ref_json, '$.import_id') = ?",
+            &[TARGET, &second],
+        )
+        .await,
+        0,
+        "the later import never overwrites an existing import_ref"
+    );
+    let report: String =
+        sqlx::query_scalar("SELECT staged_report_json FROM memory_imports WHERE import_id = ?")
+            .bind(&second)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("second import report");
+    let report: Value = serde_json::from_str(&report).expect("report json");
+    assert_eq!(
+        report["record_id_map"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(3),
+        "the new hop is recorded in its own identity report"
+    );
+}
+
 #[tokio::test]
 async fn a_colliding_subject_is_refused_by_fail_and_renamed_on_request() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
 
-    // Importing the space into itself collides on both subject ids.
+    // Importing the space into itself collides on both subject ids. The collision is a
+    // staging decision now: the final chunk refuses it rather than freezing a staged
+    // import that cannot activate.
     let chunks = staged_source(&fixture, "rename-export-1").await;
-    let staged =
-        ready(stage_into(&fixture, SPACE, chunks[0].clone(), "rename-stage-0", None).await);
-    let import_id = staged["result"]["import_id"]
-        .as_str()
-        .expect("import id")
-        .to_string();
-    let refused = run_import(&fixture, SPACE, &import_id, "rename-activate-1", true).await;
+    let refused = stage_into(
+        &fixture,
+        SPACE,
+        chunks[0].clone(),
+        "rename-stage-0",
+        Some(json!({ "conflict_policy": "fail" })),
+    )
+    .await;
     let reject = rejected(&refused);
     assert_eq!(
         reject.code,
@@ -2270,12 +2654,22 @@ async fn a_colliding_subject_is_refused_by_fail_and_renamed_on_request() {
     assert_eq!(
         count(
             &fixture,
+            "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
+            &[SPACE]
+        )
+        .await,
+        0,
+        "a refused final chunk stages nothing"
+    );
+    assert_eq!(
+        count(
+            &fixture,
             "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
             &[SPACE]
         )
         .await,
         4,
-        "a refused activation applies nothing (the fixture's four rows, tombstone included)"
+        "a refused final chunk applies nothing"
     );
 
     // `rename_subject` mints the colliding subjects and rebases every row on them.

@@ -11,10 +11,7 @@ use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
-use mindcore_runtime::{
-    MemoryFace, MindProviders, MindcoreServe, ServeFaces, ToolRegistration,
-    MEMORY_TRANSFER_OPERATIONS,
-};
+use mindcore_runtime::{MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_sqlite::MindStore;
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
@@ -266,7 +263,7 @@ async fn attached_memory_service_is_advertised_and_served() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
         serve.surface(ServeFaces {
-            memory: Some(MemoryFace::new(Arc::new(RecordingMemory), [])),
+            memory: Some(Arc::new(RecordingMemory)),
             ..faces(metadata("runtime"))
         }),
         "assemble mixed surface",
@@ -291,44 +288,25 @@ async fn attached_memory_service_is_advertised_and_served() {
     assert!(surface.ports.as_baseline().is_none());
 }
 
-/// The transfer family is derived from the face's own registration: all five §7.29–§7.33
-/// operations earn `spoke-memory-transfer`, and a face that registers fewer never claims it.
+/// The seam reports no operations, so an attached service earns `spoke-memory` and never
+/// `spoke-memory-transfer`: a signed manifest must not claim a family the bound service cannot
+/// show it dispatches, even when the host's own dispatch handles the transfer ops.
 #[tokio::test]
-async fn transfer_is_advertised_only_when_all_five_operations_are_registered() {
+async fn an_attached_memory_service_never_claims_the_transfer_family() {
     let serve = Fixture::open().await.serve();
-    let complete = expect_ok(
+    let surface = expect_ok(
         serve.surface(ServeFaces {
-            memory: Some(MemoryFace::new(
-                Arc::new(RecordingMemory),
-                MEMORY_TRANSFER_OPERATIONS,
-            )),
+            memory: Some(Arc::new(RecordingMemory)),
             ..faces(metadata("runtime"))
         }),
-        "assemble a transfer-serving surface",
+        "assemble a memory-serving surface",
     );
+    assert!(capabilities(&surface).contains(&"spoke-memory"));
     assert!(
-        capabilities(&complete).contains(&"spoke-memory-transfer"),
-        "the whole family is registered: {:?}",
-        capabilities(&complete)
+        !capabilities(&surface).contains(&"spoke-memory-transfer"),
+        "the opaque service seam cannot prove the family: {:?}",
+        capabilities(&surface)
     );
-    assert!(capabilities(&complete).contains(&"spoke-memory"));
-
-    let partial = expect_ok(
-        serve.surface(ServeFaces {
-            memory: Some(MemoryFace::new(
-                Arc::new(RecordingMemory),
-                MEMORY_TRANSFER_OPERATIONS[..4].to_vec(),
-            )),
-            ..faces(metadata("runtime"))
-        }),
-        "assemble a base-only surface",
-    );
-    assert!(
-        !capabilities(&partial).contains(&"spoke-memory-transfer"),
-        "one unregistered operation withholds the family: {:?}",
-        capabilities(&partial)
-    );
-    assert!(capabilities(&partial).contains(&"spoke-memory"));
 }
 
 /// A registration advertises its descriptor and is installed on the responder. Whether the
