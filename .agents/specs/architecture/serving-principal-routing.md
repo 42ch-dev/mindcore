@@ -24,6 +24,10 @@ A caller-supplied principal, scope or collection is never used to select a route
 principal ids, not peer ids; values are workflow collection scopes. The standalone Knowledge face
 still uses its own `ServeFaces.scope_id`, `knowledge`, and `admission`.
 
+The one private lookup, `knowledge_route(&self, principal: &Principal) -> Option<&KnowledgeScope>`,
+borrows the scope by `principal_id(principal)` for both carrier admission and the recall knowledge
+slot.
+
 ### Deliberation
 
 `deliberate` settles onto a carrier entry, so it needs exactly one routed collection per call.
@@ -55,6 +59,8 @@ additional, not a condition of the call.
 
 ### Construction
 
+- `MemoryWorkflowBinding::new(pool, reflections_enabled)` starts with an empty private
+  `knowledge_routes`; `with_knowledge_routes` validates and takes ownership of the full map.
 - An empty principal key or an empty collection is refused when the surface is assembled; the
   refusal does not wait for the first call.
 - The route map is host configuration: it is not persisted, not derived from arguments, and not
@@ -80,14 +86,11 @@ reconfiguration requirement, so this is recorded rather than implemented.
 
 ## Where it lives
 
-- `crates/mindcore-runtime/src/lib.rs:136-164` — `ServeFaces`, whose `workflow_routes` field carries
-  the map and whose doc comment states the workflow collection allowlist and that routes are never
-  read from the wire.
-- `crates/mindcore-spoke/src/workflows.rs:279-342` — `MemoryWorkflowBinding::with_knowledge_routes`
-  validates and takes ownership of the full map; `MemoryWorkflowBinding::new(pool,
-  reflections_enabled)` starts with an empty private `knowledge_routes`. The one private lookup,
-  `knowledge_route(&self, principal: &Principal) -> Option<&KnowledgeScope>`, borrows the scope by
-  `principal_id(principal)` for both carrier admission and the recall knowledge slot.
+- `crates/mindcore-runtime/src/lib.rs:136-164` — `ServeFaces`; the `workflow_routes` doc comment
+  states the workflow collection allowlist and that routes are never read from the wire.
+- `crates/mindcore-spoke/src/workflows.rs:89` — `MemoryWorkflowBinding::new`.
+- `crates/mindcore-spoke/src/workflows.rs:289-320` — `MemoryWorkflowBinding::with_knowledge_routes`.
+- `crates/mindcore-spoke/src/workflows.rs:340-342` — `MemoryWorkflowBinding::knowledge_route`.
 - Served tool ids, argument/result shapes and the surrounding face contract:
   [`serving-seam.md`](serving-seam.md).
 
