@@ -22,14 +22,14 @@ Routing therefore has two independent inputs, and neither is caller-declared:
 A caller-supplied principal, scope or collection is never used to select a route.
 
 `ServeFaces.workflow_routes: BTreeMap<String, KnowledgeScope>` carries the map
-(`crates/mindcore-runtime/src/lib.rs:230`). Keys are exact principal ids, not peer ids; values are
+(`crates/mindcore-runtime/src/lib.rs:233`). Keys are exact principal ids, not peer ids; values are
 workflow collection scopes. The standalone Knowledge face still uses its own `ServeFaces.scope_id`,
-`knowledge`, and `admission`. `MemoryWorkflowBinding::new(pool, reflections_enabled)` starts with an
+`knowledge`, and `admission`. `MemoryWorkflowBinding::new(pool, reflections)` starts with an
 empty private `knowledge_routes`; `with_knowledge_routes` validates and takes ownership of the full
-map (`crates/mindcore-spoke/src/workflows.rs:289-321`). The one private lookup,
+map (`crates/mindcore-spoke/src/workflows.rs:295-326`). The one private lookup,
 `knowledge_route(&self, principal: &Principal) -> Option<&KnowledgeScope>`, borrows the scope by
 `principal_id(principal)` for both carrier admission and the recall knowledge slot
-(`crates/mindcore-spoke/src/workflows.rs:336-343`).
+(`crates/mindcore-spoke/src/workflows.rs:346-348`).
 
 ### Deliberation
 
@@ -64,7 +64,7 @@ additional, not a condition of the call.
 
 `tools.mindcore.adopt` reads one host-configured shared collection and writes the admitted
 principal's routed collection. `ServeFaces.adoption: Option<AdoptionRoute>` names the source
-(`crates/mindcore-runtime/src/lib.rs:188-190,222`); the destination is that principal's own
+(`crates/mindcore-runtime/src/lib.rs:191-193,225`); the destination is that principal's own
 `workflow_routes` entry, resolved from the same map the workflow binding takes. Neither collection
 is named by the request.
 
@@ -74,7 +74,7 @@ is named by the request.
   the shared entry another principal reads.
 - An admitted principal without a route is refused `NotAuthorized` with the fixed message
   `principal has no workflow knowledge route` and no target detail
-  (`crates/mindcore-runtime/src/tools.rs:294-315`); the call falls back to no collection and never
+  (`crates/mindcore-runtime/src/tools.rs:294-312`); the call falls back to no collection and never
   reaches another principal's destination.
 - The source is read-only to the call and only the routed destination is written, both on one
   `BEGIN IMMEDIATE` transaction, so adoption adds no write outside the routed collection. The
@@ -86,18 +86,12 @@ is named by the request.
 
 - An empty principal key, an empty collection, or one collection named by two routes is refused
   when the surface is assembled; the refusal does not wait for the first call
-  (`crates/mindcore-spoke/src/workflows.rs:289-321`). The adoption source is validated in the same
+  (`crates/mindcore-spoke/src/workflows.rs:295-326`). The adoption source is validated in the same
   assembly step, before any port or registration exists.
 - The route map is host configuration: it is not persisted, not derived from arguments, and not
   read from the wire.
 - The route never substitutes for a live grant: every carrier write and knowledge read still
   re-derives the grants on its own transaction.
-
-### Known limit
-
-A route is fixed for the lifetime of the surface. Changing a principal's collection requires
-assembling a new surface; there is no hot reload of the route map. The workspace has no periodic
-reconfiguration requirement, so this is recorded rather than implemented.
 
 ## Invariants
 
@@ -116,35 +110,28 @@ reconfiguration requirement, so this is recorded rather than implemented.
 
 ## Where it lives
 
-- `crates/mindcore-runtime/src/lib.rs` — `ServeFaces.workflow_routes`, `AdoptionRoute`, and the
-  assembly-time refusals that validate both.
-- `crates/mindcore-spoke/src/workflows.rs` — `with_knowledge_routes` and the one `knowledge_route`
-  lookup both routed workflow calls share.
+- `crates/mindcore-runtime/src/lib.rs` — `ServeFaces` (`:197-238`) with `workflow_routes`
+  (`:226-233`) and `adoption` (`:220-225`), `AdoptionRoute` (`:191-193`), and the assembly-time
+  refusals in `MindcoreRuntime::surface` (`:93-142`), the adoption source checks among them
+  (`:98-120`).
+- `crates/mindcore-spoke/src/workflows.rs` — `MemoryWorkflowBinding::new` (`:92-99`),
+  `with_knowledge_routes` (`:295-326`) and the one `knowledge_route` lookup (`:346-348`) both
+  routed workflow calls share.
 - `crates/mindcore-runtime/src/tools.rs` — the call-time route lookup for adoption and its
-  refusals.
+  target-free refusal (`:301-312`).
 - `.agents/specs/architecture/serving-seam.md` — the served tool ABI and the advertisement rule.
 - `crates/mindcore-runtime/tests/loopback.rs` — the signed-session assertions for each route and
   each advertisement case.
 
-## Change obligations
-
-Changing the route map shape, the admission-to-route rule, or the collection any served call
-resolves updates this page, `serving-seam.md`'s tool ABI, and the loopback assertions in the same
-change. A new routed call states here which collection it reads and which it writes, and how it
-refuses a principal with no route.
-
 ## Known limit
 
-- `crates/mindcore-runtime/src/lib.rs:136-164` — `ServeFaces`; the `workflow_routes` doc comment
-  states the workflow collection allowlist and that routes are never read from the wire.
-- `crates/mindcore-spoke/src/workflows.rs:89` — `MemoryWorkflowBinding::new`.
-- `crates/mindcore-spoke/src/workflows.rs:289-320` — `MemoryWorkflowBinding::with_knowledge_routes`.
-- `crates/mindcore-spoke/src/workflows.rs:340-342` — `MemoryWorkflowBinding::knowledge_route`.
-- Served tool ids, argument/result shapes and the surrounding face contract:
-  [`serving-seam.md`](serving-seam.md).
+A route is fixed for the lifetime of the surface. Changing a principal's collection requires
+assembling a new surface; there is no hot reload of the route map. The workspace has no periodic
+reconfiguration requirement, so this is recorded rather than implemented.
 
 ## Change obligations
 
-Changing admission, route resolution, reachability or collection isolation updates this page and
-the served tool table in [`serving-seam.md`](serving-seam.md) in the same change, and keeps the
-invariants above true.
+Changing admission, the route map shape, route resolution, reachability or collection isolation
+updates this page, the served tool table in [`serving-seam.md`](serving-seam.md) and the loopback
+assertions in the same change, and keeps the invariants above true. A new routed call states here
+which collection it reads and which it writes, and how it refuses a principal with no route.
