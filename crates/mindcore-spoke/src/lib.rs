@@ -227,16 +227,7 @@ impl MemoryAdapter {
         SpokeResult::Reject(Reject::unsupported(op).into_spoke())
     }
 
-    // note: O2 — import staging is not served by this build.
-
-    pub async fn stage_import(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.imports.stage")
-    }
+    // note: O2 — import activation and discard are not served by this build.
 
     pub async fn activate_import(
         &self,

@@ -5,6 +5,7 @@
 mod bundle;
 mod chunk;
 mod exports;
+mod stage;
 #[cfg(test)]
 mod tests;
 
@@ -169,7 +170,7 @@ async fn subject_rows(
 }
 
 /// JCS byte length of one value, computed through the shared canonicalizer.
-fn canonical_len(value: &Value) -> AResult<usize> {
+pub(super) fn canonical_len(value: &Value) -> AResult<usize> {
     let length = spoke_operations::content_serialized_bytes(value);
     if length == usize::MAX {
         Err(Reject::invalid(

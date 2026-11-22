@@ -860,6 +860,55 @@ fn export_row(row: ExportColumns) -> RepoResult<MemoryExportRow> {
     })
 }
 
+/// Positional form of [`MemoryImportRow`] for the runtime-decoded staging lookup.
+type ImportColumns = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
+    let (
+        import_id,
+        space_id,
+        requester,
+        source_export_id,
+        bundle_digest,
+        expected_count,
+        next_ordinal,
+        conflict_policy,
+        adopt_grants_json,
+        state,
+        created_at,
+        expires_at,
+    ) = row;
+    Ok(MemoryImportRow {
+        import_id,
+        space_id,
+        requester,
+        source_export_id,
+        bundle_digest,
+        expected_count: u64::try_from(expected_count)
+            .map_err(|_| invalid_row("negative import expected_count"))?,
+        next_ordinal: u64::try_from(next_ordinal)
+            .map_err(|_| invalid_row("negative import next_ordinal"))?,
+        conflict_policy,
+        adopt_grants: from_json(&adopt_grants_json, "import adopt_grants")?,
+        state,
+        created_at,
+        expires_at,
+    })
+}
+
 fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
     let capabilities: Vec<String> = serde_json::from_str(&row.capabilities_json)
         .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
@@ -1157,6 +1206,24 @@ pub struct MemoryExportRow {
     pub expires_at: String,
 }
 
+/// One staged import: the immutable header facts fixed by ordinal zero, the
+/// progress the next accepted chunk advances, and the expiry that is never reset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryImportRow {
+    pub import_id: String,
+    pub space_id: String,
+    pub requester: String,
+    pub source_export_id: String,
+    pub bundle_digest: String,
+    pub expected_count: u64,
+    pub next_ordinal: u64,
+    pub conflict_policy: String,
+    pub adopt_grants: Value,
+    pub state: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
 /// The borrowed-transaction repository. Zero-sized: the caller's transaction is the seam.
 pub struct SqliteMemoryRepository;
 
@@ -1379,6 +1446,134 @@ impl SqliteMemoryRepository {
         .execute(&mut **tx)
         .await
         .map_err(|error| conflict(error, format_args!("{export_id}.{ordinal}")))?;
+        Ok(())
+    }
+
+    /// The one staging import for a target space, requester and source export:
+    /// the key the partial staging index makes single-valued.
+    pub async fn import_by_source(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        requester: &str,
+        source_export_id: &str,
+    ) -> RepoResult<Option<MemoryImportRow>> {
+        sqlx::query_as::<_, ImportColumns>(
+            "SELECT import_id, space_id, requester_principal_id, source_export_id, \
+             bundle_digest, expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
+             state, created_at, expires_at FROM memory_imports \
+             WHERE space_id = ? AND requester_principal_id = ? AND source_export_id = ? \
+             AND state = 'staging'",
+        )
+        .bind(space.as_str())
+        .bind(requester)
+        .bind(source_export_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(import_row)
+        .transpose()
+    }
+
+    /// Insert-only import header; ordinal zero owns it whole.
+    pub async fn insert_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        row: &MemoryImportRow,
+    ) -> RepoResult<()> {
+        let expected_count = i64::try_from(row.expected_count)
+            .map_err(|_| invalid_row("import expected_count is out of range"))?;
+        let next_ordinal = i64::try_from(row.next_ordinal)
+            .map_err(|_| invalid_row("import next_ordinal is out of range"))?;
+        let adopt_grants = to_json(&row.adopt_grants, "import adopt_grants")?;
+        sqlx::query(
+            "INSERT INTO memory_imports \
+             (import_id, space_id, requester_principal_id, source_export_id, bundle_digest, \
+              expected_count, next_ordinal, conflict_policy, adopt_grants_json, state, \
+              created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.import_id)
+        .bind(&row.space_id)
+        .bind(&row.requester)
+        .bind(&row.source_export_id)
+        .bind(&row.bundle_digest)
+        .bind(expected_count)
+        .bind(next_ordinal)
+        .bind(&row.conflict_policy)
+        .bind(adopt_grants)
+        .bind(&row.state)
+        .bind(&row.created_at)
+        .bind(&row.expires_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, &row.import_id))?;
+        Ok(())
+    }
+
+    /// One stored staged chunk of an import, exactly as it arrived.
+    pub async fn import_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        ordinal: u64,
+    ) -> RepoResult<Option<String>> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM memory_import_chunks WHERE import_id = ? AND ordinal = ?",
+        )
+        .bind(import_id)
+        .bind(ordinal)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)
+    }
+
+    /// Insert-only staged chunk; one row per ordinal, never rewritten.
+    pub async fn insert_import_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        ordinal: u64,
+        payload: &str,
+    ) -> RepoResult<()> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query(
+            "INSERT INTO memory_import_chunks (import_id, ordinal, payload) VALUES (?, ?, ?)",
+        )
+        .bind(import_id)
+        .bind(ordinal)
+        .bind(payload)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, format_args!("{import_id}.{ordinal}")))?;
+        Ok(())
+    }
+
+    /// Advance one staging import to its next ordinal, and to `staged` once the
+    /// whole sequence has verified.
+    pub async fn advance_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        next_ordinal: u64,
+        staged: bool,
+    ) -> RepoResult<()> {
+        let next_ordinal = i64::try_from(next_ordinal)
+            .map_err(|_| invalid_row("import next_ordinal is out of range"))?;
+        sqlx::query(
+            "UPDATE memory_imports \
+             SET next_ordinal = ?, state = CASE WHEN ? THEN 'staged' ELSE state END \
+             WHERE import_id = ?",
+        )
+        .bind(next_ordinal)
+        .bind(i64::from(staged))
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
         Ok(())
     }
 }

@@ -32,7 +32,7 @@ pub(crate) const EXPORT_CHUNK_BYTES: u64 = 262_144;
 const IDEMPOTENCY_RETENTION_SECONDS: u64 = 2_592_000;
 const RECEIPT_RETENTION_SECONDS: u64 = 2_592_000;
 const DEDUP_RETENTION_SECONDS: u64 = 5_184_000;
-const STAGED_IMPORT_TTL_SECONDS: u64 = 86_400;
+pub(crate) const STAGED_IMPORT_TTL_SECONDS: u64 = 86_400;
 pub(crate) const EXPORT_RETENTION_SECONDS: u64 = 86_400;
 
 /// §7.0.7: the caller's `limit` defaults to and may not exceed `max_page_size`.

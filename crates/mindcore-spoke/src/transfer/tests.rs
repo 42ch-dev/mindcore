@@ -1016,3 +1016,340 @@ async fn a_scope_the_caller_cannot_read_answers_absence_rather_than_expiry() {
         spoke_operations::SpokeRejectCode::NotFound
     );
 }
+
+// ---- §7.31/§7.32 imports.stage ----
+
+/// Stage admission needs `admin` beside `transfer` on the target space.
+async fn elevate(fixture: &Fixture) {
+    sqlx::query("UPDATE memory_grants SET capabilities_json = ? WHERE grant_id = 'g_1'")
+        .bind(r#"["admin","records_read","transfer"]"#)
+        .execute(&fixture.pool)
+        .await
+        .expect("elevate the space-wide grant");
+}
+
+/// One element larger than the chunk limit travels alone, so the fixture's
+/// export splits into a header chunk, the oversized record, and the trailing
+/// arrays — three ordinals.
+async fn seed_big_record(fixture: &Fixture) {
+    let mut row = record("r_big", "s_1", None, false);
+    if let RecordState::Live { content, .. } = &mut row.state {
+        content.text = "x".repeat(300_000);
+    }
+    let mut tx = fixture.begin().await;
+    fixture
+        .repository
+        .insert_record(&mut tx, &row)
+        .await
+        .expect("seed oversized record");
+    tx.commit().await.expect("commit oversized record");
+}
+
+/// Stage one chunk as `p_1`, committing on success and rolling back a refusal so
+/// the fixture observes exactly what the caller's transaction would.
+async fn stage_chunk(
+    fixture: &Fixture,
+    chunk: Value,
+    key: &str,
+) -> spoke_operations::SpokeResult<crate::MemoryStage> {
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let ordinal = chunk["chunk_ordinal"].as_u64().expect("ordinal");
+    let request = if ordinal == 0 {
+        json!({
+            "space_id": SPACE,
+            "chunk": chunk,
+            "conflict_policy": "fail",
+            "idempotency_key": key,
+        })
+    } else {
+        json!({ "space_id": SPACE, "chunk": chunk, "idempotency_key": key })
+    };
+    let result = adapter
+        .stage_import(&mut tx, &principal("p_1"), request)
+        .await;
+    if matches!(result, spoke_operations::SpokeResult::Ok(_)) {
+        tx.commit().await.expect("commit stage");
+    } else {
+        tx.rollback().await.expect("rollback stage");
+    }
+    result
+}
+
+async fn export_chunks(fixture: &Fixture, export_id: &str) -> Vec<Value> {
+    let first = read_page(fixture, export_id, 0, "p_1").await;
+    let count = first["chunk"]["chunk_count"].as_u64().expect("chunk count");
+    let mut chunks = vec![first["chunk"].clone()];
+    for ordinal in 1..count {
+        let page = read_page(fixture, export_id, ordinal, "p_1").await;
+        chunks.push(page["chunk"].clone());
+    }
+    chunks
+}
+
+/// Create a whole-space export as `p_1` and return its wire chunks.
+async fn staged_source(fixture: &Fixture, key: &str) -> Vec<Value> {
+    let created = create_export(fixture, key).await;
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    export_chunks(fixture, &export_id).await
+}
+
+async fn import_state(fixture: &Fixture, import_id: &str) -> (String, i64) {
+    sqlx::query_as("SELECT state, next_ordinal FROM memory_imports WHERE import_id = ?")
+        .bind(import_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("import row")
+}
+
+async fn staged_chunk_count(fixture: &Fixture, import_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM memory_import_chunks WHERE import_id = ?")
+        .bind(import_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("staged chunk count")
+}
+
+fn detail<'a>(reject: &'a spoke_operations::SpokeReject, key: &str) -> &'a Value {
+    reject
+        .details
+        .as_ref()
+        .expect("refusal details")
+        .get(key)
+        .expect("named detail")
+}
+
+#[tokio::test]
+async fn a_valid_single_chunk_sequence_reaches_staged() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    let chunks = staged_source(&fixture, "stage-key-1").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-1-0").await);
+    assert_eq!(body["status"], json!("committed"));
+    assert_eq!(body["result"]["chunks_received"], json!(1));
+    let import_id = body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 1)
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+}
+
+#[tokio::test]
+async fn out_of_order_and_repeated_ordinals_conflict_without_staging() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    seed_big_record(&fixture).await;
+    let chunks = staged_source(&fixture, "stage-key-2").await;
+    assert_eq!(chunks.len(), 3, "the oversized record splits the export");
+
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-2-0").await);
+    let import_id = body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    // Ordinal 2 before ordinal 1.
+    let ahead = stage_chunk(&fixture, chunks[2].clone(), "stage-2-2").await;
+    let reject = rejected(&ahead);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("out_of_order"));
+    assert_eq!(detail(reject, "expected_ordinal"), &json!(1));
+
+    // The header again, while its import is still staging.
+    let repeated_header = stage_chunk(&fixture, chunks[0].clone(), "stage-2-0b").await;
+    assert_eq!(
+        detail(rejected(&repeated_header), "reason"),
+        &json!("duplicate_header")
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+
+    ready(stage_chunk(&fixture, chunks[1].clone(), "stage-2-1").await);
+    let repeated_tail = stage_chunk(&fixture, chunks[1].clone(), "stage-2-1b").await;
+    assert_eq!(
+        rejected(&repeated_tail).code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 2);
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staging".to_string(), 2)
+    );
+
+    let body = ready(stage_chunk(&fixture, chunks[2].clone(), "stage-2-2b").await);
+    assert_eq!(body["result"]["chunks_received"], json!(3));
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 3)
+    );
+}
+
+/// A final chunk altered and re-sealed: its own digest verifies, so only the
+/// whole-sequence verification can catch it, and nothing further is staged.
+#[tokio::test]
+async fn a_corrupt_final_chunk_conflicts_and_leaves_the_import_staging() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    seed_big_record(&fixture).await;
+    let mut chunks = staged_source(&fixture, "stage-key-3").await;
+    assert_eq!(chunks.len(), 3, "the oversized record splits the export");
+
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-3-0").await);
+    let import_id = body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    ready(stage_chunk(&fixture, chunks[1].clone(), "stage-3-1").await);
+
+    // The fixture's profile trails the oversized record, so it rides the final
+    // chunk; altering a schema-valid field keeps every per-chunk check true.
+    let last = chunks.last_mut().expect("a final chunk");
+    let profile = last["profiles"]
+        .as_array_mut()
+        .and_then(|profiles| profiles.first_mut())
+        .expect("the final chunk carries the profile");
+    profile["document"]["body"] = json!("tampered");
+    last["bytes"] = json!(spoke_operations::content_serialized_bytes(last));
+    let digest = hex_digest_excluding(last, "chunk_digest");
+    last["chunk_digest"] = json!(digest);
+
+    let result = stage_chunk(&fixture, chunks[2].clone(), "stage-3-2").await;
+    let reject = rejected(&result);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("verification"));
+    assert!(!detail(reject, "errors")
+        .as_array()
+        .expect("errors")
+        .is_empty());
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staging".to_string(), 2)
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 2);
+}
+
+#[tokio::test]
+async fn an_expired_staging_import_refuses_instead_of_resuming() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    seed_big_record(&fixture).await;
+    let chunks = staged_source(&fixture, "stage-key-4").await;
+    assert_eq!(chunks.len(), 3, "the oversized record splits the export");
+
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-4-0").await);
+    let import_id = body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    sqlx::query("UPDATE memory_imports SET expires_at = ? WHERE import_id = ?")
+        .bind("2000-01-01T00:00:00.000Z")
+        .bind(&import_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the import");
+
+    let result = stage_chunk(&fixture, chunks[1].clone(), "stage-4-1").await;
+    let reject = rejected(&result);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("expired"));
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staging".to_string(), 1)
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+}
+
+fn reseal(bundle: &mut Value) {
+    let digest = hex_digest_excluding(bundle, "digest");
+    bundle
+        .as_object_mut()
+        .expect("bundle")
+        .insert("digest".to_string(), json!(digest));
+}
+
+fn sealed_partition(bundle: &Value) -> Vec<Value> {
+    ok(
+        super::chunk::partition(bundle, policy::EXPORT_CHUNK_BYTES),
+        "partition",
+    )
+}
+
+#[tokio::test]
+async fn sequence_verification_rejects_versions_references_and_adoptions() {
+    let fixture = Fixture::open().await;
+    let mut tx = fixture.begin().await;
+    let artifact = ok(
+        build(
+            &fixture.repository,
+            &mut tx,
+            &spec(None, PlacementSelection::SubjectAll),
+        )
+        .await,
+        "build export",
+    );
+    tx.rollback().await.expect("rollback build");
+
+    let verify = |bundle: &Value, adopted: Value| {
+        let chunks = sealed_partition(bundle);
+        let digest = bundle["digest"].as_str().expect("digest");
+        super::stage::verification_errors(&chunks, chunks.len() as u64, digest, "exp_1", &adopted)
+    };
+    assert!(
+        verify(&artifact.bundle, json!([])).is_empty(),
+        "the export's own chunks verify"
+    );
+
+    let mut versioned = artifact.bundle.clone();
+    versioned["bundle_format_version"] = json!(2);
+    reseal(&mut versioned);
+    let errors = verify(&versioned, json!([]));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("bundle_format_version")),
+        "{errors:?}"
+    );
+
+    let mut dangling = artifact.bundle.clone();
+    let consumed = dangling["candidates"]
+        .as_array_mut()
+        .expect("candidates")
+        .iter_mut()
+        .find(|candidate| candidate.get("consumed_by").is_some())
+        .expect("a consumed candidate");
+    consumed["consumed_by"]["record_ids"] = json!(["r_missing"]);
+    reseal(&mut dangling);
+    let errors = verify(&dangling, json!([]));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("record r_missing")),
+        "{errors:?}"
+    );
+
+    let adopted = json!([{ "grant_id": "g_missing", "principal_id": "p_9" }]);
+    let errors = verify(&artifact.bundle, adopted);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("adopted grant g_missing")),
+        "{errors:?}"
+    );
+}
