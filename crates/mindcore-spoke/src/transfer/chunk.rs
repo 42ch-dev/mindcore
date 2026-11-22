@@ -106,7 +106,11 @@ pub(super) fn partition(bundle: &Value, limit: u64) -> AResult<Vec<Value>> {
         current.push((field, element));
         counts[index] += 1;
         sums[index] += element_len;
-        if current.len() > 1 {
+        // The header chunk is measured even for its first element: the header alone
+        // can push an element that fits an ordinary chunk past the limit. A group
+        // past ordinal zero is measured only once it holds two elements, so an
+        // oversized single element still travels alone.
+        if current.len() > 1 || groups.is_empty() {
             let frame = frame_for(
                 &mut frames,
                 groups.len() as u64,

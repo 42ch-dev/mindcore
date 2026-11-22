@@ -6,8 +6,9 @@ use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
 use mindcore_base::ir::{
     CandidateState, Classification, Consumption, MemoryCandidateIr, MemoryContent, MemoryGrantRow,
-    MemoryProfileRow, MemoryRecordIr, MemoryReflectionRow, MemoryRepository, MemorySubjectRow,
-    Placement, PlacementSelection, Provenance, ReceiptState, RecordState, ReviewReceiptIr,
+    MemoryJournalRow, MemoryProfileRow, MemoryRecordIr, MemoryReflectionRow, MemoryRepository,
+    MemorySubjectRow, Placement, PlacementSelection, Provenance, ReceiptState, RecordState,
+    ReviewReceiptIr,
 };
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use sqlx::SqlitePool;
@@ -533,6 +534,72 @@ async fn reflection_with_an_unverifiable_basis_is_withheld() {
     assert!(bundle.reflections.is_empty());
 }
 
+#[tokio::test]
+async fn a_subject_with_an_unsettled_intent_contributes_nothing() {
+    let fixture = Fixture::open().await;
+    seed_reflection(&fixture, "ref_1").await;
+    let mut tx = fixture.begin().await;
+    fixture
+        .repository
+        .insert_journal_intent(
+            &mut tx,
+            &MemoryJournalRow {
+                seq: 0,
+                receipt_id: "rc_pending".to_string(),
+                space_id: SpaceId::new(SPACE),
+                subject_id: SubjectId::new("s_1"),
+                requester: CallerId::new("p_1"),
+                operation: "memory.records.create".to_string(),
+                idempotency_key: None,
+                state: "pending".to_string(),
+                targets: Vec::new(),
+                result: None,
+                created_at: NOW.to_string(),
+                updated_at: NOW.to_string(),
+            },
+        )
+        .await
+        .expect("seed an unsettled intent");
+    tx.commit().await.expect("commit intent");
+
+    let mut request = spec(None, PlacementSelection::SubjectAll);
+    request.include_reflections = true;
+    let mut tx = fixture.begin().await;
+    let artifact = ok(
+        build(&fixture.repository, &mut tx, &request).await,
+        "build export",
+    );
+    tx.rollback().await.expect("rollback");
+
+    // The filtered bundle still satisfies the pinned schema.
+    let bundle = decode_bundle(&artifact.bundle);
+    let subject_ids: Vec<&str> = artifact.bundle["subjects"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|subject| subject["subject_id"].as_str().expect("subject id"))
+        .collect();
+    assert_eq!(
+        subject_ids,
+        vec!["s_2"],
+        "a withheld subject contributes nothing, its subject row included"
+    );
+    let record_ids: Vec<&str> = artifact.bundle["records"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|record| record["record_id"].as_str().expect("record id"))
+        .collect();
+    assert_eq!(
+        record_ids,
+        vec!["r_4"],
+        "only the unaffected subject's record crosses"
+    );
+    assert!(bundle.candidates.is_empty(), "no withheld candidate");
+    assert!(bundle.profiles.is_empty(), "no withheld profile");
+    assert!(bundle.reflections.is_empty(), "no withheld reflection");
+}
+
 async fn seed_reflection(fixture: &Fixture, reflection_id: &str) {
     let live = vec![("r_1".to_string(), 1i64), ("r_2".to_string(), 1i64)];
     let profiles = vec![("personality".to_string(), 1i64)];
@@ -749,6 +816,48 @@ fn header_only_bundle_is_one_chunk() {
         hex_digest_excluding(&reassemble(&chunks), "digest"),
         bundle["digest"].as_str().expect("digest")
     );
+}
+
+#[test]
+fn an_element_the_header_cannot_hold_starts_ordinal_one() {
+    let limit = 2_048;
+    let header_bytes = {
+        let header_only = synthetic_bundle(json!({ "reflections": [] }));
+        let chunks = ok(super::chunk::partition(&header_only, limit), "partition");
+        assert_eq!(chunks.len(), 1, "the header alone is one chunk");
+        chunks[0]["bytes"].as_u64().expect("bytes")
+    };
+
+    // Sized so that header plus element overflows while the element alone fits.
+    let target = limit - header_bytes + 32;
+    let base = spoke_operations::content_serialized_bytes(&synthetic_record("r_edge", 0)) as u64;
+    let record = synthetic_record("r_edge", (target - base) as usize);
+    let element_bytes = spoke_operations::content_serialized_bytes(&record) as u64;
+    assert_eq!(element_bytes, target, "the record is sized as intended");
+    assert!(element_bytes <= limit, "the element fits an ordinary chunk");
+    assert!(
+        header_bytes + element_bytes > limit,
+        "the header plus the element overflows"
+    );
+
+    let bundle = synthetic_bundle(json!({ "records": [record], "reflections": [] }));
+    let chunks = ok(super::chunk::partition(&bundle, limit), "partition");
+    assert_eq!(chunks.len(), 2, "the header moves to a chunk of its own");
+    assert!(
+        chunks[0].get("records").is_none(),
+        "ordinal zero carries the header alone"
+    );
+    assert_eq!(
+        chunks[1]["records"].as_array().expect("array").len(),
+        1,
+        "the lone element starts ordinal one"
+    );
+    assert!(chunks[0]["bytes"].as_u64().expect("bytes") <= limit);
+    assert!(
+        chunks[1]["bytes"].as_u64().expect("bytes") <= limit,
+        "the element alone fits its chunk"
+    );
+    assert_eq!(reassemble(&chunks)["records"], bundle["records"]);
 }
 
 fn principal(id: &str) -> spoke_schemas::Principal {

@@ -67,6 +67,15 @@ pub(crate) async fn build(
 
     let mut snapshots = Vec::new();
     for subject in subject_rows(repository, tx, spec).await? {
+        // §5.2/D-10: every authorized read withholds the subject while any of its
+        // durable intents is unsettled, so the export carries nothing of it, its
+        // subject row included. Counts therefore report the post-filter totals.
+        if repository
+            .has_unsettled_intent(tx, &spec.space_id, &subject.subject_id)
+            .await?
+        {
+            continue;
+        }
         let subject_id = subject.subject_id.as_str();
         let records = repository
             .list_records(tx, &spec.space_id, subject_id, &record_selection(spec))
