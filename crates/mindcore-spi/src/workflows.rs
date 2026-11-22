@@ -542,7 +542,7 @@ impl SpiMindWorkflows {
             replayed,
         } = self.binding.capture(principal, request).await?;
         let mut outcomes = Vec::with_capacity(candidates.len());
-        // Fresh candidates this run leaves pending: its durable Pending
+        // why: fresh candidates this run leaves pending: its durable Pending
         // decision, recorded before success so a later replay can report it.
         // Only the deciding run writes it; a replay's snapshot cannot prove
         // what another run decided.
@@ -553,7 +553,7 @@ impl SpiMindWorkflows {
         } in candidates
         {
             if replayed {
-                // A pending candidate, recorded pending or not, is reported
+                // why: a pending candidate, recorded pending or not, is reported
                 // from its receipt entry; only a consumed one is read back.
                 let pending = matches!(
                     lifecycle,
@@ -614,7 +614,7 @@ impl SpiMindWorkflows {
             .await?;
         let pending = match &candidate {
             MemoryCandidate::PendingCandidate(pending) => pending,
-            // Another run consumed this candidate after the capture committed.
+            // why: another run consumed this candidate after the capture committed.
             MemoryCandidate::ConsumedCandidate(consumed) => {
                 return self
                     .recorded_outcome(principal, &space, &capture_key, consumed)
@@ -880,7 +880,7 @@ impl SpiMindWorkflows {
                 self.recorded_outcome(principal, &space, &capture_key, consumed)
                     .await
             }
-            // The receipt read and this read are separate transactions; a
+            // why: the receipt read and this read are separate transactions; a
             // candidate only moves pending → consumed, so this reports the
             // state the authorized read actually served.
             MemoryCandidate::PendingCandidate(_) => {
@@ -1009,7 +1009,7 @@ impl SpiMindWorkflows {
         if let Some(lens) = lens {
             let admitted: Vec<&str> = admitted.iter().map(String::as_str).collect();
             let cited_ids: Vec<&str> = cited_ids.iter().map(String::as_str).collect();
-            // Both recommendation kinds reach the lens: a domain that refuses a
+            // why: both recommendation kinds reach the lens: a domain that refuses a
             // `none` keeps its redline even when nothing would be written.
             lens.validate_proposal(
                 &ProposalDraft::Cognition {
@@ -1023,7 +1023,7 @@ impl SpiMindWorkflows {
         }
         ensure_time_left(deadline)?;
         let Some(record) = record else {
-            // `none`: the lens was consulted, but no policy and no write follow.
+            // why: `none`: the lens was consulted, but no policy and no write follow.
             return Ok(DeliberateOutcome::NoChange { verdict });
         };
         let fallback = DefaultPolicy;
@@ -1043,7 +1043,7 @@ impl SpiMindWorkflows {
             }
             PolicyDecision::Reject { reason } => return Err(SpiError::PolicyRejected(reason)),
         }
-        // Last point before the write begins: after it, an unknown outcome is
+        // why: last point before the write begins: after it, an unknown outcome is
         // reported as one rather than flattened into a deadline refusal.
         ensure_time_left(deadline)?;
         let mind_state_version = self
@@ -1506,7 +1506,7 @@ fn deliberate_citations(
                 record_id: id.clone(),
                 revision: record_revision(record),
             }),
-            // A carrier record needs no revision check of its own: the
+            // why: a carrier record needs no revision check of its own: the
             // carrier CAS covers every change to it.
             None if snapshot.cognition.iter().any(|record| {
                 record.get("record_id").and_then(Value::as_str) == Some(id.as_str())
@@ -1583,7 +1583,7 @@ fn stamp_cognition_record(
     }
     let record = Value::Object(record);
     if let SpokeResult::Reject(reject) = validate_cognition_record(&record) {
-        // The assessment context is the one validated field the caller
+        // why: the assessment context is the one validated field the caller
         // supplies: when the record validates without it, the rejection is
         // that input's, not the provider's draft.
         if request.assessment_context_id.is_some()
@@ -2061,7 +2061,7 @@ impl SpiMindWorkflows {
             }
         };
 
-        // The snapshot that selects vector rows: admission and withholding are
+        // why: the snapshot that selects vector rows: admission and withholding are
         // rebuilt and the page is compared before a row is probed, so a page
         // that moved since the first read is refused here rather than served
         // from a stale cache.
@@ -2090,7 +2090,7 @@ impl SpiMindWorkflows {
             stored.push(row.vector);
         }
         let texts: Vec<&str> = records.iter().map(record_text).collect();
-        // Only a live record can fill a vector row: a tombstone has no text left
+        // why: only a live record can fill a vector row: a tombstone has no text left
         // to embed and its row is pruned, so it is never a miss.
         let misses: Vec<usize> = stored
             .iter()
@@ -2108,7 +2108,7 @@ impl SpiMindWorkflows {
                 .collect();
             let vectors = match embedder.embed_batch(&batch).await {
                 Ok(vectors) => vectors,
-                // Hybrid work — the query vector included — is discarded and
+                // why: hybrid work — the query vector included — is discarded and
                 // nothing is written, so the lexical result keeps a warm slot.
                 Err(SpiError::EmbeddingsUnavailable) => return Ok(RankedRecall::lexical(records)),
                 Err(error) => return Err(error),
@@ -2135,7 +2135,7 @@ impl SpiMindWorkflows {
                         });
                         Some(vector)
                     }
-                    // A tombstone holds no vector: it scores without similarity
+                    // why: a tombstone holds no vector: it scores without similarity
                     // rather than paying a provider call on every recall.
                     RetainedRecord::TombstonedRecord(_) => None,
                 },
@@ -2145,7 +2145,7 @@ impl SpiMindWorkflows {
 
         let scores = hybrid_scores(&texts, query, &query_vector, &vectors);
         let mut order: Vec<usize> = (0..records.len()).collect();
-        // Stable: equal scores keep the adapter's order.
+        // note: stable ordering — equal scores keep the adapter's order.
         order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
         let mut records = reorder(records, &order);
         if let Some(reasoner) = caps.reasoner {

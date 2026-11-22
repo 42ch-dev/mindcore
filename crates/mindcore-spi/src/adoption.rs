@@ -55,7 +55,7 @@ pub async fn adopt_knowledge_entry(
     entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
-    // Neither an empty id nor a zero revision can name an adoption anchor, so the call is refused
+    // why: neither an empty id nor a zero revision can name an adoption anchor, so the call is refused
     // before it reads or writes: every anchor this helper writes round-trips through the parser.
     let Some(anchor) = adoption_anchor_at_revision(entry_id, expected_source_revision) else {
         return spoke_reject(
@@ -64,7 +64,7 @@ pub async fn adopt_knowledge_entry(
             None,
         );
     };
-    // The source decides existence, freshness and disclosure before the destination is read, so a
+    // why: the source decides existence, freshness and disclosure before the destination is read, so a
     // missing, superseded or undisclosable source answers one generic absence even on a repeat.
     let source = match src.get_knowledge_entry(entry_id).await {
         SpokeResult::Ok(source) if knowledge_entry_visible_to_viewpoint(&source, None) => source,
@@ -76,7 +76,7 @@ pub async fn adopt_knowledge_entry(
     };
     let visible_source_revision = source.revision;
 
-    // The slot is the exact key. Only this adoption's own anchor is recognizable; any other
+    // why: the slot is the exact key. Only this adoption's own anchor is recognizable; any other
     // occupant is a conflict this helper never overwrites.
     let mut copy = match dst.get_knowledge_entry(entry_id).await {
         SpokeResult::Ok(existing) => return classify(existing, entry_id, expected_source_revision),
@@ -89,7 +89,7 @@ pub async fn adopt_knowledge_entry(
     if visible_source_revision != Some(expected_source_revision) {
         return source_revision_conflict(entry_id, expected_source_revision);
     }
-    // The source DTO moves into the destination write: only the identity the destination assigns
+    // why: the source DTO moves into the destination write: only the identity the destination assigns
     // and the provenance this call records differ from what was just read.
     copy.entry_id = entry_id.to_string();
     copy.revision = None;
@@ -100,7 +100,7 @@ pub async fn adopt_knowledge_entry(
 
     match dst.put_knowledge_entry(copy, None).await {
         SpokeResult::Ok(created) => SpokeResult::Ok(AdoptionOutcome::Created(created)),
-        // Another writer claimed the slot between the read and the create. The stored copy answers
+        // why: another writer claimed the slot between the read and the create. The stored copy answers
         // like a pre-existing one; an unreadable slot preserves the original conflict.
         SpokeResult::Reject(reject)
             if reject.code == SpokeRejectCode::KnowledgeEntryAlreadyExists =>
@@ -133,7 +133,7 @@ fn classify(
             format!("adopted copy of {entry_id} carries source revision {adopted}"),
             None,
         ),
-        // An unrelated occupant, or a legacy anchor without a recorded revision, is never adopted
+        // why: an unrelated occupant, or a legacy anchor without a recorded revision, is never adopted
         // over and never refreshed.
         None => occupied(entry_id),
     }
@@ -175,7 +175,7 @@ fn empty_cognition_records(entry: &mut KnowledgeEntry) {
         return;
     };
     if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&key) {
-        // Only a present array is cleared in place; any other shape stays for the destination to
+        // why: only a present array is cleared in place; any other shape stays for the destination to
         // validate rather than being masked as an empty history.
         if let Some(Value::Array(records)) = module.get_mut("records") {
             records.clear();

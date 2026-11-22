@@ -286,7 +286,7 @@ mod tests {
     fn identity_hash_is_stable_and_separates_every_field() {
         let base = hash("provider", "model", "version", 384);
         assert_eq!(base.len(), 64);
-        // Pinned to the storage contract's sample identity: the digest of the exact JCS bytes
+        // invariant: pinned to the storage contract's sample identity — the digest of the exact JCS bytes
         // `{"dim":384,"model_id":"model","model_version":"version","provider_id":"provider"}`.
         assert_eq!(
             base,
@@ -302,7 +302,7 @@ mod tests {
             hash("provider", "model2", "version", 384),
             hash("provider", "model", "version2", 384),
             hash("provider", "model", "version", 1024),
-            // Exact bytes: no trimming, case folding or normalization.
+            // note: exact bytes — no trimming, case folding or normalization.
             hash(" provider", "model", "version", 384),
         ] {
             assert_ne!(base, other);
@@ -320,7 +320,7 @@ mod tests {
         let bounded = hash("provider", "model", "version", largest);
         assert_eq!(bounded.len(), 64);
 
-        // One past the bound: `4 * dim` no longer fits a `usize`, so no vector can hold it.
+        // why: one past the bound — `4 * dim` no longer fits a `usize`, so no vector can hold it.
         let beyond = largest + 1;
         assert_eq!(beyond.checked_mul(4), None);
         assert_eq!(
@@ -404,7 +404,7 @@ mod tests {
             page_vectors(&store, &active, &[("rec_1", 1)], 2).await,
             vec![Some(vec![1.0, 2.0])]
         );
-        // A stale revision is a miss, not an approximation.
+        // why: a stale revision is a miss, not an approximation.
         assert_eq!(
             page_vectors(&store, &active, &[("rec_1", 2)], 2).await,
             vec![None]
@@ -423,7 +423,7 @@ mod tests {
             vec![None]
         );
 
-        // Another identity keeps its own partition.
+        // why: another identity keeps its own partition.
         expect_ok(
             upsert_record_vector(&store.pool(), "rec_1", &retired, 2, &[3.0, 4.0]).await,
             "write retired identity",
@@ -486,7 +486,7 @@ mod tests {
             vec![Some(vec![1.0, 0.0]), None, None, None, Some(vec![1.0, 0.0])],
             "one entry per page row, exact hits only"
         );
-        // Another dimension under the same identity is a miss too.
+        // why: another dimension under the same identity is a miss too.
         assert_eq!(
             page_vectors(&store, &active, &[("rec_hit", 3)], 3).await,
             vec![None]
@@ -504,13 +504,13 @@ mod tests {
             .await
             .expect("open store");
         let rejected = [
-            // Fractional revision: affinity keeps REAL 0.5.
+            // why: fractional revision — affinity keeps REAL 0.5.
             "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 0.5, 2, x'0000000000000000')",
-            // Fractional dimension: `length(vector) = 4 * 1.5` holds for six bytes.
+            // why: fractional dimension — `length(vector) = 4 * 1.5` holds for six bytes.
             "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 1, 1.5, x'000000000000')",
-            // A blob whose length disagrees with the dimension.
+            // why: a blob whose length disagrees with the dimension.
             "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 1, 2, x'00000000000000')",
-            // Zero revision.
+            // why: zero revision.
             "INSERT INTO memory_embedding_vectors VALUES ('rec_2', 'id', 0, 2, x'0000000000000000')",
         ];
         for sql in rejected {

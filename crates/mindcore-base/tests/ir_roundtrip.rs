@@ -426,7 +426,7 @@ fn rejects_null_for_typed_optionals_and_nonpositive_version() {
     }
 }
 
-// I-000024: `modules.cognition.extensions` routes through the same namespace-keyed
+// why: `modules.cognition.extensions` routes through the same namespace-keyed
 // extension-map rule as every other extensions site. A bare object read would admit all
 // three invalid shapes below, so these fixtures go red if the shared check is removed.
 #[test]
@@ -439,7 +439,7 @@ fn cognition_module_extensions_share_the_extension_rule() {
         Err(WireError::InvalidField { .. })
     ));
 
-    // A namespace key with a non-object value passes the codec's key-only rule but is
+    // why: a namespace key with a non-object value passes the codec's key-only rule but is
     // still refused by the pinned SPOKE cognition gate.
     let mut entry = knowledge_entry();
     entry["modules"] = json!({"cognition": cognition_module()});
@@ -457,7 +457,6 @@ fn cognition_module_extensions_share_the_extension_rule() {
         Err(WireError::InvalidField { .. })
     ));
 
-    // A schema-valid opaque map still round-trips untouched.
     let mut entry = knowledge_entry();
     entry["modules"] = json!({"cognition": cognition_module()});
     entry["modules"]["cognition"]["extensions"] = json!({
@@ -470,14 +469,13 @@ fn cognition_module_extensions_share_the_extension_rule() {
     assert_eq!(knowledge_entry_to_wire(version, ir), entry);
 }
 
-// I-000024 (member sites): schema-declared cognition record, world-fact and
+// why: schema-declared cognition record, world-fact and
 // memory-content cognition-record `extensions` go through the same key-only rule before
 // the pinned SPOKE validator. A non-namespace key is `InvalidField`; a namespace key
 // with a non-object value passes the codec and is refused by SPOKE as `Cognition`.
 #[test]
 fn cognition_member_extensions_share_the_extension_rule() {
     for site in ["records", "world_facts"] {
-        // Invalid namespace key inside a member's extension map.
         let mut entry = knowledge_entry();
         entry["modules"] = json!({"cognition": cognition_module()});
         entry["modules"]["cognition"][site][0]["extensions"] = json!({"Bad.Key": {"v": 1}});
@@ -492,7 +490,7 @@ fn cognition_member_extensions_share_the_extension_rule() {
             "{site} member namespace key"
         );
 
-        // A namespace key with a non-object value passes the codec's key-only rule but is
+        // why: a namespace key with a non-object value passes the codec's key-only rule but is
         // still refused by the pinned SPOKE cognition gate.
         let mut entry = knowledge_entry();
         entry["modules"] = json!({"cognition": cognition_module()});
@@ -506,7 +504,6 @@ fn cognition_member_extensions_share_the_extension_rule() {
         );
     }
 
-    // Memory-content cognition records share the rule.
     let mut candidate = pending_candidate();
     candidate["proposed"]["content"]["cognition"] =
         json!([{"kind": "arbitrary", "extensions": {"Bad.Key": {}}}]);
@@ -518,14 +515,13 @@ fn cognition_member_extensions_share_the_extension_rule() {
         })
     ));
 
-    // Schema-valid member extension maps still round-trip untouched.
     let mut entry = knowledge_entry();
     entry["modules"] = json!({"cognition": cognition_module()});
     let (version, ir) = knowledge_entry_from_wire(entry.clone()).unwrap();
     assert_eq!(knowledge_entry_to_wire(version, ir), entry);
 }
 
-// I-000025: `modules` is a namespace-keyed object; object-or-array applies to the
+// invariant: `modules` is a namespace-keyed object; object-or-array applies to the
 // individual namespace values, never to the container itself.
 #[test]
 fn modules_is_an_object_with_object_or_array_values() {
@@ -547,7 +543,7 @@ fn modules_is_an_object_with_object_or_array_values() {
     assert_eq!(knowledge_entry_to_wire(version, ir), entry);
 }
 
-// I-000024: extension values are opaque — the key grammar bounds the map, and any JSON
+// invariant: extension values are opaque — the key grammar bounds the map, and any JSON
 // value shape round-trips losslessly at every non-SPOKE-gated extension site.
 #[test]
 fn extension_values_are_opaque_and_round_trip() {
@@ -572,7 +568,6 @@ fn extension_values_are_opaque_and_round_trip() {
         assert_eq!(review_receipt_to_wire(version, ir), receipt);
     }
 
-    // A key outside the namespace grammar is still refused on every site.
     let mut entry = knowledge_entry();
     entry["extensions"] = json!({"md.note": 1});
     assert!(matches!(

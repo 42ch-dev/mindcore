@@ -36,7 +36,7 @@ fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
 /// a protocol operation through `MemoryAdapter`.
 async fn provision_space(pool: &SqlitePool, caller: &str) {
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    // One host transaction covers both rows: a failed grant must not leave an active space.
+    // why: one host transaction covers both rows: a failed grant must not leave an active space.
     let mut tx = pool.begin().await.expect("begin the provisioning");
     sqlx::query(
         "INSERT INTO memory_spaces \
@@ -151,7 +151,7 @@ async fn production_open_serves_recall_after_bootstrap() {
         .to_string();
     tx.commit().await.expect("commit the capture");
 
-    // A pending candidate is not knowledge yet: capture alone serves no recall.
+    // why: a pending candidate is not knowledge yet: capture alone serves no recall.
     assert!(
         recall(&pool, &adapter, &caller).await.is_empty(),
         "a captured candidate must not be recallable before review"
@@ -178,7 +178,7 @@ async fn production_open_serves_recall_after_bootstrap() {
     };
     tx.commit().await.expect("commit the review");
 
-    // The staged intent owes file targets; publish them under this test's own root and confirm
+    // note: the staged intent owes file targets; publish them under this test's own root and confirm
     // the published bytes before settling.
     let mut tx = pool.begin().await.expect("begin the journal read");
     let intent = SqliteMemoryRepository
@@ -221,7 +221,7 @@ async fn production_open_serves_recall_after_bootstrap() {
     assert_eq!(records[0]["record_id"], json!(record_id));
     assert_eq!(records[0]["content"]["text"], json!(BODY));
 
-    // The retained record is in the file, not the process: a fresh open still serves it.
+    // why: the retained record is in the file, not the process: a fresh open still serves it.
     store.close().await;
     let store = MindStore::open(&path).await.expect("reopen the store");
     let pool = store.pool();

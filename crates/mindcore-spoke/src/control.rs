@@ -49,7 +49,7 @@ fn subject_scoped<'a>(capability: &'a str, subject_id: &'a str) -> GrantRequirem
 }
 
 impl MemoryAdapter {
-    // ── §7.1 describe ──────────────────────────────────────────────────
+    // contract §7.1 describe
 
     pub async fn describe(
         &self,
@@ -65,7 +65,7 @@ impl MemoryAdapter {
         Self::ready::<MemoryDescribeResponse>(policy::describe_body(self.reflections))
     }
 
-    // ── §7.2 spaces.list ───────────────────────────────────────────────
+    // contract §7.2 spaces.list
 
     pub async fn list_spaces(
         &self,
@@ -91,7 +91,7 @@ impl MemoryAdapter {
         }
         let principal_id = principal_id(principal);
         let now = Utc::now();
-        // One streaming scan decides which spaces the principal can see; the
+        // why: one streaming scan decides which spaces the principal can see; the
         // revisions the cursor needs come from a projection over those spaces,
         // so peak memory follows the visible grants, not the whole history.
         let mut visible_space_ids: HashSet<String> = HashSet::new();
@@ -142,7 +142,7 @@ impl MemoryAdapter {
         Self::ready::<MemorySpacesListResponse>(body)
     }
 
-    // ── §7.3/§7.4 space status ─────────────────────────────────────────
+    // contract §7.3/§7.4 space status
 
     pub async fn freeze_space(
         &self,
@@ -286,7 +286,7 @@ impl MemoryAdapter {
         Ok(MemoryStage::Ready(project::receipt_body(&receipt)))
     }
 
-    // ── §7.5 subjects.ensure ───────────────────────────────────────────
+    // contract §7.5 subjects.ensure
 
     pub async fn ensure_subject(
         &self,
@@ -307,7 +307,7 @@ impl MemoryAdapter {
             wire::decode(&raw, "memory.subjects.ensure request")?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.as_str();
-        // §7.0.5: the one keyless op, so its receipt never replays and always
+        // contract §7.0.5 — the one keyless op, so its receipt never replays and always
         // records its own outcome.
         let op = Self::op(
             request.space_id.as_str(),
@@ -361,7 +361,7 @@ impl MemoryAdapter {
         Self::ready::<MemorySubjectsEnsureResponse>(project::receipt_body(&receipt))
     }
 
-    // ── §7.6 subjects.get ──────────────────────────────────────────────
+    // contract §7.6 subjects.get
 
     pub async fn get_subject(
         &self,
@@ -384,7 +384,7 @@ impl MemoryAdapter {
         admission::space(&self.repository, tx, &space).await?;
         let subject_id = request.subject_id.as_str();
         let rows = admission::grants(&self.repository, tx, &space).await?;
-        // §7.6/S-4: no live grant on the subject hides the subject entirely.
+        // contract §7.6/S-4 — no live grant on the subject hides the subject entirely.
         if !admission::any_grant_for_subject(
             &rows,
             principal_id,
@@ -392,7 +392,7 @@ impl MemoryAdapter {
             subject_id,
             Utc::now(),
         ) {
-            // §7.6/S-4: no coverage is `NOT_AUTHORIZED` before the row is read,
+            // contract §7.6/S-4 — no coverage is `NOT_AUTHORIZED` before the row is read,
             // so a revoked or expired grant cannot disclose the subject either.
             return Err(Reject::not_authorized(format!(
                 "principal {principal_id} holds no live grant on subject {subject_id}"
@@ -404,7 +404,7 @@ impl MemoryAdapter {
         Self::ready::<MemorySubjectsGetResponse>(json!({ "subject": project::subject_body(&row) }))
     }
 
-    // ── §7.7 subjects.fence ────────────────────────────────────────────
+    // contract §7.7 subjects.fence
 
     pub async fn fence_subject(
         &self,
@@ -506,7 +506,7 @@ impl MemoryAdapter {
         Self::ready::<MemorySubjectsFenceResponse>(project::receipt_body(&receipt))
     }
 
-    // ── §7.8 grants.list ───────────────────────────────────────────────
+    // contract §7.8 grants.list
 
     pub async fn list_grants(
         &self,
@@ -550,7 +550,7 @@ impl MemoryAdapter {
         let applied = if admin {
             requested
         } else {
-            // §7.8: a non-admin sees exactly its own grants and nothing else.
+            // contract §7.8 — a non-admin sees exactly its own grants and nothing else.
             if !rows.iter().any(|row| {
                 row.principal_id.as_str() == principal_id && admission::live_grant(row, now)
             }) {
@@ -608,7 +608,7 @@ impl MemoryAdapter {
         )
     }
 
-    // ── §7.9 grants.grant ──────────────────────────────────────────────
+    // contract §7.9 grants.grant
 
     pub async fn grant(
         &self,
@@ -705,7 +705,7 @@ impl MemoryAdapter {
         Self::ready::<MemoryGrantsGrantResponse>(project::receipt_body(&receipt))
     }
 
-    // ── §7.10 grants.revoke ────────────────────────────────────────────
+    // contract §7.10 grants.revoke
 
     pub async fn revoke_grant(
         &self,

@@ -182,7 +182,7 @@ fn namespace(key: &str) -> bool {
         })
 }
 
-// I-000024: an extension map is bounded by its KEYS (the namespace grammar);
+// invariant: an extension map is bounded by its KEYS (the namespace grammar);
 // values are opaque and never descended into — the encoder emits them verbatim.
 fn is_extension_map(value: &Value) -> bool {
     value
@@ -204,7 +204,7 @@ fn only_keys(object: &Object, keys: &[&str], name: &'static str) -> Result<(), W
     Ok(())
 }
 
-// A source anchor is a separately versioned payload. Check its closed shape without decoding it
+// why: a source anchor is a separately versioned payload. Check its closed shape without decoding it
 // into a generated type that would rewrite its number values or optional members.
 fn validate_anchor(value: &Value) -> Result<(), WireError> {
     const NAME: &str = "source_anchor";
@@ -402,7 +402,7 @@ fn modules_from_wire(value: Value) -> Result<KnowledgeModules, WireError> {
 
 fn cognition_from_wire(value: Value) -> Result<CognitionModule, WireError> {
     const NAME: &str = "knowledge_entry.modules.cognition";
-    // Decode (and rule-check) members first so this module's extensions follow the same
+    // why: decode (and rule-check) members first so this module's extensions follow the same
     // shared key-only rule as every other extensions site; the pinned SPOKE gate stays as
     // whole-shape validation of records, facts and unknown members — it still rejects
     // non-object extension values on cognition sites.

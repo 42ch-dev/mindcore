@@ -25,8 +25,6 @@ use spoke_schemas::{
     Principal,
 };
 
-// ---------- wire fixtures (same shapes the SPOKE schema tests pin) ----------
-
 fn pending_candidate() -> MemoryCandidate {
     serde_json::from_str(
         r#"{
@@ -90,8 +88,6 @@ fn belief_record() -> CognitionRecord {
     }))
     .expect("belief record parses")
 }
-
-// ---------- the external test double (conformance proof, not executed) ----------
 
 struct MockEmbedder {
     identity: EmbeddingIdentity,
@@ -196,8 +192,6 @@ impl MindWorkflows for MockWorkflows {
     }
 }
 
-// ---------- conformance: the public trait surface binds externally ----------
-
 #[test]
 fn external_impls_bind_to_every_capability_trait() {
     let embedder = MockEmbedder {
@@ -214,7 +208,7 @@ fn external_impls_bind_to_every_capability_trait() {
     let lens = MockLens;
     let workflows = MockWorkflows;
 
-    // Object-safety: every capability trait takes `&dyn`, and the workflows
+    // why: object-safety — every capability trait takes `&dyn`, and the workflows
     // surface itself is object-safe.
     let embedder_dyn: &dyn Embedder = &embedder;
     let reasoner_dyn: &dyn Reasoner = &reasoner;
@@ -229,7 +223,7 @@ fn external_impls_bind_to_every_capability_trait() {
         workflows_dyn,
     );
 
-    // The bundle accepting the injected implementors is the compile-time
+    // why: the bundle accepting the injected implementors is the compile-time
     // proof; asserting on `Some(x).is_some()` would pin the literal, not the
     // contract.
     let _caps = MindCapabilities {
@@ -238,8 +232,6 @@ fn external_impls_bind_to_every_capability_trait() {
         policy_hook: Some(policy_dyn),
     };
 }
-
-// ---------- shipped code assertions ----------
 
 #[test]
 fn embedding_identity_compares_all_four_fields() {
@@ -298,7 +290,6 @@ async fn default_policy_holds_every_draft_for_human_review() {
     let candidate = pending_candidate();
     let record = belief_record();
 
-    // Each canonical review action leaves the candidate pending.
     for proposed in [
         decision(json!({ "action": "promote" })),
         decision(json!({
@@ -323,7 +314,6 @@ async fn default_policy_holds_every_draft_for_human_review() {
         }
     }
 
-    // A cognition draft is held the same way.
     let verdict = policy
         .evaluate_settlement(SettlementDraft::Cognition { proposed: &record })
         .await
@@ -334,13 +324,11 @@ async fn default_policy_holds_every_draft_for_human_review() {
     }
 }
 
-// ---------- PromptReasoner over a local text-prompt fixture ----------
-
 #[tokio::test]
 async fn prompt_reasoner_wraps_full_text_in_the_wire_envelope() {
     let captured = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&captured);
-    // The Nexus PromptExecutor seam: execute(PromptRequest) → full_text.
+    // note: the Nexus PromptExecutor seam — execute(PromptRequest) → full_text.
     let reasoner = PromptReasoner::new(move |prompt: String| {
         let sink = Arc::clone(&sink);
         async move {
@@ -361,7 +349,7 @@ async fn prompt_reasoner_wraps_full_text_in_the_wire_envelope() {
         .strip_prefix("fixed skeleton\n\n```json\n")
         .and_then(|rest| rest.strip_suffix("\n```"))
         .expect("prompt is the system prompt plus one fenced JSON block");
-    // Decode the outbound envelope: all three fields travel as values, so a
+    // why: decode the outbound envelope — all three fields travel as values, so a
     // dropped output_schema or a reshaped payload fails here.
     let envelope: Value = serde_json::from_str(body).expect("envelope is JSON");
     assert_eq!(envelope["task_kind"], json!("absorb"));
@@ -378,7 +366,7 @@ async fn prompt_reasoner_rejects_malformed_full_text() {
         let counter = Arc::clone(&counter);
         async move {
             counter.fetch_add(1, Ordering::SeqCst);
-            // A valid JSON value embedded in prose: a bridge that extracted
+            // why: a valid JSON value embedded in prose — a bridge that extracted
             // the JSON would wrongly succeed instead of reporting
             // InvalidReasonerOutput on the complete reply.
             Ok(r#"the verdict is {"verdict": "settle"}, trust me"#.to_string())
@@ -414,8 +402,6 @@ async fn prompt_reasoner_propagates_transport_refusals() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one prompt call");
 }
-
-// ---------- adoption helper over an in-memory port double ----------
 
 #[derive(Default)]
 struct MemoryKnowledgeEntries {
@@ -519,7 +505,6 @@ async fn adoption_over_a_port_double_creates_once_and_refuses_an_absent_source()
         serde_json::to_value(&created).expect("copy serializes")
     );
 
-    // The source is untouched: same revision, still no anchor.
     let source_after = match src.get_knowledge_entry(entry_id).await {
         SpokeResult::Ok(entry) => entry,
         SpokeResult::Reject(reject) => panic!("source read refused: {reject:?}"),
@@ -542,7 +527,7 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
     let src = MemoryKnowledgeEntries::default();
     let dst = MemoryKnowledgeEntries::default();
 
-    // A store may hold an empty key: the create path binds the id as given. Anchoring that copy
+    // why: a store may hold an empty key — the create path binds the id as given. Anchoring that copy
     // would write the bare `shared:` locator the parser rejects, so the call refuses first.
     let empty_source = match src.put_knowledge_entry(shared_entry(""), None).await {
         SpokeResult::Ok(entry) => entry,
@@ -560,7 +545,6 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
         other => panic!("an empty entry id must be refused, got {other:?}"),
     }
 
-    // Revision zero names no assigned revision either.
     let entry_id = "ke_shared_gate";
     match src.put_knowledge_entry(shared_entry(entry_id), None).await {
         SpokeResult::Ok(entry) => assert_eq!(entry.revision, Some(1)),
@@ -571,7 +555,6 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
         other => panic!("a zero revision must be refused, got {other:?}"),
     }
 
-    // Neither refusal claimed the slot: the first anchored adoption still creates.
     match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
         SpokeResult::Ok(AdoptionOutcome::Created(created)) => assert_eq!(created.revision, Some(1)),
         other => panic!("the refusals must leave the slot empty, got {other:?}"),
@@ -582,7 +565,7 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
 async fn adoption_refuses_a_copy_from_another_source_revision() {
     let entry_id = "ke_shared_gate";
 
-    // A copy adopted at revision 1 stays that copy after the source advances: a request naming
+    // why: a copy adopted at revision 1 stays that copy after the source advances — a request naming
     // revision 2 asks for content this slot never adopted.
     let src = MemoryKnowledgeEntries::default();
     let dst = MemoryKnowledgeEntries::default();
@@ -612,7 +595,6 @@ async fn adoption_refuses_a_copy_from_another_source_revision() {
         other => panic!("a newer request must not be answered by an older copy, got {other:?}"),
     }
 
-    // The mirror: a copy adopted at 2 while the source sits at 3.
     let src = MemoryKnowledgeEntries::default();
     let dst = MemoryKnowledgeEntries::default();
     let first = match src.put_knowledge_entry(shared_entry(entry_id), None).await {

@@ -61,7 +61,7 @@ async fn install_step_counter(connection: &mut SqliteConnection) {
         .lock_handle()
         .await
         .expect("lock the sqlite handle");
-    // sqlx's callback contract is inverted from SQLite's: returning `true` continues.
+    // why: sqlx's callback contract is inverted from SQLite's: returning `true` continues.
     handle.set_progress_handler(1, || {
         VDBE_STEPS.fetch_add(1, Ordering::Relaxed);
         true
@@ -204,7 +204,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     let dir = TempDir::new().expect("temporary directory");
     let path = dir.path().join("mindcore.db");
 
-    // The migrator owns the schema; the logging pool below owns the measurement.
+    // note: the migrator owns the schema; the logging pool below owns the measurement.
     let store = MindStore::open(&path).await.expect("open store");
     store.close().await;
     let pool = SqlitePoolOptions::new()
@@ -218,7 +218,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         .await
         .expect("open logging pool");
 
-    // The empty carrier row: revision 1, no records, no head.
+    // note: the empty carrier row: revision 1, no records, no head.
     let carrier = KnowledgeEntry {
         body: KnowledgeEntryBody::default(),
         canonical_name: KnowledgeEntryCanonicalName::try_from("ke_wren name")
@@ -246,7 +246,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     }
     tx.commit().await.expect("commit the carrier row");
 
-    // Nothing to point at yet: the lookup is still one statement over no record.
+    // why: nothing to point at yet: the lookup is still one statement over no record.
     let (headless_lookup_statements, _, headless) = measured_lookup(&pool).await;
     assert_eq!(
         headless, None,
@@ -257,7 +257,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         "the headless lookup is one statement"
     );
 
-    // History of one: the first append is unmeasured setup, the second is measured
+    // note: history of one: the first append is unmeasured setup, the second is measured
     // while the scope holds one record.
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
@@ -274,7 +274,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         measured_append(&pool, 2, "cog_second").await;
     assert_eq!(assigned_at_1, 3);
 
-    // History of one thousand: filler appends 3..=1000 in one transaction.
+    // note: history of one thousand: filler appends 3..=1000 in one transaction.
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -300,7 +300,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     }
     tx.commit().await.expect("commit the filler appends");
 
-    // The measured operations now run while the scope holds one thousand records.
+    // note: the measured operations now run while the scope holds one thousand records.
     let (lookup_at_1000, steps_at_1000, current_at_1000) = measured_lookup(&pool).await;
     assert_eq!(
         current_at_1000.as_deref(),
@@ -365,7 +365,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         "the counter must see the lookup itself: {lookup_at_1}"
     );
 
-    // Every append really landed and the head points at the newest row.
+    // why: every append really landed and the head points at the newest row.
     let header = match read_carrier_header(&pool, COLLECTION, CARRIER).await {
         SpokeResult::Ok(header) => header,
         SpokeResult::Reject(reject) => panic!("header read rejected: {reject:?}"),

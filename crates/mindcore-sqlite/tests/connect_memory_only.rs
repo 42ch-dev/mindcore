@@ -176,7 +176,7 @@ impl RemoteMemoryService for FixtureMemoryService {
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         if op != "memory.recall" {
-            // The fixture serves one meaningful Memory op; anything else is
+            // why: the fixture serves one meaningful Memory op; anything else is
             // outside this face's provided surface.
             return spoke_reject(
                 SpokeRejectCode::CapabilityPortMissing,
@@ -312,7 +312,7 @@ async fn memory_only_signed_negotiation() {
     assert_eq!(session.adapter.state(), RemoteAdapterState::Established);
     assert!(session.adapter.session_id().is_some());
 
-    // The adapter verified the responder's signature and observed its
+    // why: the adapter verified the responder's signature and observed its
     // authenticated peer id and signed-hello manifest.
     assert_eq!(
         session.adapter.remote_peer_id().as_deref(),
@@ -328,7 +328,7 @@ async fn memory_only_signed_negotiation() {
         .iter()
         .any(|capability| capability == "spoke-baseline"));
 
-    // The responder's view of the dialer is symmetric: authenticated peer id
+    // why: the responder's view of the dialer is symmetric: authenticated peer id
     // and `["spoke-memory"]` only.
     assert_eq!(
         session.responder.remote_peer_id().as_deref(),

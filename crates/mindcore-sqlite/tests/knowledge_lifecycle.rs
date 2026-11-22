@@ -37,7 +37,7 @@ fn database_path(label: &str) -> PathBuf {
     ))
 }
 
-// WAL leaves siblings next to the database; a rerun must start from an empty store.
+// why: WAL leaves siblings next to the database; a rerun must start from an empty store.
 fn remove_database(path: &Path) {
     let _ = std::fs::remove_file(path);
     for suffix in ["-wal", "-shm"] {
@@ -280,7 +280,7 @@ async fn history_floor(pool: &SqlitePool, collection: &str, entry_id: &str) -> i
     .expect("stored history floor")
 }
 
-// Seed a floor directly, without a prune, so the read gate is provable on its own.
+// note: seed a floor directly, without a prune, so the read gate is provable on its own.
 async fn seed_history_floor(pool: &SqlitePool, collection: &str, entry_id: &str, floor: i64) {
     sqlx::query(
         "UPDATE knowledge_entries SET history_floor_revision = ? \
@@ -318,7 +318,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     let shared = store.knowledge(KnowledgeScope::new("shared"));
     let personal = store.knowledge(KnowledgeScope::new("wren"));
 
-    // Stage 1: create, then two updates, one appended cognition record each.
+    // note: stage 1 — create, then two updates, one appended cognition record each.
     let created = expect_ok(
         shared
             .put_knowledge_entry(entry_with("entry-a", REVISION_ONE), None)
@@ -357,7 +357,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
     assert_eq!(third.revision, Some(3));
 
-    // Negatives: the id refuses a second create, and a stale conditional write is refused without
+    // why: negatives — the id refuses a second create, and a stale conditional write is refused without
     // moving the entry. The stale payload repeats every committed record, so only the CAS can
     // refuse it.
     assert_eq!(
@@ -393,7 +393,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     assert_eq!(summary_of(&head), Some(REVISION_THREE));
     assert_eq!(record_ids(&head), vec!["cog_one", "cog_two"]);
 
-    // Stage 2: adopt at revision 3. The copy anchors back, the source row is untouched and a
+    // note: stage 2 — adopt at revision 3. The copy anchors back, the source row is untouched and a
     // repeat returns the same copy instead of writing a second one.
     // The whole source row through the public live read: adoption must leave every field alone.
     let source_before = expect_ok(
@@ -452,7 +452,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         1,
         "no repeat claimed the destination slot twice"
     );
-    // The repeat answered from the destination too: the source row is still the one both
+    // why: the repeat answered from the destination too: the source row is still the one both
     // adoptions read.
     assert_eq!(
         as_json(&expect_ok(
@@ -463,7 +463,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "a repeat adoption only reads its source row"
     );
 
-    // Stage 3: supersede entry-a with entry-b. The default read omits it, the explicit read
+    // note: stage 3 — supersede entry-a with entry-b. The default read omits it, the explicit read
     // returns it with its marker, and a write after the supersede is refused.
     expect_ok(
         shared
@@ -513,7 +513,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     assert_eq!(summary_of(&marked.entry), Some(REVISION_THREE));
     assert_eq!(record_ids(&marked.entry), vec!["cog_one", "cog_two"]);
 
-    // A write naming the pre-marker revision never lands: the superseded guard answers first and
+    // why: a write naming the pre-marker revision never lands: the superseded guard answers first and
     // leaves no fifth revision behind.
     match shared
         .put_knowledge_entry(
@@ -546,7 +546,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         Some(4)
     );
 
-    // Adoption against the superseded source answers the same generic absence as a missing one,
+    // why: adoption against the superseded source answers the same generic absence as a missing one,
     // and neither attempt moves the source row. The default read hides the source now, so the
     // explicit superseded read supplies both sides of that comparison; the destination copy is
     // compared once, after the last refusal in this scenario.
@@ -573,7 +573,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "a refused adoption never moves the source's marker"
     );
 
-    // Stage 4: after the refused write, every revision still replays its whole payload and every
+    // note: stage 4 — after the refused write, every revision still replays its whole payload and every
     // cognition record it held, and the refused write left no fifth revision. Revision 4 is the
     // superseded head, so its payload and history are the third revision's with only the revision
     // advanced.
@@ -600,7 +600,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "a revision the refused write never created",
     );
 
-    // Stage 5: the adopted copy still identifies the exact revision it copied, and its anchor now
+    // note: stage 5 — the adopted copy still identifies the exact revision it copied, and its anchor now
     // resolves through the supersede to the live successor.
     assert_eq!(
         adoption_anchor_parts(&copy),
@@ -628,7 +628,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "the personal collection still holds exactly the one copy"
     );
 
-    // Stage 6: an owner-private source answers the same generic absence as a missing one, and a
+    // note: stage 6 — an owner-private source answers the same generic absence as a missing one, and a
     // revision that never existed is one absence.
     expect_ok(
         shared
@@ -640,7 +640,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         adopt_knowledge_entry(&shared, &personal, "entry-p", 1).await,
         "adopting an owner-private entry",
     );
-    // Every refusal above is covered here: the destination copy's content, its anchor and the
+    // why: every refusal above is covered here — the destination copy's content, its anchor and the
     // collection's row count are asserted once, after the last refusal.
     let copy_after = expect_ok(
         personal.get_knowledge_entry("entry-a").await,
@@ -685,7 +685,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
     let store = MindStore::open(&path).await.expect("open store");
     let shared = store.knowledge(KnowledgeScope::new("shared"));
 
-    // Three revisions: the first carries no record, the second one, the third two.
+    // note: three revisions — the first carries no record, the second one, the third two.
     let created = expect_ok(
         shared
             .put_knowledge_entry(entry_with("entry-f", REVISION_ONE), None)
@@ -715,12 +715,12 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
         "third revision",
     );
 
-    // The column default starts a fresh row at 1: creation never names it, and neither update
+    // why: the column default starts a fresh row at 1: creation never names it, and neither update
     // moved it.
     let pool = store.pool();
     assert_eq!(history_floor(&pool, "shared", "entry-f").await, 1);
 
-    // At or above floor 1 every revision replays as stored: 1 and 2 from a saved checkpoint, 3
+    // why: at or above floor 1 every revision replays as stored: 1 and 2 from a saved checkpoint, 3
     // from the live row.
     for (revision, expected) in [
         (1, as_json(&created)),
@@ -737,16 +737,16 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
         );
     }
 
-    // Seed the floor directly, without a prune, so the read gate is proven on its own.
+    // note: seed the floor directly, without a prune, so the read gate is proven on its own.
     seed_history_floor(&pool, "shared", "entry-f", 2).await;
 
-    // Below the floor the preimage was pruned: that is not the generic absence.
+    // why: below the floor the preimage was pruned: that is not the generic absence.
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
         "a revision below the seeded floor",
     );
 
-    // At or above the floor replay is byte-identical to the pre-seed result: revision 2 is a
+    // why: at or above the floor replay is byte-identical to the pre-seed result: revision 2 is a
     // checkpoint hit and revision 3 the live fallback.
     for (revision, expected) in [(2, as_json(&second)), (3, as_json(&third))] {
         assert_eq!(
@@ -759,7 +759,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
         );
     }
 
-    // A later full write leaves the floor alone: the column is storage-owned, not payload-derived.
+    // why: a later full write leaves the floor alone: the column is storage-owned, not payload-derived.
     let fourth = expect_ok(
         shared
             .put_knowledge_entry(
@@ -776,7 +776,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
     assert_eq!(fourth.revision, Some(4));
     assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
 
-    // Generic absence still covers zero, the unrepresentable range, a missing entry and a revision
+    // why: generic absence still covers zero, the unrepresentable range, a missing entry and a revision
     // above the live one; a floor never turns one of those into a refusal that claims a prune.
     expect_revision_absent(
         shared.get_entry_at_revision("entry-f", 0).await,
@@ -795,7 +795,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
         "a revision above the live one",
     );
 
-    // The floor lives on the entry row, so the truncation refusal survives a close and reopen of
+    // why: the floor lives on the entry row, so the truncation refusal survives a close and reopen of
     // the same file instead of being reconstructed in memory.
     drop(pool);
     store.close().await;
@@ -836,7 +836,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
     let store = MindStore::open(&path).await.expect("open store");
     let shared = store.knowledge(KnowledgeScope::new("shared"));
 
-    // Create, then three full rewrites: revisions 1..4 and one checkpoint for each replaced
+    // note: create, then three full rewrites: revisions 1..4 and one checkpoint for each replaced
     // revision, so 1, 2 and 3 are on disk and 4 is the live row.
     expect_ok(
         shared
@@ -887,7 +887,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
     );
     assert_eq!(history_floor(&pool, "shared", "entry-f").await, 1);
 
-    // The prune keeps revisions 2 and up. Replay every one of them now, before the prune, so the
+    // why: the prune keeps revisions 2 and up. Replay every one of them now, before the prune, so the
     // comparison after it is replay-to-replay rather than write-to-replay.
     let mut replay_before = Vec::new();
     for revision in 2..=4 {
@@ -914,7 +914,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
         "the prune deletes exactly the checkpoints below the new floor"
     );
 
-    // At or above the floor the replay is byte-identical to the replay snapshotted before it.
+    // why: at or above the floor the replay is byte-identical to the replay snapshotted before it.
     for (revision, expected) in replay_before {
         assert_eq!(
             as_json(&expect_ok(
@@ -926,13 +926,13 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
             "revision {revision} replays exactly as it did before the prune"
         );
     }
-    // The revision just below the floor is the one the prune removed.
+    // why: the revision just below the floor is the one the prune removed.
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
         "the revision just below the new floor",
     );
 
-    // A second prune with the same window has nothing to delete and leaves the floor alone.
+    // why: a second prune with the same window has nothing to delete and leaves the floor alone.
     let repeated = expect_ok(
         shared.prune_history("entry-f", 2).await,
         "a repeated prune with the same window",
@@ -945,7 +945,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
         [2, 3]
     );
 
-    // Emptying history is a different action: a zero window is refused before any transaction.
+    // why: emptying history is a different action: a zero window is refused before any transaction.
     assert_eq!(
         expect_reject(
             shared.prune_history("entry-f", 0).await,
@@ -959,7 +959,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
         [2, 3]
     );
 
-    // A missing entry answers the current-entry absence, not a prune-shaped refusal.
+    // why: a missing entry answers the current-entry absence, not a prune-shaped refusal.
     match shared.prune_history("entry-never-seeded", 1).await {
         SpokeResult::Ok(report) => panic!("a missing entry was pruned with {report:?}"),
         SpokeResult::Reject(reject) => {
@@ -972,7 +972,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
         }
     }
 
-    // A retired entry keeps its history and answers the same generic absence: the live-only
+    // why: a retired entry keeps its history and answers the same generic absence: the live-only
     // predicate refuses it before any checkpoint is read or deleted.
     expect_ok(
         shared
@@ -1005,7 +1005,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
     );
     assert_eq!(history_floor(&pool, "shared", "entry-f").await, 2);
 
-    // A later prune with a *smaller* window cuts again: the window's K-th newest is not yet the
+    // why: a later prune with a *smaller* window cuts again: the window's K-th newest is not yet the
     // floor, so the delete must still remove rows. This is the case a floor-only prune would fail.
     expect_ok(
         shared
@@ -1059,7 +1059,7 @@ async fn knowledge_prune_keeps_revisions_derived_across_a_gap_replayable() {
     let store = MindStore::open(&path).await.expect("open store");
     let shared = store.knowledge(KnowledgeScope::new("shared"));
 
-    // Alternate full rewrites and dedicated appends: an append advances the revision without
+    // note: alternate full rewrites and dedicated appends: an append advances the revision without
     // writing a preimage, so the checkpoints sit at 1, 3 and 5 and revisions 2 and 4 are derived,
     // replaying only from the checkpoint above them.
     expect_ok(
@@ -1173,7 +1173,7 @@ async fn knowledge_prune_keeps_revisions_derived_across_a_gap_replayable() {
         .map(|(_, expected)| expected.clone())
         .expect("revision 2 was replayed before the prune");
 
-    // Keeping two checkpoints deletes only checkpoint 1. Revisions 2 and 4 lose their preimage but
+    // why: keeping two checkpoints deletes only checkpoint 1. Revisions 2 and 4 lose their preimage but
     // not their answer: the next checkpoint plus the crossed appends replays them exactly.
     let pruned: PruneReport = expect_ok(
         shared.prune_history("entry-p", 2).await,
@@ -1202,7 +1202,7 @@ async fn knowledge_prune_keeps_revisions_derived_across_a_gap_replayable() {
         "the revision whose preimage the prune removed",
     );
 
-    // The derived replay survives a reopen: it is the surviving checkpoint, not the deleted row,
+    // why: the derived replay survives a reopen: it is the surviving checkpoint, not the deleted row,
     // that keeps revision 2 answerable.
     drop(pool);
     store.close().await;
@@ -1229,7 +1229,7 @@ async fn knowledge_history_survives_writes_and_reopen_until_an_explicit_prune() 
     let store = MindStore::open(&path).await.expect("open store");
     let shared = store.knowledge(KnowledgeScope::new("shared"));
 
-    // Create plus three full rewrites: one checkpoint per replaced revision, none removed.
+    // note: create plus three full rewrites: one checkpoint per replaced revision, none removed.
     expect_ok(
         shared
             .put_knowledge_entry(entry_with("entry-r", REVISION_ONE), None)
@@ -1258,7 +1258,7 @@ async fn knowledge_history_survives_writes_and_reopen_until_an_explicit_prune() 
     );
     assert_eq!(history_floor(&pool, "shared", "entry-r").await, 1);
 
-    // Reopening the same file removes nothing: the checkpoints and the floor survive it.
+    // why: reopening the same file removes nothing: the checkpoints and the floor survive it.
     drop(pool);
     store.close().await;
     let store = MindStore::open(&path).await.expect("reopen the store");
@@ -1269,7 +1269,7 @@ async fn knowledge_history_survives_writes_and_reopen_until_an_explicit_prune() 
     );
     assert_eq!(history_floor(&store.pool(), "shared", "entry-r").await, 1);
 
-    // Only an explicit prune removes history, and only what its window leaves behind.
+    // why: only an explicit prune removes history, and only what its window leaves behind.
     let shared = store.knowledge(KnowledgeScope::new("shared"));
     let pruned: PruneReport = expect_ok(
         shared.prune_history("entry-r", 2).await,

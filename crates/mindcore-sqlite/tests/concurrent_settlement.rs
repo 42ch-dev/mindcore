@@ -94,7 +94,7 @@ async fn competing_handles_retain_one_candidate() {
     ensure_subject(&left_pool, &adapter, &caller).await;
     let candidate = capture(&left_pool, &adapter, &caller, hearing("cap-race")).await;
 
-    // Both handles review, publish and settle the same candidate on their own connections.
+    // note: both handles review, publish and settle the same candidate on their own connections.
     let (left_result, right_result) = tokio::join!(
         attempt_retain(
             &left_pool,
@@ -116,7 +116,7 @@ async fn competing_handles_retain_one_candidate() {
     let (_, winner) = match (left_result, right_result) {
         (SpokeResult::Ok(retained), SpokeResult::Reject(reject))
         | (SpokeResult::Reject(reject), SpokeResult::Ok(retained)) => {
-            // The loser's refusal depends on how far its transaction got before the winner
+            // why: the loser's refusal depends on how far its transaction got before the winner
             // committed: a consumed candidate, a lost revision CAS, or a write SQLite refused
             // once the sibling's commit invalidated the loser's WAL snapshot. The last case is
             // contention, and a retain loser never commits, so it is a retryable pre-commit
@@ -138,7 +138,7 @@ async fn competing_handles_retain_one_candidate() {
         _ => panic!("exactly one concurrent retention must win"),
     };
 
-    // One candidate, one record: the loser's staged record rolled back with its transaction.
+    // why: one candidate, one record: the loser's staged record rolled back with its transaction.
     for pool in [left_pool.clone(), right_pool.clone()] {
         let records = recalled(
             &pool,
@@ -185,7 +185,7 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
     ensure_subject(&left_pool, &adapter, &caller).await;
     let candidate = capture(&left_pool, &adapter, &caller, hearing("cap-settle")).await;
 
-    // Stage one intent through the left handle; the receipt stays pending for both to settle.
+    // note: stage one intent through the left handle; the receipt stays pending for both to settle.
     let receipt = expect_ok(
         stage_review(
             &left_pool,
@@ -198,7 +198,7 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
         .await,
         "stage the review",
     );
-    // Both handles open their settlement transaction and read the pending pair before either
+    // why: both handles open their settlement transaction and read the pending pair before either
     // writes. Each read is awaited in turn, so the overlap is built, not sampled: the winner only
     // commits after both snapshots hold the pending receipt over the pending intent.
     let mut winner_tx = left_pool.begin().await.expect("begin the left settlement");
@@ -224,7 +224,7 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
         .await
         .expect("commit the winning settlement");
 
-    // The loser already observed the pending pair, so its settlement is a write against that
+    // why: the loser already observed the pending pair, so its settlement is a write against that
     // closed snapshot rather than a read of the winner's commit. The serialized writer refuses it
     // before any statement runs — the `rows_affected == 0` predicate below never answers — and the
     // protocol reports uncertainty; any successful reply here means the pending pair was replayed
@@ -265,7 +265,7 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
         .await
         .expect("rollback the losing settlement");
 
-    // A settlement from a fresh snapshot replays the one committed outcome.
+    // why: a settlement from a fresh snapshot replays the one committed outcome.
     let replay = expect_ok(
         settle_receipt(&left_pool, &adapter, "wren", &receipt).await,
         "replay the settlement",
@@ -273,7 +273,7 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
     assert_eq!(replay["status"], json!("committed"));
     assert_eq!(replay["receipt_id"], json!(receipt));
 
-    // The contended settlement left the pair single-applied: applied intent, scrubbed targets,
+    // why: the contended settlement left the pair single-applied: applied intent, scrubbed targets,
     // committed receipt.
     let (state, targets, status): (String, String, String) = sqlx::query_as(
         "SELECT j.state, j.targets_json, r.status FROM memory_journal j \

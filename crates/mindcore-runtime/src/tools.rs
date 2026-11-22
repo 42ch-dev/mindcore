@@ -167,7 +167,7 @@ impl WorkflowTools {
         let principals = Arc::clone(&self.principals);
         let providers = self.providers.clone();
         ToolRegistration::new(descriptor, move |responder| {
-            // Weak: the handler serves its session without extending its lifetime.
+            // why: weak — the handler serves its session without extending its lifetime.
             let session: Weak<ConnectResponder> = Arc::downgrade(responder);
             let workflows = Arc::clone(&workflows);
             let principals = Arc::clone(&principals);
@@ -363,14 +363,14 @@ fn deliberate_outcome(outcome: DeliberateOutcome) -> Value {
 /// One workflow failure as the wire reject the seam documents.
 fn workflow_reject(error: SpiError) -> SpokeReject {
     match error {
-        // The settlement refusal travels whole: code, message and structured details.
+        // why: the settlement refusal travels whole — code, message and structured details.
         SpiError::Settlement(reject) => reject,
         SpiError::InvalidInput(message) => SpokeReject {
             code: SpokeRejectCode::InvalidInput,
             message,
             details: None,
         },
-        // A policy veto is the host's decision about the proposal, not a failure and not a lost
+        // why: a policy veto is the host's decision about the proposal, not a failure and not a lost
         // admission: it carries its own kind and the host's reason. `NotAuthorized` stays the
         // lost-admission code.
         SpiError::PolicyRejected(reason) => SpokeReject {
