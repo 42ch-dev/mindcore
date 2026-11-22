@@ -430,6 +430,12 @@ impl MemoryAdapter {
                 live = None;
             }
         }
+        // why: retention purges expired staging on any successful transfer write for the space,
+        // so an abandoned import does not hold its storage until its own source export returns.
+        // The exact-source reclaim above runs first, so a late chunk still names its expiry.
+        self.repository
+            .expire_imports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
         let row = if ordinal == 0 {
             if let Some(row) = &live {
                 return Err(conflict(format!(
@@ -437,7 +443,9 @@ impl MemoryAdapter {
                     row.import_id
                 ))
                 .detail("reason", json!("duplicate_header"))
-                .detail("import_id", json!(row.import_id)));
+                .detail("import_id", json!(row.import_id))
+                .detail("expected_ordinal", json!(row.next_ordinal))
+                .detail("received_ordinal", json!(ordinal)));
             }
             None
         } else {

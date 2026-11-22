@@ -8,8 +8,23 @@ use spoke_operations::{spoke_reject, SpokeRejectCode, SpokeResult};
 use sqlx::SqlitePool;
 
 use crate::reject::Reject;
-use crate::transfer::{self, OPERATIONS};
+use crate::transfer;
 use crate::{MemoryAdapter, MemoryStage};
+
+/// §7.28 receipt polling: what a client is told to resolve an `OUTCOME_UNCERTAIN` transfer
+/// commit through, so the face that answers the five transfers must answer this too.
+pub(crate) const RECEIPT_GET: &str = "memory.receipts.get";
+
+/// What this service dispatches: the five §7.29–§7.33 operations plus receipt polling, which
+/// reads the same receipt namespace over the same store.
+static SERVED: [&str; 6] = [
+    transfer::CREATE,
+    transfer::GET,
+    transfer::STAGE,
+    transfer::ACTIVATE,
+    transfer::DISCARD,
+    RECEIPT_GET,
+];
 
 /// A memory service that can name the `memory.*` operations it dispatches.
 ///
@@ -22,13 +37,13 @@ pub trait ServedMemory: RemoteMemoryService {
     }
 }
 
-/// The five §7.29–§7.33 operations over the host's store.
+/// The five §7.29–§7.33 operations and §7.28 receipt polling over the host's store.
 ///
 /// `RemoteMemoryService::invoke` hands the service no transaction, so the service is the caller:
 /// each op runs in one transaction on the host's pool — `BEGIN IMMEDIATE` for the four mutations,
-/// a read for `exports.get` — and commits only after the adapter answers `Ready`. Any other
-/// `memory.*` op is refused as `CapabilityPortMissing`; a host that needs the rest of the family
-/// binds it separately.
+/// a read for `exports.get` and `receipts.get` — and commits only after the adapter answers
+/// `Ready`. Any other `memory.*` op is refused as `CapabilityPortMissing`; a host that needs the
+/// rest of the family binds it separately.
 pub struct TransferService {
     pool: SqlitePool,
     admission: MemoryAdmission,
@@ -51,7 +66,7 @@ impl TransferService {
 
 impl ServedMemory for TransferService {
     fn operations(&self) -> &'static [&'static str] {
-        &OPERATIONS
+        &SERVED
     }
 }
 
@@ -63,7 +78,8 @@ impl RemoteMemoryService for TransferService {
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         // why: no op ran, so a refused reservation has no outcome in doubt.
-        let begun = match op == transfer::GET {
+        let read = op == transfer::GET || op == RECEIPT_GET;
+        let begun = match read {
             true => self.pool.begin().await,
             false => self.pool.begin_with("BEGIN IMMEDIATE").await,
         };
@@ -93,6 +109,7 @@ impl RemoteMemoryService for TransferService {
                     .discard_import(&mut tx, &principal, payload)
                     .await
             }
+            RECEIPT_GET => self.adapter.get_receipt(&mut tx, &principal, payload).await,
             _ => {
                 return spoke_reject(
                     SpokeRejectCode::CapabilityPortMissing,

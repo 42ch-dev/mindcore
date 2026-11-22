@@ -161,6 +161,9 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryExportsCreateResponse>(&receipt);
         }
+        self.repository
+            .expire_imports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
         admission::gate(&self.repository, tx, &admission).await?;
         if require_quiescent {
             let space = admission::space(&self.repository, tx, &op.space).await?;

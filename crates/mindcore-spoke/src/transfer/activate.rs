@@ -615,7 +615,9 @@ pub(super) async fn prepare(
 }
 
 /// No adopted grant may be wider than the caller's own current coverage: no
-/// amplification, and a non-expiring import needs a non-expiring cover.
+/// amplification, and a non-expiring import needs a non-expiring cover. Staging and
+/// activation both run it — the grants become permanent only at activation, so the cover
+/// is re-derived there rather than trusted from the frozen import.
 fn not_subsumed(
     grants: &[MemoryGrantRow],
     caller_grants: &[MemoryGrantRow],
@@ -875,8 +877,8 @@ fn stored_grant(value: &Value, space: &SpaceId) -> AResult<MemoryGrantRow> {
 
 /// Recheck the frozen rows against the live target before the flip: a subject or a
 /// profile the target gained since staging refuses the activation instead of surfacing
-/// as a storage failure. The mapping itself is never re-derived, and the caller's
-/// current coverage is rechecked by the operation's own admission before this runs.
+/// as a storage failure. The mapping itself is never re-derived; adopted-grant coverage
+/// is a separate check against the activating caller's current grants.
 async fn recheck(
     repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
@@ -966,6 +968,9 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryImportsActivateResponse>(&receipt);
         }
+        self.repository
+            .expire_imports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
 
         let Some(import) = self.repository.import(tx, &op.space, &import_id).await? else {
             return Err(Reject::not_found(format!("import {import_id}")));
@@ -987,6 +992,17 @@ impl MemoryAdapter {
         };
         let staged = decode_staged(&payload, &op.space, principal_id)?;
         recheck(&self.repository, tx, &op.space, &staged).await?;
+        // why: an adopted grant is written without an expiry, so the cover that justified it at
+        // staging is re-derived from the activating caller's current grants — a live but expiring
+        // `admin` at cutover must not install one permanently.
+        let caller_grants = admission::grants(&self.repository, tx, &op.space).await?;
+        not_subsumed(
+            &staged.grants,
+            &caller_grants,
+            &op.space,
+            principal_id,
+            op.now,
+        )?;
 
         let space_row = admission::space(&self.repository, tx, &op.space).await?;
         let observed = space_row.revision.clone();
@@ -1101,6 +1117,9 @@ impl MemoryAdapter {
         if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
             return Self::replay::<MemoryImportsDiscardResponse>(&receipt);
         }
+        self.repository
+            .expire_imports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
 
         let Some(import) = self.repository.import(tx, &op.space, &import_id).await? else {
             return Err(Reject::not_found(format!("import {import_id}")));

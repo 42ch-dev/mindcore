@@ -245,7 +245,7 @@ CREATE UNIQUE INDEX idx_memory_imports_staging
     WHERE state IN ('staging', 'staged');
 
 -- The expiry decision reads live imports by this key: an expired import is reclaimed
--- (`expired`, payload released) on the next successful stage of the same source export.
+-- (`expired`, payload released) on the next successful transfer write of its space.
 CREATE INDEX idx_memory_imports_expires
     ON memory_imports (expires_at);
 

@@ -1430,6 +1430,64 @@ async fn transfer_is_advertised_and_served_when_the_service_reports_all_five() {
     assert_eq!(activated["status"], "committed");
 }
 
+/// The receipt a transfer commit returns is pollable on the same signed session: an
+/// `OUTCOME_UNCERTAIN` outcome resolves through `memory.receipts.get`, which the service
+/// reports beside the five transfer operations and dispatches over the same store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_transfer", PRINCIPAL, &["transfer", "admin"])
+        .await;
+    let service = Arc::new(TransferService::new(
+        fixture.store.pool(),
+        principal_admission(),
+    ));
+    assert!(
+        service.operations().contains(&"memory.receipts.get"),
+        "the service reports the op an uncertain commit is resolved through: {:?}",
+        service.operations()
+    );
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory", "spoke-memory-transfer"]),
+            Some(service),
+            MindProviders::default(),
+            routes(&[]),
+        ),
+    );
+    let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
+
+    let created = wire(expect_ok(
+        MemoryPort::create_export(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "t7-poll-export" })),
+        )
+        .await,
+        "memory.exports.create",
+    ));
+    let receipt_id = created["receipt_id"]
+        .as_str()
+        .expect("receipt id")
+        .to_string();
+
+    let polled = wire(expect_ok(
+        MemoryPort::get_receipt(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "receipt_id": receipt_id })),
+        )
+        .await,
+        "memory.receipts.get",
+    ));
+    assert_eq!(polled["receipt"]["op"], json!("memory.exports.create"));
+    assert_eq!(polled["receipt"]["status"], json!("committed"));
+    assert_eq!(polled["receipt"]["receipt_id"], json!(receipt_id));
+}
+
 fn typed<T: serde::de::DeserializeOwned>(value: Value) -> T {
     serde_json::from_value(value).expect("the request JSON matches its schema")
 }

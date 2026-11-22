@@ -1708,6 +1708,39 @@ impl SqliteMemoryRepository {
         Ok(updated.rows_affected() == 1)
     }
 
+    /// Reclaim every live import of one space past its fixed expiry: a content-free terminal
+    /// state each, payload released, chunks deleted — so an abandoned import stops holding
+    /// storage once any transfer write of that space succeeds, not only when its own source
+    /// export is staged again.
+    pub async fn expire_imports(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        now: &str,
+    ) -> RepoResult<()> {
+        sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'expired', staged_payload_json = NULL, staged_report_json = NULL, \
+             provenance_json = NULL \
+             WHERE space_id = ? AND state IN ('staging', 'staged') AND expires_at <= ?",
+        )
+        .bind(space.as_str())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        sqlx::query(
+            "DELETE FROM memory_import_chunks \
+             WHERE import_id IN (SELECT import_id FROM memory_imports \
+             WHERE space_id = ? AND state = 'expired')",
+        )
+        .bind(space.as_str())
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(())
+    }
+
     /// Pre-activation rollback: only an import that never activated can be discarded,
     /// and the content-bearing payload it never applied is released with it.
     pub async fn mark_import_discarded(

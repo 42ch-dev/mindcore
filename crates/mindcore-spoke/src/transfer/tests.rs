@@ -1372,6 +1372,38 @@ async fn repeated_ordinals_conflict_without_ending_the_import() {
     );
 }
 
+/// A repeated header names the ordinal it refused, so a new idempotency key can tell a
+/// header collision from a chunk rejection and learn where the live import stands.
+#[tokio::test]
+async fn a_repeated_header_names_the_ordinal_it_refused() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    seed_big_record(&fixture).await;
+    let chunks = staged_source(&fixture, "ordinal-source").await;
+    assert_eq!(chunks.len(), 3, "the oversized record splits the export");
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "ordinal-0").await);
+    let import_id = body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    let repeated = stage_chunk(&fixture, chunks[0].clone(), "ordinal-0b").await;
+    let reject = rejected(&repeated);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("duplicate_header"));
+    assert_eq!(detail(reject, "received_ordinal"), &json!(0));
+    assert_eq!(detail(reject, "expected_ordinal"), &json!(1));
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staging".to_string(), 1),
+        "the refusal writes nothing"
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+}
+
 /// `next_ordinal` alone decides what is acceptable, so an ordinal ahead of the import
 /// is the same refusal as a repeat: nothing is written, nothing is deleted, and the
 /// sequence still completes once the right chunk arrives.
@@ -1541,6 +1573,60 @@ async fn an_expired_import_is_reclaimed_by_the_next_stage_of_its_source_export()
     assert_eq!(
         import_state(&fixture, &restarted_id).await,
         ("staging".to_string(), 1)
+    );
+}
+
+/// An abandoned import is reclaimed by any later successful transfer write of its space,
+/// not only by a stage of the same source export: the expired row keeps no payload, no
+/// report and no chunks.
+#[tokio::test]
+async fn an_expired_import_is_reclaimed_by_an_unrelated_transfer_write() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    seed_big_record(&fixture).await;
+    let chunks = staged_source(&fixture, "sweep-source").await;
+    assert_eq!(chunks.len(), 3, "the oversized record splits the export");
+    let mut import_id = String::new();
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        let body = ready(stage_chunk(&fixture, chunk.clone(), &format!("sweep-{ordinal}")).await);
+        import_id = body["result"]["import_id"]
+            .as_str()
+            .expect("import id")
+            .to_string();
+    }
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 3),
+        "the abandoned import froze its payload"
+    );
+    sqlx::query("UPDATE memory_imports SET expires_at = ? WHERE import_id = ?")
+        .bind("2000-01-01T00:00:00.000Z")
+        .bind(&import_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the import");
+
+    // A different source export's create succeeds in the same space and owns the reclaim.
+    create_export(&fixture, "sweep-other").await;
+
+    let (state, payload, report): (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT state, staged_payload_json, staged_report_json \
+         FROM memory_imports WHERE import_id = ?",
+    )
+    .bind(&import_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("reclaimed import row");
+    assert_eq!(
+        state, "expired",
+        "the dead import keeps a content-free marker"
+    );
+    assert!(payload.is_none(), "the expired payload is released");
+    assert!(report.is_none(), "the expired report is released");
+    assert_eq!(
+        staged_chunk_count(&fixture, &import_id).await,
+        0,
+        "the expired chunks are released"
     );
 }
 
@@ -2383,6 +2469,62 @@ async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
         .await,
         0,
         "a refused adoption stages nothing"
+    );
+}
+
+/// Adoption becomes permanent only at activation, so the cover that justified it at staging
+/// is re-derived from the activating caller's current grants: a cover that now expires
+/// refuses the flip and installs nothing.
+#[tokio::test]
+async fn activation_refuses_adoption_when_the_callers_cover_now_expires() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let chunks = staged_source(&fixture, "adopt-export-3").await;
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "adopt-stage-2",
+            Some(json!({ "adopt_grants": [{ "grant_id": "g_2", "principal_id": "p_2" }] })),
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    // The cover survives staging and stays live for the activation's own admission, but it
+    // now expires: the adopted grant it would copy has no expiry of its own.
+    sqlx::query("UPDATE memory_grants SET expires_at = ? WHERE grant_id = 'g_target'")
+        .bind("2030-01-01T00:00:00.000Z")
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the target cover");
+
+    let result = activate(&fixture, &import_id, "adopt-activate-2").await;
+    let reject = rejected(&result);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("grant_not_subsumed"));
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 1),
+        "a refused activation leaves the import staged"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_grants WHERE space_id = ? AND principal_id = 'p_2'",
+            &[TARGET],
+        )
+        .await,
+        0,
+        "a refused activation installs no adopted grant"
     );
 }
 
