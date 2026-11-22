@@ -142,19 +142,14 @@ pub struct MemoryAdapter {
 }
 
 impl MemoryAdapter {
-    /// `reflections_enabled` is the instance's own policy switch: it decides
-    /// both what `describe` advertises and whether §7.25–§7.27 are served.
+    /// `reflections` is the instance's own policy switch: it decides both what
+    /// `describe` advertises and whether §7.25–§7.27 are served.
     #[must_use]
-    pub fn new(reflections_enabled: bool) -> Self {
+    pub fn new(reflections: bool) -> Self {
         Self {
             repository: SqliteMemoryRepository,
-            reflections: reflections_enabled,
+            reflections,
         }
-    }
-
-    #[must_use]
-    pub fn reflections_enabled(&self) -> bool {
-        self.reflections
     }
 
     /// Validate and validate-again one rebuilt success body against its pinned
