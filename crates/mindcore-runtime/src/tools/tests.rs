@@ -5,14 +5,18 @@
 //! loopback task; here the serving path is driven with an already authenticated peer id. The
 //! mapping is crate-internal, so these assertions live beside it rather than behind a public API.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use tempfile::TempDir;
 
 use mindcore_spi::{
     AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
     MindCapabilities, MindWorkflows, SpiError,
 };
+use mindcore_sqlite::MindStore;
 use spoke_operations::{spoke_reject, validate_tool_arguments};
 use spoke_schemas::{CognitionRecord, KnowledgeEntry, RetainedRecord};
 
@@ -134,17 +138,17 @@ fn tools(fake: Arc<Fake>) -> WorkflowTools {
     WorkflowTools::new(fake, admission(), MindProviders::default())
 }
 
-fn expect_ok(result: SpokeResult<Value>, context: &str) -> Value {
+fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
     match result {
         SpokeResult::Ok(value) => value,
         SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
     }
 }
 
-fn expect_reject(result: SpokeResult<Value>, context: &str) -> SpokeReject {
+fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
     match result {
         SpokeResult::Reject(reject) => reject,
-        SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value}"),
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value:?}"),
     }
 }
 
@@ -958,4 +962,299 @@ fn minimal(schema: &Value, root: &Value) -> Value {
             panic!("the advertised schema leaves a member unconstrained ({other:?}): {schema}")
         }
     }
+}
+
+/// The adoption tool over a real store: a shared source holding the entry to adopt and one unrelated
+/// occupant, the caller's destination already holding a different entry under that occupant's id, and
+/// one admitted principal with a route beside one admitted without.
+async fn adoption_tool() -> (TempDir, AdoptionTool) {
+    let dir = TempDir::new().expect("temporary directory");
+    let store = MindStore::open(&dir.path().join("adoption.db"))
+        .await
+        .expect("open store");
+    for (collection, entry_id) in [
+        ("shared", "ke_shared"),
+        ("shared", "ke_occupant"),
+        // the destination holds an entry this adoption does not own under the source's id.
+        ("wren", "ke_occupant"),
+    ] {
+        let mut seeded = entry();
+        seeded.entry_id = entry_id.to_string();
+        match store
+            .knowledge(KnowledgeScope::new(collection))
+            .put_knowledge_entry(seeded, None)
+            .await
+        {
+            SpokeResult::Ok(_) => {}
+            SpokeResult::Reject(reject) => panic!("seed {collection}/{entry_id}: {reject:?}"),
+        }
+    }
+    let tool = AdoptionTool::new(
+        store.pool(),
+        Arc::new(|peer_id: &str| match peer_id {
+            "peer-driver" => SpokeResult::Ok(principal()),
+            "peer-unrouted" => SpokeResult::Ok(
+                serde_json::from_value(json!({ "principal_id": "prn_other", "extensions": {} }))
+                    .expect("principal JSON matches the schema"),
+            ),
+            _ => spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                format!("peer {peer_id} holds no workflow admission"),
+                None,
+            ),
+        }),
+        "shared".to_string(),
+        Arc::new(BTreeMap::from([(
+            "prn_driver".to_string(),
+            KnowledgeScope::new("wren"),
+        )])),
+    );
+    (dir, tool)
+}
+
+/// The routed principal adopts onto its own route: the four refusals the local function produces
+/// travel unchanged, the first call creates the copy and the repeat serves the stored one.
+#[tokio::test]
+async fn a_routed_principal_adopts_once_and_the_local_refusals_pass_through() {
+    let (_dir, tool) = adoption_tool().await;
+
+    for (case, arguments, code) in [
+        (
+            "an entry the shared collection does not hold",
+            json!({ "entry_id": "ke_absent", "expected_source_revision": 1 }),
+            SpokeRejectCode::KnowledgeEntryNotFound,
+        ),
+        (
+            "a stale expected source revision",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 2 }),
+            SpokeRejectCode::RevisionConflict,
+        ),
+        (
+            "a destination slot another entry holds",
+            json!({ "entry_id": "ke_occupant", "expected_source_revision": 1 }),
+            SpokeRejectCode::KnowledgeEntryAlreadyExists,
+        ),
+        (
+            "no source revision to anchor at",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 0 }),
+            SpokeRejectCode::InvalidInput,
+        ),
+    ] {
+        let reject = expect_reject(tool.dispatch("peer-driver", arguments).await, case);
+        assert_eq!(reject.code, code, "{case}: {reject:?}");
+    }
+
+    let arguments = json!({ "entry_id": "ke_shared", "expected_source_revision": 1 });
+    let created = expect_ok(
+        tool.dispatch("peer-driver", arguments.clone()).await,
+        "adopt",
+    );
+    assert_eq!(created["outcome"], "created");
+    assert_eq!(created["entry"]["entry_id"], "ke_shared");
+    assert_eq!(created["entry"]["revision"], 1);
+
+    let again = expect_ok(
+        tool.dispatch("peer-driver", arguments).await,
+        "repeat adoption",
+    );
+    assert_eq!(again["outcome"], "already_present");
+    assert_eq!(
+        again["entry"]["revision"], 1,
+        "the repeat serves the stored copy unchanged"
+    );
+}
+
+/// An admitted principal without a route is refused even though another principal is routed, and the
+/// refusal names neither a collection nor a principal.
+#[tokio::test]
+async fn an_unrouted_principal_is_refused_without_target_details() {
+    let (_dir, tool) = adoption_tool().await;
+    let reject = expect_reject(
+        tool.dispatch(
+            "peer-unrouted",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 1 }),
+        )
+        .await,
+        "unrouted adoption",
+    );
+
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(reject.details.is_none(), "{reject:?}");
+    assert!(
+        !reject.message.contains("wren"),
+        "the refusal names no destination collection: {}",
+        reject.message
+    );
+}
+
+/// The source half of the adoption is read-only by construction: the write its port must expose
+/// refuses before it touches the store, and the shared entry keeps the revision it was seeded at.
+#[tokio::test]
+async fn the_adoption_source_handle_refuses_a_write() {
+    let dir = TempDir::new().expect("temporary directory");
+    let store = MindStore::open(&dir.path().join("source.db"))
+        .await
+        .expect("open store");
+    let mut seeded = entry();
+    seeded.entry_id = "ke_shared".to_string();
+    expect_ok(
+        store
+            .knowledge(KnowledgeScope::new("shared"))
+            .put_knowledge_entry(seeded, None)
+            .await,
+        "seed the shared source",
+    );
+
+    let pool = store.pool();
+    let mut transaction = pool.begin().await.expect("begin the call's transaction");
+    let refusal = {
+        let gate = tokio::sync::Mutex::new(&mut transaction);
+        let source = AdoptionSource {
+            collection: "shared",
+            gate: &gate,
+        };
+        source.put_knowledge_entry(entry(), None).await
+    };
+    transaction
+        .rollback()
+        .await
+        .expect("drop the call's transaction");
+
+    let reject = expect_reject(refusal, "a write through the adoption source");
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(
+        reject.message, "the adoption source is read-only",
+        "{reject:?}"
+    );
+    let stored = expect_ok(
+        store
+            .knowledge(KnowledgeScope::new("shared"))
+            .get_knowledge_entry("ke_shared")
+            .await,
+        "read the shared source back",
+    );
+    assert_eq!(
+        stored.revision,
+        Some(1),
+        "the shared entry is the one seeded, not a rewrite: {stored:?}"
+    );
+}
+
+/// Routing is this tool's authorization, so it is answered before the payload is looked at: an
+/// admitted principal without a route is refused with `NotAuthorized` even when the arguments would
+/// not decode.
+#[tokio::test]
+async fn an_unrouted_principal_is_refused_before_its_arguments_are_read() {
+    let (_dir, tool) = adoption_tool().await;
+    let reject = expect_reject(
+        tool.dispatch(
+            "peer-unrouted",
+            json!({ "entry_id": "ke_shared", "unexpected": true }),
+        )
+        .await,
+        "an unrouted adoption with arguments that do not decode",
+    );
+
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized, "{reject:?}");
+    assert!(reject.details.is_none(), "{reject:?}");
+}
+
+/// Neither a refused payload nor a storage fault carries its diagnostic: the wire keeps the closed
+/// class, and the serde, SQL and stored-payload text stays host-side.
+#[tokio::test]
+async fn adoption_refusals_carry_no_raw_diagnostics() {
+    let (_dir, tool) = adoption_tool().await;
+
+    let reject = expect_reject(
+        tool.dispatch("peer-driver", json!({ "entry_id": "ke_shared" }))
+            .await,
+        "adoption without an expected source revision",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput, "{reject:?}");
+    assert_eq!(
+        reject.message, "the adoption arguments are entry_id and expected_source_revision",
+        "the refusal names the advertised shape, not the serde diagnostic"
+    );
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("arguments"),
+        "{reject:?}"
+    );
+
+    // why: a stored payload the store cannot decode fails the source read itself, which is the
+    // storage fault whose decoder text must not travel.
+    sqlx::query(
+        "UPDATE knowledge_entries SET payload = 'not an entry' \
+         WHERE collection = 'shared' AND entry_id = 'ke_shared'",
+    )
+    .execute(&tool.pool)
+    .await
+    .expect("corrupt the stored payload");
+    let reject = expect_reject(
+        tool.dispatch(
+            "peer-driver",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 1 }),
+        )
+        .await,
+        "adoption of a stored payload that does not decode",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(reject.message, "knowledge adoption could not complete");
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("store"),
+        "{reject:?}"
+    );
+    let refusal = format!("{reject:?}");
+    assert!(
+        !refusal.contains("payload") && !refusal.contains("shared") && !refusal.contains("SELECT"),
+        "the refusal carries no stored text, no collection and no statement: {refusal}"
+    );
+}
+
+/// A sink that refuses every write, the way a closed stderr descriptor does, and counts the
+/// attempts it was offered.
+struct ClosedSink(Rc<Cell<usize>>);
+
+impl std::io::Write for ClosedSink {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        self.0.set(self.0.get() + 1);
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
+/// The fault diagnostic is best-effort: the same call that fails to write the sink still returns
+/// the contractual refusal instead of unwinding out of the handler.
+#[test]
+fn an_unwritable_fault_diagnostic_still_yields_the_refusal() {
+    let attempts = Rc::new(Cell::new(0));
+    let reject = adoption_fault(ClosedSink(Rc::clone(&attempts)), "store", "boom");
+    // why: the refusal alone also holds for a handler that never offers the diagnostic to the sink.
+    assert!(
+        attempts.get() > 0,
+        "the fault diagnostic was never offered to the host sink: {reject:?}"
+    );
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(reject.message, "knowledge adoption could not complete");
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("store"),
+        "{reject:?}"
+    );
 }

@@ -15,7 +15,7 @@
 pub mod adoption;
 pub mod workflows;
 
-pub use adoption::{adopt_knowledge_entry, AdoptionOutcome};
+pub use adoption::{adopt_knowledge_entry, adopt_knowledge_entry_typed, AdoptionOutcome};
 pub use workflows::{
     page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
     CapturedCandidate, CitedRecord, DeliberateSnapshot, PageFact, PageVector, PageVectors,

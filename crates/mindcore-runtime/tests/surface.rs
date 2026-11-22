@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
-use mindcore_runtime::{MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
+use mindcore_runtime::tools::{ABSORB, ADOPT, DELIBERATE, RECALL_CONTEXT};
+use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
 use spoke_connect::remote::{
@@ -164,6 +164,7 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         memory: None,
         principals: principals(),
         providers: MindProviders::default(),
+        adoption: None,
         workflow_routes: routes(),
         tools: Vec::new(),
     }
@@ -256,13 +257,22 @@ async fn manifest_follows_the_composed_faces() {
 #[tokio::test]
 async fn an_unroutable_destination_is_refused_at_assembly() {
     let serve = Fixture::open().await.serve();
-    for routes in [
-        BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
-        BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
-        BTreeMap::from([
-            ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
-            ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
-        ]),
+    for (routes, message) in [
+        (
+            BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
+            "a knowledge route needs a non-empty principal id",
+        ),
+        (
+            BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
+            "the knowledge route for principal prn_owner names an empty collection",
+        ),
+        (
+            BTreeMap::from([
+                ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
+                ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
+            ]),
+            "a destination collection is routed to more than one principal",
+        ),
     ] {
         let reject = match serve.surface(ServeFaces {
             workflow_routes: routes,
@@ -277,11 +287,185 @@ async fn an_unroutable_destination_is_refused_at_assembly() {
             }
         };
         assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+        assert_eq!(reject.message, message);
         assert!(
             reject.details.is_none(),
             "the assembly refusal carries no route details: {reject:?}"
         );
     }
+}
+
+/// The adoption source is one collection for the whole surface. Beside the per-principal routes it
+/// assembles, and the source need not hold any row.
+#[tokio::test]
+async fn an_adoption_source_beside_the_routes_assembles() {
+    let serve = Fixture::open().await.serve();
+    let surface = expect_ok(
+        serve.surface(ServeFaces {
+            // no row exists in this collection: adoption does not require one at assembly.
+            adoption: Some(AdoptionRoute {
+                source: KnowledgeScope::new("shared"),
+            }),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble an adopting surface",
+    );
+
+    assert!(surface.ports.as_knowledge().is_some());
+}
+
+/// The adoption source must differ from every route destination, connected or not: a source that
+/// is also a principal's destination would let one principal's write become another's source.
+#[tokio::test]
+async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly() {
+    let serve = Fixture::open().await.serve();
+    for (routes, source) in [
+        // the admitted principal's own destination.
+        (routes(), COLLECTION),
+        // a route whose principal holds no admission on this surface.
+        (
+            BTreeMap::from([
+                ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
+                ("prn_unconnected".to_string(), KnowledgeScope::new("shared")),
+            ]),
+            "shared",
+        ),
+    ] {
+        let reject = match serve.surface(ServeFaces {
+            workflow_routes: routes,
+            adoption: Some(AdoptionRoute {
+                source: KnowledgeScope::new(source),
+            }),
+            ..faces(metadata("runtime"))
+        }) {
+            SpokeResult::Reject(reject) => reject,
+            SpokeResult::Ok(surface) => {
+                panic!(
+                    "a route destination became the adoption source {:?}",
+                    capabilities(&surface)
+                )
+            }
+        };
+        assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+        assert!(
+            reject.details.is_none(),
+            "the assembly refusal carries no route details: {reject:?}"
+        );
+    }
+}
+
+/// An empty source collection names no source to read, so assembly refuses it.
+#[tokio::test]
+async fn an_empty_adoption_source_is_refused_at_assembly() {
+    let serve = Fixture::open().await.serve();
+    let reject = match serve.surface(ServeFaces {
+        adoption: Some(AdoptionRoute {
+            source: KnowledgeScope::new(""),
+        }),
+        ..faces(metadata("runtime"))
+    }) {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(surface) => {
+            panic!(
+                "an empty adoption source assembled {:?}",
+                capabilities(&surface)
+            )
+        }
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+    assert!(reject.details.is_none(), "{reject:?}");
+}
+
+/// The adoption id is the runtime's: a host registration cannot supply it on a surface that serves
+/// no adoption, nor replace the descriptor installed for it when the surface does.
+#[tokio::test]
+async fn a_host_registration_cannot_shadow_the_adoption_tool() {
+    let serve = Fixture::open().await.serve();
+
+    let unserved = expect_ok(
+        serve.surface(ServeFaces {
+            tools: vec![shadowing_adoption()],
+            ..faces(metadata("runtime"))
+        }),
+        "assemble a surface a host tries to shadow without configuring adoption",
+    );
+    assert!(
+        !capabilities(&unserved).contains(&ADOPT),
+        "a host registration supplied an id no adoption serves: {:?}",
+        capabilities(&unserved)
+    );
+    assert!(
+        unserved
+            .manifest
+            .tools
+            .iter()
+            .all(|tool| tool.capability_id.as_str() != ADOPT),
+        "the host's adoption descriptor is not advertised"
+    );
+
+    let source = || {
+        Some(AdoptionRoute {
+            source: KnowledgeScope::new("shared"),
+        })
+    };
+    let plain = expect_ok(
+        serve.surface(ServeFaces {
+            adoption: source(),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble an adopting surface",
+    );
+    let shadowed = expect_ok(
+        serve.surface(ServeFaces {
+            adoption: source(),
+            tools: vec![shadowing_adoption()],
+            ..faces(metadata("runtime"))
+        }),
+        "assemble an adopting surface a host tries to shadow",
+    );
+
+    assert_eq!(
+        advertised_descriptor(&shadowed, ADOPT),
+        advertised_descriptor(&plain, ADOPT),
+        "the host registration replaced the runtime's adoption descriptor"
+    );
+}
+
+/// A host registration borrowing the runtime's adoption id: accepted, its descriptor and handler
+/// would stand in for the runtime's.
+fn shadowing_adoption() -> ToolRegistration {
+    let descriptor: ToolDescriptor = serde_json::from_value(json!({
+        "schema_version": 1,
+        "capability_id": ADOPT,
+        "op": ADOPT,
+        "description": "A host-supplied adoption tool.",
+        "input": { "type": "object" },
+        "output": { "type": "object" },
+    }))
+    .expect("tool descriptor JSON matches the schema");
+    ToolRegistration::new(descriptor, |_responder| {
+        let handler: ToolHandler = Arc::new(|arguments: Value| {
+            Box::pin(
+                async move { spoke_ok(json!({ "adopted_by": "host", "arguments": arguments })) },
+            )
+        });
+        handler
+    })
+}
+
+/// The one advertised descriptor for `capability_id`, as the manifest carries it.
+fn advertised_descriptor(
+    surface: &mindcore_runtime::MindcoreSurface,
+    capability_id: &str,
+) -> Value {
+    let matching: Vec<&ToolDescriptor> = surface
+        .manifest
+        .tools
+        .iter()
+        .filter(|tool| tool.capability_id.as_str() == capability_id)
+        .collect();
+    assert_eq!(matching.len(), 1, "{capability_id} is advertised once");
+    serde_json::to_value(matching[0]).expect("a tool descriptor serializes")
 }
 
 /// Attaching the host's memory service adds its capability and its face, still without a baseline.

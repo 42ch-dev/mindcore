@@ -55,6 +55,38 @@ pub async fn adopt_knowledge_entry(
     entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
+    adopt(src, dst, entry_id, expected_source_revision).await
+}
+
+/// The same adoption for callers holding concrete ports.
+///
+/// Generic dispatch keeps each `&S`/`&D` in the returned future's state, so — unlike the
+/// object-safe entry, whose `&dyn` borrow is not `Sync` — this future is `Send` when both ports
+/// are; a served handler needs that to box it as `Send`.
+pub async fn adopt_knowledge_entry_typed<S, D>(
+    src: &S,
+    dst: &D,
+    entry_id: &str,
+    expected_source_revision: u64,
+) -> SpokeResult<AdoptionOutcome>
+where
+    S: KnowledgeEntryPort + Sync,
+    D: KnowledgeEntryPort + Sync,
+{
+    adopt(src, dst, entry_id, expected_source_revision).await
+}
+
+/// The one implementation of the adoption rules; both public entries dispatch here.
+async fn adopt<S, D>(
+    src: &S,
+    dst: &D,
+    entry_id: &str,
+    expected_source_revision: u64,
+) -> SpokeResult<AdoptionOutcome>
+where
+    S: KnowledgeEntryPort + ?Sized,
+    D: KnowledgeEntryPort + ?Sized,
+{
     // why: neither an empty id nor a zero revision can name an adoption anchor, so the call is refused
     // before it reads or writes: every anchor this helper writes round-trips through the parser.
     let Some(anchor) = adoption_anchor_at_revision(entry_id, expected_source_revision) else {
@@ -197,4 +229,41 @@ fn source_revision_conflict<T>(entry_id: &str, expected: u64) -> SpokeResult<T> 
         format!("shared knowledge entry {entry_id} is not at revision {expected}"),
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port with no entries: every read and write is the generic absence.
+    struct AbsentKnowledge;
+
+    #[async_trait::async_trait]
+    impl KnowledgeEntryPort for AbsentKnowledge {
+        async fn get_knowledge_entry(&self, _entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+            source_absent()
+        }
+
+        async fn put_knowledge_entry(
+            &self,
+            _entry: KnowledgeEntry,
+            _expected_base_revision: Option<u64>,
+        ) -> SpokeResult<KnowledgeEntry> {
+            source_absent()
+        }
+    }
+
+    /// A served handler boxes this future as `Send`; the assertion fails to compile if the typed
+    /// entry ever stops holding `Send` state (each `&S` is `Send` only because `S: Sync`).
+    #[test]
+    fn typed_entry_yields_a_send_future() {
+        fn assert_send<T: Send>(_: T) {}
+
+        assert_send(adopt_knowledge_entry_typed(
+            &AbsentKnowledge,
+            &AbsentKnowledge,
+            "ke_entry",
+            1,
+        ));
+    }
 }
