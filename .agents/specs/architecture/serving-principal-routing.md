@@ -22,7 +22,7 @@ Routing therefore has two independent inputs, and neither is caller-declared:
 A caller-supplied principal, scope or collection is never used to select a route.
 
 `ServeFaces.workflow_routes: BTreeMap<String, KnowledgeScope>` carries the map
-(`crates/mindcore-runtime/src/lib.rs:222`). Keys are exact principal ids, not peer ids; values are
+(`crates/mindcore-runtime/src/lib.rs:230`). Keys are exact principal ids, not peer ids; values are
 workflow collection scopes. The standalone Knowledge face still uses its own `ServeFaces.scope_id`,
 `knowledge`, and `admission`. `MemoryWorkflowBinding::new(pool, reflections_enabled)` starts with an
 empty private `knowledge_routes`; `with_knowledge_routes` validates and takes ownership of the full
@@ -99,9 +99,10 @@ is named by the request.
   is any route destination. Read-only access beyond the routed collection is otherwise not
   observable through the served surface and is therefore not asserted.
 - No refusal discloses another principal's route, collection or entry.
-- No wire argument or result names a principal, route, collection or source; a call resolves every
-  collection from host configuration and admission alone. Adoption's arguments name one entry and
-  its expected source revision, and its result carries that copy.
+- No wire value selects the authenticated principal, the source collection or the destination
+  collection: admission supplies the principal, `AdoptionRoute` the source, and the principal's
+  route-map entry the destination. Adoption's arguments name one entry and its expected source
+  revision, and its result carries that copy, whose stored provenance selects nothing.
 - The carrier record format is unchanged.
 
 ## Where it lives
