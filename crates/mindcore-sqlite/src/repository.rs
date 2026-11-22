@@ -1386,6 +1386,26 @@ impl SqliteMemoryRepository {
         .transpose()
     }
 
+    /// One export header by its primary key, whichever space created it: an import
+    /// names its source export without naming that export's space.
+    pub async fn export_by_id(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        export_id: &str,
+    ) -> RepoResult<Option<MemoryExportRow>> {
+        sqlx::query_as::<_, ExportColumns>(
+            "SELECT export_id, space_id, requester_principal_id, subject_id, selection_json, \
+             include_tombstoned, bundle_digest, chunk_count, created_at, expires_at \
+             FROM memory_exports WHERE export_id = ?",
+        )
+        .bind(export_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(export_row)
+        .transpose()
+    }
+
     /// One stored wire chunk of an export, exactly as it was published.
     pub async fn export_chunk(
         &self,

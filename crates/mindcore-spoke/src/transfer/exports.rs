@@ -10,9 +10,9 @@ use spoke_schemas::{
     MemoryExportsGetResponse, Principal,
 };
 
-use mindcore_base::ids::SubjectId;
+use mindcore_base::ids::{SpaceId, SubjectId};
 use mindcore_base::ir::{MemoryRepository, PlacementSelection};
-use mindcore_sqlite::MemoryExportRow;
+use mindcore_sqlite::{MemoryExportRow, SqliteMemoryRepository};
 
 use super::{build, ExportSpec};
 use crate::admission::{self, Admission, Coverage};
@@ -42,6 +42,54 @@ fn export_requirement<'a>(
             subject_all: true,
         },
     }
+}
+
+/// The stored export's original selection; `None` is the scope's default.
+fn stored_selection(row: &MemoryExportRow) -> AResult<PlacementSelection> {
+    match &row.selection {
+        Some(stored) => {
+            let value: Value = serde_json::from_str(stored)
+                .map_err(|_| Reject::internal("stored export selection is unreadable"))?;
+            Ok(wire::PlacementSelectionWire::from_json(&value)?.ir())
+        }
+        None => Ok(PlacementSelection::SubjectAll),
+    }
+}
+
+/// §7.30: the coverage paging this stored export requires. A tombstone-inclusive
+/// export additionally needs `admin`.
+fn read_requirements<'a>(
+    row: &'a MemoryExportRow,
+    selection: &'a PlacementSelection,
+) -> Vec<GrantRequirement<'a>> {
+    let subject = row.subject_id.as_deref();
+    let mut requirements = vec![export_requirement("transfer", subject, selection)];
+    if row.include_tombstoned {
+        requirements.push(export_requirement("admin", subject, selection));
+    }
+    requirements
+}
+
+/// §7.30/§7.31: whether the caller may page this stored export at all. Staging
+/// asks before it answers any staging fact about the export's chunks.
+pub(super) async fn readable(
+    repository: &SqliteMemoryRepository,
+    tx: &mut Tx<'_>,
+    row: &MemoryExportRow,
+    principal: &str,
+    now: DateTime<Utc>,
+) -> AResult<bool> {
+    let space = SpaceId::new(row.space_id.as_str());
+    let selection = stored_selection(row)?;
+    let requirements = read_requirements(row, &selection);
+    let grants = admission::wire_grants(&repository.list_grants(tx, &space, None).await?)?;
+    Ok(admission::one_grant_covers(
+        &grants,
+        principal,
+        space.as_str(),
+        now,
+        &requirements,
+    ))
 }
 
 impl MemoryAdapter {
@@ -219,19 +267,8 @@ impl MemoryAdapter {
         let Some(row) = self.repository.export(tx, &op.space, &export_id).await? else {
             return Err(Reject::not_found(format!("export {export_id}")));
         };
-        let subject = row.subject_id.as_deref();
-        let selection = match &row.selection {
-            Some(stored) => {
-                let value: Value = serde_json::from_str(stored)
-                    .map_err(|_| Reject::internal("stored export selection is unreadable"))?;
-                wire::PlacementSelectionWire::from_json(&value)?.ir()
-            }
-            None => PlacementSelection::SubjectAll,
-        };
-        let mut requirements = vec![export_requirement("transfer", subject, &selection)];
-        if row.include_tombstoned {
-            requirements.push(export_requirement("admin", subject, &selection));
-        }
+        let selection = stored_selection(&row)?;
+        let requirements = read_requirements(&row, &selection);
         let admission = Admission {
             operation: GET,
             space: &op.space,

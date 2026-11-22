@@ -52,6 +52,15 @@ pub(super) fn conflict(message: impl Into<String>) -> Reject {
     Reject::terminal(SpokeRejectCode::ImportConflict, message)
 }
 
+/// The one absence answer a staging call may give: it names no import, no ordinal
+/// and no expiry, so a caller who may not read the source export learns nothing.
+pub(super) fn no_staging_import(source_export_id: &str) -> Reject {
+    conflict(format!(
+        "no staging import holds source export {source_export_id}"
+    ))
+    .detail("reason", json!("no_staging_import"))
+}
+
 /// A verification refusal names every failed check, so one attempt reports the
 /// whole broken sequence rather than its first symptom.
 pub(super) fn unverified(errors: Vec<String>) -> Reject {
@@ -124,6 +133,12 @@ fn chunk_errors(
 /// plus every array in its fixed concatenation order.
 pub(super) fn reassemble(sequence: &[Value]) -> Option<Value> {
     let mut bundle = sequence.first()?.get("header")?.as_object()?.clone();
+    // why: the wire header omits an empty `extensions`, while the logical bundle the
+    // sender digested always carries it; restoring `{}` keeps the digest and the
+    // payload schema in agreement.
+    bundle
+        .entry("extensions".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
     for field in BUNDLE_ARRAY_FIELDS {
         if !sequence.iter().any(|chunk| chunk.get(field).is_some()) {
             continue;
@@ -148,6 +163,20 @@ fn key_set<'a>(bundle: &'a Value, field: &str, member: &str) -> BTreeSet<&'a str
         .collect()
 }
 
+/// `GrantSummary.principal_ref` is an opaque correlation label — "never credentials
+/// or tokens" (`spoke-schemas` 0.17.0 `PrincipalRef`). The published contract states
+/// only a minimum length, so the screen is our own emission grammar: `prl_` plus 32
+/// lowercase hex digits. Anything else carries key material, a raw principal id or a
+/// foreign token, and is refused rather than echoed.
+fn correlation_label(value: &str) -> bool {
+    value.strip_prefix("prl_").is_some_and(|label| {
+        label.len() == 32
+            && label
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 /// References and grant summaries: every cross-reference resolves inside the
 /// bundle, and an adopted grant is one the bundle actually carries.
 fn reference_errors(bundle: &Value, adopted: &Value) -> Vec<String> {
@@ -170,6 +199,16 @@ fn reference_errors(bundle: &Value, adopted: &Value) -> Vec<String> {
 
     let mut grant_ids = BTreeSet::new();
     for grant in bundle["grants"].as_array().into_iter().flatten() {
+        if !grant
+            .get("principal_ref")
+            .and_then(Value::as_str)
+            .is_some_and(correlation_label)
+        {
+            errors.push(
+                "a grant summary carries a principal_ref that is not an opaque correlation label"
+                    .to_string(),
+            );
+        }
         let Some(grant_id) = grant.get("grant_id").and_then(Value::as_str) else {
             continue;
         };
@@ -350,6 +389,21 @@ impl MemoryAdapter {
             freeze_gated: false,
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
+        if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
+            return Self::replay::<MemoryImportsStageResponse>(&receipt);
+        }
+
+        // §7.30/§7.31: a caller who could not page the source export is answered the
+        // same absence as a caller who never staged, before any state is read.
+        // why: an export this store never held is foreign, so there is no local
+        // coverage to check and the state a stage reveals is the caller's own.
+        if let Some(export) = self.repository.export_by_id(tx, &source_export_id).await? {
+            if !super::exports::readable(&self.repository, tx, &export, principal_id, op.now)
+                .await?
+            {
+                return Err(no_staging_import(&source_export_id));
+            }
+        }
 
         let staging = self
             .repository
@@ -370,22 +424,37 @@ impl MemoryAdapter {
             None
         } else {
             let Some(row) = staging else {
-                return Err(conflict(format!(
-                    "no staging import holds source export {source_export_id}"
-                ))
-                .detail("reason", json!("no_staging_import")));
+                return Err(no_staging_import(&source_export_id));
             };
             if expired(&row, op.now)? {
                 return Err(expiry_conflict(&row));
             }
             if ordinal != row.next_ordinal {
-                return Err(conflict(format!(
-                    "chunk {ordinal} is out of order; the import expects {}",
-                    row.next_ordinal
-                ))
-                .detail("reason", json!("out_of_order"))
-                .detail("expected_ordinal", json!(row.next_ordinal))
-                .detail("received_ordinal", json!(ordinal)));
+                if ordinal < row.next_ordinal {
+                    return Err(conflict(format!(
+                        "chunk {ordinal} is out of order; the import expects {}",
+                        row.next_ordinal
+                    ))
+                    .detail("reason", json!("out_of_order"))
+                    .detail("expected_ordinal", json!(row.next_ordinal))
+                    .detail("received_ordinal", json!(ordinal)));
+                }
+                // why: a skipped ordinal can never be repaired, and a refusal's writes
+                // roll back with the caller's transaction — so the gap ends the import
+                // as a committed outcome instead of being refused.
+                self.repository
+                    .mark_import_discarded(tx, &row.import_id)
+                    .await?;
+                self.repository
+                    .delete_import_chunks(tx, &row.import_id)
+                    .await?;
+                let result = json!({
+                    "chunks_received": 0,
+                    "import_id": &row.import_id,
+                });
+                let receipt = admission::committed_receipt(&op, &mint("rct"), result);
+                self.repository.insert_receipt(tx, &receipt, None).await?;
+                return Self::ready::<MemoryImportsStageResponse>(project::receipt_body(&receipt));
             }
             Some(row)
         };

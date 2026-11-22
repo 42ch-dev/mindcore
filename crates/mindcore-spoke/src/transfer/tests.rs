@@ -1064,6 +1064,19 @@ async fn stage_into(
     key: &str,
     header: Option<Value>,
 ) -> spoke_operations::SpokeResult<crate::MemoryStage> {
+    stage_as(fixture, space, "p_1", chunk, key, header).await
+}
+
+/// Stage one chunk as `as_principal`; a refusal rolls back so the fixture observes
+/// exactly what that caller's transaction would.
+async fn stage_as(
+    fixture: &Fixture,
+    space: &str,
+    as_principal: &str,
+    chunk: Value,
+    key: &str,
+    header: Option<Value>,
+) -> spoke_operations::SpokeResult<crate::MemoryStage> {
     let adapter = crate::MemoryAdapter::new(false);
     let mut tx = fixture.begin().await;
     let ordinal = chunk["chunk_ordinal"].as_u64().expect("ordinal");
@@ -1084,7 +1097,7 @@ async fn stage_into(
         }
     }
     let result = adapter
-        .stage_import(&mut tx, &principal("p_1"), request)
+        .stage_import(&mut tx, &principal(as_principal), request)
         .await;
     if matches!(result, spoke_operations::SpokeResult::Ok(_)) {
         tx.commit().await.expect("commit stage");
@@ -1161,8 +1174,53 @@ async fn a_valid_single_chunk_sequence_reaches_staged() {
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
 }
 
+/// §7.0.5: the same key and payload replays the recorded outcome and writes
+/// nothing; the same key with a different payload is a conflict at any age.
 #[tokio::test]
-async fn out_of_order_and_repeated_ordinals_conflict_without_staging() {
+async fn stage_import_replays_on_the_same_key_and_conflicts_on_a_new_digest() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    let chunks = staged_source(&fixture, "stage-key-replay").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+
+    let first = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-replay").await);
+    let import_id = first["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    let replay = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-replay").await);
+    assert_eq!(replay["status"], json!("committed"));
+    assert_eq!(replay["result"], first["result"]);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
+            &[SPACE]
+        )
+        .await,
+        1,
+        "a replay stages no second import"
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+
+    let changed = stage_into(
+        &fixture,
+        SPACE,
+        chunks[0].clone(),
+        "stage-replay",
+        Some(json!({ "conflict_policy": "rename_subject" })),
+    )
+    .await;
+    let reject = rejected(&changed);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::IdempotencyConflict
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
+}
+
+#[tokio::test]
+async fn repeated_ordinals_conflict_without_ending_the_import() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
     seed_big_record(&fixture).await;
@@ -1175,16 +1233,6 @@ async fn out_of_order_and_repeated_ordinals_conflict_without_staging() {
         .expect("import id")
         .to_string();
 
-    // Ordinal 2 before ordinal 1.
-    let ahead = stage_chunk(&fixture, chunks[2].clone(), "stage-2-2").await;
-    let reject = rejected(&ahead);
-    assert_eq!(
-        reject.code,
-        spoke_operations::SpokeRejectCode::ImportConflict
-    );
-    assert_eq!(detail(reject, "reason"), &json!("out_of_order"));
-    assert_eq!(detail(reject, "expected_ordinal"), &json!(1));
-
     // The header again, while its import is still staging.
     let repeated_header = stage_chunk(&fixture, chunks[0].clone(), "stage-2-0b").await;
     assert_eq!(
@@ -1194,11 +1242,15 @@ async fn out_of_order_and_repeated_ordinals_conflict_without_staging() {
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
 
     ready(stage_chunk(&fixture, chunks[1].clone(), "stage-2-1").await);
+    // A repeat of an ordinal the import already holds is a retry, not a gap: it
+    // conflicts and leaves the sequence completable.
     let repeated_tail = stage_chunk(&fixture, chunks[1].clone(), "stage-2-1b").await;
+    let reject = rejected(&repeated_tail);
     assert_eq!(
-        rejected(&repeated_tail).code,
+        reject.code,
         spoke_operations::SpokeRejectCode::ImportConflict
     );
+    assert_eq!(detail(reject, "reason"), &json!("out_of_order"));
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 2);
     assert_eq!(
         import_state(&fixture, &import_id).await,
@@ -1210,6 +1262,56 @@ async fn out_of_order_and_repeated_ordinals_conflict_without_staging() {
     assert_eq!(
         import_state(&fixture, &import_id).await,
         ("staged".to_string(), 3)
+    );
+}
+
+/// A chunk that skips an ordinal ends the import: the gap is committed as a
+/// discarded import, so no later chunk can complete that sequence.
+#[tokio::test]
+async fn a_gap_ends_the_import_and_only_a_new_import_can_complete() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    seed_big_record(&fixture).await;
+    let chunks = staged_source(&fixture, "stage-key-gap").await;
+    assert_eq!(chunks.len(), 3, "the oversized record splits the export");
+
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "gap-0").await);
+    let import_id = body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    // Ordinal 2 arrives while ordinal 1 is missing.
+    let gap = ready(stage_chunk(&fixture, chunks[2].clone(), "gap-2").await);
+    assert_eq!(gap["result"]["chunks_received"], json!(0));
+    assert_eq!(gap["result"]["import_id"], json!(import_id));
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("discarded".to_string(), 1)
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
+
+    // Neither the missing ordinal nor the chunk that showed the gap can complete it.
+    for (chunk, key) in [(chunks[1].clone(), "gap-1"), (chunks[2].clone(), "gap-2b")] {
+        let result = stage_chunk(&fixture, chunk, key).await;
+        let reject = rejected(&result);
+        assert_eq!(
+            reject.code,
+            spoke_operations::SpokeRejectCode::ImportConflict
+        );
+        assert_eq!(detail(reject, "reason"), &json!("no_staging_import"));
+    }
+
+    // The only route forward is a new import of the same source export.
+    let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "gap-0b").await);
+    let restarted_id = restarted["result"]["import_id"]
+        .as_str()
+        .expect("restarted import id")
+        .to_string();
+    assert_ne!(restarted_id, import_id);
+    assert_eq!(
+        import_state(&fixture, &restarted_id).await,
+        ("staging".to_string(), 1)
     );
 }
 
@@ -1294,6 +1396,62 @@ async fn an_expired_staging_import_refuses_instead_of_resuming() {
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
 }
 
+/// A caller who may write the target space but cannot page the named source
+/// export learns nothing about it: no import, no ordinal, no expiry.
+#[tokio::test]
+async fn an_unreadable_source_export_answers_generic_absence() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    // p_2 may write TARGET, but inside the source space it holds only a
+    // subject-scoped grant, so a whole-space export is not readable there.
+    {
+        let mut tx = fixture.begin().await;
+        let mut row = grant("g_target_p2", None, "p_2", &[], false, false);
+        row.space_id = SpaceId::new(TARGET);
+        row.capabilities = vec![
+            "admin".to_string(),
+            "records_read".to_string(),
+            "transfer".to_string(),
+        ];
+        fixture
+            .repository
+            .insert_grant(&mut tx, &row)
+            .await
+            .expect("seed p_2 target grant");
+        tx.commit().await.expect("commit p_2 target grant");
+    }
+    let chunks = staged_source(&fixture, "stage-key-read").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+
+    let refused = stage_as(&fixture, TARGET, "p_2", chunks[0].clone(), "read-0", None).await;
+    let reject = rejected(&refused);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("no_staging_import"));
+    let details = reject.details.as_ref().expect("refusal details");
+    assert!(!details.contains_key("expected_ordinal"));
+    assert!(!details.contains_key("expires_at"));
+    assert!(!details.contains_key("import_id"));
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        0,
+        "an unreadable source export stages nothing"
+    );
+
+    // The export's own reader stages the same chunk: the screen is on the caller's
+    // coverage of the source export, not on the export.
+    let staged = ready(stage_as(&fixture, TARGET, "p_1", chunks[0].clone(), "read-0b", None).await);
+    assert_eq!(staged["result"]["chunks_received"], json!(1));
+}
+
 fn reseal(bundle: &mut Value) {
     let digest = hex_digest_excluding(bundle, "digest");
     bundle
@@ -1372,8 +1530,93 @@ async fn sequence_verification_rejects_versions_references_and_adoptions() {
     );
 }
 
-// ---- §7.32/§7.33 imports.activate and imports.discard ----
+/// `GrantSummary.principal_ref` is an opaque correlation label. A value that
+/// carries key material — here a bearer token — is refused by final verification
+/// without being echoed.
+#[tokio::test]
+async fn a_grant_summary_whose_principal_ref_looks_like_a_token_is_refused() {
+    let fixture = Fixture::open().await;
+    let mut tx = fixture.begin().await;
+    let artifact = ok(
+        build(
+            &fixture.repository,
+            &mut tx,
+            &spec(None, PlacementSelection::SubjectAll),
+        )
+        .await,
+        "build export",
+    );
+    tx.rollback().await.expect("rollback build");
 
+    let mut bundle = artifact.bundle.clone();
+    let grant = bundle["grants"]
+        .as_array_mut()
+        .and_then(|grants| grants.first_mut())
+        .expect("the fixture exports a grant summary");
+    let label = grant["principal_ref"].as_str().expect("principal ref");
+    assert!(label.starts_with("prl_"), "the export labels the principal");
+    let token = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwXzEifQ";
+    grant["principal_ref"] = json!(token);
+    reseal(&mut bundle);
+
+    let chunks = sealed_partition(&bundle);
+    let errors = super::stage::verification_errors(
+        &chunks,
+        chunks.len() as u64,
+        bundle["digest"].as_str().expect("digest"),
+        "exp_1",
+        &json!([]),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("not an opaque correlation label")),
+        "{errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains(token)),
+        "the refusal never echoes the value it refused: {errors:?}"
+    );
+}
+
+/// The wire header omits an empty `extensions`; reassembly restores `{}`, so a
+/// header without the member still decodes as a `MemoryExportBundle`.
+#[tokio::test]
+async fn a_header_that_omits_empty_extensions_still_reassembles() {
+    let fixture = Fixture::open().await;
+    let mut tx = fixture.begin().await;
+    let artifact = ok(
+        build(
+            &fixture.repository,
+            &mut tx,
+            &spec(None, PlacementSelection::SubjectAll),
+        )
+        .await,
+        "build export",
+    );
+    tx.rollback().await.expect("rollback build");
+
+    let mut chunks = sealed_partition(&artifact.bundle);
+    chunks[0]["header"]
+        .as_object_mut()
+        .expect("ordinal zero carries the header")
+        .remove("extensions");
+    let bytes = spoke_operations::content_serialized_bytes(&chunks[0]);
+    chunks[0]["bytes"] = json!(bytes);
+    let chunk_digest = hex_digest_excluding(&chunks[0], "chunk_digest");
+    chunks[0]["chunk_digest"] = json!(chunk_digest);
+
+    let errors = super::stage::verification_errors(
+        &chunks,
+        chunks.len() as u64,
+        artifact.digest.as_str(),
+        "exp_1",
+        &json!([]),
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+// ---- §7.32/§7.33 imports.activate and imports.discard ----
 const TARGET: &str = "spc_target";
 
 /// A second, empty space where `p_1` holds `transfer` and `admin`.
