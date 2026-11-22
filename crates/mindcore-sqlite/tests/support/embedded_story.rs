@@ -70,7 +70,7 @@ fn timestamp(text: &str) -> DateTime<Utc> {
     text.parse().expect("valid RFC 3339 timestamp")
 }
 
-// The shared seed is a fixture file, not a second fixture: it is read as typed entries.
+// note: the shared seed is a fixture file, not a second fixture: it is read as typed entries.
 fn shared_fixture() -> (String, Vec<KnowledgeEntry>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/iteration-01/shared-collection.json");
@@ -113,7 +113,7 @@ fn reference(kind: &str, id: &str) -> Value {
     json!({"kind": kind, "id": id, "namespace": "mindcore"})
 }
 
-// Task 1's record, verbatim, with the scenario's truth, acquisition route and retained record.
+// note: Task 1's record, verbatim, with the scenario's truth, acquisition route and retained record.
 fn belief_record(
     record_id: &str,
     truth: &str,
@@ -153,7 +153,7 @@ fn belief_record(
     })
 }
 
-// Pinned schemas ship one copy of `SourceAnchor` per schema and only the knowledge_entry copy is
+// why: pinned schemas ship one copy of `SourceAnchor` per schema and only the knowledge_entry copy is
 // accepted by `KnowledgeEntry.source_anchor`; their wire shapes are identical.
 pub fn entry_anchor(
     anchor: spoke_schemas::SourceAnchor,
@@ -173,7 +173,7 @@ pub fn record_ids(records: &[Value]) -> Vec<&str> {
         .collect()
 }
 
-// The envelope holder and every assessment's holder/assessor must name one entry.
+// invariant: the envelope holder and every assessment's holder/assessor must name one entry.
 fn assert_holder_consistency(value: &Value) {
     let holder = &value["holder_entry_id"];
     for item in value["cognition"]["items"]
@@ -200,12 +200,12 @@ fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
     }
 }
 
-// Host control-plane provisioning: the protocol has no create-space or first-grant operation, so
+// why: host control-plane provisioning: the protocol has no create-space or first-grant operation, so
 // the host writes one active space and one space-wide grant per space. Everything after this is a
 // protocol operation.
 pub async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    // One host transaction covers both rows: a failed grant must not leave an active space.
+    // why: one host transaction covers both rows: a failed grant must not leave an active space.
     let mut tx = pool.begin().await.expect("begin the provisioning");
     sqlx::query(
         "INSERT INTO memory_spaces \
@@ -477,7 +477,7 @@ pub async fn run_story(label: &str) {
     let path = temp.database_path();
     let store = MindStore::open(&path).await.expect("open store");
 
-    // Setup: three collections, two principals, two protocol spaces, one shared fixture entry.
+    // note: setup: three collections, two principals, two protocol spaces, one shared fixture entry.
     let wren_caller = principal("caller_wren");
     let studio_caller = principal("caller_studio");
     let pool = store.pool();
@@ -507,7 +507,7 @@ pub async fn run_story(label: &str) {
         path.display()
     );
 
-    // S1: Wren hears about the gate; hearing is not yet knowledge.
+    // note: S1 — Wren hears about the gate; hearing is not yet knowledge.
     let hearing = capture(
         &pool,
         &adapter,
@@ -548,7 +548,7 @@ pub async fn run_story(label: &str) {
         &format!("hearing: captured {hearing} in wren/tavern; recall empty; no personal entry"),
     );
 
-    // S2: a catalog read through the shared scope changes nothing on Wren's side.
+    // note: S2 — a catalog read through the shared scope changes nothing on Wren's side.
     let shared_read = expect_ok(
         facts.get_knowledge_entry(&shared_entry_id).await,
         "read the shared entry",
@@ -565,7 +565,7 @@ pub async fn run_story(label: &str) {
         "catalog read: shared entry revision 1 unchanged; wren has no entries; derived state NoRecords",
     );
 
-    // S3: adoption writes a personal entry and retains the hearing, leaving the shared entry alone.
+    // note: S3 — adoption writes a personal entry and retains the hearing, leaving the shared entry alone.
     let mut adoption = entry(
         "ke_wren_north_gate",
         "location",
@@ -603,7 +603,7 @@ pub async fn run_story(label: &str) {
     )
     .await;
 
-    // The same review key replays its committed receipt instead of staging a second record.
+    // why: the same review key replays its committed receipt instead of staging a second record.
     let mut tx = pool.begin().await.expect("begin the review replay");
     let replay = ready(
         adapter
@@ -619,7 +619,7 @@ pub async fn run_story(label: &str) {
     assert_eq!(replay["receipt_id"], json!(hearsay_receipt));
     assert_eq!(replay["result"]["record_ids"], json!([hearsay.clone()]));
 
-    // A second review of the same candidate under a fresh key is refused: one candidate yields
+    // why: a second review of the same candidate under a fresh key is refused: one candidate yields
     // one retained record.
     let mut tx = pool.begin().await.expect("begin the second review");
     assert_eq!(
@@ -637,7 +637,7 @@ pub async fn run_story(label: &str) {
     );
     tx.rollback().await.expect("rollback the second review");
 
-    // Scoped isolation, now that a record exists: the record is recallable in its own scope and
+    // why: scoped isolation, now that a record exists: the record is recallable in its own scope and
     // must not answer another space's or another subject's recall. S1's cross-space recall ran
     // while both spaces were empty, so it could not tell a filtered recall from an unfiltered one;
     // the positive control below keeps these refusals from being vacuous in turn.
@@ -686,7 +686,7 @@ pub async fn run_story(label: &str) {
         ),
     );
 
-    // S4: the personal carrier starts empty, then records a doubt citing the retained hearsay.
+    // note: S4 — the personal carrier starts empty, then records a doubt citing the retained hearsay.
     let carrier_entry = entry(
         "ke_wren_cognition",
         "character",
@@ -700,7 +700,7 @@ pub async fn run_story(label: &str) {
         read_carrier(&wren, "ke_wren_cognition").await,
         "read the empty carrier",
     );
-    // The supplied assessment time is bound once, so the projection must return this exact value.
+    // why: the supplied assessment time is bound once, so the projection must return this exact value.
     let doubt_assessed_at = "2026-11-19T18:05:00Z";
     let doubt = append_cognition_record(
         &carrier,
@@ -735,7 +735,7 @@ pub async fn run_story(label: &str) {
         "doubt: cog_hearsay persisted (truth Unknown, Testimony) at carrier revision 2; mind state valid",
     );
 
-    // S5: perception at the gate revises the judgment; the revision is conditional.
+    // note: S5 — perception at the gate revises the judgment; the revision is conditional.
     let gate_observed_at = "2026-11-19T19:30:00Z";
     let observation = capture(
         &pool,
@@ -774,7 +774,7 @@ pub async fn run_story(label: &str) {
     );
     let revision_before = carrier.revision.expect("the carrier holds a revision");
     assert_eq!(revision_before, 2);
-    // Same binding rule as the doubt: the projection must return this exact value.
+    // why: same binding rule as the doubt: the projection must return this exact value.
     let revision_assessed_at = "2026-11-19T19:35:00Z";
     let reconsidered = append_cognition_record(
         &carrier,
@@ -827,7 +827,7 @@ pub async fn run_story(label: &str) {
         "appending the revision must preserve the first record"
     );
 
-    // Value preservation: the projection must return the `assessed_at` supplied above, not a
+    // why: value preservation: the projection must return the `assessed_at` supplied above, not a
     // store-assigned or recomputed time. Expected values are the bound inputs themselves.
     assert_eq!(
         assessments[0]["assessed_at"],
@@ -850,7 +850,7 @@ pub async fn run_story(label: &str) {
             .as_str()
             .expect("the doubt carries its assessment time"),
     );
-    // Story times only: the store-assigned `created_at` is wall-clock, so comparing against it
+    // why: story times only: the store-assigned `created_at` is wall-clock, so comparing against it
     // would fail as soon as real time passes the story's fixed instant.
     let gate_observed = timestamp(gate_observed_at);
     assert!(
@@ -876,7 +876,7 @@ pub async fn run_story(label: &str) {
         ),
     );
 
-    // S6: the shared catalog moves on without touching Wren's entry or derived records.
+    // note: S6 — the shared catalog moves on without touching Wren's entry or derived records.
     let shared_before_update = expect_ok(
         facts.get_knowledge_entry(&shared_entry_id).await,
         "read the shared entry before its update",
@@ -928,7 +928,7 @@ pub async fn run_story(label: &str) {
         "shared change: shared entry revision 2 carries the new summary; Wren entry revision 1; derived records and projection identical to step 5",
     );
 
-    // S7: the file, not the process, holds the mind.
+    // note: S7 — the file, not the process, holds the mind.
     let expected_value =
         mind_state_value(&view_after_shared, "ms_wren_story").expect("render the pre-close state");
     let expected_holder = view_after_shared.holder_entry_id.clone();
@@ -965,7 +965,7 @@ pub async fn run_story(label: &str) {
         ),
     );
 
-    // S8: scope and revision refusals leave both collections exactly as they were.
+    // note: S8 — scope and revision refusals leave both collections exactly as they were.
     assert_eq!(
         expect_reject(
             studio.get_knowledge_entry("ke_wren_north_gate").await,
@@ -1017,7 +1017,7 @@ pub async fn run_story(label: &str) {
         SpokeRejectCode::KnowledgeEntryNotFound
     );
 
-    // A write aimed at a collection that holds no such row is stale, never a create.
+    // why: a write aimed at a collection that holds no such row is stale, never a create.
     assert_eq!(
         expect_reject(
             studio.put_knowledge_entry(updated.clone(), Some(2)).await,

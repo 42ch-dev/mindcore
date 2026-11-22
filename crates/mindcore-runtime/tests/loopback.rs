@@ -841,7 +841,7 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
         MindProviders::default(),
         workflow_routes,
     );
-    // Both peers are admitted; each principal's route names its own collection.
+    // note: both peers are admitted; each principal's route names its own collection.
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
     assert!(
@@ -851,7 +851,7 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
     );
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[RECALL_CONTEXT]).await;
-    // One token per serialized byte: two records plus the carrier entry need a wider budget than
+    // why: one token per serialized byte: two records plus the carrier entry need a wider budget than
     // the default fixture pack.
     let mut arguments = recall_arguments();
     arguments["max_tokens"] = json!(4_000);
@@ -950,7 +950,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
         "the evidence carries nothing the carrier does not already hold"
     );
     assert_eq!(result["verdict"]["record_ids"], json!(["rec_north_gate"]));
-    // `no_change` is the branch that reads the carrier and writes nothing: the carrier is still at
+    // why: `no_change` is the branch that reads the carrier and writes nothing: the carrier is still at
     // the revision the snapshot read. The settled branch's carrier write is covered by the
     // workflow tests in `mindcore-spoke`.
     let revision: i64 = sqlx::query_scalar(
@@ -1002,7 +1002,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
 
-    // The first principal's verdict lands on its own collection's carrier, and nothing in the
+    // why: the first principal's verdict lands on its own collection's carrier, and nothing in the
     // second collection may change: capture it immediately before the call.
     let first = connect(&surface, &[DELIBERATE, RECALL_CONTEXT]).await;
     let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
@@ -1042,7 +1042,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         "the first call leaves the second collection's rows, carrier revision and update stamp unchanged"
     );
 
-    // The second principal settles onto its own carrier, never the first's.
+    // why: the second principal settles onto its own carrier, never the first's.
     let second = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE, RECALL_CONTEXT]).await;
     let untouched = collection_state(&pool, COLLECTION, CARRIER).await;
     let settled = expect_ok(
@@ -1083,7 +1083,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         "the second call leaves the first collection's rows, carrier revision and update stamp unchanged"
     );
 
-    // A recall's slot is routed per principal too: each peer lists only its own collection's
+    // why: a recall's slot is routed per principal too: each peer lists only its own collection's
     // entry, never the other principal's, whichever route the host configured first.
     let mut recall = recall_arguments();
     recall["max_tokens"] = json!(4_000);
@@ -1123,7 +1123,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         "the slot carries this collection's entry, not the other principal's copy: {second_pack}"
     );
 
-    // The route fixes the collection, the request's holder names the entry inside it: the first
+    // why: the route fixes the collection, the request's holder names the entry inside it: the first
     // principal naming the second principal's holder is refused, and neither collection changes.
     let first_before = collection_state(&pool, COLLECTION, CARRIER).await;
     let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
@@ -1216,7 +1216,7 @@ async fn a_peer_without_a_route_cannot_write_the_carrier() {
         "a refused carrier write leaves the entry untouched"
     );
 
-    // The same unrouted peer still recalls its memory: one token per serialized byte, so the two
+    // why: the same unrouted peer still recalls its memory: one token per serialized byte, so the two
     // records need a wider budget than the default pack.
     let mut arguments = recall_arguments();
     arguments["max_tokens"] = json!(4_000);
@@ -1581,7 +1581,7 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
 
-    // Identity 1 writes its partition and installs the one query slot.
+    // note: identity 1 writes its partition and installs the one query slot.
     expect_ok(
         session
             .adapter
@@ -1595,7 +1595,7 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
         "the serving identity stores one row per live record"
     );
 
-    // Rotation moves the slot to identity 2; identity 1's rows stay until it is retired.
+    // note: rotation moves the slot to identity 2; identity 1's rows stay until it is retired.
     embedder.rotate();
     expect_ok(
         session
@@ -1622,7 +1622,7 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
         "another identity's rows survive"
     );
 
-    // Identity 2's slot and rows are still warm: a recall needs no provider call at all.
+    // why: identity 2's slot and rows are still warm: a recall needs no provider call at all.
     let before = embedder.embedded().len();
     expect_ok(
         session
@@ -1637,7 +1637,7 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
         "another identity's query slot survives the retirement"
     );
 
-    // The retired identity recomputes instead of serving rows it no longer has.
+    // why: the retired identity recomputes instead of serving rows it no longer has.
     embedder.rotate();
     let before = embedder.embedded().len();
     expect_ok(
@@ -1691,7 +1691,7 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
 
-    // Two recalls under identity 1 leave its query slot warm: the second embeds nothing.
+    // why: two recalls under identity 1 leave its query slot warm: the second embeds nothing.
     expect_ok(
         session
             .adapter
@@ -1713,7 +1713,7 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
         "identity 1 stores one row per live record"
     );
 
-    // Retiring the identity that owns the cached slot empties the slot with its partition.
+    // why: retiring the identity that owns the cached slot empties the slot with its partition.
     let deleted = expect_ok(
         surface.retire_embedding_identity(&axes_identity("1")).await,
         "retire the warm identity 1",
@@ -1738,7 +1738,7 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
         "the retired identity re-embeds its query instead of reusing the cleared slot"
     );
 
-    // Identity 2 installs a warm slot of its own; retiring identity 1 leaves it warm.
+    // why: identity 2 installs a warm slot of its own; retiring identity 1 leaves it warm.
     embedder.rotate();
     expect_ok(
         session

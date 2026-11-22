@@ -527,12 +527,12 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let mut transaction = self.pool.begin().await.map_err(|error| {
             internal(format!("vector read transaction could not begin: {error}"))
         })?;
-        // The same authorized read as the recall itself: a page that lost its
+        // why: the same authorized read as the recall itself — a page that lost its
         // grant or became withheld refuses here, so no row is probed for it.
         let records = self
             .authorized_page(&mut transaction, principal, request)
             .await?;
-        // The page the caller holds is the only one this read may serve: a
+        // why: the page the caller holds is the only one this read may serve — a
         // record that moved after the first read is refused before its new
         // revision is looked up, so a decode of the newer row can never
         // surface as a storage error instead of the conflict.
@@ -620,7 +620,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         };
         let mut candidates = Vec::with_capacity(candidate_ids.len());
         for candidate_id in candidate_ids {
-            // A fresh capture just inserted its candidate pending. A replay
+            // why: a fresh capture just inserted its candidate pending. A replay
             // reports the Pending decision its absorb run recorded, and only
             // otherwise the state that run left, read under the receipt that
             // names it.
@@ -673,7 +673,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         )
         .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
         let space = SpaceId::new(request.space_id.to_string());
-        // The capture transaction has already committed: take the write
+        // why: the capture transaction has already committed — take the write
         // reservation, verify that exact receipt and insert the marker, with
         // no provider call or settlement inside this short transaction.
         let mut transaction = self
@@ -704,7 +704,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                     receipt.receipt_id
                 ))
             })?;
-        // Capture receipt order, not the caller's order, owns the marker.
+        // why: capture receipt order, not the caller's order, owns the marker.
         let mut pending = Vec::with_capacity(pending_candidate_ids.len());
         for candidate in captured {
             let candidate = candidate.as_str().ok_or_else(|| {
@@ -743,7 +743,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             .await
             .map_err(|error| internal(format!("absorb decision could not be read: {error}")))?
         {
-            // The journal's unique receipt id makes the write idempotent: only
+            // why: the journal's unique receipt id makes the write idempotent — only
             // a marker equal in its complete identity and decision is
             // authoritative; any other row under that receipt is corruption.
             Some(existing)
@@ -805,7 +805,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                     "memory.candidates.get candidate does not decode: {error}"
                 ))
             })?;
-        // A consumed candidate owes no page: the workflow reports its recorded
+        // why: a consumed candidate owes no page — the workflow reports its recorded
         // outcome instead of deciding again.
         let MemoryCandidate::PendingCandidate(pending) = &candidate else {
             transaction.commit().await.map_err(|error| {
@@ -907,7 +907,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             let intent = self
                 .staged_intent(&mut transaction, &space, receipt_id)
                 .await?;
-            // The dismissal leg names no record in its result, so only the
+            // why: the dismissal leg names no record in its result, so only the
             // update leg's own result yields a revision here.
             settled.extend(
                 self.staged_revisions(&mut transaction, &space, &intent)
@@ -915,7 +915,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             );
             intents.push((receipt_id.clone(), intent.targets));
         }
-        // Both effects are in this one staging transaction: a refusal above
+        // why: both effects are in this one staging transaction — a refusal above
         // rolls the transaction back with both of them.
         transaction.commit().await.map_err(|error| {
             uncertain_commit(
@@ -972,7 +972,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         expected: &SnapshotFact,
         fills: &[RecordFill],
     ) -> Result<(), SpiError> {
-        // A fill writes under the transaction that reauthorizes it. Take the
+        // why: a fill writes under the transaction that reauthorizes it. Take the
         // write reservation at begin so no other connection can commit
         // between the reauthorization read and the first fill: a deferred
         // begin would upgrade a snapshot another writer already invalidated
@@ -1005,7 +1005,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .into_spoke(),
             ));
         }
-        // Only the page read above authorizes a fill; with the write
+        // why: only the page read above authorizes a fill; with the write
         // reservation held from begin, a cache-only failure below is a miss,
         // never an invalidated release.
         if let Some(identity_hash) = identity_hash {
@@ -1030,7 +1030,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .await;
             }
         }
-        // The reauthorization above is what the release rests on: a failed
+        // why: the reauthorization above is what the release rests on — a failed
         // cache write rolls back to misses and still releases.
         let _ = transaction.commit().await;
         Ok(())
@@ -1051,7 +1051,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             internal(format!("vector fill transaction could not begin: {error}"))
         })?;
         for fill in fills {
-            // The fill rechecks in this transaction what the warm read saw:
+            // why: the fill rechecks in this transaction what the warm read saw —
             // work that outlived a newer revision or a withheld subject writes
             // nothing.
             let body = ready(
@@ -1116,7 +1116,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 "update receipt transaction could not commit: {error}"
             ))
         })?;
-        // Retention: capture and update receipts are rows of one table under
+        // why: retention — capture and update receipts are rows of one table under
         // one aged policy, and this crate has no per-op retention branch; the
         // capture receipt is minted first, so a replay is refused there before
         // an aged-out update receipt could be read here.
@@ -1244,7 +1244,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 .into_spoke(),
             ));
         }
-        // The append validates the record, inserts its one row and advances the head and
+        // why: the append validates the record, inserts its one row and advances the head and
         // the carrier revision inside this transaction; the workflow's grant, withholding
         // and citation rechecks above already ran against the same snapshot.
         let assigned = match append_cognition(
@@ -1366,7 +1366,7 @@ async fn absorb_decision(
         .and_then(Value::as_str)
         .ok_or_else(|| internal("a replayed capture carries no receipt_id".to_string()))?;
     let space = SpaceId::new(space_id.to_string());
-    // The receipt id is globally unique, so the row under it is read whole and
+    // why: the receipt id is globally unique, so the row under it is read whole and
     // its space validated below: filtering by space first would hide a
     // corrupted marker as one that was never written.
     let Some(marker) = SqliteMemoryRepository
@@ -1382,7 +1382,7 @@ async fn absorb_decision(
     };
     let requester = body.get("requester_principal_id").and_then(Value::as_str);
     let key = body.get("idempotency_key").and_then(Value::as_str);
-    // The payload is exactly the receipt-ordered pending list: a right list
+    // why: the payload is exactly the receipt-ordered pending list — a right list
     // beside any other member is as malformed as a wrong one, so replay
     // accepts no shape the repeat write refuses. The array moves out of the
     // decoded marker rather than being re-collected id by id: this read only
@@ -1416,7 +1416,7 @@ async fn absorb_decision(
             "capture receipt {receipt_id} holds a malformed absorb decision"
         )));
     };
-    // The decision is a nonempty subsequence of the capture receipt's own
+    // why: the decision is a nonempty subsequence of the capture receipt's own
     // list: order and uniqueness come from that list, so an empty, repeated or
     // reordered decision is corruption, never the recorded one.
     let mut held = capture_candidates.iter();

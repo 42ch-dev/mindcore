@@ -691,7 +691,7 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
                 .expect("the advertised argument is an object")
                 .remove(&member);
 
-            // The advertised schema refuses the argument, not only serde.
+            // why: the advertised schema refuses the argument, not only serde.
             match validate_tool_arguments(&descriptor, &missing) {
                 SpokeResult::Reject(reject) => {
                     assert_eq!(
@@ -718,7 +718,7 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
                 ),
             }
 
-            // And the handler requires it too, so advertisement and behavior agree.
+            // why: the handler requires it too, so advertisement and behavior agree.
             let reject = expect_reject(
                 tool.call(capability_id, "peer-driver", missing).await,
                 &format!("{capability_id}: argument without {member}"),
@@ -731,7 +731,7 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
         }
     }
 
-    // The provider refuses `cognition_filter`, so the served shape does not advertise it either.
+    // why: the provider refuses `cognition_filter`, so the served shape does not advertise it either.
     let recall = tool
         .descriptors()
         .into_iter()

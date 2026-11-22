@@ -383,7 +383,7 @@ async fn get_record_round_trips_wire_through_ir() {
     assert_eq!(record["content"], stored["content"]);
     assert_eq!(record["scope"], stored["scope"]);
     assert_eq!(record["revision"], 1);
-    // The projection is a valid protocol body: it decodes through the codec.
+    // why: the projection is a valid protocol body — it decodes through the codec.
     mindcore_base::ir::wire::memory_record_from_wire(record.clone())
         .expect("the rebuilt body decodes to IR");
     tx.rollback().await.expect("rollback");
@@ -540,7 +540,7 @@ async fn journaled_mutation_stages_and_the_caller_rollback_erases_it() {
     };
     assert_eq!(space.as_str(), SPACE);
 
-    // Staged, inside the caller's transaction.
+    // note: staged, inside the caller's transaction.
     assert_eq!(harness.count(&mut tx, "memory_records").await, 1);
     let receipt = sqlx::query!(
         "SELECT status, result_json FROM memory_receipts WHERE receipt_id = ?",
@@ -573,7 +573,7 @@ async fn journaled_mutation_stages_and_the_caller_rollback_erases_it() {
         .expect("content")
         .contains("record_id:"));
 
-    // No record survives the caller's rollback: the adapter committed nothing.
+    // why: no record survives the caller's rollback — the adapter committed nothing.
     tx.rollback().await.expect("rollback");
     assert_eq!(harness.count_pool("memory_records").await, 0);
     assert_eq!(harness.count_pool("memory_receipts").await, 0);
@@ -780,7 +780,7 @@ async fn empty_required_profile_is_incomplete() {
     );
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
 
-    // With authored content the same basis generates: the gate refused the
+    // why: with authored content the same basis generates — the gate refused the
     // empty document, not the subject.
     sqlx::query!(
         "UPDATE memory_profiles SET document_json = ? \
@@ -969,10 +969,10 @@ async fn grant_expiry_is_compared_as_an_instant() {
 
     let harness = Harness::open().await;
     harness.seed_grant(PRINCIPAL, &["capture"]).await;
-    // Text sorts after `now` (local wall clock is ~10h ahead) but the instant
+    // why: text sorts after `now` (local wall clock is ~10h ahead) but the instant
     // is two hours in the past.
     let expired = offset_stamp(-120, 12);
-    // Text sorts before `now` (local wall clock is ~10h behind) but the instant
+    // why: text sorts before `now` (local wall clock is ~10h behind) but the instant
     // is two hours in the future.
     let live = offset_stamp(120, -12);
     harness
@@ -1001,7 +1001,7 @@ async fn grant_expiry_is_compared_as_an_instant() {
     );
     let receipt_id = body["receipt_id"].as_str().expect("receipt id").to_string();
 
-    // Expired by instant: no participation, and an admin grant cannot rescue it.
+    // why: expired by instant — no participation, and an admin grant cannot rescue it.
     let expired_probe = adapter
         .get_receipt(
             &mut tx,
@@ -1013,7 +1013,7 @@ async fn grant_expiry_is_compared_as_an_instant() {
     assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
     assert_eq!(retry_class(refusal), "terminal");
 
-    // Live by instant: the offset grant participates and reads its own receipt.
+    // why: live by instant — the offset grant participates and reads its own receipt.
     let own = ready(
         adapter
             .capture(
@@ -1078,7 +1078,7 @@ async fn digest_binds_the_original_request_not_the_normalized_dto() {
         .expect("receipt id")
         .to_string();
 
-    // Only a normalized member differs, but the original bytes differ: the key
+    // why: only a normalized member differs, but the original bytes differ — the key
     // names a different payload and must not replay the earlier receipt.
     let collision = adapter
         .capture(&mut tx, &principal(PRINCIPAL), without_null.clone())
@@ -1087,7 +1087,7 @@ async fn digest_binds_the_original_request_not_the_normalized_dto() {
     assert_eq!(refusal.code, SpokeRejectCode::IdempotencyConflict);
     assert_eq!(retry_class(refusal), "terminal");
 
-    // The identical original request still replays its receipt.
+    // why: the identical original request still replays its receipt.
     let replay = ready(
         adapter
             .capture(&mut tx, &principal(PRINCIPAL), with_null)
@@ -1142,7 +1142,7 @@ async fn revoked_grant_denies_subject_and_profile_reads() {
     assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
     assert_eq!(retry_class(refusal), "terminal");
 
-    // Unrevoked and unexpired: both reads proceed (the profile read is
+    // why: unrevoked and unexpired — both reads proceed (the profile read is
     // honestly empty rather than refused).
     let subject = ready(
         adapter
@@ -1290,7 +1290,7 @@ async fn stale_record_revision_rejects_without_a_second_write() {
         other => panic!("expected a journal pending stage, got {other:?}"),
     };
     tx.commit().await.expect("commit");
-    // The caller publishes the intent's file targets before settling.
+    // note: the caller publishes the intent's file targets before settling.
     let mut tx = harness.begin().await;
     let targets = harness.targets(&mut tx, &receipt_id).await;
     tx.rollback().await.expect("rollback");
@@ -1359,7 +1359,7 @@ async fn revoked_coverage_blocks_replay_but_not_poll() {
         "idempotency_key": "cap-y04-seq"
     });
 
-    // 1-2: admin issues grant A (capture) to the requester; the requester
+    // note: 1-2 — admin issues grant A (capture) to the requester; the requester
     // stages its effect under A.
     let mut tx = harness.begin().await;
     let granted = ready(
@@ -1391,7 +1391,7 @@ async fn revoked_coverage_blocks_replay_but_not_poll() {
     let receipt_id = body["receipt_id"].as_str().expect("receipt").to_string();
     tx.commit().await.expect("commit capture");
 
-    // 3-4: revoke A and issue B (read-only participation) for the requester.
+    // note: 3-4 — revoke A and issue B (read-only participation) for the requester.
     let mut tx = harness.begin().await;
     let _ = ready(
         adapter
@@ -1423,7 +1423,7 @@ async fn revoked_coverage_blocks_replay_but_not_poll() {
     );
     tx.commit().await.expect("commit revoke+grant");
 
-    // Poll succeeds through B; replay of the A effect refuses; the stranger
+    // why: poll succeeds through B; replay of the A effect refuses; the stranger
     // sees the same refusal for known and unknown ids.
     let mut tx = harness.begin().await;
     let poll = ready(
@@ -1493,7 +1493,7 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
         SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
         other => panic!("expected a journal pending stage, got {other:?}"),
     };
-    // Baseline uncertainty before commit: the same key cannot re-stage.
+    // why: baseline uncertainty before commit — the same key cannot re-stage.
     let replay = adapter
         .create_record(&mut tx1, &principal(PRINCIPAL), request.clone())
         .await;
@@ -1502,7 +1502,7 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
     assert_eq!(retry_class(refusal), "uncertain");
     tx1.commit().await.expect("commit stage");
 
-    // Committed stage, still unsettled: replay stays uncertain and the poll
+    // why: committed stage, still unsettled — replay stays uncertain and the poll
     // reports the pending status honestly.
     let mut tx = harness.begin().await;
     let replay = adapter
@@ -1522,7 +1522,7 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
     assert_eq!(retry_class(refusal), "uncertain");
     tx.rollback().await.expect("rollback");
 
-    // The caller's publication phase: every owed file target must land before
+    // why: the caller's publication phase — every owed file target must land before
     // settlement — until then the intent keeps its targets.
     let mut tx = harness.begin().await;
     let targets = harness.targets(&mut tx, &receipt_id).await;
@@ -1530,7 +1530,7 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
     tx.rollback().await.expect("rollback");
     assert!(harness.publish(&targets).await, "publication must confirm");
 
-    // After confirmed publication the caller settles in a fresh transaction.
+    // note: after confirmed publication the caller settles in a fresh transaction.
     let mut tx2 = harness.begin().await;
     let settled = adapter
         .settle_journal(&mut tx2, &SpaceId::new(SPACE), &receipt_id)
@@ -1540,7 +1540,7 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
         SpokeResult::Reject(reject) => panic!("settle rejected: {reject:?}"),
     };
     assert_eq!(body["status"], "committed");
-    // Settlement scrubs the owed targets the publication already covered.
+    // why: settlement scrubs the owed targets the publication already covered.
     assert!(harness.targets(&mut tx2, &receipt_id).await.is_empty());
     tx2.commit().await.expect("commit settle");
 
@@ -1558,7 +1558,7 @@ async fn settle_journal_applies_intent_and_commits_receipt() {
         json!([])
     );
 
-    // Settled: the replay returns the stored result instead of a new effect.
+    // why: settled — the replay returns the stored result instead of a new effect.
     let mut tx = harness.begin().await;
     let replay = ready(
         adapter
@@ -1633,7 +1633,7 @@ async fn settle_journal_reports_mismatch_as_uncertain() {
     tx.commit().await.expect("commit");
 
     let mut tx = harness.begin().await;
-    // The pending receipt carries no intent: refusing, never a receipt/success.
+    // why: the pending receipt carries no intent — refusing, never a receipt/success.
     let orphan = adapter
         .settle_journal(&mut tx, &SpaceId::new(SPACE), "rct_orphan")
         .await;
@@ -1641,13 +1641,13 @@ async fn settle_journal_reports_mismatch_as_uncertain() {
     assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
     assert_eq!(retry_class(refusal), "terminal");
 
-    // An already-committed non-journal receipt returns its stored result.
+    // why: an already-committed non-journal receipt returns its stored result.
     let settled = adapter
         .settle_journal(&mut tx, &SpaceId::new(SPACE), &committed_id)
         .await;
     assert!(settled.is_ok(), "committed receipt settles: {settled:?}");
 
-    // Force the pending intent ahead of its receipt: the settle pair refuses
+    // why: force the pending intent ahead of its receipt — the settle pair refuses
     // as uncertainty and the caller's rollback keeps both sides untouched.
     sqlx::query!(
         "UPDATE memory_journal SET state = 'applied' WHERE receipt_id = ?",
@@ -1741,7 +1741,7 @@ async fn complete_reflection_settles_only_for_the_same_owner() {
         SpokeResult::Ok(MemoryStage::ReflectionPending(work)) => work,
         other => panic!("expected a reflection pending stage, got {other:?}"),
     };
-    // The parked window: a leased pending receipt, no envelope, no cost.
+    // note: the parked window — a leased pending receipt, no envelope, no cost.
     let parked = sqlx::query!(
         "SELECT status, owner_id FROM memory_receipts WHERE receipt_id = ?",
         &work.receipt_id,
@@ -1754,7 +1754,7 @@ async fn complete_reflection_settles_only_for_the_same_owner() {
     assert_eq!(harness.count(&mut tx, "memory_reflections").await, 0);
     tx.commit().await.expect("commit lease");
 
-    // Phase 2: compose outside the transaction, then settle as the same owner.
+    // note: phase 2 — compose outside the transaction, then settle as the same owner.
     let effect = work.compose();
     let mut tx2 = harness.begin().await;
     let completed = adapter.complete_reflection(&mut tx2, effect).await;
@@ -1780,7 +1780,7 @@ async fn complete_reflection_settles_only_for_the_same_owner() {
     assert_eq!(envelope.cost_unit_kind, "basis_record");
     assert_eq!(envelope.cost_units, Some(1.0));
 
-    // Terminal replay returns the stored committed result.
+    // why: terminal replay returns the stored committed result.
     let mut tx = harness.begin().await;
     let replay = ready(
         adapter
@@ -1861,7 +1861,7 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
     };
     tx.commit().await.expect("commit lease");
 
-    // A completion carrying a different lease owner never settles.
+    // why: a completion carrying a different lease owner never settles.
     let mut effect = work.compose();
     let receipt_id = effect.receipt_id.clone();
     effect.owner_id = "own_other".to_string();
@@ -1882,7 +1882,7 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
     .expect("receipt");
     assert_eq!(status, "pending");
 
-    // A same-key replay of the still-pending effect stays uncertain.
+    // why: a same-key replay of the still-pending effect stays uncertain.
     let mut tx = harness.begin().await;
     let replay = adapter
         .generate_reflection(&mut tx, &principal(PRINCIPAL), request)
@@ -1958,10 +1958,10 @@ async fn expired_lease_retry_takes_over_and_settles() {
         other => panic!("expected a reflection pending stage, got {other:?}"),
     };
     let receipt_id = work.receipt_id.clone();
-    // The crash: transaction 1 commits, the caller never completes.
+    // note: the crash — transaction 1 commits, the caller never completes.
     tx.commit().await.expect("commit lease");
 
-    // Advance past the lease instant.
+    // note: advance past the lease instant.
     sqlx::query!(
         "UPDATE memory_receipts SET lease_expires_at = '2020-01-01T00:00:00.000Z' \
          WHERE receipt_id = ?",
@@ -1971,7 +1971,7 @@ async fn expired_lease_retry_takes_over_and_settles() {
     .await
     .expect("expire lease");
 
-    // The same-key retry does not answer uncertain: it stages takeover work on
+    // why: the same-key retry does not answer uncertain — it stages takeover work on
     // the abandoned receipt under a fresh owner.
     let mut tx = harness.begin().await;
     let retried = adapter
@@ -1985,7 +1985,7 @@ async fn expired_lease_retry_takes_over_and_settles() {
     assert_ne!(work2.owner_id, work.owner_id);
     tx.commit().await.expect("commit retry probe");
 
-    // The takeover persisted B's owner: the crashed owner's stale completion can
+    // why: the takeover persisted B's owner — the crashed owner's stale completion can
     // no longer settle behind B's claim.
     let mut tx_a = harness.begin().await;
     let stale = adapter
@@ -1995,7 +1995,7 @@ async fn expired_lease_retry_takes_over_and_settles() {
     assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
     tx_a.rollback().await.expect("rollback stale settle");
 
-    // A third same-key retry sees the re-leased pending row: no takeover work,
+    // why: a third same-key retry sees the re-leased pending row — no takeover work,
     // just the uncertainty contract.
     let mut tx_c = harness.begin().await;
     let third = adapter
@@ -2005,7 +2005,7 @@ async fn expired_lease_retry_takes_over_and_settles() {
     assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
     tx_c.rollback().await.expect("rollback third retry");
 
-    // Even after B's stamped lease itself lapses, ownership stays persisted:
+    // why: even after B's stamped lease itself lapses, ownership stays persisted —
     // the crashed owner's completion is still refused, the envelope never
     // lands, and the receipt stays pending until the recorded owner settles.
     sqlx::query!(
@@ -2049,7 +2049,7 @@ async fn expired_lease_retry_takes_over_and_settles() {
         .to_string();
     tx2.commit().await.expect("commit completion");
 
-    // The replay now resolves the key to the stored committed result.
+    // why: the replay now resolves the key to the stored committed result.
     let mut tx = harness.begin().await;
     let replay = ready(
         adapter
@@ -2076,7 +2076,7 @@ async fn staging_storage_failure_rolls_back_the_partial_write() {
     let adapter = MemoryAdapter::new(true);
     let mut tx = harness.begin().await;
 
-    // Failing the journal table inside the caller's transaction makes the
+    // why: failing the journal table inside the caller's transaction makes the
     // intent insert fail AFTER the record insert: a genuine partial write.
     sqlx::query!("DROP TABLE memory_journal")
         .execute(&mut *tx)
@@ -2099,7 +2099,7 @@ async fn staging_storage_failure_rolls_back_the_partial_write() {
     let refusal = reject(&result);
     assert_eq!(refusal.code, SpokeRejectCode::InternalError);
     assert_eq!(retry_class(refusal), "retryable");
-    // The partial write was real: the record sat inside this transaction.
+    // why: the partial write was real — the record sat inside this transaction.
     assert_eq!(harness.count(&mut tx, "memory_records").await, 1);
     tx.rollback().await.expect("rollback erases the stage");
 
@@ -2122,7 +2122,7 @@ async fn partial_publish_recovery_keeps_intent_pending_until_republish() {
         .await;
     let adapter = MemoryAdapter::new(true);
 
-    // Stage a capture, then dismiss it: the journaled intent owes the consumed
+    // note: stage a capture, then dismiss it — the journaled intent owes the consumed
     // candidate's file target.
     let mut tx = harness.begin().await;
     let body = ready(
@@ -2165,7 +2165,7 @@ async fn partial_publish_recovery_keeps_intent_pending_until_republish() {
     };
     tx1.commit().await.expect("commit stage");
 
-    // A torn write: the target file exists but holds truncated bytes, so the
+    // why: a torn write — the target file exists but holds truncated bytes, so the
     // publication attempt fails confirmation and the caller must not settle.
     let mut tx = harness.begin().await;
     let targets = harness.targets(&mut tx, &receipt_id).await;
@@ -2182,7 +2182,7 @@ async fn partial_publish_recovery_keeps_intent_pending_until_republish() {
         "torn bytes fail confirmation"
     );
 
-    // Unsettled: the poll answers OUTCOME_UNCERTAIN and the intent keeps its
+    // why: unsettled — the poll answers OUTCOME_UNCERTAIN and the intent keeps its
     // owed targets until settlement scrubs them.
     let mut tx = harness.begin().await;
     assert_eq!(
@@ -2201,7 +2201,7 @@ async fn partial_publish_recovery_keeps_intent_pending_until_republish() {
     assert_eq!(retry_class(refusal), "uncertain");
     tx.rollback().await.expect("rollback");
 
-    // Recovery: republishing lands every owed target, then the settle in a
+    // why: recovery — republishing lands every owed target, then the settle in a
     // fresh transaction commits the receipt and scrubs the intent's targets.
     assert!(harness.publish(&targets).await, "republish must confirm");
     let mut tx2 = harness.begin().await;
@@ -2254,7 +2254,7 @@ async fn settle_journal_storage_failure_reports_uncertain() {
     tx.rollback().await.expect("rollback");
     assert!(harness.publish(&targets).await, "publication must confirm");
 
-    // The journal table is gone when transaction 2 reads the intent: the
+    // why: the journal table is gone when transaction 2 reads the intent — the
     // published effect is durable, the settlement outcome unknown — uncertain,
     // and the caller's rollback restores the table with the intent pending.
     let mut tx2 = harness.begin().await;
@@ -2351,7 +2351,7 @@ async fn complete_reflection_storage_failure_reports_uncertain() {
     };
     tx.commit().await.expect("commit lease");
 
-    // Composition happened; the envelope insert then hits a missing table in
+    // why: composition happened; the envelope insert then hits a missing table in
     // transaction 2 — an unsettled effect the caller must resolve.
     let effect = work.compose();
     let receipt_id = effect.receipt_id.clone();
@@ -2455,7 +2455,7 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
         }
     }
 
-    // Canonical promote stages one retained record.
+    // note: canonical promote stages one retained record.
     let candidate_id = capture(&harness, "cap-canonical-promote").await;
     let stage = review(
         &harness,
@@ -2469,7 +2469,7 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
     let result = outcome(&harness, &receipt_id).await;
     assert_eq!(result["outcome"], "promoted");
     assert_eq!(result["record_ids"].as_array().expect("records").len(), 1);
-    // An explicit `content_override: null` decodes as absent and the staged
+    // why: an explicit `content_override: null` decodes as absent and the staged
     // record keeps the candidate's own content.
     let candidate_id = capture(&harness, "cap-null-override").await;
     let stage = review(
@@ -2495,7 +2495,7 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
         "a canonical review candidate to consume"
     );
 
-    // Canonical fragment stages the two named fragments.
+    // note: canonical fragment stages the two named fragments.
     let candidate_id = capture(&harness, "cap-canonical-fragment").await;
     let stage = review(
         &harness,
@@ -2516,7 +2516,7 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
     assert_eq!(result["outcome"], "fragmented");
     assert_eq!(result["record_ids"].as_array().expect("records").len(), 2);
 
-    // Canonical drop consumes without records; the rationale member is legal.
+    // note: canonical drop consumes without records; the rationale member is legal.
     let candidate_id = capture(&harness, "cap-canonical-drop").await;
     let stage = review(
         &harness,
@@ -2531,15 +2531,15 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
     assert_eq!(result["outcome"], "dropped");
     assert_eq!(result["record_ids"], json!([]));
 
-    // Non-canonical spellings reject as INVALID_INPUT before any effect.
+    // why: non-canonical spellings reject as INVALID_INPUT before any effect.
     let candidate_id = capture(&harness, "cap-rejected-shapes").await;
     for (index, decision) in [
-        json!("drop"),                                        // bare string variant
-        json!({"promote": {}}),                               // legacy member spelling
-        json!({"action": "promote", "bogus": 1}),             // extra member
-        json!({"action": "promote", "content_override": 42}), // non-object override
-        json!({"action": "rewrite"}),                         // unknown action
-        json!({"action": "fragment", "fragments": []}),       // validator: minItems 1
+        json!("drop"),                                        // note: bare string variant
+        json!({"promote": {}}),                               // note: legacy member spelling
+        json!({"action": "promote", "bogus": 1}),             // note: extra member
+        json!({"action": "promote", "content_override": 42}), // note: non-object override
+        json!({"action": "rewrite"}),                         // note: unknown action
+        json!({"action": "fragment", "fragments": []}),       // note: validator minItems 1
     ]
     .into_iter()
     .enumerate()
@@ -2556,7 +2556,7 @@ async fn canonical_review_decisions_journal_and_legacy_shapes_reject() {
         assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
         assert_eq!(retry_class(refusal), "terminal");
     }
-    // The rejected candidate was never consumed.
+    // why: the rejected candidate was never consumed.
     assert_eq!(harness.count_pool("memory_candidates").await, 5);
     let consumed: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM memory_candidates WHERE status = 'consumed'")
@@ -2603,7 +2603,7 @@ async fn canonical_fence_targets_transition_and_legacy_shapes_reject() {
         result
     }
 
-    // A subject target fences the whole subject.
+    // note: a subject target fences the whole subject.
     let body = ready(
         fence(
             &harness,
@@ -2618,7 +2618,7 @@ async fn canonical_fence_targets_transition_and_legacy_shapes_reject() {
     assert_eq!(body["result"]["status"], "fenced");
     assert_eq!(body["result"]["revision"], 2);
 
-    // A context target keeps the status and records the context.
+    // note: a context target keeps the status and records the context.
     let body = ready(
         fence(
             &harness,
@@ -2647,13 +2647,13 @@ async fn canonical_fence_targets_transition_and_legacy_shapes_reject() {
     assert_eq!(body["result"]["fenced_contexts"], json!([]));
     assert_eq!(body["result"]["revision"], 4);
 
-    // Non-canonical targets reject as INVALID_INPUT before any effect.
+    // why: non-canonical targets reject as INVALID_INPUT before any effect.
     for (index, target) in [
-        json!("subject"),                              // bare string variant
-        json!({"context": "ctx_9"}),                   // legacy member spelling
-        json!({"type": "subject", "context_id": "x"}), // context_id on subject
-        json!({"type": "context"}),                    // missing context_id
-        json!({"type": "unknown"}),                    // unknown target type
+        json!("subject"),                              // note: bare string variant
+        json!({"context": "ctx_9"}),                   // note: legacy member spelling
+        json!({"type": "subject", "context_id": "x"}), // note: context_id on subject
+        json!({"type": "context"}),                    // note: missing context_id
+        json!({"type": "unknown"}),                    // note: unknown target type
     ]
     .into_iter()
     .enumerate()
@@ -2672,7 +2672,7 @@ async fn canonical_fence_targets_transition_and_legacy_shapes_reject() {
         assert_eq!(retry_class(refusal), "terminal");
     }
 
-    // The pinned validator maps context-archive to INVALID_INPUT too.
+    // why: the pinned validator maps context-archive to INVALID_INPUT too.
     let result = fence(
         &harness,
         &adapter,
@@ -2685,7 +2685,7 @@ async fn canonical_fence_targets_transition_and_legacy_shapes_reject() {
     let refusal = reject(&result);
     assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
 
-    // Rejected targets left the subject at revision 4, status still fenced.
+    // why: rejected targets left the subject at revision 4, status still fenced.
     let (status, fenced, revision): (String, String, i64) = sqlx::query_as(
         "SELECT status, fenced_contexts_json, revision FROM memory_subjects \
          WHERE space_id = 'sp_1' AND subject_id = 's_1'",
@@ -2816,12 +2816,12 @@ async fn recall_byte_budget_pages_advance_and_terminate() {
         cursors.push(cursor.to_string());
         request["cursor"] = json!(cursor);
     }
-    // I-000061: the oversized candidate is served whole on its own page; every
+    // invariant: I-000061 — the oversized candidate is served whole on its own page; every
     // record appears exactly once, and the budget names it at each cut.
     assert_eq!(served, vec!["rec_a", "rec_big", "rec_b"]);
     assert!(!overflow.is_empty() && overflow.iter().all(|id| id == "rec_big"));
 
-    // An oversized trailing candidate is still returned whole on the page its
+    // why: an oversized trailing candidate is still returned whole on the page its
     // cursor reaches.
     let harness = Harness::open().await;
     harness.seed_grant(PRINCIPAL, &["recall"]).await;
@@ -2941,7 +2941,7 @@ async fn record_projection_escapes_injected_front_matter() {
 /// `profile_kind` and the caller's principal id (`updated_by`) the same way.
 #[tokio::test]
 async fn profile_projection_escapes_injected_front_matter() {
-    // The requester id is the projection's `updated_by`; a newline in it must
+    // why: the requester id is the projection's `updated_by`; a newline in it must
     // not inject a key either.
     const INJECTED_PRINCIPAL: &str = "p_1\nrevision: 999";
     let harness = Harness::open().await;
@@ -3104,7 +3104,7 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     }
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
     assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
-    // The refusals wrote nothing: revision, content and tombstone are the
+    // why: the refusals wrote nothing — revision, content and tombstone are the
     // seeded values read back inside this same transaction.
     let row = sqlx::query!(
         "SELECT revision, content_json, tombstone_json FROM memory_records \
@@ -3118,7 +3118,7 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     assert_eq!(row.content_json, r#"{"text":"a live record"}"#);
     assert_eq!(row.tombstone_json.as_deref(), None);
 
-    // The unfenced sibling placement stays writable.
+    // why: the unfenced sibling placement stays writable.
     let sibling = adapter
         .update_record(
             &mut tx,
@@ -3132,7 +3132,7 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     ));
     tx.rollback().await.expect("rollback");
 
-    // A fenced/archived subject fences every record write, placement aside.
+    // why: a fenced/archived subject fences every record write, placement aside.
     sqlx::query(
         "UPDATE memory_subjects SET status = 'fenced' \
          WHERE space_id = ? AND subject_id = ?",
@@ -3167,7 +3167,7 @@ async fn update_and_delete_refuse_on_fenced_placement() {
     assert_eq!(harness.count(&mut tx, "memory_journal").await, 0);
     tx.rollback().await.expect("rollback");
 
-    // Missing subject row fails closed, consistent with records.promote.
+    // why: missing subject row fails closed, consistent with records.promote.
     sqlx::query(
         "UPDATE memory_subjects SET status = 'active' \
          WHERE space_id = ? AND subject_id = ?",
@@ -3245,7 +3245,7 @@ async fn delete_of_tombstoned_rejects_and_the_key_still_replays() {
     assert!(matches!(settled, SpokeResult::Ok(_)), "settle: {settled:?}");
     tx.commit().await.expect("commit settle");
 
-    // A fresh key over the tombstone refuses before any effect and leaves the
+    // why: a fresh key over the tombstone refuses before any effect and leaves the
     // stored state alone.
     let mut tx = harness.begin().await;
     let repeat = adapter
@@ -3276,7 +3276,7 @@ async fn delete_of_tombstoned_rejects_and_the_key_still_replays() {
     assert!(tombstone.get("deleted_at").is_some());
     tx.rollback().await.expect("rollback");
 
-    // Fence the subject afterwards: the same key still replays the committed
+    // why: fence the subject afterwards — the same key still replays the committed
     // receipt — the fresh-effect gates never re-run on a replay (I-000056).
     sqlx::query(
         "UPDATE memory_subjects SET status = 'fenced' \
@@ -3312,7 +3312,7 @@ async fn uncovered_by_id_rows_read_as_not_found() {
     let adapter = MemoryAdapter::new(true);
 
     let mut tx = harness.begin().await;
-    // The same id rejects identically before the row exists and after it
+    // why: the same id rejects identically before the row exists and after it
     // exists but is uncovered — concealment is total.
     let before = adapter
         .update_record(
@@ -3335,7 +3335,7 @@ async fn uncovered_by_id_rows_read_as_not_found() {
         absent_reject.details.clone(),
     );
     seed_record(&mut tx, "rec_held", "a held record", NOW).await;
-    // The held candidate exists for PRINCIPAL only.
+    // note: the held candidate exists for PRINCIPAL only.
     let captured = ready(
         adapter
             .capture(
@@ -3357,7 +3357,7 @@ async fn uncovered_by_id_rows_read_as_not_found() {
         .to_string();
     tx.commit().await.expect("commit seeds");
 
-    // Missing and existing ids are indistinguishable in both by-id arms.
+    // why: missing and existing ids are indistinguishable in both by-id arms.
     let mut tx = harness.begin().await;
     for result in [
         adapter
@@ -3440,7 +3440,7 @@ async fn uncovered_by_id_rows_read_as_not_found() {
         assert_eq!(refusal.code, SpokeRejectCode::NotFound);
         assert_eq!(retry_class(refusal), "terminal");
     }
-    // A request-derived requirement keeps NOT_AUTHORIZED: the stranger knows
+    // why: a request-derived requirement keeps NOT_AUTHORIZED — the stranger knows
     // the subject exists and only lacks the write capability.
     let created = adapter
         .create_record(
@@ -3459,7 +3459,7 @@ async fn uncovered_by_id_rows_read_as_not_found() {
     let refusal = reject(&created);
     assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
     assert_eq!(retry_class(refusal), "terminal");
-    // After seeding, the held id still rejects with the byte-identical
+    // why: after seeding, the held id still rejects with the byte-identical
     // envelope the absent id produced.
     let after = adapter
         .update_record(
@@ -3486,7 +3486,7 @@ async fn uncovered_by_id_rows_read_as_not_found() {
     );
     tx.rollback().await.expect("rollback");
 
-    // Split coverage stays concealed: one grant covers only the shared source,
+    // invariant: split coverage stays concealed — one grant covers only the shared source,
     // another only the c9 target — §6.5 never unions them — so promote of the
     // held record rejects exactly like a missing record.
     for (grant_id, shared_access, contexts) in [
@@ -3622,7 +3622,7 @@ async fn null_filter_and_omitted_include_shared_survive_reflections() {
         .expect("reflection id")
         .to_string();
 
-    // The stored row carries no filter member.
+    // why: the stored row carries no filter member.
     let stored_filter: Option<String> =
         sqlx::query_scalar("SELECT filter_json FROM memory_reflections WHERE reflection_id = ?")
             .bind(&reflection_id)
@@ -3631,7 +3631,7 @@ async fn null_filter_and_omitted_include_shared_survive_reflections() {
             .expect("stored filter");
     assert_eq!(stored_filter.as_deref(), None);
 
-    // Simulate a legacy literal-'null' filter: reads must treat it as absent.
+    // note: simulate a legacy literal-'null' filter — reads must treat it as absent.
     sqlx::query("UPDATE memory_reflections SET filter_json = 'null' WHERE reflection_id = ?")
         .bind(&reflection_id)
         .execute(&harness.pool)
@@ -3676,7 +3676,7 @@ async fn null_filter_and_omitted_include_shared_survive_reflections() {
 #[tokio::test]
 async fn cognition_filter_presence_rejects_at_every_pinned_boundary() {
     let harness = Harness::open().await;
-    // No grant and an unknown space: the refusal must precede repository access.
+    // why: no grant and an unknown space — the refusal must precede repository access.
     let adapter = MemoryAdapter::new(true);
     let mut tx = harness.begin().await;
 
@@ -3758,7 +3758,7 @@ async fn cognition_filter_presence_rejects_at_every_pinned_boundary() {
             .await,
     );
 
-    // A build without the reflection family keeps its family refusal first.
+    // why: a build without the reflection family keeps its family refusal first.
     let disabled = MemoryAdapter::new(false);
     let state = disabled
         .get_reflection_state(
@@ -3787,7 +3787,7 @@ async fn recall_byte_budget_charges_content_cognition() {
     let adapter = MemoryAdapter::new(true);
     let mut tx = harness.begin().await;
 
-    // `{"text":"a"}` is 11 bytes on the wire; the belief record's serialized
+    // why: `{"text":"a"}` is 11 bytes on the wire; the belief record's serialized
     // size is the cognition charge the budget must see.
     let reference =
         |id: &str| json!({ "kind": "knowledge_entry", "id": id, "namespace": "mindcore" });
@@ -3842,7 +3842,7 @@ async fn recall_byte_budget_charges_content_cognition() {
         ready(adapter.recall(tx, &principal(PRINCIPAL), request).await)
     };
 
-    // The cognition bytes push rec_cog past the 48-byte page: it defers.
+    // why: the cognition bytes push rec_cog past the 48-byte page — it defers.
     let first = page(None, &mut tx).await;
     let records = first["records"].as_array().expect("records");
     assert_eq!(records.len(), 1);
@@ -3851,7 +3851,7 @@ async fn recall_byte_budget_charges_content_cognition() {
     assert_eq!(first["overflow_record_id"], "rec_cog");
     let cursor = first["next_cursor"].as_str().expect("next cursor");
 
-    // The next page serves the deferred record whole.
+    // why: the next page serves the deferred record whole.
     let second = page(Some(cursor), &mut tx).await;
     let records = second["records"].as_array().expect("records");
     assert_eq!(records.len(), 1);
@@ -3868,7 +3868,7 @@ async fn recall_byte_budget_charges_content_cognition() {
     tx.rollback().await.expect("rollback");
 }
 
-// ── §5.2/D-10 withheld reads (I-000043) ──────────────────────────────
+// contract §5.2/D-10 withheld reads (I-000043)
 
 /// The exact refusal every guarded read leaves while the subject has an
 /// unsettled intent: the closed vocabulary's `INTERNAL_ERROR` carrying only
@@ -4006,7 +4006,7 @@ async fn unsettled_intent_withholds_guarded_reads() {
         .await;
     let adapter = MemoryAdapter::new(true);
 
-    // Baseline coverage: one visible record and one visible candidate.
+    // note: baseline coverage — one visible record and one visible candidate.
     let mut tx = harness.begin().await;
     seed_record(&mut tx, "rec_held", "a withheld record", NOW).await;
     let captured = ready(
@@ -4030,7 +4030,7 @@ async fn unsettled_intent_withholds_guarded_reads() {
         .to_string();
     tx.commit().await.expect("commit seeds");
 
-    // Every guarded read serves while no intent is unsettled.
+    // why: every guarded read serves while no intent is unsettled.
     let mut tx = harness.begin().await;
     for (op, result) in guarded_reads(&adapter, &mut tx, SPACE, SUBJECT, &candidate_id).await {
         assert!(
@@ -4040,7 +4040,7 @@ async fn unsettled_intent_withholds_guarded_reads() {
     }
     tx.rollback().await.expect("rollback");
 
-    // Any non-applied lifecycle state withholds, not only `pending`.
+    // why: any non-applied lifecycle state withholds, not only `pending`.
     for (index, state) in ["pending", "deferred", "quarantined"].iter().enumerate() {
         harness
             .seed_intent(&format!("rct_withheld_{index}"), SPACE, SUBJECT, state)
@@ -4050,7 +4050,7 @@ async fn unsettled_intent_withholds_guarded_reads() {
             assert_unreconciled(op, &result, SUBJECT);
         }
         tx.rollback().await.expect("rollback");
-        // Settlement releases the reads; the next state is seeded fresh.
+        // why: settlement releases the reads; the next state is seeded fresh.
         sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = ?")
             .bind(format!("rct_withheld_{index}"))
             .execute(&harness.pool)
@@ -4058,7 +4058,7 @@ async fn unsettled_intent_withholds_guarded_reads() {
             .expect("apply intent");
     }
 
-    // Intents for another subject or space never withhold this subject.
+    // why: intents for another subject or space never withhold this subject.
     harness
         .seed_intent("rct_other_subject", SPACE, "s_2", "pending")
         .await;
@@ -4074,7 +4074,7 @@ async fn unsettled_intent_withholds_guarded_reads() {
     }
     tx.rollback().await.expect("rollback");
 
-    // Reopened for this subject, reads refuse again.
+    // why: reopened for this subject, reads refuse again.
     harness
         .seed_intent("rct_reopened", SPACE, SUBJECT, "pending")
         .await;
@@ -4123,7 +4123,7 @@ async fn corrupt_unsettled_payload_still_refuses_unreconciled() {
         .to_string();
     tx.commit().await.expect("commit seeds");
 
-    // `targets_json` is `NOT NULL` but unconstrained: a stored non-array value
+    // why: `targets_json` is `NOT NULL` but unconstrained — a stored non-array value
     // must not mask the withhold behind a retryable decode failure.
     harness
         .seed_intent("rct_corrupt", SPACE, SUBJECT, "pending")
@@ -4158,7 +4158,7 @@ async fn corrupt_record_content_still_refuses_unreconciled() {
     seed_record(&mut tx, "rec_corrupt", "a withheld record", NOW).await;
     tx.commit().await.expect("commit seeds");
 
-    // `content_json` is `NOT NULL` but unconstrained: stored non-JSON must not
+    // why: `content_json` is `NOT NULL` but unconstrained — stored non-JSON must not
     // mask the withhold behind the decode failure an early full-row read hit.
     sqlx::query(
         "UPDATE memory_records SET content_json = 'not json' \
@@ -4182,7 +4182,7 @@ async fn corrupt_record_content_still_refuses_unreconciled() {
     assert_unreconciled("memory.records.get", &result, SUBJECT);
     tx.rollback().await.expect("rollback");
 
-    // Settled, the read reaches the payload: an undecodable row is a storage
+    // why: settled, the read reaches the payload — an undecodable row is a storage
     // failure, so the earlier refusal proves the probe ran before selection.
     sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_rec'")
         .execute(&harness.pool)
@@ -4239,7 +4239,7 @@ async fn corrupt_candidate_content_still_refuses_unreconciled() {
         .to_string();
     tx.commit().await.expect("commit seeds");
 
-    // `content_json` is unconstrained text: stored non-JSON must not mask the
+    // why: `content_json` is unconstrained text — stored non-JSON must not mask the
     // withhold behind the decode failure an early full-row read hit.
     sqlx::query("UPDATE memory_candidates SET content_json = 'not json' WHERE candidate_id = ?")
         .bind(candidate_id.as_str())
@@ -4261,7 +4261,7 @@ async fn corrupt_candidate_content_still_refuses_unreconciled() {
     assert_unreconciled("memory.candidates.get", &result, SUBJECT);
     tx.rollback().await.expect("rollback");
 
-    // Settled, the read reaches the payload: an undecodable row is a storage
+    // why: settled, the read reaches the payload — an undecodable row is a storage
     // failure, so the earlier refusal proves the probe ran before selection.
     sqlx::query("UPDATE memory_journal SET state = 'applied' WHERE receipt_id = 'rct_corrupt_cnd'")
         .execute(&harness.pool)
@@ -4291,7 +4291,7 @@ async fn corrupt_candidate_content_still_refuses_unreconciled() {
 #[tokio::test]
 async fn concealment_and_authorization_precede_the_withhold_probe() {
     let harness = Harness::open().await;
-    // A context-restricted grant with shared access: it covers shared rows but
+    // why: a context-restricted grant with shared access — it covers shared rows but
     // never rows scoped to another context.
     sqlx::query(
         "INSERT INTO memory_grants \
@@ -4306,7 +4306,7 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
     .execute(&harness.pool)
     .await
     .expect("seed grant");
-    // A second unrestricted grant writes the private candidate; it carries no
+    // why: a second unrestricted grant writes the private candidate; it carries no
     // review capability, so it still never covers the by-id read.
     sqlx::query(
         "INSERT INTO memory_grants \
@@ -4324,7 +4324,7 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
     let adapter = MemoryAdapter::new(true);
 
     let mut tx = harness.begin().await;
-    // An uncovered record: context-scoped under a context the grant lacks.
+    // note: an uncovered record — context-scoped under a context the grant lacks.
     sqlx::query(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
@@ -4342,7 +4342,7 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
     .execute(&mut *tx)
     .await
     .expect("seed private record");
-    // A tombstone under the same coverage, visible to admin only.
+    // note: a tombstone under the same coverage, visible to admin only.
     sqlx::query(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
@@ -4360,7 +4360,7 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
     .execute(&mut *tx)
     .await
     .expect("seed tombstone");
-    // An uncovered candidate: captured into a context the read grant lacks.
+    // note: an uncovered candidate — captured into a context the read grant lacks.
     let captured = ready(
         adapter
             .capture(
@@ -4382,7 +4382,7 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
         .to_string();
     tx.commit().await.expect("commit seeds");
 
-    // Withhold the subject: concealment must still answer first.
+    // why: withhold the subject — concealment must still answer first.
     harness
         .seed_intent("rct_pending", SPACE, SUBJECT, "pending")
         .await;
@@ -4452,7 +4452,7 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
         );
     }
 
-    // A request-subject read without coverage still answers `NOT_AUTHORIZED`
+    // why: a request-subject read without coverage still answers `NOT_AUTHORIZED`
     // before the journal is probed.
     let records = adapter
         .list_records(
@@ -4484,18 +4484,18 @@ async fn receipts_poll_serves_regardless_of_unsettled_intents() {
     harness
         .seed_receipt("rct_mine_failed", PRINCIPAL, "failed")
         .await;
-    // `rct_theirs` is polled for its `NOT_AUTHORIZED` before any projection.
+    // note: `rct_theirs` is polled for its `NOT_AUTHORIZED` before any projection.
     harness
         .seed_receipt("rct_theirs", STRANGER, "committed")
         .await;
-    // The unsettled intent belongs to this subject; it must not change any
+    // why: the unsettled intent belongs to this subject; it must not change any
     // receipt result.
     harness
         .seed_intent("rct_intent", SPACE, SUBJECT, "pending")
         .await;
     let adapter = MemoryAdapter::new(true);
 
-    // The committed receipt carries the real per-op result shape — capture
+    // why: the committed receipt carries the real per-op result shape — capture
     // commits its receipt directly in the caller's transaction.
     let mut tx = harness.begin().await;
     let committed_body = ready(
@@ -4567,7 +4567,7 @@ async fn receipts_poll_serves_regardless_of_unsettled_intents() {
         "failed poll must serve the recorded error envelope"
     );
 
-    // Another requester's receipt stays `NOT_AUTHORIZED`, not withheld.
+    // why: another requester's receipt stays `NOT_AUTHORIZED`, not withheld.
     let theirs = adapter
         .get_receipt(
             &mut tx,

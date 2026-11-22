@@ -90,19 +90,19 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        // The route map's emptiness decides the deliberation advertisement; read it before the
+        // why: the route map's emptiness decides the deliberation advertisement; read it before the
         // map moves into the binding.
         let routed = !faces.workflow_routes.is_empty();
         let workflows = match self.workflows(faces.workflow_routes) {
             Ok(workflows) => workflows,
-            // The host's own configuration is refused before any port or registration exists.
+            // why: the host's own configuration is refused before any port or registration exists.
             Err(reject) => return SpokeResult::Reject(reject),
         };
         let engine: Arc<dyn MindWorkflows> = workflows.clone();
         let mut tools =
             WorkflowTools::new(engine, faces.principals, faces.providers).registrations();
         tools.extend(faces.tools);
-        // Deliberation settles onto a routed carrier collection; a surface without a route serves
+        // invariant: deliberation settles onto a routed carrier collection; a surface without a route serves
         // no deliberation. The invariant holds over the final set, so a host registration cannot
         // restore the tool or its handler.
         if !routed {

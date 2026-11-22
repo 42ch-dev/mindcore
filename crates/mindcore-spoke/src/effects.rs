@@ -72,7 +72,7 @@ impl FileEffect {
     fn new(path: String, content: String, prior: Option<String>) -> AResult<Self> {
         // shortcut: the digest is JCS/SHA-256 over the content object, not the
         // file's own bytes — the adapter and its publisher recompute it the
-        // same way; upgrade to a raw-bytes hash if a foreign tool must verify.
+        // same way; upgrade: to a raw-bytes hash if a foreign tool must verify.
         let digest = policy::digest(&json!({ "content": content }))?;
         Ok(Self {
             path,

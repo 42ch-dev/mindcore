@@ -176,7 +176,7 @@ async fn the_knowledge_list_hydrates_a_page_in_one_statement() {
     let dir = TempDir::new().expect("temporary directory");
     let path = dir.path().join("mindcore.db");
 
-    // The migrator owns the schema; the logging pool below owns the measurement.
+    // note: the migrator owns the schema; the logging pool below owns the measurement.
     let store = MindStore::open(&path).await.expect("open store");
     store.close().await;
     let pool: SqlitePool = SqlitePoolOptions::new()

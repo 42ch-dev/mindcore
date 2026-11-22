@@ -108,7 +108,7 @@ impl Harness {
         .execute(&harness.pool)
         .await
         .expect("seed subject");
-        // Two seeded grants: a space-wide admin grant (no subject_id) for the
+        // note: two seeded grants — a space-wide admin grant (no subject_id) for the
         // control-plane ops, plus a subject-scoped grant carrying the whole
         // subject-side capability set for content/profile selectors.
         sqlx::query(
@@ -264,7 +264,7 @@ async fn every_selector_takes_the_caller_transaction() {
     let admin = principal(PRINCIPAL);
     let mut tx = harness.begin().await;
 
-    // C0 describe — no request members needed.
+    // note: C0 describe — no request members needed.
     let body = ready(
         adapter.describe(&mut tx, &admin, json!({})).await,
         "describe",
@@ -274,14 +274,14 @@ async fn every_selector_takes_the_caller_transaction() {
         json!(["spoke-memory", "spoke-memory-reflection"])
     );
 
-    // C1 list spaces (empty object is the list-everything request).
+    // note: C1 list spaces (empty object is the list-everything request).
     let body = ready(
         adapter.list_spaces(&mut tx, &admin, json!({})).await,
         "spaces.list",
     );
     assert_eq!(body["spaces"][0]["space_id"], SPACE);
 
-    // C2 freeze: expected_revision = 1 -> revision 2.
+    // note: C2 freeze — expected_revision = 1 -> revision 2.
     let body = ready(
         adapter
             .freeze_space(
@@ -298,7 +298,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["result"]["status"], "frozen");
 
-    // C3 unfreeze back to active revision 3 so later ops are not gated.
+    // note: C3 unfreeze back to active revision 3 so later ops are not gated.
     let body = ready(
         adapter
             .unfreeze_space(
@@ -315,7 +315,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["result"]["status"], "active");
 
-    // C4 ensure a second subject (created=true) next to the seeded one.
+    // note: C4 ensure a second subject (created=true) next to the seeded one.
     let body = ready(
         adapter
             .ensure_subject(
@@ -332,7 +332,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["result"]["created"], true);
 
-    // C5 get the seeded subject.
+    // note: C5 get the seeded subject.
     let body = ready(
         adapter
             .get_subject(
@@ -345,7 +345,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["subject"]["subject_id"], SUBJECT);
 
-    // C6 fence ctx-a on the subject (revision 1 -> 2).
+    // note: C6 fence ctx-a on the subject (revision 1 -> 2).
     let body = ready(
         adapter
             .fence_subject(
@@ -365,7 +365,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["result"]["fenced_contexts"], json!([CTX_A]));
 
-    // C7 grant a review-only coverage for a second principal.
+    // note: C7 grant a review-only coverage for a second principal.
     let body = ready(
         adapter
             .grant(
@@ -389,7 +389,7 @@ async fn every_selector_takes_the_caller_transaction() {
         .expect("grant id")
         .to_string();
 
-    // C8 list grants for the space.
+    // note: C8 list grants for the space.
     let body = ready(
         adapter
             .list_grants(&mut tx, &admin, json!({ "space_id": SPACE }))
@@ -398,7 +398,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["grants"].as_array().expect("grants").len(), 3);
 
-    // C9 revoke the grant at revision 1.
+    // note: C9 revoke the grant at revision 1.
     let body = ready(
         adapter
             .revoke_grant(
@@ -416,7 +416,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["result"]["revoked"], true);
 
-    // D1 capture a candidate (Ready stage, receipt staged in the caller tx).
+    // note: D1 capture a candidate (Ready stage, receipt staged in the caller tx).
     let body = ready(
         adapter
             .capture(
@@ -438,7 +438,7 @@ async fn every_selector_takes_the_caller_transaction() {
         .expect("candidate id")
         .to_string();
 
-    // A second pending candidate for the dismiss selector.
+    // note: a second pending candidate for the dismiss selector.
     let body = ready(
         adapter
             .capture(
@@ -460,7 +460,7 @@ async fn every_selector_takes_the_caller_transaction() {
         .expect("candidate id")
         .to_string();
 
-    // D2 list pending candidates.
+    // note: D2 list pending candidates.
     let body = ready(
         adapter
             .list_candidates(
@@ -473,7 +473,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["candidates"].as_array().expect("candidates").len(), 2);
 
-    // D3 get the first candidate.
+    // note: D3 get the first candidate.
     let body = ready(
         adapter
             .get_candidate(
@@ -486,7 +486,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["candidate"]["status"], "pending");
 
-    // D4 review cand_a to promote — a journaled effect: receipt and intent
+    // note: D4 review cand_a to promote — a journaled effect: receipt and intent
     // are staged, then settled in-tx so later guarded reads reconcile.
     let review_receipt = staged(
         adapter
@@ -507,7 +507,7 @@ async fn every_selector_takes_the_caller_transaction() {
     .expect("review is journaled");
     settle(&adapter, &mut tx, &review_receipt, "candidates.review").await;
 
-    // D5 dismiss cand_b — also journaled and settled in-tx.
+    // note: D5 dismiss cand_b — also journaled and settled in-tx.
     let dismiss_receipt = staged(
         adapter
             .dismiss_candidate(
@@ -532,13 +532,13 @@ async fn every_selector_takes_the_caller_transaction() {
     )
     .await;
 
-    // The review's promoted record, visible inside the caller transaction.
+    // why: the review's promoted record, visible inside the caller transaction.
     let ra: String = sqlx::query_scalar("SELECT record_id FROM memory_records")
         .fetch_one(&mut *tx)
         .await
         .expect("promoted record staged");
 
-    // D6 create an authored record — journaled and settled in-tx.
+    // note: D6 create an authored record — journaled and settled in-tx.
     let create_receipt = staged(
         adapter
             .create_record(
@@ -565,7 +565,7 @@ async fn every_selector_takes_the_caller_transaction() {
             .await
             .expect("created record staged");
 
-    // D7 get the promoted record.
+    // note: D7 get the promoted record.
     let body = ready(
         adapter
             .get_record(
@@ -578,7 +578,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["record"]["record_id"], ra);
 
-    // D8 list the subject's records (the promoted row and the created row).
+    // note: D8 list the subject's records (the promoted row and the created row).
     let body = ready(
         adapter
             .list_records(
@@ -595,7 +595,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["records"].as_array().expect("records").len(), 2);
 
-    // D9 update the created record at revision 1.
+    // note: D9 update the created record at revision 1.
     let update_receipt = staged(
         adapter
             .update_record(
@@ -621,7 +621,7 @@ async fn every_selector_takes_the_caller_transaction() {
     )
     .await;
 
-    // D10 promote moves the record into context scope ctx-b — the baseline's
+    // note: D10 promote moves the record into context scope ctx-b — the baseline's
     // scope-change case: the row's scope and revision update inside the
     // caller's transaction and the change is journaled (receipt + intent
     // staged, then settled in-tx so later guarded reads reconcile).
@@ -665,7 +665,7 @@ async fn every_selector_takes_the_caller_transaction() {
     assert_eq!(scope_context_id.as_deref(), Some("ctx-b"));
     assert_eq!(promote_rev, 3);
 
-    // D11 delete at the live revision (update bumped to 2, promote to 3).
+    // note: D11 delete at the live revision (update bumped to 2, promote to 3).
     let delete_receipt = staged(
         adapter
             .delete_record(
@@ -689,7 +689,7 @@ async fn every_selector_takes_the_caller_transaction() {
     )
     .await;
 
-    // D12 recall the subject's remaining rows.
+    // note: D12 recall the subject's remaining rows.
     ready(
         adapter
             .recall(
@@ -706,7 +706,7 @@ async fn every_selector_takes_the_caller_transaction() {
         "recall",
     );
 
-    // D13 update the personality profile — journaled.
+    // note: D13 update the personality profile — journaled.
     let profile_receipt = staged(
         adapter
             .update_profile(
@@ -732,7 +732,7 @@ async fn every_selector_takes_the_caller_transaction() {
     )
     .await;
 
-    // D14 read the profile back.
+    // note: D14 read the profile back.
     let body = ready(
         adapter
             .get_profile(
@@ -749,7 +749,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["profiles"].as_array().expect("profiles").len(), 1);
 
-    // D15 poll the capture receipt by id.
+    // note: D15 poll the capture receipt by id.
     let cap_receipt: String =
         sqlx::query_scalar("SELECT receipt_id FROM memory_receipts WHERE op = 'memory.capture'")
             .fetch_one(&mut *tx)
@@ -767,7 +767,7 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(body["receipt"]["receipt_id"], cap_receipt);
 
-    // F1 reflection state — a read; the digest feeds F2.
+    // note: F1 reflection state — a read; the digest feeds F2.
     let body = ready(
         adapter
             .get_reflection_state(
@@ -787,7 +787,7 @@ async fn every_selector_takes_the_caller_transaction() {
         .expect("state digest")
         .to_string();
 
-    // F2 generate — this fixture is complete (personality profile + live
+    // note: F2 generate — this fixture is complete (personality profile + live
     // records + matching state digest), so the expected path is a leased
     // ReflectionPending: a pending receipt carrying the lease is staged
     // inside the caller's transaction for transaction-2 completion.
@@ -816,7 +816,7 @@ async fn every_selector_takes_the_caller_transaction() {
             .expect("leased receipt staged");
     assert_eq!(lease_status, "pending");
 
-    // F3 list reflections.
+    // note: F3 list reflections.
     ready(
         adapter
             .list_reflections(
@@ -832,7 +832,7 @@ async fn every_selector_takes_the_caller_transaction() {
         "reflections.list",
     );
 
-    // O2 transfer family: all five refuse CAPABILITY_PORT_MISSING on the
+    // note: O2 transfer family — all five refuse CAPABILITY_PORT_MISSING on the
     // supplied transaction, exercised with the baseline's typed payloads
     // (export id + chunk ordinal, staged import chunk descriptor, import id).
     let zero_digest = "0".repeat(64);
@@ -884,7 +884,7 @@ async fn every_selector_takes_the_caller_transaction() {
             )
             .await,
     ];
-    // Compare refusal code, retry class and details.op against the O2 contract.
+    // why: compare refusal code, retry class and details.op against the O2 contract.
     let transfer_ops = [
         "memory.exports.create",
         "memory.exports.get",
@@ -904,12 +904,12 @@ async fn every_selector_takes_the_caller_transaction() {
         }
     }
 
-    // Everything above sits in this one transaction; commit and confirm.
+    // note: everything above sits in this one transaction; commit and confirm.
     tx.commit().await.expect("caller commit");
     assert_eq!(harness.count("memory_candidates").await, 2);
     assert_eq!(harness.count("memory_records").await, 2);
     assert_eq!(harness.count("memory_profiles").await, 1);
-    // Staged receipts exist for every mutating selector; staged journal
+    // why: staged receipts exist for every mutating selector; staged journal
     // intents exist for the journaled ones (review, dismiss, create, update,
     // delete, profile update).
     assert!(harness.count("memory_receipts").await >= 8);
@@ -926,7 +926,7 @@ async fn caller_commit_persists_effect_receipt_and_intent() {
     let adapter = MemoryAdapter::new(true);
     let admin = principal(PRINCIPAL);
 
-    // Capture: Ready stage, but the candidate + receipt live only in the tx.
+    // why: capture is a Ready stage, but the candidate + receipt live only in the tx.
     let mut tx = harness.begin().await;
     let body = ready(
         adapter
@@ -950,7 +950,7 @@ async fn caller_commit_persists_effect_receipt_and_intent() {
         .to_string();
     tx.commit().await.expect("caller commit");
 
-    // A journaled effect: record + pending receipt + pending intent, all
+    // why: a journaled effect — record + pending receipt + pending intent, all
     // durable only after the caller commits.
     let mut tx = harness.begin().await;
     let receipt_id = staged(
@@ -980,13 +980,13 @@ async fn caller_commit_persists_effect_receipt_and_intent() {
             .await
             .expect("candidate lookup");
     assert_eq!(persisted_candidate.as_deref(), Some(candidate_id.as_str()));
-    // (a) the journaled operation's record row persisted.
+    // note: (a) the journaled operation's record row persisted.
     let record_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_records")
         .fetch_one(&harness.pool)
         .await
         .expect("record count");
     assert_eq!(record_count, 1, "the journaled record must persist");
-    // (b) capture's own committed receipt persisted beside its effect.
+    // note: (b) capture's own committed receipt persisted beside its effect.
     let (cap_status, cap_receipt_id): (String, String) = sqlx::query_as(
         "SELECT status, receipt_id FROM memory_receipts WHERE op = 'memory.capture'",
     )
@@ -995,7 +995,7 @@ async fn caller_commit_persists_effect_receipt_and_intent() {
     .expect("capture receipt");
     assert_eq!(cap_status, "committed");
     assert!(cap_receipt_id.starts_with("rct_"), "{cap_receipt_id}");
-    // (c) the journaled effect's pending receipt + pending intent persisted.
+    // note: (c) the journaled effect's pending receipt + pending intent persisted.
     let (status, journal_state): (String, String) = sqlx::query_as(
         "SELECT r.status, j.state \
          FROM memory_receipts r JOIN memory_journal j ON j.receipt_id = r.receipt_id \
@@ -1076,7 +1076,7 @@ async fn receipt_y04_second_grant_selector() {
     let q = principal("ctr_q");
     let mut tx = harness.begin().await;
 
-    // Y04.0: O grants P capture on ctx-a and ctx-b, Q capture on ctx-b only.
+    // note: Y04.0 — O grants P capture on ctx-a and ctx-b, Q capture on ctx-b only.
     let mut grant_ids = Vec::new();
     for (key, context) in [("y04-grant-a", "ctx-a"), ("y04-grant-b", "ctx-b")] {
         let body = ready(
@@ -1126,7 +1126,7 @@ async fn receipt_y04_second_grant_selector() {
         "grants.grant",
     );
 
-    // Y04.0 continued: P captures under ctx-a; the committed receipt carries
+    // note: Y04.0 continued — P captures under ctx-a; the committed receipt carries
     // the result but never the captured text.
     let cap_request = json!({
         "space_id": SPACE,
@@ -1148,7 +1148,7 @@ async fn receipt_y04_second_grant_selector() {
         "receipt envelope must be content-free: {body_json}"
     );
 
-    // Y04.1: revoking only the ctx-a grant leaves P a live participant via
+    // note: Y04.1 — revoking only the ctx-a grant leaves P a live participant via
     // ctx-b; polling the receipt still returns the same retained body.
     let body = ready(
         adapter
@@ -1184,7 +1184,7 @@ async fn receipt_y04_second_grant_selector() {
         "poll must not disclose captured content: {body}"
     );
 
-    // Y04.2: P replays the identical capture while only ctx-b is live — the
+    // note: Y04.2 — P replays the identical capture while only ctx-b is live; the
     // placement requirement binds ctx-a, so authorization refuses before the
     // dedup probe can serve the replay.
     match adapter.capture(&mut tx, &p, cap_request).await {
@@ -1198,7 +1198,7 @@ async fn receipt_y04_second_grant_selector() {
         other => panic!("revoked-context replay must refuse: {other:?}"),
     }
 
-    // Y04.3: Q (live on ctx-b but not the requester) is refused; the space
+    // note: Y04.3 — Q (live on ctx-b but not the requester) is refused; the space
     // admin reads the identical content-free body.
     match adapter
         .get_receipt(
@@ -1229,7 +1229,7 @@ async fn receipt_y04_second_grant_selector() {
     );
     assert_eq!(body["receipt"], *retained);
 
-    // Y04.4: P's last grant is revoked; both its known-id and unissued-id
+    // note: Y04.4 — P's last grant is revoked; both its known-id and unissued-id
     // polls refuse NOT_AUTHORIZED/terminal identically (no enumeration), and
     // the admin still reads the retained receipt.
     ready(
@@ -1276,7 +1276,7 @@ async fn receipt_y04_second_grant_selector() {
     assert_eq!(body["receipt"], *retained);
     tx.commit().await.expect("caller commit");
 
-    // The retained receipt and the revoked grant rows are durable across the
+    // why: the retained receipt and the revoked grant rows are durable across the
     // close/reopen boundary — authorization survives reopen.
     harness.reopen().await;
     let mut tx = harness.begin().await;
@@ -1304,7 +1304,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
     let adapter = MemoryAdapter::new(true);
     let admin = principal(PRINCIPAL);
 
-    // Baseline L3 pre-COMMIT fault: the caller drops its transaction before
+    // note: baseline L3 pre-COMMIT fault — the caller drops its transaction before
     // committing, so no record, receipt, intent or file target is durable —
     // including across the pool close/reopen.
     let mut tx = harness.begin().await;
@@ -1331,7 +1331,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
         assert_eq!(harness.count(table).await, 0, "{table} must stay empty");
     }
 
-    // Baseline L3 normal path: journaled create committed by the caller.
+    // note: baseline L3 normal path — journaled create committed by the caller.
     let create_request = json!({
         "space_id": SPACE,
         "subject_id": SUBJECT,
@@ -1350,7 +1350,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
     .expect("create is journaled");
     tx.commit().await.expect("caller commit");
 
-    // After close/reopen the row, the pending receipt and the pending intent
+    // why: after close/reopen the row, the pending receipt and the pending intent
     // are all still there; the intent still owes its publication targets.
     harness.reopen().await;
     let (status, state, targets): (String, String, String) = sqlx::query_as(
@@ -1371,7 +1371,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
         .await
         .expect("staged record row");
 
-    // Post-COMMIT fault leg: replaying the identical request while the
+    // note: post-COMMIT fault leg — replaying the identical request while the
     // receipt is pending reports OUTCOME_UNCERTAIN — the dedup probe finds
     // the pending receipt and refuses before a second effect can stage.
     let mut tx = harness.begin().await;
@@ -1388,7 +1388,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
     assert_eq!(harness.count("memory_records").await, 1);
     assert_eq!(harness.count("memory_journal").await, 1);
 
-    // File leg: every target the intent owes is a digest-matched file the
+    // note: file leg — every target the intent owes is a digest-matched file the
     // caller publishes into `memory-store/` beside the fixture DB. The
     // digest is JCS/SHA-256 over {"content": <bytes>} — recomputed the same
     // way the adapter stamped it.
@@ -1412,7 +1412,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
         assert_eq!(recomputed, digest, "digest-matched file for {rel}");
     }
 
-    // Post-COMMIT / settle-path fault: publication has already landed, then
+    // note: post-COMMIT / settle-path fault — publication has already landed, then
     // a storage failure inside the settlement transaction (journal table
     // renamed out from under the read) makes the outcome genuinely unknown —
     // the adapter reports OUTCOME_UNCERTAIN with the `uncertain` retry class,
@@ -1438,7 +1438,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
     }
     tx.rollback().await.expect("rollback restores the table");
 
-    // The caller's rollback leaves nothing new durable: the intent and its
+    // why: the caller's rollback leaves nothing new durable — the intent and its
     // receipt stay pending, and the renamed table reverts with them.
     let (status, state): (String, String) = sqlx::query_as(
         "SELECT r.status, j.state \
@@ -1458,7 +1458,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
         "the faulted settle must not create a second intent"
     );
 
-    // Poll before settlement reports OUTCOME_UNCERTAIN; republish the owed
+    // note: poll before settlement reports OUTCOME_UNCERTAIN; republish the owed
     // targets (idempotent) and the retry settle commits receipt + intent.
     let mut tx = harness.begin().await;
     match adapter
@@ -1503,7 +1503,7 @@ async fn journaled_effect_survives_reopen_and_settles() {
     assert_eq!(state, "applied");
     assert_eq!(targets, "[]", "settlement scrubs the targets");
 
-    // Replay-does-not-duplicate-publish: a second settle returns the stored
+    // why: replay-does-not-duplicate-publish — a second settle returns the stored
     // outcome and replaying the original op request serves the committed
     // receipt — no second publish: the file set is byte-identical to the
     // post-publish snapshot and no new record or intent appears.
@@ -1638,7 +1638,7 @@ async fn optional_reflection_refusal() {
             SpokeResult::Ok(_) => panic!("{op} must refuse"),
         }
     }
-    // A refused optional family writes nothing: no receipt, no reflection row.
+    // why: a refused optional family writes nothing — no receipt, no reflection row.
     tx.commit().await.expect("caller commit");
     assert_eq!(harness.count("memory_receipts").await, 0);
     assert_eq!(harness.count("memory_reflections").await, 0);
@@ -1745,7 +1745,7 @@ async fn reflection_lease_completes_in_second_transaction() {
     };
     tx.commit().await.expect("transaction 1 commit");
 
-    // Transaction 2: the composed deterministic effect settles the lease.
+    // note: transaction 2 — the composed deterministic effect settles the lease.
     let mut tx = harness.begin().await;
     let body = match adapter.complete_reflection(&mut tx, work.compose()).await {
         SpokeResult::Ok(body) => body,
@@ -1765,7 +1765,7 @@ async fn reflection_lease_completes_in_second_transaction() {
             .await
             .expect("envelope row");
     assert!(!body_text.is_empty());
-    // The now-visible reflection lists and reports a fresh state.
+    // why: the now-visible reflection lists and reports a fresh state.
     let mut tx = harness.begin().await;
     let body = ready(
         adapter
@@ -1801,7 +1801,7 @@ async fn restricted_caller_candidate_visibility() {
     let reviewer = principal("ctr_p");
     let mut tx = harness.begin().await;
 
-    // Grant P review coverage on U confined to ctx-a, no shared access.
+    // note: grant P review coverage on U confined to ctx-a, no shared access.
     ready(
         adapter
             .grant(
@@ -1850,7 +1850,7 @@ async fn restricted_caller_candidate_visibility() {
         unreachable!()
     };
 
-    // In-scope: the restricted caller reads its own pending candidate.
+    // note: in-scope — the restricted caller reads its own pending candidate.
     let body = ready(
         adapter
             .get_candidate(
@@ -1863,7 +1863,7 @@ async fn restricted_caller_candidate_visibility() {
     );
     assert_eq!(body["candidate"]["status"], "pending");
 
-    // Out of scope: the ctx-b candidate hides exactly as an absent id.
+    // note: out of scope — the ctx-b candidate hides exactly as an absent id.
     match adapter
         .get_candidate(
             &mut tx,
@@ -1882,7 +1882,7 @@ async fn restricted_caller_candidate_visibility() {
         other => panic!("out-of-scope candidate must hide: {other:?}"),
     }
 
-    // Admin consumes cand_a by review-promote; the post-consume restricted
+    // note: admin consumes cand_a by review-promote; the post-consume restricted
     // read serves the consumed shell — digest + consuming receipt, no body.
     let receipt_id = staged(
         adapter
@@ -1940,7 +1940,7 @@ async fn promotion_into_shared_scope() {
     let admin = principal(PRINCIPAL);
     let mut tx = harness.begin().await;
 
-    // Baseline carrier: a record authored into context scope ctx-a.
+    // note: baseline carrier — a record authored into context scope ctx-a.
     let create_receipt = staged(
         adapter
             .create_record(
@@ -1977,7 +1977,7 @@ async fn promotion_into_shared_scope() {
             .await
             .expect("provenance before promote");
 
-    // Before: ctx-a sees the record, shared does not.
+    // note: before — ctx-a sees the record, shared does not.
     let body = ready(
         adapter
             .list_records(
@@ -2009,7 +2009,7 @@ async fn promotion_into_shared_scope() {
     );
     assert!(body["records"].as_array().expect("records").is_empty());
 
-    // Promote into shared scope; the row updates in the caller's tx.
+    // note: promote into shared scope; the row updates in the caller's tx.
     let promote_receipt = staged(
         adapter
             .promote_record(
@@ -2049,7 +2049,7 @@ async fn promotion_into_shared_scope() {
         "provenance survives promotion"
     );
 
-    // After: membership flips — shared serves the record, ctx-a no longer.
+    // note: after — membership flips: shared serves the record, ctx-a no longer.
     let body = ready(
         adapter
             .list_records(
@@ -2101,7 +2101,7 @@ async fn scoped_capture_baseline_d1_d2() {
     let reviewer = principal("ctr_p");
     let mut tx = harness.begin().await;
 
-    // Ensure V with a distinct bearer kind — the second creation is valid
+    // note: ensure V with a distinct bearer kind — the second creation is valid
     // only because its kind.id differs from U's `character`.
     let body = ready(
         adapter
@@ -2119,7 +2119,7 @@ async fn scoped_capture_baseline_d1_d2() {
     );
     assert_eq!(body["result"]["created"], true);
 
-    // Grant P review coverage on U confined to ctx-a (baseline D2's
+    // note: grant P review coverage on U confined to ctx-a (baseline D2's
     // restricted lister).
     ready(
         adapter
@@ -2140,7 +2140,7 @@ async fn scoped_capture_baseline_d1_d2() {
         "grants.grant",
     );
 
-    // CAP(U,A,d-a) → ca, CAP(U,B,d-b) → cb, CAP(U,A,d-c) → cc, CAP(V,A,d-v).
+    // note: CAP(U,A,d-a) → ca, CAP(U,B,d-b) → cb, CAP(U,A,d-c) → cc, CAP(V,A,d-v).
     let capture = |key: &str, subject: &str, context: &str| {
         json!({
             "space_id": SPACE,
@@ -2184,7 +2184,7 @@ async fn scoped_capture_baseline_d1_d2() {
         .expect("v candidate id")
         .to_string();
 
-    // Exact replay of d-a returns the same committed receipt/candidate id;
+    // note: exact replay of d-a returns the same committed receipt/candidate id;
     // the same key with changed text is IDEMPOTENCY_CONFLICT/terminal.
     let body = ready(
         adapter
@@ -2206,7 +2206,7 @@ async fn scoped_capture_baseline_d1_d2() {
         other => panic!("altered replay must conflict: {other:?}"),
     }
 
-    // D2: O pages U's pending candidates limit=1 — [ca], [cb], [cc], no gap,
+    // note: D2 — O pages U's pending candidates limit=1 — [ca], [cb], [cc], no gap,
     // and cv is excluded from U's listing entirely.
     let mut cursor = Value::Null;
     let mut pages = Vec::new();
@@ -2248,7 +2248,7 @@ async fn scoped_capture_baseline_d1_d2() {
         "V candidate must not list under U"
     );
 
-    // The restricted principal pages only its granted context: [ca], [cc],
+    // note: the restricted principal pages only its granted context — [ca], [cc],
     // skipping the ctx-b candidate without a gap.
     let mut cursor = Value::Null;
     let mut pages = Vec::new();
@@ -2357,7 +2357,7 @@ async fn recall_pagination_d12() {
     let [r1, r2, r_del] = records.as_slice() else {
         unreachable!()
     };
-    // Positive control while the record is live: its own words match it and
+    // note: positive control while the record is live — its own words match it and
     // rank it first, while the two siblings score zero and are still served.
     // The same words are rerun after the delete below, so their later failure
     // to produce this record cannot be blamed on the query shape.
@@ -2408,7 +2408,7 @@ async fn recall_pagination_d12() {
     )
     .await;
 
-    // Tombstoning scrubs the body and keeps the deletion mark: the row below
+    // why: tombstoning scrubs the body and keeps the deletion mark — the row below
     // still exists, but carries no searchable text for any query to rank.
     let tombstone: Option<String> =
         sqlx::query_scalar("SELECT tombstone_json FROM memory_records WHERE record_id = ?1")
@@ -2432,7 +2432,7 @@ async fn recall_pagination_d12() {
         "the tombstone retains no searchable text"
     );
 
-    // Same words as the positive control, now that no surviving record carries
+    // note: same words as the positive control, now that no surviving record carries
     // them: both zero-score siblings are still served and the tombstone is not,
     // so the exclusion is the tombstone filter rather than the query shape.
     let body = ready(
@@ -2466,7 +2466,7 @@ async fn recall_pagination_d12() {
         "zero-score live rows stay served; the tombstone does not"
     );
 
-    // Page 1: one record, truncated, cursor continues; page 2 serves the
+    // note: page 1 — one record, truncated, cursor continues; page 2 serves the
     // remaining record with no further cursor. A second query shape reaches
     // the same two live rows and still never the tombstone.
     let body = ready(
@@ -2535,7 +2535,7 @@ async fn recall_pagination_d12() {
     assert_eq!(body["truncated"], false);
     assert!(body["next_cursor"].is_null());
 
-    // Byte budget below one record's size: the budget names the overflowing
+    // note: byte budget below one record's size — the budget names the overflowing
     // record and keeps the page honest — no fabricated partial body.
     let body = ready(
         adapter
@@ -2571,7 +2571,7 @@ async fn reflection_pagination_f3() {
     let adapter = MemoryAdapter::new(true);
     let admin = principal(PRINCIPAL);
 
-    // Transaction 1: profile + basis record + first generation lease.
+    // note: transaction 1 — profile + basis record + first generation lease.
     let mut tx = harness.begin().await;
     let profile_receipt = staged(
         adapter
@@ -2661,7 +2661,7 @@ async fn reflection_pagination_f3() {
     };
     tx.commit().await.expect("tx1 commit");
 
-    // Transaction 2: complete the first lease.
+    // note: transaction 2 — complete the first lease.
     let mut tx = harness.begin().await;
     let body = match adapter.complete_reflection(&mut tx, work.compose()).await {
         SpokeResult::Ok(body) => body,
@@ -2673,7 +2673,7 @@ async fn reflection_pagination_f3() {
         .to_string();
     tx.commit().await.expect("tx2 commit");
 
-    // Transaction 3: update the basis record, re-read the state digest and
+    // note: transaction 3 — update the basis record, re-read the state digest and
     // stage the second generation.
     let mut tx = harness.begin().await;
     let update_receipt = staged(
@@ -2735,7 +2735,7 @@ async fn reflection_pagination_f3() {
     };
     tx.commit().await.expect("tx3 commit");
 
-    // Transaction 4: complete the updated lease.
+    // note: transaction 4 — complete the updated lease.
     let mut tx = harness.begin().await;
     let body = match adapter.complete_reflection(&mut tx, work.compose()).await {
         SpokeResult::Ok(body) => body,
@@ -2747,7 +2747,7 @@ async fn reflection_pagination_f3() {
         .to_string();
     tx.commit().await.expect("tx4 commit");
 
-    // List limit=1: the updated (newest) envelope leads, the stale first
+    // note: list limit=1 — the updated (newest) envelope leads, the stale first
     // envelope follows on the cursor page — each flag recomputed at read.
     let mut tx = harness.begin().await;
     let body = ready(

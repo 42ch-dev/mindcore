@@ -85,12 +85,12 @@ fn reference(kind: &str, id: &str) -> Value {
     json!({"kind": kind, "id": id, "namespace": CARRIER_NAMESPACE})
 }
 
-// A holder reference in another realm: same shape, different namespace.
+// note: a holder reference in another realm: same shape, different namespace.
 fn foreign_reference(kind: &str, id: &str) -> Value {
     json!({"kind": kind, "id": id, "namespace": "other_realm"})
 }
 
-// One current-view belief record about the adopted north-gate proposition.
+// note: one current-view belief record about the adopted north-gate proposition.
 fn belief(record_id: &str, q: f64) -> Value {
     json!({
         "kind": "belief",
@@ -359,7 +359,7 @@ fn invalid_record_is_rejected_and_carrier_unchanged() {
 fn non_current_record_is_rejected() {
     let mut recorded = belief("cog_recorded", 0.4);
     recorded["view"] = json!("recorded_at");
-    // The pinned record validator is placement-agnostic, so only the current-view
+    // why: the pinned record validator is placement-agnostic, so only the current-view
     // rule can reject this record at append time.
     expect_ok(
         validate_cognition_record(&recorded),
@@ -423,13 +423,13 @@ async fn carrier_write_rejects_malformed_module_without_touching_row() {
             "extensions": {},
         }),
     );
-    // The port is the single validation point: a direct put of a malformed module at the correct
+    // why: the port is the single validation point: a direct put of a malformed module at the correct
     // base revision must be refused before any row is written.
     match port.put_knowledge_entry(broken.clone(), Some(1)).await {
         SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
         SpokeResult::Ok(entry) => panic!("malformed module was persisted: {entry:?}"),
     }
-    // The carrier helper delegates to that same check.
+    // why: the carrier helper delegates to that same check.
     match write_carrier(&port, broken, 1).await {
         SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
         SpokeResult::Ok(entry) => panic!("malformed module was persisted: {entry:?}"),
@@ -445,7 +445,7 @@ async fn carrier_write_rejects_malformed_module_without_touching_row() {
     store.close().await;
 }
 
-// A record with a foreign holder passes the pinned module validator, so only the carrier identity
+// why: a record with a foreign holder passes the pinned module validator, so only the carrier identity
 // check can refuse it at the persistence boundary.
 #[tokio::test]
 async fn carrier_write_rejects_foreign_holder_without_touching_row() {
@@ -488,7 +488,7 @@ async fn carrier_write_rejects_foreign_holder_without_touching_row() {
     );
     store.close().await;
 }
-// A caller-supplied record with a missing or non-string record_id must get the pinned public
+// why: a caller-supplied record with a missing or non-string record_id must get the pinned public
 // diagnostic, not a panic or the wire validator's generic message, at the same public boundary
 // that checks every other record shape.
 #[test]
@@ -514,7 +514,7 @@ fn record_without_record_id_returns_typed_rejection() {
     }
 }
 
-// A record held by the right kind and id but in another realm passes the pinned module
+// why: a record held by the right kind and id but in another realm passes the pinned module
 // validator, so only the full holder tuple can refuse it at the persistence boundary.
 #[tokio::test]
 async fn carrier_write_rejects_foreign_holder_namespace_without_touching_row() {
@@ -558,7 +558,7 @@ async fn carrier_write_rejects_foreign_holder_namespace_without_touching_row() {
     store.close().await;
 }
 
-// A record held by a different kind of entity but the same raw id passes the pinned module
+// why: a record held by a different kind of entity but the same raw id passes the pinned module
 // validator, so only the full holder comparison can refuse it at the persistence boundary.
 #[tokio::test]
 async fn carrier_write_rejects_foreign_holder_kind_without_touching_row() {
@@ -710,7 +710,7 @@ fn records_without_revision_are_rejected() {
 fn float_order_record_is_rejected_on_append() {
     let mut float_order = belief("cog_float_order", 0.4);
     float_order["order"] = json!(1.0);
-    // The wire-shape gate itself still accepts the float: the representation
+    // why: the wire-shape gate itself still accepts the float: the representation
     // rule is a carrier contract, not a schema change.
     expect_ok(
         validate_cognition_record(&float_order),
@@ -787,7 +787,7 @@ async fn record_rows_keep_append_order_and_scoped_ids() {
         "create carrier",
     );
 
-    // A second connection so the test holds the write reservation itself.
+    // note: a second connection so the test holds the write reservation itself.
     let pool = second_pool(&path).await;
 
     let header = expect_ok(
@@ -796,7 +796,7 @@ async fn record_rows_keep_append_order_and_scoped_ids() {
     );
     assert_eq!((header.revision, header.head_seq), (1, None));
 
-    // The second record carries its own `order` (2), independent of its storage
+    // why: the second record carries its own `order` (2), independent of its storage
     // position (second append): only the storage order may decide the read-back.
     let second_by_storage = with_order(belief("cog_early", 0.6), 2);
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
@@ -851,7 +851,7 @@ async fn append_rejects_a_stale_revision_without_touching_rows() {
     assert_eq!(assigned, 2);
     tx.commit().await.expect("commit");
 
-    // Complete pre-rejection snapshot: the rejected transaction is compared against
+    // why: complete pre-rejection snapshot: the rejected transaction is compared against
     // these bytes record-by-record, not by record ids alone.
     let committed = expect_ok(
         read_records(&pool, "wren", "ke_wren").await,
@@ -865,7 +865,7 @@ async fn append_rejects_a_stale_revision_without_touching_rows() {
             let details = reject.details.as_ref().expect("stale details");
             assert_eq!(details.get("expected_base_revision"), Some(&json!(1)));
             assert_eq!(details.get("stored_revision"), Some(&json!(2)));
-            // Still inside the rejecting transaction, so a write-then-reject
+            // why: still inside the rejecting transaction, so a write-then-reject
             // implementation cannot hide its writes behind the rollback below.
             let header = expect_ok(
                 read_carrier_header(&mut *tx, "wren", "ke_wren").await,
@@ -923,7 +923,7 @@ async fn append_rejects_a_duplicate_id_at_the_current_revision() {
     assert_eq!(assigned, 2);
     tx.commit().await.expect("commit");
 
-    // Complete pre-rejection snapshot: the rejected transaction is compared against
+    // why: complete pre-rejection snapshot: the rejected transaction is compared against
     // these bytes record-by-record, not by record ids alone.
     let committed = expect_ok(
         read_records(&pool, "wren", "ke_wren").await,
@@ -938,7 +938,7 @@ async fn append_rejects_a_duplicate_id_at_the_current_revision() {
                 reject.message.contains("cog_hearsay") && reject.message.contains("already exists"),
                 "got {reject:?}"
             );
-            // Still inside the rejecting transaction, so a write-then-reject
+            // why: still inside the rejecting transaction, so a write-then-reject
             // implementation cannot hide its writes behind the rollback below.
             let header = expect_ok(
                 read_carrier_header(&mut *tx, "wren", "ke_wren").await,
@@ -1102,7 +1102,7 @@ async fn missing_and_empty_cognition_modules_stay_explicit() {
         assert_eq!(header.head_seq, None, "{entry_id} has no rows to point at");
     }
 
-    // The first storage append onto the module-less carrier seeds the envelope.
+    // why: the first storage append onto the module-less carrier seeds the envelope.
     let mut seeded = belief("cog_seeded", 0.4);
     seeded["holder"] = reference("knowledge_entry", "ke_plain");
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.expect("begin");
@@ -1156,7 +1156,7 @@ async fn append_onto_a_module_without_records_is_projected() {
         "create carrier",
     );
 
-    // Only a foreign payload write reaches this shape: the port's put gates the module.
+    // why: only a foreign payload write reaches this shape: the port's put gates the module.
     let foreign = with_module(
         "ke_partial",
         Some(1),
@@ -1187,7 +1187,7 @@ async fn append_onto_a_module_without_records_is_projected() {
         .clone();
     assert_eq!(module_keys(&records), vec!["cog_partial"]);
 
-    // The client re-submits exactly what it read: without the normalized member this put was
+    // why: the client re-submits exactly what it read: without the normalized member this put was
     // refused for dropping a record it never saw.
     let put = expect_ok(
         port.put_knowledge_entry(read, Some(2)).await,
@@ -1234,7 +1234,7 @@ async fn full_put_keeps_the_committed_prefix_immutable() {
     assert_eq!(created.revision, Some(1));
     let baseline = expect_ok(read_carrier(&port, "ke_wren").await, "read carrier");
 
-    // Dropping a committed record is invalid input.
+    // why: dropping a committed record is invalid input.
     match port
         .put_knowledge_entry(
             with_module(
@@ -1260,7 +1260,7 @@ async fn full_put_keeps_the_committed_prefix_immutable() {
         SpokeResult::Ok(entry) => panic!("a prefix-dropping put was persisted: {entry:?}"),
     }
 
-    // Rewriting a committed record's value is invalid input.
+    // why: rewriting a committed record's value is invalid input.
     let rewritten = with_order(belief("cog_prefix_first", 0.45), 2);
     match port
         .put_knowledge_entry(
@@ -1289,7 +1289,7 @@ async fn full_put_keeps_the_committed_prefix_immutable() {
         SpokeResult::Ok(entry) => panic!("a prefix-rewriting put was persisted: {entry:?}"),
     }
 
-    // Reordering the committed prefix is invalid input too.
+    // why: reordering the committed prefix is invalid input too.
     match port
         .put_knowledge_entry(
             with_module(
@@ -1317,7 +1317,7 @@ async fn full_put_keeps_the_committed_prefix_immutable() {
         SpokeResult::Ok(entry) => panic!("a prefix-reordering put was persisted: {entry:?}"),
     }
 
-    // Every refusal left the stored carrier exactly as it was.
+    // why: every refusal left the stored carrier exactly as it was.
     let reread = expect_ok(read_carrier(&port, "ke_wren").await, "reread carrier");
     assert_eq!(reread.revision, Some(1));
     assert_eq!(
@@ -1326,7 +1326,7 @@ async fn full_put_keeps_the_committed_prefix_immutable() {
         "the refused puts must leave the committed prefix untouched"
     );
 
-    // A put that appends a validated suffix commits.
+    // why: a put that appends a validated suffix commits.
     let suffix = belief("cog_prefix_third", 0.75);
     let updated = expect_ok(
         port.put_knowledge_entry(
@@ -1448,7 +1448,7 @@ async fn holders_and_collections_isolate_heads_records_and_ids() {
         "append s1",
     );
     assert_eq!(s1, 2);
-    // The same record_id as wren's committed cog_w1 is a different scoped id in studio.
+    // why: the same record_id as wren's committed cog_w1 is a different scoped id in studio.
     let s2 = expect_ok(
         append_cognition(
             &mut tx,
@@ -1463,7 +1463,7 @@ async fn holders_and_collections_isolate_heads_records_and_ids() {
     assert_eq!(s2, 3);
     tx.commit().await.expect("commit");
 
-    // Current judgments are per holder.
+    // why: current judgments are per holder.
     let wren_current = expect_ok(
         read_current_record(&pool, "wren", "ke_wren").await,
         "wren current",
@@ -1484,7 +1484,7 @@ async fn holders_and_collections_isolate_heads_records_and_ids() {
     assert_eq!(studio_current["record_id"].as_str(), Some("cog_w1"));
     assert_eq!(studio_current["q"]["value"].as_f64(), Some(0.9));
 
-    // Historical lookups never cross the scope.
+    // why: historical lookups never cross the scope.
     let fox_sees_w1 = expect_ok(
         read_record(&pool, "wren", "ke_fox", "cog_w1").await,
         "fox scoped lookup",
@@ -1493,7 +1493,7 @@ async fn holders_and_collections_isolate_heads_records_and_ids() {
     let fox_records = expect_ok(read_records(&pool, "wren", "ke_fox").await, "fox records");
     assert_eq!(module_keys(&fox_records), vec!["cog_f1"]);
 
-    // Independent revisions and heads per holder and per collection.
+    // why: independent revisions and heads per holder and per collection.
     for (collection, entry_id, expected) in [
         ("wren", "ke_wren", (3, Some(2))),
         ("wren", "ke_fox", (2, Some(1))),
@@ -1527,7 +1527,7 @@ async fn historical_records_stay_addressable_while_the_head_moves() {
         "create carrier",
     );
 
-    // Appended oldest first; the DTO `order` field counts the other way.
+    // why: appended oldest first; the DTO `order` field counts the other way.
     let oldest = with_order(belief("cog_oldest", 0.2), 3);
     let middle = with_order(belief("cog_middle", 0.5), 1);
     let newest = with_order(belief("cog_newest", 0.8), 2);
@@ -1628,7 +1628,7 @@ async fn a_superseded_carrier_has_no_current_judgment() {
         None,
         "a superseded carrier offers no current judgment"
     );
-    // The explicit record lookup and revision replay stay available.
+    // why: the explicit record lookup and revision replay stay available.
     let historical = expect_ok(
         read_record(&pool, "wren", "ke_wren", "cog_last").await,
         "record lookup after marking",
@@ -1731,7 +1731,7 @@ async fn projection_matches_the_pre_change_fixtures_across_groups() {
         "the derived MindState must be byte-identical to the pre-change derivation"
     );
 
-    // Two addressed targets are two groups, in first-appearance order; the last
+    // why: two addressed targets are two groups, in first-appearance order; the last
     // appended record of each group wins, whatever its `order` says.
     let items = state["cognition"]["items"]
         .as_array()

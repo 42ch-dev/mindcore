@@ -75,7 +75,7 @@ impl ReflectionWork {
     /// commit — keeps the parked window free of any unfinished envelope.
     ///
     /// simplify: the local engine renders the digest-pinned basis snapshot,
-    /// not record bodies; the real cognition engine plugs in at this seam.
+    /// not record bodies; upgrade: when the real cognition engine plugs in at this seam.
     pub fn compose(self) -> ReflectionEffect {
         let record_count = self
             .basis
@@ -226,7 +226,7 @@ impl MemoryAdapter {
         SpokeResult::Reject(Reject::unsupported(op).into_spoke())
     }
 
-    // ── O2: transfer is not served by this build ──────────────────────────
+    // note: O2 — transfer is not served by this build.
 
     pub async fn create_export(
         &self,
