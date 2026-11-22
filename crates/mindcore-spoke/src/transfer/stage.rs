@@ -18,7 +18,9 @@ use spoke_schemas::{
     MemoryExportBundle, MemoryImportsStageRequest, MemoryImportsStageResponse, Principal,
 };
 
-use super::bundle::{digest_excluding, BUNDLE_FORMAT_VERSION};
+use super::bundle::{
+    carries_explicit_null, digest_excluding, explicit_null_refusal, BUNDLE_FORMAT_VERSION,
+};
 use super::canonical_len;
 use super::chunk::BUNDLE_ARRAY_FIELDS;
 use crate::admission::{self, Admission, Coverage};
@@ -613,6 +615,17 @@ impl MemoryAdapter {
                 return Err(unverified(errors));
             }
             bundle = reassemble(&sequence);
+            if let Some(logical) = &bundle {
+                let array = |field: &str| logical.get(field).and_then(Value::as_array);
+                // why: defence in depth. These bytes verified, but the pinned content type cannot
+                // carry a present null, so activating them would change the document.
+                if carries_explicit_null(
+                    array("records").map(Vec::as_slice).unwrap_or_default(),
+                    array("candidates").map(Vec::as_slice).unwrap_or_default(),
+                ) {
+                    return Err(explicit_null_refusal());
+                }
+            }
         }
 
         let fresh = if row.is_none() {

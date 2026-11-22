@@ -1382,15 +1382,12 @@ async fn a_kindless_subject_survives_the_typed_client_round_trip() {
     );
 }
 
-/// Stored content spells a present, null `structured` value as `"structured": null`. The typed
-/// re-encode the seal applies decodes that to `None` and would omit the member, turning present
-/// content into absent content; the seal keeps the wire's presence through create, stage and
-/// activate.
+/// A stored document spells a present, null `structured` value as `"structured": null`. The pinned
+/// content type carries no present null, so the typed seal would omit the member and the transfer
+/// would carry a different document; the export refuses instead of changing it.
 #[tokio::test]
-async fn an_explicitly_null_structured_value_survives_create_stage_activate() {
+async fn an_explicit_null_document_is_refused_at_export() {
     let fixture = Fixture::open().await;
-    elevate(&fixture).await;
-    target_space(&fixture).await;
     let mut row = record("r_null", "s_1", None, false);
     if let RecordState::Live { content, .. } = &mut row.state {
         content.structured = Some(Value::Null);
@@ -1403,60 +1400,72 @@ async fn an_explicitly_null_structured_value_survives_create_stage_activate() {
         .expect("seed the null-structured record");
     tx.commit().await.expect("commit the seeded record");
 
-    let chunks = staged_source(&fixture, "null-structured-export").await;
-    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
-    let records = chunks[0]["records"].as_array().expect("records");
-    let carried = records
-        .iter()
-        .find(|value| value["record_id"] == json!("r_null"))
-        .expect("the null-structured record is exported");
-    assert!(
-        carried["content"].get("structured").is_some(),
-        "the seal keeps the member, not just its null reading: {carried}"
-    );
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let result = adapter
+        .create_export(
+            &mut tx,
+            &principal("p_1"),
+            json!({ "space_id": SPACE, "idempotency_key": "null-content-export" }),
+        )
+        .await;
+    tx.rollback().await.expect("rollback a refused export");
+    let reject = rejected(&result);
+    assert_eq!(reject.code, spoke_operations::SpokeRejectCode::InvalidInput);
     assert_eq!(
-        carried["content"]["structured"],
-        Value::Null,
-        "the seal keeps the explicit null"
+        detail(reject, "reason"),
+        &json!("explicit_null_content_not_transferable"),
+        "the refusal names what it could not carry: {reject:?}"
     );
+}
 
-    let staged = ready(
-        stage_into(
-            &fixture,
-            TARGET,
-            chunks[0].clone(),
-            "null-structured-stage-0",
-            None,
+/// Defence in depth: a bundle whose bytes verify but whose content member spells an explicit null
+/// is refused at final verification with the same reason, so no arrival can be activated as a
+/// document the sender's seal changed.
+#[tokio::test]
+async fn a_bundle_carrying_an_explicit_null_is_refused_at_final_verification() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let mut tx = fixture.begin().await;
+    let artifact = ok(
+        build(
+            &fixture.repository,
+            &mut tx,
+            &spec(None, PlacementSelection::SubjectAll),
         )
         .await,
+        "build export",
     );
-    let import_id = staged["result"]["import_id"]
-        .as_str()
-        .expect("import id")
-        .to_string();
-    assert_eq!(
-        ready(activate(&fixture, &import_id, "null-structured-activate").await)["status"],
-        json!("committed")
-    );
+    tx.rollback().await.expect("rollback build");
 
-    let stored: String = sqlx::query_scalar(
-        "SELECT content_json FROM memory_records \
-         WHERE space_id = ? AND json_extract(content_json, '$.text') = ?",
+    let mut bundle = artifact.bundle.clone();
+    bundle["records"][0]["content"]["structured"] = Value::Null;
+    reseal(&mut bundle);
+    let chunks = sealed_partition(&bundle);
+    let result = stage_into(
+        &fixture,
+        TARGET,
+        chunks[0].clone(),
+        "null-content-stage-0",
+        None,
     )
-    .bind(TARGET)
-    .bind("ledger for r_null")
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("the activated record");
-    let content: Value = serde_json::from_str(&stored).expect("stored content decodes");
-    assert!(
-        content.get("structured").is_some(),
-        "the member is present, not absent: {content}"
+    .await;
+    let reject = rejected(&result);
+    assert_eq!(
+        detail(reject, "reason"),
+        &json!("explicit_null_content_not_transferable"),
+        "final verification refuses the document it cannot carry: {reject:?}"
     );
     assert_eq!(
-        content["structured"],
-        Value::Null,
-        "activation stores the present null"
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
+            &[TARGET],
+        )
+        .await,
+        0,
+        "a refused final chunk stages nothing"
     );
 }
 

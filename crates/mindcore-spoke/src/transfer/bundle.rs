@@ -46,39 +46,48 @@ pub(super) fn digest_excluding(value: &Value, field: &str) -> AResult<String> {
 /// timestamps back into `DateTime` and writes chrono's `AutoSi` spelling, so a stored `…:00.000Z`
 /// sealed verbatim would make the chunk it sends back fail the digest this store sealed.
 fn typed<T: DeserializeOwned + Serialize>(value: Value) -> AResult<Value> {
-    let member: T = serde_json::from_value(value.clone()).map_err(|error| {
+    let member: T = serde_json::from_value(value).map_err(|error| {
         Reject::internal(format!("a stored bundle member is unreadable: {error}"))
     })?;
-    let mut encoded = serde_json::to_value(member)
-        .map_err(|error| Reject::internal(format!("a bundled member is unencodable: {error}")))?;
-    restore_explicit_nulls(&value, &mut encoded);
-    Ok(encoded)
+    serde_json::to_value(member)
+        .map_err(|error| Reject::internal(format!("a bundled member is unencodable: {error}")))
 }
 
-/// The pinned schema types cannot carry an explicit `null`: an `Option` member decodes one to
-/// `None`, and its re-encode omits the member, while stored content spells `"structured": null`
-/// for a present, null structured value. Presence is part of the bytes this store seals, so every
-/// `null` the wire carries and the typed encode dropped is spliced back.
-fn restore_explicit_nulls(wire: &Value, encoded: &mut Value) {
-    match (wire, encoded) {
-        (Value::Object(wire), Value::Object(encoded)) => {
-            for (member, value) in wire {
-                match encoded.get_mut(member) {
-                    Some(encoded) => restore_explicit_nulls(value, encoded),
-                    None if value.is_null() => {
-                        encoded.insert(member.clone(), Value::Null);
-                    }
-                    None => {}
-                }
-            }
-        }
-        (Value::Array(wire), Value::Array(encoded)) => {
-            for (wire, encoded) in wire.iter().zip(encoded.iter_mut()) {
-                restore_explicit_nulls(wire, encoded);
-            }
-        }
-        _ => {}
+/// Refusal reason for a stored document the transfer format cannot carry unchanged.
+pub(super) const EXPLICIT_NULL_REASON: &str = "explicit_null_content_not_transferable";
+
+/// The stored documents a logical bundle carries: `records[].content` and a pending
+/// `candidates[].proposed.content`. The pinned content type cannot represent a present `null` —
+/// an `Option` decodes one to `None`, and the typed encoding then omits the member — so such a
+/// document can only transfer as a different document.
+pub(super) fn carries_explicit_null(records: &[Value], candidates: &[Value]) -> bool {
+    records
+        .iter()
+        .filter_map(|record| record.get("content"))
+        .chain(candidates.iter().filter_map(|candidate| {
+            candidate
+                .get("proposed")
+                .and_then(|proposed| proposed.get("content"))
+        }))
+        .any(has_null)
+}
+
+fn has_null(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(items) => items.iter().any(has_null),
+        Value::Object(members) => members.values().any(has_null),
+        _ => false,
     }
+}
+
+/// The one refusal for a document a transfer would have to change to carry.
+pub(super) fn explicit_null_refusal() -> Reject {
+    Reject::invalid(
+        "a stored document contains an explicit null, which this transfer format cannot carry \
+         unchanged; rewrite the document without the null, or leave it out of the export",
+    )
+    .detail("reason", json!(EXPLICIT_NULL_REASON))
 }
 
 fn typed_array<T: DeserializeOwned + Serialize>(values: Vec<Value>) -> AResult<Value> {
@@ -181,6 +190,11 @@ pub(super) fn assemble(
     let mut candidate_values = candidate_values;
     candidate_values
         .sort_by(|left, right| key(left, "candidate_id").cmp(key(right, "candidate_id")));
+    // why: the typed encoding below must omit a member the pinned content type cannot carry, so a
+    // document that spells an explicit null is refused here instead of sealing changed content.
+    if carries_explicit_null(&record_values, &candidate_values) {
+        return Err(explicit_null_refusal());
+    }
     profile_values.sort_by(|left, right| {
         (key(left, "subject_id"), key(left, "profile_kind"))
             .cmp(&(key(right, "subject_id"), key(right, "profile_kind")))
