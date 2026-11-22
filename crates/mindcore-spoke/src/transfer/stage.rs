@@ -175,21 +175,65 @@ fn key_set<'a>(bundle: &'a Value, field: &str, member: &str) -> BTreeSet<&'a str
 
 /// `GrantSummary.principal_ref` is an opaque correlation label — "never credentials
 /// or tokens" (`spoke-schemas` 0.17.0 `PrincipalRef`). The published contract states
-/// only that minimum, so the screen refuses credential-shaped values — a scheme
-/// prefix carrying whitespace, a JWT, or a common key prefix — and accepts every other
-/// opaque label, including a foreign exporter's own spelling. This crate emits
-/// `prl_` plus 32 lowercase hex digits (`bundle::principal_label`); that grammar is
-/// our convention, not an inbound requirement.
+/// only that minimum, so the screen refuses a value that matches a known credential's
+/// *whole shape*: a live key prefix followed by that provider's token length and
+/// alphabet, or a JWT. A prefix alone is not evidence — a foreign exporter's plain
+/// label such as `sk_invoice_42` or `ghp_batch_7` stays a correlation label. This crate
+/// emits `prl_` plus 32 lowercase hex digits (`bundle::principal_label`); that grammar
+/// is our convention, not an inbound requirement.
 fn correlation_label(value: &str) -> bool {
-    const CREDENTIAL_PREFIXES: [&str; 9] = [
-        "sk_", "pk_", "rk_", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AKIA",
-    ];
-    !value.is_empty()
-        && !value.chars().any(char::is_whitespace)
-        && !value.starts_with("eyJ")
-        && !CREDENTIAL_PREFIXES
-            .iter()
-            .any(|prefix| value.starts_with(prefix))
+    !value.is_empty() && !value.chars().any(char::is_whitespace) && !credential_shaped(value)
+}
+
+/// Prefix paired with the tail a real credential carries, never the bare prefix.
+fn credential_shaped(value: &str) -> bool {
+    // Stripe-style live/test secrets: `sk_live_`/`rk_live_` + 24+ base62.
+    for prefix in ["sk_live_", "sk_test_", "rk_live_", "rk_test_", "pk_live_"] {
+        if let Some(tail) = value.strip_prefix(prefix) {
+            if tail.len() >= 24 && tail.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return true;
+            }
+        }
+    }
+    // GitHub tokens: `ghp_`/`gho_`/`ghs_`/`ghu_` + exactly 36 base62.
+    for prefix in ["ghp_", "gho_", "ghs_", "ghu_"] {
+        if let Some(tail) = value.strip_prefix(prefix) {
+            if tail.len() == 36 && tail.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return true;
+            }
+        }
+    }
+    // Slack tokens: `xoxb-`/`xoxp-` + long digit groups.
+    for prefix in ["xoxb-", "xoxp-", "xoxa-", "xoxo-"] {
+        if let Some(tail) = value.strip_prefix(prefix) {
+            if tail.len() >= 24
+                && tail
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_alphabetic() || c == '-')
+            {
+                return true;
+            }
+        }
+    }
+    // AWS access key id: exactly `AKIA` + 16 uppercase alphanumerics.
+    if let Some(tail) = value.strip_prefix("AKIA") {
+        if tail.len() == 16
+            && tail
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // JWT: three base64url segments, the header starting `eyJ`.
+    let segments: Vec<&str> = value.split('.').collect();
+    segments.len() == 3
+        && value.starts_with("eyJ")
+        && segments.iter().all(|segment| {
+            segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
 }
 
 /// References and grant summaries: every cross-reference resolves inside the
@@ -198,6 +242,24 @@ fn reference_errors(bundle: &Value, adopted: &Value) -> Vec<String> {
     let mut errors = Vec::new();
     let subjects = key_set(bundle, "subjects", "subject_id");
     let records = key_set(bundle, "records", "record_id");
+
+    // why: the identity maps are many-to-one keys. A duplicate would pass verification
+    // and then break activation's mapping, stranding the import mid-sequence.
+    for (field, member, noun) in [
+        ("subjects", "subject_id", "subject"),
+        ("records", "record_id", "record"),
+        ("candidates", "candidate_id", "candidate"),
+    ] {
+        let mut ids = BTreeSet::new();
+        for item in bundle[field].as_array().into_iter().flatten() {
+            let Some(id) = item.get(member).and_then(Value::as_str) else {
+                continue;
+            };
+            if !ids.insert(id) {
+                errors.push(format!("{noun} {id} appears more than once"));
+            }
+        }
+    }
 
     for field in ["records", "profiles", "candidates", "reflections", "grants"] {
         for item in bundle[field].as_array().into_iter().flatten() {
@@ -408,18 +470,10 @@ impl MemoryAdapter {
             return Self::replay::<MemoryImportsStageResponse>(&receipt);
         }
 
-        // §7.30/§7.31: a caller who could not page the source export is answered the
-        // same absence as a caller who never staged, before any state is read.
-        // why: an export this store never held is foreign, so there is no local
-        // coverage to check and the state a stage reveals is the caller's own.
-        if let Some(export) = self.repository.export_by_id(tx, &source_export_id).await? {
-            if !super::exports::readable(&self.repository, tx, &export, principal_id, op.now)
-                .await?
-            {
-                return Err(no_staging_import(&source_export_id));
-            }
-        }
-
+        // why: a local export the caller may not page is treated exactly like an export
+        // this store never held. Refusing one and accepting the other would disclose
+        // which guessed export ids exist; staging is the caller's own durable state, and
+        // the chunks it carries verify against the bundle on their own.
         let staging = self
             .repository
             .import_by_source(tx, &op.space, principal_id, &source_export_id)
@@ -440,11 +494,15 @@ impl MemoryAdapter {
                 live = None;
             }
         }
-        // why: retention purges expired staging on any successful transfer write for the space,
-        // so an abandoned import does not hold its storage until its own source export returns.
-        // The exact-source reclaim above runs first, so a late chunk still names its expiry.
+        // why: retention purges expired staging and expired export payloads on any
+        // successful transfer write for the space, so neither abandoned transfer state
+        // holds storage until its own source returns. The exact-source reclaim above runs
+        // first, so a late chunk still names its expiry.
         self.repository
             .expire_imports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
+        self.repository
+            .expire_exports(tx, &op.space, &policy::timestamp(op.now))
             .await?;
         let row = if ordinal == 0 {
             if let Some(row) = &live {

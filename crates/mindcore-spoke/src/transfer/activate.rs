@@ -627,33 +627,40 @@ fn not_subsumed(
 ) -> AResult<()> {
     let caller_wire = admission::wire_grants(caller_grants)?;
     for grant in grants {
-        for capability in &grant.capabilities {
-            let requirement = GrantRequirement {
+        // why: an adopted grant is one row with one capability set. Requiring a single
+        // caller grant to cover every capability keeps two separately held capabilities
+        // from being merged into a grant wider than either source.
+        let requirements: Vec<GrantRequirement<'_>> = grant
+            .capabilities
+            .iter()
+            .map(|capability| GrantRequirement {
                 capability,
                 subject_id: grant.subject_id.as_ref().map(SubjectId::as_str),
                 context_ids: grant.context_ids.iter().map(ToString::to_string).collect(),
                 reads_shared: grant.shared_access || grant.context_ids.is_empty(),
                 subject_all: grant.context_ids.is_empty(),
-            };
-            let covered = caller_grants.iter().zip(&caller_wire).any(|(row, wire)| {
-                row.expires_at.is_none()
-                    && spoke_operations::grant_covers(
+            })
+            .collect();
+        let covered = caller_grants.iter().zip(&caller_wire).any(|(row, wire)| {
+            row.expires_at.is_none()
+                && requirements.iter().all(|requirement| {
+                    spoke_operations::grant_covers(
                         wire,
                         principal,
                         space.as_str(),
                         now,
-                        &requirement,
+                        requirement,
                     )
-            });
-            if !covered {
-                return Err(conflict(format!(
-                    "adopted grant {} would amplify coverage the caller does not hold",
-                    grant.grant_id
-                ))
-                .detail("reason", json!("grant_not_subsumed"))
-                .detail("grant_id", json!(grant.grant_id))
-                .detail("capability", json!(capability)));
-            }
+                })
+        });
+        if !covered {
+            return Err(conflict(format!(
+                "adopted grant {} would amplify coverage the caller does not hold",
+                grant.grant_id
+            ))
+            .detail("reason", json!("grant_not_subsumed"))
+            .detail("grant_id", json!(grant.grant_id))
+            .detail("capabilities", json!(grant.capabilities)));
         }
     }
     Ok(())
@@ -971,6 +978,9 @@ impl MemoryAdapter {
         self.repository
             .expire_imports(tx, &op.space, &policy::timestamp(op.now))
             .await?;
+        self.repository
+            .expire_exports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
 
         let Some(import) = self.repository.import(tx, &op.space, &import_id).await? else {
             return Err(Reject::not_found(format!("import {import_id}")));
@@ -1119,6 +1129,9 @@ impl MemoryAdapter {
         }
         self.repository
             .expire_imports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
+        self.repository
+            .expire_exports(tx, &op.space, &policy::timestamp(op.now))
             .await?;
 
         let Some(import) = self.repository.import(tx, &op.space, &import_id).await? else {

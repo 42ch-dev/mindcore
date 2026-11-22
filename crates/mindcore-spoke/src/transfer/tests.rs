@@ -1059,6 +1059,53 @@ async fn a_read_past_the_retention_window_answers_expired() {
     );
 }
 
+/// Retention reclaims an expired export's payload on the next successful transfer
+/// write of its space, the way expired imports are reclaimed; the metadata row stays
+/// so a later read still answers `EXPORT_EXPIRED`.
+#[tokio::test]
+async fn the_next_transfer_write_reclaims_an_expired_export_payload() {
+    let fixture = Fixture::open().await;
+    let expired = create_export(&fixture, "sweep-key-1").await;
+    let expired_id = expired["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    expire(&fixture, &expired_id).await;
+    assert!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_export_chunks WHERE export_id = ?",
+            &[expired_id.as_str()],
+        )
+        .await
+            > 0,
+        "the expired export still holds its payload"
+    );
+
+    create_export(&fixture, "sweep-key-2").await;
+
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_export_chunks WHERE export_id = ?",
+            &[expired_id.as_str()],
+        )
+        .await,
+        0,
+        "the next transfer write released the expired payload"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_exports WHERE export_id = ?",
+            &[expired_id.as_str()],
+        )
+        .await,
+        1,
+        "the metadata row stays so the expiry answer still resolves"
+    );
+}
+
 #[tokio::test]
 async fn a_scope_the_caller_cannot_read_answers_absence_rather_than_expiry() {
     let fixture = Fixture::open().await;
@@ -1275,6 +1322,41 @@ async fn a_valid_single_chunk_sequence_reaches_staged() {
     .expect("import row");
     assert!(payload.is_some(), "the translated rows are durable");
     assert!(stored_report.is_some(), "the identity report is durable");
+}
+
+/// The fixture's subjects carry no `kind`. The sealed bundle must omit the member
+/// rather than seal `null`, because the typed client drops an absent optional on the
+/// wire — the null would make its chunk disagree with the digest this store sealed.
+#[tokio::test]
+async fn a_kindless_subject_survives_the_typed_client_round_trip() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    let chunks = staged_source(&fixture, "kindless-export").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+
+    let sealed = chunks[0]["subjects"].as_array().expect("subjects");
+    assert!(!sealed.is_empty());
+    for subject in sealed {
+        assert!(
+            subject.get("kind").is_none(),
+            "an absent kind is omitted, not null"
+        );
+    }
+    let typed: spoke_schemas::MemoryExportChunk =
+        serde_json::from_value(chunks[0].clone()).expect("chunk decodes against its schema");
+    let sent = serde_json::to_value(typed).expect("chunk re-encodes");
+    for subject in sent["subjects"].as_array().expect("subjects") {
+        assert!(
+            subject.get("kind").is_none(),
+            "the typed client's wire shape agrees"
+        );
+    }
+
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "kindless-0").await);
+    assert_eq!(
+        body["result"]["staged_report"]["counts"]["subjects"],
+        json!(2)
+    );
 }
 
 /// §7.0.5: the same key and payload replays the recorded outcome and writes
@@ -1814,10 +1896,12 @@ async fn a_staged_import_holds_its_source_export_against_a_second_key() {
     );
 }
 
-/// A caller who may write the target space but cannot page the named source
-/// export learns nothing about it: no import, no ordinal, no expiry.
+/// A local export the caller cannot page and an export this store never held are
+/// indistinguishable at staging: both are the caller's own durable state, and both
+/// stage the chunks the caller supplies. Refusing only the first would let a guessed
+/// export id probe which exports exist.
 #[tokio::test]
-async fn an_unreadable_source_export_answers_generic_absence() {
+async fn an_unreadable_local_source_stages_exactly_like_a_foreign_export() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
     target_space(&fixture).await;
@@ -1839,35 +1923,45 @@ async fn an_unreadable_source_export_answers_generic_absence() {
             .expect("seed p_2 target grant");
         tx.commit().await.expect("commit p_2 target grant");
     }
-    let chunks = staged_source(&fixture, "stage-key-read").await;
-    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+    let local = staged_source(&fixture, "stage-key-read").await;
+    assert_eq!(local.len(), 1, "the fixture export is one chunk");
 
-    let refused = stage_as(&fixture, TARGET, "p_2", chunks[0].clone(), "read-0", None).await;
-    let reject = rejected(&refused);
-    assert_eq!(
-        reject.code,
-        spoke_operations::SpokeRejectCode::ImportConflict
+    // The same snapshot under an export id this store never held: a foreign bundle.
+    let mut foreign_spec = spec(None, PlacementSelection::SubjectAll);
+    foreign_spec.export_id = "exp_never_held".to_string();
+    let mut tx = fixture.begin().await;
+    let foreign = ok(
+        build(&fixture.repository, &mut tx, &foreign_spec).await,
+        "build foreign export",
     );
-    assert_eq!(detail(reject, "reason"), &json!("no_staging_import"));
-    let details = reject.details.as_ref().expect("refusal details");
-    assert!(!details.contains_key("expected_ordinal"));
-    assert!(!details.contains_key("expires_at"));
-    assert!(!details.contains_key("import_id"));
+    tx.rollback().await.expect("rollback build");
+    assert_eq!(foreign.chunks.len(), 1);
+
+    let unreadable =
+        ready(stage_as(&fixture, TARGET, "p_2", local[0].clone(), "read-0", None).await);
+    let absent = ready(
+        stage_as(
+            &fixture,
+            TARGET,
+            "p_2",
+            foreign.chunks[0].clone(),
+            "read-0f",
+            None,
+        )
+        .await,
+    );
+    assert_eq!(unreadable["result"]["chunks_received"], json!(1));
+    assert_eq!(absent["result"]["chunks_received"], json!(1));
     assert_eq!(
         count(
             &fixture,
             "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
-            &[TARGET]
+            &[TARGET],
         )
         .await,
-        0,
-        "an unreadable source export stages nothing"
+        2,
+        "neither answer discloses whether the named export exists locally"
     );
-
-    // The export's own reader stages the same chunk: the screen is on the caller's
-    // coverage of the source export, not on the export.
-    let staged = ready(stage_as(&fixture, TARGET, "p_1", chunks[0].clone(), "read-0b", None).await);
-    assert_eq!(staged["result"]["chunks_received"], json!(1));
 }
 
 fn reseal(bundle: &mut Value) {
@@ -1948,6 +2042,53 @@ async fn sequence_verification_rejects_versions_references_and_adoptions() {
     );
 }
 
+/// Duplicate identity keys would pass verification and then break activation's
+/// mapping, so final verification refuses them like any other reference error.
+#[tokio::test]
+async fn duplicate_subject_record_or_candidate_ids_fail_final_verification() {
+    let fixture = Fixture::open().await;
+    let mut tx = fixture.begin().await;
+    let artifact = ok(
+        build(
+            &fixture.repository,
+            &mut tx,
+            &spec(None, PlacementSelection::SubjectAll),
+        )
+        .await,
+        "build export",
+    );
+    tx.rollback().await.expect("rollback build");
+
+    for (array, noun) in [
+        ("subjects", "subject"),
+        ("records", "record"),
+        ("candidates", "candidate"),
+    ] {
+        let mut bundle = artifact.bundle.clone();
+        let first = bundle[array]
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("the fixture exports the array")
+            .clone();
+        bundle[array].as_array_mut().expect("array").push(first);
+        reseal(&mut bundle);
+        let chunks = sealed_partition(&bundle);
+        let errors = super::stage::verification_errors(
+            &chunks,
+            chunks.len() as u64,
+            sealed_digest(&bundle),
+            "exp_1",
+            &json!([]),
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(noun) && error.contains("more than once")),
+            "{array}: {errors:?}"
+        );
+    }
+}
+
 /// `GrantSummary.principal_ref` is an opaque correlation label. A value that carries
 /// key material — here a bearer token — is refused by final verification without being
 /// echoed; a foreign exporter's own opaque spelling is accepted, because this crate's
@@ -2009,6 +2150,68 @@ async fn a_grant_summary_principal_ref_is_screened_for_credentials_not_for_our_g
         !errors.iter().any(|error| error.contains(token)),
         "the refusal never echoes the value it refused: {errors:?}"
     );
+}
+
+/// The screen refuses a credential's whole shape, not a bare prefix: a short foreign
+/// label that happens to start with a known key prefix stays an opaque label, while a
+/// value carrying the provider's token length and alphabet is refused.
+#[tokio::test]
+async fn the_credential_screen_keeps_plain_prefixed_labels() {
+    let fixture = Fixture::open().await;
+    let mut tx = fixture.begin().await;
+    let artifact = ok(
+        build(
+            &fixture.repository,
+            &mut tx,
+            &spec(None, PlacementSelection::SubjectAll),
+        )
+        .await,
+        "build export",
+    );
+    tx.rollback().await.expect("rollback build");
+
+    let screen = |label: &str| {
+        let mut bundle = artifact.bundle.clone();
+        bundle["grants"][0]["principal_ref"] = json!(label);
+        reseal(&mut bundle);
+        let chunks = sealed_partition(&bundle);
+        super::stage::verification_errors(
+            &chunks,
+            chunks.len() as u64,
+            sealed_digest(&bundle),
+            "exp_1",
+            &json!([]),
+        )
+    };
+
+    for label in [
+        "sk_invoice_42",
+        "ghp_batch_7",
+        "pk_project_1",
+        "xoxb-staging",
+    ] {
+        let errors = screen(label);
+        assert!(
+            errors.is_empty(),
+            "a plain opaque label {label} is not a credential: {errors:?}"
+        );
+    }
+    // Prefix plus the provider's own token length and alphabet, built here so the
+    // fixture source never carries a credential-shaped literal.
+    let shaped = [
+        format!("sk_live_{}", "9fK2mQ8xT4vR7bN3cL6pW1sD"),
+        format!("ghp_{}", "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF3hJ6"),
+        format!("AKIA{}", "Q7XK4M9P2R5T8V3W"),
+    ];
+    for label in &shaped {
+        let errors = screen(label);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("not an opaque correlation label")),
+            "{label} carries key material: {errors:?}"
+        );
+    }
 }
 
 /// The wire header omits an empty `extensions`; reassembly restores `{}`, so a
@@ -2614,6 +2817,65 @@ async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
         .await,
         0,
         "a refused adoption stages nothing"
+    );
+}
+
+/// An adopted grant is one row with one capability set. Capabilities held in two
+/// separate caller grants never merge into it: no single grant must cover fewer than
+/// the adopted grant's whole set.
+#[tokio::test]
+async fn adoption_refuses_capabilities_that_only_separate_grants_cover() {
+    let fixture = Fixture::open().await;
+    target_space(&fixture).await;
+    // Admission needs a live space-wide admin grant, but it expires: it can open the
+    // stage yet cannot cover a permanent adopted grant.
+    sqlx::query("UPDATE memory_grants SET expires_at = ? WHERE grant_id = 'g_target'")
+        .bind("2030-01-01T00:00:00.000Z")
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the target admin cover");
+    // Two non-expiring grants hold one adopted capability each.
+    for (grant_id, capability) in [
+        ("g_target_transfer", "transfer"),
+        ("g_target_records", "records_read"),
+    ] {
+        let mut row = grant(grant_id, None, "p_1", &[], false, false);
+        row.space_id = SpaceId::new(TARGET);
+        row.capabilities = vec![capability.to_string()];
+        let mut tx = fixture.begin().await;
+        fixture
+            .repository
+            .insert_grant(&mut tx, &row)
+            .await
+            .expect("seed a split grant");
+        tx.commit().await.expect("commit the split grant");
+    }
+
+    // g_2 asks for transfer and records_read together.
+    let chunks = staged_source(&fixture, "split-cover-export").await;
+    let refused = stage_into(
+        &fixture,
+        TARGET,
+        chunks[0].clone(),
+        "split-cover-stage",
+        Some(json!({ "adopt_grants": [{ "grant_id": "g_2", "principal_id": "p_2" }] })),
+    )
+    .await;
+    let reject = rejected(&refused);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("grant_not_subsumed"));
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_imports WHERE space_id = ?",
+            &[TARGET],
+        )
+        .await,
+        0,
+        "a split cover stages nothing"
     );
 }
 

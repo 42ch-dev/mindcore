@@ -132,14 +132,42 @@ impl RemoteMemoryService for TransferService {
         };
         match tx.commit().await {
             Ok(()) => SpokeResult::Ok(body),
-            // §14.2/§14.3: the effect may or may not be durable; never claim either way.
-            Err(_) => reject(Reject::uncertain(format!(
-                "{op} commit outcome was not confirmed"
-            ))),
+            // §14.2/§14.3: the effect may or may not be durable; never claim either way,
+            // and name the receipt the client can poll so it can resolve without a retry.
+            Err(_) => reject(commit_uncertain(op, &body)),
         }
     }
 }
 
+/// The commit acknowledgement was lost. The receipt id is the client's resolution
+/// handle (§7.28 `memory.receipts.get`); it is omitted only if the settled body carried
+/// no receipt, which no routed mutation does.
+fn commit_uncertain(op: &str, body: &Value) -> Reject {
+    let mut reject = Reject::uncertain(format!("{op} commit outcome was not confirmed"));
+    if let Some(receipt_id) = body.get("receipt_id").cloned() {
+        reject = reject.detail("receipt_id", receipt_id);
+    }
+    reject
+}
+
 fn reject(reject: Reject) -> SpokeResult<Value> {
     SpokeResult::Reject(reject.into_spoke())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use spoke_operations::SpokeRejectCode;
+
+    use super::commit_uncertain;
+
+    #[test]
+    fn an_unconfirmed_commit_names_the_receipt_that_resolves_it() {
+        let body = json!({ "schema_version": 1, "receipt_id": "rct_1", "status": "committed" });
+        let reject = commit_uncertain("memory.imports.activate", &body).into_spoke();
+        assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+        let details = reject.details.expect("refusal details");
+        assert_eq!(details["receipt_id"], json!("rct_1"));
+        assert_eq!(details["retry_class"], json!("uncertain"));
+    }
 }

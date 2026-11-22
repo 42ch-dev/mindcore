@@ -10,9 +10,9 @@ use spoke_schemas::{
     MemoryExportsGetResponse, Principal,
 };
 
-use mindcore_base::ids::{SpaceId, SubjectId};
+use mindcore_base::ids::SubjectId;
 use mindcore_base::ir::{MemoryRepository, PlacementSelection};
-use mindcore_sqlite::{MemoryExportRow, SqliteMemoryRepository};
+use mindcore_sqlite::MemoryExportRow;
 
 use super::{build, ExportSpec};
 use crate::admission::{self, Admission, Coverage};
@@ -68,28 +68,6 @@ fn read_requirements<'a>(
         requirements.push(export_requirement("admin", subject, selection));
     }
     requirements
-}
-
-/// §7.30/§7.31: whether the caller may page this stored export at all. Staging
-/// asks before it answers any staging fact about the export's chunks.
-pub(super) async fn readable(
-    repository: &SqliteMemoryRepository,
-    tx: &mut Tx<'_>,
-    row: &MemoryExportRow,
-    principal: &str,
-    now: DateTime<Utc>,
-) -> AResult<bool> {
-    let space = SpaceId::new(row.space_id.as_str());
-    let selection = stored_selection(row)?;
-    let requirements = read_requirements(row, &selection);
-    let grants = admission::wire_grants(&repository.list_grants(tx, &space, None).await?)?;
-    Ok(admission::one_grant_covers(
-        &grants,
-        principal,
-        space.as_str(),
-        now,
-        &requirements,
-    ))
 }
 
 impl MemoryAdapter {
@@ -163,6 +141,9 @@ impl MemoryAdapter {
         }
         self.repository
             .expire_imports(tx, &op.space, &policy::timestamp(op.now))
+            .await?;
+        self.repository
+            .expire_exports(tx, &op.space, &policy::timestamp(op.now))
             .await?;
         admission::gate(&self.repository, tx, &admission).await?;
         if require_quiescent {
