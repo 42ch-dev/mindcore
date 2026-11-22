@@ -1902,7 +1902,7 @@ mod tests {
             "create module-less carrier",
         );
 
-        // why: the entry read — revision 1's payload pairs with revision 1's records.
+        // note: the entry read — revision 1's payload pairs with revision 1's records.
         let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
         store.seam.install(hook_to_test, hook_rx);
@@ -1936,7 +1936,7 @@ mod tests {
             record_ids(&dto)
         );
 
-        // why: the append really committed during the read — a fresh read sees revision 2.
+        // note: the append really committed during the read — a fresh read sees revision 2.
         let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
         assert_eq!(fresh.revision, Some(2));
         assert_eq!(record_ids(&fresh), vec!["cog_hearsay"]);
@@ -1990,7 +1990,7 @@ mod tests {
             "wren's records must come from its own snapshot"
         );
 
-        // why: the second append really committed during the listing.
+        // note: the second append really committed during the listing.
         let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
         assert_eq!(fresh.revision, Some(3));
         assert_eq!(record_ids(&fresh), vec!["cog_hearsay", "cog_newer"]);
@@ -2030,7 +2030,7 @@ mod tests {
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
         store.seam.install(hook_to_test, hook_rx);
 
-        // why: the other store's read completes without suspending on this store's seam.
+        // note: the other store's read completes without suspending on this store's seam.
         let other_port = other.knowledge(KnowledgeScope::new("wren"));
         let dto = timeout(
             Duration::from_secs(10),
