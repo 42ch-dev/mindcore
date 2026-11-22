@@ -91,6 +91,33 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
+        // why: the adoption source is read for the whole surface while each principal's route is
+        // its write destination. Pinned before the route map moves into the binding, and before any
+        // registration or port exists, so an invalid configuration cannot leave a half-built
+        // surface.
+        if let Some(adoption) = &faces.adoption {
+            let source = &adoption.source.collection;
+            if source.is_empty() {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    "the adoption source names an empty collection",
+                    None,
+                );
+            }
+            if let Some((principal, _)) = faces
+                .workflow_routes
+                .iter()
+                .find(|(_, route)| route.collection == *source)
+            {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    format!(
+                        "the adoption source collection {source} is the workflow destination of principal {principal}"
+                    ),
+                    None,
+                );
+            }
+        }
         // why: the route map's emptiness decides the deliberation advertisement; read it before the
         // map moves into the binding.
         let routed = !faces.workflow_routes.is_empty();
@@ -133,6 +160,14 @@ impl MindcoreServe {
     }
 }
 
+/// The shared collection adoption reads from: one source for the whole surface, while each
+/// admitted principal's workflow route names the destination its adopted entry is written to.
+/// Assembly refuses a source that names a route destination, so a principal's write can never
+/// become the source another reads.
+pub struct AdoptionRoute {
+    pub source: KnowledgeScope,
+}
+
 /// The host's side of the surface: non-capability manifest metadata and the face wiring the
 /// runtime cannot invent.
 pub struct ServeFaces {
@@ -158,6 +193,11 @@ pub struct ServeFaces {
     pub principals: MemoryAdmission,
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
+    /// The one host-configured adoption source, or `None` to serve no adoption. Its collection must
+    /// be non-empty and must not be any [`ServeFaces::workflow_routes`] destination, including a
+    /// route of a principal that is not connected; assembly refuses otherwise. The source need not
+    /// hold rows.
+    pub adoption: Option<AdoptionRoute>,
     /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
     /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
     /// a route need not name a collection that already holds rows; each destination collection
