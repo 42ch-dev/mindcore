@@ -18,14 +18,14 @@ This is legal because the workspace is unreleased: all five crates are `publish 
 ## Alternatives considered
 
 - **Add a migration for the protocol tables and keep the legacy ones.** Rejected: the dead shape stays, a reader cannot tell which is authoritative, and the schema keeps living in two places. It also preserves the fixture as a second source of truth.
-- **Keep `MemoryStore` beside the protocol repository.** Rejected: two memory semantics on one store type is the defect. Removing it is a breaking API change, accepted because no workspace consumer existed outside the implementor and its two tests.
+- **Keep `MemoryStore` beside the protocol repository.** Rejected: two memory semantics on one store type is the defect. Removing it is a breaking API change (`36b2e56`), but re-adding a trait later costs less than maintaining both APIs and their distinct settlement semantics (`crates/mindcore-sqlite/src/repository.rs:1140-1141`).
 - **Migrate data from the legacy shape.** Rejected: nothing in production has data to migrate, and a migration path would have to be maintained and tested for a shape that never shipped.
 
 ## Consequences
 
 - Starting state equals target state: there is no intermediate schema for a test or a host to honour accidentally.
 - Every existing local database becomes invalid. The public guidance scopes recreation to a migration mismatch and says a busy, locked or I/O-failing database is retried — the distinction matters because only the first case is unrecoverable.
-- Deleting a public trait is a one-way door for any future embedder; carrying two settlement semantics in one crate costs more than re-adding a trait later.
+- Deleting a public trait is a one-way door for any future embedder; carrying two settlement semantics in one crate costs more than re-adding a trait later (`crates/mindcore-spi/src/workflows.rs:394-424`).
 - The fixture disappears as a schema source, so a migration regression now fails `store_bootstrap` rather than passing silently.
 
 ## References
