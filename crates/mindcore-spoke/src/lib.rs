@@ -227,6 +227,10 @@ pub(crate) fn principal_id(principal: &Principal) -> &str {
 }
 
 pub(crate) fn recorded_failure(failure: &ReceiptFailure) -> Reject {
+    // why: the wire vocabulary is closed, so a persisted code this build does not
+    // know replays as `INTERNAL_ERROR`; the recorded `retry_class` below is replayed
+    // verbatim, so only the code's name degrades, never the retry semantics the
+    // failure actually had (`terminal` seeds only a record that carried no class).
     let code =
         SpokeRejectCode::try_from_str(&failure.code).unwrap_or(SpokeRejectCode::InternalError);
     let class = failure
@@ -262,4 +266,42 @@ pub(crate) fn mint(prefix: &str) -> String {
 /// One stored row's revision bumped by one.
 pub(crate) fn bump(revision: &serde_json::Number) -> serde_json::Number {
     serde_json::Number::from(revision.as_u64().unwrap_or(0).saturating_add(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(code: &str, retry_class: &str) -> ReceiptFailure {
+        ReceiptFailure {
+            code: code.to_string(),
+            message: "the provider refused this op".to_string(),
+            details: serde_json::json!({ "retry_class": retry_class })
+                .as_object()
+                .expect("details object")
+                .clone(),
+            extensions: serde_json::Map::new(),
+        }
+    }
+
+    /// A persisted reject the closed wire vocabulary cannot name still replays:
+    /// the code degrades to `INTERNAL_ERROR` and the recorded `retry_class` — the
+    /// part the caller acts on — arrives unchanged; a known code keeps its own.
+    #[test]
+    fn a_recorded_reject_replays_its_class_and_degrades_only_an_unknown_code() {
+        let unknown = recorded_failure(&failure("NO_SUCH_CODE", "retryable")).into_spoke();
+        assert_eq!(unknown.code, SpokeRejectCode::InternalError);
+        assert_eq!(unknown.message, "the provider refused this op");
+        assert_eq!(
+            unknown
+                .details
+                .as_ref()
+                .and_then(|details| details.get("retry_class"))
+                .and_then(Value::as_str),
+            Some("retryable")
+        );
+
+        let known = recorded_failure(&failure("NOT_FOUND", "terminal")).into_spoke();
+        assert_eq!(known.code, SpokeRejectCode::NotFound);
+    }
 }

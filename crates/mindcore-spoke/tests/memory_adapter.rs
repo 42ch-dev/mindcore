@@ -479,7 +479,9 @@ async fn same_key_with_a_different_payload_rejects_as_idempotency_conflict() {
     tx.rollback().await.expect("rollback");
 }
 
-/// O1/O2: a family this build does not serve refuses before touching storage.
+/// O1/O2: a family this build does not serve refuses before touching storage,
+/// and a served transfer selector still refuses an unkeyed request inside the
+/// caller's transaction instead of staging a receipt.
 #[tokio::test]
 async fn withheld_families_refuse_before_storage() {
     let harness = Harness::open().await;
@@ -503,15 +505,14 @@ async fn withheld_families_refuse_before_storage() {
         "memory.reflections.state"
     );
 
+    // why: transfer is served, so `memory.exports.create` runs its own wire
+    // validation; an unkeyed request refuses before it reads or stages anything.
     let export = adapter
         .create_export(&mut tx, &principal(PRINCIPAL), json!({ "space_id": SPACE }))
         .await;
     let refusal = reject(&export);
-    assert_eq!(refusal.code, SpokeRejectCode::CapabilityPortMissing);
-    assert_eq!(
-        refusal.details.as_ref().expect("details")["op"],
-        "memory.exports.create"
-    );
+    assert_eq!(refusal.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(retry_class(refusal), "terminal");
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
     tx.rollback().await.expect("rollback");
 }
