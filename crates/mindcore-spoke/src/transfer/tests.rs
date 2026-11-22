@@ -1052,19 +1052,37 @@ async fn stage_chunk(
     chunk: Value,
     key: &str,
 ) -> spoke_operations::SpokeResult<crate::MemoryStage> {
+    stage_into(fixture, SPACE, chunk, key, None).await
+}
+
+/// Stage one chunk into `space`; ordinal zero may carry extra header members
+/// (adopted grants, reference translations).
+async fn stage_into(
+    fixture: &Fixture,
+    space: &str,
+    chunk: Value,
+    key: &str,
+    header: Option<Value>,
+) -> spoke_operations::SpokeResult<crate::MemoryStage> {
     let adapter = crate::MemoryAdapter::new(false);
     let mut tx = fixture.begin().await;
     let ordinal = chunk["chunk_ordinal"].as_u64().expect("ordinal");
-    let request = if ordinal == 0 {
+    let mut request = if ordinal == 0 {
         json!({
-            "space_id": SPACE,
+            "space_id": space,
             "chunk": chunk,
             "conflict_policy": "fail",
             "idempotency_key": key,
         })
     } else {
-        json!({ "space_id": SPACE, "chunk": chunk, "idempotency_key": key })
+        json!({ "space_id": space, "chunk": chunk, "idempotency_key": key })
     };
+    if let Some(header) = header {
+        let request = request.as_object_mut().expect("request object");
+        for (member, value) in header.as_object().expect("header object") {
+            request.insert(member.clone(), value.clone());
+        }
+    }
     let result = adapter
         .stage_import(&mut tx, &principal("p_1"), request)
         .await;
@@ -1352,4 +1370,771 @@ async fn sequence_verification_rejects_versions_references_and_adoptions() {
             .any(|error| error.contains("adopted grant g_missing")),
         "{errors:?}"
     );
+}
+
+// ---- §7.32/§7.33 imports.activate and imports.discard ----
+
+const TARGET: &str = "spc_target";
+
+/// A second, empty space where `p_1` holds `transfer` and `admin`.
+async fn target_space(fixture: &Fixture) {
+    let mut tx = fixture.begin().await;
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+          created_at) VALUES (?, 'target', 'host_1', 1, 'active', 1, ?)",
+    )
+    .bind(TARGET)
+    .bind(NOW)
+    .execute(&mut *tx)
+    .await
+    .expect("seed target space");
+    let mut row = grant("g_target", None, "p_1", &[], false, false);
+    row.space_id = SpaceId::new(TARGET);
+    row.capabilities = vec![
+        "admin".to_string(),
+        "records_read".to_string(),
+        "transfer".to_string(),
+    ];
+    fixture
+        .repository
+        .insert_grant(&mut tx, &row)
+        .await
+        .expect("seed target grant");
+    tx.commit().await.expect("commit target space");
+}
+
+async fn count(fixture: &Fixture, sql: &'static str, binds: &[&str]) -> i64 {
+    let mut query = sqlx::query_scalar::<_, i64>(sql);
+    for bind in binds {
+        query = query.bind(*bind);
+    }
+    query.fetch_one(&fixture.pool).await.expect("count")
+}
+
+async fn activate(
+    fixture: &Fixture,
+    import_id: &str,
+    key: &str,
+) -> spoke_operations::SpokeResult<crate::MemoryStage> {
+    run_import(fixture, TARGET, import_id, key, true).await
+}
+
+async fn discard(
+    fixture: &Fixture,
+    import_id: &str,
+    key: &str,
+) -> spoke_operations::SpokeResult<crate::MemoryStage> {
+    run_import(fixture, TARGET, import_id, key, false).await
+}
+
+async fn run_import(
+    fixture: &Fixture,
+    space: &str,
+    import_id: &str,
+    key: &str,
+    activation: bool,
+) -> spoke_operations::SpokeResult<crate::MemoryStage> {
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let request = json!({ "space_id": space, "import_id": import_id, "idempotency_key": key });
+    let result = if activation {
+        adapter
+            .activate_import(&mut tx, &principal("p_1"), request)
+            .await
+    } else {
+        adapter
+            .discard_import(&mut tx, &principal("p_1"), request)
+            .await
+    };
+    if matches!(result, spoke_operations::SpokeResult::Ok(_)) {
+        tx.commit().await.expect("commit import mutation");
+    } else {
+        tx.rollback().await.expect("rollback import mutation");
+    }
+    result
+}
+
+#[tokio::test]
+async fn activation_applies_the_staged_bundle_exactly_once() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let chunks = staged_source(&fixture, "activate-export-1").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "activate-stage-0",
+            None,
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    // Invisible until the caller commits the borrowed transaction.
+    {
+        let adapter = crate::MemoryAdapter::new(false);
+        let mut tx = fixture.begin().await;
+        ready(
+            adapter
+                .activate_import(
+                    &mut tx,
+                    &principal("p_1"),
+                    json!({ "space_id": TARGET, "import_id": import_id, "idempotency_key": "activate-1" }),
+                )
+                .await,
+        );
+        tx.rollback().await.expect("rollback activation");
+    }
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        0,
+        "a rolled-back activation applies nothing"
+    );
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 1)
+    );
+
+    let body = ready(activate(&fixture, &import_id, "activate-1").await);
+    assert_eq!(body["status"], json!("committed"));
+    let result = &body["result"];
+    assert_eq!(
+        result["activated"],
+        json!({
+            "candidates": 2,
+            "profiles": 1,
+            "receipt_summaries": 1,
+            "records": 3,
+            "reflections": 0,
+            "subjects": 2,
+        })
+    );
+    assert_eq!(result["authority_generation"], json!(2));
+    assert_eq!(result["import_id"], json!(import_id));
+
+    // Fully visible after commit: rows, generation, revision, import state.
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_candidates WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_subjects WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_profiles WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        1
+    );
+    let (generation, revision): (i64, i64) = sqlx::query_as(
+        "SELECT authority_generation, revision FROM memory_spaces WHERE space_id = ?",
+    )
+    .bind(TARGET)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("space row");
+    assert_eq!((generation, revision), (2, 2));
+
+    let row: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT state, activated_at, staged_payload_json, staged_report_json \
+         FROM memory_imports WHERE import_id = ?",
+    )
+    .bind(&import_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("import row");
+    assert_eq!(row.0, "activated");
+    assert!(row.1.is_some(), "activation stamps activated_at");
+    assert!(row.2.is_some(), "activation records the translated rows");
+    assert!(row.3.is_some(), "activation records the identity report");
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
+
+    // Every record carries the import provenance, and no candidate dangles.
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? \
+             AND json_extract(import_ref_json, '$.import_id') = ?",
+            &[TARGET, &import_id],
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_candidates c, \
+             json_each(json_extract(c.consumed_by_json, '$.record_ids')) j \
+             WHERE c.space_id = ? AND NOT EXISTS (SELECT 1 FROM memory_records r \
+               WHERE r.space_id = c.space_id AND r.record_id = j.value)",
+            &[TARGET],
+        )
+        .await,
+        0
+    );
+
+    // The same key and digest replays the recorded outcome without a second write.
+    let replay = ready(activate(&fixture, &import_id, "activate-1").await);
+    assert_eq!(replay["result"], *result);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        3
+    );
+
+    // A second activation under a fresh key names the state the import has left.
+    let again = activate(&fixture, &import_id, "activate-2").await;
+    let reject = rejected(&again);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "state"), &json!("activated"));
+}
+
+#[tokio::test]
+async fn discard_deletes_staging_and_refuses_an_activated_import() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+
+    let chunks = staged_source(&fixture, "discard-export-1").await;
+    let staged =
+        ready(stage_into(&fixture, TARGET, chunks[0].clone(), "discard-stage-0", None).await);
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    let body = ready(discard(&fixture, &import_id, "discard-1").await);
+    assert_eq!(
+        body["result"],
+        json!({ "discarded": true, "import_id": import_id })
+    );
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("discarded".to_string(), 1)
+    );
+    assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        0,
+        "discarding applies nothing"
+    );
+
+    let again = discard(&fixture, &import_id, "discard-2").await;
+    let reject = rejected(&again);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "state"), &json!("discarded"));
+
+    // An activated import has left the state discard requires.
+    let chunks = staged_source(&fixture, "discard-export-2").await;
+    let staged =
+        ready(stage_into(&fixture, TARGET, chunks[0].clone(), "discard-stage-1", None).await);
+    let activated_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    ready(activate(&fixture, &activated_id, "discard-activate-1").await);
+
+    let refused = discard(&fixture, &activated_id, "discard-3").await;
+    let reject = rejected(&refused);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "state"), &json!("activated"));
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        3,
+        "a refused discard leaves the activated rows alone"
+    );
+}
+
+/// A belief record whose typed references can be translated: one external
+/// carrier reference and one reference to an imported record.
+fn translated_belief() -> Value {
+    let reference = |kind: &str, namespace: &str, id: &str| json!({ "kind": kind, "namespace": namespace, "id": id });
+    json!({
+        "kind": "belief",
+        "order": 1,
+        "record_id": "belief_tr",
+        "holder": reference("knowledge_entry", "fixture", "ke_mira"),
+        "target": {
+            "carrier": reference("external", "src_realm", "ext_1"),
+            "target_id": "prop_harbor_closed",
+            "kind": "proposition"
+        },
+        "assessor": reference("knowledge_entry", "fixture", "ke_mira"),
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [reference("memory_record", "fixture", "r_1")]
+        },
+        "assessment_context": { "context_id": "ctx_dusk" },
+        "effective_at": NOW,
+        "assessed_at": NOW,
+        "view": "recorded_at",
+        "q": {
+            "value": 0.9,
+            "assertion": "belief_attribution",
+            "method": "self_report",
+            "calibration": "uncalibrated"
+        },
+        "extensions": {}
+    })
+}
+
+async fn seed_translated_record(fixture: &Fixture) {
+    let mut row = record("r_tr", "s_1", None, false);
+    if let RecordState::Live { content, .. } = &mut row.state {
+        content.text = "translated anchor".to_string();
+        content.cognition = Some(vec![translated_belief()]);
+    }
+    let mut tx = fixture.begin().await;
+    fixture
+        .repository
+        .insert_record(&mut tx, &row)
+        .await
+        .expect("seed cognition record");
+    tx.commit().await.expect("commit cognition record");
+}
+
+#[tokio::test]
+async fn ordinal_zero_translations_and_id_maps_reach_transferred_content() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    seed_translated_record(&fixture).await;
+    let chunks = staged_source(&fixture, "translate-export-1").await;
+
+    let translations = json!([{
+        "from": { "kind": "external", "namespace": "src_realm", "id": "ext_1" },
+        "to": { "kind": "external", "namespace": "dst_realm", "id": "ext_2" },
+    }]);
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "translate-stage-0",
+            Some(json!({ "reference_translations": translations.clone() })),
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    let stored: String = sqlx::query_scalar(
+        "SELECT reference_translations_json FROM memory_imports WHERE import_id = ?",
+    )
+    .bind(&import_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("stored translations");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).expect("translations json"),
+        translations,
+        "ordinal zero's translations are durable on the import"
+    );
+
+    ready(activate(&fixture, &import_id, "translate-activate-1").await);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? \
+             AND json_extract(content_json, '$.cognition[0].target.carrier.namespace') = 'dst_realm' \
+             AND json_extract(content_json, '$.cognition[0].target.carrier.id') = 'ext_2'",
+            &[TARGET],
+        )
+        .await,
+        1,
+        "the explicit translation pair reached the imported content"
+    );
+
+    let records: Vec<String> =
+        sqlx::query_scalar("SELECT record_id FROM memory_records WHERE space_id = ?")
+            .bind(TARGET)
+            .fetch_all(&fixture.pool)
+            .await
+            .expect("target record ids");
+    let evidence: String = sqlx::query_scalar(
+        "SELECT json_extract(content_json, '$.cognition[0].basis.evidence[0].id') \
+         FROM memory_records WHERE space_id = ? \
+         AND json_extract(content_json, '$.cognition') IS NOT NULL",
+    )
+    .bind(TARGET)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("translated evidence reference");
+    assert!(
+        records.contains(&evidence),
+        "the id map rewrote the record reference to a row the target actually holds"
+    );
+}
+
+#[tokio::test]
+async fn activation_creates_only_the_listed_grants_the_caller_covers() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let chunks = staged_source(&fixture, "adopt-export-1").await;
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "adopt-stage-0",
+            Some(json!({ "adopt_grants": [{ "grant_id": "g_2", "principal_id": "p_2" }] })),
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    ready(activate(&fixture, &import_id, "adopt-activate-1").await);
+
+    let row: (String, String, Option<String>, String, String, i64) = sqlx::query_as(
+        "SELECT grant_id, principal_id, subject_id, capabilities_json, context_ids_json, \
+         revision FROM memory_grants WHERE space_id = ? AND principal_id = 'p_2'",
+    )
+    .bind(TARGET)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("adopted grant");
+    assert!(
+        row.0.starts_with("grt_"),
+        "an adopted grant takes a fresh store-wide identity"
+    );
+    assert_eq!(row.1, "p_2", "the listed target principal owns it");
+    assert_eq!(row.2.as_deref(), Some("s_1"), "the subject id is preserved");
+    assert_eq!(
+        serde_json::from_str::<Value>(&row.3).expect("capabilities"),
+        json!(["transfer", "records_read"])
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&row.4).expect("contexts"),
+        json!(["ctx_1"])
+    );
+    assert_eq!(row.5, 1, "an imported grant starts at revision one");
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_grants WHERE space_id = ? \
+             AND grant_id IN ('g_1', 'g_3')",
+            &[TARGET],
+        )
+        .await,
+        0,
+        "unlisted and revoked grants are never created"
+    );
+}
+
+#[tokio::test]
+async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    // The caller's own cover stays live but expires; a non-expiring adopted
+    // grant would then outlive the grant it was copied from.
+    sqlx::query("UPDATE memory_grants SET expires_at = ? WHERE grant_id = 'g_target'")
+        .bind("2030-01-01T00:00:00.000Z")
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the target grant");
+
+    let chunks = staged_source(&fixture, "adopt-export-2").await;
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "adopt-stage-1",
+            Some(json!({ "adopt_grants": [{ "grant_id": "g_1", "principal_id": "p_1" }] })),
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    let result = activate(&fixture, &import_id, "adopt-activate-2").await;
+    let reject = rejected(&result);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("grant_not_subsumed"));
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("staged".to_string(), 1)
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
+            &[TARGET]
+        )
+        .await,
+        0,
+        "a refused adoption applies nothing"
+    );
+}
+
+#[tokio::test]
+async fn activating_a_tombstone_inclusive_import_keeps_the_scrubbed_envelope() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let created = ready(
+        adapter
+            .create_export(
+                &mut tx,
+                &principal("p_1"),
+                json!({
+                    "space_id": SPACE,
+                    "idempotency_key": "tombstone-export-1",
+                    "include_tombstoned": true,
+                }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit export");
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    let chunks = export_chunks(&fixture, &export_id).await;
+
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "tombstone-stage-0",
+            None,
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    let body = ready(activate(&fixture, &import_id, "tombstone-activate-1").await);
+    assert_eq!(body["result"]["activated"]["records"], json!(4));
+
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? \
+             AND tombstone_json IS NOT NULL \
+             AND json_extract(content_json, '$.text') = ''",
+            &[TARGET],
+        )
+        .await,
+        1,
+        "the scrubbed tombstone envelope crosses the import without regaining content"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? AND import_ref_json IS NULL",
+            &[TARGET],
+        )
+        .await,
+        1,
+        "a tombstoned row carries no import reference"
+    );
+}
+
+#[tokio::test]
+async fn a_colliding_subject_is_refused_by_fail_and_renamed_on_request() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+
+    // Importing the space into itself collides on both subject ids.
+    let chunks = staged_source(&fixture, "rename-export-1").await;
+    let staged =
+        ready(stage_into(&fixture, SPACE, chunks[0].clone(), "rename-stage-0", None).await);
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    let refused = run_import(&fixture, SPACE, &import_id, "rename-activate-1", true).await;
+    let reject = rejected(&refused);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("subject_collision"));
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ?",
+            &[SPACE]
+        )
+        .await,
+        4,
+        "a refused activation applies nothing (the fixture's four rows, tombstone included)"
+    );
+
+    // `rename_subject` mints the colliding subjects and rebases every row on them.
+    let chunks = staged_source(&fixture, "rename-export-2").await;
+    let staged = ready(
+        stage_into(
+            &fixture,
+            SPACE,
+            chunks[0].clone(),
+            "rename-stage-1",
+            Some(json!({ "conflict_policy": "rename_subject" })),
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    ready(run_import(&fixture, SPACE, &import_id, "rename-activate-2", true).await);
+
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_subjects WHERE space_id = ?",
+            &[SPACE]
+        )
+        .await,
+        4,
+        "two preserved subjects plus two renamed copies"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_records WHERE space_id = ? \
+             AND subject_id NOT IN ('s_1', 's_2')",
+            &[SPACE],
+        )
+        .await,
+        3,
+        "every imported record is rebased on its renamed subject"
+    );
+}
+
+#[tokio::test]
+async fn an_imported_reflection_arrives_stale_with_its_basis() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    seed_reflection(&fixture, "rfl_1").await;
+
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let created = ready(
+        adapter
+            .create_export(
+                &mut tx,
+                &principal("p_1"),
+                json!({
+                    "space_id": SPACE,
+                    "idempotency_key": "reflection-export-1",
+                    "include_reflections": true,
+                }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit export");
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    let chunks = export_chunks(&fixture, &export_id).await;
+
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "reflection-stage-0",
+            None,
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    let body = ready(activate(&fixture, &import_id, "reflection-activate-1").await);
+    assert_eq!(body["result"]["activated"]["reflections"], json!(1));
+
+    let row: (String, String, String, i64) = sqlx::query_as(
+        "SELECT reflection_id, body_text, selection_json, stale_cache \
+         FROM memory_reflections WHERE space_id = ? AND subject_id = 's_1'",
+    )
+    .bind(TARGET)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("imported reflection");
+    assert!(
+        row.0.starts_with("rfl_"),
+        "the imported reflection takes a fresh identity"
+    );
+    assert_eq!(row.1, "derived");
+    assert_eq!(row.2, json!({ "mode": "subject_all" }).to_string());
+    assert_eq!(row.3, 1, "an imported reflection is stale by construction");
 }

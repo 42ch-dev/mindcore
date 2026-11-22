@@ -874,6 +874,7 @@ type ImportColumns = (
     String,
     String,
     String,
+    String,
 );
 
 fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
@@ -887,6 +888,7 @@ fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
         next_ordinal,
         conflict_policy,
         adopt_grants_json,
+        reference_translations_json,
         state,
         created_at,
         expires_at,
@@ -903,6 +905,10 @@ fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
             .map_err(|_| invalid_row("negative import next_ordinal"))?,
         conflict_policy,
         adopt_grants: from_json(&adopt_grants_json, "import adopt_grants")?,
+        reference_translations: from_json(
+            &reference_translations_json,
+            "import reference_translations",
+        )?,
         state,
         created_at,
         expires_at,
@@ -1219,6 +1225,8 @@ pub struct MemoryImportRow {
     pub next_ordinal: u64,
     pub conflict_policy: String,
     pub adopt_grants: Value,
+    /// Ordinal-zero `reference_translations`; applied on activation, never on staging.
+    pub reference_translations: Value,
     pub state: String,
     pub created_at: String,
     pub expires_at: String,
@@ -1461,7 +1469,7 @@ impl SqliteMemoryRepository {
         sqlx::query_as::<_, ImportColumns>(
             "SELECT import_id, space_id, requester_principal_id, source_export_id, \
              bundle_digest, expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
-             state, created_at, expires_at FROM memory_imports \
+             reference_translations_json, state, created_at, expires_at FROM memory_imports \
              WHERE space_id = ? AND requester_principal_id = ? AND source_export_id = ? \
              AND state = 'staging'",
         )
@@ -1486,12 +1494,14 @@ impl SqliteMemoryRepository {
         let next_ordinal = i64::try_from(row.next_ordinal)
             .map_err(|_| invalid_row("import next_ordinal is out of range"))?;
         let adopt_grants = to_json(&row.adopt_grants, "import adopt_grants")?;
+        let reference_translations =
+            to_json(&row.reference_translations, "import reference_translations")?;
         sqlx::query(
             "INSERT INTO memory_imports \
              (import_id, space_id, requester_principal_id, source_export_id, bundle_digest, \
-              expected_count, next_ordinal, conflict_policy, adopt_grants_json, state, \
-              created_at, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
+              reference_translations_json, state, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.import_id)
         .bind(&row.space_id)
@@ -1502,6 +1512,7 @@ impl SqliteMemoryRepository {
         .bind(next_ordinal)
         .bind(&row.conflict_policy)
         .bind(adopt_grants)
+        .bind(reference_translations)
         .bind(&row.state)
         .bind(&row.created_at)
         .bind(&row.expires_at)
@@ -1574,6 +1585,88 @@ impl SqliteMemoryRepository {
         .execute(&mut **tx)
         .await
         .map_err(decode_row)?;
+        Ok(())
+    }
+
+    /// One import header of one space by its id, whatever state it holds.
+    pub async fn import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        import_id: &str,
+    ) -> RepoResult<Option<MemoryImportRow>> {
+        sqlx::query_as::<_, ImportColumns>(
+            "SELECT import_id, space_id, requester_principal_id, source_export_id, \
+             bundle_digest, expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
+             reference_translations_json, state, created_at, expires_at FROM memory_imports \
+             WHERE space_id = ? AND import_id = ?",
+        )
+        .bind(space.as_str())
+        .bind(import_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(import_row)
+        .transpose()
+    }
+
+    /// The one visibility flip: a `staged` import becomes `activated`, carrying the
+    /// translated rows, the identity mapping and the retained source provenance.
+    /// `false` means the row had already left `staged`, so nothing is applied twice.
+    pub async fn mark_import_activated(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        activated_at: &str,
+        staged_payload: &str,
+        staged_report: &str,
+        provenance: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'activated', activated_at = ?, staged_payload_json = ?, \
+             staged_report_json = ?, provenance_json = ? \
+             WHERE import_id = ? AND state = 'staged'",
+        )
+        .bind(activated_at)
+        .bind(staged_payload)
+        .bind(staged_report)
+        .bind(provenance)
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Pre-activation rollback: only an import that never activated can be discarded.
+    pub async fn mark_import_discarded(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports SET state = 'discarded' \
+             WHERE import_id = ? AND state IN ('staging', 'staged', 'expired')",
+        )
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Release every staged chunk of one import; activation and discard both own this.
+    pub async fn delete_import_chunks(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+    ) -> RepoResult<()> {
+        sqlx::query("DELETE FROM memory_import_chunks WHERE import_id = ?")
+            .bind(import_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(decode_row)?;
         Ok(())
     }
 }

@@ -2,6 +2,7 @@
 //! into the logical export bundle, sealed by its JCS digest, and partitioned
 //! into element-atomic wire chunks.
 
+mod activate;
 mod bundle;
 mod chunk;
 mod exports;

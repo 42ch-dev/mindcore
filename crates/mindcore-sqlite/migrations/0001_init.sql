@@ -217,6 +217,8 @@ CREATE TABLE memory_imports (
     conflict_policy TEXT NOT NULL CHECK (conflict_policy IN ('fail', 'rename_subject')),
     -- Ordinal-zero `adopt_grants`: applied on activation only, never auto-activated.
     adopt_grants_json TEXT NOT NULL DEFAULT '[]',
+    -- Ordinal-zero `reference_translations`: applied to transferred Content on activation only.
+    reference_translations_json TEXT NOT NULL DEFAULT '[]',
     state TEXT NOT NULL CHECK (state IN ('staging', 'staged', 'activated', 'discarded', 'expired')),
     -- Written once by final verification, before the inbound chunks are dropped: the translated
     -- rows to apply and the report that fixes the ID mappings.

@@ -31,7 +31,7 @@ use crate::{mint, principal_id, MemoryAdapter, MemoryStage, Tx};
 const STAGE: &str = "memory.imports.stage";
 
 /// The space-wide coverage every import mutation needs.
-fn space_requirement(capability: &str) -> GrantRequirement<'_> {
+pub(super) fn space_requirement(capability: &str) -> GrantRequirement<'_> {
     GrantRequirement {
         capability,
         subject_id: None,
@@ -48,26 +48,26 @@ fn validated(result: SpokeResult<()>) -> AResult<()> {
     }
 }
 
-fn conflict(message: impl Into<String>) -> Reject {
+pub(super) fn conflict(message: impl Into<String>) -> Reject {
     Reject::terminal(SpokeRejectCode::ImportConflict, message)
 }
 
 /// A verification refusal names every failed check, so one attempt reports the
 /// whole broken sequence rather than its first symptom.
-fn unverified(errors: Vec<String>) -> Reject {
+pub(super) fn unverified(errors: Vec<String>) -> Reject {
     conflict("the staged import sequence does not verify")
         .detail("reason", json!("verification"))
         .detail("errors", json!(errors))
 }
 
-fn expired(row: &MemoryImportRow, now: DateTime<Utc>) -> AResult<bool> {
+pub(super) fn expired(row: &MemoryImportRow, now: DateTime<Utc>) -> AResult<bool> {
     let expires = DateTime::parse_from_rfc3339(&row.expires_at)
         .map_err(|_| Reject::internal("stored import expiry is unreadable"))?
         .with_timezone(&Utc);
     Ok(now >= expires)
 }
 
-fn expiry_conflict(row: &MemoryImportRow) -> Reject {
+pub(super) fn expiry_conflict(row: &MemoryImportRow) -> Reject {
     conflict(format!("import {} has expired", row.import_id))
         .detail("reason", json!("expired"))
         .detail("import_id", json!(row.import_id))
@@ -122,7 +122,7 @@ fn chunk_errors(
 
 /// The logical bundle a complete chunk sequence carries: the ordinal-zero header
 /// plus every array in its fixed concatenation order.
-fn reassemble(sequence: &[Value]) -> Option<Value> {
+pub(super) fn reassemble(sequence: &[Value]) -> Option<Value> {
     let mut bundle = sequence.first()?.get("header")?.as_object()?.clone();
     for field in BUNDLE_ARRAY_FIELDS {
         if !sequence.iter().any(|chunk| chunk.get(field).is_some()) {
@@ -308,6 +308,7 @@ impl MemoryAdapter {
                 chunk,
                 conflict_policy,
                 adopt_grants,
+                reference_translations,
                 ..
             } => (
                 0,
@@ -318,6 +319,9 @@ impl MemoryAdapter {
                     conflict_policy.to_string(),
                     serde_json::to_value(adopt_grants)
                         .map_err(|error| Reject::invalid(format!("adopt_grants: {error}")))?,
+                    serde_json::to_value(reference_translations).map_err(|error| {
+                        Reject::invalid(format!("reference_translations: {error}"))
+                    })?,
                 )),
             ),
             MemoryImportsStageRequest::Variant1 { chunk, .. } => (
@@ -397,7 +401,7 @@ impl MemoryAdapter {
                 wire_digest,
                 header
                     .as_ref()
-                    .map(|(_, adopted)| adopted.clone())
+                    .map(|(_, adopted, _)| adopted.clone())
                     .unwrap_or_else(|| json!([])),
             ),
         };
@@ -450,7 +454,7 @@ impl MemoryAdapter {
         if row.is_none() {
             let ttl = i64::try_from(policy::STAGED_IMPORT_TTL_SECONDS)
                 .map_err(|_| Reject::internal("staged import ttl is out of range"))?;
-            let (conflict_policy, adopt_grants) =
+            let (conflict_policy, adopt_grants, reference_translations) =
                 header.expect("ordinal zero carries the header selection");
             self.repository
                 .insert_import(
@@ -465,6 +469,7 @@ impl MemoryAdapter {
                         next_ordinal: if final_chunk { expected_count } else { 1 },
                         conflict_policy,
                         adopt_grants,
+                        reference_translations,
                         state: if final_chunk { "staged" } else { "staging" }.to_string(),
                         created_at: policy::timestamp(op.now),
                         expires_at: policy::timestamp(op.now + chrono::Duration::seconds(ttl)),

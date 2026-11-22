@@ -221,31 +221,6 @@ impl MemoryAdapter {
             Ok(())
         }
     }
-
-    /// An optional op this build does not serve (§4.1): no storage, no receipt.
-    fn refuse(op: &'static str) -> SpokeResult<MemoryStage> {
-        SpokeResult::Reject(Reject::unsupported(op).into_spoke())
-    }
-
-    // note: O2 — import activation and discard are not served by this build.
-
-    pub async fn activate_import(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.imports.activate")
-    }
-
-    pub async fn discard_import(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.imports.discard")
-    }
 }
 
 /// The authenticated principal the caller supplied; never payload-asserted.
