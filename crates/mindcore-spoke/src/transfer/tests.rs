@@ -1665,6 +1665,76 @@ async fn an_unrelated_reclaim_names_the_dead_import_and_frees_its_source_export(
     );
 }
 
+/// A reclaimed import is decided by its persisted `expired` state, not the clock: a
+/// backward clock step that leaves `expires_at` in the future must neither revive the
+/// dead header as a live one nor accept its next chunk.
+#[tokio::test]
+async fn a_reclaimed_import_stays_dead_after_the_clock_moves_back() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    seed_big_record(&fixture).await;
+    let chunks = staged_source(&fixture, "clock-source").await;
+    assert_eq!(chunks.len(), 3, "the oversized record splits the export");
+
+    let body = ready(stage_chunk(&fixture, chunks[0].clone(), "clock-0").await);
+    let import_id = body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    // Retention reclaims the abandoned import, then the expiry moves past the clock,
+    // as a rollback across that instant leaves the reclaimed row.
+    sqlx::query("UPDATE memory_imports SET expires_at = ? WHERE import_id = ?")
+        .bind("2000-01-01T00:00:00.000Z")
+        .bind(&import_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the import");
+    create_export(&fixture, "clock-other").await;
+    assert_eq!(
+        import_state(&fixture, &import_id).await,
+        ("expired".to_string(), 1),
+        "retention reclaimed the abandoned import"
+    );
+    sqlx::query("UPDATE memory_imports SET expires_at = ? WHERE import_id = ?")
+        .bind("2999-01-01T00:00:00.000Z")
+        .bind(&import_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("move the expiry past the clock");
+
+    // A mid-sequence chunk names the dead import and its expiry, not a live header.
+    let late = stage_chunk(&fixture, chunks[1].clone(), "clock-1").await;
+    let reject = rejected(&late);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("expired"));
+    assert_eq!(detail(reject, "import_id"), &json!(import_id));
+    assert_eq!(
+        detail(reject, "expires_at"),
+        &json!("2999-01-01T00:00:00.000Z")
+    );
+    assert_eq!(
+        staged_chunk_count(&fixture, &import_id).await,
+        0,
+        "the refusal writes no chunk into the dead import"
+    );
+
+    // A new header for the source export still starts a fresh import.
+    let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "clock-0b").await);
+    let restarted_id = restarted["result"]["import_id"]
+        .as_str()
+        .expect("restarted import id")
+        .to_string();
+    assert_ne!(restarted_id, import_id);
+    assert_eq!(
+        import_state(&fixture, &restarted_id).await,
+        ("staging".to_string(), 1)
+    );
+}
+
 /// One live import per source export: once the first reaches `staged`, a second
 /// idempotency key cannot open a second import that would activate the same export twice.
 #[tokio::test]

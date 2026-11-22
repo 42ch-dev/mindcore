@@ -70,6 +70,11 @@ pub(super) fn unverified(errors: Vec<String>) -> Reject {
 }
 
 pub(super) fn expired(row: &MemoryImportRow, now: DateTime<Utc>) -> AResult<bool> {
+    // why: a reclaimed row is dead whatever the clock says; deciding it by time alone
+    // would let a backward clock step revive the import as a live header.
+    if row.state == "expired" {
+        return Ok(true);
+    }
     let expires = DateTime::parse_from_rfc3339(&row.expires_at)
         .map_err(|_| Reject::internal("stored import expiry is unreadable"))?
         .with_timezone(&Utc);
