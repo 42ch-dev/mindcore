@@ -13,6 +13,7 @@ use mindcore_base::ir::{
     CandidateState, MemoryGrantRow, MemoryRecordIr, MemoryReflectionRow, MemorySpaceRow,
     MemorySubjectRow, Placement, PlacementSelection, RecordState,
 };
+use mindcore_sqlite::MemoryReceiptSummary;
 
 use crate::admission;
 use crate::policy;
@@ -20,7 +21,7 @@ use crate::project;
 use crate::reject::{AResult, Reject};
 use crate::wire;
 
-use super::{ExportSpec, ReceiptRow, SubjectSnapshot};
+use super::{ExportSpec, SubjectSnapshot};
 
 /// Transfer-format version; independent of the protocol and schema versions.
 pub(super) const BUNDLE_FORMAT_VERSION: u64 = 1;
@@ -51,7 +52,7 @@ pub(super) fn assemble(
     space: &MemorySpaceRow,
     subjects: Vec<SubjectSnapshot>,
     grants: &[MemoryGrantRow],
-    receipts: &[ReceiptRow],
+    receipts: &[MemoryReceiptSummary],
 ) -> AResult<Value> {
     let whole_space = spec.subject_id.is_none();
     let include_profiles = whole_space || matches!(spec.selection, PlacementSelection::SubjectAll);
@@ -362,7 +363,7 @@ fn grant_value(grant: &MemoryGrantRow, spec: &ExportSpec) -> AResult<Value> {
 
 /// §6.11 `ReceiptSummary`: content-free dedup provenance. The raw idempotency key is
 /// omitted, and no result, error or lease fact crosses.
-fn receipt_value(receipt: &ReceiptRow, export_id: &str) -> AResult<Value> {
+fn receipt_value(receipt: &MemoryReceiptSummary, export_id: &str) -> AResult<Value> {
     Ok(json!({
         "receipt_id": receipt.receipt_id,
         "op": receipt.operation,

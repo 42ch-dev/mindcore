@@ -750,3 +750,160 @@ fn header_only_bundle_is_one_chunk() {
         bundle["digest"].as_str().expect("digest")
     );
 }
+
+fn principal(id: &str) -> spoke_schemas::Principal {
+    serde_json::from_value(json!({ "principal_id": id, "extensions": {} })).expect("principal")
+}
+
+fn ready(result: spoke_operations::SpokeResult<crate::MemoryStage>) -> Value {
+    match result {
+        spoke_operations::SpokeResult::Ok(crate::MemoryStage::Ready(body)) => body,
+        other => panic!("expected a ready stage, got {other:?}"),
+    }
+}
+
+fn rejected<T: std::fmt::Debug>(
+    result: &spoke_operations::SpokeResult<T>,
+) -> &spoke_operations::SpokeReject {
+    match result {
+        spoke_operations::SpokeResult::Reject(reject) => reject,
+        spoke_operations::SpokeResult::Ok(_) => panic!("expected a reject, got {result:?}"),
+    }
+}
+
+/// Create a whole-space export as `p_1` and return the committed receipt body.
+async fn create_export(fixture: &Fixture, key: &str) -> Value {
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let body = ready(
+        adapter
+            .create_export(
+                &mut tx,
+                &principal("p_1"),
+                json!({ "space_id": SPACE, "idempotency_key": key }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit create");
+    body
+}
+
+async fn read_page(fixture: &Fixture, export_id: &str, ordinal: u64, as_principal: &str) -> Value {
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let result = adapter
+        .get_export(
+            &mut tx,
+            &principal(as_principal),
+            json!({ "space_id": SPACE, "export_id": export_id, "chunk_ordinal": ordinal }),
+        )
+        .await;
+    tx.rollback().await.expect("rollback read");
+    ready(result)
+}
+
+#[tokio::test]
+async fn create_then_page_reassembles_the_same_bundle() {
+    let fixture = Fixture::open().await;
+    let created = create_export(&fixture, "export-key-1").await;
+    assert_eq!(created["status"], json!("committed"));
+    let result = &created["result"];
+    assert_eq!(result["counts"]["subjects"], json!(2));
+    assert_eq!(result["counts"]["records"], json!(3));
+    let export_id = result["export_id"].as_str().expect("export id").to_string();
+    let chunk_count = result["chunk_count"].as_u64().expect("chunk count");
+
+    let mut chunks = Vec::new();
+    for ordinal in 0..chunk_count {
+        let chunk = read_page(&fixture, &export_id, ordinal, "p_1").await;
+        // A second read of the same page is byte-identical.
+        let again = read_page(&fixture, &export_id, ordinal, "p_1").await;
+        assert_eq!(chunk, again, "an export page is stable across reads");
+        chunks.push(chunk["chunk"].clone());
+    }
+
+    let reassembled = reassemble(&chunks);
+    assert_eq!(
+        hex_digest_excluding(&reassembled, "digest"),
+        result["bundle_digest"].as_str().expect("bundle digest"),
+        "the pages reassemble to the sealed bundle"
+    );
+    let total: u64 = chunks
+        .iter()
+        .map(|chunk| chunk["bytes"].as_u64().expect("bytes"))
+        .sum();
+    assert_eq!(result["total_bytes"], json!(total));
+
+    // Same key, same digest: the recorded outcome replays and stores nothing new.
+    let replay = create_export(&fixture, "export-key-1").await;
+    assert_eq!(replay["result"]["export_id"], json!(export_id));
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_exports WHERE space_id = ?")
+        .bind(SPACE)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count exports");
+    assert_eq!(stored, 1);
+}
+
+async fn expire(fixture: &Fixture, export_id: &str) {
+    sqlx::query("UPDATE memory_exports SET expires_at = ? WHERE export_id = ?")
+        .bind("2000-01-01T00:00:00.000Z")
+        .bind(export_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the export");
+}
+
+#[tokio::test]
+async fn a_read_past_the_retention_window_answers_expired() {
+    let fixture = Fixture::open().await;
+    let created = create_export(&fixture, "export-key-2").await;
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    expire(&fixture, &export_id).await;
+
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let result = adapter
+        .get_export(
+            &mut tx,
+            &principal("p_1"),
+            json!({ "space_id": SPACE, "export_id": export_id, "chunk_ordinal": 0 }),
+        )
+        .await;
+    tx.rollback().await.expect("rollback read");
+    assert_eq!(
+        rejected(&result).code,
+        spoke_operations::SpokeRejectCode::ExportExpired
+    );
+}
+
+#[tokio::test]
+async fn a_scope_the_caller_cannot_read_answers_absence_rather_than_expiry() {
+    let fixture = Fixture::open().await;
+    let created = create_export(&fixture, "export-key-3").await;
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    // Even an expired export answers absence first: `p_2` holds only a
+    // subject/context grant, and this export is space-wide.
+    expire(&fixture, &export_id).await;
+
+    let adapter = crate::MemoryAdapter::new(false);
+    let mut tx = fixture.begin().await;
+    let result = adapter
+        .get_export(
+            &mut tx,
+            &principal("p_2"),
+            json!({ "space_id": SPACE, "export_id": export_id, "chunk_ordinal": 0 }),
+        )
+        .await;
+    tx.rollback().await.expect("rollback read");
+    assert_eq!(
+        rejected(&result).code,
+        spoke_operations::SpokeRejectCode::NotFound
+    );
+}

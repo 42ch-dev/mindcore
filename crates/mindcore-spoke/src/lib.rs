@@ -227,25 +227,7 @@ impl MemoryAdapter {
         SpokeResult::Reject(Reject::unsupported(op).into_spoke())
     }
 
-    // note: O2 — transfer is not served by this build.
-
-    pub async fn create_export(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.exports.create")
-    }
-
-    pub async fn get_export(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.exports.get")
-    }
+    // note: O2 — import staging is not served by this build.
 
     pub async fn stage_import(
         &self,

@@ -783,6 +783,83 @@ struct SubjectRow {
     created_at: String,
 }
 
+/// Positional form of [`SubjectRow`] for the runtime-decoded space-wide scan.
+type SubjectColumns = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+);
+
+fn subject_columns_row(row: SubjectColumns) -> RepoResult<MemorySubjectRow> {
+    let (
+        space_id,
+        subject_id,
+        kind_ns,
+        kind_id,
+        status,
+        fenced_contexts_json,
+        revision,
+        created_at,
+    ) = row;
+    subject_row(SubjectRow {
+        space_id,
+        subject_id,
+        kind_ns,
+        kind_id,
+        status,
+        fenced_contexts_json,
+        revision,
+        created_at,
+    })
+}
+
+/// Positional form of [`MemoryExportRow`] for the runtime-decoded header lookup.
+type ExportColumns = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+    i64,
+    String,
+    String,
+);
+
+fn export_row(row: ExportColumns) -> RepoResult<MemoryExportRow> {
+    let (
+        export_id,
+        space_id,
+        requester,
+        subject_id,
+        selection,
+        include_tombstoned,
+        bundle_digest,
+        chunk_count,
+        created_at,
+        expires_at,
+    ) = row;
+    Ok(MemoryExportRow {
+        export_id,
+        space_id,
+        requester,
+        subject_id,
+        selection,
+        include_tombstoned: include_tombstoned != 0,
+        bundle_digest,
+        chunk_count: u64::try_from(chunk_count)
+            .map_err(|_| invalid_row("negative export chunk_count"))?,
+        created_at,
+        expires_at,
+    })
+}
+
 fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
     let capabilities: Vec<String> = serde_json::from_str(&row.capabilities_json)
         .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
@@ -1050,6 +1127,36 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for JournalRow {
     }
 }
 
+/// One content-free `memory_receipts` projection for a whole-space export summary:
+/// no result, error, lease or raw idempotency key is selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryReceiptSummary {
+    pub receipt_id: String,
+    pub requester: String,
+    pub operation: String,
+    pub payload_digest: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+/// One stored export header: the metadata a page read authorizes on, plus the
+/// fixed expiration and artifact counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryExportRow {
+    pub export_id: String,
+    pub space_id: String,
+    pub requester: String,
+    /// `None` for a whole-space export.
+    pub subject_id: Option<String>,
+    /// Canonical `ReadSelection` JSON; `None` is the subject scope's default.
+    pub selection: Option<String>,
+    pub include_tombstoned: bool,
+    pub bundle_digest: String,
+    pub chunk_count: u64,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
 /// The borrowed-transaction repository. Zero-sized: the caller's transaction is the seam.
 pub struct SqliteMemoryRepository;
 
@@ -1133,6 +1240,146 @@ impl SqliteMemoryRepository {
         .map_err(decode_row)?
         .map(journal_row)
         .transpose()
+    }
+
+    /// Every subject row of one space, in stable id order.
+    pub async fn list_subjects(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+    ) -> RepoResult<Vec<MemorySubjectRow>> {
+        let rows = sqlx::query_as::<_, SubjectColumns>(
+            "SELECT space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, \
+             revision, created_at FROM memory_subjects WHERE space_id = ? ORDER BY subject_id",
+        )
+        .bind(space.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        rows.into_iter().map(subject_columns_row).collect()
+    }
+
+    /// The space's receipt rows projected content-free, in stable id order.
+    pub async fn receipt_summaries(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+    ) -> RepoResult<Vec<MemoryReceiptSummary>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+            "SELECT receipt_id, requester_principal_id, op, payload_digest, status, created_at \
+             FROM memory_receipts WHERE space_id = ? ORDER BY receipt_id",
+        )
+        .bind(space.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(receipt_id, requester, operation, payload_digest, status, created_at)| {
+                    MemoryReceiptSummary {
+                        receipt_id,
+                        requester,
+                        operation,
+                        payload_digest,
+                        status,
+                        created_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// One export header of one space, `Ok(None)` when the store never held it.
+    pub async fn export(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        export_id: &str,
+    ) -> RepoResult<Option<MemoryExportRow>> {
+        sqlx::query_as::<_, ExportColumns>(
+            "SELECT export_id, space_id, requester_principal_id, subject_id, selection_json, \
+             include_tombstoned, bundle_digest, chunk_count, created_at, expires_at \
+             FROM memory_exports WHERE space_id = ? AND export_id = ?",
+        )
+        .bind(space.as_str())
+        .bind(export_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(export_row)
+        .transpose()
+    }
+
+    /// One stored wire chunk of an export, exactly as it was published.
+    pub async fn export_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        export_id: &str,
+        ordinal: u64,
+    ) -> RepoResult<Option<String>> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM memory_export_chunks WHERE export_id = ? AND ordinal = ?",
+        )
+        .bind(export_id)
+        .bind(ordinal)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)
+    }
+
+    /// Insert-only export header; the artifact's chunks follow under the same id.
+    pub async fn insert_export(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        row: &MemoryExportRow,
+    ) -> RepoResult<()> {
+        let chunk_count = i64::try_from(row.chunk_count)
+            .map_err(|_| invalid_row("export chunk_count is out of range"))?;
+        sqlx::query(
+            "INSERT INTO memory_exports \
+             (export_id, space_id, requester_principal_id, subject_id, selection_json, \
+              include_tombstoned, bundle_digest, chunk_count, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.export_id)
+        .bind(&row.space_id)
+        .bind(&row.requester)
+        .bind(&row.subject_id)
+        .bind(&row.selection)
+        .bind(i64::from(row.include_tombstoned))
+        .bind(&row.bundle_digest)
+        .bind(chunk_count)
+        .bind(&row.created_at)
+        .bind(&row.expires_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, &row.export_id))?;
+        Ok(())
+    }
+
+    /// Insert-only export chunk; one row per ordinal, never rewritten.
+    pub async fn insert_export_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        export_id: &str,
+        ordinal: u64,
+        payload: &str,
+    ) -> RepoResult<()> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query(
+            "INSERT INTO memory_export_chunks (export_id, ordinal, payload) VALUES (?, ?, ?)",
+        )
+        .bind(export_id)
+        .bind(ordinal)
+        .bind(payload)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, format_args!("{export_id}.{ordinal}")))?;
+        Ok(())
     }
 }
 
