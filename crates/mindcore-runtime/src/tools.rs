@@ -1,32 +1,45 @@
-//! The three Mind workflow tools served over Connect.
+//! The Mind tools served over Connect: the three workflow tools and the shared-entry adoption tool.
 //!
 //! Connect owns the signed `{ "arguments": … }` / `{ "result": … }` wrappers; these handlers see
 //! only the argument object and return only the result value. Each handler binds to the responder
 //! session it was installed on, takes the authenticated peer from that session, and resolves it to
 //! the host-admitted [`Principal`] — a principal is never decoded from the arguments.
 //!
+//! Adoption is the one tool that owns a transaction: it takes one `BEGIN IMMEDIATE` from the shared
+//! pool and lends that borrowed transaction to both scoped port handles, so the shared source read
+//! and the caller's routed destination write commit together.
+//!
 //! The mapping stays thin: decode, call the workflow, encode. [`SpiError::Settlement`] keeps its
 //! reject unchanged (code, message and details); the other variants map to the seam's stable
 //! kinds. A policy veto carries the host's reason and a deadline its retry class; provider
 //! internals never reach the wire message.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use sqlx::{Sqlite, SqlitePool, Transaction};
+use tokio::sync::Mutex;
 
+use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
-    AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
-    Embedder, Evidence, MindCapabilities, MindWorkflows, PolicyHook, Reasoner, SpiError,
+    adopt_knowledge_entry_typed, AbsorbCandidateOutcome, AdoptionOutcome, ContextPack,
+    DeliberateOutcome, DeliberateRequest, DomainLens, Embedder, Evidence, MindCapabilities,
+    MindWorkflows, PolicyHook, Reasoner, SpiError,
 };
+use mindcore_sqlite::{read_entry, write_entry};
 use spoke_connect::remote::{ConnectResponder, MemoryAdmission, ToolHandler};
-use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    spoke_reject, KnowledgeEntryPort, SpokeReject, SpokeRejectCode, SpokeResult,
+};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
-use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
+use spoke_schemas::{KnowledgeEntry, MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
 use crate::ToolRegistration;
 
@@ -36,6 +49,8 @@ pub const RECALL_CONTEXT: &str = "tools.mindcore.recall_context";
 pub const ABSORB: &str = "tools.mindcore.absorb";
 /// Stable capability id of the deliberation workflow.
 pub const DELIBERATE: &str = "tools.mindcore.deliberate";
+/// Stable capability id of the shared-entry adoption tool.
+pub const ADOPT: &str = "tools.mindcore.adopt";
 
 /// The provider capabilities a tool call injects into its workflow.
 ///
@@ -167,7 +182,6 @@ impl WorkflowTools {
         let principals = Arc::clone(&self.principals);
         let providers = self.providers.clone();
         ToolRegistration::new(descriptor, move |responder| {
-            // why: weak — the handler serves its session without extending its lifetime.
             let session: Weak<ConnectResponder> = Arc::downgrade(responder);
             let workflows = Arc::clone(&workflows);
             let principals = Arc::clone(&principals);
@@ -178,15 +192,9 @@ impl WorkflowTools {
                 let principals = Arc::clone(&principals);
                 let providers = providers.clone();
                 Box::pin(async move {
-                    let Some(peer_id) = session
-                        .upgrade()
-                        .and_then(|responder| responder.remote_peer_id())
-                    else {
-                        return SpokeResult::Reject(SpokeReject {
-                            code: SpokeRejectCode::NotAuthorized,
-                            message: "the responder session carries no authenticated peer".into(),
-                            details: None,
-                        });
+                    let peer_id = match authenticated_peer(&session) {
+                        Ok(peer_id) => peer_id,
+                        Err(reject) => return SpokeResult::Reject(reject),
                     };
                     serve(
                         workflows,
@@ -202,6 +210,228 @@ impl WorkflowTools {
             handler
         })
     }
+}
+
+/// The authenticated peer of the session a handler was installed on.
+///
+/// The session is held weakly, so a handler serves its session without extending its lifetime; a
+/// handler bound to one session must not be installed on another, so an upgraded session that
+/// carries no peer is the terminal refusal rather than a call resolved against another caller.
+fn authenticated_peer(session: &Weak<ConnectResponder>) -> Result<String, SpokeReject> {
+    match session
+        .upgrade()
+        .and_then(|responder| responder.remote_peer_id())
+    {
+        Some(peer_id) => Ok(peer_id),
+        None => Err(SpokeReject {
+            code: SpokeRejectCode::NotAuthorized,
+            message: "the responder session carries no authenticated peer".into(),
+            details: None,
+        }),
+    }
+}
+
+/// The shared-entry adoption tool: one source collection read for the whole surface, and each
+/// routed principal's own collection as the destination.
+///
+/// Built only when the host configured an [`crate::AdoptionRoute`]: a surface without one neither
+/// advertises nor installs it. The call reads no scope, collection or route from the wire.
+pub(crate) struct AdoptionTool {
+    pool: SqlitePool,
+    principals: MemoryAdmission,
+    source: String,
+    /// A copy of the validated route map the workflow binding serves, taken at assembly: both sides
+    /// are built from [`crate::ServeFaces::workflow_routes`] and neither mutates it, so a principal
+    /// resolves to one destination collection for both.
+    routes: BTreeMap<String, KnowledgeScope>,
+}
+
+impl AdoptionTool {
+    pub(crate) fn new(
+        pool: SqlitePool,
+        principals: MemoryAdmission,
+        source: String,
+        routes: BTreeMap<String, KnowledgeScope>,
+    ) -> Self {
+        Self {
+            pool,
+            principals,
+            source,
+            routes,
+        }
+    }
+
+    /// The one registration: its descriptor is what the manifest advertises, and its installer is
+    /// the handler that serves the call.
+    pub(crate) fn registration(self) -> ToolRegistration {
+        let descriptor = descriptor(
+            ADOPT,
+            "Adopt a shared knowledge entry into the caller's own collection.",
+            adopt_input(),
+            adopt_output(),
+        );
+        let tool = Arc::new(self);
+        ToolRegistration::new(descriptor, move |responder| {
+            let session: Weak<ConnectResponder> = Arc::downgrade(responder);
+            let tool = Arc::clone(&tool);
+            let handler: ToolHandler = Arc::new(move |arguments: Value| {
+                let session = session.clone();
+                let tool = Arc::clone(&tool);
+                Box::pin(async move {
+                    let peer_id = match authenticated_peer(&session) {
+                        Ok(peer_id) => peer_id,
+                        Err(reject) => return SpokeResult::Reject(reject),
+                    };
+                    tool.dispatch(&peer_id, arguments).await
+                })
+            });
+            handler
+        })
+    }
+
+    /// One call for an already authenticated peer: the host admits the principal, then the
+    /// principal's own route names the destination.
+    async fn dispatch(&self, peer_id: &str, arguments: Value) -> SpokeResult<Value> {
+        let principal = match (self.principals)(peer_id) {
+            SpokeResult::Ok(principal) => principal,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        self.adopt(&principal, arguments).await
+    }
+
+    async fn adopt(&self, principal: &Principal, arguments: Value) -> SpokeResult<Value> {
+        let arguments: AdoptArguments = match decode(arguments) {
+            Ok(arguments) => arguments,
+            Err(reject) => return SpokeResult::Reject(reject),
+        };
+        let Some(destination) = self.routes.get(principal.principal_id.as_str()) else {
+            // why: target-free — a caller never learns whether another principal holds a route, so no
+            // message names a collection or a principal.
+            return spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                "principal has no workflow knowledge route",
+                None,
+            );
+        };
+        // why: one write reservation for the shared source read and the routed destination write, so a
+        // concurrent adoption or put cannot interleave between them.
+        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return spoke_reject(
+                    SpokeRejectCode::InternalError,
+                    format!("knowledge adoption could not begin: {error}"),
+                    None,
+                )
+            }
+        };
+        // why: the two handles borrow this one transaction; each takes the guard only for its own await,
+        // and both are dropped here so the commit below owns the transaction again.
+        let outcome = {
+            let gate = Mutex::new(&mut transaction);
+            let src = AdoptionPort {
+                collection: &self.source,
+                gate: &gate,
+            };
+            let dst = AdoptionPort {
+                collection: &destination.collection,
+                gate: &gate,
+            };
+            adopt_knowledge_entry_typed(
+                &src,
+                &dst,
+                &arguments.entry_id,
+                arguments.expected_source_revision,
+            )
+            .await
+        };
+        let outcome = match outcome {
+            SpokeResult::Ok(outcome) => outcome,
+            // why: nothing was written, so the dropped transaction rolls back and the refusal travels
+            // unchanged.
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if let Err(error) = transaction.commit().await {
+            return spoke_reject(
+                SpokeRejectCode::InternalError,
+                format!("knowledge adoption could not commit: {error}"),
+                None,
+            );
+        }
+        SpokeResult::Ok(adopt_outcome(outcome))
+    }
+}
+
+fn adopt_outcome(outcome: AdoptionOutcome) -> Value {
+    match outcome {
+        AdoptionOutcome::Created(entry) => json!({ "outcome": "created", "entry": entry }),
+        AdoptionOutcome::AlreadyPresent(entry) => {
+            json!({ "outcome": "already_present", "entry": entry })
+        }
+    }
+}
+
+/// One call-local port: a fixed collection over the call's one borrowed transaction.
+///
+/// Two ports are alive at once, so neither owns the transaction: each holds the same async mutex and
+/// takes the guard for its own await. The handle is `Sync`, which is what makes the typed adoption
+/// future `Send` for a served handler.
+struct AdoptionPort<'a, 'b, 'tx> {
+    collection: &'a str,
+    gate: &'b Mutex<&'b mut Transaction<'tx, Sqlite>>,
+}
+
+#[async_trait]
+impl<'a, 'b, 'tx> KnowledgeEntryPort for AdoptionPort<'a, 'b, 'tx> {
+    async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        let mut gate = self.gate.lock().await;
+        read_entry(&mut gate, self.collection, entry_id).await
+    }
+
+    async fn put_knowledge_entry(
+        &self,
+        entry: KnowledgeEntry,
+        expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        let mut gate = self.gate.lock().await;
+        write_entry(&mut gate, self.collection, entry, expected_base_revision).await
+    }
+}
+
+/// The adoption arguments: the two members the local function anchors on, and nothing that names a
+/// scope, a collection or a route.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptArguments {
+    entry_id: String,
+    expected_source_revision: u64,
+}
+
+fn adopt_input() -> Value {
+    json!({
+        "$id": "https://mindcore.invalid/schemas/tools/adopt.input.schema.json",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entry_id", "expected_source_revision"],
+        "properties": {
+            "entry_id": { "type": "string", "minLength": 1 },
+            "expected_source_revision": { "type": "integer", "minimum": 1 },
+        },
+    })
+}
+
+/// The adoption result as the seam's closed branches: `outcome` alone says whether this call wrote
+/// the copy, and `entry` is the stored copy either way.
+fn adopt_output() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["outcome", "entry"],
+        "properties": {
+            "outcome": { "type": "string", "enum": ["created", "already_present"] },
+            "entry": { "type": "object" },
+        },
+    })
 }
 
 async fn serve(

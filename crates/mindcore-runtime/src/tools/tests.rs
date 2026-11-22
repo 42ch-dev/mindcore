@@ -8,11 +8,13 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use tempfile::TempDir;
 
 use mindcore_spi::{
     AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
     MindCapabilities, MindWorkflows, SpiError,
 };
+use mindcore_sqlite::MindStore;
 use spoke_operations::{spoke_reject, validate_tool_arguments};
 use spoke_schemas::{CognitionRecord, KnowledgeEntry, RetainedRecord};
 
@@ -958,4 +960,124 @@ fn minimal(schema: &Value, root: &Value) -> Value {
             panic!("the advertised schema leaves a member unconstrained ({other:?}): {schema}")
         }
     }
+}
+
+/// The adoption tool over a real store: a shared source holding the entry to adopt and one unrelated
+/// occupant, the caller's destination already holding a different entry under that occupant's id, and
+/// one admitted principal with a route beside one admitted without.
+async fn adoption_tool() -> (TempDir, AdoptionTool) {
+    let dir = TempDir::new().expect("temporary directory");
+    let store = MindStore::open(&dir.path().join("adoption.db"))
+        .await
+        .expect("open store");
+    for (collection, entry_id) in [
+        ("shared", "ke_shared"),
+        ("shared", "ke_occupant"),
+        // the destination holds an entry this adoption does not own under the source's id.
+        ("wren", "ke_occupant"),
+    ] {
+        let mut seeded = entry();
+        seeded.entry_id = entry_id.to_string();
+        match store
+            .knowledge(KnowledgeScope::new(collection))
+            .put_knowledge_entry(seeded, None)
+            .await
+        {
+            SpokeResult::Ok(_) => {}
+            SpokeResult::Reject(reject) => panic!("seed {collection}/{entry_id}: {reject:?}"),
+        }
+    }
+    let tool = AdoptionTool::new(
+        store.pool(),
+        Arc::new(|peer_id: &str| match peer_id {
+            "peer-driver" => SpokeResult::Ok(principal()),
+            "peer-unrouted" => SpokeResult::Ok(
+                serde_json::from_value(json!({ "principal_id": "prn_other", "extensions": {} }))
+                    .expect("principal JSON matches the schema"),
+            ),
+            _ => spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                format!("peer {peer_id} holds no workflow admission"),
+                None,
+            ),
+        }),
+        "shared".to_string(),
+        BTreeMap::from([("prn_driver".to_string(), KnowledgeScope::new("wren"))]),
+    );
+    (dir, tool)
+}
+
+/// The routed principal adopts onto its own route: the four refusals the local function produces
+/// travel unchanged, the first call creates the copy and the repeat serves the stored one.
+#[tokio::test]
+async fn a_routed_principal_adopts_once_and_the_local_refusals_pass_through() {
+    let (_dir, tool) = adoption_tool().await;
+
+    for (case, arguments, code) in [
+        (
+            "an entry the shared collection does not hold",
+            json!({ "entry_id": "ke_absent", "expected_source_revision": 1 }),
+            SpokeRejectCode::KnowledgeEntryNotFound,
+        ),
+        (
+            "a stale expected source revision",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 2 }),
+            SpokeRejectCode::RevisionConflict,
+        ),
+        (
+            "a destination slot another entry holds",
+            json!({ "entry_id": "ke_occupant", "expected_source_revision": 1 }),
+            SpokeRejectCode::KnowledgeEntryAlreadyExists,
+        ),
+        (
+            "no source revision to anchor at",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 0 }),
+            SpokeRejectCode::InvalidInput,
+        ),
+    ] {
+        let reject = expect_reject(tool.dispatch("peer-driver", arguments).await, case);
+        assert_eq!(reject.code, code, "{case}: {reject:?}");
+    }
+
+    let arguments = json!({ "entry_id": "ke_shared", "expected_source_revision": 1 });
+    let created = expect_ok(
+        tool.dispatch("peer-driver", arguments.clone()).await,
+        "adopt",
+    );
+    assert_eq!(created["outcome"], "created");
+    assert_eq!(created["entry"]["entry_id"], "ke_shared");
+    assert_eq!(created["entry"]["revision"], 1);
+
+    let again = expect_ok(
+        tool.dispatch("peer-driver", arguments).await,
+        "repeat adoption",
+    );
+    assert_eq!(again["outcome"], "already_present");
+    assert_eq!(
+        again["entry"]["revision"], 1,
+        "the repeat serves the stored copy unchanged"
+    );
+}
+
+/// An admitted principal without a route is refused even though another principal is routed, and the
+/// refusal names neither a collection nor a principal.
+#[tokio::test]
+async fn an_unrouted_principal_is_refused_without_target_details() {
+    let (_dir, tool) = adoption_tool().await;
+    let reject = expect_reject(
+        tool.dispatch(
+            "peer-unrouted",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 1 }),
+        )
+        .await,
+        "unrouted adoption",
+    );
+
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(reject.details.is_none(), "{reject:?}");
+    assert!(
+        !reject.message.contains("wren"),
+        "the refusal names no destination collection: {}",
+        reject.message
+    );
 }
