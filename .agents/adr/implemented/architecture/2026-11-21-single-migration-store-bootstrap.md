@@ -25,7 +25,7 @@ This is legal because the workspace is unreleased: all five crates are `publish 
 
 - Starting state equals target state: there is no intermediate schema for a test or a host to honour accidentally.
 - Every existing local database becomes invalid. The public guidance scopes recreation to a migration mismatch and says a busy, locked or I/O-failing database is retried — the distinction matters because only the first case is unrecoverable.
-- Deleting a public trait is a one-way door for any future embedder; the workspace had no such consumer, and re-adding a trait later is cheaper than carrying two semantics now.
+- Deleting a public trait is a one-way door for any future embedder; carrying two settlement semantics in one crate costs more than re-adding a trait later.
 - The fixture disappears as a schema source, so a migration regression now fails `store_bootstrap` rather than passing silently.
 
 ## References

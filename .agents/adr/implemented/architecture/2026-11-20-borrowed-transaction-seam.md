@@ -28,7 +28,7 @@ The seam is what breaks again if it is re-opened. Any repository method that ope
 ## Consequences
 
 - Parity evidence runs unchanged on both sides of the seam (iteration iter003-settle: 47-row matrix, 43 pass / 4 decision-classified).
-- Repository APIs thread a transaction handle; convenience pool-owning entry points remain legacy-only, outside the embedded path.
+- Repository APIs thread a transaction handle; `MindStore` exposes `open`, `close` and `pool`, but no pool-owning convenience entry point for memory settlement.
 - Per-record `extensions` need a durable home if a future consumer must persist them — a schema change owned by the upstream provider, not a local column (see knowledge doc `borrowed-transaction-sqlite-repository.md`).
 - Withheld-read isolation for unsettled journal intents (spec §5.2/D-10) is implemented on this seam: while any of a subject's journal intents in a space is in a non-`applied` state, the adapter refuses that subject's content reads after authorization and before any content is selected or projected, on the same borrowed transaction. `I-000043` tracked that work and is closed (`.agents/specs/architecture/storage-ir-boundary.md:40`).
 
