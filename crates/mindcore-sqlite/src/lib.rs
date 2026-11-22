@@ -12,5 +12,8 @@ pub use knowledge::{
     write_entry, CarrierHeader, KnowledgeEntryLifecycle, PruneReport, RoutedKnowledgeStore,
     ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
 };
-pub use repository::{SqliteMemoryRepository, SqliteRepositoryError};
+pub use repository::{
+    MemoryExportRow, MemoryImportRow, MemoryReceiptSummary, SqliteMemoryRepository,
+    SqliteRepositoryError,
+};
 pub use store::MindStore;

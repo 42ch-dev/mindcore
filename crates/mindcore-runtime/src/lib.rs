@@ -16,10 +16,11 @@ use serde_json::Value;
 
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
-use mindcore_spoke::MemoryWorkflowBinding;
+use mindcore_spoke::{MemoryWorkflowBinding, ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::{validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
     CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_MEMORY,
+    CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
     ConnectResponder, KnowledgeAdmission, MemoryAdmission, RemoteKnowledgeFace,
@@ -75,7 +76,7 @@ impl MindcoreServe {
     /// the principal its admission returns, through the host's route map.
     fn workflows(
         &self,
-        routes: BTreeMap<String, KnowledgeScope>,
+        routes: Arc<BTreeMap<String, KnowledgeScope>>,
     ) -> Result<Arc<SpiMindWorkflows>, SpokeReject> {
         let publish = Arc::clone(&self.publish);
         let binding = MemoryWorkflowBinding::new(self.store.pool(), self.reflections)
@@ -90,10 +91,51 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        // why: the route map's emptiness decides the deliberation advertisement; read it before the
-        // map moves into the binding.
-        let routed = !faces.workflow_routes.is_empty();
-        let workflows = match self.workflows(faces.workflow_routes) {
+        // why: the adoption source is read for the whole surface while each principal's route is
+        // its write destination. Pinned before the route map moves into the binding, and before any
+        // registration or port exists, so an invalid configuration cannot leave a half-built
+        // surface.
+        if let Some(adoption) = &faces.adoption {
+            let source = &adoption.source.collection;
+            if source.is_empty() {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    "the adoption source names an empty collection",
+                    None,
+                );
+            }
+            if let Some((principal, _)) = faces
+                .workflow_routes
+                .iter()
+                .find(|(_, route)| route.collection == *source)
+            {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    format!(
+                        "the adoption source collection {source} is the workflow destination of principal {principal}"
+                    ),
+                    None,
+                );
+            }
+        }
+        // why: one validated map serves every reader — the workflow binding and the adoption tool
+        // hold the same `Arc`, so a principal cannot resolve to one destination in a workflow call
+        // and another in an adoption.
+        let routes = Arc::new(faces.workflow_routes);
+        // why: the adoption tool reads one shared source while each routed principal names its write
+        // destination, so it resolves through that same map, and exists only when the host
+        // configured a source.
+        let adoption = faces.adoption.map(|route| {
+            tools::AdoptionTool::new(
+                self.store.pool(),
+                Arc::clone(&faces.principals),
+                route.source.collection,
+                Arc::clone(&routes),
+            )
+        });
+        // why: the route map's emptiness decides the deliberation advertisement.
+        let routed = !routes.is_empty();
+        let workflows = match self.workflows(routes) {
             Ok(workflows) => workflows,
             // why: the host's own configuration is refused before any port or registration exists.
             Err(reject) => return SpokeResult::Reject(reject),
@@ -101,14 +143,24 @@ impl MindcoreServe {
         let engine: Arc<dyn MindWorkflows> = workflows.clone();
         let mut tools =
             WorkflowTools::new(engine, faces.principals, faces.providers).registrations();
-        tools.extend(faces.tools);
+        if let Some(adoption) = adoption {
+            tools.push(adoption.registration());
+        }
+        // invariant: tools.mindcore.adopt is this surface's id — a host registration can neither supply it
+        // when the host configured no adoption, nor replace the handler installed for it when it did.
+        tools.extend(
+            faces
+                .tools
+                .into_iter()
+                .filter(|tool| tool.descriptor.capability_id.as_str() != tools::ADOPT),
+        );
         // invariant: deliberation settles onto a routed carrier collection; a surface without a route serves
         // no deliberation. The invariant holds over the final set, so a host registration cannot
         // restore the tool or its handler.
         if !routed {
             tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
         }
-        let manifest = derive_manifest(faces.manifest, faces.memory.is_some(), &tools);
+        let manifest = derive_manifest(faces.manifest, faces.memory.as_deref(), &tools);
         let manifest = match manifest {
             SpokeResult::Ok(manifest) => manifest,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -119,7 +171,8 @@ impl MindcoreServe {
         };
         let mut ports = RemoteServePortsComposite::knowledge_only(Arc::new(face));
         if let Some(memory) = faces.memory {
-            ports = ports.with_memory(memory);
+            let service: Arc<dyn RemoteMemoryService> = memory;
+            ports = ports.with_memory(service);
         }
         SpokeResult::Ok(MindcoreSurface {
             ports: Arc::new(ports),
@@ -129,6 +182,14 @@ impl MindcoreServe {
             pool: self.store.pool(),
         })
     }
+}
+
+/// The shared collection adoption reads from: one source for the whole surface, while each
+/// admitted principal's workflow route names the destination its adopted entry is written to.
+/// Assembly refuses a source that names a route destination, so a principal's write can never
+/// become the source another reads.
+pub struct AdoptionRoute {
+    pub source: KnowledgeScope,
 }
 
 /// The host's side of the surface: non-capability manifest metadata and the face wiring the
@@ -144,12 +205,24 @@ pub struct ServeFaces {
     /// Maps the authenticated peer to the one scope it may read and write; never read from the wire.
     pub admission: KnowledgeAdmission,
     /// The host's memory family service. `None` composes no memory face and advertises none.
-    pub memory: Option<Arc<dyn RemoteMemoryService>>,
+    ///
+    /// Installing the service proves the `spoke-memory` family. It earns
+    /// `spoke-memory-transfer` only by reporting all five §7.29–§7.33 operations through
+    /// [`ServedMemory::operations`]: a signed manifest must not claim a family the bound service
+    /// cannot show it dispatches. A bare `RemoteMemoryService` takes the trait's default and
+    /// reports none.
+    pub memory: Option<Arc<dyn ServedMemory>>,
     /// Maps the authenticated peer to the `Principal` the workflows admit. The same host mapping
     /// the memory face uses; never read from the wire.
     pub principals: MemoryAdmission,
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
+    /// The one host-configured adoption source, or `None` to serve no adoption. Its collection must
+    /// be non-empty and must not be any [`ServeFaces::workflow_routes`] destination, including a
+    /// route of a principal that is not connected; assembly refuses otherwise. The source need not
+    /// hold rows. `Some` advertises `tools.mindcore.adopt` and installs its handler; each call
+    /// answers `NotAuthorized` for a principal whose route the map does not name.
+    pub adoption: Option<AdoptionRoute>,
     /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
     /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
     /// a route need not name a collection that already holds rows; each destination collection
@@ -159,7 +232,8 @@ pub struct ServeFaces {
     /// Routes are never read from the wire.
     pub workflow_routes: BTreeMap<String, KnowledgeScope>,
     /// Additional host tools: every descriptor is advertised and its handler installed, except the
-    /// reserved `tools.mindcore.deliberate` id on a surface with an empty route map.
+    /// ids this runtime owns — `tools.mindcore.deliberate` on a surface with an empty route map, and
+    /// `tools.mindcore.adopt` on every surface.
     pub tools: Vec<ToolRegistration>,
 }
 
@@ -251,18 +325,26 @@ impl MindcoreSurface {
 }
 
 /// The advertised capabilities follow the composed faces: the knowledge face always, the memory
-/// face only when its service is attached.
+/// family flag when a memory service is attached, and the transfer family flag when that service
+/// reports every one of [`TRANSFER_OPERATIONS`].
 ///
 /// The knowledge face applies SPOKE's owner-private disclosure, so a viewpoint-scoped list is
 /// served and the supplemental ownership capability is truthful; it never stands in for peer or
 /// entry admission.
-fn face_capabilities(memory: bool) -> Vec<String> {
+fn face_capabilities(memory: Option<&dyn ServedMemory>) -> Vec<String> {
     let mut capabilities = vec![
         CAPABILITY_SPOKE_KNOWLEDGE.to_string(),
         CAPABILITY_KE_OWNERSHIP.to_string(),
     ];
-    if memory {
+    if let Some(memory) = memory {
         capabilities.push(CAPABILITY_SPOKE_MEMORY.to_string());
+        let reported = memory.operations();
+        if TRANSFER_OPERATIONS
+            .iter()
+            .all(|operation| reported.contains(operation))
+        {
+            capabilities.push(CAPABILITY_SPOKE_MEMORY_TRANSFER.to_string());
+        }
     }
     capabilities
 }
@@ -271,7 +353,7 @@ fn face_capabilities(memory: bool) -> Vec<String> {
 /// manifest the responder will sign.
 fn derive_manifest(
     mut manifest: HostCapabilityManifest,
-    memory: bool,
+    memory: Option<&dyn ServedMemory>,
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
     manifest.capabilities = face_capabilities(memory);

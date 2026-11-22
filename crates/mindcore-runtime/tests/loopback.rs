@@ -20,16 +20,17 @@ use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
+use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
+use mindcore_runtime::tools::{ABSORB, ADOPT, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{
-    MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
+    AdoptionRoute, MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
 };
 use mindcore_spi::{
     CognitiveTaskKind, Embedder, EmbeddingIdentity, PolicyDecision, PolicyHook, Reasoner,
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
-use mindcore_sqlite::MindStore;
+use mindcore_spoke::{ServedMemory, TransferService};
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
@@ -52,8 +53,12 @@ const CARRIER_TWO: &str = "ke_mora";
 const SPACE: &str = "spc_loopback";
 const SUBJECT: &str = "subj_loopback";
 const PRINCIPAL: &str = "prn_loopback";
-const NOW: &str = "2026-11-21T00:00:00.000Z";
+/// why: a transfer chunk travels back through the typed wire DTOs, which canonicalize a whole
+/// second to no fraction and drop a null `kind`; this fixture seeds the shape they carry unchanged.
+const NOW: &str = "2026-11-21T00:00:00.500Z";
 const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
+/// The host-configured collection adoption reads from, never one of this fixture's routes.
+const SHARED: &str = "shared";
 /// A host-owned tool the runtime serves beside its own three.
 const HOST_TOOL: &str = "tools.mindcore.host_tool";
 
@@ -94,7 +99,7 @@ impl Fixture {
             "INSERT INTO memory_subjects \
              (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, \
               created_at) \
-             VALUES (?, ?, NULL, NULL, 'active', '[]', 1, ?)",
+             VALUES (?, ?, 'kind', 'belief', 'active', '[]', 1, ?)",
         )
         .bind(SPACE)
         .bind(SUBJECT)
@@ -369,6 +374,8 @@ impl RemoteMemoryService for MemoryFace {
     }
 }
 
+impl ServedMemory for MemoryFace {}
+
 /// The host's reasoner: one `none` verdict over the evidence the deliberation supplied.
 struct NoChangeReasoner;
 
@@ -461,7 +468,7 @@ impl PolicyHook for AutoPolicy {
 /// an empty map serves and advertises no `deliberate` at all.
 fn faces(
     manifest: HostCapabilityManifest,
-    memory: Option<Arc<dyn RemoteMemoryService>>,
+    memory: Option<Arc<dyn ServedMemory>>,
     providers: MindProviders,
     workflow_routes: BTreeMap<String, KnowledgeScope>,
 ) -> ServeFaces {
@@ -473,6 +480,7 @@ fn faces(
         memory,
         principals: principal_admission(),
         providers,
+        adoption: None,
         workflow_routes,
         tools: Vec::new(),
     }
@@ -574,6 +582,11 @@ fn recall_arguments() -> Value {
         },
         "max_tokens": 1_000,
     })
+}
+
+/// The adoption arguments: one entry id and the source revision the caller expects.
+fn adopt_arguments() -> Value {
+    json!({ "entry_id": "ke_shared", "expected_source_revision": 1 })
 }
 
 fn recall_request() -> MemoryRecallRequest {
@@ -1279,6 +1292,11 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
         "an attached memory face is advertised: {:?}",
         capabilities(&attached)
     );
+    assert!(
+        !capabilities(&attached).contains(&"spoke-memory-transfer"),
+        "a bare service reports no operation and cannot claim the family: {:?}",
+        capabilities(&attached)
+    );
     let session = connect(&attached, &["spoke-memory"]).await;
     let body = expect_ok(
         MemoryPort::recall(&*session.adapter, &principal(), recall_request()).await,
@@ -1290,6 +1308,200 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
         "the host's memory service answered the authenticated peer"
     );
     assert_eq!(body["total_authorized"], 7);
+}
+
+/// The five §7.29–§7.33 operations over the real store. A service that reports all five earns
+/// `spoke-memory-transfer`, and every op reaches the adapter through the signed session. The
+/// service owns each op's transaction, so the export one create commits is the artifact the
+/// later page, stage and activation read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_is_advertised_and_served_when_the_service_reports_all_five() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_transfer", PRINCIPAL, &["transfer", "admin"])
+        .await;
+    let service = Arc::new(TransferService::new(
+        fixture.store.pool(),
+        principal_admission(),
+    ));
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory", "spoke-memory-transfer"]),
+            Some(service),
+            MindProviders::default(),
+            routes(&[]),
+        ),
+    );
+    assert!(
+        capabilities(&surface).contains(&"spoke-memory-transfer"),
+        "a service that reports the whole family earns it: {:?}",
+        capabilities(&surface)
+    );
+    let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
+
+    let created = wire(expect_ok(
+        MemoryPort::create_export(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "t7-export" })),
+        )
+        .await,
+        "memory.exports.create",
+    ));
+    assert_eq!(created["status"], "committed");
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    assert_eq!(
+        created["result"]["chunk_count"],
+        json!(1),
+        "the loopback space exports as one chunk"
+    );
+
+    let page = wire(expect_ok(
+        MemoryPort::get_export(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "export_id": export_id, "chunk_ordinal": 0 })),
+        )
+        .await,
+        "memory.exports.get",
+    ));
+    let chunk = page["chunk"].clone();
+    assert_eq!(chunk["export_id"], json!(export_id));
+
+    let staged = wire(expect_ok(
+        MemoryPort::stage_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "chunk": chunk.clone(),
+                "conflict_policy": "rename_subject",
+                "idempotency_key": "t7-stage",
+            })),
+        )
+        .await,
+        "memory.imports.stage",
+    ));
+    assert_eq!(staged["result"]["chunks_received"], json!(1));
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    let discarded = wire(expect_ok(
+        MemoryPort::discard_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "import_id": &import_id,
+                "idempotency_key": "t7-discard",
+            })),
+        )
+        .await,
+        "memory.imports.discard",
+    ));
+    assert_eq!(discarded["result"]["discarded"], json!(true));
+
+    let restaged = wire(expect_ok(
+        MemoryPort::stage_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "chunk": chunk,
+                "conflict_policy": "rename_subject",
+                "idempotency_key": "t7-stage-again",
+            })),
+        )
+        .await,
+        "memory.imports.stage",
+    ));
+    let activated = wire(expect_ok(
+        MemoryPort::activate_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "import_id": restaged["result"]["import_id"].as_str().expect("import id"),
+                "idempotency_key": "t7-activate",
+            })),
+        )
+        .await,
+        "memory.imports.activate",
+    ));
+    assert_eq!(activated["status"], "committed");
+}
+
+/// The receipt a transfer commit returns is pollable on the same signed session: an
+/// `OUTCOME_UNCERTAIN` outcome resolves through `memory.receipts.get`, which the service
+/// reports beside the five transfer operations and dispatches over the same store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_transfer", PRINCIPAL, &["transfer", "admin"])
+        .await;
+    let service = Arc::new(TransferService::new(
+        fixture.store.pool(),
+        principal_admission(),
+    ));
+    assert!(
+        service.operations().contains(&"memory.receipts.get"),
+        "the service reports the op an uncertain commit is resolved through: {:?}",
+        service.operations()
+    );
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory", "spoke-memory-transfer"]),
+            Some(service),
+            MindProviders::default(),
+            routes(&[]),
+        ),
+    );
+    let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
+
+    let created = wire(expect_ok(
+        MemoryPort::create_export(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "t7-poll-export" })),
+        )
+        .await,
+        "memory.exports.create",
+    ));
+    let receipt_id = created["receipt_id"]
+        .as_str()
+        .expect("receipt id")
+        .to_string();
+
+    let polled = wire(expect_ok(
+        MemoryPort::get_receipt(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "receipt_id": receipt_id })),
+        )
+        .await,
+        "memory.receipts.get",
+    ));
+    assert_eq!(polled["receipt"]["op"], json!("memory.exports.create"));
+    assert_eq!(polled["receipt"]["status"], json!("committed"));
+    assert_eq!(polled["receipt"]["receipt_id"], json!(receipt_id));
+}
+
+fn typed<T: serde::de::DeserializeOwned>(value: Value) -> T {
+    serde_json::from_value(value).expect("the request JSON matches its schema")
+}
+
+fn wire(value: impl serde::Serialize) -> Value {
+    serde_json::to_value(value).expect("the response serializes")
 }
 
 /// The baseline face is never composed: the dialer claims `spoke-baseline`, the responder still
@@ -1423,6 +1635,275 @@ async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
             .await,
         DELIBERATE,
         "op_unsupported",
+    );
+}
+
+/// Advertisement honesty for adoption: a surface with no `AdoptionRoute` advertises no adoption
+/// capability, no descriptor, and installs no handler — a dialer claiming the id answers
+/// `op_unsupported`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconfigured_adoption_surface_neither_advertises_nor_serves_the_tool() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            routes(&[PRINCIPAL]),
+        ),
+    );
+
+    assert!(
+        !capabilities(&surface).contains(&ADOPT),
+        "a surface without an adoption source advertises no adoption capability: {:?}",
+        capabilities(&surface)
+    );
+    assert!(
+        surface
+            .manifest
+            .tools
+            .iter()
+            .all(|tool| tool.capability_id.as_str() != ADOPT),
+        "a surface without an adoption source advertises no adoption descriptor"
+    );
+
+    let session = connect(&surface, &[ADOPT]).await;
+    assert_wire_deny(
+        session.adapter.invoke_tool(ADOPT, adopt_arguments()).await,
+        ADOPT,
+        "op_unsupported",
+    );
+}
+
+/// A configured adoption source is advertised exactly once beside the workflow tools, with the
+/// documented argument and result shape, and a signed session reaches its installed handler. The
+/// adoption outcomes themselves are pinned over the tool in `crates/mindcore-runtime/src/tools/tests.rs`;
+/// this surface test owns advertisement and installation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configured_adoption_surface_advertises_and_serves_the_tool() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[PRINCIPAL]),
+    );
+    faces.adoption = Some(AdoptionRoute {
+        source: KnowledgeScope::new(SHARED),
+    });
+    let surface = surface(&serve, faces);
+
+    assert!(
+        capabilities(&surface).contains(&ADOPT),
+        "a configured adoption source is advertised: {:?}",
+        capabilities(&surface)
+    );
+    let advertised: Vec<&ToolDescriptor> = surface
+        .manifest
+        .tools
+        .iter()
+        .filter(|tool| tool.capability_id.as_str() == ADOPT)
+        .collect();
+    assert_eq!(
+        advertised.len(),
+        1,
+        "the adoption descriptor is advertised once"
+    );
+    assert_eq!(
+        advertised[0].input["required"],
+        json!(["entry_id", "expected_source_revision"]),
+        "the advertised arguments are the documented pair"
+    );
+    assert_eq!(
+        advertised[0].output["properties"]["outcome"]["enum"],
+        json!(["created", "already_present"]),
+        "the advertised result carries the two closed outcomes"
+    );
+
+    let session = connect(&surface, &[ADOPT]).await;
+    // why: a malformed call is decoded inside the handler, so `InvalidInput` proves the advertised
+    // tool has an installed handler; an uninstalled one answers `op_unsupported`.
+    let reject = expect_reject(
+        session
+            .adapter
+            .invoke_tool(ADOPT, json!({ "entry_id": "ke_shared" }))
+            .await,
+        "adopt without an expected source revision",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput, "{reject:?}");
+}
+
+/// Surface advertisement is not a per-principal grant: one surface advertises and installs
+/// adoption, and an admitted principal that holds no route is refused at call time with
+/// `NotAuthorized`, without a collection name or any other target detail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrouted_principal_cannot_adopt_on_a_serving_surface() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[PRINCIPAL]),
+    );
+    faces.principals = two_principal_admission();
+    faces.adoption = Some(AdoptionRoute {
+        source: KnowledgeScope::new(SHARED),
+    });
+    let surface = surface(&serve, faces);
+
+    assert!(
+        capabilities(&surface).contains(&ADOPT),
+        "the surface advertises adoption for its routed principal too"
+    );
+
+    let session = connect_as(&surface, &PEER_TWO_SEED, &[ADOPT]).await;
+    let reject = expect_reject(
+        session.adapter.invoke_tool(ADOPT, adopt_arguments()).await,
+        "adoption by an admitted principal without a route",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        reject
+            .message
+            .contains("principal has no workflow knowledge route"),
+        "the refusal is the missing-route rule, not the admission: {reject:?}"
+    );
+    assert!(reject.details.is_none(), "{reject:?}");
+    let refusal = format!("{reject:?}");
+    assert!(
+        !refusal.contains(SHARED) && !refusal.contains(COLLECTION),
+        "the refusal names no collection: {refusal}"
+    );
+}
+
+/// Adoption's switch is the presence of an `AdoptionRoute`, not the size of the route map: a
+/// surface with a source and no routes still advertises and installs adoption, while the same empty
+/// map serves no deliberation. The empty-map rule belongs to `deliberate` alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_is_advertised_beside_an_empty_route_map() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    faces.adoption = Some(AdoptionRoute {
+        source: KnowledgeScope::new(SHARED),
+    });
+    let surface = surface(&serve, faces);
+
+    assert!(
+        capabilities(&surface).contains(&ADOPT),
+        "a source with no routes still advertises adoption: {:?}",
+        capabilities(&surface)
+    );
+    assert_eq!(
+        surface
+            .manifest
+            .tools
+            .iter()
+            .filter(|tool| tool.capability_id.as_str() == ADOPT)
+            .count(),
+        1,
+        "the adoption descriptor is advertised once"
+    );
+    assert!(
+        !capabilities(&surface).contains(&DELIBERATE),
+        "the same empty route map still serves no deliberation: {:?}",
+        capabilities(&surface)
+    );
+
+    // why: advertisement is not a grant, and answering the call proves the handler is installed.
+    let session = connect(&surface, &[ADOPT]).await;
+    let reject = expect_reject(
+        session.adapter.invoke_tool(ADOPT, adopt_arguments()).await,
+        "adoption on a surface with no routes",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized, "{reject:?}");
+}
+
+/// A successful adoption end to end: the copy lands in the caller's routed collection over a signed
+/// session, and its anchor resolves to the shared source entry at the revision it was adopted from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_routed_principal_adopts_a_shared_entry_into_its_own_collection() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let shared = ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(SHARED));
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                serde_json::from_value(json!({
+                    "schema_version": 1,
+                    "entry_id": "ke_shared",
+                    "entry_type": "note",
+                    "canonical_name": "the shared gate note",
+                    "status": "confirmed",
+                    "body": { "summary": "the north gate closes at dusk" },
+                    "extensions": {},
+                }))
+                .expect("shared entry JSON matches the schema"),
+                None,
+            )
+            .await,
+        "seed the shared source entry",
+    );
+    let source_revision = expect_ok(
+        shared.get_knowledge_entry("ke_shared").await,
+        "read the seeded source entry",
+    )
+    .revision
+    .expect("the seeded entry carries a revision");
+
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[PRINCIPAL]),
+    );
+    faces.adoption = Some(AdoptionRoute {
+        source: KnowledgeScope::new(SHARED),
+    });
+    let surface = surface(&serve, faces);
+
+    let session = connect(&surface, &[ADOPT]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(
+                ADOPT,
+                json!({ "entry_id": "ke_shared", "expected_source_revision": source_revision }),
+            )
+            .await,
+        "adoption over the signed session",
+    );
+    assert_eq!(result["outcome"], "created", "{result}");
+
+    let destination = ScopedKnowledgeStore::new(pool, KnowledgeScope::new(COLLECTION));
+    let copy = expect_ok(
+        destination.get_knowledge_entry("ke_shared").await,
+        "read the copy from the caller's own collection",
+    );
+    assert_eq!(copy.entry_id, "ke_shared");
+    assert_eq!(
+        adoption_anchor_parts(&copy),
+        Some(("ke_shared", Some(source_revision))),
+        "the copy's anchor resolves to the source entry at the revision adopted: {copy:?}"
+    );
+    let source = expect_ok(
+        shared.get_knowledge_entry("ke_shared").await,
+        "read the shared source entry back",
+    );
+    assert_eq!(
+        source.revision,
+        Some(source_revision),
+        "adoption reads the source and never moves it"
     );
 }
 
