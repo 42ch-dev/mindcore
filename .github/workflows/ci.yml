@@ -47,3 +47,21 @@ jobs:
       - run: cargo test --locked --workspace
         env:
           SQLX_OFFLINE: "true"
+
+  corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.18.1
+          # The install line below is the only thing that decides the CLI version.
+          package-manager-cache: false
+      - name: Install corpus CLI
+        run: npm install --global @mstar-harness/cli@4.8.3
+      - name: Lint specs corpus
+        run: mstar-harness lint .agents/specs --type specs
+      - name: Lint ADR corpus
+        run: mstar-harness lint .agents/adr --type adr
