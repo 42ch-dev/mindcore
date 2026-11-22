@@ -783,6 +783,146 @@ struct SubjectRow {
     created_at: String,
 }
 
+/// Positional form of [`SubjectRow`] for the runtime-decoded space-wide scan.
+type SubjectColumns = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+);
+
+fn subject_columns_row(row: SubjectColumns) -> RepoResult<MemorySubjectRow> {
+    let (
+        space_id,
+        subject_id,
+        kind_ns,
+        kind_id,
+        status,
+        fenced_contexts_json,
+        revision,
+        created_at,
+    ) = row;
+    subject_row(SubjectRow {
+        space_id,
+        subject_id,
+        kind_ns,
+        kind_id,
+        status,
+        fenced_contexts_json,
+        revision,
+        created_at,
+    })
+}
+
+/// Positional form of [`MemoryExportRow`] for the runtime-decoded header lookup.
+type ExportColumns = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+    i64,
+    String,
+    String,
+    String,
+);
+
+fn export_row(row: ExportColumns) -> RepoResult<MemoryExportRow> {
+    let (
+        export_id,
+        space_id,
+        requester,
+        subject_id,
+        selection,
+        include_tombstoned,
+        bundle_digest,
+        chunk_count,
+        created_at,
+        expires_at,
+        state,
+    ) = row;
+    Ok(MemoryExportRow {
+        export_id,
+        space_id,
+        requester,
+        subject_id,
+        selection,
+        include_tombstoned: include_tombstoned != 0,
+        bundle_digest,
+        chunk_count: u64::try_from(chunk_count)
+            .map_err(|_| invalid_row("negative export chunk_count"))?,
+        created_at,
+        expires_at,
+        expired: state == "expired",
+    })
+}
+
+/// Positional form of [`MemoryImportRow`] for the runtime-decoded staging lookup.
+type ImportColumns = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+);
+
+fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
+    let (
+        import_id,
+        space_id,
+        requester,
+        source_export_id,
+        bundle_digest,
+        expected_count,
+        next_ordinal,
+        conflict_policy,
+        adopt_grants_json,
+        reference_translations_json,
+        staged_payload_json,
+        state,
+        created_at,
+        expires_at,
+    ) = row;
+    Ok(MemoryImportRow {
+        import_id,
+        space_id,
+        requester,
+        source_export_id,
+        bundle_digest,
+        expected_count: u64::try_from(expected_count)
+            .map_err(|_| invalid_row("negative import expected_count"))?,
+        next_ordinal: u64::try_from(next_ordinal)
+            .map_err(|_| invalid_row("negative import next_ordinal"))?,
+        conflict_policy,
+        adopt_grants: from_json(&adopt_grants_json, "import adopt_grants")?,
+        reference_translations: from_json(
+            &reference_translations_json,
+            "import reference_translations",
+        )?,
+        staged_payload: staged_payload_json
+            .map(|raw| from_json(&raw, "import staged payload"))
+            .transpose()?,
+        state,
+        created_at,
+        expires_at,
+    })
+}
+
 fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
     let capabilities: Vec<String> = serde_json::from_str(&row.capabilities_json)
         .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
@@ -1050,6 +1190,60 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for JournalRow {
     }
 }
 
+/// One content-free `memory_receipts` projection for a whole-space export summary:
+/// no result, error, lease or raw idempotency key is selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryReceiptSummary {
+    pub receipt_id: String,
+    pub requester: String,
+    pub operation: String,
+    pub payload_digest: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+/// One stored export header: the metadata a page read authorizes on, plus the
+/// fixed expiration and artifact counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryExportRow {
+    pub export_id: String,
+    pub space_id: String,
+    pub requester: String,
+    /// `None` for a whole-space export.
+    pub subject_id: Option<String>,
+    /// Canonical `ReadSelection` JSON; `None` is the subject scope's default.
+    pub selection: Option<String>,
+    pub include_tombstoned: bool,
+    pub bundle_digest: String,
+    pub chunk_count: u64,
+    pub created_at: String,
+    pub expires_at: String,
+    /// Reclaimed: the payload is gone and a page read answers `EXPORT_EXPIRED`.
+    pub expired: bool,
+}
+
+/// One staged import: the immutable header facts fixed by ordinal zero, the
+/// progress the next accepted chunk advances, and the expiry that is never reset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryImportRow {
+    pub import_id: String,
+    pub space_id: String,
+    pub requester: String,
+    pub source_export_id: String,
+    pub bundle_digest: String,
+    pub expected_count: u64,
+    pub next_ordinal: u64,
+    pub conflict_policy: String,
+    pub adopt_grants: Value,
+    /// Ordinal-zero `reference_translations`; applied on activation, never on staging.
+    pub reference_translations: Value,
+    /// The translated rows final verification froze, present only for `staged`.
+    pub staged_payload: Option<Value>,
+    pub state: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
 /// The borrowed-transaction repository. Zero-sized: the caller's transaction is the seam.
 pub struct SqliteMemoryRepository;
 
@@ -1133,6 +1327,473 @@ impl SqliteMemoryRepository {
         .map_err(decode_row)?
         .map(journal_row)
         .transpose()
+    }
+
+    /// Every subject row of one space, in stable id order.
+    pub async fn list_subjects(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+    ) -> RepoResult<Vec<MemorySubjectRow>> {
+        let rows = sqlx::query_as::<_, SubjectColumns>(
+            "SELECT space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, \
+             revision, created_at FROM memory_subjects WHERE space_id = ? ORDER BY subject_id",
+        )
+        .bind(space.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        rows.into_iter().map(subject_columns_row).collect()
+    }
+
+    /// The space's receipt rows projected content-free, in stable id order.
+    pub async fn receipt_summaries(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+    ) -> RepoResult<Vec<MemoryReceiptSummary>> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+            "SELECT receipt_id, requester_principal_id, op, payload_digest, status, created_at \
+             FROM memory_receipts WHERE space_id = ? ORDER BY receipt_id",
+        )
+        .bind(space.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(receipt_id, requester, operation, payload_digest, status, created_at)| {
+                    MemoryReceiptSummary {
+                        receipt_id,
+                        requester,
+                        operation,
+                        payload_digest,
+                        status,
+                        created_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// One export header of one space, `Ok(None)` when the store never held it.
+    pub async fn export(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        export_id: &str,
+    ) -> RepoResult<Option<MemoryExportRow>> {
+        sqlx::query_as::<_, ExportColumns>(
+            "SELECT export_id, space_id, requester_principal_id, subject_id, selection_json, \
+             include_tombstoned, bundle_digest, chunk_count, created_at, expires_at, state \
+             FROM memory_exports WHERE space_id = ? AND export_id = ?",
+        )
+        .bind(space.as_str())
+        .bind(export_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(export_row)
+        .transpose()
+    }
+
+    /// One stored wire chunk of an export, exactly as it was published.
+    pub async fn export_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        export_id: &str,
+        ordinal: u64,
+    ) -> RepoResult<Option<String>> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM memory_export_chunks WHERE export_id = ? AND ordinal = ?",
+        )
+        .bind(export_id)
+        .bind(ordinal)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)
+    }
+
+    /// Insert-only export header; the artifact's chunks follow under the same id.
+    pub async fn insert_export(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        row: &MemoryExportRow,
+    ) -> RepoResult<()> {
+        let chunk_count = i64::try_from(row.chunk_count)
+            .map_err(|_| invalid_row("export chunk_count is out of range"))?;
+        sqlx::query(
+            "INSERT INTO memory_exports \
+             (export_id, space_id, requester_principal_id, subject_id, selection_json, \
+              include_tombstoned, bundle_digest, chunk_count, created_at, expires_at, state) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.export_id)
+        .bind(&row.space_id)
+        .bind(&row.requester)
+        .bind(&row.subject_id)
+        .bind(&row.selection)
+        .bind(i64::from(row.include_tombstoned))
+        .bind(&row.bundle_digest)
+        .bind(chunk_count)
+        .bind(&row.created_at)
+        .bind(&row.expires_at)
+        .bind(if row.expired { "expired" } else { "live" })
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, &row.export_id))?;
+        Ok(())
+    }
+
+    /// Insert-only export chunk; one row per ordinal, never rewritten.
+    pub async fn insert_export_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        export_id: &str,
+        ordinal: u64,
+        payload: &str,
+    ) -> RepoResult<()> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query(
+            "INSERT INTO memory_export_chunks (export_id, ordinal, payload) VALUES (?, ?, ?)",
+        )
+        .bind(export_id)
+        .bind(ordinal)
+        .bind(payload)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, format_args!("{export_id}.{ordinal}")))?;
+        Ok(())
+    }
+
+    /// The one import holding a target space, requester and source export: the live one
+    /// if there is one, else the latest reclaimed one. The partial index makes a live
+    /// import single-valued, so a second idempotency key cannot open a second import;
+    /// an `expired` row only names its own death, so a late chunk is refused with its
+    /// expiry while a fresh header may still start the sequence again.
+    pub async fn import_by_source(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        requester: &str,
+        source_export_id: &str,
+    ) -> RepoResult<Option<MemoryImportRow>> {
+        sqlx::query_as::<_, ImportColumns>(
+            "SELECT import_id, space_id, requester_principal_id, source_export_id, \
+             bundle_digest, expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
+             reference_translations_json, staged_payload_json, state, created_at, expires_at \
+             FROM memory_imports \
+             WHERE space_id = ? AND requester_principal_id = ? AND source_export_id = ? \
+             AND state IN ('staging', 'staged', 'expired') \
+             ORDER BY state = 'expired', created_at DESC",
+        )
+        .bind(space.as_str())
+        .bind(requester)
+        .bind(source_export_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(import_row)
+        .transpose()
+    }
+
+    /// Insert-only import header; ordinal zero owns it whole.
+    pub async fn insert_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        row: &MemoryImportRow,
+    ) -> RepoResult<()> {
+        let expected_count = i64::try_from(row.expected_count)
+            .map_err(|_| invalid_row("import expected_count is out of range"))?;
+        let next_ordinal = i64::try_from(row.next_ordinal)
+            .map_err(|_| invalid_row("import next_ordinal is out of range"))?;
+        let adopt_grants = to_json(&row.adopt_grants, "import adopt_grants")?;
+        let reference_translations =
+            to_json(&row.reference_translations, "import reference_translations")?;
+        sqlx::query(
+            "INSERT INTO memory_imports \
+             (import_id, space_id, requester_principal_id, source_export_id, bundle_digest, \
+              expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
+              reference_translations_json, state, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.import_id)
+        .bind(&row.space_id)
+        .bind(&row.requester)
+        .bind(&row.source_export_id)
+        .bind(&row.bundle_digest)
+        .bind(expected_count)
+        .bind(next_ordinal)
+        .bind(&row.conflict_policy)
+        .bind(adopt_grants)
+        .bind(reference_translations)
+        .bind(&row.state)
+        .bind(&row.created_at)
+        .bind(&row.expires_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, &row.import_id))?;
+        Ok(())
+    }
+
+    /// One stored staged chunk of an import, exactly as it arrived.
+    pub async fn import_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        ordinal: u64,
+    ) -> RepoResult<Option<String>> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM memory_import_chunks WHERE import_id = ? AND ordinal = ?",
+        )
+        .bind(import_id)
+        .bind(ordinal)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)
+    }
+
+    /// Insert-only staged chunk; one row per ordinal, never rewritten.
+    pub async fn insert_import_chunk(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        ordinal: u64,
+        payload: &str,
+    ) -> RepoResult<()> {
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| invalid_row("chunk ordinal is out of range"))?;
+        sqlx::query(
+            "INSERT INTO memory_import_chunks (import_id, ordinal, payload) VALUES (?, ?, ?)",
+        )
+        .bind(import_id)
+        .bind(ordinal)
+        .bind(payload)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, format_args!("{import_id}.{ordinal}")))?;
+        Ok(())
+    }
+
+    /// Advance one staging import to its next ordinal. Only a non-final chunk calls
+    /// this; the final chunk freezes the import through `finish_import`.
+    pub async fn advance_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        next_ordinal: u64,
+    ) -> RepoResult<()> {
+        let next_ordinal = i64::try_from(next_ordinal)
+            .map_err(|_| invalid_row("import next_ordinal is out of range"))?;
+        sqlx::query(
+            "UPDATE memory_imports SET next_ordinal = ? \
+             WHERE import_id = ? AND state = 'staging'",
+        )
+        .bind(next_ordinal)
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(())
+    }
+
+    /// One import header of one space by its id, whatever state it holds.
+    pub async fn import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        import_id: &str,
+    ) -> RepoResult<Option<MemoryImportRow>> {
+        sqlx::query_as::<_, ImportColumns>(
+            "SELECT import_id, space_id, requester_principal_id, source_export_id, \
+             bundle_digest, expected_count, next_ordinal, conflict_policy, adopt_grants_json, \
+             reference_translations_json, staged_payload_json, state, created_at, expires_at \
+             FROM memory_imports \
+             WHERE space_id = ? AND import_id = ?",
+        )
+        .bind(space.as_str())
+        .bind(import_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .map(import_row)
+        .transpose()
+    }
+
+    /// Freeze the translated rows final verification built: the import leaves
+    /// `staging` for `staged`, carrying the payload activation applies and the report
+    /// that fixes the identity mapping. `false` means the row was not mid-staging.
+    pub async fn finish_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        staged_payload: &str,
+        staged_report: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'staged', next_ordinal = expected_count, staged_payload_json = ?, \
+             staged_report_json = ? \
+             WHERE import_id = ? AND state = 'staging'",
+        )
+        .bind(staged_payload)
+        .bind(staged_report)
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// One visibility flip: a `staged` import becomes `activated`, carrying the
+    /// retained source provenance; the content-bearing payload it applied is released.
+    /// `false` means the row had already left `staged`, so nothing is applied twice.
+    pub async fn mark_import_activated(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+        activated_at: &str,
+        provenance: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'activated', activated_at = ?, staged_payload_json = NULL, \
+             provenance_json = ? \
+             WHERE import_id = ? AND state = 'staged'",
+        )
+        .bind(activated_at)
+        .bind(provenance)
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Reclaim an import past its fixed expiry: content-free terminal state, with the
+    /// content-bearing payload released, so its source-export key stops blocking a
+    /// fresh import. `false` means it had already left the live states.
+    pub async fn expire_import(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'expired', staged_payload_json = NULL, staged_report_json = NULL, \
+             provenance_json = NULL \
+             WHERE import_id = ? AND state IN ('staging', 'staged')",
+        )
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Reclaim every live import of one space past its fixed expiry: a content-free terminal
+    /// state each, payload released, chunks deleted — so an abandoned import stops holding
+    /// storage once any transfer write of that space succeeds, not only when its own source
+    /// export is staged again.
+    pub async fn expire_imports(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        now: &str,
+    ) -> RepoResult<()> {
+        sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'expired', staged_payload_json = NULL, staged_report_json = NULL, \
+             provenance_json = NULL \
+             WHERE space_id = ? AND state IN ('staging', 'staged') AND expires_at <= ?",
+        )
+        .bind(space.as_str())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        sqlx::query(
+            "DELETE FROM memory_import_chunks \
+             WHERE import_id IN (SELECT import_id FROM memory_imports \
+             WHERE space_id = ? AND state = 'expired')",
+        )
+        .bind(space.as_str())
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(())
+    }
+
+    /// Reclaim every export of one space past its fixed retention: the header is marked
+    /// `expired` (so a later read answers `EXPORT_EXPIRED` from that state, not from a clock
+    /// that may have rolled back), and the chunk payloads are deleted once any transfer write
+    /// of that space succeeds.
+    pub async fn expire_exports(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        space: &SpaceId,
+        now: &str,
+    ) -> RepoResult<()> {
+        sqlx::query(
+            "DELETE FROM memory_export_chunks \
+             WHERE export_id IN (SELECT export_id FROM memory_exports \
+             WHERE space_id = ? AND expires_at <= ?)",
+        )
+        .bind(space.as_str())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        sqlx::query(
+            "UPDATE memory_exports SET state = 'expired' \
+             WHERE space_id = ? AND state = 'live' AND expires_at <= ?",
+        )
+        .bind(space.as_str())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(())
+    }
+
+    /// Pre-activation rollback: only an import that never activated can be discarded,
+    /// and the content-bearing payload it never applied is released with it.
+    pub async fn mark_import_discarded(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+    ) -> RepoResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE memory_imports \
+             SET state = 'discarded', staged_payload_json = NULL, staged_report_json = NULL, \
+             provenance_json = NULL \
+             WHERE import_id = ? AND state IN ('staging', 'staged', 'expired')",
+        )
+        .bind(import_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(decode_row)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Release every staged chunk of one import; activation and discard both own this.
+    pub async fn delete_import_chunks(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        import_id: &str,
+    ) -> RepoResult<()> {
+        sqlx::query("DELETE FROM memory_import_chunks WHERE import_id = ?")
+            .bind(import_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(decode_row)?;
+        Ok(())
     }
 }
 

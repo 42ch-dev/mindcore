@@ -51,23 +51,26 @@ pub(crate) fn space_body(space: &MemorySpaceRow) -> Value {
     })
 }
 
-/// §6.3 subject projection.
+/// §6.3 subject projection. An absent `kind` is omitted, never `null`: the typed
+/// client drops `None` on the wire, so a `null` here would make the chunk it sends
+/// back disagree with the digest this store sealed.
 pub(crate) fn subject_body(subject: &MemorySubjectRow) -> Value {
-    let kind = match &subject.kind {
-        Some((ns, id)) => json!({ "ns": ns, "id": id }),
-        None => Value::Null,
-    };
-    json!({
+    let mut body = json!({
         "schema_version": SCHEMA_VERSION,
         "space_id": subject.space_id.as_str(),
         "subject_id": subject.subject_id.as_str(),
-        "kind": kind,
         "status": subject.status,
         "fenced_contexts": subject.fenced_contexts.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "created_at": subject.created_at,
         "revision": subject.revision,
         "extensions": {},
-    })
+    });
+    if let Some((ns, id)) = &subject.kind {
+        body.as_object_mut()
+            .expect("subject projection is an object")
+            .insert("kind".to_string(), json!({ "ns": ns, "id": id }));
+    }
+    body
 }
 
 /// §6.4 grant projection; a restricted grant carries its context set.

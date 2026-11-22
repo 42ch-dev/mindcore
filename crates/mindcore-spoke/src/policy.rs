@@ -16,10 +16,16 @@ use crate::reject::{AResult, Reject};
 
 /// §3: the memory protocol revision this adapter speaks.
 pub(crate) const MEMORY_PROTOCOL_VERSION: u64 = 1;
-/// §4.1: the families this build serves with Reflection enabled.
-pub(crate) const CAPABILITIES: [&str; 2] = ["spoke-memory", "spoke-memory-reflection"];
+/// §4.1: the families this build serves with Reflection enabled. The transfer
+/// family is unconditional: this adapter serves all five §7.29–§7.33 operations.
+pub(crate) const CAPABILITIES: [&str; 3] = [
+    "spoke-memory",
+    "spoke-memory-reflection",
+    "spoke-memory-transfer",
+];
 /// §4.1: the same provider with the reflection sub-capability withheld.
-pub(crate) const CAPABILITIES_WITHOUT_REFLECTION: [&str; 1] = ["spoke-memory"];
+pub(crate) const CAPABILITIES_WITHOUT_REFLECTION: [&str; 2] =
+    ["spoke-memory", "spoke-memory-transfer"];
 /// §4.2: the authored kinds generation requires before it composes.
 pub(crate) const REQUIRED_PROFILE_KINDS: [&str; 1] = ["personality"];
 /// §6.1: opaque policy stamp clients pin recall/reflection bases to.
@@ -28,12 +34,12 @@ pub(crate) const ENGINE_POLICY_VERSION: &str = "mindcore-local-memory-v1";
 const MAX_CONTENT_BYTES: u64 = 65_536;
 const MAX_CANDIDATES_PER_CAPTURE: u64 = 32;
 const MAX_PAGE_SIZE: u64 = 100;
-const EXPORT_CHUNK_BYTES: u64 = 262_144;
+pub(crate) const EXPORT_CHUNK_BYTES: u64 = 262_144;
 const IDEMPOTENCY_RETENTION_SECONDS: u64 = 2_592_000;
 const RECEIPT_RETENTION_SECONDS: u64 = 2_592_000;
 const DEDUP_RETENTION_SECONDS: u64 = 5_184_000;
-const STAGED_IMPORT_TTL_SECONDS: u64 = 86_400;
-const EXPORT_RETENTION_SECONDS: u64 = 86_400;
+pub(crate) const STAGED_IMPORT_TTL_SECONDS: u64 = 86_400;
+pub(crate) const EXPORT_RETENTION_SECONDS: u64 = 86_400;
 
 /// §7.0.7: the caller's `limit` defaults to and may not exceed `max_page_size`.
 pub(crate) const MAX_PAGE_SIZE_BOUND: NonZeroU64 = match NonZeroU64::new(MAX_PAGE_SIZE) {
@@ -62,8 +68,8 @@ pub(crate) fn max_content_bytes() -> usize {
 
 /// §7.1 when the fixture policy withholds Reflection: the three reflection ops
 /// refuse before any storage access.
-pub(crate) fn describe_body(reflections_enabled: bool) -> Value {
-    let capabilities: &[&str] = if reflections_enabled {
+pub(crate) fn describe_body(reflections: bool) -> Value {
+    let capabilities: &[&str] = if reflections {
         &CAPABILITIES
     } else {
         &CAPABILITIES_WITHOUT_REFLECTION

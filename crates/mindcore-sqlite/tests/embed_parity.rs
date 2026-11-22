@@ -11,7 +11,7 @@
 //!
 //! The selector list is the v02 baseline's full adapter surface: the 33 named
 //! `MemoryAdapter` operations (5 of the 38 wire ops are the transfer family,
-//! exercised here as `CAPABILITY_PORT_MISSING` refusals; `settle_journal` /
+//! driven end to end on the same borrowed transaction; `settle_journal` /
 //! `complete_reflection` are caller-phase methods, not selectors).
 
 use std::collections::BTreeMap;
@@ -115,7 +115,7 @@ impl Harness {
             "INSERT INTO memory_grants \
              (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
               shared_access, expires_at, revoked_at, revision, created_at) \
-             VALUES ('grt_admin', 'spc_parity', NULL, 'ctr_admin', '[\"admin\"]', \
+             VALUES ('grt_admin', 'spc_parity', NULL, 'ctr_admin', '[\"admin\",\"transfer\"]', \
               '[]', 1, NULL, NULL, 1, '2026-11-20T09:20:01.123Z')",
         )
         .execute(&harness.pool)
@@ -238,24 +238,26 @@ fn fixture_guard_refuses_existing_leaf() {
     assert!(Fixture::guard(&leaf).is_err());
 }
 
+/// Symlink creation is the only platform-specific step; without it the
+/// dangling leaf never exists and the guard assertions would prove nothing.
+#[cfg(unix)]
 #[test]
 fn fixture_guard_refuses_dangling_symlink() {
     let fixture = Fixture::fresh();
     let foreign = fixture.root.join("foreign-target.db");
     let link = fixture.db_path();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&foreign, &link).expect("symlink");
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&foreign, &link).expect("symlink");
     assert!(!link.exists());
     assert!(Fixture::guard(&link).is_err());
 }
 
 /// The 33 named adapter operations, each driven by the caller's own
 /// `&mut Transaction` — the full v02 selector surface on the embedded arm.
-/// Reads must reach a `Ready` stage; writes may stage `Ready` or
-/// `JournalPending`; the transfer family refuses `CAPABILITY_PORT_MISSING`.
-/// One caller transaction carries every selector and commits at the end.
+/// Reads must reach a `Ready` stage and writes `Ready` or `JournalPending`.
+/// The five transfer operations run the same way: their rows are visible only
+/// inside the caller's transaction, the caller's rollback erases them and the
+/// caller's commit makes them durable, so none opens one of its own.
+/// One caller transaction carries every baseline selector and commits at the end.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn every_selector_takes_the_caller_transaction() {
@@ -271,7 +273,11 @@ async fn every_selector_takes_the_caller_transaction() {
     );
     assert_eq!(
         body["capabilities"],
-        json!(["spoke-memory", "spoke-memory-reflection"])
+        json!([
+            "spoke-memory",
+            "spoke-memory-reflection",
+            "spoke-memory-transfer"
+        ])
     );
 
     // note: C1 list spaces (empty object is the list-everything request).
@@ -832,78 +838,6 @@ async fn every_selector_takes_the_caller_transaction() {
         "reflections.list",
     );
 
-    // note: O2 transfer family — all five refuse CAPABILITY_PORT_MISSING on the
-    // supplied transaction, exercised with the baseline's typed payloads
-    // (export id + chunk ordinal, staged import chunk descriptor, import id).
-    let zero_digest = "0".repeat(64);
-    let transfer = [
-        adapter
-            .create_export(
-                &mut tx,
-                &admin,
-                json!({ "space_id": SPACE, "idempotency_key": "opt-export" }),
-            )
-            .await,
-        adapter
-            .get_export(
-                &mut tx,
-                &admin,
-                json!({ "space_id": SPACE, "export_id": "exp_1", "chunk_ordinal": 0 }),
-            )
-            .await,
-        adapter
-            .stage_import(
-                &mut tx,
-                &admin,
-                json!({
-                    "space_id": SPACE,
-                    "chunk": {
-                        "export_id": "exp_1",
-                        "chunk_ordinal": 1,
-                        "chunk_count": 2,
-                        "bundle_digest": zero_digest,
-                        "chunk_digest": zero_digest,
-                        "bytes": 1,
-                    },
-                    "idempotency_key": "opt-stage",
-                }),
-            )
-            .await,
-        adapter
-            .activate_import(
-                &mut tx,
-                &admin,
-                json!({ "space_id": SPACE, "import_id": "imp_1", "idempotency_key": "opt-activate" }),
-            )
-            .await,
-        adapter
-            .discard_import(
-                &mut tx,
-                &admin,
-                json!({ "space_id": SPACE, "import_id": "imp_1", "idempotency_key": "opt-discard" }),
-            )
-            .await,
-    ];
-    // why: compare refusal code, retry class and details.op against the O2 contract.
-    let transfer_ops = [
-        "memory.exports.create",
-        "memory.exports.get",
-        "memory.imports.stage",
-        "memory.imports.activate",
-        "memory.imports.discard",
-    ];
-    for (result, op) in transfer.into_iter().zip(transfer_ops) {
-        match result {
-            SpokeResult::Reject(reject) => {
-                assert_eq!(reject.code, SpokeRejectCode::CapabilityPortMissing, "{op}");
-                let details = reject.details.as_ref().expect("refusal details");
-                assert_eq!(details["retry_class"], "terminal", "{op}");
-                assert_eq!(details["op"], op, "{op}");
-            }
-            SpokeResult::Ok(_) => panic!("{op} must refuse"),
-        }
-    }
-
     // note: everything above sits in this one transaction; commit and confirm.
     tx.commit().await.expect("caller commit");
     assert_eq!(harness.count("memory_candidates").await, 2);
@@ -916,6 +850,149 @@ async fn every_selector_takes_the_caller_transaction() {
     assert!(harness.count("memory_journal").await >= 5);
     let _ = review_receipt;
     let _ = create_receipt;
+
+    // note: O2 the transfer family runs on the caller's transaction too. The export is only
+    // readable from inside the transaction that wrote it, the import it feeds is staged and
+    // discarded on that same transaction, and the caller's rollback erases every row they wrote
+    // — so none of the five opens, commits or rolls back a transaction of its own.
+    let mut transfer = harness.begin().await;
+    let created = ready(
+        adapter
+            .create_export(
+                &mut transfer,
+                &admin,
+                json!({ "space_id": SPACE, "idempotency_key": "par-export" }),
+            )
+            .await,
+        "exports.create",
+    );
+    assert_eq!(created["status"], json!("committed"));
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    let chunk_count = created["result"]["chunk_count"]
+        .as_u64()
+        .expect("chunk count");
+    let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_exports")
+        .fetch_one(&mut *transfer)
+        .await
+        .expect("the export header is readable through the caller's transaction");
+    assert_eq!(written, 1);
+
+    // note: exports.get reads that uncommitted export — a transaction of its own could not see it.
+    let page = ready(
+        adapter
+            .get_export(
+                &mut transfer,
+                &admin,
+                json!({ "space_id": SPACE, "export_id": &export_id, "chunk_ordinal": 0 }),
+            )
+            .await,
+        "exports.get",
+    );
+    let chunk = page["chunk"].clone();
+    assert_eq!(chunk["export_id"], json!(export_id));
+    assert_eq!(chunk["chunk_count"], json!(chunk_count));
+
+    // note: imports.stage takes ordinal zero of that export. The parity space exports as one
+    // chunk, so staging the final ordinal verifies the sequence, fixes the translated rows
+    // and reaches `staged`. The import targets the same space, so the subject collision the
+    // final chunk decides is resolved by a rename.
+    assert_eq!(chunk_count, 1, "the parity space exports as one chunk");
+    let staged_body = ready(
+        adapter
+            .stage_import(
+                &mut transfer,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "chunk": chunk,
+                    "conflict_policy": "rename_subject",
+                    "idempotency_key": "par-stage",
+                }),
+            )
+            .await,
+        "imports.stage",
+    );
+    assert_eq!(staged_body["result"]["chunks_received"], json!(1));
+    assert!(
+        staged_body["result"]["staged_report"].is_object(),
+        "the final chunk freezes the identity report"
+    );
+    let import_id = staged_body["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    let state: String = sqlx::query_scalar("SELECT state FROM memory_imports WHERE import_id = ?1")
+        .bind(&import_id)
+        .fetch_one(&mut *transfer)
+        .await
+        .expect("the staged import is readable through the caller's transaction");
+    assert_eq!(state, "staged");
+
+    // note: imports.discard releases the staged payload inside the same transaction.
+    let discarded = ready(
+        adapter
+            .discard_import(
+                &mut transfer,
+                &admin,
+                json!({
+                    "space_id": SPACE,
+                    "import_id": &import_id,
+                    "idempotency_key": "par-discard",
+                }),
+            )
+            .await,
+        "imports.discard",
+    );
+    assert_eq!(discarded["result"]["discarded"], json!(true));
+
+    // note: imports.activate resolves the import this transaction just discarded; a separate
+    // transaction would not see it at all and answer NOT_FOUND instead of the state conflict.
+    match adapter
+        .activate_import(
+            &mut transfer,
+            &admin,
+            json!({
+                "space_id": SPACE,
+                "import_id": &import_id,
+                "idempotency_key": "par-activate",
+            }),
+        )
+        .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::ImportConflict);
+            let details = reject.details.as_ref().expect("refusal details");
+            assert_eq!(details["state"], json!("discarded"));
+        }
+        SpokeResult::Ok(stage) => {
+            panic!("an import that left `staged` cannot activate: {stage:?}")
+        }
+    }
+
+    // why: a transfer call that committed or rolled back on its own would leave rows here.
+    transfer.rollback().await.expect("caller rollback");
+    assert_eq!(harness.count("memory_exports").await, 0);
+    assert_eq!(harness.count("memory_export_chunks").await, 0);
+    assert_eq!(harness.count("memory_imports").await, 0);
+    assert_eq!(harness.count("memory_import_chunks").await, 0);
+
+    // note: the caller's commit is what makes a transfer effect durable.
+    let mut committed = harness.begin().await;
+    ready(
+        adapter
+            .create_export(
+                &mut committed,
+                &admin,
+                json!({ "space_id": SPACE, "idempotency_key": "par-export-committed" }),
+            )
+            .await,
+        "exports.create",
+    );
+    committed.commit().await.expect("caller commit");
+    assert_eq!(harness.count("memory_exports").await, 1);
 }
 
 /// D11: the caller's commit is what makes the staged effect, its receipt and

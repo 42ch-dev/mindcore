@@ -77,7 +77,6 @@ The delivered contract is documented in `.agents/specs/architecture/mind-model.m
 ## Not yet available
 
 - A server process or transport of our own: `mindcore-runtime` composes the surface, a host serves it.
-- Memory transfer between minds.
 - Migration of an existing store or provider (live data movement).
 
-Each has an owner in the project roadmap; none is a stub here.
+Neither has a roadmap owner or an issue in this repository yet, and neither is a stub here.

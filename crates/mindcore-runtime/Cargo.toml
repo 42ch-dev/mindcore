@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
 mindcore-base = { path = "../mindcore-base" }
 mindcore-sqlite = { path = "../mindcore-sqlite" }
 mindcore-spi = { path = "../mindcore-spi" }
@@ -18,9 +19,9 @@ spoke-connect = { workspace = true, features = ["remote-adapter"] }
 spoke-operations.workspace = true
 spoke-schemas.workspace = true
 sqlx.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-async-trait.workspace = true
 ed25519-dalek = "2"
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
