@@ -367,12 +367,23 @@ impl AdoptionTool {
 /// local tables, columns and stored payloads, so it goes to the host's stderr and never into the
 /// signed refusal.
 fn adoption_fault(stage: &str, diagnostic: impl std::fmt::Display) -> SpokeReject {
-    eprintln!("mindcore adoption {stage} fault: {diagnostic}");
+    // why: the host-side diagnostic is best-effort — a stderr that cannot be written (a closed
+    // descriptor) must not panic the handler out of the refusal the caller is owed.
+    emit_fault_diagnostic(std::io::stderr(), stage, &diagnostic);
     SpokeReject {
         code: SpokeRejectCode::InternalError,
         message: "knowledge adoption could not complete".into(),
         details: Some(kind_details(stage)),
     }
+}
+
+/// The fault's host-side line, whose own failure is ignored: the refusal is the contract.
+fn emit_fault_diagnostic(
+    mut sink: impl std::io::Write,
+    stage: &str,
+    diagnostic: &dyn std::fmt::Display,
+) {
+    let _ = writeln!(sink, "mindcore adoption {stage} fault: {diagnostic}");
 }
 
 /// The adoption's own four refusals travel as they are; anything else a port reports is a storage

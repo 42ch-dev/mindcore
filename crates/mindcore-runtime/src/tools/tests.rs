@@ -1217,3 +1217,27 @@ async fn adoption_refusals_carry_no_raw_diagnostics() {
         "the refusal carries no stored text, no collection and no statement: {refusal}"
     );
 }
+
+/// A sink that refuses every write, the way a closed stderr descriptor does.
+struct ClosedSink;
+
+impl std::io::Write for ClosedSink {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
+/// The fault diagnostic is best-effort: when the sink cannot be written, the line is dropped and
+/// the call still returns the contractual refusal instead of unwinding out of the handler.
+#[test]
+fn an_unwritable_fault_diagnostic_still_yields_the_refusal() {
+    emit_fault_diagnostic(ClosedSink, "store", &"boom");
+
+    let reject = adoption_fault("store", "boom");
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(reject.message, "knowledge adoption could not complete");
+}
