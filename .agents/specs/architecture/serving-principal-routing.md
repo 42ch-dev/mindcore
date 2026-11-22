@@ -77,7 +77,10 @@ is named by the request.
   (`crates/mindcore-runtime/src/tools.rs:294-315`); the call falls back to no collection and never
   reaches another principal's destination.
 - The source is read-only to the call and only the routed destination is written, both on one
-  `BEGIN IMMEDIATE` transaction, so adoption adds no write outside the routed collection.
+  `BEGIN IMMEDIATE` transaction, so adoption adds no write outside the routed collection. The
+  source handle is a distinct type from the destination handle, and the one write its port must
+  expose refuses before any statement runs, so no caller can write the shared collection through
+  the source side.
 
 ### Construction
 

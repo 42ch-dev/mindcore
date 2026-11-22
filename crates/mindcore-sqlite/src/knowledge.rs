@@ -1678,13 +1678,6 @@ pub async fn append_cognition(
     SpokeResult::Ok(next)
 }
 
-// why: `adopt_knowledge_entry_typed` yields a `Send` future only over `Sync` ports, and a served
-// handler relies on this one being `Sync`.
-const _: fn() = || {
-    fn assert_sync<T: Sync>() {}
-    assert_sync::<ScopedKnowledgeStore>();
-};
-
 #[async_trait]
 impl KnowledgeEntryPort for ScopedKnowledgeStore {
     async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {

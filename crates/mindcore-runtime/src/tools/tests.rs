@@ -136,17 +136,17 @@ fn tools(fake: Arc<Fake>) -> WorkflowTools {
     WorkflowTools::new(fake, admission(), MindProviders::default())
 }
 
-fn expect_ok(result: SpokeResult<Value>, context: &str) -> Value {
+fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
     match result {
         SpokeResult::Ok(value) => value,
         SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
     }
 }
 
-fn expect_reject(result: SpokeResult<Value>, context: &str) -> SpokeReject {
+fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
     match result {
         SpokeResult::Reject(reject) => reject,
-        SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value}"),
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value:?}"),
     }
 }
 
@@ -1002,7 +1002,10 @@ async fn adoption_tool() -> (TempDir, AdoptionTool) {
             ),
         }),
         "shared".to_string(),
-        BTreeMap::from([("prn_driver".to_string(), KnowledgeScope::new("wren"))]),
+        Arc::new(BTreeMap::from([(
+            "prn_driver".to_string(),
+            KnowledgeScope::new("wren"),
+        )])),
     );
     (dir, tool)
 }
@@ -1079,5 +1082,138 @@ async fn an_unrouted_principal_is_refused_without_target_details() {
         !reject.message.contains("wren"),
         "the refusal names no destination collection: {}",
         reject.message
+    );
+}
+
+/// The source half of the adoption is read-only by construction: the write its port must expose
+/// refuses before it touches the store, and the shared entry keeps the revision it was seeded at.
+#[tokio::test]
+async fn the_adoption_source_handle_refuses_a_write() {
+    let dir = TempDir::new().expect("temporary directory");
+    let store = MindStore::open(&dir.path().join("source.db"))
+        .await
+        .expect("open store");
+    let mut seeded = entry();
+    seeded.entry_id = "ke_shared".to_string();
+    expect_ok(
+        store
+            .knowledge(KnowledgeScope::new("shared"))
+            .put_knowledge_entry(seeded, None)
+            .await,
+        "seed the shared source",
+    );
+
+    let pool = store.pool();
+    let mut transaction = pool.begin().await.expect("begin the call's transaction");
+    let refusal = {
+        let gate = tokio::sync::Mutex::new(&mut transaction);
+        let source = AdoptionSource {
+            collection: "shared",
+            gate: &gate,
+        };
+        source.put_knowledge_entry(entry(), None).await
+    };
+    transaction
+        .rollback()
+        .await
+        .expect("drop the call's transaction");
+
+    let reject = expect_reject(refusal, "a write through the adoption source");
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(
+        reject.message, "the adoption source is read-only",
+        "{reject:?}"
+    );
+    let stored = expect_ok(
+        store
+            .knowledge(KnowledgeScope::new("shared"))
+            .get_knowledge_entry("ke_shared")
+            .await,
+        "read the shared source back",
+    );
+    assert_eq!(
+        stored.revision,
+        Some(1),
+        "the shared entry is the one seeded, not a rewrite: {stored:?}"
+    );
+}
+
+/// Routing is this tool's authorization, so it is answered before the payload is looked at: an
+/// admitted principal without a route is refused with `NotAuthorized` even when the arguments would
+/// not decode.
+#[tokio::test]
+async fn an_unrouted_principal_is_refused_before_its_arguments_are_read() {
+    let (_dir, tool) = adoption_tool().await;
+    let reject = expect_reject(
+        tool.dispatch(
+            "peer-unrouted",
+            json!({ "entry_id": "ke_shared", "unexpected": true }),
+        )
+        .await,
+        "an unrouted adoption with arguments that do not decode",
+    );
+
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized, "{reject:?}");
+    assert!(reject.details.is_none(), "{reject:?}");
+}
+
+/// Neither a refused payload nor a storage fault carries its diagnostic: the wire keeps the closed
+/// class, and the serde, SQL and stored-payload text stays host-side.
+#[tokio::test]
+async fn adoption_refusals_carry_no_raw_diagnostics() {
+    let (_dir, tool) = adoption_tool().await;
+
+    let reject = expect_reject(
+        tool.dispatch("peer-driver", json!({ "entry_id": "ke_shared" }))
+            .await,
+        "adoption without an expected source revision",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput, "{reject:?}");
+    assert_eq!(
+        reject.message, "the adoption arguments are entry_id and expected_source_revision",
+        "the refusal names the advertised shape, not the serde diagnostic"
+    );
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("arguments"),
+        "{reject:?}"
+    );
+
+    // why: a stored payload the store cannot decode fails the source read itself, which is the
+    // storage fault whose decoder text must not travel.
+    sqlx::query(
+        "UPDATE knowledge_entries SET payload = 'not an entry' \
+         WHERE collection = 'shared' AND entry_id = 'ke_shared'",
+    )
+    .execute(&tool.pool)
+    .await
+    .expect("corrupt the stored payload");
+    let reject = expect_reject(
+        tool.dispatch(
+            "peer-driver",
+            json!({ "entry_id": "ke_shared", "expected_source_revision": 1 }),
+        )
+        .await,
+        "adoption of a stored payload that does not decode",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(reject.message, "knowledge adoption could not complete");
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("store"),
+        "{reject:?}"
+    );
+    let refusal = format!("{reject:?}");
+    assert!(
+        !refusal.contains("payload") && !refusal.contains("shared") && !refusal.contains("SELECT"),
+        "the refusal carries no stored text, no collection and no statement: {refusal}"
     );
 }

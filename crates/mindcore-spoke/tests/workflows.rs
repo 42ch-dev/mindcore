@@ -32,11 +32,13 @@ const PRINCIPAL: &str = "prn_1";
 const NOW: &str = "2026-11-20T09:00:00.000Z";
 
 /// A route map putting each of `principals` onto the fixture's one collection.
-fn routes(principals: &[&str]) -> BTreeMap<String, KnowledgeScope> {
-    principals
-        .iter()
-        .map(|principal| ((*principal).to_string(), KnowledgeScope::new("wren")))
-        .collect()
+fn routes(principals: &[&str]) -> Arc<BTreeMap<String, KnowledgeScope>> {
+    Arc::new(
+        principals
+            .iter()
+            .map(|principal| ((*principal).to_string(), KnowledgeScope::new("wren")))
+            .collect(),
+    )
 }
 
 /// What the embedder does to the store while it runs — outside every

@@ -6,6 +6,7 @@
 //! transaction open and the workflow can revalidate afterwards.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -78,7 +79,9 @@ const ABSORB_DECISION_OP: &str = "mindcore.absorb.decision";
 pub struct MemoryWorkflowBinding {
     adapter: MemoryAdapter,
     pool: SqlitePool,
-    knowledge_routes: BTreeMap<String, KnowledgeScope>,
+    /// Shared with every other reader of the same validated map — the adoption tool resolves its
+    /// destination here too — so both sides can never drift apart.
+    knowledge_routes: Arc<BTreeMap<String, KnowledgeScope>>,
     publisher: Option<Box<JournalPublisher>>,
 }
 
@@ -90,7 +93,7 @@ impl MemoryWorkflowBinding {
         Self {
             adapter: MemoryAdapter::new(reflections_enabled),
             pool,
-            knowledge_routes: BTreeMap::new(),
+            knowledge_routes: Arc::new(BTreeMap::new()),
             publisher: None,
         }
     }
@@ -286,16 +289,19 @@ impl MemoryWorkflowBinding {
     /// carrier collection, so a repeat would let one routed principal reach another's carriers. A
     /// map cannot repeat a key, and `KnowledgeScope` is not a wire `Scope`, so no admission call
     /// applies.
+    ///
+    /// The map is shared, not copied: the caller holds the same `Arc` and reads it for anything else
+    /// that must resolve a destination (the adoption tool), so one validated map has one content.
     pub fn with_knowledge_routes(
         mut self,
-        routes: BTreeMap<String, KnowledgeScope>,
+        routes: Arc<BTreeMap<String, KnowledgeScope>>,
     ) -> Result<Self, SpokeReject> {
         let invalid = |message: String| SpokeReject {
             code: SpokeRejectCode::InvalidInput,
             message,
             details: None,
         };
-        for (principal, scope) in &routes {
+        for (principal, scope) in routes.iter() {
             if principal.is_empty() {
                 return Err(invalid(
                     "a knowledge route needs a non-empty principal id".to_string(),

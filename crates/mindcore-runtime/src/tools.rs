@@ -240,10 +240,9 @@ pub(crate) struct AdoptionTool {
     pool: SqlitePool,
     principals: MemoryAdmission,
     source: String,
-    /// A copy of the validated route map the workflow binding serves, taken at assembly: both sides
-    /// are built from [`crate::ServeFaces::workflow_routes`] and neither mutates it, so a principal
-    /// resolves to one destination collection for both.
-    routes: BTreeMap<String, KnowledgeScope>,
+    /// The one validated route map, shared with the workflow binding: both hold this `Arc` and
+    /// neither mutates it, so a principal resolves to one destination collection for both.
+    routes: Arc<BTreeMap<String, KnowledgeScope>>,
 }
 
 impl AdoptionTool {
@@ -251,7 +250,7 @@ impl AdoptionTool {
         pool: SqlitePool,
         principals: MemoryAdmission,
         source: String,
-        routes: BTreeMap<String, KnowledgeScope>,
+        routes: Arc<BTreeMap<String, KnowledgeScope>>,
     ) -> Self {
         Self {
             pool,
@@ -300,10 +299,8 @@ impl AdoptionTool {
     }
 
     async fn adopt(&self, principal: &Principal, arguments: Value) -> SpokeResult<Value> {
-        let arguments: AdoptArguments = match decode(arguments) {
-            Ok(arguments) => arguments,
-            Err(reject) => return SpokeResult::Reject(reject),
-        };
+        // why: routing is this tool's authorization, so it is answered before the payload is looked
+        // at: an unrouted principal learns nothing about the arguments, well-formed or not.
         let Some(destination) = self.routes.get(principal.principal_id.as_str()) else {
             // why: target-free — a caller never learns whether another principal holds a route, so no
             // message names a collection or a principal.
@@ -313,27 +310,33 @@ impl AdoptionTool {
                 None,
             );
         };
+        let arguments: AdoptArguments = match serde_json::from_value(arguments) {
+            Ok(arguments) => arguments,
+            // why: a serde diagnostic describes the payload that was refused; the wire carries the
+            // advertised argument shape instead.
+            Err(_) => {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    "the adoption arguments are entry_id and expected_source_revision",
+                    Some(kind_details("arguments")),
+                )
+            }
+        };
         // why: one write reservation for the shared source read and the routed destination write, so a
         // concurrent adoption or put cannot interleave between them.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
-            Err(error) => {
-                return spoke_reject(
-                    SpokeRejectCode::InternalError,
-                    format!("knowledge adoption could not begin: {error}"),
-                    None,
-                )
-            }
+            Err(error) => return SpokeResult::Reject(adoption_fault("begin", error)),
         };
         // why: the two handles borrow this one transaction; each takes the guard only for its own await,
         // and both are dropped here so the commit below owns the transaction again.
         let outcome = {
             let gate = Mutex::new(&mut transaction);
-            let src = AdoptionPort {
+            let src = AdoptionSource {
                 collection: &self.source,
                 gate: &gate,
             };
-            let dst = AdoptionPort {
+            let dst = AdoptionDestination {
                 collection: &destination.collection,
                 gate: &gate,
             };
@@ -347,18 +350,40 @@ impl AdoptionTool {
         };
         let outcome = match outcome {
             SpokeResult::Ok(outcome) => outcome,
-            // why: nothing was written, so the dropped transaction rolls back and the refusal travels
-            // unchanged.
-            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            // why: nothing was written, so the dropped transaction rolls back. The adoption's own four
+            // refusals travel unchanged; a port fault is a storage fault that stays host-side.
+            SpokeResult::Reject(reject) => return adoption_refusal(reject),
         };
         if let Err(error) = transaction.commit().await {
-            return spoke_reject(
-                SpokeRejectCode::InternalError,
-                format!("knowledge adoption could not commit: {error}"),
-                None,
-            );
+            return SpokeResult::Reject(adoption_fault("commit", error));
         }
         SpokeResult::Ok(adopt_outcome(outcome))
+    }
+}
+
+/// A storage fault under adoption.
+///
+/// The wire carries a fixed message and the failing stage: a raw sqlx or decoder diagnostic names
+/// local tables, columns and stored payloads, so it goes to the host's stderr and never into the
+/// signed refusal.
+fn adoption_fault(stage: &str, diagnostic: impl std::fmt::Display) -> SpokeReject {
+    eprintln!("mindcore adoption {stage} fault: {diagnostic}");
+    SpokeReject {
+        code: SpokeRejectCode::InternalError,
+        message: "knowledge adoption could not complete".into(),
+        details: Some(kind_details(stage)),
+    }
+}
+
+/// The adoption's own four refusals travel as they are; anything else a port reports is a storage
+/// or stored-payload fault, and its text stays host-side.
+fn adoption_refusal(reject: SpokeReject) -> SpokeResult<Value> {
+    match reject.code {
+        SpokeRejectCode::KnowledgeEntryNotFound
+        | SpokeRejectCode::RevisionConflict
+        | SpokeRejectCode::KnowledgeEntryAlreadyExists
+        | SpokeRejectCode::InvalidInput => SpokeResult::Reject(reject),
+        _ => SpokeResult::Reject(adoption_fault("store", reject.message)),
     }
 }
 
@@ -371,18 +396,48 @@ fn adopt_outcome(outcome: AdoptionOutcome) -> Value {
     }
 }
 
-/// One call-local port: a fixed collection over the call's one borrowed transaction.
+/// The call's read half: the shared source.
 ///
-/// Two ports are alive at once, so neither owns the transaction: each holds the same async mutex and
-/// takes the guard for its own await. The handle is `Sync`, which is what makes the typed adoption
+/// The adoption only ever reads the source. `KnowledgeEntryPort` carries a write because the
+/// destination needs one, so the source handle refuses that write before it touches the store: the
+/// shared collection cannot be written through the source side, whatever a future caller tries.
+///
+/// Two handles are alive at once, so neither owns the transaction: each holds the same async mutex
+/// and takes the guard for its own await. Both are `Sync`, which is what makes the typed adoption
 /// future `Send` for a served handler.
-struct AdoptionPort<'a, 'b, 'tx> {
+struct AdoptionSource<'a, 'b, 'tx> {
     collection: &'a str,
     gate: &'b Mutex<&'b mut Transaction<'tx, Sqlite>>,
 }
 
 #[async_trait]
-impl<'a, 'b, 'tx> KnowledgeEntryPort for AdoptionPort<'a, 'b, 'tx> {
+impl KnowledgeEntryPort for AdoptionSource<'_, '_, '_> {
+    async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        let mut gate = self.gate.lock().await;
+        read_entry(&mut gate, self.collection, entry_id).await
+    }
+
+    async fn put_knowledge_entry(
+        &self,
+        _entry: KnowledgeEntry,
+        _expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        spoke_reject(
+            SpokeRejectCode::InternalError,
+            "the adoption source is read-only",
+            None,
+        )
+    }
+}
+
+/// The call's write half: the caller's routed destination.
+struct AdoptionDestination<'a, 'b, 'tx> {
+    collection: &'a str,
+    gate: &'b Mutex<&'b mut Transaction<'tx, Sqlite>>,
+}
+
+#[async_trait]
+impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
     async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
         let mut gate = self.gate.lock().await;
         read_entry(&mut gate, self.collection, entry_id).await

@@ -20,7 +20,7 @@ use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_runtime::tools::{ABSORB, ADOPT, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{
     AdoptionRoute, MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
@@ -30,7 +30,7 @@ use mindcore_spi::{
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
 use mindcore_spoke::{ServedMemory, TransferService};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
@@ -1777,6 +1777,133 @@ async fn an_unrouted_principal_cannot_adopt_on_a_serving_surface() {
     assert!(
         !refusal.contains(SHARED) && !refusal.contains(COLLECTION),
         "the refusal names no collection: {refusal}"
+    );
+}
+
+/// Adoption's switch is the presence of an `AdoptionRoute`, not the size of the route map: a
+/// surface with a source and no routes still advertises and installs adoption, while the same empty
+/// map serves no deliberation. The empty-map rule belongs to `deliberate` alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_is_advertised_beside_an_empty_route_map() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    faces.adoption = Some(AdoptionRoute {
+        source: KnowledgeScope::new(SHARED),
+    });
+    let surface = surface(&serve, faces);
+
+    assert!(
+        capabilities(&surface).contains(&ADOPT),
+        "a source with no routes still advertises adoption: {:?}",
+        capabilities(&surface)
+    );
+    assert_eq!(
+        surface
+            .manifest
+            .tools
+            .iter()
+            .filter(|tool| tool.capability_id.as_str() == ADOPT)
+            .count(),
+        1,
+        "the adoption descriptor is advertised once"
+    );
+    assert!(
+        !capabilities(&surface).contains(&DELIBERATE),
+        "the same empty route map still serves no deliberation: {:?}",
+        capabilities(&surface)
+    );
+
+    // why: advertisement is not a grant, and answering the call proves the handler is installed.
+    let session = connect(&surface, &[ADOPT]).await;
+    let reject = expect_reject(
+        session.adapter.invoke_tool(ADOPT, adopt_arguments()).await,
+        "adoption on a surface with no routes",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized, "{reject:?}");
+}
+
+/// A successful adoption end to end: the copy lands in the caller's routed collection over a signed
+/// session, and its anchor resolves to the shared source entry at the revision it was adopted from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_routed_principal_adopts_a_shared_entry_into_its_own_collection() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let shared = ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(SHARED));
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                serde_json::from_value(json!({
+                    "schema_version": 1,
+                    "entry_id": "ke_shared",
+                    "entry_type": "note",
+                    "canonical_name": "the shared gate note",
+                    "status": "confirmed",
+                    "body": { "summary": "the north gate closes at dusk" },
+                    "extensions": {},
+                }))
+                .expect("shared entry JSON matches the schema"),
+                None,
+            )
+            .await,
+        "seed the shared source entry",
+    );
+    let source_revision = expect_ok(
+        shared.get_knowledge_entry("ke_shared").await,
+        "read the seeded source entry",
+    )
+    .revision
+    .expect("the seeded entry carries a revision");
+
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+        routes(&[PRINCIPAL]),
+    );
+    faces.adoption = Some(AdoptionRoute {
+        source: KnowledgeScope::new(SHARED),
+    });
+    let surface = surface(&serve, faces);
+
+    let session = connect(&surface, &[ADOPT]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(
+                ADOPT,
+                json!({ "entry_id": "ke_shared", "expected_source_revision": source_revision }),
+            )
+            .await,
+        "adoption over the signed session",
+    );
+    assert_eq!(result["outcome"], "created", "{result}");
+
+    let destination = ScopedKnowledgeStore::new(pool, KnowledgeScope::new(COLLECTION));
+    let copy = expect_ok(
+        destination.get_knowledge_entry("ke_shared").await,
+        "read the copy from the caller's own collection",
+    );
+    assert_eq!(copy.entry_id, "ke_shared");
+    assert_eq!(
+        adoption_anchor_parts(&copy),
+        Some(("ke_shared", Some(source_revision))),
+        "the copy's anchor resolves to the source entry at the revision adopted: {copy:?}"
+    );
+    let source = expect_ok(
+        shared.get_knowledge_entry("ke_shared").await,
+        "read the shared source entry back",
+    );
+    assert_eq!(
+        source.revision,
+        Some(source_revision),
+        "adoption reads the source and never moves it"
     );
 }
 

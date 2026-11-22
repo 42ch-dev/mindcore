@@ -76,7 +76,7 @@ impl MindcoreServe {
     /// the principal its admission returns, through the host's route map.
     fn workflows(
         &self,
-        routes: BTreeMap<String, KnowledgeScope>,
+        routes: Arc<BTreeMap<String, KnowledgeScope>>,
     ) -> Result<Arc<SpiMindWorkflows>, SpokeReject> {
         let publish = Arc::clone(&self.publish);
         let binding = MemoryWorkflowBinding::new(self.store.pool(), self.reflections)
@@ -118,21 +118,24 @@ impl MindcoreServe {
                 );
             }
         }
+        // why: one validated map serves every reader — the workflow binding and the adoption tool
+        // hold the same `Arc`, so a principal cannot resolve to one destination in a workflow call
+        // and another in an adoption.
+        let routes = Arc::new(faces.workflow_routes);
         // why: the adoption tool reads one shared source while each routed principal names its write
-        // destination, so it is built from the same validated route map the binding serves — before
-        // that map moves — and only when the host configured a source.
+        // destination, so it resolves through that same map, and exists only when the host
+        // configured a source.
         let adoption = faces.adoption.map(|route| {
             tools::AdoptionTool::new(
                 self.store.pool(),
                 Arc::clone(&faces.principals),
                 route.source.collection,
-                faces.workflow_routes.clone(),
+                Arc::clone(&routes),
             )
         });
-        // why: the route map's emptiness decides the deliberation advertisement; read it before the
-        // map moves into the binding.
-        let routed = !faces.workflow_routes.is_empty();
-        let workflows = match self.workflows(faces.workflow_routes) {
+        // why: the route map's emptiness decides the deliberation advertisement.
+        let routed = !routes.is_empty();
+        let workflows = match self.workflows(routes) {
             Ok(workflows) => workflows,
             // why: the host's own configuration is refused before any port or registration exists.
             Err(reject) => return SpokeResult::Reject(reject),
