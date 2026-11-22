@@ -68,8 +68,8 @@ pub(crate) fn max_content_bytes() -> usize {
 
 /// §7.1 when the fixture policy withholds Reflection: the three reflection ops
 /// refuse before any storage access.
-pub(crate) fn describe_body(reflections_enabled: bool) -> Value {
-    let capabilities: &[&str] = if reflections_enabled {
+pub(crate) fn describe_body(reflections: bool) -> Value {
+    let capabilities: &[&str] = if reflections {
         &CAPABILITIES
     } else {
         &CAPABILITIES_WITHOUT_REFLECTION

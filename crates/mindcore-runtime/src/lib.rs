@@ -57,17 +57,17 @@ type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
 impl MindcoreServe {
     /// Build over the host's store.
     ///
-    /// `reflections_enabled` matches the memory adapter instance the host serves. `publish` is the
+    /// `reflections` matches the memory adapter instance the host serves. `publish` is the
     /// host's journal publisher: a settlement leg without one is refused by the binding, and the
     /// runtime never invents a publisher.
     pub fn new(
         store: MindStore,
-        reflections_enabled: bool,
+        reflections: bool,
         publish: impl Fn(&[Value]) -> Result<(), SpiError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             store,
-            reflections: reflections_enabled,
+            reflections,
             publish: Arc::new(publish),
         }
     }

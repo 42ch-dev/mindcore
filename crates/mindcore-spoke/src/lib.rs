@@ -142,19 +142,14 @@ pub struct MemoryAdapter {
 }
 
 impl MemoryAdapter {
-    /// `reflections_enabled` is the instance's own policy switch: it decides
-    /// both what `describe` advertises and whether §7.25–§7.27 are served.
+    /// `reflections` is the instance's own policy switch: it decides both what
+    /// `describe` advertises and whether §7.25–§7.27 are served.
     #[must_use]
-    pub fn new(reflections_enabled: bool) -> Self {
+    pub fn new(reflections: bool) -> Self {
         Self {
             repository: SqliteMemoryRepository,
-            reflections: reflections_enabled,
+            reflections,
         }
-    }
-
-    #[must_use]
-    pub fn reflections_enabled(&self) -> bool {
-        self.reflections
     }
 
     /// Validate and validate-again one rebuilt success body against its pinned
@@ -232,8 +227,19 @@ pub(crate) fn principal_id(principal: &Principal) -> &str {
 }
 
 pub(crate) fn recorded_failure(failure: &ReceiptFailure) -> Reject {
-    let code =
-        SpokeRejectCode::try_from_str(&failure.code).unwrap_or(SpokeRejectCode::InternalError);
+    // why: a same-key replay can only re-play the recorded failure, so a code this build
+    // does not know answers one generic terminal refusal — neither the recorded message
+    // nor a `retryable` class may suggest the outcome could differ on a second attempt.
+    let Some(code) = SpokeRejectCode::try_from_str(&failure.code) else {
+        return Reject::terminal(
+            SpokeRejectCode::InternalError,
+            "the recorded failure names an unrecognized reject code",
+        )
+        .detail(
+            "reason",
+            Value::String("unrecognized_recorded_reject_code".to_string()),
+        );
+    };
     let class = failure
         .details
         .get("retry_class")
@@ -267,4 +273,56 @@ pub(crate) fn mint(prefix: &str) -> String {
 /// One stored row's revision bumped by one.
 pub(crate) fn bump(revision: &serde_json::Number) -> serde_json::Number {
     serde_json::Number::from(revision.as_u64().unwrap_or(0).saturating_add(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(code: &str, retry_class: &str) -> ReceiptFailure {
+        ReceiptFailure {
+            code: code.to_string(),
+            message: "the provider refused this op".to_string(),
+            details: serde_json::json!({ "retry_class": retry_class })
+                .as_object()
+                .expect("details object")
+                .clone(),
+            extensions: serde_json::Map::new(),
+        }
+    }
+
+    /// A persisted reject the closed wire vocabulary cannot name answers one generic
+    /// terminal refusal: a same-key replay can only re-play it, so neither the
+    /// recorded message nor a `retryable` class invites a second attempt. A known
+    /// code replays its own class verbatim.
+    #[test]
+    fn a_recorded_reject_replays_its_class_and_degrades_only_an_unknown_code() {
+        let unknown = recorded_failure(&failure("NO_SUCH_CODE", "retryable")).into_spoke();
+        assert_eq!(unknown.code, SpokeRejectCode::InternalError);
+        assert_eq!(
+            unknown.message,
+            "the recorded failure names an unrecognized reject code"
+        );
+        let details = unknown.details.expect("details");
+        assert_eq!(
+            details.get("retry_class").and_then(Value::as_str),
+            Some("terminal")
+        );
+        assert_eq!(
+            details.get("reason").and_then(Value::as_str),
+            Some("unrecognized_recorded_reject_code")
+        );
+
+        let known = recorded_failure(&failure("NOT_FOUND", "retryable")).into_spoke();
+        assert_eq!(known.code, SpokeRejectCode::NotFound);
+        assert_eq!(known.message, "the provider refused this op");
+        assert_eq!(
+            known
+                .details
+                .as_ref()
+                .and_then(|details| details.get("retry_class"))
+                .and_then(Value::as_str),
+            Some("retryable")
+        );
+    }
 }

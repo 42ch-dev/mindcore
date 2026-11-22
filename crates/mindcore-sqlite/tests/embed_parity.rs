@@ -238,15 +238,15 @@ fn fixture_guard_refuses_existing_leaf() {
     assert!(Fixture::guard(&leaf).is_err());
 }
 
+/// Symlink creation is the only platform-specific step; without it the
+/// dangling leaf never exists and the guard assertions would prove nothing.
+#[cfg(unix)]
 #[test]
 fn fixture_guard_refuses_dangling_symlink() {
     let fixture = Fixture::fresh();
     let foreign = fixture.root.join("foreign-target.db");
     let link = fixture.db_path();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&foreign, &link).expect("symlink");
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&foreign, &link).expect("symlink");
     assert!(!link.exists());
     assert!(Fixture::guard(&link).is_err());
 }

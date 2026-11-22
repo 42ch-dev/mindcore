@@ -86,12 +86,12 @@ pub struct MemoryWorkflowBinding {
 }
 
 impl MemoryWorkflowBinding {
-    /// Bind to `pool`; `reflections_enabled` matches the adapter instance the
-    /// host serves.
+    /// Bind to `pool`; `reflections` matches the adapter instance the host
+    /// serves.
     #[must_use]
-    pub fn new(pool: SqlitePool, reflections_enabled: bool) -> Self {
+    pub fn new(pool: SqlitePool, reflections: bool) -> Self {
         Self {
-            adapter: MemoryAdapter::new(reflections_enabled),
+            adapter: MemoryAdapter::new(reflections),
             pool,
             knowledge_routes: Arc::new(BTreeMap::new()),
             publisher: None,
