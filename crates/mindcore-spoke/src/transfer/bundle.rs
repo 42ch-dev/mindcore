@@ -20,7 +20,7 @@ use mindcore_base::ir::{
 use mindcore_sqlite::MemoryReceiptSummary;
 use spoke_schemas::data::memory_export_bundle::{
     GrantSummary, MemoryCandidate, ProfileDocument, ReceiptSummary, Reflection, RetainedRecord,
-    Source, Subject,
+    Shared57 as BundleContent, Source, Subject,
 };
 
 use crate::admission;
@@ -57,28 +57,32 @@ fn typed<T: DeserializeOwned + Serialize>(value: Value) -> AResult<Value> {
 pub(super) const EXPLICIT_NULL_REASON: &str = "explicit_null_content_not_transferable";
 
 /// The stored documents a logical bundle carries: `records[].content` and a pending
-/// `candidates[].proposed.content`. The pinned content type cannot represent a present `null` —
-/// an `Option` decodes one to `None`, and the typed encoding then omits the member — so such a
-/// document can only transfer as a different document.
+/// `candidates[].proposed.content`. The pinned content type loses exactly one member to a present
+/// `null` — `structured` is an `Option`, which decodes `null` to `None`, and the typed encoding
+/// then omits the member — so such a document can only transfer as a different document. A `null`
+/// nested inside `structured` or inside a cognition record is carried byte-for-byte and is not
+/// screened.
 pub(super) fn carries_explicit_null(records: &[Value], candidates: &[Value]) -> bool {
-    records
-        .iter()
-        .filter_map(|record| record.get("content"))
-        .chain(candidates.iter().filter_map(|candidate| {
-            candidate
-                .get("proposed")
-                .and_then(|proposed| proposed.get("content"))
-        }))
-        .any(has_null)
+    let record_contents = records.iter().filter_map(|record| record.get("content"));
+    let candidate_contents = candidates.iter().filter_map(|candidate| {
+        candidate
+            .get("proposed")
+            .and_then(|proposed| proposed.get("content"))
+    });
+    record_contents
+        .chain(candidate_contents)
+        .any(|content| content.get("structured").is_some_and(Value::is_null))
 }
 
-fn has_null(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::Array(items) => items.iter().any(has_null),
-        Value::Object(members) => members.values().any(has_null),
-        _ => false,
-    }
+/// Compile-time enumeration of the pinned content type's members, so a member added to it cannot
+/// reach the wire without this screen being revisited for the new member's lossy slot.
+#[allow(dead_code)]
+fn content_members_are_enumerated(content: BundleContent) {
+    let BundleContent {
+        text: _,
+        structured: _,
+        cognition: _,
+    } = content;
 }
 
 /// The one refusal for a document a transfer would have to change to carry.

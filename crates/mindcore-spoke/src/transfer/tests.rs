@@ -1419,6 +1419,59 @@ async fn an_explicit_null_document_is_refused_at_export() {
     );
 }
 
+/// A `null` nested inside `structured` is what the pinned content type carries unchanged, so the
+/// export seals it and a receiving store re-imports the document. Only a present `null`
+/// occupying `structured` itself is lossy.
+#[tokio::test]
+async fn a_nested_null_document_exports_and_reimports() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let structured = json!({ "product": [false, 0, null, []] });
+    let mut row = record("r_nested", "s_1", None, false);
+    if let RecordState::Live { content, .. } = &mut row.state {
+        content.structured = Some(structured.clone());
+    }
+    let mut tx = fixture.begin().await;
+    fixture
+        .repository
+        .insert_record(&mut tx, &row)
+        .await
+        .expect("seed the nested-null record");
+    tx.commit().await.expect("commit the seeded record");
+
+    let chunks = staged_source(&fixture, "nested-null-export").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+    let exported = chunks[0]["records"]
+        .as_array()
+        .expect("chunk records")
+        .iter()
+        .find(|record| record["record_id"] == json!("r_nested"))
+        .expect("the nested-null record travels");
+    assert_eq!(
+        exported["content"]["structured"], structured,
+        "the seal carries the nested null unchanged: {exported}"
+    );
+
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "nested-null-stage-0",
+            None,
+        )
+        .await,
+    );
+    assert_eq!(staged["status"], json!("committed"));
+    let report = &staged["result"]["staged_report"];
+    assert_eq!(report["counts"]["records"], json!(4));
+    assert!(
+        report["record_id_map"].get("r_nested").is_some(),
+        "the nested-null document is re-imported, not refused: {report}"
+    );
+}
+
 /// Defence in depth: a bundle whose bytes verify but whose content member spells an explicit null
 /// is refused at final verification with the same reason, so no arrival can be activated as a
 /// document the sender's seal changed.
