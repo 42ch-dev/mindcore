@@ -225,10 +225,11 @@ fn credential_shaped(value: &str) -> bool {
             return true;
         }
     }
-    // JWT/JWE compact serialisation: a base64url header starting `eyJ` (the base64url of `{"`)
-    // ahead of the form's other segments — three for a JWS, five for a JWE, two with the
-    // signature stripped, three with it empty. A dotless `eyJ…` value is a prefix, not a shape,
-    // so it stays an opaque label.
+    // JOSE compact serialisation: a base64url header segment that is a JSON object, ahead of the
+    // form's other segments — three for a JWS, five for a JWE, two or three with the signature
+    // stripped or empty. The header is the test: a versioned opaque label such as
+    // `eyJreport_42.v1` shares the `eyJ` prefix and the alphabet, but its segments do not decode to
+    // JSON, so it stays a correlation label.
     let segments: Vec<&str> = value.split('.').collect();
     (2..=5).contains(&segments.len())
         && value.starts_with("eyJ")
@@ -237,6 +238,19 @@ fn credential_shaped(value: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         })
+        && jose_header(segments[0])
+}
+
+/// A JOSE header is base64url (no padding) of a JSON object; a label that merely starts `eyJ`
+/// decodes to bytes that are not JSON.
+fn jose_header(segment: &str) -> bool {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    URL_SAFE_NO_PAD
+        .decode(segment)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|header| header.is_object())
 }
 
 /// References and grant summaries: every cross-reference resolves inside the

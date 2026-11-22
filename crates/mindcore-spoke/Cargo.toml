@@ -12,6 +12,7 @@ mindcore-base = { path = "../mindcore-base" }
 mindcore-sqlite = { path = "../mindcore-sqlite" }
 mindcore-spi = { path = "../mindcore-spi" }
 async-trait.workspace = true
+base64 = "0.22"
 spoke-connect = { workspace = true, features = ["remote-adapter"] }
 spoke-schemas.workspace = true
 spoke-operations.workspace = true

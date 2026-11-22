@@ -22,5 +22,5 @@ Staging freezes the destinations; activation applies them. The final staging chu
 
 - Staging pays one translation pass and one mapping build; activation's work is proportional to the frozen row set.
 - An abandoned import expires after `STAGED_IMPORT_TTL_SECONDS`, and the sweep releases the frozen payload as well as any leftover chunk (`crates/mindcore-sqlite/src/repository.rs:1703`).
-- Activation cannot apply a mapping the staged report did not publish: `decode_staged` accepts only the frozen rows and `recheck` refuses a target that moved under them.
+- Activation cannot apply a subject, record or candidate identity the staged report did not publish: `decode_staged` accepts only the frozen rows and `recheck` refuses a target that moved under them. An adopted grant is the exception the report does not map: its id is a store-wide key, so it takes a fresh target identity like any imported row, and §7.31's report carries only `grants_adopted`/`grants_dropped`. The adoption cover is rechecked against the caller's own live grants at staging and again at activation.
 - The frozen payload is trusted only because staging wrote it in the same store on the same transaction seam; a row it cannot decode is an internal fault, never a caller-visible refusal.

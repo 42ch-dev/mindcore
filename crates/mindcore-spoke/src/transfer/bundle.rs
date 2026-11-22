@@ -46,11 +46,39 @@ pub(super) fn digest_excluding(value: &Value, field: &str) -> AResult<String> {
 /// timestamps back into `DateTime` and writes chrono's `AutoSi` spelling, so a stored `…:00.000Z`
 /// sealed verbatim would make the chunk it sends back fail the digest this store sealed.
 fn typed<T: DeserializeOwned + Serialize>(value: Value) -> AResult<Value> {
-    let member: T = serde_json::from_value(value).map_err(|error| {
+    let member: T = serde_json::from_value(value.clone()).map_err(|error| {
         Reject::internal(format!("a stored bundle member is unreadable: {error}"))
     })?;
-    serde_json::to_value(member)
-        .map_err(|error| Reject::internal(format!("a bundled member is unencodable: {error}")))
+    let mut encoded = serde_json::to_value(member)
+        .map_err(|error| Reject::internal(format!("a bundled member is unencodable: {error}")))?;
+    restore_explicit_nulls(&value, &mut encoded);
+    Ok(encoded)
+}
+
+/// The pinned schema types cannot carry an explicit `null`: an `Option` member decodes one to
+/// `None`, and its re-encode omits the member, while stored content spells `"structured": null`
+/// for a present, null structured value. Presence is part of the bytes this store seals, so every
+/// `null` the wire carries and the typed encode dropped is spliced back.
+fn restore_explicit_nulls(wire: &Value, encoded: &mut Value) {
+    match (wire, encoded) {
+        (Value::Object(wire), Value::Object(encoded)) => {
+            for (member, value) in wire {
+                match encoded.get_mut(member) {
+                    Some(encoded) => restore_explicit_nulls(value, encoded),
+                    None if value.is_null() => {
+                        encoded.insert(member.clone(), Value::Null);
+                    }
+                    None => {}
+                }
+            }
+        }
+        (Value::Array(wire), Value::Array(encoded)) => {
+            for (wire, encoded) in wire.iter().zip(encoded.iter_mut()) {
+                restore_explicit_nulls(wire, encoded);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn typed_array<T: DeserializeOwned + Serialize>(values: Vec<Value>) -> AResult<Value> {

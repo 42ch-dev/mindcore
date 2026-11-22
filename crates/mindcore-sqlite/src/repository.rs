@@ -1428,8 +1428,8 @@ impl SqliteMemoryRepository {
         sqlx::query(
             "INSERT INTO memory_exports \
              (export_id, space_id, requester_principal_id, subject_id, selection_json, \
-              include_tombstoned, bundle_digest, chunk_count, created_at, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              include_tombstoned, bundle_digest, chunk_count, created_at, expires_at, state) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.export_id)
         .bind(&row.space_id)
@@ -1441,6 +1441,7 @@ impl SqliteMemoryRepository {
         .bind(chunk_count)
         .bind(&row.created_at)
         .bind(&row.expires_at)
+        .bind(if row.expired { "expired" } else { "live" })
         .execute(&mut **tx)
         .await
         .map_err(|error| conflict(error, &row.export_id))?;

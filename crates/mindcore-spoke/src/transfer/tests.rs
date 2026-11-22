@@ -1382,6 +1382,84 @@ async fn a_kindless_subject_survives_the_typed_client_round_trip() {
     );
 }
 
+/// Stored content spells a present, null `structured` value as `"structured": null`. The typed
+/// re-encode the seal applies decodes that to `None` and would omit the member, turning present
+/// content into absent content; the seal keeps the wire's presence through create, stage and
+/// activate.
+#[tokio::test]
+async fn an_explicitly_null_structured_value_survives_create_stage_activate() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let mut row = record("r_null", "s_1", None, false);
+    if let RecordState::Live { content, .. } = &mut row.state {
+        content.structured = Some(Value::Null);
+    }
+    let mut tx = fixture.begin().await;
+    fixture
+        .repository
+        .insert_record(&mut tx, &row)
+        .await
+        .expect("seed the null-structured record");
+    tx.commit().await.expect("commit the seeded record");
+
+    let chunks = staged_source(&fixture, "null-structured-export").await;
+    assert_eq!(chunks.len(), 1, "the fixture export is one chunk");
+    let records = chunks[0]["records"].as_array().expect("records");
+    let carried = records
+        .iter()
+        .find(|value| value["record_id"] == json!("r_null"))
+        .expect("the null-structured record is exported");
+    assert!(
+        carried["content"].get("structured").is_some(),
+        "the seal keeps the member, not just its null reading: {carried}"
+    );
+    assert_eq!(
+        carried["content"]["structured"],
+        Value::Null,
+        "the seal keeps the explicit null"
+    );
+
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "null-structured-stage-0",
+            None,
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    assert_eq!(
+        ready(activate(&fixture, &import_id, "null-structured-activate").await)["status"],
+        json!("committed")
+    );
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT content_json FROM memory_records \
+         WHERE space_id = ? AND json_extract(content_json, '$.text') = ?",
+    )
+    .bind(TARGET)
+    .bind("ledger for r_null")
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("the activated record");
+    let content: Value = serde_json::from_str(&stored).expect("stored content decodes");
+    assert!(
+        content.get("structured").is_some(),
+        "the member is present, not absent: {content}"
+    );
+    assert_eq!(
+        content["structured"],
+        Value::Null,
+        "activation stores the present null"
+    );
+}
+
 /// §7.0.5: the same key and payload replays the recorded outcome and writes
 /// nothing; the same key with a different payload is a conflict at any age.
 #[tokio::test]
@@ -2215,6 +2293,9 @@ async fn the_credential_screen_keeps_plain_prefixed_labels() {
         "xoxb-staging",
         // A dotless `eyJ` value is a prefix, not a JWT's segment structure.
         "eyJreport_42",
+        // Three segments are not enough either: a JWT's header segment decodes to a JSON object,
+        // and this versioned label's does not.
+        "eyJreport_42.v1",
     ] {
         let errors = screen(label);
         assert!(

@@ -24,4 +24,7 @@ The served operations are carried by a type this crate owns. `pub trait ServedMe
 - A surface with this crate's service advertises `spoke-memory-transfer` and serves the five operations over one loopback session; a surface with a bare `RemoteMemoryService` advertises `spoke-memory` only; a service reporting four of five advertises no transfer family (`crates/mindcore-runtime/tests/loopback.rs:1296,1331`; `crates/mindcore-runtime/tests/surface.rs:503-543`).
 - The manifest derivation, the service's `operations()`, and the dispatcher all read the five `transfer::OPERATIONS` constants; no advertised op string is spelled a second time (`crates/mindcore-spoke/src/transfer/mod.rs:33`, `crates/mindcore-spoke/src/serve.rs:20`, `crates/mindcore-runtime/src/lib.rs:342`).
 - Receipt polling rides the same service, so an unacknowledged transfer commit answers `OUTCOME_UNCERTAIN` with the settled receipt id in `details` and the client resolves it through `memory.receipts.get` (`crates/mindcore-spoke/src/serve.rs:145`).
-- A new operation joins the family in one place — the constants list — and the advertisement follows it without a manifest edit.
+- A new transfer operation joins two adjacent crate-owned lists: `transfer::OPERATIONS` is the
+  advertisement gate, and `SERVED` (`crates/mindcore-spoke/src/serve.rs:20`) is what the service
+  reports it dispatches, so the second list is not derived from the first and must be edited with
+  it. Neither is a manifest edit.

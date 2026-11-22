@@ -486,7 +486,6 @@ pub(super) async fn prepare(
     // amplification, and a non-expiring import needs a non-expiring cover.
     let summaries = members(bundle, "grants");
     let mut grants = Vec::new();
-    let mut grant_map = BTreeMap::new();
     let mut adopted = BTreeSet::new();
     let mut dropped = 0_u64;
     for value in import
@@ -544,12 +543,10 @@ pub(super) async fn prepare(
         });
     }
     not_subsumed(&grants, caller_grants, space, principal, now)?;
-    // `grant_id` is a store-wide primary key, so an adopted grant takes a fresh
-    // target identity like any imported row; the report keeps the mapping.
+    // `grant_id` is a store-wide primary key, so an adopted grant takes a fresh target identity
+    // like any imported row; §7.31's report carries only the adoption counts, not that mapping.
     for grant in &mut grants {
-        let target = mint("grt");
-        grant_map.insert(grant.grant_id.clone(), target.clone());
-        grant.grant_id = target;
+        grant.grant_id = mint("grt");
     }
 
     let source = bundle
