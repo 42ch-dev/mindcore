@@ -12,6 +12,7 @@ use tempfile::TempDir;
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
+use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
@@ -109,7 +110,8 @@ fn principals() -> MemoryAdmission {
     })
 }
 
-/// The memory service is host-supplied; this fixture only proves the face is attached.
+/// The memory service is host-supplied; this fixture only proves the face is attached. It takes
+/// the trait's default and reports no operation.
 struct RecordingMemory;
 
 #[async_trait]
@@ -120,6 +122,31 @@ impl RemoteMemoryService for RecordingMemory {
             "the wiring fixture serves no memory op",
             None,
         )
+    }
+}
+
+impl ServedMemory for RecordingMemory {}
+
+/// Four of the five transfer operations: a partial family must advertise nothing.
+struct FourOfFive;
+
+static FOUR_OF_FIVE: [&str; 4] = [
+    TRANSFER_OPERATIONS[0],
+    TRANSFER_OPERATIONS[1],
+    TRANSFER_OPERATIONS[2],
+    TRANSFER_OPERATIONS[3],
+];
+
+#[async_trait]
+impl RemoteMemoryService for FourOfFive {
+    async fn invoke(&self, peer_id: &str, op: &str, payload: Value) -> SpokeResult<Value> {
+        RecordingMemory.invoke(peer_id, op, payload).await
+    }
+}
+
+impl ServedMemory for FourOfFive {
+    fn operations(&self) -> &'static [&'static str] {
+        &FOUR_OF_FIVE
     }
 }
 
@@ -286,6 +313,53 @@ async fn attached_memory_service_is_advertised_and_served() {
     );
     assert!(surface.ports.as_knowledge().is_some());
     assert!(surface.ports.as_baseline().is_none());
+}
+
+/// A bare `RemoteMemoryService` takes the trait's default and reports no operation, so it earns
+/// `spoke-memory` and never `spoke-memory-transfer`.
+#[tokio::test]
+async fn a_bare_memory_service_advertises_only_the_memory_family() {
+    let serve = Fixture::open().await.serve();
+    let surface = expect_ok(
+        serve.surface(ServeFaces {
+            memory: Some(Arc::new(RecordingMemory)),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble a memory-serving surface",
+    );
+    assert!(capabilities(&surface).contains(&"spoke-memory"));
+    assert!(
+        !capabilities(&surface).contains(&"spoke-memory-transfer"),
+        "a service that reports no operation cannot prove the family: {:?}",
+        capabilities(&surface)
+    );
+}
+
+/// Four of the five operations is not the family: the manifest claims neither transfer nor a
+/// partial family.
+#[tokio::test]
+async fn a_service_reporting_four_of_five_advertises_no_transfer_family() {
+    let serve = Fixture::open().await.serve();
+    let surface = expect_ok(
+        serve.surface(ServeFaces {
+            memory: Some(Arc::new(FourOfFive)),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble a partially transfer-serving surface",
+    );
+    assert!(capabilities(&surface).contains(&"spoke-memory"));
+    assert!(
+        !capabilities(&surface).contains(&"spoke-memory-transfer"),
+        "a partial family is not the family: {:?}",
+        capabilities(&surface)
+    );
+    assert!(
+        !capabilities(&surface)
+            .iter()
+            .any(|capability| capability.starts_with("spoke-memory-transfer")),
+        "no partial family capability exists to advertise: {:?}",
+        capabilities(&surface)
+    );
 }
 
 /// A registration advertises its descriptor and is installed on the responder. Whether the

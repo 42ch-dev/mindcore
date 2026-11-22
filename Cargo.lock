@@ -2135,6 +2135,7 @@ dependencies = [
  "mindcore-sqlite",
  "serde",
  "serde_json",
+ "spoke-connect",
  "spoke-operations",
  "spoke-schemas",
  "sqlx",

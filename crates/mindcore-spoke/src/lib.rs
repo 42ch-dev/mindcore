@@ -16,9 +16,13 @@ mod policy;
 mod project;
 mod reflection;
 mod reject;
+mod serve;
+mod transfer;
 mod wire;
 mod workflows;
 
+pub use serve::{ServedMemory, TransferService};
+pub use transfer::OPERATIONS as TRANSFER_OPERATIONS;
 pub use workflows::MemoryWorkflowBinding;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,58 +223,6 @@ impl MemoryAdapter {
         } else {
             Ok(())
         }
-    }
-
-    /// An optional op this build does not serve (§4.1): no storage, no receipt.
-    fn refuse(op: &'static str) -> SpokeResult<MemoryStage> {
-        SpokeResult::Reject(Reject::unsupported(op).into_spoke())
-    }
-
-    // note: O2 — transfer is not served by this build.
-
-    pub async fn create_export(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.exports.create")
-    }
-
-    pub async fn get_export(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.exports.get")
-    }
-
-    pub async fn stage_import(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.imports.stage")
-    }
-
-    pub async fn activate_import(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.imports.activate")
-    }
-
-    pub async fn discard_import(
-        &self,
-        _tx: &mut Tx<'_>,
-        _principal: &Principal,
-        _request: Value,
-    ) -> SpokeResult<MemoryStage> {
-        Self::refuse("memory.imports.discard")
     }
 }
 

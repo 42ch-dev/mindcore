@@ -255,7 +255,11 @@ async fn describe_derives_the_served_surface() {
     assert_eq!(body["memory_protocol_version"], 1);
     assert_eq!(
         body["capabilities"],
-        json!(["spoke-memory", "spoke-memory-reflection"])
+        json!([
+            "spoke-memory",
+            "spoke-memory-reflection",
+            "spoke-memory-transfer"
+        ])
     );
     assert_eq!(body["engine_policy_version"], "mindcore-local-memory-v1");
     assert_eq!(body["required_profile_kinds"], json!(["personality"]));
@@ -267,7 +271,10 @@ async fn describe_derives_the_served_surface() {
             .describe(&mut tx, &principal(PRINCIPAL), request)
             .await,
     );
-    assert_eq!(body["capabilities"], json!(["spoke-memory"]));
+    assert_eq!(
+        body["capabilities"],
+        json!(["spoke-memory", "spoke-memory-transfer"])
+    );
 }
 
 /// §7.11: the capture commits its receipt in the caller's transaction, and the

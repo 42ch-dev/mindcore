@@ -29,6 +29,7 @@ use mindcore_spi::{
     CognitiveTaskKind, Embedder, EmbeddingIdentity, PolicyDecision, PolicyHook, Reasoner,
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
+use mindcore_spoke::{ServedMemory, TransferService};
 use mindcore_sqlite::MindStore;
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
@@ -52,7 +53,9 @@ const CARRIER_TWO: &str = "ke_mora";
 const SPACE: &str = "spc_loopback";
 const SUBJECT: &str = "subj_loopback";
 const PRINCIPAL: &str = "prn_loopback";
-const NOW: &str = "2026-11-21T00:00:00.000Z";
+/// why: a transfer chunk travels back through the typed wire DTOs, which canonicalize a whole
+/// second to no fraction and drop a null `kind`; this fixture seeds the shape they carry unchanged.
+const NOW: &str = "2026-11-21T00:00:00.500Z";
 const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
 /// A host-owned tool the runtime serves beside its own three.
 const HOST_TOOL: &str = "tools.mindcore.host_tool";
@@ -94,7 +97,7 @@ impl Fixture {
             "INSERT INTO memory_subjects \
              (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, \
               created_at) \
-             VALUES (?, ?, NULL, NULL, 'active', '[]', 1, ?)",
+             VALUES (?, ?, 'kind', 'belief', 'active', '[]', 1, ?)",
         )
         .bind(SPACE)
         .bind(SUBJECT)
@@ -369,6 +372,8 @@ impl RemoteMemoryService for MemoryFace {
     }
 }
 
+impl ServedMemory for MemoryFace {}
+
 /// The host's reasoner: one `none` verdict over the evidence the deliberation supplied.
 struct NoChangeReasoner;
 
@@ -461,7 +466,7 @@ impl PolicyHook for AutoPolicy {
 /// an empty map serves and advertises no `deliberate` at all.
 fn faces(
     manifest: HostCapabilityManifest,
-    memory: Option<Arc<dyn RemoteMemoryService>>,
+    memory: Option<Arc<dyn ServedMemory>>,
     providers: MindProviders,
     workflow_routes: BTreeMap<String, KnowledgeScope>,
 ) -> ServeFaces {
@@ -1279,6 +1284,11 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
         "an attached memory face is advertised: {:?}",
         capabilities(&attached)
     );
+    assert!(
+        !capabilities(&attached).contains(&"spoke-memory-transfer"),
+        "a bare service reports no operation and cannot claim the family: {:?}",
+        capabilities(&attached)
+    );
     let session = connect(&attached, &["spoke-memory"]).await;
     let body = expect_ok(
         MemoryPort::recall(&*session.adapter, &principal(), recall_request()).await,
@@ -1290,6 +1300,200 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
         "the host's memory service answered the authenticated peer"
     );
     assert_eq!(body["total_authorized"], 7);
+}
+
+/// The five §7.29–§7.33 operations over the real store. A service that reports all five earns
+/// `spoke-memory-transfer`, and every op reaches the adapter through the signed session. The
+/// service owns each op's transaction, so the export one create commits is the artifact the
+/// later page, stage and activation read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_is_advertised_and_served_when_the_service_reports_all_five() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_transfer", PRINCIPAL, &["transfer", "admin"])
+        .await;
+    let service = Arc::new(TransferService::new(
+        fixture.store.pool(),
+        principal_admission(),
+    ));
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory", "spoke-memory-transfer"]),
+            Some(service),
+            MindProviders::default(),
+            routes(&[]),
+        ),
+    );
+    assert!(
+        capabilities(&surface).contains(&"spoke-memory-transfer"),
+        "a service that reports the whole family earns it: {:?}",
+        capabilities(&surface)
+    );
+    let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
+
+    let created = wire(expect_ok(
+        MemoryPort::create_export(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "t7-export" })),
+        )
+        .await,
+        "memory.exports.create",
+    ));
+    assert_eq!(created["status"], "committed");
+    let export_id = created["result"]["export_id"]
+        .as_str()
+        .expect("export id")
+        .to_string();
+    assert_eq!(
+        created["result"]["chunk_count"],
+        json!(1),
+        "the loopback space exports as one chunk"
+    );
+
+    let page = wire(expect_ok(
+        MemoryPort::get_export(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "export_id": export_id, "chunk_ordinal": 0 })),
+        )
+        .await,
+        "memory.exports.get",
+    ));
+    let chunk = page["chunk"].clone();
+    assert_eq!(chunk["export_id"], json!(export_id));
+
+    let staged = wire(expect_ok(
+        MemoryPort::stage_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "chunk": chunk.clone(),
+                "conflict_policy": "rename_subject",
+                "idempotency_key": "t7-stage",
+            })),
+        )
+        .await,
+        "memory.imports.stage",
+    ));
+    assert_eq!(staged["result"]["chunks_received"], json!(1));
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    let discarded = wire(expect_ok(
+        MemoryPort::discard_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "import_id": &import_id,
+                "idempotency_key": "t7-discard",
+            })),
+        )
+        .await,
+        "memory.imports.discard",
+    ));
+    assert_eq!(discarded["result"]["discarded"], json!(true));
+
+    let restaged = wire(expect_ok(
+        MemoryPort::stage_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "chunk": chunk,
+                "conflict_policy": "rename_subject",
+                "idempotency_key": "t7-stage-again",
+            })),
+        )
+        .await,
+        "memory.imports.stage",
+    ));
+    let activated = wire(expect_ok(
+        MemoryPort::activate_import(
+            &*session.adapter,
+            &principal(),
+            typed(json!({
+                "space_id": SPACE,
+                "import_id": restaged["result"]["import_id"].as_str().expect("import id"),
+                "idempotency_key": "t7-activate",
+            })),
+        )
+        .await,
+        "memory.imports.activate",
+    ));
+    assert_eq!(activated["status"], "committed");
+}
+
+/// The receipt a transfer commit returns is pollable on the same signed session: an
+/// `OUTCOME_UNCERTAIN` outcome resolves through `memory.receipts.get`, which the service
+/// reports beside the five transfer operations and dispatches over the same store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_transfer", PRINCIPAL, &["transfer", "admin"])
+        .await;
+    let service = Arc::new(TransferService::new(
+        fixture.store.pool(),
+        principal_admission(),
+    ));
+    assert!(
+        service.operations().contains(&"memory.receipts.get"),
+        "the service reports the op an uncertain commit is resolved through: {:?}",
+        service.operations()
+    );
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory", "spoke-memory-transfer"]),
+            Some(service),
+            MindProviders::default(),
+            routes(&[]),
+        ),
+    );
+    let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
+
+    let created = wire(expect_ok(
+        MemoryPort::create_export(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "t7-poll-export" })),
+        )
+        .await,
+        "memory.exports.create",
+    ));
+    let receipt_id = created["receipt_id"]
+        .as_str()
+        .expect("receipt id")
+        .to_string();
+
+    let polled = wire(expect_ok(
+        MemoryPort::get_receipt(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "receipt_id": receipt_id })),
+        )
+        .await,
+        "memory.receipts.get",
+    ));
+    assert_eq!(polled["receipt"]["op"], json!("memory.exports.create"));
+    assert_eq!(polled["receipt"]["status"], json!("committed"));
+    assert_eq!(polled["receipt"]["receipt_id"], json!(receipt_id));
+}
+
+fn typed<T: serde::de::DeserializeOwned>(value: Value) -> T {
+    serde_json::from_value(value).expect("the request JSON matches its schema")
+}
+
+fn wire(value: impl serde::Serialize) -> Value {
+    serde_json::to_value(value).expect("the response serializes")
 }
 
 /// The baseline face is never composed: the dialer claims `spoke-baseline`, the responder still

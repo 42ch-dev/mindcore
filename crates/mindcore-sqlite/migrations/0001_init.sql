@@ -2,7 +2,7 @@
 -- change is refused — a missing version when an applied file is gone, a checksum mismatch when an
 -- applied file changed — and must be recreated, not upgraded.
 --
--- The ten `memory_*` tables are the protocol schema `MindStore::open` must produce: the served
+-- The fourteen `memory_*` tables are the protocol schema `MindStore::open` must produce: the served
 -- adapter and the borrowed-transaction `SqliteMemoryRepository` both read exactly these columns.
 -- Nexus host-only objects stay absent: the `guard_*`/`outbox_*`/`immutable_*` triggers and the
 -- `nexus_writer_*` UDFs they call, plus `core_workspace_gate`/`core_writer_registration`/
@@ -165,6 +165,99 @@ CREATE INDEX idx_memory_receipts_space_status
 
 CREATE INDEX idx_memory_receipts_created_at
     ON memory_receipts (created_at);
+
+-- ── Transfer plane ──
+-- One committed export: the header metadata plus the original authorization scope a later `get`
+-- must recheck before it reveals an ordinal or an expiry. The complete wire chunks live only in
+-- `memory_export_chunks`; no whole-bundle blob is duplicated here. Expiry is fixed at creation and
+-- never reset by a replay or a page read.
+CREATE TABLE memory_exports (
+    export_id TEXT PRIMARY KEY CHECK (length(export_id) > 0),
+    space_id TEXT NOT NULL CHECK (length(space_id) > 0),
+    requester_principal_id TEXT NOT NULL CHECK (length(requester_principal_id) > 0),
+    -- NULL for a whole-space export, set for a subject export.
+    subject_id TEXT CHECK (subject_id IS NULL OR length(subject_id) > 0),
+    -- Canonical `ReadSelection` JSON; NULL means the subject scope's default and is invalid for a
+    -- whole-space export, which selects no placement.
+    selection_json TEXT,
+    -- Admin-only tombstone inclusion: `get` rechecks admin coverage when set.
+    include_tombstoned INTEGER NOT NULL CHECK (include_tombstoned IN (0, 1)),
+    bundle_digest TEXT NOT NULL CHECK (length(bundle_digest) = 64),
+    chunk_count INTEGER NOT NULL CHECK (typeof(chunk_count) = 'integer' AND chunk_count >= 1),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    CHECK (selection_json IS NULL OR subject_id IS NOT NULL)
+) WITHOUT ROWID;
+
+-- Each complete immutable wire chunk of one export, keyed by its ordinal: ordinal zero carries the
+-- header and every later chunk carries whole elements. Paging reads this key in order.
+CREATE TABLE memory_export_chunks (
+    export_id TEXT NOT NULL CHECK (length(export_id) > 0),
+    ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    -- The chunk object as published; it already carries its own digest and `bytes`.
+    payload TEXT NOT NULL CHECK (length(payload) > 0),
+    PRIMARY KEY (export_id, ordinal)
+) WITHOUT ROWID;
+
+-- One staged import, fixed by ordinal zero and advanced per accepted chunk. The wire tail carries
+-- no import id, so a later chunk resolves its import by the
+-- (space_id, requester_principal_id, source_export_id) key that the unique partial index below
+-- makes single-valued; the digest and count are fixed with it.
+CREATE TABLE memory_imports (
+    import_id TEXT PRIMARY KEY CHECK (length(import_id) > 0),
+    space_id TEXT NOT NULL CHECK (length(space_id) > 0),
+    requester_principal_id TEXT NOT NULL CHECK (length(requester_principal_id) > 0),
+    source_export_id TEXT NOT NULL CHECK (length(source_export_id) > 0),
+    bundle_digest TEXT NOT NULL CHECK (length(bundle_digest) = 64),
+    -- Header `chunk_count`; a header-only bundle still stages one chunk.
+    expected_count INTEGER NOT NULL CHECK (typeof(expected_count) = 'integer' AND expected_count >= 1),
+    -- Next ordinal the caller must present; durable per accepted chunk.
+    next_ordinal INTEGER NOT NULL
+        CHECK (typeof(next_ordinal) = 'integer' AND next_ordinal BETWEEN 0 AND expected_count),
+    conflict_policy TEXT NOT NULL CHECK (conflict_policy IN ('fail', 'rename_subject')),
+    -- Ordinal-zero `adopt_grants`: applied on activation only, never auto-activated.
+    adopt_grants_json TEXT NOT NULL DEFAULT '[]',
+    -- Ordinal-zero `reference_translations`: applied to transferred Content on activation only.
+    reference_translations_json TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL CHECK (state IN ('staging', 'staged', 'activated', 'discarded', 'expired')),
+    -- Written once by final verification, before the inbound chunks are dropped: the translated
+    -- rows to apply and the report that fixes the ID mappings.
+    staged_payload_json TEXT,
+    staged_report_json TEXT,
+    -- Content-free source receipt summaries retained as import provenance after activation,
+    -- deduplicated by (source authority host, source space, receipt identity).
+    provenance_json TEXT,
+    created_at TEXT NOT NULL,
+    -- Fixed at ordinal zero; never reset by a replay or a later chunk.
+    expires_at TEXT NOT NULL,
+    activated_at TEXT,
+    CHECK ((state = 'activated') = (activated_at IS NOT NULL)),
+    -- `staged` means every ordinal landed, so the inbound sequence is complete.
+    CHECK (state NOT IN ('staged', 'activated') OR next_ordinal = expected_count)
+) WITHOUT ROWID;
+
+-- The tail chunk carries no import id, so each subsequent `stage` resolves one live import through
+-- this key; the unique index also holds the one-live-import-per-source-export invariant, across
+-- both non-terminal states, so a second idempotency key cannot open a second import for the same
+-- source export while the first is `staging` or `staged`.
+CREATE UNIQUE INDEX idx_memory_imports_staging
+    ON memory_imports (space_id, requester_principal_id, source_export_id)
+    WHERE state IN ('staging', 'staged');
+
+-- The expiry decision reads live imports by this key: an expired import is reclaimed
+-- (`expired`, payload released) on the next successful transfer write of its space.
+CREATE INDEX idx_memory_imports_expires
+    ON memory_imports (expires_at);
+
+-- Inbound chunks of one import, keyed by ordinal: each accepted chunk is durable without rewriting
+-- the earlier ones. Final verification consumes and removes them.
+CREATE TABLE memory_import_chunks (
+    import_id TEXT NOT NULL CHECK (length(import_id) > 0),
+    ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    -- The staged chunk as received; ordinal zero carries the header.
+    payload TEXT NOT NULL CHECK (length(payload) > 0),
+    PRIMARY KEY (import_id, ordinal)
+) WITHOUT ROWID;
 
 -- ── Durable intent journal ──
 CREATE TABLE memory_journal (
