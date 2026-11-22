@@ -326,7 +326,9 @@ impl AdoptionTool {
         // concurrent adoption or put cannot interleave between them.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
-            Err(error) => return SpokeResult::Reject(adoption_fault("begin", error)),
+            Err(error) => {
+                return SpokeResult::Reject(adoption_fault(std::io::stderr(), "begin", error))
+            }
         };
         // why: the two handles borrow this one transaction; each takes the guard only for its own await,
         // and both are dropped here so the commit below owns the transaction again.
@@ -355,7 +357,7 @@ impl AdoptionTool {
             SpokeResult::Reject(reject) => return adoption_refusal(reject),
         };
         if let Err(error) = transaction.commit().await {
-            return SpokeResult::Reject(adoption_fault("commit", error));
+            return SpokeResult::Reject(adoption_fault(std::io::stderr(), "commit", error));
         }
         SpokeResult::Ok(adopt_outcome(outcome))
     }
@@ -364,26 +366,21 @@ impl AdoptionTool {
 /// A storage fault under adoption.
 ///
 /// The wire carries a fixed message and the failing stage: a raw sqlx or decoder diagnostic names
-/// local tables, columns and stored payloads, so it goes to the host's stderr and never into the
-/// signed refusal.
-fn adoption_fault(stage: &str, diagnostic: impl std::fmt::Display) -> SpokeReject {
-    // why: the host-side diagnostic is best-effort — a stderr that cannot be written (a closed
+/// local tables, columns and stored payloads, so it goes to `sink` (the host's stderr) and never
+/// into the signed refusal.
+fn adoption_fault(
+    mut sink: impl std::io::Write,
+    stage: &str,
+    diagnostic: impl std::fmt::Display,
+) -> SpokeReject {
+    // why: the host-side diagnostic is best-effort — a sink that cannot be written (a closed
     // descriptor) must not panic the handler out of the refusal the caller is owed.
-    emit_fault_diagnostic(std::io::stderr(), stage, &diagnostic);
+    let _ = writeln!(sink, "mindcore adoption {stage} fault: {diagnostic}");
     SpokeReject {
         code: SpokeRejectCode::InternalError,
         message: "knowledge adoption could not complete".into(),
         details: Some(kind_details(stage)),
     }
-}
-
-/// The fault's host-side line, whose own failure is ignored: the refusal is the contract.
-fn emit_fault_diagnostic(
-    mut sink: impl std::io::Write,
-    stage: &str,
-    diagnostic: &dyn std::fmt::Display,
-) {
-    let _ = writeln!(sink, "mindcore adoption {stage} fault: {diagnostic}");
 }
 
 /// The adoption's own four refusals travel as they are; anything else a port reports is a storage
@@ -394,7 +391,7 @@ fn adoption_refusal(reject: SpokeReject) -> SpokeResult<Value> {
         | SpokeRejectCode::RevisionConflict
         | SpokeRejectCode::KnowledgeEntryAlreadyExists
         | SpokeRejectCode::InvalidInput => SpokeResult::Reject(reject),
-        _ => SpokeResult::Reject(adoption_fault("store", reject.message)),
+        _ => SpokeResult::Reject(adoption_fault(std::io::stderr(), "store", reject.message)),
     }
 }
 

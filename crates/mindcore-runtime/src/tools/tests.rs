@@ -1231,13 +1231,20 @@ impl std::io::Write for ClosedSink {
     }
 }
 
-/// The fault diagnostic is best-effort: when the sink cannot be written, the line is dropped and
-/// the call still returns the contractual refusal instead of unwinding out of the handler.
+/// The fault diagnostic is best-effort: the same call that fails to write the sink still returns
+/// the contractual refusal instead of unwinding out of the handler.
 #[test]
 fn an_unwritable_fault_diagnostic_still_yields_the_refusal() {
-    emit_fault_diagnostic(ClosedSink, "store", &"boom");
-
-    let reject = adoption_fault("store", "boom");
+    let reject = adoption_fault(ClosedSink, "store", "boom");
     assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
     assert_eq!(reject.message, "knowledge adoption could not complete");
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("store"),
+        "{reject:?}"
+    );
 }
