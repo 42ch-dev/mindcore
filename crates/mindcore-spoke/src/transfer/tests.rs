@@ -1735,6 +1735,46 @@ async fn a_reclaimed_import_stays_dead_after_the_clock_moves_back() {
     );
 }
 
+/// `activated` is terminal, so the deadline its staging ran against no longer decides
+/// anything: a repeat activation past it names the state the import has left, not `expired`.
+#[tokio::test]
+async fn an_activated_import_past_its_old_deadline_answers_its_state() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let chunks = staged_source(&fixture, "terminal-export-1").await;
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "terminal-stage-0",
+            None,
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+    ready(activate(&fixture, &import_id, "terminal-activate-1").await);
+    sqlx::query("UPDATE memory_imports SET expires_at = ? WHERE import_id = ?")
+        .bind("2000-01-01T00:00:00.000Z")
+        .bind(&import_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("backdate the activated import");
+
+    let again = activate(&fixture, &import_id, "terminal-activate-2").await;
+    let reject = rejected(&again);
+    assert_eq!(
+        reject.code,
+        spoke_operations::SpokeRejectCode::ImportConflict
+    );
+    assert_eq!(detail(reject, "reason"), &json!("import_state"));
+    assert_eq!(detail(reject, "state"), &json!("activated"));
+}
+
 /// One live import per source export: once the first reaches `staged`, a second
 /// idempotency key cannot open a second import that would activate the same export twice.
 #[tokio::test]

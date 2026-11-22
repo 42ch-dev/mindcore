@@ -70,10 +70,15 @@ pub(super) fn unverified(errors: Vec<String>) -> Reject {
 }
 
 pub(super) fn expired(row: &MemoryImportRow, now: DateTime<Utc>) -> AResult<bool> {
-    // why: a reclaimed row is dead whatever the clock says; deciding it by time alone
-    // would let a backward clock step revive the import as a live header.
-    if row.state == "expired" {
-        return Ok(true);
+    // why: only an import nobody has activated carries a deadline. `activated` and
+    // `discarded` are terminal, so a late chunk or a repeat activation against one must
+    // answer its state, never the clock that its staging once ran against.
+    match row.state.as_str() {
+        // why: a reclaimed row is dead whatever the clock says; deciding it by time alone
+        // would let a backward clock step revive the import as a live header.
+        "expired" => return Ok(true),
+        "staging" | "staged" => {}
+        _ => return Ok(false),
     }
     let expires = DateTime::parse_from_rfc3339(&row.expires_at)
         .map_err(|_| Reject::internal("stored import expiry is unreadable"))?
