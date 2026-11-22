@@ -16,10 +16,16 @@ use crate::reject::{AResult, Reject};
 
 /// §3: the memory protocol revision this adapter speaks.
 pub(crate) const MEMORY_PROTOCOL_VERSION: u64 = 1;
-/// §4.1: the families this build serves with Reflection enabled.
-pub(crate) const CAPABILITIES: [&str; 2] = ["spoke-memory", "spoke-memory-reflection"];
+/// §4.1: the families this build serves with Reflection enabled. The transfer
+/// family is unconditional: this adapter serves all five §7.29–§7.33 operations.
+pub(crate) const CAPABILITIES: [&str; 3] = [
+    "spoke-memory",
+    "spoke-memory-reflection",
+    "spoke-memory-transfer",
+];
 /// §4.1: the same provider with the reflection sub-capability withheld.
-pub(crate) const CAPABILITIES_WITHOUT_REFLECTION: [&str; 1] = ["spoke-memory"];
+pub(crate) const CAPABILITIES_WITHOUT_REFLECTION: [&str; 2] =
+    ["spoke-memory", "spoke-memory-transfer"];
 /// §4.2: the authored kinds generation requires before it composes.
 pub(crate) const REQUIRED_PROFILE_KINDS: [&str; 1] = ["personality"];
 /// §6.1: opaque policy stamp clients pin recall/reflection bases to.

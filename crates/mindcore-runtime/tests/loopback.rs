@@ -470,7 +470,9 @@ fn faces(
         scope_id: SCOPE_ID.to_string(),
         knowledge: KnowledgeScope::new(COLLECTION),
         admission: knowledge_admission(),
-        memory,
+        // why: this fixture's service serves `memory.recall` only, so it registers no transfer op
+        // and must not claim that family.
+        memory: memory.map(|service| mindcore_runtime::MemoryFace::new(service, ["memory.recall"])),
         principals: principal_admission(),
         providers,
         workflow_routes,
@@ -1277,6 +1279,11 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
     assert!(
         capabilities(&attached).contains(&"spoke-memory"),
         "an attached memory face is advertised: {:?}",
+        capabilities(&attached)
+    );
+    assert!(
+        !capabilities(&attached).contains(&"spoke-memory-transfer"),
+        "a face that dispatches no transfer operation must not claim the family: {:?}",
         capabilities(&attached)
     );
     let session = connect(&attached, &["spoke-memory"]).await;
