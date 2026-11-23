@@ -4,10 +4,10 @@
 //! the destination is the one `dst` serves. Neither port is selected from the payload, so one
 //! host-supplied pairing decides where a copy can land.
 //!
-//! The destination key is the source `entry_id`. A repeat call recognizes the copy by the protocol
-//! adoption anchor it carries and returns it instead of writing a second one, so the guarantee
-//! leans on the destination port's atomic create-only CAS; without that CAS the slot can be
-//! claimed twice.
+//! The destination key is `destination_entry_id`, which the caller has already resolved (the
+//! protocol default is the source id). A repeat call recognizes the copy by the protocol adoption
+//! anchor it carries and returns it instead of writing a second one, so the guarantee leans on the
+//! destination port's atomic create-only CAS; without that CAS the slot can be claimed twice.
 
 use serde_json::{Map, Value};
 
@@ -16,7 +16,7 @@ use spoke_operations::{
     knowledge_entry_visible_to_viewpoint, spoke_reject, KnowledgeEntryPort, SpokeReject,
     SpokeRejectCode, SpokeResult,
 };
-use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
+use spoke_schemas::knowledge_entry::KnowledgeEntryModulesKey;
 use spoke_schemas::KnowledgeEntry;
 
 /// Module namespace holding a carrier's cognition envelope.
@@ -37,34 +37,37 @@ pub enum AdoptionOutcome {
     AlreadyPresent(KnowledgeEntry),
 }
 
-/// Adopts the shared entry `entry_id` into the collection `dst` serves.
+/// Adopts the shared entry `source_entry_id` into the slot `destination_entry_id` of the collection
+/// `dst` serves.
 ///
-/// The copy carries an adoption anchor naming `source_scope_id`, the entry id and the source
-/// revision it was taken from, and keeps the source's knowledge metadata, but none of its cognition
-/// records. The source entry is only ever read.
+/// The copy carries an adoption anchor naming `source_scope_id`, the source entry id and the source
+/// revision it was taken from, and keeps the source's knowledge metadata, but not its `cognition`
+/// module. The source entry is only ever read.
 ///
 /// A missing, superseded or undisclosable source is reported as one generic
-/// [`SpokeRejectCode::KnowledgeEntryNotFound`], repeat calls included: no anchor is ever written
-/// for a source the caller cannot see now. An occupied slot is recognized only by this adoption's
-/// own anchor, and only at the revision that anchor records: a copy adopted at another revision is
+/// [`SpokeRejectCode::NotFound`], repeat calls included: no anchor is ever written for a source the
+/// caller cannot see now. An occupied slot is recognized only by this adoption's own anchor, and
+/// only at the revision that anchor records: a copy adopted at another revision is
 /// [`SpokeRejectCode::RevisionConflict`] with `details.adopted_revision` naming the revision it was
 /// adopted at, even when the source now sits at the requested one, so a stale copy is never served
 /// as the revision asked for. Any other occupant — an anchor naming another scope or entry, or a
-/// superseded row the live read hides — is [`SpokeRejectCode::KnowledgeEntryAlreadyExists`] and is
-/// never overwritten or refreshed. An empty scope id, an empty `entry_id` and a zero revision name
-/// no anchor and are [`SpokeRejectCode::InvalidInput`].
+/// superseded row the live read hides — is [`SpokeRejectCode::RevisionConflict`] without details,
+/// and is never overwritten or refreshed. An empty scope id, an empty `destination_entry_id` and a
+/// zero revision name no anchor and are [`SpokeRejectCode::InvalidInput`].
 pub async fn adopt_knowledge_entry(
     src: &dyn KnowledgeEntryPort,
     dst: &dyn KnowledgeEntryPort,
     source_scope_id: &str,
-    entry_id: &str,
+    source_entry_id: &str,
+    destination_entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
     adopt(
         src,
         dst,
         source_scope_id,
-        entry_id,
+        source_entry_id,
+        destination_entry_id,
         expected_source_revision,
     )
     .await
@@ -79,7 +82,8 @@ pub async fn adopt_knowledge_entry_typed<S, D>(
     src: &S,
     dst: &D,
     source_scope_id: &str,
-    entry_id: &str,
+    source_entry_id: &str,
+    destination_entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome>
 where
@@ -90,7 +94,8 @@ where
         src,
         dst,
         source_scope_id,
-        entry_id,
+        source_entry_id,
+        destination_entry_id,
         expected_source_revision,
     )
     .await
@@ -101,21 +106,30 @@ async fn adopt<S, D>(
     src: &S,
     dst: &D,
     source_scope_id: &str,
-    entry_id: &str,
+    source_entry_id: &str,
+    destination_entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome>
 where
     S: KnowledgeEntryPort + ?Sized,
     D: KnowledgeEntryPort + ?Sized,
 {
-    let Some(anchor) = adoption_anchor(source_scope_id, entry_id, expected_source_revision) else {
+    let Some(anchor) = adoption_anchor(source_scope_id, source_entry_id, expected_source_revision)
+    else {
         return spoke_reject(
             SpokeRejectCode::InvalidInput,
             "an adoption anchors a non-empty scope id and entry id at a positive source revision",
             None,
         );
     };
-    let source = match src.get_knowledge_entry(entry_id).await {
+    if destination_entry_id.is_empty() {
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            "an adoption names a non-empty destination entry id",
+            None,
+        );
+    }
+    let source = match src.get_knowledge_entry(source_entry_id).await {
         SpokeResult::Ok(source) if knowledge_entry_visible_to_viewpoint(&source, None) => source,
         SpokeResult::Ok(_) => return source_absent(),
         SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::KnowledgeEntryNotFound => {
@@ -125,12 +139,12 @@ where
     };
     let visible_source_revision = source.revision;
 
-    let mut copy = match dst.get_knowledge_entry(entry_id).await {
+    let mut copy = match dst.get_knowledge_entry(destination_entry_id).await {
         SpokeResult::Ok(existing) => {
             return classify(
                 existing,
                 source_scope_id,
-                entry_id,
+                source_entry_id,
                 expected_source_revision,
             )
         }
@@ -141,13 +155,13 @@ where
     };
 
     if visible_source_revision != Some(expected_source_revision) {
-        return source_revision_conflict(entry_id, expected_source_revision);
+        return source_revision_conflict(source_entry_id, expected_source_revision);
     }
-    copy.entry_id = entry_id.to_string();
+    copy.entry_id = destination_entry_id.to_string();
     copy.revision = None;
     copy.created_at = None;
     copy.updated_at = None;
-    empty_cognition_records(&mut copy);
+    copy.modules.remove(&cognition_module_key());
     copy.source_anchor = None;
     copy.adoption_anchor = Some(anchor);
 
@@ -157,17 +171,19 @@ where
         // caller-OCC refusal a remote destination answers an occupied create with; both mean the
         // same slot claim, so both re-read and classify.
         SpokeResult::Reject(reject) if rejects_occupied_create(&reject) => {
-            match dst.get_knowledge_entry(entry_id).await {
+            match dst.get_knowledge_entry(destination_entry_id).await {
                 SpokeResult::Ok(existing) => classify(
                     existing,
                     source_scope_id,
-                    entry_id,
+                    source_entry_id,
                     expected_source_revision,
                 ),
                 SpokeResult::Reject(_) => SpokeResult::Reject(reject),
             }
         }
-        SpokeResult::Reject(reject) if rejects_superseded_occupant(&reject) => occupied(entry_id),
+        SpokeResult::Reject(reject) if rejects_superseded_occupant(&reject) => {
+            occupied(destination_entry_id)
+        }
         SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
     }
 }
@@ -180,10 +196,10 @@ where
 fn classify(
     existing: KnowledgeEntry,
     source_scope_id: &str,
-    entry_id: &str,
+    source_entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
-    match adopted_revision(&existing, source_scope_id, entry_id) {
+    match adopted_revision(&existing, source_scope_id, source_entry_id) {
         Some(adopted) if expected_source_revision == adopted => {
             SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing))
         }
@@ -192,18 +208,18 @@ fn classify(
             details.insert(ADOPTED_REVISION_DETAIL.to_string(), Value::from(adopted));
             spoke_reject(
                 SpokeRejectCode::RevisionConflict,
-                format!("adopted copy of {entry_id} carries source revision {adopted}"),
+                format!("adopted copy of {source_entry_id} carries source revision {adopted}"),
                 Some(details),
             )
         }
-        None => occupied(entry_id),
+        None => occupied(&existing.entry_id),
     }
 }
 
 /// The one occupancy refusal: the slot holds something this adoption does not own.
 fn occupied<T>(entry_id: &str) -> SpokeResult<T> {
     spoke_reject(
-        SpokeRejectCode::KnowledgeEntryAlreadyExists,
+        SpokeRejectCode::RevisionConflict,
         format!("knowledge entry {entry_id} already exists"),
         None,
     )
@@ -236,10 +252,14 @@ fn rejects_superseded_occupant(reject: &SpokeReject) -> bool {
 }
 
 /// The revision a copy's adoption anchor records for this source, when it names it.
-fn adopted_revision(entry: &KnowledgeEntry, source_scope_id: &str, entry_id: &str) -> Option<u64> {
+fn adopted_revision(
+    entry: &KnowledgeEntry,
+    source_scope_id: &str,
+    source_entry_id: &str,
+) -> Option<u64> {
     match adoption_anchor_parts(entry) {
         Some((scope_id, source_id, adopted))
-            if scope_id == source_scope_id && source_id == entry_id =>
+            if scope_id == source_scope_id && source_id == source_entry_id =>
         {
             Some(adopted)
         }
@@ -247,21 +267,13 @@ fn adopted_revision(entry: &KnowledgeEntry, source_scope_id: &str, entry_id: &st
     }
 }
 
-/// Keeps the cognition envelope and its member presence, but no copied judgment rows.
-fn empty_cognition_records(entry: &mut KnowledgeEntry) {
-    let Ok(key) = KnowledgeEntryModulesKey::try_from(COGNITION_MODULE) else {
-        return;
-    };
-    if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&key) {
-        if let Some(Value::Array(records)) = module.get_mut("records") {
-            records.clear();
-        }
-    }
+fn cognition_module_key() -> KnowledgeEntryModulesKey {
+    KnowledgeEntryModulesKey::try_from(COGNITION_MODULE).expect("a valid module key")
 }
 
 fn source_absent<T>() -> SpokeResult<T> {
     spoke_reject(
-        SpokeRejectCode::KnowledgeEntryNotFound,
+        SpokeRejectCode::NotFound,
         "source knowledge entry not found",
         None,
     )
@@ -279,13 +291,23 @@ fn source_revision_conflict<T>(entry_id: &str, expected: u64) -> SpokeResult<T> 
 mod tests {
     use super::*;
 
+    /// A port answering the store's own absence code, which is the vocabulary a source read
+    /// refuses in before the adoption restates it.
+    fn absent_from_store<T>() -> SpokeResult<T> {
+        spoke_reject(
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            "knowledge entry not found",
+            None,
+        )
+    }
+
     /// A port with no entries: every read and write is the generic absence.
     struct AbsentKnowledge;
 
     #[async_trait::async_trait]
     impl KnowledgeEntryPort for AbsentKnowledge {
         async fn get_knowledge_entry(&self, _entry_id: &str) -> SpokeResult<KnowledgeEntry> {
-            source_absent()
+            absent_from_store()
         }
 
         async fn put_knowledge_entry(
@@ -293,7 +315,7 @@ mod tests {
             _entry: KnowledgeEntry,
             _expected_base_revision: Option<u64>,
         ) -> SpokeResult<KnowledgeEntry> {
-            source_absent()
+            absent_from_store()
         }
     }
 
@@ -307,6 +329,7 @@ mod tests {
             &AbsentKnowledge,
             &AbsentKnowledge,
             "spc_shared",
+            "ke_entry",
             "ke_entry",
             1,
         ));
@@ -346,7 +369,7 @@ mod tests {
     impl KnowledgeEntryPort for RacedDestination {
         async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
             if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                return source_absent();
+                return absent_from_store();
             }
             let mut copy = self.own_copy();
             copy.entry_id = entry_id.to_string();
@@ -431,6 +454,7 @@ mod tests {
                 &dst,
                 "spc_shared",
                 "ke_shared_gate",
+                "ke_shared_gate",
                 2,
             )
             .await
@@ -465,6 +489,7 @@ mod tests {
                 &SourceAtTwo(source_at_two()),
                 &dst,
                 "spc_shared",
+                "ke_shared_gate",
                 "ke_shared_gate",
                 2,
             )

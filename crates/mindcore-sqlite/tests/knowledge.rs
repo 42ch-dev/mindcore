@@ -2883,11 +2883,7 @@ fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
     match result {
         SpokeResult::Ok(outcome) => panic!("{context}: unexpectedly adopted {outcome:?}"),
         SpokeResult::Reject(reject) => {
-            assert_eq!(
-                reject.code,
-                SpokeRejectCode::KnowledgeEntryNotFound,
-                "{context}"
-            );
+            assert_eq!(reject.code, SpokeRejectCode::NotFound, "{context}");
             assert_eq!(
                 reject.message, "source knowledge entry not found",
                 "{context}"
@@ -2939,14 +2935,15 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     );
     let source_before = stored_row(&reader, "shared", shared_id).await;
 
+    let destination_id = "ke_wren_north_gate";
     let created = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 1).await,
         "first adoption",
     ) {
         AdoptionOutcome::Created(created) => created,
         other => panic!("the first adoption must create the copy, got {other:?}"),
     };
-    assert_eq!(created.entry_id, shared_id);
+    assert_eq!(created.entry_id, destination_id);
     assert_eq!(created.revision, Some(1));
     assert_eq!(created.created_at, None);
     assert!(created.updated_at.is_none());
@@ -2961,17 +2958,8 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
         "the copy leaves the ordinary provenance pointer to its own writes"
     );
     assert!(
-        module_of(&created).is_some_and(|module| module.contains_key("world_facts")),
-        "the cognition envelope and its members survive"
-    );
-    assert!(
-        record_ids(&created).is_empty(),
-        "the source's judgments must not become personal committed records"
-    );
-    assert_eq!(
-        module_of(&created).and_then(|module| module.get("records")),
-        Some(&json!([])),
-        "the copy's cognition history is an explicit empty array, not a dropped member"
+        module_of(&created).is_none(),
+        "the copy drops the cognition module instead of keeping an emptied envelope"
     );
 
     assert_eq!(
@@ -2988,7 +2976,7 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     assert_eq!(advanced.revision, Some(2));
 
     let repeat = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 1).await,
         "repeat at the adopted revision",
     ) {
         AdoptionOutcome::AlreadyPresent(existing) => existing,
@@ -2996,7 +2984,7 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     };
     assert_eq!(as_json(&repeat), as_json(&created));
     assert_eq!(anchor_source_revision(&repeat), Some(1));
-    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 2).await {
+    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 2).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(
                 reject.code,
@@ -3018,17 +3006,17 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
 
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 3).await,
+            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 3).await,
             "a request naming neither revision",
         ),
         SpokeRejectCode::RevisionConflict
     );
 
-    assert_eq!(stored_row(&reader, "wren", shared_id).await.0, 1);
+    assert_eq!(stored_row(&reader, "wren", destination_id).await.0, 1);
     let rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
     )
-    .bind(shared_id)
+    .bind(destination_id)
     .fetch_one(&reader)
     .await
     .expect("destination row count");
@@ -3054,7 +3042,7 @@ async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded(
         "seed the source",
     );
     let adopted = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, shared_id, 1).await,
         "first adoption",
     ) {
         AdoptionOutcome::Created(created) => created,
@@ -3073,7 +3061,7 @@ async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded(
     let copy_before = stored_row(&reader, "wren", shared_id).await;
 
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, shared_id, 1).await,
         "a repeat whose source turned superseded",
     );
     assert_eq!(
@@ -3103,7 +3091,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
     let reader = second_connection(&path).await;
 
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_absent", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_absent", "ke_absent", 1).await,
         "a missing source",
     );
 
@@ -3113,7 +3101,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
         "seed an owner-private source",
     );
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_private", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_private", "ke_private", 1).await,
         "an owner-private source",
     );
 
@@ -3130,7 +3118,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
     );
     let superseded_before = stored_row(&reader, "shared", "ke_stage_one").await;
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_stage_one", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_stage_one", "ke_stage_one", 1).await,
         "a superseded source",
     );
     assert_eq!(
@@ -3168,13 +3156,29 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
             .await,
         "seed an unrelated occupant",
     );
-    assert_eq!(
-        expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_shared_gate", 1).await,
-            "an unrelated occupant",
-        ),
-        SpokeRejectCode::KnowledgeEntryAlreadyExists
-    );
+    match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_shared_gate",
+        "ke_shared_gate",
+        1,
+    )
+    .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::RevisionConflict,
+                "an unrelated occupant"
+            );
+            assert!(
+                reject.details.is_none(),
+                "only a stale copy names the revision it was adopted at"
+            );
+        }
+        other => panic!("an unrelated occupant must refuse the adoption, got {other:?}"),
+    }
     assert_eq!(
         as_json(&expect_ok(
             dst.get_knowledge_entry("ke_shared_gate").await,
@@ -3198,10 +3202,18 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
     );
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_other_scope_gate", 1).await,
+            adopt_knowledge_entry(
+                &src,
+                &dst,
+                SHARED_SCOPE,
+                "ke_other_scope_gate",
+                "ke_other_scope_gate",
+                1
+            )
+            .await,
             "an occupant anchored to another source scope",
         ),
-        SpokeRejectCode::KnowledgeEntryAlreadyExists
+        SpokeRejectCode::RevisionConflict
     );
     assert_eq!(
         as_json(&expect_ok(
@@ -3218,7 +3230,15 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
     );
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_fresh_gate", 5).await,
+            adopt_knowledge_entry(
+                &src,
+                &dst,
+                SHARED_SCOPE,
+                "ke_fresh_gate",
+                "ke_fresh_gate",
+                5
+            )
+            .await,
             "a stale expected revision",
         ),
         SpokeRejectCode::RevisionConflict
@@ -3262,9 +3282,18 @@ async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
     );
     let occupant_before = stored_state(&reader, "ke_shared_gate").await;
 
-    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_shared_gate", 1).await {
+    match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_shared_gate",
+        "ke_shared_gate",
+        1,
+    )
+    .await
+    {
         SpokeResult::Reject(reject) => {
-            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
+            assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
             assert_eq!(
                 reject.message, "knowledge entry ke_shared_gate already exists",
                 "the occupancy refusal carries no supersede diagnostic"
@@ -3285,7 +3314,7 @@ async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
 }
 
 #[tokio::test]
-async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
+async fn adoption_drops_a_cognition_module_the_copy_would_not_accept() {
     let path = database_path("adopt-invalid-copy");
     let store = MindStore::open(&path).await.expect("open store");
     let dst = store.knowledge(KnowledgeScope::new("wren"));
@@ -3300,24 +3329,30 @@ async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
     module.insert("records".to_string(), Value::Null);
     let src = FixedSource(broken);
 
-    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_broken_carrier", 1).await {
-        SpokeResult::Reject(reject) => {
-            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
-            assert!(
-                reject.details.is_none(),
-                "a validation refusal is not the structured occupancy detail"
-            );
-        }
-        other => panic!("an unwritable copy must refuse the adoption, got {other:?}"),
-    }
+    let created = match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_broken_carrier",
+        "ke_mine_carrier",
+        1,
+    )
+    .await
+    {
+        SpokeResult::Ok(AdoptionOutcome::Created(created)) => created,
+        other => panic!("the cognition module is dropped before the write, got {other:?}"),
+    };
+    assert!(
+        module_of(&created).is_none(),
+        "neither `null` nor `[]` lands in the non-array slot the source carries"
+    );
     assert_eq!(
-        expect_reject(
-            dst.get_knowledge_entry("ke_broken_carrier").await,
-            "the refused copy claims no destination slot",
-        ),
-        SpokeRejectCode::KnowledgeEntryNotFound,
-        "the destination holds no adopted module, so neither `null` nor `[]` lands in the \
-         non-array slot the source carries"
+        module_of(&expect_ok(
+            dst.get_knowledge_entry("ke_mine_carrier").await,
+            "read the copy back"
+        )),
+        None,
+        "the stored copy carries no cognition module either"
     );
 
     store.close().await;
@@ -3428,8 +3463,22 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
     );
 
     let (left, right) = tokio::join!(
-        adopt_knowledge_entry(&left_src, &left_gated, SHARED_SCOPE, shared_id, 1),
-        adopt_knowledge_entry(&right_src, &right_gated, SHARED_SCOPE, shared_id, 1),
+        adopt_knowledge_entry(
+            &left_src,
+            &left_gated,
+            SHARED_SCOPE,
+            shared_id,
+            shared_id,
+            1
+        ),
+        adopt_knowledge_entry(
+            &right_src,
+            &right_gated,
+            SHARED_SCOPE,
+            shared_id,
+            shared_id,
+            1
+        ),
     );
     assert!(
         left_gated.observed_absent() && right_gated.observed_absent(),
