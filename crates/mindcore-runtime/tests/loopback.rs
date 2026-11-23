@@ -1781,6 +1781,10 @@ async fn adoption_is_advertised_and_served_only_with_the_face() {
         "the knowledge face stays advertised either way: {:?}",
         capabilities(&absent)
     );
+    assert!(
+        absent.ports.as_adoption().is_none(),
+        "an uncomposed adoption face installs no adoption port"
+    );
     let session = connect(&absent, &[ADOPTION, "spoke-knowledge"]).await;
     assert_wire_deny(
         AdoptionPort::adopt_knowledge_entry(
@@ -1862,6 +1866,14 @@ async fn knowledge_adopt_anchors_the_terminal_and_repeats_idempotently() {
         1,
         "the first adoption writes the one copy"
     );
+    let stored = wire(expect_ok(
+        KnowledgeEntryPort::get_knowledge_entry(dialer, SHARED_ENTRY).await,
+        "read the stored copy back through the port",
+    ));
+    assert_eq!(
+        stored, adopted["entry"],
+        "the port serves the entry the first call wrote: {stored}"
+    );
 
     let replay = wire(expect_ok(
         AdoptionPort::adopt_knowledge_entry(
@@ -1904,9 +1916,21 @@ async fn knowledge_adopt_anchors_the_terminal_and_repeats_idempotently() {
         "a fresh key re-reads the anchor instead of writing: {fresh}"
     );
     assert_eq!(
+        fresh["entry"], stored,
+        "a fresh key serves the stored copy, not a different entry: {fresh}"
+    );
+    assert_eq!(
         destination_rows(&pool, SHARED_ENTRY).await,
         1,
         "a fresh key still leaves one copy"
+    );
+    let after = wire(expect_ok(
+        KnowledgeEntryPort::get_knowledge_entry(dialer, SHARED_ENTRY).await,
+        "re-read the copy after the fresh key",
+    ));
+    assert_eq!(
+        after, stored,
+        "a fresh key rewrites nothing in the destination slot: {after}"
     );
 
     // Move the source, then ask for the revision it sits at: the copy in the destination slot was
