@@ -737,6 +737,14 @@ impl RoutedKnowledgeStore {
                 }
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             };
+        // Disclosure is a payload property, so the live row's visibility says nothing about the
+        // replayed payload: a revision whose own fields fall outside the admitted scope is the
+        // same absence as a hidden live row.
+        match visible(&entry, scope) {
+            SpokeResult::Ok(true) => {}
+            SpokeResult::Ok(false) => return history_not_found(entity_id),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        }
         let snapshot = match history_snapshot(entry, entity_id, revision) {
             SpokeResult::Ok(snapshot) => snapshot,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -794,6 +802,13 @@ impl RoutedKnowledgeStore {
                 .await
             {
                 SpokeResult::Ok(report) => report,
+                // The helper repeats the liveness probe inside this transaction; a row that left
+                // between the permission read and that probe is the same absence.
+                SpokeResult::Reject(reject)
+                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+                {
+                    return history_not_found(entity_id)
+                }
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             };
         if transaction.commit().await.is_err() {
@@ -1256,7 +1271,7 @@ pub async fn prune_entry_history(
 /// the live row stands in when no saved revision is that recent. The gap between them is advanced
 /// by dedicated appends alone, so it subtracts from the checkpoint head and the records are read
 /// only through that derived head — a later record never reaches an earlier replay.
-pub async fn read_entry_revision(
+async fn read_entry_revision(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,

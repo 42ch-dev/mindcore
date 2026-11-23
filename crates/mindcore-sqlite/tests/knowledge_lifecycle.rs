@@ -1507,6 +1507,51 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
 }
 
 #[tokio::test]
+async fn a_history_replay_outside_the_admitted_scope_answers_the_generic_absence() {
+    let path = database_path("history-replay-visibility");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let peer = principal("peer-a");
+    let admitted = scope_of("spc_shared");
+
+    // Revision 1 is owner-private and revision 2 is public, so the live row is visible to a
+    // viewpoint-free admitted scope while the revision behind it is not.
+    expect_ok(
+        shared
+            .put_knowledge_entry(private_entry("entry-v", "mira's private draft"), None)
+            .await,
+        "seed entry-v private",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-v", REVISION_TWO), Some(1))
+            .await,
+        "publish entry-v",
+    );
+
+    let details = expect_history_reject(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-v", 1)
+            .await,
+        SpokeRejectCode::NotFound,
+        "a private revision behind a visible live row",
+    );
+    assert!(
+        details.is_empty(),
+        "a hidden replay carries no details, like any hidden get target"
+    );
+    expect_ok(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-v", 2)
+            .await,
+        "the visible revision still replays",
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn the_history_port_redacts_a_stored_decode_fault() {
     let path = database_path("history-fault");
     remove_database(&path);
