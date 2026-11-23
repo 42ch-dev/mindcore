@@ -78,6 +78,12 @@ const RETIRED_ENTRY: &str = "ke_retired";
 const TERMINAL_ENTRY: &str = "ke_terminal";
 /// An owner-private source: no viewpoint-free read reaches it, adoption included.
 const PRIVATE_ENTRY: &str = "ke_private";
+/// A source retired into [`HUGE_TERMINAL`], whose stored revision is above the served ceiling.
+const HUGE_RETIRED: &str = "ke_huge_retired";
+/// The live terminal of [`HUGE_RETIRED`]: revision `2^53 + 2` in its column and its payload.
+const HUGE_TERMINAL: &str = "ke_huge_terminal";
+/// A revision SQLite accepts and the served adoption success cannot carry.
+const HUGE_REVISION: u64 = (1 << 53) + 2;
 /// A stored two-node cycle, seeded with direct markers because the store never writes one.
 const CYCLE_A: &str = "ke_cycle_a";
 const CYCLE_B: &str = "ke_cycle_b";
@@ -351,6 +357,24 @@ fn refuse_knowledge(peer_id: &str) -> SpokeResult<Scope> {
         format!("peer {peer_id} holds no knowledge admission"),
         None,
     )
+}
+
+/// The same admission with one entry or entry-type restriction on the admitted scope: the id is the
+/// one this surface serves, so only the selection can refuse the caller's destination.
+fn restricted_knowledge_admission(restriction: Value) -> KnowledgeAdmission {
+    let peer_id = dialer_peer_id();
+    Arc::new(move |peered: &str| match peered == peer_id {
+        true => {
+            let mut scope = json!({ "scope_id": SCOPE_ID });
+            for (member, value) in restriction.as_object().expect("an object restriction") {
+                scope[member.as_str()] = value.clone();
+            }
+            spoke_ok(
+                serde_json::from_value(scope).expect("the admitted scope JSON matches the schema"),
+            )
+        }
+        false => refuse_knowledge(peered),
+    })
 }
 
 fn principal_admission() -> MemoryAdmission {
@@ -2133,6 +2157,184 @@ async fn knowledge_adopt_refuses_with_the_contract_codes() {
             "{context} names no table: {reject:?}"
         );
     }
+}
+
+/// A host may admit the correct destination scope id while restricting which of its entries the
+/// peer reaches. Adoption must honour that selection: a copy whose entry is outside it is neither
+/// written nor returned, and the destination slot stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_honours_the_admitted_destination_selection() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_shared_source(&pool).await;
+    let (_dir, serve) = fixture.serve();
+
+    for (context, restriction) in [
+        (
+            "an entry-id selection that excludes the copy",
+            json!({ "entry_ids": ["ke_somebody_else"] }),
+        ),
+        (
+            "an entry-type selection that excludes the copy",
+            json!({ "entry_types": ["belief"] }),
+        ),
+    ] {
+        let mut admitted = adopting_faces(routes(&[PRINCIPAL]));
+        admitted.admission = restricted_knowledge_admission(restriction.clone());
+        let surface = surface(&serve, admitted);
+        let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+        let reject = expect_reject(
+            AdoptionPort::adopt_knowledge_entry(
+                &*session.adapter,
+                &principal(),
+                &scope_of(SCOPE_ID),
+                &adopt_request(SHARED_ENTRY, 1, "restricted-selection"),
+            )
+            .await,
+            context,
+        );
+        assert_eq!(
+            reject.code,
+            SpokeRejectCode::NotAuthorized,
+            "{context}: {reject:?}"
+        );
+        assert!(
+            reject.details.clone().unwrap_or_default().is_empty(),
+            "{context} carries no details: {reject:?}"
+        );
+        assert_eq!(
+            destination_rows(&pool, SHARED_ENTRY).await,
+            0,
+            "{context} writes nothing"
+        );
+        drop(session);
+    }
+
+    // The same source and route adopt normally once the selection admits the copy's entry.
+    let surface_of = |admission: KnowledgeAdmission| {
+        let mut admitted = adopting_faces(routes(&[PRINCIPAL]));
+        admitted.admission = admission;
+        surface(&serve, admitted)
+    };
+    let admitting = surface_of(knowledge_admission());
+    let session = connect(&admitting, &[ADOPTION, "spoke-knowledge"]).await;
+    let adopted = wire(expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &adopt_request(SHARED_ENTRY, 1, "unrestricted-selection"),
+        )
+        .await,
+        "an unrestricted admission still adopts",
+    ));
+    assert_eq!(adopted["outcome"], json!("adopted"), "{adopted}");
+    assert_eq!(
+        destination_rows(&pool, SHARED_ENTRY).await,
+        1,
+        "the unrestricted admission writes the one copy"
+    );
+    let stored = wire(expect_ok(
+        KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, SHARED_ENTRY).await,
+        "read the stored copy back through the knowledge face",
+    ));
+    drop(session);
+
+    // The same slot re-read under a selection that excludes it: the repeat must not serve the
+    // excluded copy, and the slot is left byte-identical.
+    for (context, restriction) in [
+        (
+            "an entry-id selection that excludes the stored copy",
+            json!({ "entry_ids": ["ke_somebody_else"] }),
+        ),
+        (
+            "an entry-type selection that excludes the stored copy",
+            json!({ "entry_types": ["belief"] }),
+        ),
+    ] {
+        let surface = surface_of(restricted_knowledge_admission(restriction));
+        let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+        let reject = expect_reject(
+            AdoptionPort::adopt_knowledge_entry(
+                &*session.adapter,
+                &principal(),
+                &scope_of(SCOPE_ID),
+                &adopt_request(SHARED_ENTRY, 1, "restricted-reread"),
+            )
+            .await,
+            context,
+        );
+        assert_eq!(
+            reject.code,
+            SpokeRejectCode::NotAuthorized,
+            "{context} hides the copy instead of serving it: {reject:?}"
+        );
+        drop(session);
+    }
+    assert_eq!(
+        destination_rows(&pool, SHARED_ENTRY).await,
+        1,
+        "a refused repeat writes no second copy"
+    );
+    let session = connect(&admitting, &[ADOPTION, "spoke-knowledge"]).await;
+    let after = wire(expect_ok(
+        KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, SHARED_ENTRY).await,
+        "re-read the copy under an admitting scope",
+    ));
+    assert_eq!(
+        after, stored,
+        "a refused repeat leaves the destination slot unchanged: {after}"
+    );
+}
+
+/// A stored source can sit at a revision the served wire cannot carry. The call refuses before the
+/// copy is written, so a committed copy is never reported as a transport failure and the
+/// destination stays empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_refuses_a_terminal_revision_outside_the_served_range() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_shared_source(&pool).await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+    let dialer = &*session.adapter;
+
+    // A retired source whose live terminal sits at 2^53 + 2: the request's own revision is in range
+    // and is never compared against a retired source, so only the resolved terminal can refuse.
+    let reject = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &adopt_request(HUGE_RETIRED, 1, "adopt-out-of-domain"),
+        )
+        .await,
+        "a terminal revision above the served ceiling",
+    );
+    assert_eq!(
+        reject.message, "knowledge adoption could not complete",
+        "the refusal carries the fixed fault message: {reject:?}"
+    );
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(Value::as_str),
+        Some("store"),
+        "the refusal names the failing stage: {reject:?}"
+    );
+    assert_eq!(
+        destination_rows(&pool, HUGE_TERMINAL).await,
+        0,
+        "an unservable terminal writes no copy"
+    );
+    assert_eq!(
+        destination_rows(&pool, HUGE_RETIRED).await,
+        0,
+        "and no copy under the requested id either"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

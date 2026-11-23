@@ -66,10 +66,8 @@ additional, not a condition of the call.
 routed collection. `ServeFaces.adoption: Option<AdoptionRoute>` names the source by its wire
 `scope_id` and its collection (`crates/mindcore-runtime/src/lib.rs:245-250,287`); the destination is
 that principal's own `workflow_routes` entry, resolved from the same map the workflow binding takes.
-Neither collection is selected by a request member: `destination_scope_id` only has to equal the
-admitted scope id, and answers `NOT_AUTHORIZED` before the source is read; `source_scope_id` only
-has to equal `AdoptionRoute.scope_id`, and any other value answers the same generic `NOT_FOUND` as a
-missing source.
+Neither collection is selected by a request member: the two scope members are only compared against
+the configured source and the admitted scope.
 
 - Assembly refuses an empty source scope id, an empty source collection, a source scope id equal to
   `ServeFaces.scope_id`, and a source collection equal to any route destination, including the route
@@ -84,14 +82,20 @@ missing source.
   `principal has no workflow knowledge route` and no target detail
   (`crates/mindcore-runtime/src/adoption.rs`); the call falls back to no collection and never
   reaches another principal's destination.
+- The route selects the destination collection; the admitted scope's entry selection narrows what
+  the call may serve or write inside it. Both come from host configuration, never from the payload.
 - The source is read-only to the call and only the routed destination is written, both on one
   `BEGIN IMMEDIATE` transaction, so adoption adds no write outside the routed collection. The
   source handle is a distinct type from the destination handle, and the one write its port must
   expose refuses before any statement runs, so no caller can write the shared collection through
   the source side.
 - The source resolves through its retirement chain before the copy is read, so the write lands a
-  copy whose anchor names the terminal, never a retired hop; `.agents/specs/data/knowledge-lifecycle.md`
-  § Adoption owns the anchor, copy and refusal rules.
+  copy whose anchor names the terminal, never a retired hop.
+
+The scope mapping, the refusal vocabulary and its wire codes, the terminal-anchor rule, the served
+revision domain, the copy's inherited governance and the idempotency envelope are
+[`serving-seam.md`](serving-seam.md)'s alone; this page states only which collection the route
+selects and how admission reaches it.
 
 ### Construction
 

@@ -20,8 +20,9 @@ use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{adopt_knowledge_entry_typed, AdoptionOutcome};
 use mindcore_sqlite::{load_retirement_entry, read_entry, retirement_successors_of, write_entry};
 use spoke_operations::{
-    resolve_retirement_chain, spoke_reject, AdoptionPort, KnowledgeEntryPort, RetirementChainEntry,
-    RetirementTerminal, SpokeReject, SpokeRejectCode, SpokeResult,
+    filter_knowledge_entries_by_scope, resolve_retirement_chain, spoke_reject, AdoptionPort,
+    KnowledgeEntryPort, RetirementChainEntry, RetirementTerminal, SpokeReject, SpokeRejectCode,
+    SpokeResult,
 };
 use spoke_schemas::{
     KnowledgeAdoptRequest, KnowledgeAdoptResponse, KnowledgeEntry, Principal, Scope,
@@ -31,6 +32,15 @@ use crate::AdoptionRoute;
 
 /// The fixed message a storage fault carries onto the wire; the diagnostic stays host-side.
 const ADOPTION_FAULT: &str = "knowledge adoption could not complete";
+
+/// The largest revision the served adoption success can carry: every revision member of the served
+/// contract lives at or below the IEEE-754 safe-integer ceiling, and a stored value above it cannot
+/// form a conformant response.
+const SERVED_REVISION_BOUND: u64 = (1 << 53) - 1;
+
+/// The refusal a destination entry outside the admitted selection answers with, on both the read
+/// that classifies an existing copy and the write that would create one.
+const DESTINATION_SELECTION: &str = "adoption destination entry is outside the admitted context";
 
 /// The adoption port over one host store.
 ///
@@ -90,21 +100,31 @@ impl AdoptionPort for AdoptionService {
             Ok(transaction) => transaction,
             Err(error) => return SpokeResult::Reject(adoption_fault("begin", error)),
         };
-        let outcome = adopt_in(&mut transaction, &self.source, destination, request).await;
+        let outcome = adopt_in(&mut transaction, &self.source, destination, scope, request).await;
         let outcome = match outcome {
             SpokeResult::Ok(outcome) => outcome,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(adoption_refusal(reject)),
         };
+        // The response is built before the transaction settles: a copy Connect could not accept is
+        // a fault of the same call, never a committed write reported as a transport failure.
+        let created = matches!(&outcome, AdoptionOutcome::Created(_));
+        let response = match adopted(outcome) {
+            SpokeResult::Ok(response) => response,
+            SpokeResult::Reject(reject) => {
+                let _ = transaction.rollback().await;
+                return SpokeResult::Reject(reject);
+            }
+        };
         // A repeat write is no write: the recorded copy is served and the reads leave nothing to
         // commit.
-        let settled = match &outcome {
-            AdoptionOutcome::Created(_) => transaction.commit().await,
-            AdoptionOutcome::AlreadyPresent(_) => transaction.rollback().await,
+        let settled = match created {
+            true => transaction.commit().await,
+            false => transaction.rollback().await,
         };
         if let Err(error) = settled {
             return SpokeResult::Reject(adoption_fault("commit", error));
         }
-        adopted(outcome)
+        SpokeResult::Ok(response)
     }
 }
 
@@ -114,6 +134,7 @@ async fn adopt_in(
     transaction: &mut Transaction<'_, Sqlite>,
     source: &AdoptionRoute,
     destination: &KnowledgeScope,
+    admitted: &Scope,
     request: &KnowledgeAdoptRequest,
 ) -> SpokeResult<AdoptionOutcome> {
     let gate = Mutex::new(transaction);
@@ -197,9 +218,10 @@ async fn adopt_in(
     };
     let dst = AdoptionDestination {
         collection: destination.collection.as_str(),
+        scope: admitted,
         gate: &gate,
     };
-    adopt_knowledge_entry_typed(
+    let outcome = adopt_knowledge_entry_typed(
         &src,
         &dst,
         &terminal.source_scope_id,
@@ -207,7 +229,11 @@ async fn adopt_in(
         destination_id,
         terminal.source_revision,
     )
-    .await
+    .await;
+    match outcome {
+        SpokeResult::Ok(outcome) => SpokeResult::Ok(outcome),
+        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+    }
 }
 
 /// The call's read half: the shared source.
@@ -239,9 +265,14 @@ impl KnowledgeEntryPort for AdoptionSource<'_, '_, '_> {
     }
 }
 
-/// The call's write half: the caller's routed destination.
+/// The call's write half: the caller's routed destination, under the admitted selection.
+///
+/// The principal's route remains the collection selector; the admitted `Scope` additionally
+/// refines which entries of that collection this call may serve or write, so an entry the host
+/// admitted the scope without is neither returned nor copied.
 struct AdoptionDestination<'a, 'b, 'tx> {
     collection: &'a str,
+    scope: &'a Scope,
     gate: &'b Mutex<&'b mut Transaction<'tx, Sqlite>>,
 }
 
@@ -249,7 +280,15 @@ struct AdoptionDestination<'a, 'b, 'tx> {
 impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
     async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
         let mut gate = self.gate.lock().await;
-        read_entry(&mut gate, self.collection, entry_id).await
+        let entry = read_entry(&mut gate, self.collection, entry_id).await;
+        match entry {
+            SpokeResult::Ok(entry) => match admitted_destination(&entry, self.scope) {
+                SpokeResult::Ok(true) => SpokeResult::Ok(entry),
+                SpokeResult::Ok(false) => not_authorized(DESTINATION_SELECTION),
+                SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+            },
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
     }
 
     async fn put_knowledge_entry(
@@ -257,6 +296,11 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
         entry: KnowledgeEntry,
         expected_base_revision: Option<u64>,
     ) -> SpokeResult<KnowledgeEntry> {
+        match admitted_destination(&entry, self.scope) {
+            SpokeResult::Ok(true) => {}
+            SpokeResult::Ok(false) => return not_authorized(DESTINATION_SELECTION),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        }
         let mut gate = self.gate.lock().await;
         write_entry(&mut gate, self.collection, entry, expected_base_revision).await
     }
@@ -297,6 +341,9 @@ fn adoption_refusal(reject: SpokeReject) -> SpokeReject {
 }
 
 /// The adopted copy as the response envelope.
+///
+/// Built before the transaction settles, so a copy the served wire cannot describe refuses the
+/// call instead of committing and then failing as a transport fault.
 fn adopted(outcome: AdoptionOutcome) -> SpokeResult<KnowledgeAdoptResponse> {
     let (word, entry) = match outcome {
         AdoptionOutcome::Created(entry) => ("adopted", entry),
@@ -306,6 +353,15 @@ fn adopted(outcome: AdoptionOutcome) -> SpokeResult<KnowledgeAdoptResponse> {
         Ok(response) => SpokeResult::Ok(response),
         Err(error) => SpokeResult::Reject(adoption_fault("response", error)),
     }
+}
+
+/// Whether the served response's own revision member sits inside the served range. A created copy
+/// is assigned by the store, but a destination slot that already held this adoption can carry a
+/// stored revision above it.
+fn served_entry_revision(entry: &KnowledgeEntry) -> bool {
+    entry
+        .revision
+        .is_none_or(|revision| revision <= SERVED_REVISION_BOUND)
 }
 
 /// One chain lookup as the resolver's closures answer it: absence as `None`, and a storage fault

@@ -12,9 +12,12 @@
   `AdoptionRoute.scope_id`, and any other value is the same generic `NOT_FOUND` as a missing source —
   required `destination_scope_id` — it must equal the peer's admitted scope id, or `NOT_AUTHORIZED`
   before the source is read — required `idempotency_key`, and optional `destination_entry_id`, which
-  names the copy and defaults to the resolved terminal's entry id. `ServeFaces.adoption`'s
-  `AdoptionRoute` gains `scope_id` beside `source`, and assembly now also refuses a source scope
-  equal to `ServeFaces.scope_id`. Two behaviour changes: adoption admits through the knowledge
+  names the copy and defaults to the resolved terminal's entry id; assembly now also refuses a
+  source scope equal to `ServeFaces.scope_id`. Two further refusals: the admitted scope's
+  `entry_ids`/`entry_types` selection now applies to the destination, so an excluded entry is
+  neither served nor written, and a resolved terminal revision above `2^53-1` refuses before the
+  write instead of committing a copy whose response the wire cannot carry. Two behaviour changes:
+  adoption admits through the knowledge
   face's `(principals, knowledge_admission)` pair, so a routed principal that face does not admit
   answers `NOT_AUTHORIZED` where the product tool served it; and the source resolves through
   `resolve_retirement_chain` before the copy, so the anchor names the live terminal (the copy's own

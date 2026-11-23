@@ -117,8 +117,16 @@ would have served it. Neither the principal nor the admitted scope comes from th
 | `source_entry_id` | a live or retired row of `AdoptionRoute.source` | `NOT_FOUND`, no details |
 | `source_revision` | the live source's current revision; never compared for a retired source; never `0` | `REVISION_CONFLICT`, no details / `INVALID_INPUT` |
 | `destination_scope_id` | the admitted `Scope.scope_id` | `NOT_AUTHORIZED`, no details, before the source is read |
-| `destination_entry_id` | absent → the resolved terminal's `source_entry_id` | — |
+| `destination_entry_id` | absent → the resolved terminal's `source_entry_id`; a supplied value may name that same id | — |
 | `idempotency_key` | 1–128 code points | `INVALID_INPUT`, refused by Connect's decoder |
+
+The destination collection is the principal's route and nothing else; the admitted `Scope`'s
+`entry_ids`, `entry_types`, `source_id` and `viewpoint` refinements still apply to it, because the
+admitted scope is the host's statement about which entries of that collection the peer may reach.
+Adoption applies them to the destination entry it would return and to the copy it would write: an
+entry outside the admitted selection answers `NOT_AUTHORIZED` with no details and is neither served
+nor written, exactly as the routed knowledge face hides it. The route selects the collection; the
+admitted selection narrows what the call may touch inside it.
 
 **Assembly** refuses an empty source scope id, an empty source collection, a source collection equal
 to any route destination — including the route of a principal that is not currently connected — and
@@ -137,7 +145,10 @@ A chain that cannot resolve — a cycle, an ambiguous merge, a missing hop, more
 32 edges — answers `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order. A
 retired source's requested revision is not compared, because the anchor records the terminal's own
 revision; a live source that moved off the requested revision answers `REVISION_CONFLICT` with no
-details.
+details. A resolved terminal whose own revision is above the served domain has no conformant success
+to report — the anchor and the copy's `revision` both carry it — so the call refuses before writing
+anything, with the fixed fault message and `details.kind = "store"`; the copy is never committed for
+a response the wire cannot carry.
 
 **Copy and inherited governance.** `body`, `canonical_name`, `entry_type` and `status` come from the
 terminal; `modules` loses `cognition` rather than keeping an emptied envelope; `source_anchor` stays
@@ -146,8 +157,9 @@ left for the store to assign; the request's `extensions` are not copied. `owner`
 inherited from the terminal rather than reset to the destination's, because the destination is the
 principal's whole route collection — the access boundary itself — and the port refuses every source
 the viewpoint-free predicate does not see, so an inherited policy cannot disclose anything the
-admitted principal could not already read. The copy is addressed by `destination_entry_id` when
-supplied, otherwise by the terminal's id; the anchor names the terminal either way.
+admitted principal could not already read. The copy's `entry_id` is the caller's
+`destination_entry_id` when supplied — a caller may supply the terminal's own id — and the terminal's
+id otherwise; the anchor names the terminal either way.
 
 **Refusals and dedup.** The call reads only the host-configured source and writes only the routed
 destination, committing on one `BEGIN IMMEDIATE` transaction that commits for `adopted` and rolls
@@ -157,8 +169,10 @@ the copy's own anchor triple returns `already_present` with the stored copy, ano
 same source is `REVISION_CONFLICT` with exactly `details.adopted_revision`, and any other occupant is
 `REVISION_CONFLICT` without that member, left byte-identical. Any other store answer becomes
 `InternalError` with the fixed message `knowledge adoption could not complete` and `details.kind`
-naming the failing stage (`begin`, `commit` or `store`); the serde, SQL and stored-payload text stays
-on the host side and never enters the signed refusal. Connect's `AdoptionPortService` dedups by
+naming the failing stage (`begin`, `commit`, `store` or `response`); the serde, SQL and stored-payload
+text stays on the host side and never enters the signed refusal. The typed response is built before
+the transaction settles, so a copy the response cannot describe rolls the write back instead of
+committing one Connect would reject. Connect's `AdoptionPortService` dedups by
 `(op, effective scope, requester principal id, idempotency_key)` with the whole-payload digest: a
 same-key same-digest replay returns the recorded outcome with `outcome` normalized to
 `already_present` and never reaches the port, a same-key different-digest replay answers

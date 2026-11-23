@@ -37,11 +37,15 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 destination_entry_id, expected_source_revision)` copies a shared entry into a personal collection
 through the caller's two scoped ports. It is the local half of the served `knowledge.adopt`
 operation; the retirement-chain resolution that precedes it belongs to the served face, so the
-source this function sees is already the terminal.
+source this function sees is already the terminal. The served defaults, refusal vocabulary, terminal
+resolution, destination selection and dedup are
+[`serving-seam.md`](../architecture/serving-seam.md)'s; everything below is this helper's own
+behavior over the two ports it is given.
 
 - The destination is addressed by `destination_entry_id`, never by the source id: the caller
-  resolves it — Connect's default is the terminal's id, and a supplied one names the copy — and the
-  collection distinguishes the copy from its source.
+  resolves it — the served runtime defaults it to the resolved terminal's id, and a supplied value
+  may name the copy or that same terminal id — and the collection distinguishes the copy from its
+  source.
 - The copy carries the protocol's `KnowledgeEntry.adoption_anchor` and leaves `source_anchor` unset.
   The anchor is the `(source_scope_id, source_entry_id, source_revision)` triple: the wire scope id
   of the source, the entry id, and the source revision it read. `source_scope_id` is not the source
@@ -105,12 +109,11 @@ source this function sees is already the terminal.
 - An adoption anchor naming a retired entry resolves to the first live entry along the chain. A hidden or missing hop answers the generic absence keyed by the anchor's original id; a cycle is `InternalError`.
 - A retired carrier has no current judgment: the current-record lookup joins the live predicate, while explicit historical reads and revision replay stay available.
 - Adoption never copies a retired row: the served face resolves the requested source to the first
-  live entry along the chain and copies that terminal, so the copy's anchor names a live row — and
-  its stored `entry_id` is that terminal's id only when `destination_entry_id` was omitted. A chain
-  that cannot resolve — a cycle, an ambiguous merge, a missing hop, more than 32 edges — answers
-  `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order, and writes nothing. A
-  live source that has moved off the requested revision since is `REVISION_CONFLICT`, never a silent
-  copy of the newer state; an existing copy keeps its original provenance.
+  live entry along the chain and copies that terminal, so the copy's anchor names a live row. The
+  copy's stored `entry_id` is `destination_entry_id` when the caller supplied one — including the
+  terminal's own id — and that terminal's id only when the member was absent. The served chain,
+  revision-domain and refusal rules are
+  [`serving-seam.md`](../architecture/serving-seam.md) § terminal anchor and § refusals.
 
 ### Shared scope rehearsal
 
