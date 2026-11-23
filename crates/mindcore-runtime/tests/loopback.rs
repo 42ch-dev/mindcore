@@ -2551,17 +2551,30 @@ async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
     attached.history = true;
     let surface = surface(&serve, attached);
     let session = connect(&surface, &["spoke-history"]).await;
+    let dialer = &*session.adapter;
     let scope = scope_of(SCOPE_ID);
 
     let first = expect_ok(
-        session
-            .adapter
+        dialer
             .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
             .await,
         "the first prune",
     );
     assert_eq!(first.deleted, 1);
     assert_eq!(first.floor_revision, Some(2));
+
+    // One more revision after the first prune leaves two checkpoints (2 and 3), so a replay that
+    // re-ran the prune instead of replaying its record would delete checkpoint 2 and report a
+    // higher floor. The record is the only thing keeping that checkpoint alive.
+    expect_ok(
+        store
+            .put_knowledge_entry(
+                history_entry("ke_history", "the gate is bolted at midnight"),
+                base,
+            )
+            .await,
+        "write another revision after the first prune",
+    );
 
     let replay = expect_ok(
         session
@@ -2575,6 +2588,20 @@ async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
         serde_json::to_vec(&first).expect("the result serializes"),
         "the recorded outcome replays byte-equal"
     );
+    for revision in [2u64, 3] {
+        expect_ok(
+            HistoryPort::get_history_snapshot(
+                dialer,
+                &principal(),
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                revision,
+            )
+            .await,
+            "the replay deleted nothing, so both checkpoints above the floor still exist",
+        );
+    }
 
     let reject = expect_reject(
         session
@@ -2592,6 +2619,30 @@ async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
             .await,
         "a new key runs the prune again",
     );
-    assert_eq!(fresh.deleted, 0, "no checkpoint is left to delete");
-    assert_eq!(fresh.floor_revision, None, "a no-op reports no floor");
+    assert_eq!(
+        fresh.deleted, 1,
+        "the checkpoint written after the first prune is now the older one"
+    );
+    assert_eq!(
+        fresh.floor_revision,
+        Some(3),
+        "the fresh key really pruned: the floor moved past checkpoint 2"
+    );
+    let reject = expect_reject(
+        HistoryPort::get_history_snapshot(
+            dialer,
+            &principal(),
+            &scope,
+            "knowledge_entry",
+            "ke_history",
+            2,
+        )
+        .await,
+        "replay the checkpoint the fresh key pruned",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::HistoryTruncated);
+    assert_eq!(
+        reject.details.clone().unwrap_or_default().get("floor_revision"),
+        Some(&json!(3))
+    );
 }
