@@ -1236,11 +1236,6 @@ impl SqliteMemoryRepository {
     ) -> RepoResult<()> {
         let mut rows = sqlx::query_as!(
             GrantRow,
-            // why: the existing-space filter keeps an orphan grant (no space row,
-            // unconstrained payload) out of the decode: no listing can show it.
-            // `EXISTS` rather than `IN`: SQLite then reads the index once over
-            // the principal and probes one space row per grant, instead of
-            // probing the index once per stored space.
             "SELECT grant_id, space_id, subject_id, principal_id, \
              capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
              revision, created_at FROM memory_grants \
@@ -1269,9 +1264,6 @@ impl SqliteMemoryRepository {
         let spaces = serde_json::to_string(visible_space_ids)
             .map_err(|error| invalid_row(format_args!("visible space ids: {error}")))?;
         sqlx::query_as::<_, (String, i64)>(
-            // why: `+space_id` keeps the IN list off the index, so SQLite reads the
-            // index once over the principal and tests the visible set there,
-            // instead of probing the index once per visible space.
             "SELECT grant_id, revision FROM memory_grants \
              WHERE principal_id = ? AND +space_id IN (SELECT value FROM json_each(?)) \
              ORDER BY space_id, grant_id",
@@ -1291,8 +1283,6 @@ impl SqliteMemoryRepository {
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         receipt_id: &str,
     ) -> RepoResult<Option<MemoryJournalRow>> {
-        // why: runtime-checked rather than the compile-checked macro — this lookup
-        // owns no offline query cache entry.
         sqlx::query_as::<_, JournalRow>(
             "SELECT seq, receipt_id, space_id, subject_id, requester_principal_id, \
              op, idempotency_key, state, targets_json, result_json, created_at, updated_at \
