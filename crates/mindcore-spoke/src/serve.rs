@@ -58,7 +58,6 @@ impl TransferService {
         Self {
             pool,
             admission,
-            // why: the transfer family reads no reflection policy.
             adapter: MemoryAdapter::new(false),
         }
     }

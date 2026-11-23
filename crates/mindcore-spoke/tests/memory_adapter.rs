@@ -1830,7 +1830,6 @@ async fn cross_owner_reflection_completion_rolls_both_back() {
     };
     tx.commit().await.expect("commit lease");
 
-    // why: a completion carrying a different lease owner never settles.
     let mut effect = work.compose();
     let receipt_id = effect.receipt_id.clone();
     effect.owner_id = "own_other".to_string();
@@ -1937,8 +1936,6 @@ async fn expired_lease_retry_takes_over_and_settles() {
     .await
     .expect("expire lease");
 
-    // why: the same-key retry does not answer uncertain — it stages takeover work on
-    // the abandoned receipt under a fresh owner.
     let mut tx = harness.begin().await;
     let retried = adapter
         .generate_reflection(&mut tx, &principal(PRINCIPAL), request.clone())
@@ -1951,8 +1948,6 @@ async fn expired_lease_retry_takes_over_and_settles() {
     assert_ne!(work2.owner_id, work.owner_id);
     tx.commit().await.expect("commit retry probe");
 
-    // why: the takeover persisted B's owner — the crashed owner's stale completion can
-    // no longer settle behind B's claim.
     let mut tx_a = harness.begin().await;
     let stale = adapter
         .complete_reflection(&mut tx_a, work.clone().compose())
@@ -1961,8 +1956,6 @@ async fn expired_lease_retry_takes_over_and_settles() {
     assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
     tx_a.rollback().await.expect("rollback stale settle");
 
-    // why: a third same-key retry sees the re-leased pending row — no takeover work,
-    // just the uncertainty contract.
     let mut tx_c = harness.begin().await;
     let third = adapter
         .generate_reflection(&mut tx_c, &principal(PRINCIPAL), request.clone())
@@ -1971,9 +1964,6 @@ async fn expired_lease_retry_takes_over_and_settles() {
     assert_eq!(refusal.code, SpokeRejectCode::OutcomeUncertain);
     tx_c.rollback().await.expect("rollback third retry");
 
-    // why: even after B's stamped lease itself lapses, ownership stays persisted —
-    // the crashed owner's completion is still refused, the envelope never
-    // lands, and the receipt stays pending until the recorded owner settles.
     sqlx::query!(
         "UPDATE memory_receipts SET lease_expires_at = '2020-01-01T00:00:00.000Z' \
          WHERE receipt_id = ?",
@@ -2753,8 +2743,6 @@ async fn recall_byte_budget_pages_advance_and_terminate() {
         cursors.push(cursor.to_string());
         request["cursor"] = json!(cursor);
     }
-    // invariant: I-000061 — the oversized candidate is served whole on its own page; every
-    // record appears exactly once, and the budget names it at each cut.
     assert_eq!(served, vec!["rec_a", "rec_big", "rec_b"]);
     assert!(!overflow.is_empty() && overflow.iter().all(|id| id == "rec_big"));
 
@@ -3696,8 +3684,6 @@ async fn recall_byte_budget_charges_content_cognition() {
     let adapter = MemoryAdapter::new(true);
     let mut tx = harness.begin().await;
 
-    // why: `{"text":"a"}` is 11 bytes on the wire; the belief record's serialized
-    // size is the cognition charge the budget must see.
     let reference =
         |id: &str| json!({ "kind": "knowledge_entry", "id": id, "namespace": "mindcore" });
     let belief = json!({
@@ -3751,7 +3737,6 @@ async fn recall_byte_budget_charges_content_cognition() {
         ready(adapter.recall(tx, &principal(PRINCIPAL), request).await)
     };
 
-    // why: the cognition bytes push rec_cog past the 48-byte page — it defers.
     let first = page(None, &mut tx).await;
     let records = first["records"].as_array().expect("records");
     assert_eq!(records.len(), 1);
@@ -3760,7 +3745,6 @@ async fn recall_byte_budget_charges_content_cognition() {
     assert_eq!(first["overflow_record_id"], "rec_cog");
     let cursor = first["next_cursor"].as_str().expect("next cursor");
 
-    // why: the next page serves the deferred record whole.
     let second = page(Some(cursor), &mut tx).await;
     let records = second["records"].as_array().expect("records");
     assert_eq!(records.len(), 1);

@@ -253,8 +253,6 @@ pub(super) async fn prepare(
     principal: &str,
     now: DateTime<Utc>,
 ) -> AResult<Prepared> {
-    // Subjects keep their identity unless the caller asked for a rename, in which
-    // case a target collision mints a fresh one; `fail` refuses the collision.
     let mut subjects = Vec::new();
     let mut subject_map: BTreeMap<String, String> = BTreeMap::new();
     for value in members(bundle, "subjects") {
@@ -276,8 +274,6 @@ pub(super) async fn prepare(
         subject_map.insert(source, target);
     }
 
-    // Records and candidates always take fresh identities; their source ids stay
-    // reachable through `import_ref` and the report.
     let mut record_map = BTreeMap::new();
     for value in members(bundle, "records") {
         let source = text(member(value, "record")?, "record_id")?.to_string();
@@ -315,9 +311,6 @@ pub(super) async fn prepare(
                 translate_references(cognition, &translations, &record_map, &subject_map);
             }
         }
-        // why: an `import_ref` already on the record is the identity an earlier
-        // authority move gave it; §7.31 adopts it verbatim as historical attribution,
-        // so this hop only stamps records that carry none.
         if !fields.contains_key("import_ref")
             && fields.contains_key("content")
             && !fields.contains_key("tombstone")
@@ -410,9 +403,6 @@ pub(super) async fn prepare(
         });
     }
 
-    // Imported reflections keep their pinned basis as historical provenance and
-    // carry the write-time stale hint: the target's live inputs are not the ones
-    // the source derived from.
     let mut reflections = Vec::new();
     for value in members(bundle, "reflections") {
         let object = member(value, "reflection")?;
@@ -481,9 +471,6 @@ pub(super) async fn prepare(
         });
     }
 
-    // Adoption creates only the grants the caller listed, and never one wider
-    // than the caller's own current coverage: no unlisted grant and no
-    // amplification, and a non-expiring import needs a non-expiring cover.
     let summaries = members(bundle, "grants");
     let mut grants = Vec::new();
     let mut adopted = BTreeSet::new();
@@ -618,9 +605,6 @@ fn not_subsumed(
 ) -> AResult<()> {
     let caller_wire = admission::wire_grants(caller_grants)?;
     for grant in grants {
-        // why: an adopted grant is one row with one capability set. Requiring a single
-        // caller grant to cover every capability keeps two separately held capabilities
-        // from being merged into a grant wider than either source.
         let requirements: Vec<GrantRequirement<'_>> = grant
             .capabilities
             .iter()

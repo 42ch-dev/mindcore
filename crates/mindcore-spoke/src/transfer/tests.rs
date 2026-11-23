@@ -1202,8 +1202,6 @@ async fn stage_as(
         json!({
             "space_id": space,
             "chunk": chunk,
-            // why: these stages import a space into itself, so the subject collision the
-            // final chunk now decides is resolved by a rename rather than a refusal.
             "conflict_policy": "rename_subject",
             "idempotency_key": key,
         })

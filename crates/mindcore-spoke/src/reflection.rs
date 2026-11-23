@@ -344,9 +344,6 @@ impl MemoryAdapter {
             freeze_gated: true,
         };
         admission::authorize(&self.repository, tx, &admission, op.now).await?;
-        // why: a probed receipt settles the key outright, except a pending row whose lease
-        // already lapsed: that retry claims it below instead of answering uncertain
-        // forever.
         let take_over = match admission::probe(&self.repository, tx, &op).await? {
             Some(receipt)
                 if matches!(receipt.state, ReceiptState::Pending)
@@ -409,9 +406,6 @@ impl MemoryAdapter {
         let (receipt_id, owner_id) = match take_over {
             Some(receipt_id) => {
                 let owner_id = mint("own");
-                // why: the lease is stamped at claim time inside the repository, not at
-                // `op.now` — the staging tx may sit on its basis work for longer
-                // than the lease itself.
                 let claimed = self
                     .repository
                     .claim_receipt_lease(
@@ -556,10 +550,6 @@ impl MemoryAdapter {
             },
             ..*receipt
         };
-        // why: the CAS carries the lease identity exactly — only the owner the pending row is
-        // leased to may settle — expiry no longer admits a bypass, so a takeover must have
-        // persisted its own lease first. A re-settled or wrong-owner row refuses here and
-        // the caller's rollback removes the envelope with it.
         if !self
             .repository
             .update_receipt(tx, &settled, "pending", Some(effect.owner_id.as_str()))

@@ -227,9 +227,6 @@ pub(crate) fn principal_id(principal: &Principal) -> &str {
 }
 
 pub(crate) fn recorded_failure(failure: &ReceiptFailure) -> Reject {
-    // why: a same-key replay can only re-play the recorded failure, so a code this build
-    // does not know answers one generic terminal refusal — neither the recorded message
-    // nor a `retryable` class may suggest the outcome could differ on a second attempt.
     let Some(code) = SpokeRejectCode::try_from_str(&failure.code) else {
         return Reject::terminal(
             SpokeRejectCode::InternalError,

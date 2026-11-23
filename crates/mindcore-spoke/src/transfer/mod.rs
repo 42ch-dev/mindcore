@@ -77,9 +77,6 @@ pub(crate) async fn build(
 
     let mut snapshots = Vec::new();
     for subject in subject_rows(repository, tx, spec).await? {
-        // §5.2/D-10: every authorized read withholds the subject while any of its
-        // durable intents is unsettled, so the export carries nothing of it, its
-        // subject row included. Counts therefore report the post-filter totals.
         if repository
             .has_unsettled_intent(tx, &spec.space_id, &subject.subject_id)
             .await?
@@ -93,8 +90,6 @@ pub(crate) async fn build(
         let candidates = repository
             .list_candidates(tx, &spec.space_id, subject_id, &candidate_selection(spec))
             .await?;
-        // Reflection staleness recomputes the pinned state digest, which covers the
-        // subject's profile revisions even when the profiles themselves are withheld.
         let profiles = if profiles_exported(spec) || spec.include_reflections {
             repository
                 .list_profiles(tx, &spec.space_id, subject_id, &[])
