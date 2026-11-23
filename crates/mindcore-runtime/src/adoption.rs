@@ -11,11 +11,13 @@ use std::io::Write;
 use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::json;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use tokio::sync::Mutex;
 
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::knowledge::{
+    adoption_fault as fixed_fault, KnowledgeScope, SERVED_REVISION_BOUND,
+};
 use mindcore_spi::{adopt_knowledge_entry_typed, AdoptionOutcome};
 use mindcore_sqlite::{load_retirement_entry, read_entry, retirement_successors_of, write_entry};
 use spoke_operations::{
@@ -28,14 +30,6 @@ use spoke_schemas::{
 };
 
 use crate::AdoptionRoute;
-
-/// The fixed message a storage fault carries onto the wire; the diagnostic stays host-side.
-const ADOPTION_FAULT: &str = "knowledge adoption could not complete";
-
-/// The largest revision the served adoption success can carry: every revision member of the served
-/// contract lives at or below the IEEE-754 safe-integer ceiling, and a stored value above it cannot
-/// form a conformant response.
-const SERVED_REVISION_BOUND: u64 = (1 << 53) - 1;
 
 /// The refusal a destination entry outside the admitted selection answers with, on both the read
 /// that classifies an existing copy and the write that would create one.
@@ -337,14 +331,7 @@ fn adoption_fault(stage: &str, diagnostic: impl std::fmt::Display) -> SpokeRejec
         std::io::stderr(),
         "mindcore adoption {stage} fault: {diagnostic}"
     );
-    SpokeReject {
-        code: SpokeRejectCode::InternalError,
-        message: ADOPTION_FAULT.into(),
-        details: Some(Map::from_iter([(
-            "kind".to_string(),
-            Value::String(stage.to_string()),
-        )])),
-    }
+    fixed_fault(stage)
 }
 
 /// The contract's own refusals travel as they are; anything else a port reports is a storage or
@@ -439,8 +426,10 @@ mod tests {
     use std::collections::HashMap;
     use std::num::NonZeroU64;
 
-    use serde_json::json;
+    use serde_json::{json, Map};
     use tempfile::TempDir;
+
+    use mindcore_base::knowledge::ADOPTION_FAULT;
 
     use mindcore_sqlite::{read_carrier_header, MindStore};
     use spoke_schemas::knowledge_entry::{

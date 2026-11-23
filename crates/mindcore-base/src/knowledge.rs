@@ -3,11 +3,35 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
+use serde_json::{Map, Value};
+use spoke_operations::{SpokeReject, SpokeRejectCode};
 use spoke_schemas::knowledge_entry::{
     AdoptionAnchor as EntryAdoptionAnchor, AdoptionAnchorSourceEntryId,
     AdoptionAnchorSourceScopeId, Shared1, Shared2,
 };
 use spoke_schemas::KnowledgeEntry;
+
+/// The largest revision the served contract can carry: every revision member lives at or below the
+/// IEEE-754 safe-integer ceiling, and a stored value above it cannot form a conformant response.
+pub const SERVED_REVISION_BOUND: u64 = (1 << 53) - 1;
+
+/// The fixed message an adoption storage fault carries onto the wire; the diagnostic stays
+/// host-side.
+pub const ADOPTION_FAULT: &str = "knowledge adoption could not complete";
+
+/// The fixed fault an adoption answers with, naming the failing stage. The SPI's occupancy
+/// classification and the runtime's refusal hygiene build it from one place, so the two cannot
+/// drift apart; the diagnostic that caused it stays host-side.
+pub fn adoption_fault(stage: &str) -> SpokeReject {
+    SpokeReject {
+        code: SpokeRejectCode::InternalError,
+        message: ADOPTION_FAULT.into(),
+        details: Some(Map::from_iter([(
+            "kind".to_string(),
+            Value::String(stage.to_string()),
+        )])),
+    }
+}
 
 /// The collection a knowledge store serves; fixed when the store is built.
 #[derive(Clone, Debug, PartialEq, Eq)]

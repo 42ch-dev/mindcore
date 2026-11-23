@@ -164,25 +164,33 @@ wire cannot carry.
 terminal; `modules` loses `cognition` rather than keeping an emptied envelope; `source_anchor` stays
 unset; `adoption_anchor` records the terminal triple; `revision`, `created_at` and `updated_at` are
 left for the store to assign; the request's `extensions` are not copied. `owner` and `disclosure` are
-inherited from the terminal rather than reset to the destination's, because the destination is the
-principal's whole route collection — the access boundary itself — and the port refuses every source
-the viewpoint-free predicate does not see, so an inherited policy cannot disclose anything the
-admitted principal could not already read. The copy's `entry_id` is the caller's
-`destination_entry_id` when supplied — a caller may supply the terminal's own id — and the terminal's
-id otherwise; the anchor names the terminal either way.
+inherited from the terminal rather than reset to the destination's, because the destination is
+`ServeFaces.knowledge` — the collection the knowledge face serves and the access boundary itself —
+and the port refuses every source the viewpoint-free predicate does not see, so an inherited policy
+cannot disclose anything the admitted principal could not already read. The copy's `entry_id` is the
+caller's `destination_entry_id` when supplied — a caller may supply the terminal's own id — and the
+terminal's id otherwise; the anchor names the terminal either way.
 
-**Refusals and dedup.** The call reads only the host-configured source and writes only the routed
-destination, committing on one `BEGIN IMMEDIATE` transaction that commits for `adopted` and rolls
-back for `already_present`. `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT`, `SOURCE_RETIRED`,
-`ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` travel as the contract builds them; a repeat naming
-the copy's own anchor triple returns `already_present` with the stored copy, another revision of the
-same source is `REVISION_CONFLICT` with exactly `details.adopted_revision`, and any other occupant is
-`REVISION_CONFLICT` without that member, left byte-identical. Any other store answer becomes
-`InternalError` with the fixed message `knowledge adoption could not complete` and `details.kind`
-naming the failing stage (`begin`, `commit`, `store` or `response`); the serde, SQL and stored-payload
-text stays on the host side and never enters the signed refusal. The typed response is built before
-the transaction settles, so a copy the response cannot describe rolls the write back instead of
-committing one Connect would reject. Connect's `AdoptionPortService` dedups by
+**Refusals and dedup.** The call reads only the host-configured source and writes only
+`ServeFaces.knowledge`, committing on one `BEGIN IMMEDIATE` transaction that commits for `adopted`
+and rolls back for `already_present`. `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT`,
+`SOURCE_RETIRED`, `ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` travel as the contract builds
+them; a repeat naming the copy's own anchor triple returns `already_present` with the stored copy,
+another revision of the same source is `REVISION_CONFLICT` with exactly `details.adopted_revision`,
+and any other occupant is `REVISION_CONFLICT` without that member, left byte-identical. A
+create-only put that meets an occupancy the preceding read missed re-reads the slot and answers by
+the same rule; a re-read answering absence or occupancy is that occupancy, one refusing
+`NOT_AUTHORIZED` or `REVISION_CONFLICT` travels as the destination reported it, and one faulting for
+storage reasons becomes the fixed `InternalError` below rather than the put's own refusal. Any other
+store answer becomes `InternalError` with the fixed message `knowledge adoption could not complete`
+and `details.kind` naming the failing stage (`begin`, `commit`, `store` or `response`); the serde,
+SQL and stored-payload text stays on the host side and never enters the signed refusal. A stored
+`adoption_anchor` revision above `2^53 - 1` is the same fixed `store` fault, never a
+`REVISION_CONFLICT` carrying the out-of-range integer — but only when that anchor names the
+requested source scope and entry. An unrelated occupant's anchor is never read as this adoption's
+revision, so it is the ordinary occupied conflict without `details`. The typed response is built
+before the transaction settles, so a copy the response cannot describe rolls the write back instead
+of committing one Connect would reject. Connect's `AdoptionPortService` dedups by
 `(op, effective scope, requester principal id, idempotency_key)` with the whole-payload digest: a
 same-key same-digest replay returns the recorded outcome with `outcome` normalized to
 `already_present` and never reaches the port, a same-key different-digest replay answers
