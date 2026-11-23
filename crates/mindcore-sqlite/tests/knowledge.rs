@@ -2351,6 +2351,91 @@ async fn an_unresolvable_adoption_anchor_answers_one_absence() {
 }
 
 #[tokio::test]
+async fn a_local_put_preserves_a_stored_adoption_anchor_or_refuses() {
+    let path = database_path("put-anchor-gate");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let created = adopted_entry("ke_mine", "ke_shared_north_gate", 1);
+    let stored = expect_ok(
+        port.put_knowledge_entry(created, None).await,
+        "a create may carry an anchor",
+    );
+    assert_eq!(stored.revision, Some(1));
+    let before = stored_state(&reader, "ke_mine").await;
+
+    for (submitted, context) in [
+        (
+            adopted_elsewhere("ke_mine", "ke_shared_north_gate", 1),
+            "another source scope",
+        ),
+        (
+            adopted_entry("ke_mine", "ke_shared_north_gate", 2),
+            "another source revision",
+        ),
+        (
+            adopted_entry("ke_mine", "ke_shared_other_gate", 1),
+            "another source entry",
+        ),
+        (entry_with("ke_mine", "an adopted copy"), "a dropped anchor"),
+    ] {
+        match port.put_knowledge_entry(submitted, Some(1)).await {
+            SpokeResult::Ok(written) => {
+                panic!("{context}: a put over a stored anchor was accepted with {written:?}")
+            }
+            SpokeResult::Reject(reject) => {
+                assert_eq!(
+                    reject.code,
+                    SpokeRejectCode::AdoptionAnchorImmutable,
+                    "{context}"
+                );
+                assert_eq!(
+                    reject
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("entry_id")),
+                    Some(&json!("ke_mine")),
+                    "{context}: the refusal names the destination entry"
+                );
+            }
+        }
+        assert_eq!(
+            stored_state(&reader, "ke_mine").await,
+            before,
+            "{context}: a refused put leaves the row byte-identical"
+        );
+    }
+
+    let mut identical = adopted_entry("ke_mine", "ke_shared_north_gate", 1);
+    identical.body.summary = Some("the same anchor, edited".to_string());
+    let updated = expect_ok(
+        port.put_knowledge_entry(identical, Some(1)).await,
+        "an identical anchor passes",
+    );
+    assert_eq!(updated.revision, Some(2));
+    assert_eq!(summary_of(&updated), Some("the same anchor, edited"));
+
+    let mut plain = entry_with("ke_plain", "never adopted");
+    plain.body.summary = Some("a plain entry".to_string());
+    expect_ok(
+        port.put_knowledge_entry(plain, None).await,
+        "create without an anchor",
+    );
+    let mut plain_update = entry_with("ke_plain", "still never adopted");
+    plain_update.body.summary = Some("a plain entry, edited".to_string());
+    let rewritten = expect_ok(
+        port.put_knowledge_entry(plain_update, Some(1)).await,
+        "an entry without an anchor takes no anchor",
+    );
+    assert!(rewritten.adoption_anchor.is_none());
+
+    store.close().await;
+    reader.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn a_cycle_in_stored_markers_is_a_storage_failure() {
     let path = database_path("supersede-cycle");
     let store = MindStore::open(&path).await.expect("open store");
