@@ -3583,9 +3583,10 @@ async fn deliberate_needs_review_carries_the_pending_judgment_and_writes_nothing
 
 /// A cited revision above the judgment wire's `2^53 - 1` integer ceiling is
 /// one the page can serve and the released validator refuses. On an
-/// auto-settle branch that refusal must land before `commit_cognition`: if
-/// the projection moved under the commit, this call would write first and
-/// fail with a stale citation instead of this projection refusal.
+/// auto-settle branch that refusal must land before `commit_cognition`: the
+/// double records the settlement and answers success, so a misordered call
+/// would still answer this projection refusal, and only the empty settlement
+/// log below would catch it.
 #[tokio::test]
 async fn deliberate_refuses_a_cited_revision_the_released_validator_rejects() {
     let binding = DeliberateDouble::serving(u64::pow(2, 53));
