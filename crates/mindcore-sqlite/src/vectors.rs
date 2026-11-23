@@ -9,6 +9,10 @@ use sqlx::{Executor, Sqlite};
 
 use crate::knowledge::internal;
 
+/// Largest dimension RFC 8785 can represent: the IEEE-754 safe integer maximum, above which
+/// `serde_jcs` refuses to canonicalize.
+const MAX_CANONICAL_DIM: u64 = (1 << 53) - 1;
+
 /// The storage identity of one serving embedder: RFC 8785 JCS SHA-256 over the four identity
 /// fields, as 64 lowercase hex.
 ///
@@ -24,6 +28,14 @@ pub fn identity_hash(
         return spoke_reject(
             SpokeRejectCode::InvalidInput,
             "embedding identity has no dimension",
+            None,
+        );
+    }
+    // RFC 8785 canonicalization (serde_jcs 0.3) refuses integers above the IEEE-754 safe range.
+    if dim as u64 > MAX_CANONICAL_DIM {
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            format!("dimension {dim} exceeds the canonical safe integer range"),
             None,
         );
     }
@@ -311,14 +323,12 @@ mod tests {
     }
 
     #[test]
-    fn identity_hash_bounds_dimension_by_representable_blob_length() {
-        let largest = usize::MAX / size_of::<f32>();
-        assert_eq!(largest.checked_mul(4), Some(largest * 4));
+    fn identity_hash_bounds_dimension_by_the_canonical_safe_range() {
+        let largest = MAX_CANONICAL_DIM as usize;
         let bounded = hash("provider", "model", "version", largest);
         assert_eq!(bounded.len(), 64);
 
         let beyond = largest + 1;
-        assert_eq!(beyond.checked_mul(4), None);
         assert_eq!(
             expect_reject(identity_hash("provider", "model", "version", beyond)),
             SpokeRejectCode::InvalidInput
