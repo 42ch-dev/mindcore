@@ -212,6 +212,19 @@ async fn adopt_in(
         .as_deref()
         .map(String::as_str)
         .unwrap_or(terminal.source_entry_id.as_str());
+    // The anchor records the terminal's revision, so a value the served wire cannot carry would
+    // commit a copy whose response Connect must reject as a transport fault. Refuse before the
+    // write instead: the caller's request was in range, the stored source is not servable.
+    if terminal.source_revision > SERVED_REVISION_BOUND {
+        return spoke_reject(
+            SpokeRejectCode::InternalError,
+            format!(
+                "shared knowledge entry {} sits at revision {} outside the served range",
+                terminal.source_entry_id, terminal.source_revision
+            ),
+            None,
+        );
+    }
     let src = AdoptionSource {
         collection,
         gate: &gate,
@@ -306,6 +319,15 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
     }
 }
 
+/// Whether one destination entry passes the admitted scope's selection: the same SPOKE predicate
+/// the routed knowledge face applies to its own served reads and writes.
+fn admitted_destination(entry: &KnowledgeEntry, scope: &Scope) -> SpokeResult<bool> {
+    match filter_knowledge_entries_by_scope(std::slice::from_ref(entry), scope) {
+        SpokeResult::Ok(visible) => SpokeResult::Ok(!visible.is_empty()),
+        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+    }
+}
+
 /// A storage fault under adoption.
 ///
 /// The wire carries a fixed message and the failing stage: a raw sqlx or decoder diagnostic names
@@ -349,6 +371,15 @@ fn adopted(outcome: AdoptionOutcome) -> SpokeResult<KnowledgeAdoptResponse> {
         AdoptionOutcome::Created(entry) => ("adopted", entry),
         AdoptionOutcome::AlreadyPresent(entry) => ("already_present", entry),
     };
+    if !served_entry_revision(&entry) {
+        return SpokeResult::Reject(adoption_fault(
+            "response",
+            format!(
+                "adopted copy {} carries a revision outside the served range",
+                entry.entry_id
+            ),
+        ));
+    }
     match serde_json::from_value(json!({ "outcome": word, "entry": entry })) {
         Ok(response) => SpokeResult::Ok(response),
         Err(error) => SpokeResult::Reject(adoption_fault("response", error)),

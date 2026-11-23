@@ -1727,6 +1727,37 @@ async fn seed_shared_source(pool: &sqlx::SqlitePool) {
             .await,
         "retire the paired source into its terminal",
     );
+    // One terminal whose stored revision sits above the served ceiling. SQLite accepts it, so only
+    // the runtime's pre-write domain check keeps it out of a response.
+    expect_ok(
+        shared
+            .put_knowledge_entry(shared_entry(HUGE_TERMINAL, "the keeper's last note"), None)
+            .await,
+        "seed the out-of-domain terminal",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(shared_entry(HUGE_RETIRED, "a note retired upward"), None)
+            .await,
+        "seed the source retired into it",
+    );
+    let huge = i64::try_from(HUGE_REVISION).expect("the seeded revision fits SQLite's integer");
+    sqlx::query(
+        "UPDATE knowledge_entries SET revision = ?, \
+         payload = json_set(payload, '$.revision', ?) \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(huge)
+    .bind(huge)
+    .bind(SHARED)
+    .bind(HUGE_TERMINAL)
+    .execute(pool)
+    .await
+    .expect("stamp the out-of-domain revision");
+    expect_ok(
+        shared.supersede_entry(HUGE_RETIRED, 1, HUGE_TERMINAL).await,
+        "retire the source into the out-of-domain terminal",
+    );
     let mut private = shared_entry(PRIVATE_ENTRY, "the keeper keeps a private note");
     private.disclosure =
         Some(KnowledgeEntryDisclosure::from_str("owner-private").expect("non-empty disclosure"));
@@ -2312,6 +2343,7 @@ async fn adoption_refuses_a_terminal_revision_outside_the_served_range() {
         .await,
         "a terminal revision above the served ceiling",
     );
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
     assert_eq!(
         reject.message, "knowledge adoption could not complete",
         "the refusal carries the fixed fault message: {reject:?}"
