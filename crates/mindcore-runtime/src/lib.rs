@@ -17,17 +17,19 @@ use serde_json::Value;
 use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
 use mindcore_spoke::{MemoryWorkflowBinding, ServedMemory, TRANSFER_OPERATIONS};
-use mindcore_sqlite::{validate_admission_scope, vectors, MindStore};
+use mindcore_sqlite::{validate_admission_scope, vectors, MindStore, RoutedKnowledgeStore};
 use spoke_connect::core::{
-    CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_MEMORY,
-    CAPABILITY_SPOKE_MEMORY_TRANSFER,
+    CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_KNOWLEDGE,
+    CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
-    ConnectResponder, KnowledgeAdmission, MemoryAdmission, RemoteKnowledgeFace,
-    RemoteMemoryService, RemoteServePorts, RemoteServePortsComposite, ToolHandler,
+    ConnectResponder, HistoryAdmission, HistoryPortService, KnowledgeAdmission, MemoryAdmission,
+    RemoteHistoryService, RemoteKnowledgeFace, RemoteMemoryService, RemoteServePorts,
+    RemoteServePortsComposite, ToolHandler,
 };
 use spoke_operations::{
-    spoke_reject, validate_manifest_tools, SpokeReject, SpokeRejectCode, SpokeResult,
+    spoke_reject, validate_manifest_tools, HistoryPort, ScopedKnowledgePort, SpokeReject,
+    SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
@@ -137,8 +139,9 @@ impl MindcoreServe {
             Err(reject) => return SpokeResult::Reject(reject),
         };
         let engine: Arc<dyn MindWorkflows> = workflows.clone();
+        let principals = faces.principals;
         let mut tools =
-            WorkflowTools::new(engine, faces.principals, faces.providers).registrations();
+            WorkflowTools::new(engine, Arc::clone(&principals), faces.providers).registrations();
         if let Some(adoption) = adoption {
             tools.push(adoption.registration());
         }
@@ -151,16 +154,43 @@ impl MindcoreServe {
         if !routed {
             tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
         }
-        let manifest = derive_manifest(faces.manifest, faces.memory.as_deref(), &tools);
+        let manifest = derive_manifest(
+            faces.manifest,
+            faces.memory.as_deref(),
+            faces.history,
+            &tools,
+        );
         let manifest = match manifest {
             SpokeResult::Ok(manifest) => manifest,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
+        let admission = validated(faces.admission);
+        let store: Arc<RoutedKnowledgeStore> =
+            Arc::new(self.store.served_knowledge(faces.scope_id, faces.knowledge));
+        let knowledge: Arc<dyn ScopedKnowledgePort + Send + Sync> = store.clone();
         let face = RemoteKnowledgeFace {
-            store: Arc::new(self.store.served_knowledge(faces.scope_id, faces.knowledge)),
-            admission: validated(faces.admission),
+            store: knowledge,
+            admission: Arc::clone(&admission),
         };
         let mut ports = RemoteServePortsComposite::knowledge_only(Arc::new(face));
+        if faces.history {
+            // History serves the knowledge face's own route and admission: one store, two port
+            // roles, so a peer replays exactly the scope it reads and writes.
+            let history_admission: HistoryAdmission = Arc::new(move |peer_id: &str| {
+                let principal = match principals(peer_id) {
+                    SpokeResult::Ok(principal) => principal,
+                    SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+                };
+                match admission(peer_id) {
+                    SpokeResult::Ok(scope) => SpokeResult::Ok((principal, scope)),
+                    SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+                }
+            });
+            let port: Arc<dyn HistoryPort + Send + Sync> = store;
+            let service: Arc<dyn RemoteHistoryService> =
+                Arc::new(HistoryPortService::new(port, history_admission));
+            ports = ports.with_history(service);
+        }
         if let Some(memory) = faces.memory {
             let service: Arc<dyn RemoteMemoryService> = memory;
             ports = ports.with_memory(service);
@@ -206,6 +236,10 @@ pub struct ServeFaces {
     /// cannot show it dispatches. A bare `RemoteMemoryService` takes the trait's default and
     /// reports none.
     pub memory: Option<Arc<dyn ServedMemory>>,
+    /// Serve the `spoke-history` face over the same routed store and knowledge admission as the
+    /// knowledge face; `false` composes no history service and advertises none. A peer replays and
+    /// prunes exactly the scope it reads and writes through `port.knowledge.*`.
+    pub history: bool,
     /// Maps the authenticated peer to the `Principal` the workflows admit. The same host mapping
     /// the memory face uses; never read from the wire.
     pub principals: MemoryAdmission,
@@ -319,17 +353,20 @@ impl MindcoreSurface {
 }
 
 /// The advertised capabilities follow the composed faces: the knowledge face always, the memory
-/// family flag when a memory service is attached, and the transfer family flag when that service
-/// reports every one of [`TRANSFER_OPERATIONS`].
+/// family flag when a memory service is attached, the transfer family flag when that service
+/// reports every one of [`TRANSFER_OPERATIONS`], and the history flag only when its face is served.
 ///
 /// The knowledge face applies SPOKE's owner-private disclosure, so a viewpoint-scoped list is
 /// served and the supplemental ownership capability is truthful; it never stands in for peer or
 /// entry admission.
-fn face_capabilities(memory: Option<&dyn ServedMemory>) -> Vec<String> {
+fn face_capabilities(memory: Option<&dyn ServedMemory>, history: bool) -> Vec<String> {
     let mut capabilities = vec![
         CAPABILITY_SPOKE_KNOWLEDGE.to_string(),
         CAPABILITY_KE_OWNERSHIP.to_string(),
     ];
+    if history {
+        capabilities.push(CAPABILITY_SPOKE_HISTORY.to_string());
+    }
     if let Some(memory) = memory {
         capabilities.push(CAPABILITY_SPOKE_MEMORY.to_string());
         let reported = memory.operations();
@@ -348,9 +385,10 @@ fn face_capabilities(memory: Option<&dyn ServedMemory>) -> Vec<String> {
 fn derive_manifest(
     mut manifest: HostCapabilityManifest,
     memory: Option<&dyn ServedMemory>,
+    history: bool,
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
-    manifest.capabilities = face_capabilities(memory);
+    manifest.capabilities = face_capabilities(memory, history);
     for tool in tools {
         manifest
             .capabilities

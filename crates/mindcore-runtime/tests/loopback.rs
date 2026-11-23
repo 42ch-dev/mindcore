@@ -480,6 +480,7 @@ fn faces(
         knowledge: KnowledgeScope::new(COLLECTION),
         admission: knowledge_admission(),
         memory,
+        history: false,
         principals: principal_admission(),
         providers,
         adoption: None,

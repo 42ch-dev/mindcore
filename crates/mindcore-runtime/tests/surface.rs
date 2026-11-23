@@ -14,6 +14,7 @@ use mindcore_runtime::tools::{ABSORB, ADOPT, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
+use spoke_connect::core::CAPABILITY_SPOKE_HISTORY;
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
     MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler,
@@ -162,6 +163,7 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         knowledge: KnowledgeScope::new(COLLECTION),
         admission: admission(),
         memory: None,
+        history: false,
         principals: principals(),
         providers: MindProviders::default(),
         adoption: None,
@@ -248,6 +250,38 @@ async fn manifest_follows_the_composed_faces() {
     assert!(
         surface.ports.as_memory().is_none(),
         "no memory service was attached"
+    );
+    assert!(
+        surface.ports.as_history().is_none(),
+        "the history face is off, so no history service is composed"
+    );
+
+    let served = expect_ok(
+        serve.surface(ServeFaces {
+            history: true,
+            ..faces(metadata("runtime"))
+        }),
+        "assemble a history-serving surface",
+    );
+    assert_eq!(
+        capabilities(&served),
+        [
+            "spoke-knowledge",
+            "ke-ownership",
+            CAPABILITY_SPOKE_HISTORY,
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE
+        ],
+        "the history face is advertised exactly when it is served"
+    );
+    assert!(
+        served.ports.as_history().is_some(),
+        "the history face is composed over the routed store"
+    );
+    expect_ok(
+        validate_manifest_tools(&served.manifest),
+        "the history-serving manifest is self-consistent",
     );
 }
 
