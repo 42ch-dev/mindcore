@@ -12,6 +12,7 @@
 //! and denies its ops on the wire, and a tool the runtime does not serve answers `op_unsupported`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,17 +21,17 @@ use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{
-    MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
+    AdoptionRoute, MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
 };
 use mindcore_spi::{
     CognitiveTaskKind, Embedder, EmbeddingIdentity, PolicyDecision, PolicyHook, Reasoner,
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
 use mindcore_spoke::{ServedMemory, TransferService};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
@@ -38,11 +39,15 @@ use spoke_connect::remote::{
     RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
 };
 use spoke_operations::{
-    revision_snapshots_equal_canonical, spoke_ok, spoke_reject, HistoryPort, KnowledgeEntryPort,
-    MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
+    revision_snapshots_equal_canonical, spoke_ok, spoke_reject, AdoptionPort, HistoryPort,
+    KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
-use spoke_schemas::{HostCapabilityManifest, KnowledgeEntry, MemoryRecallRequest, Principal, Scope};
+use spoke_schemas::knowledge_entry::{KnowledgeEntryDisclosure, KnowledgeEntryOwner};
+use spoke_schemas::{
+    HostCapabilityManifest, KnowledgeAdoptRequest, KnowledgeEntry, MemoryRecallRequest, Principal,
+    Scope,
+};
 
 const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
@@ -59,6 +64,23 @@ const NOW: &str = "2026-11-21T00:00:00.500Z";
 const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
 /// A host-owned tool the runtime serves beside its own three.
 const HOST_TOOL: &str = "tools.mindcore.host_tool";
+/// The host-configured collection adoption reads from, never one of this fixture's routes.
+const SHARED: &str = "shared";
+/// The id naming the adoption source (`SHARED`) on the wire.
+const SHARED_SCOPE: &str = "spc_shared";
+/// The capability the adoption face advertises and `knowledge.adopt` requires.
+const ADOPTION: &str = "spoke-knowledge-adoption";
+/// A scope id the adoption face never serves as its source or its destination.
+const OTHER_SCOPE: &str = "spc_other";
+const SHARED_ENTRY: &str = "ke_shared";
+/// A source retired into [`TERMINAL_ENTRY`], the live entry an adoption anchors instead.
+const RETIRED_ENTRY: &str = "ke_retired";
+const TERMINAL_ENTRY: &str = "ke_terminal";
+/// An owner-private source: no viewpoint-free read reaches it, adoption included.
+const PRIVATE_ENTRY: &str = "ke_private";
+/// A stored two-node cycle, seeded with direct markers because the store never writes one.
+const CYCLE_A: &str = "ke_cycle_a";
+const CYCLE_B: &str = "ke_cycle_b";
 
 const DIALER_SEED: [u8; 32] = [0x42u8; 32];
 const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
@@ -1617,8 +1639,478 @@ async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
     );
 }
 
-/// A host registration is served, not just advertised: the signed session invokes it and the
-/// host's own handler answers with its own result.
+/// One shared-source entry the adoption copies: a note whose summary names what the source holds.
+fn shared_entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "entry_id": entry_id,
+        "entry_type": "note",
+        "canonical_name": format!("{entry_id}'s source"),
+        "status": "confirmed",
+        "body": { "summary": summary },
+        "extensions": {},
+    }))
+    .expect("entry JSON matches the schema")
+}
+
+/// One adoption request over the configured source and the admitted destination scope.
+fn adopt_request(source_entry_id: &str, source_revision: u64, key: &str) -> KnowledgeAdoptRequest {
+    serde_json::from_value(json!({
+        "source_scope_id": SHARED_SCOPE,
+        "source_entry_id": source_entry_id,
+        "source_revision": source_revision,
+        "destination_scope_id": SCOPE_ID,
+        "idempotency_key": key,
+    }))
+    .expect("request JSON matches the schema")
+}
+
+/// The fixture's faces with the one shared adoption source attached.
+fn adopting_faces(workflow_routes: BTreeMap<String, KnowledgeScope>) -> ServeFaces {
+    ServeFaces {
+        adoption: Some(AdoptionRoute {
+            scope_id: SHARED_SCOPE.to_string(),
+            source: KnowledgeScope::new(SHARED),
+        }),
+        ..faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            workflow_routes,
+        )
+    }
+}
+
+/// The shared source the adoption face reads: a live note, a note retired into a live terminal,
+/// and an owner-private note no viewpoint-free read reaches.
+async fn seed_shared_source(pool: &sqlx::SqlitePool) {
+    let shared = ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(SHARED));
+    for (entry_id, summary) in [
+        (SHARED_ENTRY, "the north gate closes at dusk"),
+        (RETIRED_ENTRY, "the gatekeeper's first note"),
+        (TERMINAL_ENTRY, "the keeper walks the north gate"),
+    ] {
+        expect_ok(
+            shared
+                .put_knowledge_entry(shared_entry(entry_id, summary), None)
+                .await,
+            "seed the shared source",
+        );
+    }
+    expect_ok(
+        shared
+            .supersede_entry(RETIRED_ENTRY, 1, TERMINAL_ENTRY)
+            .await,
+        "retire the paired source into its terminal",
+    );
+    let mut private = shared_entry(PRIVATE_ENTRY, "the keeper keeps a private note");
+    private.disclosure =
+        Some(KnowledgeEntryDisclosure::from_str("owner-private").expect("non-empty disclosure"));
+    private.owner = Some(KnowledgeEntryOwner::try_from("kb_keeper").expect("non-empty owner"));
+    expect_ok(
+        shared.put_knowledge_entry(private, None).await,
+        "seed the owner-private source",
+    );
+}
+
+/// A two-node cycle in the shared collection's markers: the store refuses to write one, so the
+/// seed is two direct updates, the shape a corrupted marker pair would read as.
+async fn seed_cycle(pool: &sqlx::SqlitePool) {
+    let shared = ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(SHARED));
+    for entry_id in [CYCLE_A, CYCLE_B] {
+        expect_ok(
+            shared
+                .put_knowledge_entry(shared_entry(entry_id, "a cycle member"), None)
+                .await,
+            "seed a cycle member",
+        );
+    }
+    for (entry_id, successor) in [(CYCLE_A, CYCLE_B), (CYCLE_B, CYCLE_A)] {
+        sqlx::query(
+            "UPDATE knowledge_entries SET superseded_by = ? \
+             WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(successor)
+        .bind(SHARED)
+        .bind(entry_id)
+        .execute(pool)
+        .await
+        .expect("seed the cycle marker");
+    }
+}
+
+/// How many rows one collection stores under `entry_id`: the destination slot a copy claims.
+async fn destination_rows(pool: &sqlx::SqlitePool, entry_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .expect("count the destination rows")
+}
+
+/// Advertisement honesty for the adoption family: a surface with no `AdoptionRoute` advertises no
+/// `spoke-knowledge-adoption`, and a dialer that negotiated it is refused at the gate before any
+/// handler; the same dialer reaches `knowledge.adopt` once the route is configured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_is_advertised_and_served_only_with_the_face() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_shared_source(&pool).await;
+    let (_dir, serve) = fixture.serve();
+    let request = adopt_request(SHARED_ENTRY, 1, "advertise-once");
+
+    let absent = surface(
+        &serve,
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders::default(),
+            routes(&[PRINCIPAL]),
+        ),
+    );
+    assert!(
+        !capabilities(&absent).contains(&ADOPTION),
+        "an uncomposed adoption face is never advertised: {:?}",
+        capabilities(&absent)
+    );
+    assert!(
+        capabilities(&absent).contains(&"spoke-knowledge"),
+        "the knowledge face stays advertised either way: {:?}",
+        capabilities(&absent)
+    );
+    let session = connect(&absent, &[ADOPTION, "spoke-knowledge"]).await;
+    assert_wire_deny(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &request,
+        )
+        .await,
+        "knowledge.adopt",
+        "capability_missing",
+    );
+    drop(session);
+
+    let attached = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    assert!(
+        capabilities(&attached).contains(&ADOPTION),
+        "a composed adoption face is advertised: {:?}",
+        capabilities(&attached)
+    );
+    assert!(
+        attached.ports.as_adoption().is_some(),
+        "the adoption face is composed over the routed store"
+    );
+    let session = connect(&attached, &[ADOPTION, "spoke-knowledge"]).await;
+    let adopted = wire(expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &request,
+        )
+        .await,
+        "adopt over the signed session",
+    ));
+    assert_eq!(adopted["outcome"], json!("adopted"), "{adopted}");
+}
+
+/// The served adoption end to end: the copy's anchor names the configured source triple, a repeat
+/// under either key serves the stored copy instead of writing a second one, a moved source with the
+/// old copy in place is the stale-copy conflict, and a retired source anchors its live terminal
+/// under a supplied destination id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn knowledge_adopt_anchors_the_terminal_and_repeats_idempotently() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_shared_source(&pool).await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+    let dialer = &*session.adapter;
+    let destination = scope_of(SCOPE_ID);
+
+    let adopted = wire(expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request(SHARED_ENTRY, 1, "adopt-once"),
+        )
+        .await,
+        "the first adoption",
+    ));
+    assert_eq!(adopted["outcome"], json!("adopted"), "{adopted}");
+    assert_eq!(adopted["entry"]["entry_id"], json!(SHARED_ENTRY));
+    assert_eq!(
+        adopted["entry"]["adoption_anchor"],
+        json!({
+            "schema_version": 1,
+            "source_scope_id": SHARED_SCOPE,
+            "source_entry_id": SHARED_ENTRY,
+            "source_revision": 1,
+            "extensions": {},
+        }),
+        "the anchor is the configured source triple: {adopted}"
+    );
+    assert_eq!(
+        destination_rows(&pool, SHARED_ENTRY).await,
+        1,
+        "the first adoption writes the one copy"
+    );
+
+    let replay = wire(expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request(SHARED_ENTRY, 1, "adopt-once"),
+        )
+        .await,
+        "the same key and payload",
+    ));
+    assert_eq!(
+        replay["outcome"],
+        json!("already_present"),
+        "a replay reports the stored copy: {replay}"
+    );
+    assert_eq!(
+        replay["entry"]["revision"], adopted["entry"]["revision"],
+        "the replay serves the copy the first call wrote"
+    );
+    assert_eq!(
+        destination_rows(&pool, SHARED_ENTRY).await,
+        1,
+        "a replay writes no second copy"
+    );
+
+    let fresh = wire(expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request(SHARED_ENTRY, 1, "adopt-again"),
+        )
+        .await,
+        "a fresh key on the same tuple",
+    ));
+    assert_eq!(
+        fresh["outcome"],
+        json!("already_present"),
+        "a fresh key re-reads the anchor instead of writing: {fresh}"
+    );
+    assert_eq!(
+        destination_rows(&pool, SHARED_ENTRY).await,
+        1,
+        "a fresh key still leaves one copy"
+    );
+
+    // Move the source, then ask for the revision it sits at: the copy in the destination slot was
+    // adopted at revision 1, so the slot is a stale copy, not the revision asked for.
+    let shared = ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(SHARED));
+    expect_ok(
+        shared
+            .put_knowledge_entry(
+                shared_entry(
+                    SHARED_ENTRY,
+                    "the north gate closes at dusk; a keeper walks it",
+                ),
+                Some(1),
+            )
+            .await,
+        "move the source to revision 2",
+    );
+    let stale = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request(SHARED_ENTRY, 2, "adopt-moved"),
+        )
+        .await,
+        "the source moved after the copy was adopted",
+    );
+    assert_eq!(stale.code, SpokeRejectCode::RevisionConflict, "{stale:?}");
+    let details = stale.details.clone().unwrap_or_default();
+    assert_eq!(
+        details.len(),
+        1,
+        "the refusal carries exactly adopted_revision: {details:?}"
+    );
+    assert_eq!(details.get("adopted_revision"), Some(&json!(1)));
+
+    let mut retired = adopt_request(RETIRED_ENTRY, 1, "adopt-retired");
+    retired.destination_entry_id = Some("ke_copy".parse().expect("non-empty destination id"));
+    let terminal = wire(expect_ok(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &destination, &retired).await,
+        "adopt a retired source under a supplied destination id",
+    ));
+    assert_eq!(terminal["outcome"], json!("adopted"), "{terminal}");
+    assert_eq!(
+        terminal["entry"]["entry_id"],
+        json!("ke_copy"),
+        "the copy takes the supplied destination id"
+    );
+    let anchor = &terminal["entry"]["adoption_anchor"];
+    assert_eq!(anchor["source_scope_id"], json!(SHARED_SCOPE));
+    assert_eq!(
+        anchor["source_entry_id"],
+        json!(TERMINAL_ENTRY),
+        "the anchor names the terminal, never the retired source: {terminal}"
+    );
+    assert_eq!(anchor["source_revision"], json!(1));
+    let copy = expect_ok(
+        ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(COLLECTION))
+            .get_knowledge_entry("ke_copy")
+            .await,
+        "read the adopted copy from the destination collection",
+    );
+    assert_eq!(
+        adoption_anchor_parts(&copy),
+        Some((SHARED_SCOPE, TERMINAL_ENTRY, 1)),
+        "the stored copy carries the terminal's anchor: {copy:?}"
+    );
+}
+
+/// The refusal matrix over the signed session: one generic absence for an unserved source scope, a
+/// missing source and an owner-private source; `NOT_AUTHORIZED` for another destination scope; a
+/// stored marker cycle as `SOURCE_RETIRED` with its visited chain; and `IDEMPOTENCY_CONFLICT` when a
+/// key replays another payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn knowledge_adopt_refuses_with_the_contract_codes() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_shared_source(&pool).await;
+    seed_cycle(&pool).await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+    let dialer = &*session.adapter;
+    let destination = scope_of(SCOPE_ID);
+
+    let mut foreign = adopt_request(SHARED_ENTRY, 1, "refuse-foreign-source");
+    foreign.source_scope_id = OTHER_SCOPE.parse().expect("non-empty scope id");
+    let foreign = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &destination, &foreign).await,
+        "another source scope",
+    );
+    let missing = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request("ke_never_seeded", 1, "refuse-missing"),
+        )
+        .await,
+        "a source the shared collection does not hold",
+    );
+    let private = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request(PRIVATE_ENTRY, 1, "refuse-private"),
+        )
+        .await,
+        "an owner-private source",
+    );
+    for (context, reject) in [
+        ("another source scope", &foreign),
+        ("a missing source", &missing),
+        ("an owner-private source", &private),
+    ] {
+        assert_eq!(
+            reject.code,
+            SpokeRejectCode::NotFound,
+            "{context}: {reject:?}"
+        );
+        assert!(
+            reject.details.clone().unwrap_or_default().is_empty(),
+            "{context} carries no details: {reject:?}"
+        );
+    }
+    assert_eq!(
+        foreign.message, missing.message,
+        "an unserved source scope is the same generic absence as a missing source"
+    );
+
+    let mut outside = adopt_request(SHARED_ENTRY, 1, "refuse-foreign-destination");
+    outside.destination_scope_id = OTHER_SCOPE.parse().expect("non-empty scope id");
+    let unauthorized = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &destination, &outside).await,
+        "another destination scope",
+    );
+    assert_eq!(
+        unauthorized.code,
+        SpokeRejectCode::NotAuthorized,
+        "{unauthorized:?}"
+    );
+    assert!(unauthorized.details.is_none(), "{unauthorized:?}");
+
+    let cycle = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request(CYCLE_A, 1, "refuse-cycle"),
+        )
+        .await,
+        "a stored retirement cycle",
+    );
+    assert_eq!(cycle.code, SpokeRejectCode::SourceRetired, "{cycle:?}");
+    let details = cycle.details.clone().unwrap_or_default();
+    assert_eq!(
+        details.len(),
+        1,
+        "the refusal carries exactly retirement_chain: {details:?}"
+    );
+    assert_eq!(
+        details.get("retirement_chain"),
+        Some(&json!([CYCLE_A, CYCLE_B, CYCLE_A])),
+        "the chain lists the visited ids, the repeat last"
+    );
+
+    expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &destination,
+            &adopt_request(TERMINAL_ENTRY, 1, "recorded-key"),
+        )
+        .await,
+        "the call a key records",
+    );
+    let mut replayed = adopt_request(TERMINAL_ENTRY, 1, "recorded-key");
+    replayed.destination_entry_id = Some("ke_recorded".parse().expect("non-empty destination id"));
+    let conflict = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &destination, &replayed).await,
+        "the same key with another payload",
+    );
+    assert_eq!(
+        conflict.code,
+        SpokeRejectCode::IdempotencyConflict,
+        "{conflict:?}"
+    );
+
+    for (context, reject) in [
+        ("another source scope", &foreign),
+        ("a missing source", &missing),
+        ("an owner-private source", &private),
+        ("another destination scope", &unauthorized),
+        ("a stored cycle", &cycle),
+        ("a replayed key", &conflict),
+    ] {
+        assert!(
+            !reject.message.contains("knowledge_entries"),
+            "{context} names no table: {reject:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
     let fixture = Fixture::open().await;
