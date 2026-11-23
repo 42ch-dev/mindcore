@@ -127,6 +127,13 @@ impl MindcoreServe {
                     None,
                 );
             }
+            if source == &faces.knowledge.collection {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    "the adoption source collection is the collection the knowledge face serves",
+                    None,
+                );
+            }
             if let Some((principal, _)) = faces
                 .workflow_routes
                 .iter()
@@ -172,8 +179,9 @@ impl MindcoreServe {
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         let admission = validated(faces.admission, &faces.scope_id);
+        let served: KnowledgeScope = faces.knowledge;
         let store: Arc<RoutedKnowledgeStore> =
-            Arc::new(self.store.served_knowledge(faces.scope_id, faces.knowledge));
+            Arc::new(self.store.served_knowledge(faces.scope_id, served.clone()));
         let knowledge: Arc<dyn ScopedKnowledgePort + Send + Sync> = store.clone();
         let face = RemoteKnowledgeFace {
             store: knowledge,
@@ -181,9 +189,9 @@ impl MindcoreServe {
         };
         let mut ports = RemoteServePortsComposite::knowledge_only(Arc::new(face));
         if let Some(adoption) = adoption {
-            // Adoption reuses the knowledge face's admission, so a peer that does not serve
-            // knowledge cannot adopt, and the destination is the principal's own routed
-            // collection.
+            // Adoption reuses the knowledge face's admission and its one served collection, so a
+            // peer that does not serve knowledge cannot adopt, and every adopted copy is readable
+            // through the knowledge face that shares this admission.
             let adoption_admission: AdoptionAdmission = {
                 let principals = Arc::clone(&principals);
                 let admission = Arc::clone(&admission);
@@ -198,11 +206,8 @@ impl MindcoreServe {
                     }
                 })
             };
-            let port: Arc<dyn AdoptionPort + Send + Sync> = Arc::new(AdoptionService::new(
-                self.store.pool(),
-                Arc::clone(&routes),
-                adoption,
-            ));
+            let port: Arc<dyn AdoptionPort + Send + Sync> =
+                Arc::new(AdoptionService::new(self.store.pool(), served, adoption));
             let service: Arc<dyn RemoteAdoptionService> =
                 Arc::new(AdoptionPortService::new(port, adoption_admission));
             ports = ports.with_adoption(service);
@@ -239,10 +244,11 @@ impl MindcoreServe {
     }
 }
 
-/// The shared collection adoption reads from: one source for the whole surface, while each
-/// admitted principal's workflow route names the destination its adopted entry is written to.
-/// Assembly refuses a source that names a route destination, and a source scope equal to the
-/// destination scope, so a principal's write can never become the source another reads.
+/// The shared collection adoption reads from: one source for the whole surface. The destination is
+/// the collection the knowledge face serves, so an adopted copy is readable through that face by the
+/// peer that adopted it. Assembly refuses a source that names a route destination or the knowledge
+/// face's own collection, and a source scope equal to the destination scope, so a principal's write
+/// can never become the source another reads.
 pub struct AdoptionRoute {
     /// The host-owned id naming this source on the wire, recorded in every adopted copy's anchor
     /// triple. Callers cannot supply it: this baseline forwards only the configured value.
@@ -280,11 +286,13 @@ pub struct ServeFaces {
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
     /// The one host-configured adoption source, or `None` to serve no adoption. Its collection must
-    /// be non-empty and must not be any [`ServeFaces::workflow_routes`] destination, including a
-    /// route of a principal that is not connected, and its scope id must differ from
-    /// [`ServeFaces::scope_id`]; assembly refuses otherwise. The source need not hold rows. When it
-    /// is configured, the `spoke-knowledge-adoption` face serves `knowledge.adopt` over the same
-    /// admission and route map as the knowledge face.
+    /// be non-empty and must not be [`ServeFaces::knowledge`]'s collection or any
+    /// [`ServeFaces::workflow_routes`] destination, including a route of a principal that is not
+    /// connected, and its scope id must differ from [`ServeFaces::scope_id`]; assembly refuses
+    /// otherwise. The source need not hold rows. When it is configured, the
+    /// `spoke-knowledge-adoption` face serves `knowledge.adopt` over the knowledge face's admission,
+    /// and writes into [`ServeFaces::knowledge`]'s collection — the same collection
+    /// `knowledge.get`/`list` serve for that peer.
     pub adoption: Option<AdoptionRoute>,
     /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
     /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
