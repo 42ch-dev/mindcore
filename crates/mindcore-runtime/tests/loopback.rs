@@ -2519,7 +2519,13 @@ async fn history_is_advertised_and_served_only_with_the_face() {
     assert_wire_deny(
         session
             .adapter
-            .prune_history(&scope_of(SCOPE_ID), "knowledge_entry", "ke_history", 1, None)
+            .prune_history(
+                &scope_of(SCOPE_ID),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                None,
+            )
             .await,
         "history.revisions.prune",
         "capability_missing",
@@ -2557,7 +2563,13 @@ async fn history_is_advertised_and_served_only_with_the_face() {
     let pruned = expect_ok(
         session
             .adapter
-            .prune_history(&scope_of(SCOPE_ID), "knowledge_entry", "ke_history", 1, None)
+            .prune_history(
+                &scope_of(SCOPE_ID),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                None,
+            )
             .await,
         "prune the live row's empty checkpoint history",
     );
@@ -2657,7 +2669,13 @@ async fn history_replays_prunes_and_refuses_over_a_signed_session() {
     let pruned = expect_ok(
         session
             .adapter
-            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("prune-one"))
+            .prune_history(
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("prune-one"),
+            )
             .await,
         "prune the entry to its newest checkpoint",
     );
@@ -2720,8 +2738,15 @@ async fn history_replays_prunes_and_refuses_over_a_signed_session() {
     );
 
     let reject = expect_reject(
-        HistoryPort::get_history_snapshot(dialer, &principal(), &scope, "relation", "rel_history", 1)
-            .await,
+        HistoryPort::get_history_snapshot(
+            dialer,
+            &principal(),
+            &scope,
+            "relation",
+            "rel_history",
+            1,
+        )
+        .await,
         "replay an entity kind this store never keeps",
     );
     assert_eq!(reject.code, SpokeRejectCode::HistoryEntityUnsupported);
@@ -2855,7 +2880,11 @@ async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
     );
     assert_eq!(reject.code, SpokeRejectCode::HistoryTruncated);
     assert_eq!(
-        reject.details.clone().unwrap_or_default().get("floor_revision"),
+        reject
+            .details
+            .clone()
+            .unwrap_or_default()
+            .get("floor_revision"),
         Some(&json!(3))
     );
 }
