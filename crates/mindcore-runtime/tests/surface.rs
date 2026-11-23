@@ -14,7 +14,7 @@ use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
-use spoke_connect::core::CAPABILITY_SPOKE_HISTORY;
+use spoke_connect::core::{CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION};
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
     MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler,
@@ -153,6 +153,14 @@ impl ServedMemory for FourOfFive {
     }
 }
 
+/// The one shared source collection an adopting surface reads from.
+fn adoption_source() -> AdoptionRoute {
+    AdoptionRoute {
+        scope_id: "spc_shared".to_string(),
+        source: KnowledgeScope::new("shared"),
+    }
+}
+
 /// The host's route map: its one admitted principal's workflow collection.
 fn routes() -> BTreeMap<String, KnowledgeScope> {
     BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(COLLECTION))])
@@ -285,6 +293,38 @@ async fn manifest_follows_the_composed_faces() {
         validate_manifest_tools(&served.manifest),
         "the history-serving manifest is self-consistent",
     );
+
+    assert!(
+        !capabilities(&served).contains(&CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION),
+        "no adoption source is configured, so the adoption face is not advertised"
+    );
+    let adopting = expect_ok(
+        serve.surface(ServeFaces {
+            adoption: Some(adoption_source()),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble an adopting surface",
+    );
+    assert_eq!(
+        capabilities(&adopting),
+        [
+            "spoke-knowledge",
+            "ke-ownership",
+            CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION,
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE
+        ],
+        "the adoption face is advertised exactly when it is served"
+    );
+    assert!(
+        adopting.ports.as_adoption().is_some(),
+        "the adoption face is composed over the routed store"
+    );
+    expect_ok(
+        validate_manifest_tools(&adopting.manifest),
+        "the adopting manifest is self-consistent",
+    );
 }
 
 /// The host's route map is validated once, where the surface is assembled: an empty principal key,
@@ -387,6 +427,34 @@ async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly(
             "the assembly refusal carries no route details: {reject:?}"
         );
     }
+}
+
+/// A source scope equal to the destination scope would let a principal adopt from its own
+/// destination, so assembly refuses it.
+#[tokio::test]
+async fn an_adoption_source_equal_to_the_destination_scope_is_refused() {
+    let serve = Fixture::open().await.serve();
+    let reject = match serve.surface(ServeFaces {
+        adoption: Some(AdoptionRoute {
+            scope_id: SCOPE_ID.to_string(),
+            source: KnowledgeScope::new("shared"),
+        }),
+        ..faces(metadata("runtime"))
+    }) {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(surface) => {
+            panic!(
+                "a source scope equal to the destination assembled {:?}",
+                capabilities(&surface)
+            )
+        }
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        reject.message,
+        "the adoption source scope is the destination scope"
+    );
+    assert!(reject.details.is_none(), "{reject:?}");
 }
 
 /// An empty source collection or an empty source scope id names no source, so assembly refuses it.
