@@ -4,10 +4,11 @@
 //! the destination is the one `dst` serves. Neither port is selected from the payload, so one
 //! host-supplied pairing decides where a copy can land.
 //!
-//! The destination key is `destination_entry_id`, which the caller has already resolved (the
-//! protocol default is the source id). A repeat call recognizes the copy by the protocol adoption
-//! anchor it carries and returns it instead of writing a second one, so the guarantee leans on the
-//! destination port's atomic create-only CAS; without that CAS the slot can be claimed twice.
+//! The destination key is `destination_entry_id`, which the caller has already resolved: a served
+//! call defaults it to the source's resolved terminal entry id, and the request field is only the
+//! caller's override. A repeat call recognizes the copy by the protocol adoption anchor it carries
+//! and returns it instead of writing a second one, so the guarantee leans on the destination port's
+//! atomic create-only CAS; without that CAS the slot can be claimed twice.
 
 use serde_json::{Map, Value};
 
@@ -56,6 +57,12 @@ pub enum AdoptionOutcome {
 /// superseded row the live read hides — is [`SpokeRejectCode::RevisionConflict`] without details,
 /// and is never overwritten or refreshed. An empty scope id, an empty `destination_entry_id` and a
 /// zero revision name no anchor and are [`SpokeRejectCode::InvalidInput`].
+///
+/// An embedded helper caller asking for a copy whose matching stored anchor records a revision
+/// above the served ceiling gets no conformant conflict to report, so it receives the fixed
+/// [`SpokeRejectCode::InternalError`] from [`adoption_fault`] — message
+/// `knowledge adoption could not complete`, `details.kind = "store"` — instead of a
+/// [`SpokeRejectCode::RevisionConflict`].
 pub async fn adopt_knowledge_entry(
     src: &dyn KnowledgeEntryPort,
     dst: &dyn KnowledgeEntryPort,
