@@ -249,7 +249,8 @@ fn occupied<T>(entry_id: &str) -> SpokeResult<T> {
 /// The local store names it directly; a 0.18 `RemoteAdapter` destination refuses the create-only
 /// CAS in the port's OCC vocabulary (`REVISION_CONFLICT`) before the provider ever sees the put.
 /// The code is matched, never the message: a conflict raised for any other reason still re-reads
-/// the slot, and a read that does not establish occupancy forwards the original refusal.
+/// the slot, and a re-read that reports absence or occupancy answers the occupancy, while its other
+/// refusals forward as the destination reported them.
 fn rejects_occupied_create(reject: &SpokeReject) -> bool {
     matches!(
         reject.code,

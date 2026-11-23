@@ -186,9 +186,11 @@ store answer becomes `InternalError` with the fixed message `knowledge adoption 
 and `details.kind` naming the failing stage (`begin`, `commit`, `store` or `response`); the serde,
 SQL and stored-payload text stays on the host side and never enters the signed refusal. A stored
 `adoption_anchor` revision above `2^53 - 1` is the same fixed `store` fault, never a
-`REVISION_CONFLICT` carrying the out-of-range integer. The typed response is built before the
-transaction settles, so a copy the response cannot describe rolls the write back instead of
-committing one Connect would reject. Connect's `AdoptionPortService` dedups by
+`REVISION_CONFLICT` carrying the out-of-range integer — but only when that anchor names the
+requested source scope and entry. An unrelated occupant's anchor is never read as this adoption's
+revision, so it is the ordinary occupied conflict without `details`. The typed response is built
+before the transaction settles, so a copy the response cannot describe rolls the write back instead
+of committing one Connect would reject. Connect's `AdoptionPortService` dedups by
 `(op, effective scope, requester principal id, idempotency_key)` with the whole-payload digest: a
 same-key same-digest replay returns the recorded outcome with `outcome` normalized to
 `already_present` and never reaches the port, a same-key different-digest replay answers

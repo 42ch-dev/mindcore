@@ -85,13 +85,17 @@ behavior over the two ports it is given.
   before the provider as `REVISION_CONFLICT`. Either refusal re-reads the slot and answers by the
   anchor rule above, so the same-triple winner returns `AlreadyPresent` and a copy at another
   revision returns `REVISION_CONFLICT` with `details.adopted_revision`; the refusal code a
-  destination chose never changes the outcome. A re-read that answers absence or occupancy is that
-  occupancy; one that refuses `NOT_AUTHORIZED` or `REVISION_CONFLICT` is forwarded as the
-  destination reported it; anything else — a storage fault — is forwarded too, so the served face
-  turns it into the fixed `InternalError` rather than the put's own refusal. A destination refusal
-  that is merely a conflict, without that structured detail or an established occupancy, is
-  forwarded as the store reported it. A stored anchor revision above `2^53 - 1` is the fixed store
-  fault, never a refusal carrying the out-of-range integer.
+  destination chose never changes the outcome. The re-read alone decides: an answer of absence
+  (`NOT_FOUND`) or occupancy (`KNOWLEDGE_ENTRY_ALREADY_EXISTS`) becomes this call's own occupancy
+  refusal — `REVISION_CONFLICT` with no `details` — and the put's refusal and its details are
+  discarded, because no slot claim was established. Every other re-read refusal is forwarded as the
+  destination reported it: `NOT_AUTHORIZED`, `REVISION_CONFLICT` from the destination, and the
+  storage codes, which the served face turns into the fixed `InternalError` rather than the put's
+  own refusal. A put refusal that is neither an occupancy code nor the structured
+  superseded-occupant detail is not a slot claim and propagates unchanged. A stored anchor revision
+  above `2^53 - 1` is the fixed store fault, never a refusal carrying the out-of-range integer; that
+  check applies to an anchor naming the requested source scope and entry, so an anchor naming
+  anything else is the ordinary occupancy above.
 - The copy's `cognition` module is removed rather than emptied: only a present module is dropped,
   and every other shape is left for the destination to validate rather than being masked as an
   empty history. `body`, `canonical_name`, `entry_type` and `status` come from the source, and
