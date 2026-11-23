@@ -14,10 +14,14 @@ use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
 use mindcore_sqlite::{
-    append_cognition, write_entry, MindStore, ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
+    append_cognition, load_retirement_entry, retirement_successors_of, write_entry, MindStore,
+    ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
 };
 use serde_json::{json, Map, Value};
-use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    resolve_retirement_chain, spoke_reject, KnowledgeEntryPort, RetirementChainEntry,
+    RetirementTerminal, SpokeRejectCode, SpokeResult,
+};
 use spoke_schemas::knowledge_entry::{
     ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
     KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner, Shared3,
@@ -404,6 +408,257 @@ fn adopted_elsewhere(entry_id: &str, shared_id: &str, revision: u64) -> Knowledg
     let mut entry = adopted_entry(entry_id, shared_id, revision);
     entry.adoption_anchor = adoption_anchor("spc_elsewhere", shared_id, revision);
     entry
+}
+
+/// Resolve `requested`'s retirement chain over real rows in one read transaction, the way the
+/// adoption port's two closures share theirs.
+async fn resolve_chain(store: &MindStore, requested: &str) -> SpokeResult<RetirementTerminal> {
+    let mut tx = store.pool().begin().await.expect("begin chain read");
+    let cell = tokio::sync::Mutex::new(&mut tx);
+    let requested = {
+        let mut guard = cell.lock().await;
+        expect_ok(
+            load_retirement_entry(&mut guard, "wren", "wren", requested).await,
+            "the requested entry read",
+        )
+    };
+    let Some(requested) = requested else {
+        panic!("the requested entry is present");
+    };
+    resolve_retirement_chain(
+        requested,
+        |current: &RetirementChainEntry| {
+            let cell = &cell;
+            let entry_id = current.entry_id.clone();
+            async move {
+                let mut guard = cell.lock().await;
+                expect_ok(
+                    retirement_successors_of(&mut guard, "wren", &entry_id).await,
+                    "the successor read",
+                )
+            }
+        },
+        |entry_id: &str| {
+            let cell = &cell;
+            let entry_id = entry_id.to_string();
+            async move {
+                let mut guard = cell.lock().await;
+                expect_ok(
+                    load_retirement_entry(&mut guard, "wren", "wren", &entry_id).await,
+                    "a chain entry read",
+                )
+            }
+        },
+    )
+    .await
+}
+
+/// The `retirement_chain` ids a `SOURCE_RETIRED` rejection carries.
+fn expect_source_retired(result: SpokeResult<RetirementTerminal>) -> Vec<String> {
+    let SpokeResult::Reject(reject) = result else {
+        panic!("expected SOURCE_RETIRED, got {result:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::SourceRetired);
+    let chain = reject
+        .details
+        .as_ref()
+        .and_then(|details| details.get("retirement_chain"))
+        .expect("a retired chain names its visited ids");
+    chain
+        .as_array()
+        .expect("the chain is an array")
+        .iter()
+        .map(|id| id.as_str().expect("an id is a string").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_retirement_chain_resolves_to_its_live_terminal() {
+    let path = database_path("retirement-chain");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    for (entry_id, summary) in [
+        ("ke_live", "the terminal"),
+        ("ke_one", "retired once"),
+        ("ke_e0", "three edges, first"),
+        ("ke_e1", "three edges, second"),
+        ("ke_e2", "three edges, third"),
+        ("ke_e3", "three edges, terminal"),
+    ] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, summary), None)
+                .await,
+            "create the chain entry",
+        );
+    }
+
+    let live = expect_ok(resolve_chain(&store, "ke_live").await, "a live source");
+    assert_eq!(
+        live,
+        RetirementTerminal {
+            source_scope_id: "wren".to_string(),
+            source_entry_id: "ke_live".to_string(),
+            source_revision: 1,
+        },
+        "a live source resolves to itself"
+    );
+
+    expect_ok(
+        supersede(&port, "ke_one", 1, "ke_live").await,
+        "retire the one-edge source",
+    );
+    let one_edge = expect_ok(resolve_chain(&store, "ke_one").await, "one edge");
+    assert_eq!(
+        one_edge,
+        RetirementTerminal {
+            source_scope_id: "wren".to_string(),
+            source_entry_id: "ke_live".to_string(),
+            source_revision: 1,
+        },
+        "one edge reaches the live terminal"
+    );
+
+    expect_ok(
+        supersede(&port, "ke_e0", 1, "ke_e1").await,
+        "retire the first of three edges",
+    );
+    expect_ok(
+        supersede(&port, "ke_e1", 1, "ke_e2").await,
+        "retire the second of three edges",
+    );
+    expect_ok(
+        supersede(&port, "ke_e2", 1, "ke_e3").await,
+        "retire the third of three edges",
+    );
+    let three_edges = expect_ok(resolve_chain(&store, "ke_e0").await, "three edges");
+    assert_eq!(
+        three_edges,
+        RetirementTerminal {
+            source_scope_id: "wren".to_string(),
+            source_entry_id: "ke_e3".to_string(),
+            source_revision: 1,
+        },
+        "three edges reach the live terminal"
+    );
+
+    let long: Vec<String> = (0..=33).map(|index| format!("ke_c{index:02}")).collect();
+    for (index, entry_id) in long.iter().enumerate() {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, "long chain"), None)
+                .await,
+            "create a long-chain entry",
+        );
+        if index > 0 {
+            expect_ok(
+                supersede(&port, &long[index - 1], 1, entry_id).await,
+                "retire the long-chain predecessor",
+            );
+        }
+    }
+    let refused = expect_source_retired(resolve_chain(&store, "ke_c00").await);
+    assert_eq!(refused.len(), 33, "a 33rd edge is refused with 33 ids");
+    assert_eq!(refused.first().map(String::as_str), Some("ke_c00"));
+    assert_eq!(
+        refused.last().map(String::as_str),
+        Some("ke_c32"),
+        "the successor beyond the rejected edge is never listed"
+    );
+
+    for entry_id in ["ke_a", "ke_b"] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, "cycle member"), None)
+                .await,
+            "create a cycle member",
+        );
+    }
+    let mut seed = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin cycle seed");
+    for (entry_id, successor) in [("ke_a", "ke_b"), ("ke_b", "ke_a")] {
+        sqlx::query(
+            "UPDATE knowledge_entries SET superseded_by = ? \
+             WHERE collection = 'wren' AND entry_id = ?",
+        )
+        .bind(successor)
+        .bind(entry_id)
+        .execute(&mut *seed)
+        .await
+        .expect("seed the cycle marker");
+    }
+    seed.commit().await.expect("commit the cycle seed");
+    assert_eq!(
+        expect_source_retired(resolve_chain(&store, "ke_a").await),
+        vec!["ke_a".to_string(), "ke_b".to_string(), "ke_a".to_string()],
+        "a two-node cycle repeats the first id last"
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+/// A stored payload that does not decode is a storage fault, not absence: the entry loader answers
+/// `INTERNAL_ERROR` while a missing row still answers `Ok(None)`, so the caller never reports a
+/// corrupt row as `NOT_FOUND` or `SOURCE_RETIRED`.
+#[tokio::test]
+async fn a_retirement_payload_fault_is_not_absence() {
+    let path = database_path("retirement-payload-fault");
+    let store = MindStore::open(&path).await.expect("open store");
+    let seed = second_connection(&path).await;
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_broken', 1, '{ not an entry', \
+                 '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .execute(&seed)
+    .await
+    .expect("seed an undecodable stored payload");
+
+    let mut tx = store.pool().begin().await.expect("begin a fault read");
+    let broken = load_retirement_entry(&mut tx, "wren", "wren", "ke_broken").await;
+    assert_eq!(
+        expect_reject(broken, "an undecodable payload"),
+        SpokeRejectCode::InternalError,
+        "a payload fault is not absence"
+    );
+    let missing = expect_ok(
+        load_retirement_entry(&mut tx, "wren", "wren", "ke_absent").await,
+        "a missing entry read",
+    );
+    assert!(missing.is_none(), "an absent row stays absence");
+    drop(tx);
+
+    seed.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+/// A failed statement answers `INTERNAL_ERROR` from both loaders instead of the `None` absence they
+/// return for a missing row.
+#[tokio::test]
+async fn a_retirement_read_fault_is_not_absence() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("open an empty database");
+
+    let mut tx = pool.begin().await.expect("begin a fault read");
+    let entry = load_retirement_entry(&mut tx, "wren", "wren", "ke_live").await;
+    assert_eq!(
+        expect_reject(entry, "a read of a missing table"),
+        SpokeRejectCode::InternalError
+    );
+    let successors = retirement_successors_of(&mut tx, "wren", "ke_live").await;
+    assert_eq!(
+        expect_reject(successors, "a successor read of a missing table"),
+        SpokeRejectCode::InternalError
+    );
+    drop(tx);
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -2701,11 +2956,7 @@ fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
     match result {
         SpokeResult::Ok(outcome) => panic!("{context}: unexpectedly adopted {outcome:?}"),
         SpokeResult::Reject(reject) => {
-            assert_eq!(
-                reject.code,
-                SpokeRejectCode::KnowledgeEntryNotFound,
-                "{context}"
-            );
+            assert_eq!(reject.code, SpokeRejectCode::NotFound, "{context}");
             assert_eq!(
                 reject.message, "source knowledge entry not found",
                 "{context}"
@@ -2757,14 +3008,15 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     );
     let source_before = stored_row(&reader, "shared", shared_id).await;
 
+    let destination_id = "ke_wren_north_gate";
     let created = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 1).await,
         "first adoption",
     ) {
         AdoptionOutcome::Created(created) => created,
         other => panic!("the first adoption must create the copy, got {other:?}"),
     };
-    assert_eq!(created.entry_id, shared_id);
+    assert_eq!(created.entry_id, destination_id);
     assert_eq!(created.revision, Some(1));
     assert_eq!(created.created_at, None);
     assert!(created.updated_at.is_none());
@@ -2779,17 +3031,8 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
         "the copy leaves the ordinary provenance pointer to its own writes"
     );
     assert!(
-        module_of(&created).is_some_and(|module| module.contains_key("world_facts")),
-        "the cognition envelope and its members survive"
-    );
-    assert!(
-        record_ids(&created).is_empty(),
-        "the source's judgments must not become personal committed records"
-    );
-    assert_eq!(
-        module_of(&created).and_then(|module| module.get("records")),
-        Some(&json!([])),
-        "the copy's cognition history is an explicit empty array, not a dropped member"
+        module_of(&created).is_none(),
+        "the copy drops the cognition module instead of keeping an emptied envelope"
     );
 
     assert_eq!(
@@ -2806,7 +3049,7 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     assert_eq!(advanced.revision, Some(2));
 
     let repeat = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 1).await,
         "repeat at the adopted revision",
     ) {
         AdoptionOutcome::AlreadyPresent(existing) => existing,
@@ -2814,7 +3057,7 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     };
     assert_eq!(as_json(&repeat), as_json(&created));
     assert_eq!(anchor_source_revision(&repeat), Some(1));
-    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 2).await {
+    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 2).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(
                 reject.code,
@@ -2836,17 +3079,17 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
 
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 3).await,
+            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, destination_id, 3).await,
             "a request naming neither revision",
         ),
         SpokeRejectCode::RevisionConflict
     );
 
-    assert_eq!(stored_row(&reader, "wren", shared_id).await.0, 1);
+    assert_eq!(stored_row(&reader, "wren", destination_id).await.0, 1);
     let rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
     )
-    .bind(shared_id)
+    .bind(destination_id)
     .fetch_one(&reader)
     .await
     .expect("destination row count");
@@ -2872,7 +3115,7 @@ async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded(
         "seed the source",
     );
     let adopted = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, shared_id, 1).await,
         "first adoption",
     ) {
         AdoptionOutcome::Created(created) => created,
@@ -2891,7 +3134,7 @@ async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded(
     let copy_before = stored_row(&reader, "wren", shared_id).await;
 
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, shared_id, 1).await,
         "a repeat whose source turned superseded",
     );
     assert_eq!(
@@ -2921,7 +3164,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
     let reader = second_connection(&path).await;
 
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_absent", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_absent", "ke_absent", 1).await,
         "a missing source",
     );
 
@@ -2931,7 +3174,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
         "seed an owner-private source",
     );
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_private", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_private", "ke_private", 1).await,
         "an owner-private source",
     );
 
@@ -2948,7 +3191,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
     );
     let superseded_before = stored_row(&reader, "shared", "ke_stage_one").await;
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_stage_one", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_stage_one", "ke_stage_one", 1).await,
         "a superseded source",
     );
     assert_eq!(
@@ -2986,13 +3229,29 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
             .await,
         "seed an unrelated occupant",
     );
-    assert_eq!(
-        expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_shared_gate", 1).await,
-            "an unrelated occupant",
-        ),
-        SpokeRejectCode::KnowledgeEntryAlreadyExists
-    );
+    match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_shared_gate",
+        "ke_shared_gate",
+        1,
+    )
+    .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::RevisionConflict,
+                "an unrelated occupant"
+            );
+            assert!(
+                reject.details.is_none(),
+                "only a stale copy names the revision it was adopted at"
+            );
+        }
+        other => panic!("an unrelated occupant must refuse the adoption, got {other:?}"),
+    }
     assert_eq!(
         as_json(&expect_ok(
             dst.get_knowledge_entry("ke_shared_gate").await,
@@ -3016,10 +3275,18 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
     );
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_other_scope_gate", 1).await,
+            adopt_knowledge_entry(
+                &src,
+                &dst,
+                SHARED_SCOPE,
+                "ke_other_scope_gate",
+                "ke_other_scope_gate",
+                1
+            )
+            .await,
             "an occupant anchored to another source scope",
         ),
-        SpokeRejectCode::KnowledgeEntryAlreadyExists
+        SpokeRejectCode::RevisionConflict
     );
     assert_eq!(
         as_json(&expect_ok(
@@ -3036,7 +3303,15 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
     );
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_fresh_gate", 5).await,
+            adopt_knowledge_entry(
+                &src,
+                &dst,
+                SHARED_SCOPE,
+                "ke_fresh_gate",
+                "ke_fresh_gate",
+                5
+            )
+            .await,
             "a stale expected revision",
         ),
         SpokeRejectCode::RevisionConflict
@@ -3080,9 +3355,18 @@ async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
     );
     let occupant_before = stored_state(&reader, "ke_shared_gate").await;
 
-    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_shared_gate", 1).await {
+    match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_shared_gate",
+        "ke_shared_gate",
+        1,
+    )
+    .await
+    {
         SpokeResult::Reject(reject) => {
-            assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
+            assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
             assert_eq!(
                 reject.message, "knowledge entry ke_shared_gate already exists",
                 "the occupancy refusal carries no supersede diagnostic"
@@ -3103,7 +3387,7 @@ async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
 }
 
 #[tokio::test]
-async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
+async fn adoption_drops_a_cognition_module_the_copy_would_not_accept() {
     let path = database_path("adopt-invalid-copy");
     let store = MindStore::open(&path).await.expect("open store");
     let dst = store.knowledge(KnowledgeScope::new("wren"));
@@ -3118,28 +3402,98 @@ async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
     module.insert("records".to_string(), Value::Null);
     let src = FixedSource(broken);
 
-    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_broken_carrier", 1).await {
-        SpokeResult::Reject(reject) => {
-            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
-            assert!(
-                reject.details.is_none(),
-                "a validation refusal is not the structured occupancy detail"
-            );
-        }
-        other => panic!("an unwritable copy must refuse the adoption, got {other:?}"),
-    }
+    let created = match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_broken_carrier",
+        "ke_mine_carrier",
+        1,
+    )
+    .await
+    {
+        SpokeResult::Ok(AdoptionOutcome::Created(created)) => created,
+        other => panic!("the cognition module is dropped before the write, got {other:?}"),
+    };
+    assert!(
+        module_of(&created).is_none(),
+        "neither `null` nor `[]` lands in the non-array slot the source carries"
+    );
     assert_eq!(
-        expect_reject(
-            dst.get_knowledge_entry("ke_broken_carrier").await,
-            "the refused copy claims no destination slot",
-        ),
-        SpokeRejectCode::KnowledgeEntryNotFound,
-        "the destination holds no adopted module, so neither `null` nor `[]` lands in the \
-         non-array slot the source carries"
+        module_of(&expect_ok(
+            dst.get_knowledge_entry("ke_mine_carrier").await,
+            "read the copy back"
+        )),
+        None,
+        "the stored copy carries no cognition module either"
     );
 
     store.close().await;
     remove_database(&path);
+}
+
+#[tokio::test]
+async fn adoption_propagates_a_destination_refusal_that_names_no_occupant() {
+    let mut source = entry_with("ke_shared_gate", "shut after dusk");
+    source.revision = Some(1);
+    let src = FixedSource(source);
+    let dst = RefusingDestination {
+        message: "the copy's canonical name is not a wire name",
+    };
+
+    match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_shared_gate",
+        "ke_mine_gate",
+        1,
+    )
+    .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::InvalidInput,
+                "a validation refusal is not an occupancy conflict"
+            );
+            assert_eq!(
+                reject.message, dst.message,
+                "the destination's own wording survives"
+            );
+            assert!(
+                reject.details.is_none(),
+                "an unstructured refusal gains no adopted_revision or superseded_by detail"
+            );
+        }
+        other => panic!("a refused create must refuse the adoption, got {other:?}"),
+    }
+}
+
+/// A destination port whose empty slot refuses every create with one unstructured
+/// `InvalidInput`: the shape a destination adapter raises for a copy it considers invalid, which
+/// the adoption must forward rather than read as an occupancy.
+struct RefusingDestination {
+    message: &'static str,
+}
+
+#[async_trait]
+impl KnowledgeEntryPort for RefusingDestination {
+    async fn get_knowledge_entry(&self, _entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        spoke_reject(
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            "knowledge entry not found",
+            None,
+        )
+    }
+
+    async fn put_knowledge_entry(
+        &self,
+        _entry: KnowledgeEntry,
+        _expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        spoke_reject(SpokeRejectCode::InvalidInput, self.message, None)
+    }
 }
 
 /// A source port answering one fixed entry: a stored row is read back with
@@ -3246,8 +3600,22 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
     );
 
     let (left, right) = tokio::join!(
-        adopt_knowledge_entry(&left_src, &left_gated, SHARED_SCOPE, shared_id, 1),
-        adopt_knowledge_entry(&right_src, &right_gated, SHARED_SCOPE, shared_id, 1),
+        adopt_knowledge_entry(
+            &left_src,
+            &left_gated,
+            SHARED_SCOPE,
+            shared_id,
+            shared_id,
+            1
+        ),
+        adopt_knowledge_entry(
+            &right_src,
+            &right_gated,
+            SHARED_SCOPE,
+            shared_id,
+            shared_id,
+            1
+        ),
     );
     assert!(
         left_gated.observed_absent() && right_gated.observed_absent(),

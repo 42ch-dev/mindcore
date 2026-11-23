@@ -2,7 +2,7 @@
 
 ## Scope
 
-Signed Rust SPOKE sessions over a host-supplied transport: the Memory, Knowledge and History faces, the three Mind workflow tools and the shared-entry adoption tool. The library does not own a listener, accept loop, identity provisioning, publisher, or model provider.
+Signed Rust SPOKE sessions over a host-supplied transport: the Memory, Knowledge, History and adoption faces, and the three Mind workflow tools. The library does not own a listener, accept loop, identity provisioning, publisher, or model provider.
 
 ## Current state
 
@@ -50,7 +50,7 @@ Coverage is `knowledge_entry` alone, because the store keeps no relation revisio
 
 Prune is deduplicated by Connect's recorded-outcome store, keyed by `(op, effective scope, requester principal id, idempotency_key)` and holding the request digest plus the settled outcome. Both services keep the released in-memory default. That default bounds **live outcome records** only — 1024 by default — and an evicted key leaves a tombstone so a same-key replay answers `RECEIPT_EXPIRED` instead of re-executing; tombstones are never evicted, so the store's memory grows with the number of distinct evicted keys. The store belongs to one `HistoryPortService`, so its records and tombstones live for exactly that service instance: `MindcoreServe::surface` builds a new service per assembled surface, so a reassembly in the same process starts with no record and no tombstone, exactly as a restart does. Connect's standalone `HistoryPortService::with_dedup_store` accepts a durable store, but that builder is not an injection point into this runtime: `MindcoreServe::surface` constructs `HistoryPortService::new` itself and `ServeFaces` exposes no dedup store and no history service, so every host of this surface serves the in-memory default.
 
-**Dedup consequence:** the default does not outlive the service instance, so a prune whose outcome was lost to a crash — or to a reassembled surface — can be re-executed by a same-key retry after new checkpoints exist, deleting checkpoints the original call never saw — permanent data loss. A durable store narrows that exposure without closing it: Connect records the settled outcome only after the port returns, while the SQLite prune commits inside the port, so a crash between commit and record leaves a committed prune with no record, and a same-key retry executes it again. No dedup store on either side removes that window, and this surface offers no way to inject one. Adoption has no equivalent permanent-loss replay path: when the source read succeeds and the destination already holds the copy, its store CAS and anchor repeat rules make a retried copy answer `AlreadyPresent` or `RevisionConflict` and write nothing, so replaying an adoption whose outcome was lost is safe. `I-000096` tracks the durable store as a medium-severity residual for the upstream builder.
+**Dedup consequence:** the default does not outlive the service instance, so a prune whose outcome was lost to a crash — or to a reassembled surface — can be re-executed by a same-key retry after new checkpoints exist, deleting checkpoints the original call never saw — permanent data loss. A durable store narrows that exposure without closing it: Connect records the settled outcome only after the port returns, while the SQLite prune commits inside the port, so a crash between commit and record leaves a committed prune with no record, and a same-key retry executes it again. No dedup store on either side removes that window, and this surface offers no way to inject one. Adoption has no equivalent permanent-loss replay path, but it is not a guaranteed no-write repeat either. While the source still resolves to the terminal the first call copied and the destination already holds the copy, the create-only CAS and the anchor rules make the retry answer `already_present` or `REVISION_CONFLICT` and write nothing. After a reassembly dropped the record, a source since retired to a different terminal resolves the same request to that new terminal; with `destination_entry_id` omitted the copy is then addressed by the new terminal's id, so the retry writes a second copy. The original copy stays intact and nothing is lost — the repeat is simply not guaranteed to write nothing once the terminal changed and no destination id was supplied. `I-000096` tracks the durable store as a medium-severity residual for the upstream builder.
 
 ### Workflow tools
 
@@ -75,27 +75,123 @@ Connect owns the signed `{ "arguments": {…} }` request and `{ "result": … }`
 | `tools.mindcore.recall_context` | `request` (`MemoryRecallRequest`), positive integer `max_tokens` | `{records, knowledge, tokens_used}` |
 | `tools.mindcore.absorb` | `request` (`MemoryCaptureRequest`) | Array of `{status, candidate_id}` with `status` = `pending`, `dropped`, or `settled` (adds `record_ids`) |
 | `tools.mindcore.deliberate` | `space_id`, `subject_id`, `holder`, `target`, `evidence` (`[{id, text}]`), positive integer `timeout_ms` | `{status, verdict}` with `status` = `no_change`, `needs_review` (adds `draft`), or `settled` (adds `record`, `mind_state_version`) |
-| `tools.mindcore.adopt` | `entry_id`, positive integer `expected_source_revision` | `{outcome, entry}` with `outcome` = `created` or `already_present`; `entry` is the stored copy either way |
+| `knowledge.adopt` (capability `spoke-knowledge-adoption`, which requires `spoke-knowledge`) | `source_scope_id`, `source_entry_id`, positive integer `source_revision`, `destination_scope_id`, optional `destination_entry_id`, `idempotency_key`, optional `extensions` | `{outcome, entry}` with `outcome` = `adopted` or `already_present`; `entry` is the stored copy either way |
 
 An `absorb` run that updates a record and dismisses its candidate stages two intents in one transaction, the record update and the candidate dismissal, then collects the settled revisions from each staged intent's own result: a revision is yielded only for a record id the result names. The dismissal leg's result names no record, so only the update leg's result yields a revision; walking both legs adds nothing from the dismissal.
 
 An `absorb` replay reports what an earlier run of the same capture recorded for each consumed candidate. A candidate consumed by the update leg's dismissal is the one consumption whose result names no record, so the binding reads the update leg's own receipt — keyed by the capture key, the candidate id and `update` — for the record id: a committed receipt reports `settled` with that id and an absent one reports `dropped`. Capture and update receipts are rows of one table under one aged policy, and the binding has no per-operation retention branch; the capture receipt is minted first, so an aged-out capture receipt refuses the replay before an aged-out update receipt could be read.
 
-Two of the three workflow tools are routed, and only they: `deliberate`'s carrier admission and `recall_context`'s knowledge slot. Deliberation settles onto exactly one carrier entry, so `ServeFaces.workflow_routes` maps each exact principal id — not a peer id, and never a value read from the wire — to the collection those operations reach for that principal, and `MemoryWorkflowBinding::with_knowledge_routes` validates the whole map once at assembly and holds it behind one `Arc`; every reader of the routes — the binding's two workflow lookups and the adoption tool — reads that same map, so no consumer can resolve a different destination for a principal. `absorb` consults no route. The adoption tool below resolves the same map for its destination and adds no route of its own. Each destination collection belongs to exactly one principal route, so a collection named by two routes is refused at assembly; the route never substitutes for a live grant — every carrier write and knowledge read still re-derives the caller's own grants on its own transaction. At carrier admission a principal with no route is refused before any carrier access, as terminal `NotAuthorized` carrying the fixed message `principal has no workflow knowledge route` and no collection, entry, caller id, or other route detail, so it never reveals whether another principal has a route. Recall's slot is independent of the memory page and best effort for the route and the grant: a missing route, or a missing live `knowledge_read` grant in the request's space, returns the memory result with `knowledge: []`, never a refusal. That tolerance covers the route and the grant only — a grant-store read or collection-list failure is not converted into an empty slot; it propagates and fails the recall. With both a route and the grant the slot lists only the routed collection under the same disclosure predicate as the served knowledge list, so an `owner`-private entry never reaches the pack. The host map is the workflow collection allowlist: a valid route need not name a collection that already holds rows, each destination collection is one principal's, and no route is checked against the independent Knowledge face or resolved to a default collection — to change a mapping, assemble a new surface. Assembly returns `InvalidInput` for an empty principal key, an empty destination collection, or a collection named by two routes, before any port or registration exists; an empty map is valid and serves no deliberation, so it installs no `deliberate` handler and advertises neither the capability nor a tool descriptor, and a host registration of that reserved id is dropped rather than advertised or installed. `recall_context` keeps serving without a route map, with no slot to fill, and `absorb` keeps serving because it never consults one. Memory authorization, withholding, snapshot revalidation and token budgeting are unchanged by routing and stay separate rules: the page is still the adapter's own ACL and withholding read, so a memory grant revoked while providers run refuses the reread as before, while a knowledge grant revoked mid-flight empties the reread's slot, which makes the snapshot differ and surfaces as the retryable `RevisionConflict` rather than a released pack.
+Two of the three workflow tools are routed, and only they: `deliberate`'s carrier admission and `recall_context`'s knowledge slot. Deliberation settles onto exactly one carrier entry, so `ServeFaces.workflow_routes` maps each exact principal id — not a peer id, and never a value read from the wire — to the collection those operations reach for that principal, and `MemoryWorkflowBinding::with_knowledge_routes` validates the whole map once at assembly and holds it behind one `Arc`; every reader of the routes — the binding's two workflow lookups and the adoption port — reads that same map, so no consumer can resolve a different destination for a principal. `absorb` consults no route. The adoption face below resolves the same map for its destination and adds no route of its own. Each destination collection belongs to exactly one principal route, so a collection named by two routes is refused at assembly; the route never substitutes for a live grant — every carrier write and knowledge read still re-derives the caller's own grants on its own transaction. At carrier admission a principal with no route is refused before any carrier access, as terminal `NotAuthorized` carrying the fixed message `principal has no workflow knowledge route` and no collection, entry, caller id, or other route detail, so it never reveals whether another principal has a route. Recall's slot is independent of the memory page and best effort for the route and the grant: a missing route, or a missing live `knowledge_read` grant in the request's space, returns the memory result with `knowledge: []`, never a refusal. That tolerance covers the route and the grant only — a grant-store read or collection-list failure is not converted into an empty slot; it propagates and fails the recall. With both a route and the grant the slot lists only the routed collection under the same disclosure predicate as the served knowledge list, so an `owner`-private entry never reaches the pack. The host map is the workflow collection allowlist: a valid route need not name a collection that already holds rows, each destination collection is one principal's, and no route is checked against the independent Knowledge face or resolved to a default collection — to change a mapping, assemble a new surface. Assembly returns `InvalidInput` for an empty principal key, an empty destination collection, or a collection named by two routes, before any port or registration exists; an empty map is valid and serves no deliberation, so it installs no `deliberate` handler and advertises neither the capability nor a tool descriptor, and a host registration of that reserved id is dropped rather than advertised or installed. `recall_context` keeps serving without a route map, with no slot to fill, and `absorb` keeps serving because it never consults one. Memory authorization, withholding, snapshot revalidation and token budgeting are unchanged by routing and stay separate rules: the page is still the adapter's own ACL and withholding read, so a memory grant revoked while providers run refuses the reread as before, while a knowledge grant revoked mid-flight empties the reread's slot, which makes the snapshot differ and surfaces as the retryable `RevisionConflict` rather than a released pack.
 
 Settlement returns its original `SpokeReject` (code, message and details); malformed arguments and `SpiError::InvalidInput` return `InvalidInput`. A `PolicyRejected` policy veto is also `InvalidInput`, with `details.kind = "policy_rejected"` and the host's reason as the message — never `NotAuthorized`, which stays the lost-admission code. A deadline returns `InternalError` with `details.kind = "deadline_exceeded"` and `details.retry_class = "retryable"`: nothing committed, so the caller may repeat the call. The other provider errors return `InternalError` with `details.kind` set to `embeddings_unavailable`, `embedding_failed`, `reasoner_unavailable`, `reasoner_failed`, or `invalid_reasoner_output` as appropriate and carry no retry class; do not reflect provider internals into the wire message. Errors use the signed error envelope, never a success DTO. The client must negotiate each tool id it intends to invoke; descriptor `capability_id` and `op` match, and the responder owns the `mindcore` namespace.
 
-### Adoption tool
+### Adoption face
 
-`tools.mindcore.adopt` copies one shared knowledge entry into the admitted principal's own collection. The host enables it with `ServeFaces.adoption: Option<AdoptionRoute>`, whose one field names the shared source `KnowledgeScope` (`crates/mindcore-runtime/src/lib.rs:174-176,208`). There is no destination setting: the destination is the admitted principal's `workflow_routes` entry, so the one map the workflow tools resolve also routes this write, and no argument names a principal, collection or source.
+`knowledge.adopt` is the only adoption surface. It is the single registered operation of the
+`spoke-knowledge-adoption` family, it requires the co-capability `spoke-knowledge`, and its request
+and response are the published 0.18.0 `KnowledgeAdoptRequest` / `KnowledgeAdoptResponse` — no
+product request or response type exists. The retired private product adoption tool is removed
+rather than kept as a second authority: assembly drops its reserved `tools.mindcore.*` id from every
+host registration in both adoption configurations (`crates/mindcore-runtime/src/lib.rs:157`), so no
+manifest carries it and no handler answers it even when a host registers the id.
 
-Advertisement and installation come from one registration list: the manifest's descriptors and the installed handlers are both derived from it. Assembly appends the adoption registration when `AdoptionRoute` is present and drops any host registration carrying that id in both configurations (`crates/mindcore-runtime/src/lib.rs:133-142`): `adoption: None` advertises no descriptor and installs no handler, and `Some` advertises exactly one descriptor and installs exactly one handler (`crates/mindcore-runtime/src/tools.rs:267-293`). A host registration can neither supply the reserved id nor replace the handler installed for it.
+The host enables the face with `ServeFaces.adoption: Option<AdoptionRoute>`, whose `scope_id` names
+the configured source on the wire and whose `source` names the `KnowledgeScope` the store reads
+(`crates/mindcore-runtime/src/lib.rs:245-250,287`). There is no destination setting: the destination
+is the admitted principal's `workflow_routes` entry, resolved from the same map the workflow tools
+use. With `adoption: None` `face_capabilities` adds no capability and no service is composed; with
+`Some` it adds `spoke-knowledge-adoption` and `RemoteServePortsComposite::with_adoption` composes
+`spoke-connect`'s `AdoptionPortService` over the runtime's `AdoptionService`
+(`crates/mindcore-runtime/src/lib.rs:186-208,397-419`).
 
-Assembly refuses a source collection that is empty or equal to any route destination, including the route of a principal that is not currently connected, before any registration or port exists (`crates/mindcore-runtime/src/lib.rs:94-118`). A source that is also a destination would let one principal's adopted copy become the shared entry another principal reads, so that configuration never serves.
+**Admission is the knowledge face's**, composed as `(principals(peer)?, knowledge_admission(peer)?)`
+like the history family's: a peer the knowledge face does not admit cannot adopt, and a routed
+principal the knowledge admission refuses answers `NOT_AUTHORIZED` where the removed product tool
+would have served it. Neither the principal nor the admitted scope comes from the payload.
 
-Advertisement is surface level; routing is per call. An admitted principal without a route is served the tool and answered `NotAuthorized` carrying the fixed message `principal has no workflow knowledge route` and no target detail, never a fallback collection and never another principal's destination (`crates/mindcore-runtime/src/tools.rs:303-321`). The call reads only the host-configured source and writes only the routed destination, committing both on one `BEGIN IMMEDIATE` transaction; the refusals it can return are the local adoption operation's own, whose semantics `.agents/specs/data/knowledge-lifecycle.md` owns. Routing is answered before the arguments are decoded, so an unrouted caller is `NotAuthorized` whatever its payload holds. A refused argument object answers `InvalidInput` with `details.kind = "arguments"` naming the advertised shape, and a storage or stored-payload fault answers `InternalError` with the fixed message `knowledge adoption could not complete` and `details.kind` naming the failing stage (`begin`, `commit` or `store`); the serde, SQL and stored-payload text stays on the host side and never enters the signed refusal.
+**Scope mapping.** Every scope member of the request is compared, never used to select anything:
 
-Per-peer hiding is a host obligation, not a runtime setting. Connect signs its hello from one fixed manifest and the runtime installs the surface's handlers on the responder before inbound traffic reaches it (`crates/mindcore-runtime/src/lib.rs:298-306`), while a handler learns its peer only from the established session (`crates/mindcore-runtime/src/tools.rs:220-233`). A host that must hide adoption from particular peers therefore selects the surface and its matching allowlist before hello using its own trusted routing, verifies the selected peer against the authenticated session, and re-evaluates actual admission at call time. The runtime serves one manifest and one handler set per surface and exposes no per-principal manifest or handler set.
+| Request member | Must equal | Otherwise |
+|---|---|---|
+| `source_scope_id` | `AdoptionRoute.scope_id` | `NOT_FOUND`, no details — the same generic absence as a missing source |
+| `source_entry_id` | a live or retired row of `AdoptionRoute.source` | `NOT_FOUND`, no details |
+| `source_revision` | the live source's current revision; never compared for a retired source; never `0` | `REVISION_CONFLICT`, no details / `INVALID_INPUT` |
+| `destination_scope_id` | the admitted `Scope.scope_id` | `NOT_AUTHORIZED`, no details, before the source is read |
+| `destination_entry_id` | absent → the resolved terminal's `source_entry_id`; a supplied value may name that same id | — |
+| `idempotency_key` | 1–128 code points | `INVALID_INPUT`, refused by Connect's decoder |
+
+The destination collection is the principal's route and nothing else; the admitted `Scope`'s
+`entry_ids`, `entry_types`, `source_id` and `viewpoint` refinements still apply to it, because the
+admitted scope is the host's statement about which entries of that collection the peer may reach.
+Adoption applies them to the destination entry it would return and to the copy it would write: an
+entry outside the admitted selection answers `NOT_AUTHORIZED` with no details and is neither served
+nor written, exactly as the routed knowledge face hides it. The route selects the collection; the
+admitted selection narrows what the call may touch inside it.
+
+**Assembly** refuses an empty source scope id, an empty source collection, a source collection equal
+to any route destination — including the route of a principal that is not currently connected — and
+a source scope id equal to `ServeFaces.scope_id`, all with `InvalidInput` before any port or
+registration exists (`crates/mindcore-runtime/src/lib.rs:104-141`). A source that is also a
+destination would let one principal's adopted copy become the shared entry another principal reads,
+and a source scope equal to the destination scope would let a principal adopt from its own
+destination.
+
+**Terminal anchor.** The requested source resolves through `spoke_operations::resolve_retirement_chain`
+inside the same transaction before anything is read for the copy: a live source resolves to itself,
+and a retired source resolves to the first live entry along its markers, so the copy's
+`adoption_anchor` names that terminal's `(source_scope_id, source_entry_id, source_revision)` while
+the copy's own `entry_id` is `destination_entry_id` when supplied and the terminal's id otherwise.
+A chain that cannot resolve — a cycle, an ambiguous merge, a missing hop, more than the resolver's
+32 edges — answers `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order. A
+retired source's requested revision is not compared, because the anchor records the terminal's own
+revision; a live source that moved off the requested revision answers `REVISION_CONFLICT` with no
+details. A resolved terminal whose own revision is above Mindcore's served ceiling of `2^53 - 1` has
+no conformant success to report, because the anchor is the only carrier of that revision: the
+`adoption_anchor.source_revision` member records the terminal's revision and must satisfy the
+IEEE-754 safe-integer bound, which is Mindcore's own check and narrower than the numeric check
+Connect applies to the request. The copy's own `revision` is never that value — it is the
+destination row's write revision, assigned by the store (`1` on a create) — so the response's
+`entry.revision` is checked separately on return. The call refuses before writing anything, with the
+fixed fault message and `details.kind = "store"`; the copy is never committed for a response the
+wire cannot carry.
+
+**Copy and inherited governance.** `body`, `canonical_name`, `entry_type` and `status` come from the
+terminal; `modules` loses `cognition` rather than keeping an emptied envelope; `source_anchor` stays
+unset; `adoption_anchor` records the terminal triple; `revision`, `created_at` and `updated_at` are
+left for the store to assign; the request's `extensions` are not copied. `owner` and `disclosure` are
+inherited from the terminal rather than reset to the destination's, because the destination is the
+principal's whole route collection — the access boundary itself — and the port refuses every source
+the viewpoint-free predicate does not see, so an inherited policy cannot disclose anything the
+admitted principal could not already read. The copy's `entry_id` is the caller's
+`destination_entry_id` when supplied — a caller may supply the terminal's own id — and the terminal's
+id otherwise; the anchor names the terminal either way.
+
+**Refusals and dedup.** The call reads only the host-configured source and writes only the routed
+destination, committing on one `BEGIN IMMEDIATE` transaction that commits for `adopted` and rolls
+back for `already_present`. `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT`, `SOURCE_RETIRED`,
+`ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` travel as the contract builds them; a repeat naming
+the copy's own anchor triple returns `already_present` with the stored copy, another revision of the
+same source is `REVISION_CONFLICT` with exactly `details.adopted_revision`, and any other occupant is
+`REVISION_CONFLICT` without that member, left byte-identical. Any other store answer becomes
+`InternalError` with the fixed message `knowledge adoption could not complete` and `details.kind`
+naming the failing stage (`begin`, `commit`, `store` or `response`); the serde, SQL and stored-payload
+text stays on the host side and never enters the signed refusal. The typed response is built before
+the transaction settles, so a copy the response cannot describe rolls the write back instead of
+committing one Connect would reject. Connect's `AdoptionPortService` dedups by
+`(op, effective scope, requester principal id, idempotency_key)` with the whole-payload digest: a
+same-key same-digest replay returns the recorded outcome with `outcome` normalized to
+`already_present` and never reaches the port, a same-key different-digest replay answers
+`IDEMPOTENCY_CONFLICT`, and a replay of an evicted key answers `RECEIPT_EXPIRED`. The bounded
+in-memory default is the shipped store, so its records live for one service instance; see the dedup
+consequence above for what a restart exposes.
+
+**Per-peer hiding is a host obligation**, not a runtime setting. Connect signs its hello from one
+fixed manifest and the runtime installs the surface's handlers on the responder before inbound
+traffic reaches it, while admission learns its peer only from the established session. A host that
+must hide adoption from particular peers therefore selects the surface and its matching allowlist
+before hello using its own trusted routing, verifies the selected peer against the authenticated
+session, and re-evaluates actual admission at call time. The runtime serves one manifest and one
+handler set per surface and exposes no per-principal manifest or handler set.
 
 ### Store shape
 
@@ -105,7 +201,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 
 - No caller-provided principal, scope route, or manifest capability can bypass a host admission or storage guard.
 - No baseline provider is required for either face and an absent face/tool is denied. Advertisements and handler registrations describe the same capabilities.
-- The adoption source is host configuration and the adoption destination is the admitted principal's route: no wire value selects either, and a source equal to any route destination is refused before serving.
+- The adoption source is host configuration and the adoption destination is the admitted principal's route: no wire value selects either, the request's scope members are only compared against those two, and a source equal to any route destination or to the destination scope is refused before serving.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.
 - History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes. The `spoke-history` capability is advertised only when `ServeFaces.history` composes the service.
@@ -114,8 +210,8 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 
 - SQLite scoped store beside `crates/mindcore-sqlite/src/knowledge.rs` and its borrowed-transaction helpers; used both by the Knowledge loopback and by `crates/mindcore-runtime`. The same file implements `HistoryPort` for `RoutedKnowledgeStore` and projects the replay onto `RevisionSnapshot`.
 - `crates/mindcore-spoke/src/workflows.rs` owns workflow storage admission and settlement; `crates/mindcore-spi` owns the workflow contracts.
-- `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces` (including `history`), `AdoptionRoute`, the `HistoryAdmission` composition, and `face_capabilities`; `spoke-connect`'s `HistoryPortService` owns the wire decode, the effective-scope check and the prune dedup store. `crates/mindcore-runtime/src/tools.rs` owns the served tool registrations and their advertised ABI. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session, including both history ops.
+- `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces` (including `history` and `adoption`), `AdoptionRoute`, the `HistoryAdmission` and `AdoptionAdmission` compositions, the retired-id filter and `face_capabilities`; `spoke-connect`'s `HistoryPortService` and `AdoptionPortService` own the wire decode, the effective-scope check and their dedup stores; `crates/mindcore-runtime/src/adoption.rs` owns the adoption port. `crates/mindcore-runtime/src/tools.rs` owns the served workflow tool registrations and their advertised ABI. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session, including both history ops and `knowledge.adopt`.
 
 ## Change obligations
 
-Changing an advertised face, tool id, argument/result shape, or scope admission rule updates this spec and the signed loopback assertions in the same change. This page is the served history contract's only home: a change to the refusal set, its `details` members, the `RevisionSnapshot` projection, the dedup default or its lifetime updates this page; a change to the local replay or retention semantics those answers carry updates `.agents/specs/data/knowledge-lifecycle.md` as well.
+Changing an advertised face, tool id, argument/result shape, or scope admission rule updates this spec and the signed loopback assertions in the same change. This page is the served history contract's only home: a change to the refusal set, its `details` members, the `RevisionSnapshot` projection, the dedup default or its lifetime updates this page; a change to the local replay or retention semantics those answers carry updates `.agents/specs/data/knowledge-lifecycle.md` as well. This page is also the served adoption contract's only home: a change to the scope mapping, the terminal-anchor rule, the refusal vocabulary, the copy's inherited governance or the idempotency envelope updates this page, `serving-principal-routing.md` and the signed loopback assertions in the same change.

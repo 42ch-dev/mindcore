@@ -33,17 +33,71 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 
 ### Adoption
 
-`mindcore_spi::adopt_knowledge_entry(src, dst, source_scope_id, entry_id, expected_source_revision)` copies a shared entry into a personal collection through the caller's two scoped ports.
+`mindcore_spi::adopt_knowledge_entry(src, dst, source_scope_id, source_entry_id,
+destination_entry_id, expected_source_revision)` copies a shared entry into a personal collection
+through the caller's two scoped ports. It is the local half of the served `knowledge.adopt`
+operation; the retirement-chain resolution that precedes it belongs to the served face, so the
+source this function sees is already the terminal. The served defaults, refusal vocabulary, terminal
+resolution, destination selection and dedup are
+[`serving-seam.md`](../architecture/serving-seam.md)'s; everything below is this helper's own
+behavior over the two ports it is given.
 
-- The destination is addressed by the **same `entry_id`**; the collection distinguishes the copy.
-- The copy carries the protocol's `KnowledgeEntry.adoption_anchor` and leaves `source_anchor` unset. The anchor is the `(source_scope_id, source_entry_id, source_revision)` triple: the wire scope id of the source, the entry id, and the source revision it read. `source_scope_id` is not the source collection — it is a separate identifier; see the route bullet below. `mindcore_base::knowledge::adoption_anchor` is the shape's single **builder** and `adoption_anchor_parts` its single **reader** — every consumer, including the SQLite resolver and the adoption idempotency check, goes through that one reader, so a shape it cannot read back is a defect in the builder. The builder answers `None` for an empty scope id, an empty entry id or a zero revision.
-- The source scope id a host serves is `AdoptionRoute.scope_id` (`crates/mindcore-runtime/src/lib.rs`), the id naming the configured source on the wire; assembly refuses an empty one, and it is the value every copy of that source records. It is a separate identifier from `AdoptionRoute.source.collection`, the collection the source port actually reads.
-- The copy's anchor triple is its identity. A repeat naming the same source scope, entry and revision returns the existing copy (`AlreadyPresent`) with its original anchor; a request naming the source's current revision instead is `RevisionConflict` naming the revision the copy was adopted at, even when the source now sits at the requested one. A repeat never rewrites the copy and never re-points the anchor at a newer source revision.
-- A stored anchor is immutable on every put path. The Connect responder gates `port.knowledge.put` with `spoke_operations::assert_adoption_anchor_preserved`, and the local `KnowledgeEntryPort::put_knowledge_entry` path reaches the same helper through `write_entry`, between the CAS check and the write. A put that replaces or drops a stored anchor refuses `ADOPTION_ANCHOR_IMMUTABLE` with `details.entry_id` and stores nothing, or `INVALID_INPUT` when an anchor cannot be canonicalized; a create, an entry without an anchor and an identical anchor all pass. Adoption is the intended producer of an anchor, but the gate enforces preservation, not exclusivity: a create, or a put whose stored entry carries no anchor, may set one.
-- A missing, retired or undisclosable source answers one generic `KnowledgeEntryNotFound`; a source the caller cannot see is indistinguishable from one that does not exist. An empty scope id, an empty source id or a zero revision is refused before any I/O.
-- A destination slot occupied by anything else — including a retired entry — answers `KnowledgeEntryAlreadyExists` and is left byte-identical. The store distinguishes that case from a genuine validation failure by a structured refusal detail, never by matching a message.
-- A create-only put can meet the occupancy after the empty read: a local destination refuses it as `KnowledgeEntryAlreadyExists`, while a 0.18 remote destination refuses the caller-OCC fence before the provider as `RevisionConflict`. Either refusal re-reads the slot and answers by the anchor rule above, so the same-triple winner returns `AlreadyPresent` and a copy at another revision returns `RevisionConflict` with `details.adopted_revision`; the refusal code a destination chose never changes the outcome. When the re-read does not establish occupancy, the original refusal is forwarded unchanged.
-- The copy's cognition envelope is emptied in place: only a present `records` array is cleared, and every other shape is left for the destination to validate rather than being masked as an empty history.
+- The destination is addressed by `destination_entry_id`, never by the source id: the caller
+  resolves it — the served runtime defaults it to the resolved terminal's id, and a supplied value
+  may name the copy or that same terminal id — and the collection distinguishes the copy from its
+  source.
+- The copy carries the protocol's `KnowledgeEntry.adoption_anchor` and leaves `source_anchor` unset.
+  The anchor is the `(source_scope_id, source_entry_id, source_revision)` triple: the wire scope id
+  of the source, the entry id, and the source revision it read. `source_scope_id` is not the source
+  collection — it is a separate identifier; see the route bullet below.
+  `mindcore_base::knowledge::adoption_anchor` is the shape's single **builder** and
+  `adoption_anchor_parts` its single **reader** — every consumer, including the SQLite resolver and
+  the adoption idempotency check, goes through that one reader, so a shape it cannot read back is a
+  defect in the builder. The builder answers `None` for an empty scope id, an empty entry id or a
+  zero revision.
+- The source scope id a host serves is `AdoptionRoute.scope_id` (`crates/mindcore-runtime/src/lib.rs`),
+  the id naming the configured source on the wire; assembly refuses an empty one, and it is the
+  value every copy of that source records. It is a separate identifier from
+  `AdoptionRoute.source.collection`, the collection the source port actually reads.
+- The copy's anchor triple is its identity. A repeat naming the same source scope, entry and
+  revision returns the existing copy (`AlreadyPresent`) with its original anchor; a request naming
+  the source's current revision instead is `REVISION_CONFLICT` with exactly
+  `details.adopted_revision`, the revision the copy was adopted at, even when the source now sits at
+  the requested one. A repeat never rewrites the copy and never re-points the anchor at a newer
+  source revision.
+- A stored anchor is immutable on every put path. The Connect responder gates `port.knowledge.put`
+  with `spoke_operations::assert_adoption_anchor_preserved`, and the local
+  `KnowledgeEntryPort::put_knowledge_entry` path reaches the same helper through `write_entry`,
+  between the CAS check and the write. A put that replaces or drops a stored anchor refuses
+  `ADOPTION_ANCHOR_IMMUTABLE` with `details.entry_id` and stores nothing, or `INVALID_INPUT` when an
+  anchor cannot be canonicalized; a create, an entry without an anchor and an identical anchor all
+  pass. Adoption is the intended producer of an anchor, but the gate enforces preservation, not
+  exclusivity: a create, or a put whose stored entry carries no anchor, may set one.
+- A missing, retired or undisclosable source answers one generic `NOT_FOUND`; a source the caller
+  cannot see is indistinguishable from one that does not exist. An empty scope id, an empty source
+  id, an empty destination id or a zero revision is refused before any I/O as `INVALID_INPUT`.
+- A destination slot occupied by anything else — including a retired entry, and including an anchor
+  naming another source scope or entry — answers `REVISION_CONFLICT` with no `details` and is left
+  byte-identical. The store distinguishes "this slot holds a superseded entry" from a genuine
+  validation failure by a structured refusal detail, never by matching a message.
+- A create-only put can meet the occupancy after the empty read: a local destination refuses it as
+  `KNOWLEDGE_ENTRY_ALREADY_EXISTS`, while a 0.18 remote destination refuses the caller-OCC fence
+  before the provider as `REVISION_CONFLICT`. Either refusal re-reads the slot and answers by the
+  anchor rule above, so the same-triple winner returns `AlreadyPresent` and a copy at another
+  revision returns `REVISION_CONFLICT` with `details.adopted_revision`; the refusal code a
+  destination chose never changes the outcome. When the re-read does not establish occupancy, the
+  original refusal is forwarded unchanged. A destination refusal that is merely a conflict, without
+  that structured detail or an established occupancy, is forwarded as the store reported it.
+- The copy's `cognition` module is removed rather than emptied: only a present module is dropped,
+  and every other shape is left for the destination to validate rather than being masked as an
+  empty history. `body`, `canonical_name`, `entry_type` and `status` come from the source, and
+  `revision`, `created_at` and `updated_at` are left for the store to assign.
+- **Governance is inherited, not reset.** The copy keeps the source's `owner` and `disclosure`.
+  The contract resets them to the destination's; Mindcore defines no destination governance, because
+  the destination is a principal's whole route collection — the access boundary itself — and the
+  served face refuses every source the viewpoint-free predicate does not see. An inherited policy
+  therefore cannot disclose anything the admitted principal could not already read. This is a
+  recorded deviation, not an open task.
 
 ### Retirement
 
@@ -54,7 +108,12 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 - Default reads and lists omit a retired entry; `get_entry_including_superseded` returns it with its marker.
 - An adoption anchor naming a retired entry resolves to the first live entry along the chain. A hidden or missing hop answers the generic absence keyed by the anchor's original id; a cycle is `InternalError`.
 - A retired carrier has no current judgment: the current-record lookup joins the live predicate, while explicit historical reads and revision replay stay available.
-- Adoption never copies a retired source, and a repeat adoption against a source that has since been retired answers the generic absence; an existing copy keeps its original provenance.
+- Adoption never copies a retired row: the served face resolves the requested source to the first
+  live entry along the chain and copies that terminal, so the copy's anchor names a live row. The
+  copy's stored `entry_id` is `destination_entry_id` when the caller supplied one — including the
+  terminal's own id — and that terminal's id only when the member was absent. The served chain,
+  revision-domain and refusal rules are
+  [`serving-seam.md`](../architecture/serving-seam.md) § terminal anchor and § refusals.
 
 ### Shared scope rehearsal
 
@@ -96,6 +155,9 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 - History table, trigger, retirement column: `crates/mindcore-sqlite/migrations/0001_init.sql`.
 - Write path, replay, explicit prune, retirement write, resolution, current-record predicate: `crates/mindcore-sqlite/src/knowledge.rs`, `cognition.rs`.
 - Adoption and the anchor codec: `crates/mindcore-spi/src/adoption.rs`, `crates/mindcore-base/src/knowledge.rs`.
+- The served half — scope comparison, retirement-chain resolution, the one transaction and the
+  refusal hygiene: `crates/mindcore-runtime/src/adoption.rs`; its wire contract is
+  `.agents/specs/architecture/serving-seam.md`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
 - Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
 

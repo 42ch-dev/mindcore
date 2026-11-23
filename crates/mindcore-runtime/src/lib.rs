@@ -7,6 +7,7 @@
 //! [`MindcoreServe::surface`] derives `capabilities` and `tools` from the composed faces and the
 //! registrations, never from a host-supplied capability string.
 
+mod adoption;
 pub mod tools;
 
 use std::collections::BTreeMap;
@@ -20,26 +21,34 @@ use mindcore_spoke::{MemoryWorkflowBinding, ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::{validate_admission_scope, vectors, MindStore, RoutedKnowledgeStore};
 use spoke_connect::core::{
     CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_KNOWLEDGE,
-    CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
+    CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION, CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
-    ConnectResponder, HistoryAdmission, HistoryPortService, KnowledgeAdmission, MemoryAdmission,
-    RemoteHistoryService, RemoteKnowledgeFace, RemoteMemoryService, RemoteServePorts,
-    RemoteServePortsComposite, ToolHandler,
+    AdoptionAdmission, AdoptionPortService, ConnectResponder, HistoryAdmission, HistoryPortService,
+    KnowledgeAdmission, MemoryAdmission, RemoteAdoptionService, RemoteHistoryService,
+    RemoteKnowledgeFace, RemoteMemoryService, RemoteServePorts, RemoteServePortsComposite,
+    ToolHandler,
 };
 use spoke_operations::{
-    spoke_reject, validate_manifest_tools, HistoryPort, ScopedKnowledgePort, SpokeReject,
-    SpokeRejectCode, SpokeResult,
+    spoke_reject, validate_manifest_tools, AdoptionPort, HistoryPort, ScopedKnowledgePort,
+    SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
 use sqlx::SqlitePool;
 
+use adoption::AdoptionService;
 pub use tools::MindProviders;
 use tools::WorkflowTools;
 
 /// The `tools.*` namespace this runtime owns.
 const TOOLS_NAMESPACE: &str = "mindcore";
+
+/// The id of the retired product adoption tool.
+///
+/// `knowledge.adopt` replaces it: the id is dropped from every host registration, so no host can
+/// advertise or install anything under it.
+const RETIRED_ADOPT_TOOL: &str = "tools.mindcore.adopt";
 
 /// The Mindcore serving side over one host store.
 ///
@@ -93,7 +102,8 @@ impl MindcoreServe {
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        if let Some(adoption) = &faces.adoption {
+        let adoption = faces.adoption;
+        if let Some(adoption) = &adoption {
             let source = &adoption.source.collection;
             if adoption.scope_id.is_empty() {
                 return spoke_reject(
@@ -106,6 +116,13 @@ impl MindcoreServe {
                 return spoke_reject(
                     SpokeRejectCode::InvalidInput,
                     "the adoption source names an empty collection",
+                    None,
+                );
+            }
+            if adoption.scope_id == faces.scope_id {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    "the adoption source scope is the destination scope",
                     None,
                 );
             }
@@ -124,17 +141,8 @@ impl MindcoreServe {
             }
         }
         let routes = Arc::new(faces.workflow_routes);
-        let adoption = faces.adoption.map(|route| {
-            tools::AdoptionTool::new(
-                self.store.pool(),
-                Arc::clone(&faces.principals),
-                route.scope_id,
-                route.source.collection,
-                Arc::clone(&routes),
-            )
-        });
         let routed = !routes.is_empty();
-        let workflows = match self.workflows(routes) {
+        let workflows = match self.workflows(Arc::clone(&routes)) {
             Ok(workflows) => workflows,
             Err(reject) => return SpokeResult::Reject(reject),
         };
@@ -142,14 +150,11 @@ impl MindcoreServe {
         let principals = faces.principals;
         let mut tools =
             WorkflowTools::new(engine, Arc::clone(&principals), faces.providers).registrations();
-        if let Some(adoption) = adoption {
-            tools.push(adoption.registration());
-        }
         tools.extend(
             faces
                 .tools
                 .into_iter()
-                .filter(|tool| tool.descriptor.capability_id.as_str() != tools::ADOPT),
+                .filter(|tool| tool.descriptor.capability_id.as_str() != RETIRED_ADOPT_TOOL),
         );
         if !routed {
             tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
@@ -158,13 +163,14 @@ impl MindcoreServe {
             faces.manifest,
             faces.memory.as_deref(),
             faces.history,
+            adoption.is_some(),
             &tools,
         );
         let manifest = match manifest {
             SpokeResult::Ok(manifest) => manifest,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        let admission = validated(faces.admission);
+        let admission = validated(faces.admission, &faces.scope_id);
         let store: Arc<RoutedKnowledgeStore> =
             Arc::new(self.store.served_knowledge(faces.scope_id, faces.knowledge));
         let knowledge: Arc<dyn ScopedKnowledgePort + Send + Sync> = store.clone();
@@ -173,6 +179,33 @@ impl MindcoreServe {
             admission: Arc::clone(&admission),
         };
         let mut ports = RemoteServePortsComposite::knowledge_only(Arc::new(face));
+        if let Some(adoption) = adoption {
+            // Adoption reuses the knowledge face's admission, so a peer that does not serve
+            // knowledge cannot adopt, and the destination is the principal's own routed
+            // collection.
+            let adoption_admission: AdoptionAdmission = {
+                let principals = Arc::clone(&principals);
+                let admission = Arc::clone(&admission);
+                Arc::new(move |peer_id: &str| {
+                    let principal = match principals(peer_id) {
+                        SpokeResult::Ok(principal) => principal,
+                        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+                    };
+                    match admission(peer_id) {
+                        SpokeResult::Ok(scope) => SpokeResult::Ok((principal, scope)),
+                        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+                    }
+                })
+            };
+            let port: Arc<dyn AdoptionPort + Send + Sync> = Arc::new(AdoptionService::new(
+                self.store.pool(),
+                Arc::clone(&routes),
+                adoption,
+            ));
+            let service: Arc<dyn RemoteAdoptionService> =
+                Arc::new(AdoptionPortService::new(port, adoption_admission));
+            ports = ports.with_adoption(service);
+        }
         if faces.history {
             // History serves the knowledge face's own route and admission: one store, two port
             // roles, so a peer replays exactly the scope it reads and writes.
@@ -207,8 +240,8 @@ impl MindcoreServe {
 
 /// The shared collection adoption reads from: one source for the whole surface, while each
 /// admitted principal's workflow route names the destination its adopted entry is written to.
-/// Assembly refuses a source that names a route destination, so a principal's write can never
-/// become the source another reads.
+/// Assembly refuses a source that names a route destination, and a source scope equal to the
+/// destination scope, so a principal's write can never become the source another reads.
 pub struct AdoptionRoute {
     /// The host-owned id naming this source on the wire, recorded in every adopted copy's anchor
     /// triple. Callers cannot supply it: this baseline forwards only the configured value.
@@ -247,9 +280,10 @@ pub struct ServeFaces {
     pub providers: MindProviders,
     /// The one host-configured adoption source, or `None` to serve no adoption. Its collection must
     /// be non-empty and must not be any [`ServeFaces::workflow_routes`] destination, including a
-    /// route of a principal that is not connected; assembly refuses otherwise. The source need not
-    /// hold rows. `Some` advertises `tools.mindcore.adopt` and installs its handler; each call
-    /// answers `NotAuthorized` for a principal whose route the map does not name.
+    /// route of a principal that is not connected, and its scope id must differ from
+    /// [`ServeFaces::scope_id`]; assembly refuses otherwise. The source need not hold rows. When it
+    /// is configured, the `spoke-knowledge-adoption` face serves `knowledge.adopt` over the same
+    /// admission and route map as the knowledge face.
     pub adoption: Option<AdoptionRoute>,
     /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
     /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
@@ -261,7 +295,7 @@ pub struct ServeFaces {
     pub workflow_routes: BTreeMap<String, KnowledgeScope>,
     /// Additional host tools: every descriptor is advertised and its handler installed, except the
     /// ids this runtime owns — `tools.mindcore.deliberate` on a surface with an empty route map, and
-    /// `tools.mindcore.adopt` on every surface.
+    /// the retired `tools.mindcore.adopt` on every surface.
     pub tools: Vec<ToolRegistration>,
 }
 
@@ -294,8 +328,8 @@ impl ToolRegistration {
 /// The assembled surface: what `ConnectResponderOptions` takes, and the handler installation that
 /// must run before inbound hello traffic reaches the responder.
 pub struct MindcoreSurface {
-    /// Serve these ports: the knowledge face over the shared store, plus the memory face when the
-    /// host attached a service. No baseline provider is composed.
+    /// Serve these ports: the knowledge face over the shared store, plus the history, adoption and
+    /// memory faces the host attached. No baseline provider is composed.
     pub ports: Arc<dyn RemoteServePorts + Send + Sync>,
     /// Advertise this manifest: it lists exactly the capabilities `ports` and the registrations
     /// serve.
@@ -354,18 +388,28 @@ impl MindcoreSurface {
 
 /// The advertised capabilities follow the composed faces: the knowledge face always, the memory
 /// family flag when a memory service is attached, the transfer family flag when that service
-/// reports every one of [`TRANSFER_OPERATIONS`], and the history flag only when its face is served.
+/// reports every one of [`TRANSFER_OPERATIONS`], and the history and adoption flags only when
+/// their faces are served.
 ///
 /// The knowledge face applies SPOKE's owner-private disclosure, so a viewpoint-scoped list is
 /// served and the supplemental ownership capability is truthful; it never stands in for peer or
 /// entry admission.
-fn face_capabilities(memory: Option<&dyn ServedMemory>, history: bool) -> Vec<String> {
+fn face_capabilities(
+    memory: Option<&dyn ServedMemory>,
+    history: bool,
+    adoption: bool,
+) -> Vec<String> {
     let mut capabilities = vec![
         CAPABILITY_SPOKE_KNOWLEDGE.to_string(),
         CAPABILITY_KE_OWNERSHIP.to_string(),
     ];
     if history {
         capabilities.push(CAPABILITY_SPOKE_HISTORY.to_string());
+    }
+    if adoption {
+        // The co-capability `spoke-knowledge` is unconditional above, so the compound gate
+        // Connect applies to `knowledge.adopt` always holds.
+        capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION.to_string());
     }
     if let Some(memory) = memory {
         capabilities.push(CAPABILITY_SPOKE_MEMORY.to_string());
@@ -386,9 +430,10 @@ fn derive_manifest(
     mut manifest: HostCapabilityManifest,
     memory: Option<&dyn ServedMemory>,
     history: bool,
+    adoption: bool,
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
-    manifest.capabilities = face_capabilities(memory, history);
+    manifest.capabilities = face_capabilities(memory, history, adoption);
     for tool in tools {
         manifest
             .capabilities
@@ -417,16 +462,28 @@ fn derive_manifest(
 /// the request's cognition selection, so a selection the face does not serve must be refused
 /// before the merge can drop it.
 ///
+/// The admitted id must also be the one this surface serves: the routed store refuses any other
+/// id, so a resolver returning a different one would otherwise be admitted here and denied there.
+/// Both faces share this admission, so one check covers them.
+///
 /// Host admission is not peer input, so an unsupported admitted selection is refused as the same
 /// generic `NotAuthorized` a rejecting resolver returns, never as the caller-declared
 /// `InvalidInput` the routed store keeps for request scopes: the peer learns nothing about what
 /// the face does not serve. The resolver's own refusal passes through unchanged.
-fn validated(admission: KnowledgeAdmission) -> KnowledgeAdmission {
+fn validated(admission: KnowledgeAdmission, scope_id: &str) -> KnowledgeAdmission {
+    let scope_id = scope_id.to_string();
     Arc::new(move |peer_id: &str| -> SpokeResult<Scope> {
         let scope = match admission(peer_id) {
             SpokeResult::Ok(scope) => scope,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
+        if scope.scope_id != scope_id {
+            return spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                "knowledge scope not authorized",
+                None,
+            );
+        }
         match validate_admission_scope(&scope) {
             SpokeResult::Ok(()) => SpokeResult::Ok(scope),
             SpokeResult::Reject(_) => spoke_reject(

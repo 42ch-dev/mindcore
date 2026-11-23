@@ -10,17 +10,17 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_runtime::tools::{ABSORB, ADOPT, DELIBERATE, RECALL_CONTEXT};
+use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
-use spoke_connect::core::CAPABILITY_SPOKE_HISTORY;
+use spoke_connect::core::{CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION};
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
-    MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler,
+    MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler, KNOWLEDGE_OP_ADOPT,
 };
 use spoke_operations::{
-    spoke_ok, spoke_reject, validate_manifest_tools, SpokeRejectCode, SpokeResult,
+    spoke_ok, spoke_reject, validate_manifest_tools, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
@@ -28,6 +28,8 @@ use spoke_schemas::{HostCapabilityManifest, Scope};
 const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
 const HOST_TOOL: &str = "tools.mindcore.host_tool";
+/// The retired product adoption id the runtime drops from every host registration.
+const RETIRED_ADOPT: &str = "tools.mindcore.adopt";
 
 struct Fixture {
     _dir: TempDir,
@@ -83,11 +85,13 @@ fn unsupported_scope() -> Scope {
 }
 
 /// The host's admission: one admitted peer, one peer whose admitted scope carries a selection the
-/// face does not serve, and a stranger.
+/// face does not serve, one peer the host admits under a scope id this surface does not serve, and
+/// a stranger.
 fn admission() -> KnowledgeAdmission {
     Arc::new(|peer_id: &str| match peer_id {
         "peer-owner" => SpokeResult::Ok(scope_of(SCOPE_ID)),
         "peer-cognition" => SpokeResult::Ok(unsupported_scope()),
+        "peer-elsewhere" => SpokeResult::Ok(scope_of("spoke-scope-other")),
         _ => spoke_reject(
             SpokeRejectCode::NotAuthorized,
             format!("peer {peer_id} holds no knowledge admission"),
@@ -96,10 +100,11 @@ fn admission() -> KnowledgeAdmission {
     })
 }
 
-/// The host's peer-to-principal admission: the driver is admitted, a stranger is not.
+/// The host's peer-to-principal admission: the driver is admitted, and the mismatch peer is
+/// admitted as the same principal so only the admitted scope id can refuse it. A stranger is not.
 fn principals() -> MemoryAdmission {
     Arc::new(|peer_id: &str| match peer_id {
-        "peer-owner" => SpokeResult::Ok(
+        "peer-owner" | "peer-elsewhere" => SpokeResult::Ok(
             serde_json::from_value(json!({ "principal_id": "prn_owner", "extensions": {} }))
                 .expect("principal JSON matches the schema"),
         ),
@@ -151,6 +156,14 @@ impl ServedMemory for FourOfFive {
     }
 }
 
+/// The one shared source collection an adopting surface reads from.
+fn adoption_source() -> AdoptionRoute {
+    AdoptionRoute {
+        scope_id: "spc_shared".to_string(),
+        source: KnowledgeScope::new("shared"),
+    }
+}
+
 /// The host's route map: its one admitted principal's workflow collection.
 fn routes() -> BTreeMap<String, KnowledgeScope> {
     BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(COLLECTION))])
@@ -197,6 +210,13 @@ fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
     match result {
         SpokeResult::Ok(value) => value,
         SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
+    }
+}
+
+fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
+    match result {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value:?}"),
     }
 }
 
@@ -282,6 +302,38 @@ async fn manifest_follows_the_composed_faces() {
     expect_ok(
         validate_manifest_tools(&served.manifest),
         "the history-serving manifest is self-consistent",
+    );
+
+    assert!(
+        !capabilities(&served).contains(&CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION),
+        "no adoption source is configured, so the adoption face is not advertised"
+    );
+    let adopting = expect_ok(
+        serve.surface(ServeFaces {
+            adoption: Some(adoption_source()),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble an adopting surface",
+    );
+    assert_eq!(
+        capabilities(&adopting),
+        [
+            "spoke-knowledge",
+            "ke-ownership",
+            CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION,
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE
+        ],
+        "the adoption face is advertised exactly when it is served"
+    );
+    assert!(
+        adopting.ports.as_adoption().is_some(),
+        "the adoption face is composed over the routed store"
+    );
+    expect_ok(
+        validate_manifest_tools(&adopting.manifest),
+        "the adopting manifest is self-consistent",
     );
 }
 
@@ -387,6 +439,34 @@ async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly(
     }
 }
 
+/// A source scope equal to the destination scope would let a principal adopt from its own
+/// destination, so assembly refuses it.
+#[tokio::test]
+async fn an_adoption_source_equal_to_the_destination_scope_is_refused() {
+    let serve = Fixture::open().await.serve();
+    let reject = match serve.surface(ServeFaces {
+        adoption: Some(AdoptionRoute {
+            scope_id: SCOPE_ID.to_string(),
+            source: KnowledgeScope::new("shared"),
+        }),
+        ..faces(metadata("runtime"))
+    }) {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(surface) => {
+            panic!(
+                "a source scope equal to the destination assembled {:?}",
+                capabilities(&surface)
+            )
+        }
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        reject.message,
+        "the adoption source scope is the destination scope"
+    );
+    assert!(reject.details.is_none(), "{reject:?}");
+}
+
 /// An empty source collection or an empty source scope id names no source, so assembly refuses it.
 #[tokio::test]
 async fn an_empty_adoption_source_is_refused_at_assembly() {
@@ -418,69 +498,55 @@ async fn an_empty_adoption_source_is_refused_at_assembly() {
     }
 }
 
-/// The adoption id is the runtime's: a host registration cannot supply it on a surface that serves
-/// no adoption, nor replace the descriptor installed for it when the surface does.
+/// The retired adoption id is the runtime's: a host registration of `tools.mindcore.adopt` is
+/// dropped, so it appears in neither `capabilities` nor `tools` — with or without a configured
+/// adoption source, which serves nothing until the protocol face arrives.
 #[tokio::test]
 async fn a_host_registration_cannot_shadow_the_adoption_tool() {
     let serve = Fixture::open().await.serve();
 
-    let unserved = expect_ok(
-        serve.surface(ServeFaces {
-            tools: vec![shadowing_adoption()],
-            ..faces(metadata("runtime"))
-        }),
-        "assemble a surface a host tries to shadow without configuring adoption",
-    );
-    assert!(
-        !capabilities(&unserved).contains(&ADOPT),
-        "a host registration supplied an id no adoption serves: {:?}",
-        capabilities(&unserved)
-    );
-    assert!(
-        unserved
-            .manifest
-            .tools
-            .iter()
-            .all(|tool| tool.capability_id.as_str() != ADOPT),
-        "the host's adoption descriptor is not advertised"
-    );
-
-    let source = || {
+    let adopted = || {
         Some(AdoptionRoute {
             scope_id: "spc_shared".to_string(),
             source: KnowledgeScope::new("shared"),
         })
     };
-    let plain = expect_ok(
-        serve.surface(ServeFaces {
-            adoption: source(),
-            ..faces(metadata("runtime"))
-        }),
-        "assemble an adopting surface",
-    );
-    let shadowed = expect_ok(
-        serve.surface(ServeFaces {
-            adoption: source(),
-            tools: vec![shadowing_adoption()],
-            ..faces(metadata("runtime"))
-        }),
-        "assemble an adopting surface a host tries to shadow",
-    );
+    for (context, adoption) in [
+        ("without a configured adoption source", None),
+        ("with a configured adoption source", adopted()),
+    ] {
+        let surface = expect_ok(
+            serve.surface(ServeFaces {
+                adoption,
+                tools: vec![shadowing_adoption()],
+                ..faces(metadata("runtime"))
+            }),
+            "assemble a surface a host tries to shadow",
+        );
 
-    assert_eq!(
-        advertised_descriptor(&shadowed, ADOPT),
-        advertised_descriptor(&plain, ADOPT),
-        "the host registration replaced the runtime's adoption descriptor"
-    );
+        assert!(
+            !capabilities(&surface).contains(&RETIRED_ADOPT),
+            "a host registration supplied the retired id {context}: {:?}",
+            capabilities(&surface)
+        );
+        assert!(
+            surface
+                .manifest
+                .tools
+                .iter()
+                .all(|tool| tool.capability_id.as_str() != RETIRED_ADOPT),
+            "the host's retired adoption descriptor is not advertised {context}"
+        );
+    }
 }
 
-/// A host registration borrowing the runtime's adoption id: accepted, its descriptor and handler
-/// would stand in for the runtime's.
+/// A host registration borrowing the retired adoption id: its descriptor would be advertised and
+/// its handler installed if the runtime did not drop it.
 fn shadowing_adoption() -> ToolRegistration {
     let descriptor: ToolDescriptor = serde_json::from_value(json!({
         "schema_version": 1,
-        "capability_id": ADOPT,
-        "op": ADOPT,
+        "capability_id": RETIRED_ADOPT,
+        "op": RETIRED_ADOPT,
         "description": "A host-supplied adoption tool.",
         "input": { "type": "object" },
         "output": { "type": "object" },
@@ -494,21 +560,6 @@ fn shadowing_adoption() -> ToolRegistration {
         });
         handler
     })
-}
-
-/// The one advertised descriptor for `capability_id`, as the manifest carries it.
-fn advertised_descriptor(
-    surface: &mindcore_runtime::MindcoreSurface,
-    capability_id: &str,
-) -> Value {
-    let matching: Vec<&ToolDescriptor> = surface
-        .manifest
-        .tools
-        .iter()
-        .filter(|tool| tool.capability_id.as_str() == capability_id)
-        .collect();
-    assert_eq!(matching.len(), 1, "{capability_id} is advertised once");
-    serde_json::to_value(matching[0]).expect("a tool descriptor serializes")
 }
 
 /// Attaching the host's memory service adds its capability and its face, still without a baseline.
@@ -646,6 +697,57 @@ async fn tool_registrations_drive_advertisement_and_installation() {
     .await;
     expect_ok(surface.register(&responder), "install handlers");
     responder.close();
+}
+
+/// The admitted scope id must be the one this surface serves, not merely a well-formed selection:
+/// a resolver that admits another id is refused on both faces. Without the id check, an adoption
+/// whose destination names that foreign id matches the admitted context and writes to the
+/// principal's routed collection, while the knowledge face denies the same peer.
+#[tokio::test]
+async fn an_admitted_scope_id_outside_the_served_one_is_refused() {
+    let serve = Fixture::open().await.serve();
+    let surface = expect_ok(
+        serve.surface(ServeFaces {
+            adoption: Some(adoption_source()),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble an adopting surface",
+    );
+    let face = surface
+        .ports
+        .as_knowledge()
+        .expect("knowledge face composed");
+
+    let refused = match (face.admission)("peer-elsewhere") {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(scope) => panic!("a foreign admitted id reached Connect with {scope:?}"),
+    };
+    assert_eq!(refused.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(refused.message, "knowledge scope not authorized");
+    assert!(refused.details.is_none(), "{refused:?}");
+
+    let adoption = surface.ports.as_adoption().expect("adoption face composed");
+    let denied = expect_reject(
+        adoption
+            .invoke(
+                "peer-elsewhere",
+                KNOWLEDGE_OP_ADOPT,
+                json!({
+                    "source_scope_id": "spc_shared",
+                    "source_entry_id": "ke_source",
+                    "source_revision": 1,
+                    "destination_scope_id": "spoke-scope-other",
+                    "idempotency_key": "mismatch",
+                }),
+            )
+            .await,
+        "adoption under a foreign admitted id",
+    );
+    assert_eq!(
+        denied.code,
+        SpokeRejectCode::NotAuthorized,
+        "the adoption face refuses what the knowledge face denies"
+    );
 }
 
 /// The runtime validates the scope the host admits, before Connect merges any request selection.

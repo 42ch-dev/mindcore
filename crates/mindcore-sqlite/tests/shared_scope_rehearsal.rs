@@ -317,7 +317,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     );
 
     match expect_ok(
-        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "ke_gate", 2).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "ke_gate", "ke_gate", 2).await,
         "item 2: adopt ke_gate at revision 2",
     ) {
         AdoptionOutcome::Created(_) => {}

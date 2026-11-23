@@ -233,11 +233,7 @@ fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
     match result {
         SpokeResult::Ok(outcome) => panic!("{context}: unexpectedly adopted {outcome:?}"),
         SpokeResult::Reject(reject) => {
-            assert_eq!(
-                reject.code,
-                SpokeRejectCode::KnowledgeEntryNotFound,
-                "{context}"
-            );
+            assert_eq!(reject.code, SpokeRejectCode::NotFound, "{context}");
             assert_eq!(
                 reject.message, "source knowledge entry not found",
                 "{context}"
@@ -396,7 +392,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "read the source before adoption",
     );
     let copy = match expect_ok(
-        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", 3).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", "entry-a", 3).await,
         "adoption at revision 3",
     ) {
         AdoptionOutcome::Created(copy) => copy,
@@ -406,8 +402,8 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     assert_eq!(copy.revision, Some(1));
     assert_eq!(summary_of(&copy), Some(REVISION_THREE));
     assert!(
-        record_ids(&copy).is_empty(),
-        "the copy carries none of the source's judgments"
+        module_of(&copy).is_none(),
+        "the copy drops the cognition module rather than carrying an empty one"
     );
     assert_eq!(
         adoption_anchor_parts(&copy),
@@ -431,7 +427,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
 
     let repeat = match expect_ok(
-        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", 3).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", "entry-a", 3).await,
         "repeat adoption at the adopted revision",
     ) {
         AdoptionOutcome::AlreadyPresent(existing) => existing,
@@ -536,11 +532,19 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
 
     expect_source_absent(
-        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", 3).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", "entry-a", 3).await,
         "adopting a superseded source",
     );
     expect_source_absent(
-        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-never-seeded", 1).await,
+        adopt_knowledge_entry(
+            &shared,
+            &personal,
+            SHARED_SCOPE,
+            "entry-never-seeded",
+            "entry-never-seeded",
+            1,
+        )
+        .await,
         "adopting a missing source",
     );
     let marked_after = expect_ok(
@@ -614,7 +618,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "seed an owner-private entry",
     );
     expect_source_absent(
-        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-p", 1).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-p", "entry-p", 1).await,
         "adopting an owner-private entry",
     );
     let copy_after = expect_ok(
@@ -1438,8 +1442,14 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         "a prune that keeps no checkpoint",
     );
     expect_history_reject(
-        port.prune_history(&peer, &scope_of("spc_other"), "knowledge_entry", "entry-l", 0)
-            .await,
+        port.prune_history(
+            &peer,
+            &scope_of("spc_other"),
+            "knowledge_entry",
+            "entry-l",
+            0,
+        )
+        .await,
         SpokeRejectCode::NotAuthorized,
         "a zero-keep prune on an unconfigured route",
     );

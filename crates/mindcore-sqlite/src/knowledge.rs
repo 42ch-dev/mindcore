@@ -13,7 +13,7 @@ use spoke_operations::{
     assert_adoption_anchor_preserved, filter_knowledge_entries_by_scope,
     knowledge_entry_visible_to_viewpoint, spoke_reject, validate_cognition_module,
     validate_cognition_record, HistoryPort, HistoryPruneResult, KnowledgeEntryPort,
-    ScopedKnowledgePort, SpokeReject, SpokeRejectCode, SpokeResult,
+    RetirementChainEntry, ScopedKnowledgePort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::data::revision_snapshot::{RevisionSnapshotSnapshot, Shared2};
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
@@ -1146,7 +1146,7 @@ async fn read_stored_row(
 /// transaction. The payload is returned as written — one statement selects the marker with it —
 /// so a caller that re-encodes it keeps the same cognition envelope and never copies the record
 /// rows back inline; [`read_entry`] projects those rows on top.
-async fn read_lifecycle(
+pub(crate) async fn read_lifecycle(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,
@@ -1170,6 +1170,87 @@ async fn read_lifecycle(
         Ok(None) => entry_not_found(collection, entry_id),
         Err(error) => internal(format!("knowledge entry could not be read: {error}")),
     }
+}
+
+/// `Ok(Some(..))` with the entry's successors: its `superseded_by` when the row is retired, none
+/// while it is live. `Ok(None)` when the row is missing, which the chain resolver reports as an
+/// ambiguous merge. A failed read is a storage fault, so it answers `InternalError` instead of
+/// reading as absence.
+pub async fn retirement_successors_of(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+) -> SpokeResult<Option<Vec<String>>> {
+    let marker: Result<Option<Option<String>>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT superseded_by FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(&mut **tx)
+    .await;
+    match marker {
+        Ok(Some(marker)) => SpokeResult::Ok(Some(marker.into_iter().collect())),
+        Ok(None) => SpokeResult::Ok(None),
+        Err(error) => internal(format!(
+            "knowledge retirement marker could not be read: {error}"
+        )),
+    }
+}
+
+/// One retirement-chain node of `collection`, read through the caller's transaction.
+///
+/// `Ok(None)` when the row is missing or hidden from the viewpoint-free disclosure predicate, so a
+/// hidden hop never enters the chain. A failed read or a stored payload that does not decode is a
+/// storage fault, so it answers `InternalError` instead of reading as absence. `scope_id` is the
+/// source scope the row is read under; `status` is `merged` while the row carries a marker and
+/// `live` otherwise — the store never holds a `deleted` entry — and `revision` is the row's
+/// revision column.
+pub async fn load_retirement_entry(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    scope_id: &str,
+    entry_id: &str,
+) -> SpokeResult<Option<RetirementChainEntry>> {
+    let stored: Result<Option<(i64, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, payload, superseded_by FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(&mut **tx)
+    .await;
+    let (revision, payload, superseded_by) = match stored {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return SpokeResult::Ok(None),
+        Err(error) => {
+            return internal(format!(
+                "knowledge retirement entry could not be read: {error}"
+            ))
+        }
+    };
+    let entry = match decode(&payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => {
+            return internal(format!(
+                "stored retirement entry does not decode: {}",
+                reject.message
+            ))
+        }
+    };
+    if !knowledge_entry_visible_to_viewpoint(&entry, None) {
+        return SpokeResult::Ok(None);
+    }
+    SpokeResult::Ok(Some(RetirementChainEntry {
+        entry_id: entry_id.to_string(),
+        scope_id: scope_id.to_string(),
+        status: if superseded_by.is_some() {
+            "merged"
+        } else {
+            "live"
+        }
+        .to_string(),
+        revision: u64::try_from(revision).ok(),
+    }))
 }
 
 /// One entry-led replay selection: the stored floor, the chosen checkpoint's revision, its payload
