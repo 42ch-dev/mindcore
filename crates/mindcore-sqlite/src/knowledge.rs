@@ -802,8 +802,9 @@ impl RoutedKnowledgeStore {
                 .await
             {
                 SpokeResult::Ok(report) => report,
-                // The helper repeats the liveness probe inside this transaction; a row that left
-                // between the permission read and that probe is the same absence.
+                // Both reads run under this one BEGIN IMMEDIATE reservation, so the helper's probe
+                // cannot disagree with the permission read above; this arm normalizes the helper's
+                // own contract rather than an intervening disappearance.
                 SpokeResult::Reject(reject)
                     if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
                 {
