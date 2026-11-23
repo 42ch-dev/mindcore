@@ -49,8 +49,6 @@ pub(super) fn partition(bundle: &Value, digest: &str, limit: u64) -> AResult<Vec
         .and_then(Value::as_str)
         .ok_or_else(|| Reject::internal("the export bundle carries no export_id"))?
         .to_string();
-    // why: chunks whose reassembly cannot verify must never leave the adapter, so the
-    // seal the caller computed is checked against the one the bundle publishes.
     if object.get("digest").and_then(Value::as_str) != Some(digest) {
         return Err(Reject::internal("the export bundle digest does not verify"));
     }
@@ -67,8 +65,6 @@ pub(super) fn partition(bundle: &Value, digest: &str, limit: u64) -> AResult<Vec
         .map(|field| ((*field).to_string(), object[*field].clone()))
         .collect();
 
-    // An array present but empty stays visible on ordinal zero; an absent one is
-    // never emitted. `reflections` is the only member an export may omit.
     let mut stream: Vec<(&'static str, &Value)> = Vec::new();
     let mut empty_present: Vec<&'static str> = Vec::new();
     for field in BUNDLE_ARRAY_FIELDS {
@@ -86,9 +82,6 @@ pub(super) fn partition(bundle: &Value, digest: &str, limit: u64) -> AResult<Vec
         }
     }
 
-    // `chunk_count` is unknown while the last chunk is still being filled, so the
-    // frame is measured with the widest count this stream could produce: the
-    // measured size is then never smaller than the emitted one.
     let widest_count = decimal_digits(stream.len() as u64 + 1);
     let count_placeholder = 10u64.pow(widest_count as u32).saturating_sub(1);
     let widest_ordinal = decimal_digits(stream.len() as u64);
@@ -108,10 +101,6 @@ pub(super) fn partition(bundle: &Value, digest: &str, limit: u64) -> AResult<Vec
         current.push((field, element));
         counts[index] += 1;
         sums[index] += element_len;
-        // The header chunk is measured even for its first element: the header alone
-        // can push an element that fits an ordinary chunk past the limit. A group
-        // past ordinal zero is measured only once it holds two elements, so an
-        // oversized single element still travels alone.
         if current.len() > 1 || groups.is_empty() {
             let frame = frame_for(
                 &mut frames,
@@ -133,7 +122,6 @@ pub(super) fn partition(bundle: &Value, digest: &str, limit: u64) -> AResult<Vec
             }
         }
     }
-    // A bundle whose arrays are all empty still gets its one header-only chunk.
     groups.push(current);
 
     let chunk_count = groups.len() as u64;
@@ -166,9 +154,6 @@ fn frame_for(
     empty_present: &[&'static str],
     count: u64,
 ) -> AResult<u64> {
-    // Only the digit width of the ordinal is serialized into the frame, so the
-    // frame for ordinal 0 (which carries the header) and one per wider width
-    // covers every chunk this bundle can produce.
     let slot = if ordinal == 0 {
         0
     } else {
@@ -269,8 +254,6 @@ fn build_chunk(
             chunk.insert(field.to_string(), Value::Array(Vec::new()));
         }
     }
-    // The digest is a fixed 64 characters, so its placeholder keeps the measured
-    // size constant while `bytes` settles.
     chunk.insert("chunk_digest".to_string(), json!("0".repeat(64)));
 
     let mut bytes = 0u64;

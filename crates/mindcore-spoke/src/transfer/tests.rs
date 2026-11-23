@@ -1202,8 +1202,6 @@ async fn stage_as(
         json!({
             "space_id": space,
             "chunk": chunk,
-            // why: these stages import a space into itself, so the subject collision the
-            // final chunk now decides is resolved by a rename rather than a refusal.
             "conflict_policy": "rename_subject",
             "idempotency_key": key,
         })
@@ -2305,10 +2303,7 @@ async fn the_credential_screen_keeps_plain_prefixed_labels() {
         "ghp_batch_7",
         "pk_project_1",
         "xoxb-staging",
-        // A dotless `eyJ` value is a prefix, not a JWT's segment structure.
         "eyJreport_42",
-        // Three segments are not enough either: a JWT's header segment decodes to a JSON object,
-        // and this versioned label's does not.
         "eyJreport_42.v1",
     ] {
         let errors = screen(label);
@@ -2317,9 +2312,6 @@ async fn the_credential_screen_keeps_plain_prefixed_labels() {
             "a plain opaque label {label} is not a credential: {errors:?}"
         );
     }
-    // Every compact serialisation of a JWT, built here so the fixture source never carries a
-    // token-shaped literal: a JWS, the same with an empty signature, a stripped signature, and a
-    // JWE.
     let header = "eyJhbGciOiJIUzI1NiJ9";
     let claims = "eyJzdWIiOiIxIn0";
     for label in [
@@ -2336,8 +2328,6 @@ async fn the_credential_screen_keeps_plain_prefixed_labels() {
             "{label} is a JWT: {errors:?}"
         );
     }
-    // Prefix plus the provider's own token length and alphabet, built here so the
-    // fixture source never carries a credential-shaped literal.
     let shaped = [
         format!("sk_live_{}", "9fK2mQ8xT4vR7bN3cL6pW1sD"),
         format!("ghp_{}", "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF3hJ6"),

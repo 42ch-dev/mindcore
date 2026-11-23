@@ -261,8 +261,6 @@ impl MemoryAdapter {
             freeze_gated: false,
         };
         if let Err(reject) = admission::authorize(&self.repository, tx, &admission, op.now).await {
-            // §7.30: a scope this caller cannot read is indistinguishable from an
-            // export the store never held, so neither ordinal nor expiry leaks.
             return Err(match reject.code {
                 SpokeRejectCode::NotAuthorized | SpokeRejectCode::NotFound => {
                     Reject::not_found(format!("export {export_id}"))

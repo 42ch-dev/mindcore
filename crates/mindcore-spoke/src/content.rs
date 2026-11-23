@@ -358,8 +358,6 @@ impl MemoryAdapter {
             .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
-        // contract §7.7 — `archived` hides the subject from the default listing; a
-        // status-filtered listing is an explicit audit query.
         let archived = status.is_none() && subject_status.as_deref() == Some("archived");
         let visible: Vec<MemoryCandidateIr> = if archived {
             Vec::new()
@@ -775,8 +773,6 @@ impl MemoryAdapter {
         admission::space(&self.repository, tx, &space).await?;
         let rows = admission::grants(&self.repository, tx, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
-        // contract §7.20 — either read capability is accepted; one grant must cover the whole
-        // selection either way (requirements never union across grants).
         let list = admission::covered(
             &wire_grants,
             principal_id,
@@ -1391,12 +1387,6 @@ impl MemoryAdapter {
             .unwrap_or(ranked.len())
             .min(ranked.len());
         let remaining = &ranked[start..];
-        // contract §9.3/I-000061 — walk the remaining candidates once, projecting each
-        // body only as the budget reaches it and charging the emitted
-        // `Content` object's UTF-8 bytes only when `max_bytes` is set. An
-        // oversized first candidate is kept whole (and named once via
-        // `overflow_record_id`); a later overflow defers to the page the
-        // next cursor reaches — the deferred item is not consumed here.
         let max_items = request.budget.max_items.get();
         let max_bytes = request.budget.max_bytes.map(|bound| bound.get());
         let mut bodies = Vec::new();

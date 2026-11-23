@@ -140,9 +140,6 @@ fn chunk_errors(
 /// plus every array in its fixed concatenation order.
 pub(super) fn reassemble(sequence: &[Value]) -> Option<Value> {
     let mut bundle = sequence.first()?.get("header")?.as_object()?.clone();
-    // why: the wire header omits an empty `extensions`, while the logical bundle the
-    // sender digested always carries it; restoring `{}` keeps the digest and the
-    // payload schema in agreement.
     bundle
         .entry("extensions".to_string())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -218,11 +215,6 @@ fn credential_shaped(value: &str) -> bool {
             return true;
         }
     }
-    // JOSE compact serialisation: a base64url header segment that is a JSON object, ahead of the
-    // form's other segments — three for a JWS, five for a JWE, two or three with the signature
-    // stripped or empty. The header is the test: a versioned opaque label such as
-    // `eyJreport_42.v1` shares the `eyJ` prefix and the alphabet, but its segments do not decode to
-    // JSON, so it stays a correlation label.
     let segments: Vec<&str> = value.split('.').collect();
     (2..=5).contains(&segments.len())
         && value.starts_with("eyJ")
@@ -253,8 +245,6 @@ fn reference_errors(bundle: &Value, adopted: &Value) -> Vec<String> {
     let subjects = key_set(bundle, "subjects", "subject_id");
     let records = key_set(bundle, "records", "record_id");
 
-    // why: the identity maps are many-to-one keys. A duplicate would pass verification
-    // and then break activation's mapping, stranding the import mid-sequence.
     for (field, member, noun) in [
         ("subjects", "subject_id", "subject"),
         ("records", "record_id", "record"),
@@ -469,8 +459,6 @@ impl MemoryAdapter {
             issuance: None,
             subject_gate: None,
             placement_gate: None,
-            // why: the family is on the §8.2 freeze allowlist, so staging into a
-            // frozen space is a maintenance path, not a refusal.
             freeze_gated: false,
         };
         let grants = admission::authorize(&self.repository, tx, &admission, op.now).await?;
@@ -478,10 +466,6 @@ impl MemoryAdapter {
             return Self::replay::<MemoryImportsStageResponse>(&receipt);
         }
 
-        // why: a local export the caller may not page is treated exactly like an export
-        // this store never held. Refusing one and accepting the other would disclose
-        // which guessed export ids exist; staging is the caller's own durable state, and
-        // the chunks it carries verify against the bundle on their own.
         let staging = self
             .repository
             .import_by_source(tx, &op.space, principal_id, &source_export_id)
@@ -489,9 +473,6 @@ impl MemoryAdapter {
         let mut live = staging;
         if let Some(row) = &live {
             if expired(row, op.now)? {
-                // why: an expired import is dead state, not a live one. Reclaiming it
-                // here — a successful, committed write — releases its payload and its
-                // source-export key, so this call can start the sequence again.
                 if ordinal > 0 {
                     return Err(expiry_conflict(row));
                 }
@@ -524,9 +505,6 @@ impl MemoryAdapter {
             let Some(row) = live else {
                 return Err(no_staging_import(&source_export_id));
             };
-            // why: `next_ordinal` alone decides what is acceptable, so a repeat and a
-            // skipped ordinal take the same refusal — and a refusal writes nothing,
-            // deletes nothing, and leaves `next_ordinal` where it was.
             if ordinal != row.next_ordinal {
                 return Err(conflict(format!(
                     "chunk {ordinal} is out of order; the import expects {}",

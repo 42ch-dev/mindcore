@@ -61,7 +61,6 @@ async fn install_step_counter(connection: &mut SqliteConnection) {
         .lock_handle()
         .await
         .expect("lock the sqlite handle");
-    // why: sqlx's callback contract is inverted from SQLite's: returning `true` continues.
     handle.set_progress_handler(1, || {
         VDBE_STEPS.fetch_add(1, Ordering::Relaxed);
         true

@@ -9,12 +9,13 @@ applies_when:
   - A plan proves acceptance facts rather than shipping a feature
   - The proof lives in an integration test against a real store
   - The same code path both performs the write and reports its outcome
+  - A probe asserts that a screen rejects one input shape and passes a look-alike
 tags:
   - testing
   - rehearsal
   - assertions
   - acceptance
-last_updated: 2026-11-22
+last_updated: 2026-11-23
 ---
 
 # A rehearsal asserts on read-back state, and every probe needs a positive control
@@ -57,6 +58,24 @@ all reads. The negative side is only meaningful once the positive side is proven
    what the copy carried.
 5. **Name the acceptance item in every assertion message.** A failure must say which fact broke, not
    that an assertion failed.
+6. **Give a negative control the look of the positive.** A label that must pass a credential screen
+   is a control only when it shares the screen's trigger — the prefix, the alphabet, the segment
+   count. A dotless `eyJ…` value shares the JWT prefix but not its segment structure. A
+   dotted label such as `eyJreport_42.v1` shares the prefix, the base64url alphabet and a
+   place inside the accepted two-to-five segment range; both must still pass, because
+   a JWT is decided by its first segment decoding to a JSON object. Without the look-alikes
+   the screen could reject on prefix alone and the probe would stay green.
+7. **Build credential-shaped fixtures at run time.** Assemble the value from a prefix constant and a
+   tail constant (`format!("{header}.{claims}.{signature}")` for each compact serialisation, prefix
+   plus a tail of the provider's own length and alphabet for a key) so the fixture source never
+   carries a token- or key-shaped literal. The assembled values still exercise the screen, while a
+   literal in the tree trips secret scanners and reads as a leaked credential in review.
+8. **Enumerate the forms a screen must reject, not the assembly trick.** Assembling the fixtures says
+   nothing about which shapes were exercised. For a JWT screen the coverage is every compact
+   serialisation: a signed JWS, the same with an empty signature, one with the signature stripped,
+   and an encrypted JWE. They differ in segment count and in whether the last segment is
+   empty, and each needs its own assembled value and its own assertion, or a screen that misses
+   one form stays green.
 
 ## What did not work
 

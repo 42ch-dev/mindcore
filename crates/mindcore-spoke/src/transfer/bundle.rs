@@ -133,8 +133,6 @@ pub(super) fn assemble(
     };
 
     let mut subjects = subjects;
-    // why: an export of one subject still carries the row it names, even when the
-    // store has no other subject.
     subjects.sort_by(|left, right| {
         left.subject
             .subject_id
@@ -171,9 +169,6 @@ pub(super) fn assemble(
         .map(|snapshot| snapshot.subject.subject_id.as_str())
         .collect();
 
-    // A consumed candidate names the records its review produced. An id the export
-    // does not carry would disclose an excluded row and dangle at the target, so the
-    // list keeps only retained ids — possibly none, which is a valid empty array.
     let retained: std::collections::BTreeSet<String> = record_values
         .iter()
         .filter_map(|record| record["record_id"].as_str().map(str::to_string))

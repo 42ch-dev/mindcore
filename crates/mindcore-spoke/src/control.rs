@@ -87,9 +87,6 @@ impl MemoryAdapter {
         }
         let principal_id = principal_id(principal);
         let now = Utc::now();
-        // why: one streaming scan decides which spaces the principal can see; the
-        // revisions the cursor needs come from a projection over those spaces,
-        // so peak memory follows the visible grants, not the whole history.
         let mut visible_space_ids: HashSet<String> = HashSet::new();
         self.repository
             .scan_principal_grants(tx, principal_id, |grant| {
