@@ -28,6 +28,7 @@ use spoke_schemas::{
     MemoryRecordsUpdateRequest, Principal, RetainedRecord,
 };
 
+use crate::judgment::deliberate_judgment;
 use crate::{
     AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DeliberateOutcome,
     DeliberateRequest, DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput,
@@ -1011,7 +1012,9 @@ impl SpiMindWorkflows {
         }
         ensure_time_left(deadline)?;
         let Some(record) = record else {
-            return Ok(DeliberateOutcome::NoChange { verdict });
+            let judgment =
+                deliberate_judgment(principal, request, "no_change", &verdict, &cited)?;
+            return Ok(DeliberateOutcome::NoChange { verdict, judgment });
         };
         let fallback = DefaultPolicy;
         let policy: &dyn PolicyHook = caps.policy_hook.unwrap_or(&fallback);
@@ -1023,14 +1026,20 @@ impl SpiMindWorkflows {
         match decision {
             PolicyDecision::AutoSettle => {}
             PolicyDecision::RequireHumanReview { .. } => {
+                let judgment =
+                    deliberate_judgment(principal, request, "needs_review", &verdict, &cited)?;
                 return Ok(DeliberateOutcome::NeedsReview {
                     verdict,
                     draft: record,
-                })
+                    judgment,
+                });
             }
             PolicyDecision::Reject { reason } => return Err(SpiError::PolicyRejected(reason)),
         }
         ensure_time_left(deadline)?;
+        // Built before the commit so a projection defect refuses while nothing
+        // is written (compass D18).
+        let judgment = deliberate_judgment(principal, request, "settled", &verdict, &cited)?;
         let mind_state_version = self
             .binding
             .commit_cognition(
@@ -1048,6 +1057,7 @@ impl SpiMindWorkflows {
             verdict,
             record,
             mind_state_version,
+            judgment,
         })
     }
 }
@@ -1100,7 +1110,7 @@ const DELIBERATE_RETRIES: usize = 2;
 /// The identity every visible memory record's reference carries: the record
 /// kind and the Mindcore realm namespace. A basis entry naming any other pair
 /// claims an identity this snapshot never admitted.
-const MEMORY_RECORD_IDENTITY: (&str, &str) = ("memory_record", "mindcore");
+pub(crate) const MEMORY_RECORD_IDENTITY: (&str, &str) = ("memory_record", "mindcore");
 
 /// The longest request deadline the engine honours. A timeout is clamped here
 /// before the instant is computed, so no absurd value can overflow the instant

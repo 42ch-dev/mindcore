@@ -13,6 +13,7 @@
 //! caller) to [`Reasoner`].
 
 pub mod adoption;
+pub mod judgment;
 pub mod workflows;
 
 pub use adoption::{adopt_knowledge_entry, adopt_knowledge_entry_typed, AdoptionOutcome};
@@ -32,8 +33,8 @@ use spoke_operations::SpokeReject;
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::ops::memory_candidates_review_request::Decision;
 use spoke_schemas::{
-    CognitionRecord, KnowledgeEntry, MemoryCandidate, MemoryCaptureRequest, MemoryRecallRequest,
-    MemoryRecordsUpdateRequest, Principal, RetainedRecord,
+    CognitionRecord, Judgment, KnowledgeEntry, MemoryCandidate, MemoryCaptureRequest,
+    MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal, RetainedRecord,
 };
 
 /// Everything a capability call or workflow can surface, in typed form.
@@ -464,6 +465,10 @@ pub struct DeliberateRequest<'a> {
 }
 
 /// The outcome of one `deliberate` call.
+///
+/// Every variant carries the [`Judgment`] the workflow built and validated for
+/// this attempt (`spoke-judgment`): the portable projection of the same verdict,
+/// its target and its revision-pinned citations.
 #[derive(Debug, Clone)]
 pub enum DeliberateOutcome {
     /// The verdict settled and a `MindState` was derived.
@@ -475,6 +480,8 @@ pub enum DeliberateOutcome {
         /// Version of the committed source the derived `MindState` descends
         /// from.
         mind_state_version: u64,
+        /// The validated `spoke-judgment` projection of this attempt.
+        judgment: Judgment,
     },
     /// Policy held the verdict for human review; nothing settled.
     NeedsReview {
@@ -482,11 +489,15 @@ pub enum DeliberateOutcome {
         verdict: Value,
         /// The unsettled cognition record draft.
         draft: CognitionRecord,
+        /// The validated `spoke-judgment` projection of this attempt.
+        judgment: Judgment,
     },
     /// The verdict recommended no record, so nothing was written.
     NoChange {
         /// The validated structured verdict.
         verdict: Value,
+        /// The validated `spoke-judgment` projection of this attempt.
+        judgment: Judgment,
     },
 }
 
