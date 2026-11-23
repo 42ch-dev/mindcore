@@ -180,8 +180,8 @@ impl MindcoreServe {
 /// Assembly refuses a source that names a route destination, so a principal's write can never
 /// become the source another reads.
 pub struct AdoptionRoute {
-    /// The id naming this source on the wire; recorded in every adopted copy's anchor triple and
-    /// compared against a served request's `source_scope_id`.
+    /// The host-owned id naming this source on the wire, recorded in every adopted copy's anchor
+    /// triple. Callers cannot supply it: this baseline forwards only the configured value.
     pub scope_id: String,
     pub source: KnowledgeScope,
 }
