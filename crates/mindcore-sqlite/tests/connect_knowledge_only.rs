@@ -32,7 +32,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
 use mindcore_sqlite::{validate_admission_scope, MindStore, SERVED_KNOWLEDGE_LIST_LIMIT};
 use spoke_connect::core::{
     derive_peer_id_from_ed25519_pubkey, issue_capability_token, CapabilityClaims,
@@ -108,6 +108,7 @@ async fn raw_connection(path: &Path) -> SqlitePool {
 
 fn entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody {
             summary: Some(summary.to_string()),
             ..KnowledgeEntryBody::default()
@@ -471,13 +472,11 @@ async fn knowledge_only_session_serves_get_conditional_put_and_scoped_list() {
     assert_eq!(stale.code, SpokeRejectCode::StoredRevisionStale);
     let details = stale.details.expect("stale reject carries the revisions");
     assert_eq!(
-        details
-            .get("expected_base_revision")
-            .and_then(Value::as_u64),
+        details.get("expectedBaseRevision").and_then(Value::as_u64),
         Some(1)
     );
     assert_eq!(
-        details.get("stored_revision").and_then(Value::as_u64),
+        details.get("storeRevision").and_then(Value::as_u64),
         Some(2),
         "the stale refusal preserves the stored revision"
     );
@@ -1055,30 +1054,38 @@ async fn refused_put_names_no_collection() {
     assert_eq!(foreign.code, SpokeRejectCode::StoredRevisionStale);
     assert_eq!(absent.code, foreign.code);
     assert_eq!(
-        foreign.message, "knowledge entry ke_elsewhere does not hold the expected revision",
+        foreign.message, "KnowledgeEntry not found for update: ke_elsewhere",
         "the stale refusal names no collection"
     );
     assert_eq!(
-        absent.message, "knowledge entry ke_absent does not hold the expected revision",
+        absent.message, "KnowledgeEntry not found for update: ke_absent",
         "an absent id reads exactly like a foreign-only one"
     );
-    assert_eq!(
-        absent.details, foreign.details,
-        "both report the same revisions"
-    );
-    let details = foreign
+    let mut foreign_details = foreign
+        .details
+        .clone()
+        .expect("stale reject carries revisions");
+    let mut absent_details = absent
         .details
         .clone()
         .expect("stale reject carries revisions");
     assert_eq!(
-        details
-            .get("expected_base_revision")
+        foreign_details.remove("entry_id"),
+        Some(json!("ke_elsewhere"))
+    );
+    assert_eq!(absent_details.remove("entry_id"), Some(json!("ke_absent")));
+    assert_eq!(
+        absent_details, foreign_details,
+        "both report the same revisions once the echoed entry id is set aside"
+    );
+    assert_eq!(
+        foreign_details
+            .get("expectedBaseRevision")
             .and_then(Value::as_u64),
         Some(1)
     );
-    assert_eq!(
-        details.get("stored_revision"),
-        Some(&Value::Null),
+    assert!(
+        !foreign_details.contains_key("storeRevision"),
         "a row outside the served collection has no stored revision"
     );
 
@@ -1091,9 +1098,9 @@ async fn refused_put_names_no_collection() {
         .await,
         "create-only put of a visible id",
     );
-    assert_eq!(collision.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
+    assert_eq!(collision.code, SpokeRejectCode::RevisionConflict);
     assert_eq!(
-        collision.message, "knowledge entry ke_alpha already exists",
+        collision.message, "Entry already exists: ke_alpha",
         "the collision refusal names no collection"
     );
     for reject in [&foreign, &absent, &collision] {
@@ -1591,5 +1598,89 @@ async fn served_list_refuses_a_collection_over_the_bound() {
         wired_details.get("limit"),
         Some(&Value::from(SERVED_KNOWLEDGE_LIST_LIMIT)),
         "a signed session forwards the bound the collection crossed: {wired:?}"
+    );
+}
+
+/// The served store, called below the responder, applies the anchor gate itself: a put that
+/// replaces or drops a stored `adoption_anchor` refuses `ADOPTION_ANCHOR_IMMUTABLE` naming the
+/// destination entry, so a peer that reaches the port without the responder's own check (0.18
+/// gates `port.knowledge.put` before the provider) still cannot rewrite provenance.
+#[tokio::test]
+async fn the_served_put_is_the_anchor_gate_backstop() {
+    let fixture = Fixture::open().await;
+    let scope = scope_of(SCOPE_ID);
+    let served = fixture
+        .store
+        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let local = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+
+    let mut adopted = entry("ke_adopted", "an adopted copy");
+    adopted.adoption_anchor = adoption_anchor("spc_shared", "ke_shared_north_gate", 1);
+    let stored = expect_ok(
+        local.put_knowledge_entry(adopted, None).await,
+        "seed an anchored copy",
+    );
+    assert_eq!(stored.revision, Some(1));
+
+    for (submitted, context) in [
+        (
+            {
+                let mut replaced = entry("ke_adopted", "an adopted copy");
+                replaced.adoption_anchor =
+                    adoption_anchor("spc_elsewhere", "ke_shared_north_gate", 1);
+                replaced
+            },
+            "a replaced anchor",
+        ),
+        (entry("ke_adopted", "an adopted copy"), "a dropped anchor"),
+    ] {
+        let refused = expect_reject(
+            served
+                .put_scoped_knowledge_entry(&scope, submitted, Some(1))
+                .await,
+            context,
+        );
+        assert_eq!(
+            refused.code,
+            SpokeRejectCode::AdoptionAnchorImmutable,
+            "{context}: the store is the backstop, with no responder in the path"
+        );
+        assert_eq!(
+            refused
+                .details
+                .as_ref()
+                .and_then(|details| details.get("entry_id")),
+            Some(&json!("ke_adopted")),
+            "{context}: the refusal names the destination entry"
+        );
+    }
+
+    let after = expect_ok(
+        local.get_knowledge_entry("ke_adopted").await,
+        "the refused puts left the row in place",
+    );
+    assert_eq!(after.revision, Some(1));
+    assert_eq!(
+        serde_json::to_value(after.adoption_anchor.expect("the stored anchor survives"))
+            .expect("anchor serializes"),
+        serde_json::to_value(
+            adoption_anchor("spc_shared", "ke_shared_north_gate", 1).expect("a named triple")
+        )
+        .expect("anchor serializes"),
+        "the stored anchor survives both refusals"
+    );
+
+    let mut identical = entry("ke_adopted", "the same anchor, edited");
+    identical.adoption_anchor = adoption_anchor("spc_shared", "ke_shared_north_gate", 1);
+    let updated = expect_ok(
+        served
+            .put_scoped_knowledge_entry(&scope, identical, Some(1))
+            .await,
+        "an identical anchor passes the served put",
+    );
+    assert_eq!(updated.revision, Some(2));
+    assert_eq!(
+        updated.body.summary.as_deref(),
+        Some("the same anchor, edited")
     );
 }

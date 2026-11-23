@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+- **Breaking — `mindcore-runtime`:** the private product tool `tools.mindcore.adopt` is removed, not
+  deprecated. Adoption is served only as the published protocol operation `knowledge.adopt` under the
+  `spoke-knowledge-adoption` capability, which requires `spoke-knowledge`; the runtime filters the
+  reserved id out of every host registration, so no manifest advertises it and no handler answers it.
+  A caller migrates the call as `entry_id` → `source_entry_id`, `expected_source_revision` →
+  `source_revision`, and expects `outcome` `adopted` instead of `created` (`already_present` and
+  `entry` keep their meanings). The request gains required `source_scope_id` — it must equal
+  `AdoptionRoute.scope_id`, and any other value is the same generic `NOT_FOUND` as a missing source —
+  required `destination_scope_id` — it must equal the peer's admitted scope id, or `NOT_AUTHORIZED`
+  before the source is read — required `idempotency_key`, and optional `destination_entry_id`, which
+  names the copy and defaults to the resolved terminal's entry id; assembly now also refuses a
+  source scope equal to `ServeFaces.scope_id`. The destination is no longer per-principal: the copy
+  is written into the collection the knowledge face serves (`ServeFaces.knowledge`), not the
+  adopting principal's `workflow_routes` entry, so it is readable through the `knowledge.get`/`list`
+  that share the adoption's admission. `workflow_routes` now selects and authorizes only the
+  routed workflow calls and plays no part in adoption. This is a breaking assembly change: a host
+  whose adoption source collection equals that knowledge collection assembled before — the copy
+  went to the principal's distinct route collection — and is now refused with `InvalidInput` ("the
+  adoption source collection is the collection the knowledge face serves"). Migrate by naming a
+  distinct adoption source collection, different from `ServeFaces.knowledge.collection` and from
+  every `workflow_routes` destination, and by dropping any expectation that a route names an
+  adoption destination. Two further refusals: the admitted scope's
+  `entry_ids`/`entry_types` selection now applies to the destination, so an excluded entry is
+  neither served nor written and answers the ordinary occupancy `REVISION_CONFLICT` with no
+  details — byte-identical to a visible occupant's, so the answer reports slot occupancy only and
+  never the occupying entry's content, revision or visibility — `NOT_AUTHORIZED` staying the answer
+  for a `destination_scope_id` that is not the admitted scope; and a resolved terminal revision above
+  `2^53-1` refuses before the write instead of committing a copy whose response the wire cannot
+  carry. Two behaviour changes: adoption admits through the knowledge face's `(principals,
+  knowledge_admission)` pair, so a routed principal that face does not admit
+  answers `NOT_AUTHORIZED` where the product tool served it; and the source resolves through
+  `resolve_retirement_chain` before the copy, so the anchor names the live terminal (the copy's own
+  entry id is the supplied `destination_entry_id` or, when absent, that terminal's id), a
+  live source that moved off `source_revision` is `REVISION_CONFLICT` with no details, and a chain
+  that cannot resolve is `SOURCE_RETIRED` with `details.retirement_chain`. The local refusal
+  vocabulary is the protocol's — `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT` with
+  `details.adopted_revision` only for a copy adopted at another revision, `SOURCE_RETIRED`,
+  `ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` — and the `owner`/`disclosure` reset is not
+  applied, so a copy inherits the source's governance. Connect's `AdoptionPortService` supplies the
+  idempotency envelope, including `IDEMPOTENCY_CONFLICT` and `RECEIPT_EXPIRED`.
 - `mindcore-spoke` / `mindcore-runtime`: `ServeFaces.memory` takes an `Arc<dyn ServedMemory>` — a
   `RemoteMemoryService` that reports the `memory.*` operations it dispatches — and the runtime
   advertises `spoke-memory-transfer` exactly when the attached service reports all five §7.29–§7.33
@@ -25,9 +65,9 @@
   the carrier payload keeps only the cognition module envelope, and full DTO reads project
   `records` from the rows in append order. A full put must carry the committed prefix
   unchanged and appends only its validated suffix.
-- Dependencies: the SPOKE cohort is pinned to `=0.17.0` — `spoke-schemas` and `spoke-operations` in
+- Dependencies: the SPOKE cohort is pinned to `=0.18.0` — `spoke-schemas` and `spoke-operations` in
   `[workspace.dependencies]`, and `spoke-connect` there too, so the SQLite test dependency inherits
-  the same pin with `remote-adapter` enabled.
+  the same pin with `remote-adapter` enabled. 0.18.0 is this release's pin.
 - `mindcore-sqlite`: pre-release migrations are mutable and the embedded set is now one initial
   file: `0002` is deleted and its table lives in `0001_init.sql`. There is no upgrade path until the
   first release: a database whose applied migrations still match the embedded file reopens normally,

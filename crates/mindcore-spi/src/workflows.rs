@@ -28,6 +28,7 @@ use spoke_schemas::{
     MemoryRecordsUpdateRequest, Principal, RetainedRecord,
 };
 
+use crate::judgment::deliberate_judgment;
 use crate::{
     AbsorbCandidateOutcome, CognitiveTaskKind, ContextPack, DefaultPolicy, DeliberateOutcome,
     DeliberateRequest, DomainLens, Embedder, EmbeddingIdentity, Evidence, LensOutput,
@@ -1011,7 +1012,11 @@ impl SpiMindWorkflows {
         }
         ensure_time_left(deadline)?;
         let Some(record) = record else {
-            return Ok(DeliberateOutcome::NoChange { verdict });
+            let judgment = deliberate_judgment(principal, request, "no_change", &verdict, &cited)?;
+            // No write follows, but a response built past the deadline is a
+            // phase that overran it; the check stays the last step either way.
+            ensure_time_left(deadline)?;
+            return Ok(DeliberateOutcome::NoChange { verdict, judgment });
         };
         let fallback = DefaultPolicy;
         let policy: &dyn PolicyHook = caps.policy_hook.unwrap_or(&fallback);
@@ -1023,13 +1028,27 @@ impl SpiMindWorkflows {
         match decision {
             PolicyDecision::AutoSettle => {}
             PolicyDecision::RequireHumanReview { .. } => {
+                let judgment =
+                    deliberate_judgment(principal, request, "needs_review", &verdict, &cited)?;
+                ensure_time_left(deadline)?;
                 return Ok(DeliberateOutcome::NeedsReview {
                     verdict,
                     draft: record,
-                })
+                    judgment,
+                });
             }
             PolicyDecision::Reject { reason } => return Err(SpiError::PolicyRejected(reason)),
         }
+        // The whole response is built before the commit so a projection defect
+        // refuses while nothing is written (compass D18), and the deadline is
+        // checked after that work with nothing left to run before the write
+        // begins.
+        // The check below only covers an expiry observed before the call: it
+        // does not bound the store-connection wait inside `commit_cognition`,
+        // so a request can expire there and still settle (residual I-000101).
+        let judgment = deliberate_judgment(principal, request, "settled", &verdict, &cited)?;
+        let stored = serde_json::to_value(&record)
+            .map_err(|error| SpiError::InvalidInput(error.to_string()))?;
         ensure_time_left(deadline)?;
         let mind_state_version = self
             .binding
@@ -1039,8 +1058,7 @@ impl SpiMindWorkflows {
                 request.subject_id,
                 request.holder,
                 snapshot.carrier_revision,
-                serde_json::to_value(&record)
-                    .map_err(|error| SpiError::InvalidInput(error.to_string()))?,
+                stored,
                 &cited,
             )
             .await?;
@@ -1048,6 +1066,7 @@ impl SpiMindWorkflows {
             verdict,
             record,
             mind_state_version,
+            judgment,
         })
     }
 }
@@ -1100,7 +1119,7 @@ const DELIBERATE_RETRIES: usize = 2;
 /// The identity every visible memory record's reference carries: the record
 /// kind and the Mindcore realm namespace. A basis entry naming any other pair
 /// claims an identity this snapshot never admitted.
-const MEMORY_RECORD_IDENTITY: (&str, &str) = ("memory_record", "mindcore");
+pub(crate) const MEMORY_RECORD_IDENTITY: (&str, &str) = ("memory_record", "mindcore");
 
 /// The longest request deadline the engine honours. A timeout is clamped here
 /// before the instant is computed, so no absurd value can overflow the instant

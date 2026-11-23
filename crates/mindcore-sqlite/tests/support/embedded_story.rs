@@ -29,6 +29,9 @@ use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The scope id naming the shared source collection the story adopts from.
+pub const SOURCE_SCOPE: &str = "spc_village_facts";
+
 /// Scoped temp directory holding one SQLite database; dropping it removes the database
 /// together with its `-wal`/`-shm` siblings, including when an assertion panics.
 pub struct TempDb {
@@ -87,6 +90,7 @@ fn shared_fixture() -> (String, Vec<KnowledgeEntry>) {
 
 pub fn entry(entry_id: &str, entry_type: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody {
             summary: Some(summary.to_string()),
             ..KnowledgeEntryBody::default()
@@ -149,13 +153,6 @@ fn belief_record(
         "truth": truth,
         "view": "current",
     })
-}
-
-pub fn entry_anchor(
-    anchor: spoke_schemas::SourceAnchor,
-) -> spoke_schemas::knowledge_entry::SourceAnchor {
-    serde_json::from_value(serde_json::to_value(anchor).expect("anchor serializes"))
-        .expect("anchor wire shape matches the knowledge_entry copy")
 }
 
 pub fn json_of(entry: &KnowledgeEntry) -> Value {
@@ -558,7 +555,11 @@ pub async fn run_story(label: &str) {
         "location",
         "Wren believes the north gate is shut after dusk; the traveller said so in the tavern.",
     );
-    adoption.source_anchor = Some(entry_anchor(adoption_anchor(&shared_entry_id, "hearsay")));
+    adoption.adoption_anchor = adoption_anchor(
+        SOURCE_SCOPE,
+        &shared_entry_id,
+        shared_seeded.revision.unwrap_or(1),
+    );
     let adopted = expect_ok(
         wren.put_knowledge_entry(adoption, None).await,
         "write the personal entry",
@@ -570,15 +571,12 @@ pub async fn run_story(label: &str) {
     );
     assert_eq!(json_of(&personal_reread), json_of(&adopted));
     let anchor = personal_reread
-        .source_anchor
+        .adoption_anchor
         .as_ref()
         .expect("the personal entry carries its adoption anchor");
-    assert_eq!(anchor.source_id, format!("shared:{shared_entry_id}"));
-    assert_eq!(
-        serde_json::to_value(anchor).expect("anchor serializes")["extensions"]["mindcore_adoption"]
-            ["basis"],
-        json!("hearsay")
-    );
+    assert_eq!(anchor.source_scope_id.as_str(), SOURCE_SCOPE);
+    assert_eq!(anchor.source_entry_id.as_str(), shared_entry_id);
+    assert_eq!(anchor.source_revision, 1);
 
     let (hearsay_receipt, hearsay) = retain(
         &pool,
@@ -662,7 +660,7 @@ pub async fn run_story(label: &str) {
     step(
         3,
         &format!(
-            "adoption: ke_wren_north_gate revision 1 anchored to shared:{shared_entry_id} (hearsay); hearing retained as {hearsay} in receipt {hearsay_receipt}; shared entry unchanged"
+            "adoption: ke_wren_north_gate revision 1 anchored to {SOURCE_SCOPE}/{shared_entry_id} at revision 1; hearing retained as {hearsay} in receipt {hearsay_receipt}; shared entry unchanged"
         ),
     );
 

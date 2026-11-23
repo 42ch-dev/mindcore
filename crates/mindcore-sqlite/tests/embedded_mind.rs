@@ -14,7 +14,7 @@ use serde_json::{json, Map};
 use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode};
 use spoke_schemas::knowledge_entry::{ExtensionKey, KnowledgeEntryOwner};
 
-use embedded_story::{entry, entry_anchor, expect_ok, expect_reject, json_of, run_story, TempDb};
+use embedded_story::{entry, expect_ok, expect_reject, json_of, run_story, TempDb, SOURCE_SCOPE};
 
 #[tokio::test]
 async fn first_mind_story() {
@@ -34,10 +34,7 @@ async fn refusals_leave_state_unchanged() {
         "location",
         "Wren believes the north gate is shut after dusk.",
     );
-    adoption.source_anchor = Some(entry_anchor(adoption_anchor(
-        "ke_shared_north_gate",
-        "hearsay",
-    )));
+    adoption.adoption_anchor = adoption_anchor(SOURCE_SCOPE, "ke_shared_north_gate", 1);
     let personal = expect_ok(
         wren.put_knowledge_entry(adoption, None).await,
         "write the personal entry",

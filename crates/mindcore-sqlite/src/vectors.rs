@@ -9,6 +9,10 @@ use sqlx::{Executor, Sqlite};
 
 use crate::knowledge::internal;
 
+/// The largest dimension whose integer `serde_jcs` will canonicalize: the IEEE-754 safe integer
+/// maximum, above which it rejects integer inputs as out of range.
+const MAX_CANONICAL_DIM: u64 = (1 << 53) - 1;
+
 /// The storage identity of one serving embedder: RFC 8785 JCS SHA-256 over the four identity
 /// fields, as 64 lowercase hex.
 ///
@@ -24,6 +28,14 @@ pub fn identity_hash(
         return spoke_reject(
             SpokeRejectCode::InvalidInput,
             "embedding identity has no dimension",
+            None,
+        );
+    }
+    // RFC 8785 canonicalization (serde_jcs 0.3) refuses integers above the IEEE-754 safe range.
+    if dim as u64 > MAX_CANONICAL_DIM {
+        return spoke_reject(
+            SpokeRejectCode::InvalidInput,
+            format!("dimension {dim} exceeds the canonical safe integer range"),
             None,
         );
     }
@@ -269,9 +281,15 @@ mod tests {
     }
 
     fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>) -> SpokeRejectCode {
+        expect_reject_detail(result).code
+    }
+
+    fn expect_reject_detail<T: std::fmt::Debug>(
+        result: SpokeResult<T>,
+    ) -> spoke_operations::SpokeReject {
         match result {
             SpokeResult::Ok(value) => panic!("expected a rejection, got {value:?}"),
-            SpokeResult::Reject(reject) => reject.code,
+            SpokeResult::Reject(reject) => reject,
         }
     }
 
@@ -310,18 +328,37 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn identity_hash_bounds_dimension_by_representable_blob_length() {
-        let largest = usize::MAX / size_of::<f32>();
-        assert_eq!(largest.checked_mul(4), Some(largest * 4));
+    fn identity_hash_bounds_dimension_by_the_canonical_safe_range() {
+        let largest = MAX_CANONICAL_DIM as usize;
         let bounded = hash("provider", "model", "version", largest);
         assert_eq!(bounded.len(), 64);
 
         let beyond = largest + 1;
-        assert_eq!(beyond.checked_mul(4), None);
+        let reject = expect_reject_detail(identity_hash("provider", "model", "version", beyond));
+        assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
         assert_eq!(
-            expect_reject(identity_hash("provider", "model", "version", beyond)),
-            SpokeRejectCode::InvalidInput
+            reject.message,
+            format!("dimension {beyond} exceeds the canonical safe integer range")
+        );
+    }
+
+    /// On 32-bit targets the safe-integer ceiling is unreachable: `usize` tops out below it, so the
+    /// blob-length guard is the bound that actually fires.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn identity_hash_bounds_dimension_by_the_vector_blob_length() {
+        let largest = usize::MAX / size_of::<f32>();
+        let bounded = hash("provider", "model", "version", largest);
+        assert_eq!(bounded.len(), 64);
+
+        let beyond = largest + 1;
+        let reject = expect_reject_detail(identity_hash("provider", "model", "version", beyond));
+        assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+        assert_eq!(
+            reject.message,
+            format!("dimension {beyond} has no representable vector blob length")
         );
     }
 

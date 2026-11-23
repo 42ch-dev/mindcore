@@ -63,6 +63,7 @@ impl Drop for TempDb {
 
 fn carrier(entry_id: &str, revision: Option<u64>) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody::default(),
         canonical_name: KnowledgeEntryCanonicalName::try_from(format!("{entry_id} name"))
             .expect("non-empty canonical name"),
