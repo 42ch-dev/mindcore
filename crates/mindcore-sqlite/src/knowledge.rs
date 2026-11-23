@@ -12,11 +12,12 @@ use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use spoke_operations::{
     assert_adoption_anchor_preserved, filter_knowledge_entries_by_scope,
     knowledge_entry_visible_to_viewpoint, spoke_reject, validate_cognition_module,
-    validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort, SpokeReject,
-    SpokeRejectCode, SpokeResult,
+    validate_cognition_record, HistoryPort, HistoryPruneResult, KnowledgeEntryPort,
+    ScopedKnowledgePort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
+use spoke_schemas::data::revision_snapshot::{RevisionSnapshotSnapshot, Shared2};
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
-use spoke_schemas::{KnowledgeEntry, Scope};
+use spoke_schemas::{KnowledgeEntry, Principal, RevisionSnapshot, Scope};
 
 use crate::cognition::{
     gap_is_dedicated_appends, insert_record, read_append_prior_shape, read_records,
@@ -131,7 +132,7 @@ impl ScopedKnowledgeStore {
     /// Checkpoint selection and record hydration share one read transaction, so the replay is a
     /// whole committed state. Revision `0`, a revision the entry never held and a missing entry
     /// answer the same generic `KnowledgeEntryNotFound`; a revision below the entry's persisted
-    /// floor answers `KnowledgeEntryNotFound` with `details.reason` `HISTORY_TRUNCATED`. A
+    /// floor answers `HistoryTruncated` with `details.floor_revision`. A
     /// superseded entry still replays from its own history.
     pub async fn get_entry_at_revision(
         &self,
@@ -279,80 +280,17 @@ impl ScopedKnowledgeStore {
             Ok(transaction) => transaction,
             Err(error) => return internal(format!("history prune could not begin: {error}")),
         };
-        let live: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT 1 FROM knowledge_entries \
-             WHERE collection = ? AND entry_id = ? AND superseded_by IS NULL",
-        )
-        .bind(&self.scope.collection)
-        .bind(entry_id)
-        .fetch_optional(&mut *transaction)
-        .await;
-        match live {
-            Ok(Some(_)) => {}
-            Ok(None) => return entry_not_found(&self.scope.collection, entry_id),
-            Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
-        }
-        let offset = i64::try_from(keep - 1).unwrap_or(i64::MAX);
-        let checkpoints: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT revision FROM knowledge_entry_revisions \
-             WHERE collection = ? AND entry_id = ? \
-             ORDER BY revision DESC LIMIT 2 OFFSET ?",
-        )
-        .bind(&self.scope.collection)
-        .bind(entry_id)
-        .bind(offset)
-        .fetch_all(&mut *transaction)
-        .await;
-        let checkpoints = match checkpoints {
-            Ok(checkpoints) => checkpoints,
-            Err(error) => {
-                return internal(format!("history checkpoints could not be read: {error}"))
-            }
-        };
-        if checkpoints.len() < 2 {
-            if let Err(error) = transaction.commit().await {
-                return internal(format!("history prune could not commit: {error}"));
-            }
-            return SpokeResult::Ok(PruneReport {
-                deleted: 0,
-                floor: None,
-            });
-        }
-        let new_floor = checkpoints[1] + 1;
-        let deleted = match sqlx::query(
-            "DELETE FROM knowledge_entry_revisions \
-             WHERE collection = ? AND entry_id = ? AND revision < ?",
-        )
-        .bind(&self.scope.collection)
-        .bind(entry_id)
-        .bind(new_floor)
-        .execute(&mut *transaction)
-        .await
-        {
-            Ok(deleted) => deleted.rows_affected(),
-            Err(error) => {
-                return internal(format!("history checkpoints could not be deleted: {error}"))
-            }
-        };
-        let updated = sqlx::query(
-            "UPDATE knowledge_entries SET history_floor_revision = ? \
-             WHERE collection = ? AND entry_id = ?",
-        )
-        .bind(new_floor)
-        .bind(&self.scope.collection)
-        .bind(entry_id)
-        .execute(&mut *transaction)
-        .await;
-        if let Err(error) = updated {
-            return internal(format!("history floor could not be written: {error}"));
-        }
+        let report =
+            match prune_entry_history(&mut transaction, &self.scope.collection, entry_id, keep)
+                .await
+            {
+                SpokeResult::Ok(report) => report,
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
         if let Err(error) = transaction.commit().await {
             return internal(format!("history prune could not commit: {error}"));
         }
-        SpokeResult::Ok(PruneReport {
-            deleted,
-            floor: Some(new_floor as u64),
-        })
+        SpokeResult::Ok(report)
     }
 
     /// One entry of this collection whether or not it is superseded: the payload (with its
@@ -710,6 +648,241 @@ impl ScopedKnowledgePort for RoutedKnowledgeStore {
     }
 }
 
+/// The one served history op: the knowledge face's route, admission, disclosure and write
+/// permission, over the entry's own revision history.
+///
+/// The replayed entry is projected onto the released [`RevisionSnapshot`]: `entity_kind` is
+/// `knowledge_entry`, `schema_version` is `1`, `extensions` is empty and the entry travels as
+/// entity data. A failed projection is internal, never `Ok`.
+#[async_trait]
+impl HistoryPort for RoutedKnowledgeStore {
+    async fn get_history_snapshot(
+        &self,
+        _principal: &Principal,
+        scope: &Scope,
+        entity_kind: &str,
+        entity_id: &str,
+        revision: u64,
+    ) -> SpokeResult<RevisionSnapshot> {
+        served(
+            self.served_history_get(scope, entity_kind, entity_id, revision)
+                .await,
+        )
+    }
+
+    async fn prune_history(
+        &self,
+        _principal: &Principal,
+        scope: &Scope,
+        entity_kind: &str,
+        entity_id: &str,
+        keep: u64,
+    ) -> SpokeResult<HistoryPruneResult> {
+        served(
+            self.served_history_prune(scope, entity_kind, entity_id, keep)
+                .await,
+        )
+    }
+}
+
+impl RoutedKnowledgeStore {
+    /// One served history read: a missing, retired or hidden row answers `NOT_FOUND` like the
+    /// knowledge face's get, and the replay keeps its own `HistoryTruncated` refusal.
+    async fn served_history_get(
+        &self,
+        scope: &Scope,
+        entity_kind: &str,
+        entity_id: &str,
+        revision: u64,
+    ) -> SpokeResult<RevisionSnapshot> {
+        if let SpokeResult::Reject(reject) = self.admit_history(scope, entity_kind) {
+            return SpokeResult::Reject(reject);
+        }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return storage_unavailable(),
+        };
+        let stored = match read_stored_row(&mut tx, &self.scope.collection, entity_id, false).await
+        {
+            SpokeResult::Ok(stored) => stored,
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+            {
+                return history_not_found(entity_id)
+            }
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        if stored.superseded_by.is_some() {
+            return history_not_found(entity_id);
+        }
+        let entry = match decode(&stored.payload) {
+            SpokeResult::Ok(entry) => entry,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match visible(&entry, scope) {
+            SpokeResult::Ok(true) => {}
+            SpokeResult::Ok(false) => return history_not_found(entity_id),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        }
+        let entry =
+            match read_entry_revision(&mut tx, &self.scope.collection, entity_id, revision).await {
+                SpokeResult::Ok(entry) => entry,
+                SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::HistoryTruncated => {
+                    return SpokeResult::Reject(reject)
+                }
+                SpokeResult::Reject(reject)
+                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+                {
+                    return history_not_found(entity_id)
+                }
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+        // Disclosure is a payload property, so the live row's visibility says nothing about the
+        // replayed payload: a revision whose own fields fall outside the admitted scope is the
+        // same absence as a hidden live row.
+        match visible(&entry, scope) {
+            SpokeResult::Ok(true) => {}
+            SpokeResult::Ok(false) => return history_not_found(entity_id),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        }
+        let snapshot = match history_snapshot(entry, entity_id, revision) {
+            SpokeResult::Ok(snapshot) => snapshot,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match tx.commit().await {
+            Ok(()) => SpokeResult::Ok(snapshot),
+            Err(_) => storage_unavailable(),
+        }
+    }
+
+    /// One served prune: the permission is a put's, so a retired or hidden row is `NOT_AUTHORIZED`
+    /// and a missing one `NOT_FOUND`. The permission read and the cut share one `BEGIN IMMEDIATE`.
+    async fn served_history_prune(
+        &self,
+        scope: &Scope,
+        entity_kind: &str,
+        entity_id: &str,
+        keep: u64,
+    ) -> SpokeResult<HistoryPruneResult> {
+        if let SpokeResult::Reject(reject) = self.admit_history(scope, entity_kind) {
+            return SpokeResult::Reject(reject);
+        }
+        if keep == 0 {
+            return invalid_input("a history prune keeps at least one checkpoint");
+        }
+        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => transaction,
+            Err(_) => return storage_unavailable(),
+        };
+        let stored =
+            match read_stored_row(&mut transaction, &self.scope.collection, entity_id, false).await
+            {
+                SpokeResult::Ok(stored) => stored,
+                SpokeResult::Reject(reject)
+                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+                {
+                    return history_not_found(entity_id)
+                }
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+        if stored.superseded_by.is_some() {
+            return not_authorized();
+        }
+        let entry = match decode(&stored.payload) {
+            SpokeResult::Ok(entry) => entry,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match visible(&entry, scope) {
+            SpokeResult::Ok(true) => {}
+            SpokeResult::Ok(false) => return not_authorized(),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        }
+        let report =
+            match prune_entry_history(&mut transaction, &self.scope.collection, entity_id, keep)
+                .await
+            {
+                SpokeResult::Ok(report) => report,
+                // Both reads run under this one BEGIN IMMEDIATE reservation, so the helper's probe
+                // cannot disagree with the permission read above; this arm normalizes the helper's
+                // own contract rather than an intervening disappearance.
+                SpokeResult::Reject(reject)
+                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+                {
+                    return history_not_found(entity_id)
+                }
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+        if transaction.commit().await.is_err() {
+            return storage_unavailable();
+        }
+        SpokeResult::Ok(HistoryPruneResult {
+            deleted: report.deleted,
+            floor_revision: report.floor,
+        })
+    }
+
+    /// Both history ops start here: the knowledge face's route, then the kind this store serves.
+    fn admit_history(&self, scope: &Scope, entity_kind: &str) -> SpokeResult<()> {
+        if let SpokeResult::Reject(reject) = self.admit(scope) {
+            return SpokeResult::Reject(reject);
+        }
+        if entity_kind != KNOWLEDGE_ENTRY_KIND {
+            let mut details = Map::new();
+            details.insert(
+                "entity_kind".to_string(),
+                Value::String(entity_kind.to_string()),
+            );
+            return spoke_reject(
+                SpokeRejectCode::HistoryEntityUnsupported,
+                format!("this store serves no {entity_kind} revision history"),
+                Some(details),
+            );
+        }
+        SpokeResult::Ok(())
+    }
+}
+
+/// The one entity kind this store keeps revision history for.
+const KNOWLEDGE_ENTRY_KIND: &str = "knowledge_entry";
+
+/// Project one replayed entry onto the released [`RevisionSnapshot`]: the entry travels as entity
+/// data, so its stored timestamps and cognition envelope keep their spelling.
+fn history_snapshot(
+    entry: KnowledgeEntry,
+    entity_id: &str,
+    revision: u64,
+) -> SpokeResult<RevisionSnapshot> {
+    let entity = match serde_json::to_value(&entry) {
+        Ok(entity) => entity,
+        Err(error) => {
+            return internal(format!(
+                "knowledge entry snapshot could not project: {error}"
+            ))
+        }
+    };
+    let snapshot = match serde_json::from_value::<RevisionSnapshotSnapshot>(entity) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return internal(format!(
+                "knowledge entry snapshot could not project: {error}"
+            ))
+        }
+    };
+    let envelope = RevisionSnapshot::try_from(
+        RevisionSnapshot::builder()
+            .entity_id(entity_id)
+            .entity_kind(KNOWLEDGE_ENTRY_KIND)
+            .extensions(Shared2::from(HashMap::new()))
+            .revision(revision)
+            .schema_version(1u64)
+            .snapshot(snapshot),
+    );
+    match envelope {
+        Ok(snapshot) => SpokeResult::Ok(snapshot),
+        Err(error) => internal(format!("history snapshot could not project: {error}")),
+    }
+}
+
 fn not_authorized<T>() -> SpokeResult<T> {
     spoke_reject(
         SpokeRejectCode::NotAuthorized,
@@ -734,6 +907,14 @@ fn not_found<T>(entry_id: &str) -> SpokeResult<T> {
     )
 }
 
+fn history_not_found<T>(entity_id: &str) -> SpokeResult<T> {
+    spoke_reject(
+        SpokeRejectCode::NotFound,
+        format!("no history entity {entity_id} in the admitted scope"),
+        None,
+    )
+}
+
 fn revision_not_found<T>() -> SpokeResult<T> {
     spoke_reject(
         SpokeRejectCode::KnowledgeEntryNotFound,
@@ -742,14 +923,11 @@ fn revision_not_found<T>() -> SpokeResult<T> {
     )
 }
 
-fn revision_pruned<T>() -> SpokeResult<T> {
+fn revision_pruned<T>(floor: i64) -> SpokeResult<T> {
     let mut details = Map::new();
-    details.insert(
-        "reason".to_string(),
-        Value::String("HISTORY_TRUNCATED".to_string()),
-    );
+    details.insert("floor_revision".to_string(), Value::from(floor));
     spoke_reject(
-        SpokeRejectCode::KnowledgeEntryNotFound,
+        SpokeRejectCode::HistoryTruncated,
         "knowledge entry revision was pruned",
         Some(details),
     )
@@ -998,6 +1176,92 @@ async fn read_lifecycle(
 /// and head, and the live revision.
 type RevisionSelection = (i64, i64, String, Option<i64>, i64);
 
+/// One prune of `entry_id`'s checkpoints inside the caller's `BEGIN IMMEDIATE` transaction.
+///
+/// Delete the entry's checkpoints older than its `keep` newest and move its floor to
+/// `newest_deleted_checkpoint_revision + 1`. `keep` counts checkpoints, newest first, and the live
+/// row is not one; a prune that removes nothing reports `deleted: 0, floor: None` and leaves the
+/// stored floor and every checkpoint alone. Only `history_floor_revision` is written on the entry
+/// row, so the `BEFORE UPDATE OF revision` trigger saves no checkpoint of this update. A superseded
+/// or missing entry answers the same absence; the caller commits. A zero `keep` is refused: the
+/// helper is public, so its own boundary keeps the input rule the scoped callers hold.
+pub async fn prune_entry_history(
+    tx: &mut Transaction<'_, Sqlite>,
+    collection: &str,
+    entry_id: &str,
+    keep: u64,
+) -> SpokeResult<PruneReport> {
+    if keep == 0 {
+        return invalid_input("a history prune keeps at least one checkpoint");
+    }
+    let live: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT 1 FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ? AND superseded_by IS NULL",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_optional(&mut **tx)
+    .await;
+    match live {
+        Ok(Some(_)) => {}
+        Ok(None) => return entry_not_found(collection, entry_id),
+        Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
+    }
+    let offset = i64::try_from(keep - 1).unwrap_or(i64::MAX);
+    let checkpoints: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? \
+         ORDER BY revision DESC LIMIT 2 OFFSET ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .bind(offset)
+    .fetch_all(&mut **tx)
+    .await;
+    let checkpoints = match checkpoints {
+        Ok(checkpoints) => checkpoints,
+        Err(error) => return internal(format!("history checkpoints could not be read: {error}")),
+    };
+    if checkpoints.len() < 2 {
+        return SpokeResult::Ok(PruneReport {
+            deleted: 0,
+            floor: None,
+        });
+    }
+    let new_floor = checkpoints[1] + 1;
+    let deleted = match sqlx::query(
+        "DELETE FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? AND revision < ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .bind(new_floor)
+    .execute(&mut **tx)
+    .await
+    {
+        Ok(deleted) => deleted.rows_affected(),
+        Err(error) => {
+            return internal(format!("history checkpoints could not be deleted: {error}"))
+        }
+    };
+    let updated = sqlx::query(
+        "UPDATE knowledge_entries SET history_floor_revision = ? \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(new_floor)
+    .bind(collection)
+    .bind(entry_id)
+    .execute(&mut **tx)
+    .await;
+    if let Err(error) = updated {
+        return internal(format!("history floor could not be written: {error}"));
+    }
+    SpokeResult::Ok(PruneReport {
+        deleted,
+        floor: Some(new_floor as u64),
+    })
+}
+
 /// One entry of `collection` as it was stored at `revision`, read through the caller's
 /// transaction so checkpoint selection and record hydration project one snapshot.
 ///
@@ -1050,7 +1314,7 @@ async fn read_entry_revision(
         }
     };
     if assigned < floor {
-        return revision_pruned();
+        return revision_pruned(floor);
     }
     if assigned > live {
         return revision_not_found();

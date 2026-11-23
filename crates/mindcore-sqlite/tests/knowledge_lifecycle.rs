@@ -13,14 +13,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
-use mindcore_sqlite::{append_cognition, MindStore, PruneReport};
+use mindcore_sqlite::{append_cognition, prune_entry_history, MindStore, PruneReport};
 use serde_json::{json, Map, Value};
-use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    revision_snapshots_equal_canonical, HistoryPort, KnowledgeEntryPort, SpokeRejectCode,
+    SpokeResult,
+};
+use spoke_schemas::data::revision_snapshot::RevisionSnapshotSnapshot;
 use spoke_schemas::knowledge_entry::{
     KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
     KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner,
 };
-use spoke_schemas::KnowledgeEntry;
+use spoke_schemas::{KnowledgeEntry, Principal, Scope};
 use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -246,15 +250,11 @@ fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
     }
 }
 
-fn expect_history_truncated<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) {
+fn expect_history_truncated<T: std::fmt::Debug>(result: SpokeResult<T>, floor: i64, context: &str) {
     match result {
         SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
         SpokeResult::Reject(reject) => {
-            assert_eq!(
-                reject.code,
-                SpokeRejectCode::KnowledgeEntryNotFound,
-                "{context}"
-            );
+            assert_eq!(reject.code, SpokeRejectCode::HistoryTruncated, "{context}");
             assert_eq!(
                 reject.message, "knowledge entry revision was pruned",
                 "{context}"
@@ -263,9 +263,9 @@ fn expect_history_truncated<T: std::fmt::Debug>(result: SpokeResult<T>, context:
                 reject
                     .details
                     .as_ref()
-                    .and_then(|details| details.get("reason")),
-                Some(&Value::from("HISTORY_TRUNCATED")),
-                "{context}: the truncation refusal names its class"
+                    .and_then(|details| details.get("floor_revision")),
+                Some(&Value::from(floor)),
+                "{context}: the truncation refusal names the retained floor"
             );
         }
     }
@@ -711,6 +711,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
 
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
+        2,
         "a revision below the seeded floor",
     );
 
@@ -765,6 +766,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
     assert_eq!(history_floor(&store.pool(), "shared", "entry-f").await, 2);
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
+        2,
         "a pruned revision after reopen",
     );
     assert_eq!(
@@ -884,6 +886,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
     }
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
+        2,
         "the revision just below the new floor",
     );
 
@@ -1142,6 +1145,7 @@ async fn knowledge_prune_keeps_revisions_derived_across_a_gap_replayable() {
     }
     expect_history_truncated(
         shared.get_entry_at_revision("entry-p", 1).await,
+        2,
         "the revision whose preimage the prune removed",
     );
 
@@ -1221,6 +1225,405 @@ async fn knowledge_history_survives_writes_and_reopen_until_an_explicit_prune() 
         "the explicit prune leaves exactly the kept window"
     );
     assert_eq!(history_floor(&store.pool(), "shared", "entry-r").await, 2);
+
+    store.close().await;
+    remove_database(&path);
+}
+
+fn scope_of(scope_id: &str) -> Scope {
+    serde_json::from_value(json!({ "scope_id": scope_id })).expect("scope JSON matches the schema")
+}
+
+/// The admitted route plus one selection the knowledge face does not serve.
+fn scope_with_selection(selection: Value) -> Scope {
+    let mut scope = json!({ "scope_id": "spc_shared" });
+    scope
+        .as_object_mut()
+        .expect("scope object")
+        .extend(selection.as_object().expect("selection object").clone());
+    serde_json::from_value(scope).expect("scope JSON matches the schema")
+}
+
+fn principal(id: &str) -> Principal {
+    serde_json::from_value(json!({ "principal_id": id, "extensions": {} }))
+        .expect("principal JSON matches the schema")
+}
+
+/// The refusal one served history op answers, with its `details` members.
+fn expect_history_reject<T: std::fmt::Debug>(
+    result: SpokeResult<T>,
+    code: SpokeRejectCode,
+    context: &str,
+) -> Map<String, Value> {
+    match result {
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, code, "{context}: {reject:?}");
+            reject.details.unwrap_or_default()
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_history_port_maps_store_refusals_to_contract_codes() {
+    let path = database_path("history-port");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let peer = principal("peer-a");
+    let admitted = scope_of("spc_shared");
+
+    for (expected, summary) in [
+        (None, REVISION_ONE),
+        (Some(1), REVISION_TWO),
+        (Some(2), REVISION_THREE),
+        (Some(3), "the north gate reopens at dawn"),
+    ] {
+        expect_ok(
+            shared
+                .put_knowledge_entry(entry_with("entry-l", summary), expected)
+                .await,
+            "seed entry-l",
+        );
+    }
+    expect_ok(
+        shared
+            .put_knowledge_entry(private_entry("entry-private", "mira's private notes"), None)
+            .await,
+        "seed an owner-private entry",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-live", REVISION_ONE), None)
+            .await,
+        "seed entry-live",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-next", REVISION_TWO), None)
+            .await,
+        "seed entry-next",
+    );
+    expect_ok(
+        shared.supersede_entry("entry-live", 1, "entry-next").await,
+        "retire entry-live",
+    );
+
+    // Kind coverage: no relation revision table, so any other kind is unsupported by name.
+    let details = expect_history_reject(
+        port.get_history_snapshot(&peer, &admitted, "relation", "rel-1", 1)
+            .await,
+        SpokeRejectCode::HistoryEntityUnsupported,
+        "an unserved entity kind on get",
+    );
+    assert_eq!(details.len(), 1, "the refusal carries exactly entity_kind");
+    assert_eq!(details.get("entity_kind"), Some(&json!("relation")));
+
+    // The replayed snapshot targets the request and projects the entry as entity data.
+    let first = expect_ok(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-l", 2)
+            .await,
+        "replay revision 2",
+    );
+    assert_eq!(first.entity_kind.as_str(), "knowledge_entry");
+    assert_eq!(first.entity_id.as_str(), "entry-l");
+    assert_eq!(first.revision, 2);
+    match &first.snapshot {
+        RevisionSnapshotSnapshot::KnowledgeEntry {
+            entry_id, revision, ..
+        } => {
+            assert_eq!(entry_id.as_str(), "entry-l");
+            assert_eq!(*revision, Some(2));
+        }
+        other => panic!("expected a knowledge_entry snapshot, got {other:?}"),
+    }
+    let second = expect_ok(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-l", 2)
+            .await,
+        "replay revision 2 again",
+    );
+    assert!(
+        expect_ok(
+            revision_snapshots_equal_canonical(&first, &second),
+            "compare two replays of one revision"
+        ),
+        "two replays of one revision are canonically equal"
+    );
+
+    // Prune keeps the two newest checkpoints and reports the new floor.
+    let pruned = expect_ok(
+        port.prune_history(&peer, &admitted, "knowledge_entry", "entry-l", 2)
+            .await,
+        "prune entry-l to the two newest checkpoints",
+    );
+    assert_eq!(pruned.deleted, 1);
+    assert_eq!(pruned.floor_revision, Some(2));
+    assert_eq!(history_floor(&store.pool(), "shared", "entry-l").await, 2);
+
+    // Below the floor keeps its own refusal, and carries exactly the floor.
+    let details = expect_history_reject(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-l", 1)
+            .await,
+        SpokeRejectCode::HistoryTruncated,
+        "a revision below the pruned floor",
+    );
+    assert_eq!(
+        details.len(),
+        1,
+        "the refusal carries exactly floor_revision"
+    );
+    assert_eq!(details.get("floor_revision"), Some(&json!(2)));
+
+    // Revision 0, a revision above the live one and an unrepresentable one are an absence.
+    for (revision, context) in [
+        (0, "revision zero"),
+        (9, "a revision above the live one"),
+        (u64::MAX, "a revision above i64::MAX"),
+    ] {
+        let details = expect_history_reject(
+            port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-l", revision)
+                .await,
+            SpokeRejectCode::NotFound,
+            context,
+        );
+        assert!(details.is_empty(), "{context} carries no details");
+    }
+
+    // Get: a missing, retired or hidden row is the one absence.
+    for (entity_id, context) in [
+        ("entry-never-seeded", "a missing entry"),
+        ("entry-live", "a retired entry"),
+        ("entry-private", "an owner-private entry"),
+    ] {
+        let details = expect_history_reject(
+            port.get_history_snapshot(&peer, &admitted, "knowledge_entry", entity_id, 1)
+                .await,
+            SpokeRejectCode::NotFound,
+            context,
+        );
+        assert!(details.is_empty(), "{context} carries no details on get");
+    }
+
+    // Prune: a missing row is an absence; a retired or hidden row is the put's refusal.
+    let details = expect_history_reject(
+        port.prune_history(&peer, &admitted, "knowledge_entry", "entry-never-seeded", 1)
+            .await,
+        SpokeRejectCode::NotFound,
+        "a prune of a missing entry",
+    );
+    assert!(
+        details.is_empty(),
+        "a missing prune target carries no details"
+    );
+    for (entity_id, context) in [
+        ("entry-live", "a retired entry"),
+        ("entry-private", "an owner-private entry"),
+    ] {
+        let details = expect_history_reject(
+            port.prune_history(&peer, &admitted, "knowledge_entry", entity_id, 1)
+                .await,
+            SpokeRejectCode::NotAuthorized,
+            context,
+        );
+        assert!(details.is_empty(), "{context} carries no details on prune");
+    }
+
+    // Admission runs before the keep boundary: a zero keep cannot mask an unconfigured route or
+    // an unserved kind.
+    expect_history_reject(
+        port.prune_history(&peer, &admitted, "knowledge_entry", "entry-l", 0)
+            .await,
+        SpokeRejectCode::InvalidInput,
+        "a prune that keeps no checkpoint",
+    );
+    expect_history_reject(
+        port.prune_history(&peer, &scope_of("spc_other"), "knowledge_entry", "entry-l", 0)
+            .await,
+        SpokeRejectCode::NotAuthorized,
+        "a zero-keep prune on an unconfigured route",
+    );
+    let details = expect_history_reject(
+        port.prune_history(&peer, &admitted, "relation", "entry-l", 0)
+            .await,
+        SpokeRejectCode::HistoryEntityUnsupported,
+        "a zero-keep prune of an unserved kind",
+    );
+    assert_eq!(details.get("entity_kind"), Some(&json!("relation")));
+    expect_history_reject(
+        port.get_history_snapshot(
+            &peer,
+            &scope_of("spc_other"),
+            "knowledge_entry",
+            "entry-l",
+            3,
+        )
+        .await,
+        SpokeRejectCode::NotAuthorized,
+        "a get on an unconfigured route",
+    );
+    expect_history_reject(
+        port.prune_history(
+            &peer,
+            &scope_of("spc_other"),
+            "knowledge_entry",
+            "entry-l",
+            1,
+        )
+        .await,
+        SpokeRejectCode::NotAuthorized,
+        "a prune on an unconfigured route",
+    );
+    expect_history_reject(
+        port.get_history_snapshot(
+            &peer,
+            &scope_with_selection(json!({ "cognition": { "view": "recorded_at", "filter": {} } })),
+            "knowledge_entry",
+            "entry-l",
+            3,
+        )
+        .await,
+        SpokeRejectCode::InvalidInput,
+        "a selection the knowledge face does not serve",
+    );
+
+    // A prune that removes nothing reports the no-op shape and leaves the floor alone.
+    let noop = expect_ok(
+        port.prune_history(&peer, &admitted, "knowledge_entry", "entry-l", 2)
+            .await,
+        "a repeated prune with the same window",
+    );
+    assert_eq!(noop.deleted, 0);
+    assert_eq!(noop.floor_revision, None);
+    assert_eq!(history_floor(&store.pool(), "shared", "entry-l").await, 2);
+    expect_ok(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-l", 2)
+            .await,
+        "a revision at the floor still replays",
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_history_replay_outside_the_admitted_scope_answers_the_generic_absence() {
+    let path = database_path("history-replay-visibility");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let peer = principal("peer-a");
+    let admitted = scope_of("spc_shared");
+
+    // Revision 1 is owner-private and revision 2 is public, so the live row is visible to a
+    // viewpoint-free admitted scope while the revision behind it is not.
+    expect_ok(
+        shared
+            .put_knowledge_entry(private_entry("entry-v", "mira's private draft"), None)
+            .await,
+        "seed entry-v private",
+    );
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-v", REVISION_TWO), Some(1))
+            .await,
+        "publish entry-v",
+    );
+
+    let details = expect_history_reject(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-v", 1)
+            .await,
+        SpokeRejectCode::NotFound,
+        "a private revision behind a visible live row",
+    );
+    assert!(
+        details.is_empty(),
+        "a hidden replay carries no details, like any hidden get target"
+    );
+    expect_ok(
+        port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-v", 2)
+            .await,
+        "the visible revision still replays",
+    );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn the_history_port_redacts_a_stored_decode_fault() {
+    let path = database_path("history-fault");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let peer = principal("peer-a");
+    let admitted = scope_of("spc_shared");
+
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-f", REVISION_ONE), None)
+            .await,
+        "seed entry-f",
+    );
+
+    // The public prune helper keeps the input rule at its own boundary.
+    let mut transaction = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin the direct prune");
+    match prune_entry_history(&mut transaction, "shared", "entry-f", 0).await {
+        SpokeResult::Ok(report) => panic!("unexpectedly pruned with zero keep: {report:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::InvalidInput,
+                "zero keep: {reject:?}"
+            );
+        }
+    }
+    drop(transaction);
+
+    // A stored payload that cannot decode reaches the served face as a redacted storage refusal.
+    sqlx::query(
+        "UPDATE knowledge_entries SET payload = 'not a knowledge entry' \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind("shared")
+    .bind("entry-f")
+    .execute(&store.pool())
+    .await
+    .expect("corrupt the stored payload");
+
+    let reject = match port
+        .get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-f", 1)
+        .await
+    {
+        SpokeResult::Reject(reject) => reject,
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(
+        reject.message, "knowledge storage is unavailable",
+        "the served refusal carries no decode detail: {reject:?}"
+    );
+    assert!(reject.details.is_none(), "{reject:?} carries no details");
+
+    let reject = match port
+        .prune_history(&peer, &admitted, "knowledge_entry", "entry-f", 1)
+        .await
+    {
+        SpokeResult::Reject(reject) => reject,
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(
+        reject.message, "knowledge storage is unavailable",
+        "the served refusal carries no decode detail: {reject:?}"
+    );
+    assert!(reject.details.is_none(), "{reject:?} carries no details");
 
     store.close().await;
     remove_database(&path);

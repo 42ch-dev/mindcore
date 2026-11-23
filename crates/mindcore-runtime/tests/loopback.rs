@@ -38,11 +38,11 @@ use spoke_connect::remote::{
     RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
 };
 use spoke_operations::{
-    spoke_ok, spoke_reject, KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject,
-    SpokeRejectCode, SpokeResult,
+    revision_snapshots_equal_canonical, spoke_ok, spoke_reject, HistoryPort, KnowledgeEntryPort,
+    MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
-use spoke_schemas::{HostCapabilityManifest, MemoryRecallRequest, Principal, Scope};
+use spoke_schemas::{HostCapabilityManifest, KnowledgeEntry, MemoryRecallRequest, Principal, Scope};
 
 const SCOPE_ID: &str = "spoke-scope-001";
 /// The id naming the adoption source (`SHARED`) on the wire.
@@ -480,6 +480,7 @@ fn faces(
         knowledge: KnowledgeScope::new(COLLECTION),
         admission: knowledge_admission(),
         memory,
+        history: false,
         principals: principal_admission(),
         providers,
         adoption: None,
@@ -2241,5 +2242,407 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
         vector_rows(&pool, "2").await,
         2,
         "another identity's rows survive the retirement"
+    );
+}
+
+/// One entry the history face replays: a note whose summary names what that revision held.
+fn history_entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "entry_id": entry_id,
+        "entry_type": "note",
+        "canonical_name": format!("{entry_id}'s history"),
+        "status": "confirmed",
+        "body": { "summary": summary },
+        "extensions": {},
+    }))
+    .expect("entry JSON matches the schema")
+}
+
+/// Advertisement honesty for the history family: the dialer claims `spoke-history` in both
+/// sessions, yet both ops are denied while the host composes no history service and served once
+/// it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_is_advertised_and_served_only_with_the_face() {
+    let fixture = Fixture::open().await;
+    expect_ok(
+        fixture
+            .store
+            .knowledge(KnowledgeScope::new(COLLECTION))
+            .put_knowledge_entry(history_entry("ke_history", "the gate opens at dawn"), None)
+            .await,
+        "seed the replayed entry",
+    );
+    let (_dir, serve) = fixture.serve();
+
+    let absent = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-history"]),
+            None,
+            MindProviders::default(),
+            routes(&[]),
+        ),
+    );
+    assert!(
+        !capabilities(&absent).contains(&"spoke-history"),
+        "an uncomposed history face is never advertised: {:?}",
+        capabilities(&absent)
+    );
+    let session = connect(&absent, &["spoke-history"]).await;
+    assert_wire_deny(
+        HistoryPort::get_history_snapshot(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            "knowledge_entry",
+            "ke_history",
+            1,
+        )
+        .await,
+        "history.revisions.get",
+        "capability_missing",
+    );
+    assert_wire_deny(
+        session
+            .adapter
+            .prune_history(&scope_of(SCOPE_ID), "knowledge_entry", "ke_history", 1, None)
+            .await,
+        "history.revisions.prune",
+        "capability_missing",
+    );
+    drop(session);
+
+    let mut attached = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    attached.history = true;
+    let attached = surface(&serve, attached);
+    assert!(
+        capabilities(&attached).contains(&"spoke-history"),
+        "a composed history face is advertised: {:?}",
+        capabilities(&attached)
+    );
+    let session = connect(&attached, &["spoke-history"]).await;
+    let snapshot = expect_ok(
+        HistoryPort::get_history_snapshot(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            "knowledge_entry",
+            "ke_history",
+            1,
+        )
+        .await,
+        "replay revision 1 over the signed session",
+    );
+    assert_eq!(snapshot.revision, 1);
+    assert_eq!(snapshot.entity_id.as_str(), "ke_history");
+    let pruned = expect_ok(
+        session
+            .adapter
+            .prune_history(&scope_of(SCOPE_ID), "knowledge_entry", "ke_history", 1, None)
+            .await,
+        "prune the live row's empty checkpoint history",
+    );
+    assert_eq!(pruned.deleted, 0, "the live row is not a checkpoint");
+    assert_eq!(pruned.floor_revision, None, "a no-op reports no floor");
+}
+
+/// The served history face end to end: three revisions over the signed session, both historic
+/// states replayed byte-identically, one explicit prune, then the refusal matrix's history rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_replays_prunes_and_refuses_over_a_signed_session() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let mut attached = faces(
+        hello("runtime", &["spoke-history", "spoke-knowledge"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    attached.history = true;
+    let surface = surface(&serve, attached);
+    let session = connect(&surface, &["spoke-history", "spoke-knowledge"]).await;
+    let dialer = &*session.adapter;
+    let scope = scope_of(SCOPE_ID);
+
+    let created = expect_ok(
+        KnowledgeEntryPort::put_knowledge_entry(
+            dialer,
+            history_entry("ke_history", "the gate opens at dawn"),
+            None,
+        )
+        .await,
+        "create the entry over the signed session",
+    );
+    let updated_once = expect_ok(
+        KnowledgeEntryPort::put_knowledge_entry(
+            dialer,
+            history_entry("ke_history", "the gate closes at dusk"),
+            created.revision,
+        )
+        .await,
+        "update the entry to revision 2",
+    );
+    let updated_twice = expect_ok(
+        KnowledgeEntryPort::put_knowledge_entry(
+            dialer,
+            history_entry("ke_history", "the gate opens again at dawn"),
+            updated_once.revision,
+        )
+        .await,
+        "update the entry to revision 3",
+    );
+    assert_eq!(updated_twice.revision, Some(3));
+
+    for (revision, historic) in [(1u64, &created), (2u64, &updated_once)] {
+        let replay = expect_ok(
+            HistoryPort::get_history_snapshot(
+                dialer,
+                &principal(),
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                revision,
+            )
+            .await,
+            "replay a historic revision",
+        );
+        assert_eq!(replay.entity_kind.as_str(), "knowledge_entry");
+        assert_eq!(replay.entity_id.as_str(), "ke_history");
+        assert_eq!(replay.revision, revision);
+        assert_eq!(
+            serde_json::to_value(&replay.snapshot).expect("the snapshot serializes"),
+            serde_json::to_value(historic).expect("the historic entry serializes"),
+            "revision {revision} replays the entry as it stood"
+        );
+        let again = expect_ok(
+            HistoryPort::get_history_snapshot(
+                dialer,
+                &principal(),
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                revision,
+            )
+            .await,
+            "replay the same revision again",
+        );
+        assert!(
+            expect_ok(
+                revision_snapshots_equal_canonical(&replay, &again),
+                "compare two replays of one revision"
+            ),
+            "two replays of revision {revision} are canonically equal"
+        );
+    }
+
+    let pruned = expect_ok(
+        session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("prune-one"))
+            .await,
+        "prune the entry to its newest checkpoint",
+    );
+    assert_eq!(pruned.deleted, 1, "the older checkpoint was deleted");
+    assert_eq!(
+        pruned.floor_revision,
+        Some(2),
+        "the floor is the newest deleted revision plus one"
+    );
+
+    let reject = expect_reject(
+        HistoryPort::get_history_snapshot(
+            dialer,
+            &principal(),
+            &scope,
+            "knowledge_entry",
+            "ke_history",
+            1,
+        )
+        .await,
+        "replay a revision below the pruned floor",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::HistoryTruncated);
+    let details = reject.details.clone().unwrap_or_default();
+    assert_eq!(
+        details.len(),
+        1,
+        "the refusal carries exactly floor_revision: {details:?}"
+    );
+    assert_eq!(details.get("floor_revision"), Some(&json!(2)));
+    expect_ok(
+        HistoryPort::get_history_snapshot(
+            dialer,
+            &principal(),
+            &scope,
+            "knowledge_entry",
+            "ke_history",
+            2,
+        )
+        .await,
+        "a revision equal to the floor still replays",
+    );
+
+    let reject = expect_reject(
+        HistoryPort::get_history_snapshot(
+            dialer,
+            &principal(),
+            &scope,
+            "knowledge_entry",
+            "ke_never_seeded",
+            1,
+        )
+        .await,
+        "replay an unknown entity id",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotFound);
+    assert!(
+        reject.details.clone().unwrap_or_default().is_empty(),
+        "an absence carries no details"
+    );
+
+    let reject = expect_reject(
+        HistoryPort::get_history_snapshot(dialer, &principal(), &scope, "relation", "rel_history", 1)
+            .await,
+        "replay an entity kind this store never keeps",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::HistoryEntityUnsupported);
+    let details = reject.details.clone().unwrap_or_default();
+    assert_eq!(
+        details.len(),
+        1,
+        "the refusal carries exactly entity_kind: {details:?}"
+    );
+    assert_eq!(details.get("entity_kind"), Some(&json!("relation")));
+}
+
+/// The prune's idempotency contract over the wire: one key replays its recorded outcome, the same
+/// key with another payload conflicts, and a fresh key runs the prune again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
+    let fixture = Fixture::open().await;
+    let store = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    let mut base = None;
+    for summary in [
+        "the gate opens at dawn",
+        "the gate closes at dusk",
+        "the gate opens again at dawn",
+    ] {
+        base = expect_ok(
+            store
+                .put_knowledge_entry(history_entry("ke_history", summary), base)
+                .await,
+            "seed the entry's history",
+        )
+        .revision;
+    }
+    let (_dir, serve) = fixture.serve();
+    let mut attached = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    attached.history = true;
+    let surface = surface(&serve, attached);
+    let session = connect(&surface, &["spoke-history"]).await;
+    let dialer = &*session.adapter;
+    let scope = scope_of(SCOPE_ID);
+
+    let first = expect_ok(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the first prune",
+    );
+    assert_eq!(first.deleted, 1);
+    assert_eq!(first.floor_revision, Some(2));
+
+    // One more revision after the first prune leaves two checkpoints (2 and 3), so a replay that
+    // re-ran the prune instead of replaying its record would delete checkpoint 2 and report a
+    // higher floor. The record is the only thing keeping that checkpoint alive.
+    expect_ok(
+        store
+            .put_knowledge_entry(
+                history_entry("ke_history", "the gate is bolted at midnight"),
+                base,
+            )
+            .await,
+        "write another revision after the first prune",
+    );
+
+    let replay = expect_ok(
+        session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the same key and payload",
+    );
+    assert_eq!(
+        serde_json::to_vec(&replay).expect("the result serializes"),
+        serde_json::to_vec(&first).expect("the result serializes"),
+        "the recorded outcome replays byte-equal"
+    );
+    for revision in [2u64, 3] {
+        expect_ok(
+            HistoryPort::get_history_snapshot(
+                dialer,
+                &principal(),
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                revision,
+            )
+            .await,
+            "the replay deleted nothing, so both checkpoints above the floor still exist",
+        );
+    }
+
+    let reject = expect_reject(
+        session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 2, Some("key-one"))
+            .await,
+        "the same key with another keep",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::IdempotencyConflict);
+
+    let fresh = expect_ok(
+        session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-two"))
+            .await,
+        "a new key runs the prune again",
+    );
+    assert_eq!(
+        fresh.deleted, 1,
+        "the checkpoint written after the first prune is now the older one"
+    );
+    assert_eq!(
+        fresh.floor_revision,
+        Some(3),
+        "the fresh key really pruned: the floor moved past checkpoint 2"
+    );
+    let reject = expect_reject(
+        HistoryPort::get_history_snapshot(
+            dialer,
+            &principal(),
+            &scope,
+            "knowledge_entry",
+            "ke_history",
+            2,
+        )
+        .await,
+        "replay the checkpoint the fresh key pruned",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::HistoryTruncated);
+    assert_eq!(
+        reject.details.clone().unwrap_or_default().get("floor_revision"),
+        Some(&json!(3))
     );
 }

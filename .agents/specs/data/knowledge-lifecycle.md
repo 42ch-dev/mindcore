@@ -2,7 +2,7 @@
 
 ## Scope
 
-How a knowledge entry behaves over time: the history a write leaves behind, the operation that adopts a shared entry into a personal collection, and the marker that retires one entry in favour of another. It does not define memory semantics, cognition record shape, or remote (Connect) behaviour.
+How a knowledge entry behaves over time: the history a write leaves behind, the operation that adopts a shared entry into a personal collection, and the marker that retires one entry in favour of another. It also names which of these operations are served as protocol operations and which of this page's results they carry; the serving face's admission, wire decode, refusal set, snapshot projection and prune dedup are not this page's (`.agents/specs/architecture/serving-seam.md`). It does not define memory semantics, cognition record shape, or Connect transport behaviour.
 
 ## Current state
 
@@ -25,9 +25,11 @@ A create writes no history row, and a refused write (stale base revision, invali
 
 **Replay.** Reading an entry as of revision N is gated by the entry's persisted `history_floor_revision` before checkpoint selection: a positive revision below the floor has no preimage left to derive it from, so it is refused rather than looked up — after selection it would be indistinguishable from "no saved revision that recent", which is the live fallback, and that fallback would answer the request with current content. At or above the floor, replay returns the stored preimage at the first saved revision at or above N — the live row stands in when no saved revision is that recent — with cognition records truncated to that checkpoint's head minus the number of dedicated appends crossed, that is, its revision minus N. The reconstructible gap between the **requested** revision and the nearest saved checkpoint at or above it consists only of dedicated appends, so the read proves that by position: the crossed `append_seq` values must be exactly the consecutive integers in the range, each classified. A missing, extra, duplicate or non-integer position is `InternalError` — a row count is not a proof, because SQLite's non-strict columns accept a `REAL` in an integer position and a counted fractional row masks a missing one.
 
-A revision below the entry's floor answers `KnowledgeEntryNotFound` with the message `knowledge entry revision was pruned` and `details.reason` `HISTORY_TRUNCATED`; a caller matches the code and that token, never the message.
+A revision below the entry's floor answers `HistoryTruncated` with the message `knowledge entry revision was pruned` and `details.floor_revision` set to the entry's floor; a caller matches the code and that member, never the message.
 
 An unassigned revision, revision 0, a value above the representable range, a revision above the live one, and a missing entry all answer `KnowledgeEntryNotFound` with the message `knowledge entry revision not found` and no details.
+
+**Served reachability.** Both local operations are published as protocol operations when the host enables `ServeFaces.history`: `history.revisions.get` replays one revision and `history.revisions.prune` runs the same prune. `RoutedKnowledgeStore` implements `spoke_operations::HistoryPort` beside `ScopedKnowledgePort`, so the served ops reuse this page's replay, retention, admission and disclosure rules rather than a second history path: a served replay answers this page's `HistoryTruncated` and `KnowledgeEntryNotFound` cases, and a served prune returns this page's `PruneReport`. The wire decode, the protocol refusal set and its `details`, the `RevisionSnapshot` projection, the `knowledge_entry`-only coverage and the prune dedup, including how long its records live, belong to `.agents/specs/architecture/serving-seam.md` alone; that page is where the read and prune denials are distinguished.
 
 ### Adoption
 
@@ -84,7 +86,7 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 
 - History, adoption and retirement share the existing immediate-transaction discipline: the write reservation is taken before claim state is read.
 - Pruning shares that discipline: one `BEGIN IMMEDIATE` reservation covers the entry read, the window computation, the deletes and the floor update. It writes only `history_floor_revision` on the entry row — never the revision — so the capture trigger saves no checkpoint of the prune itself. A retired entry's history is never deleted, and no cognition record or live payload is touched.
-- The disclosure predicate is unchanged: hiding is one generic absence on every served path.
+- The disclosure predicate is unchanged: a hidden entry, or a retired one read through the ordinary reads and lists, is one generic local absence. The explicit lifecycle read and revision replay still see a retired entry (§ Retirement). The served face's read and prune denials are `.agents/specs/architecture/serving-seam.md`'s.
 - The current-row read, the header read, the default list and the scoped put keep their statement counts; the filter is an added predicate.
 - A retired row and its history are never deleted; no committed cognition record is rewritten.
 - The CAS compares the stored revision **column** against the caller's expectation; the marking path additionally refuses a column/payload disagreement before writing, while the full put never decodes the stored payload and therefore cannot detect that drift.
@@ -95,10 +97,11 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 - Write path, replay, explicit prune, retirement write, resolution, current-record predicate: `crates/mindcore-sqlite/src/knowledge.rs`, `cognition.rs`.
 - Adoption and the anchor codec: `crates/mindcore-spi/src/adoption.rs`, `crates/mindcore-base/src/knowledge.rs`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
+- Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
 
 ## Served failure messages
 
-A storage failure on the served knowledge face answers `InternalError` with the fixed text `knowledge storage is unavailable` and no details. The one exempt refusal is an over-bound list: both faces answer `InternalError` with `details.reason` `COLLECTION_OVER_CAPACITY` and `details.limit` set to the bound it crossed (`SERVED_KNOWLEDGE_LIST_LIMIT`), so a caller tells capacity apart from a storage fault. The served face forwards it unchanged — it is about the peer's own collection and names no local schema. Driver text is never forwarded to an admitted peer, because it names local tables and columns. A host that needs the underlying cause observes it in its own storage layer or its own logs — the library writes none.
+A storage failure on the served knowledge face answers `InternalError` with the fixed text `knowledge storage is unavailable` and no details. The one exempt refusal is an over-bound list: both faces answer `InternalError` whose `details` carries `reason` `COLLECTION_OVER_CAPACITY` and `limit` set to the bound it crossed (`SERVED_KNOWLEDGE_LIST_LIMIT`), so a caller tells capacity apart from a storage fault. The served face forwards it unchanged — it is about the peer's own collection and names no local schema. Driver text is never forwarded to an admitted peer, because it names local tables and columns. A host that needs the underlying cause observes it in its own storage layer or its own logs — the library writes none.
 
 ## Known limits
 
@@ -109,4 +112,4 @@ A storage failure on the served knowledge face answers `InternalError` with the 
 
 ## Change obligations
 
-A change to the history table, the trigger, the retirement column or the anchor shape lands together with this page, the reader that decodes it, and the lifecycle scenario. Removing the trigger's skip predicate or the positional proof silently weakens replay without failing a test that only compares happy-path output.
+A change to the history table, the trigger, the retirement column or the anchor shape lands together with this page, the reader that decodes it, and the lifecycle scenario. Removing the trigger's skip predicate or the positional proof silently weakens replay without failing a test that only compares happy-path output. A change to which local history results are served lands here; a change to the served projection, the protocol refusal set or its `details` belongs to `.agents/specs/architecture/serving-seam.md` alone, with the loopback assertions.

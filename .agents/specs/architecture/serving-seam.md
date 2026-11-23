@@ -2,7 +2,7 @@
 
 ## Scope
 
-Signed Rust SPOKE sessions over a host-supplied transport: the Memory and Knowledge faces, the three Mind workflow tools and the shared-entry adoption tool. The library does not own a listener, accept loop, identity provisioning, publisher, or model provider.
+Signed Rust SPOKE sessions over a host-supplied transport: the Memory, Knowledge and History faces, the three Mind workflow tools and the shared-entry adoption tool. The library does not own a listener, accept loop, identity provisioning, publisher, or model provider.
 
 ## Current state
 
@@ -23,9 +23,38 @@ The peer's route grants read/write knowledge access within its scope, not uncons
 | Get id absent or hidden within the routed collection | One generic `KnowledgeEntryNotFound`. An out-of-scope put is `NotAuthorized`. |
 | Admitted create hits an existing visible id; admitted update carries a stale/missing stored revision | `KnowledgeEntryAlreadyExists`; `StoredRevisionStale`, respectively. Preserve backend codes; storage failures are `InternalError`. |
 
+### History
+
+The `spoke-history` family publishes two operations over the same signed session: `history.revisions.get` returns a `RevisionSnapshot`, `history.revisions.prune` returns `HistoryPruneResult { deleted, floor_revision }` where `floor_revision` is the local report's floor. The host enables both with `ServeFaces.history`: `false` composes no history service and advertises no `spoke-history`, the composed surface adds it to `RemoteServePortsComposite::knowledge_only(face).with_history(service)`, and `face_capabilities` advertises the family from that one flag.
+
+One store fills two port roles: `RoutedKnowledgeStore` implements `spoke_operations::HistoryPort` beside `ScopedKnowledgePort`, so no second store or runtime history module exists. Admission is the knowledge face's, composed as `HistoryAdmission = (principals(peer)?, knowledge_admission(peer)?)`: a peer outside either callback gets that callback's refusal, and can therefore replay and prune exactly the scope it reads and writes through `port.knowledge.*`. Connect compares a present request `scope` with the admitted scope before calling the port — `NOT_FOUND` on get, `NOT_AUTHORIZED` on prune — and the port re-applies `RoutedKnowledgeStore::admit` as its own guard.
+
+Coverage is `knowledge_entry` alone, because the store keeps no relation revision table. Any other `entity_kind` answers `HISTORY_ENTITY_UNSUPPORTED` after admission and before any statement. The entity's own disclosure rules apply unchanged: a missing, retired or peer-hidden row is one `NOT_FOUND` on get; prune needs a put's permission, so a retired or hidden row answers `NOT_AUTHORIZED` and a missing one `NOT_FOUND`. Get checks two payloads, because visibility is a payload property: the live row decides existence and retirement, and the replayed entry is then held to the same admitted scope, so a revision whose own disclosure, viewpoint, source or entry-type fields fall outside that scope answers the same `NOT_FOUND` with no snapshot. Both ops run in one transaction — a read for get, one `BEGIN IMMEDIATE` covering the permission read and the delete for prune — and every answer passes through the same storage-failure generalization as the knowledge face, so no table or column name reaches a peer.
+
+`RevisionSnapshot` carries `schema_version` `1`, `entity_kind` `knowledge_entry`, the requested `entity_id` and `revision`, `extensions = {}`, and the replayed entry as `snapshot`: the stored entry travels as entity data, so its timestamps keep their stored spelling and a second replay is byte-equal.
+
+| Refusal | `details` |
+|---|---|
+| `entity_kind` other than `knowledge_entry` | `HISTORY_ENTITY_UNSUPPORTED` with exactly `entity_kind`, the requested kind |
+| Revision below the entry's persisted floor | `HISTORY_TRUNCATED` with exactly `floor_revision`, an integer ≥ 0 |
+| Revision `0`, above the live revision, or unassigned to the entry | `NOT_FOUND`, none |
+| Missing, retired or peer-hidden row on get; missing row on prune | `NOT_FOUND`, none |
+| Retired or peer-hidden row on prune | `NOT_AUTHORIZED`, none |
+| `keep == 0` | `INVALID_INPUT`, none; refused by the port, since Connect's decoder admits `0` |
+| Malformed payload, or a prune integer outside the JCS exact-integer range | `INVALID_INPUT` with `details.op` |
+| A failed statement or a contradicted history gap | `INTERNAL_ERROR`, none after generalization |
+| Same `idempotency_key` with a different payload digest | `IDEMPOTENCY_CONFLICT`, none |
+| Same `idempotency_key` after its record was evicted | `RECEIPT_EXPIRED`, none; the prune is not re-executed |
+
+`HISTORY_NOT_RETAINED` is never answered: every revision at or above the floor is rebuilt from the next checkpoint or the live row, and a contradicted gap is storage corruption, not a retention gap.
+
+Prune is deduplicated by Connect's recorded-outcome store, keyed by `(op, effective scope, requester principal id, idempotency_key)` and holding the request digest plus the settled outcome. Both services keep the released in-memory default. That default bounds **live outcome records** only — 1024 by default — and an evicted key leaves a tombstone so a same-key replay answers `RECEIPT_EXPIRED` instead of re-executing; tombstones are never evicted, so the store's memory grows with the number of distinct evicted keys. The store belongs to one `HistoryPortService`, so its records and tombstones live for exactly that service instance: `MindcoreServe::surface` builds a new service per assembled surface, so a reassembly in the same process starts with no record and no tombstone, exactly as a restart does. Connect's standalone `HistoryPortService::with_dedup_store` accepts a durable store, but that builder is not an injection point into this runtime: `MindcoreServe::surface` constructs `HistoryPortService::new` itself and `ServeFaces` exposes no dedup store and no history service, so every host of this surface serves the in-memory default.
+
+**Dedup consequence:** the default does not outlive the service instance, so a prune whose outcome was lost to a crash — or to a reassembled surface — can be re-executed by a same-key retry after new checkpoints exist, deleting checkpoints the original call never saw — permanent data loss. A durable store narrows that exposure without closing it: Connect records the settled outcome only after the port returns, while the SQLite prune commits inside the port, so a crash between commit and record leaves a committed prune with no record, and a same-key retry executes it again. No dedup store on either side removes that window, and this surface offers no way to inject one. Adoption has no equivalent permanent-loss replay path: when the source read succeeds and the destination already holds the copy, its store CAS and anchor repeat rules make a retried copy answer `AlreadyPresent` or `RevisionConflict` and write nothing, so replaying an adoption whose outcome was lost is safe. `I-000096` tracks the durable store as a medium-severity residual for the upstream builder.
+
 ### Workflow tools
 
-`MindcoreServe` derives served capability ids and tool descriptors from installed faces and handlers; the host supplies identity, transport, allowed peers and non-capability manifest metadata. Compose Memory and Knowledge with `RemoteServePortsComposite::knowledge_only(face).with_memory(service)`. The Memory service consumes a trusted peer-to-principal mapping and implements the advertised family contract; the runtime does not create fake baseline, reflection or transfer providers. For each accepted transport, register handlers before releasing inbound traffic; `connect_responder` starts its own SPOKE receive task and does not install handlers from the manifest.
+`MindcoreServe` derives served capability ids and tool descriptors from installed faces and handlers; the host supplies identity, transport, allowed peers and non-capability manifest metadata. Compose Memory and Knowledge with `RemoteServePortsComposite::knowledge_only(face).with_memory(service)`, and the history family with `.with_history(service)` on that same composite. The Memory service consumes a trusted peer-to-principal mapping and implements the advertised family contract; the runtime does not create fake baseline, reflection or transfer providers. For each accepted transport, register handlers before releasing inbound traffic; `connect_responder` starts its own SPOKE receive task and does not install handlers from the manifest.
 
 The memory face advertises `spoke-memory` whenever a service is attached, and `spoke-memory-transfer` only when that service reports all five §7.29–§7.33 operations through `mindcore_spoke::ServedMemory::operations`. `RemoteMemoryService` exposes one `invoke` seam and names no operation, so the service itself carries the answer: `ServedMemory` extends it with an operation list whose default is empty, and a bare `RemoteMemoryService` therefore never claims the transfer family. The derivation is the only advertisement list: `face_capabilities` compares [`TRANSFER_OPERATIONS`] against what the service reports, so no host-supplied string can claim a family the bound service cannot show it dispatches.
 
@@ -79,13 +108,14 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 - The adoption source is host configuration and the adoption destination is the admitted principal's route: no wire value selects either, and a source equal to any route destination is refused before serving.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.
+- History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes. The `spoke-history` capability is advertised only when `ServeFaces.history` composes the service.
 
 ## Where it lives
 
-- SQLite scoped store beside `crates/mindcore-sqlite/src/knowledge.rs` and its borrowed-transaction helpers; used both by the Knowledge loopback and by `crates/mindcore-runtime`.
+- SQLite scoped store beside `crates/mindcore-sqlite/src/knowledge.rs` and its borrowed-transaction helpers; used both by the Knowledge loopback and by `crates/mindcore-runtime`. The same file implements `HistoryPort` for `RoutedKnowledgeStore` and projects the replay onto `RevisionSnapshot`.
 - `crates/mindcore-spoke/src/workflows.rs` owns workflow storage admission and settlement; `crates/mindcore-spi` owns the workflow contracts.
-- `crates/mindcore-runtime/src/tools.rs` owns the served tool registrations and their advertised ABI; `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces`, `AdoptionRoute` and the assembly-time refusals. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session.
+- `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces` (including `history`), `AdoptionRoute`, the `HistoryAdmission` composition, and `face_capabilities`; `spoke-connect`'s `HistoryPortService` owns the wire decode, the effective-scope check and the prune dedup store. `crates/mindcore-runtime/src/tools.rs` owns the served tool registrations and their advertised ABI. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session, including both history ops.
 
 ## Change obligations
 
-Changing an advertised face, tool id, argument/result shape, or scope admission rule updates this spec and the signed loopback assertions in the same change.
+Changing an advertised face, tool id, argument/result shape, or scope admission rule updates this spec and the signed loopback assertions in the same change. This page is the served history contract's only home: a change to the refusal set, its `details` members, the `RevisionSnapshot` projection, the dedup default or its lifetime updates this page; a change to the local replay or retention semantics those answers carry updates `.agents/specs/data/knowledge-lifecycle.md` as well.
