@@ -145,10 +145,15 @@ A chain that cannot resolve — a cycle, an ambiguous merge, a missing hop, more
 32 edges — answers `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order. A
 retired source's requested revision is not compared, because the anchor records the terminal's own
 revision; a live source that moved off the requested revision answers `REVISION_CONFLICT` with no
-details. A resolved terminal whose own revision is above the served domain has no conformant success
-to report — the anchor and the copy's `revision` both carry it — so the call refuses before writing
-anything, with the fixed fault message and `details.kind = "store"`; the copy is never committed for
-a response the wire cannot carry.
+details. A resolved terminal whose own revision is above Mindcore's served ceiling of `2^53 - 1` has
+no conformant success to report, because the anchor is the only carrier of that revision: the
+`adoption_anchor.source_revision` member records the terminal's revision and must satisfy the
+IEEE-754 safe-integer bound, which is Mindcore's own check and narrower than the numeric check
+Connect applies to the request. The copy's own `revision` is never that value — it is the
+destination row's write revision, assigned by the store (`1` on a create) — so the response's
+`entry.revision` is checked separately on return. The call refuses before writing anything, with the
+fixed fault message and `details.kind = "store"`; the copy is never committed for a response the
+wire cannot carry.
 
 **Copy and inherited governance.** `body`, `canonical_name`, `entry_type` and `status` come from the
 terminal; `modules` loses `cognition` rather than keeping an emptied envelope; `source_anchor` stays

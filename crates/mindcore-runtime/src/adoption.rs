@@ -234,7 +234,7 @@ async fn adopt_in(
         scope: admitted,
         gate: &gate,
     };
-    let outcome = adopt_knowledge_entry_typed(
+    adopt_knowledge_entry_typed(
         &src,
         &dst,
         &terminal.source_scope_id,
@@ -242,11 +242,7 @@ async fn adopt_in(
         destination_id,
         terminal.source_revision,
     )
-    .await;
-    match outcome {
-        SpokeResult::Ok(outcome) => SpokeResult::Ok(outcome),
-        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
-    }
+    .await
 }
 
 /// The call's read half: the shared source.
