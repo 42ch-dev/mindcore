@@ -41,6 +41,12 @@ use tools::WorkflowTools;
 /// The `tools.*` namespace this runtime owns.
 const TOOLS_NAMESPACE: &str = "mindcore";
 
+/// The id of the retired product adoption tool.
+///
+/// `knowledge.adopt` replaces it: the id is dropped from every host registration, so a surface that
+/// still configures an [`AdoptionRoute`] assembles but advertises and installs nothing under it.
+const RETIRED_ADOPT_TOOL: &str = "tools.mindcore.adopt";
+
 /// The Mindcore serving side over one host store.
 ///
 /// The workflow engine runs on the same pool the knowledge face serves, so a tool call and a
@@ -124,15 +130,6 @@ impl MindcoreServe {
             }
         }
         let routes = Arc::new(faces.workflow_routes);
-        let adoption = faces.adoption.map(|route| {
-            tools::AdoptionTool::new(
-                self.store.pool(),
-                Arc::clone(&faces.principals),
-                route.scope_id,
-                route.source.collection,
-                Arc::clone(&routes),
-            )
-        });
         let routed = !routes.is_empty();
         let workflows = match self.workflows(routes) {
             Ok(workflows) => workflows,
@@ -142,14 +139,11 @@ impl MindcoreServe {
         let principals = faces.principals;
         let mut tools =
             WorkflowTools::new(engine, Arc::clone(&principals), faces.providers).registrations();
-        if let Some(adoption) = adoption {
-            tools.push(adoption.registration());
-        }
         tools.extend(
             faces
                 .tools
                 .into_iter()
-                .filter(|tool| tool.descriptor.capability_id.as_str() != tools::ADOPT),
+                .filter(|tool| tool.descriptor.capability_id.as_str() != RETIRED_ADOPT_TOOL),
         );
         if !routed {
             tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
@@ -248,8 +242,8 @@ pub struct ServeFaces {
     /// The one host-configured adoption source, or `None` to serve no adoption. Its collection must
     /// be non-empty and must not be any [`ServeFaces::workflow_routes`] destination, including a
     /// route of a principal that is not connected; assembly refuses otherwise. The source need not
-    /// hold rows. `Some` advertises `tools.mindcore.adopt` and installs its handler; each call
-    /// answers `NotAuthorized` for a principal whose route the map does not name.
+    /// hold rows. It advertises nothing yet: `knowledge.adopt` serves it once the protocol face
+    /// arrives, and `tools.mindcore.adopt` stays retired meanwhile.
     pub adoption: Option<AdoptionRoute>,
     /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
     /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
@@ -261,7 +255,7 @@ pub struct ServeFaces {
     pub workflow_routes: BTreeMap<String, KnowledgeScope>,
     /// Additional host tools: every descriptor is advertised and its handler installed, except the
     /// ids this runtime owns — `tools.mindcore.deliberate` on a surface with an empty route map, and
-    /// `tools.mindcore.adopt` on every surface.
+    /// the retired `tools.mindcore.adopt` on every surface.
     pub tools: Vec<ToolRegistration>,
 }
 

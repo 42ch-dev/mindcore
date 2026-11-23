@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_runtime::tools::{ABSORB, ADOPT, DELIBERATE, RECALL_CONTEXT};
+use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
@@ -28,6 +28,8 @@ use spoke_schemas::{HostCapabilityManifest, Scope};
 const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
 const HOST_TOOL: &str = "tools.mindcore.host_tool";
+/// The retired product adoption id the runtime drops from every host registration.
+const RETIRED_ADOPT: &str = "tools.mindcore.adopt";
 
 struct Fixture {
     _dir: TempDir,
@@ -418,69 +420,55 @@ async fn an_empty_adoption_source_is_refused_at_assembly() {
     }
 }
 
-/// The adoption id is the runtime's: a host registration cannot supply it on a surface that serves
-/// no adoption, nor replace the descriptor installed for it when the surface does.
+/// The retired adoption id is the runtime's: a host registration of `tools.mindcore.adopt` is
+/// dropped, so it appears in neither `capabilities` nor `tools` — with or without a configured
+/// adoption source, which serves nothing until the protocol face arrives.
 #[tokio::test]
 async fn a_host_registration_cannot_shadow_the_adoption_tool() {
     let serve = Fixture::open().await.serve();
 
-    let unserved = expect_ok(
-        serve.surface(ServeFaces {
-            tools: vec![shadowing_adoption()],
-            ..faces(metadata("runtime"))
-        }),
-        "assemble a surface a host tries to shadow without configuring adoption",
-    );
-    assert!(
-        !capabilities(&unserved).contains(&ADOPT),
-        "a host registration supplied an id no adoption serves: {:?}",
-        capabilities(&unserved)
-    );
-    assert!(
-        unserved
-            .manifest
-            .tools
-            .iter()
-            .all(|tool| tool.capability_id.as_str() != ADOPT),
-        "the host's adoption descriptor is not advertised"
-    );
-
-    let source = || {
+    let adopted = || {
         Some(AdoptionRoute {
             scope_id: "spc_shared".to_string(),
             source: KnowledgeScope::new("shared"),
         })
     };
-    let plain = expect_ok(
-        serve.surface(ServeFaces {
-            adoption: source(),
-            ..faces(metadata("runtime"))
-        }),
-        "assemble an adopting surface",
-    );
-    let shadowed = expect_ok(
-        serve.surface(ServeFaces {
-            adoption: source(),
-            tools: vec![shadowing_adoption()],
-            ..faces(metadata("runtime"))
-        }),
-        "assemble an adopting surface a host tries to shadow",
-    );
+    for (context, adoption) in [
+        ("without a configured adoption source", None),
+        ("with a configured adoption source", adopted()),
+    ] {
+        let surface = expect_ok(
+            serve.surface(ServeFaces {
+                adoption,
+                tools: vec![shadowing_adoption()],
+                ..faces(metadata("runtime"))
+            }),
+            "assemble a surface a host tries to shadow",
+        );
 
-    assert_eq!(
-        advertised_descriptor(&shadowed, ADOPT),
-        advertised_descriptor(&plain, ADOPT),
-        "the host registration replaced the runtime's adoption descriptor"
-    );
+        assert!(
+            !capabilities(&surface).contains(&RETIRED_ADOPT),
+            "a host registration supplied the retired id {context}: {:?}",
+            capabilities(&surface)
+        );
+        assert!(
+            surface
+                .manifest
+                .tools
+                .iter()
+                .all(|tool| tool.capability_id.as_str() != RETIRED_ADOPT),
+            "the host's retired adoption descriptor is not advertised {context}"
+        );
+    }
 }
 
-/// A host registration borrowing the runtime's adoption id: accepted, its descriptor and handler
-/// would stand in for the runtime's.
+/// A host registration borrowing the retired adoption id: its descriptor would be advertised and
+/// its handler installed if the runtime did not drop it.
 fn shadowing_adoption() -> ToolRegistration {
     let descriptor: ToolDescriptor = serde_json::from_value(json!({
         "schema_version": 1,
-        "capability_id": ADOPT,
-        "op": ADOPT,
+        "capability_id": RETIRED_ADOPT,
+        "op": RETIRED_ADOPT,
         "description": "A host-supplied adoption tool.",
         "input": { "type": "object" },
         "output": { "type": "object" },
@@ -494,21 +482,6 @@ fn shadowing_adoption() -> ToolRegistration {
         });
         handler
     })
-}
-
-/// The one advertised descriptor for `capability_id`, as the manifest carries it.
-fn advertised_descriptor(
-    surface: &mindcore_runtime::MindcoreSurface,
-    capability_id: &str,
-) -> Value {
-    let matching: Vec<&ToolDescriptor> = surface
-        .manifest
-        .tools
-        .iter()
-        .filter(|tool| tool.capability_id.as_str() == capability_id)
-        .collect();
-    assert_eq!(matching.len(), 1, "{capability_id} is advertised once");
-    serde_json::to_value(matching[0]).expect("a tool descriptor serializes")
 }
 
 /// Attaching the host's memory service adds its capability and its face, still without a baseline.
