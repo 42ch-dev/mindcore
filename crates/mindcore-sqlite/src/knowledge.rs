@@ -1634,6 +1634,7 @@ mod tests {
 
     fn plain_carrier(entry_id: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            adoption_anchor: None,
             body: KnowledgeEntryBody::default(),
             canonical_name: KnowledgeEntryCanonicalName::try_from(format!("{entry_id} name"))
                 .expect("non-empty canonical name"),

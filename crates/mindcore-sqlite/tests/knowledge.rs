@@ -79,6 +79,7 @@ async fn foreign_keys_connection(path: &Path) -> SqlitePool {
 
 fn entry_with(entry_id: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody {
             summary: Some(summary.to_string()),
             ..KnowledgeEntryBody::default()

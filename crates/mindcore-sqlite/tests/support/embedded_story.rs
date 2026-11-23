@@ -87,6 +87,7 @@ fn shared_fixture() -> (String, Vec<KnowledgeEntry>) {
 
 pub fn entry(entry_id: &str, entry_type: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody {
             summary: Some(summary.to_string()),
             ..KnowledgeEntryBody::default()

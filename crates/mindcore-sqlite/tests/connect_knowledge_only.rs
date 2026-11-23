@@ -108,6 +108,7 @@ async fn raw_connection(path: &Path) -> SqlitePool {
 
 fn entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody {
             summary: Some(summary.to_string()),
             ..KnowledgeEntryBody::default()
