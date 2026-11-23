@@ -21,15 +21,16 @@ use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
 use spoke_schemas::knowledge_entry::{
     ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
     KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner, Shared3,
-    SourceAnchor as EntrySourceAnchor,
 };
-use spoke_schemas::source_anchor::ExtensionKey as AnchorExtensionKey;
 use spoke_schemas::KnowledgeEntry;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tokio::sync::Barrier;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The scope id naming the shared source collection these adoption proofs read from.
+const SHARED_SCOPE: &str = "spc_shared";
 
 fn database_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -79,6 +80,7 @@ async fn foreign_keys_connection(path: &Path) -> SqlitePool {
 
 fn entry_with(entry_id: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody {
             summary: Some(summary.to_string()),
             ..KnowledgeEntryBody::default()
@@ -390,22 +392,17 @@ fn private_entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
     entry
 }
 
-/// An entry carrying an adoption anchor of the pinned wire shape; `revision` adds the versioned
-/// `source_revision` member.
-fn adopted_entry(entry_id: &str, shared_id: &str, revision: Option<u64>) -> KnowledgeEntry {
-    let mut anchor = adoption_anchor(shared_id, "hearsay");
-    if let Some(revision) = revision {
-        anchor
-            .extensions
-            .get_mut(&AnchorExtensionKey::try_from("mindcore_adoption").expect("valid key"))
-            .expect("the adoption anchor carries its namespace")
-            .insert("source_revision".to_string(), json!(revision));
-    }
-    let anchor: EntrySourceAnchor =
-        serde_json::from_value(serde_json::to_value(anchor).expect("anchor serializes"))
-            .expect("anchor wire shape matches the knowledge_entry copy");
+/// An entry carrying an adoption anchor naming `shared_id` in the shared source scope.
+fn adopted_entry(entry_id: &str, shared_id: &str, revision: u64) -> KnowledgeEntry {
     let mut entry = entry_with(entry_id, "adopted copy");
-    entry.source_anchor = Some(anchor);
+    entry.adoption_anchor = adoption_anchor(SHARED_SCOPE, shared_id, revision);
+    entry
+}
+
+/// An entry carrying an adoption anchor that names the same entry in another source scope.
+fn adopted_elsewhere(entry_id: &str, shared_id: &str, revision: u64) -> KnowledgeEntry {
+    let mut entry = adopted_entry(entry_id, shared_id, revision);
+    entry.adoption_anchor = adoption_anchor("spc_elsewhere", shared_id, revision);
     entry
 }
 
@@ -895,22 +892,16 @@ async fn list_entries_is_scoped_and_ordered() {
 
 #[test]
 fn adoption_anchor_shape() {
-    let basis = "adopted from the village fact sheet";
-    let anchor = adoption_anchor("ke_shared_north_gate", basis);
+    let anchor = adoption_anchor(SHARED_SCOPE, "ke_shared_north_gate", 3).expect("a named triple");
 
-    assert_eq!(anchor.source_id, "shared:ke_shared_north_gate");
-    assert_eq!(anchor.schema_version, NonZeroU64::new(1).expect("non-zero"));
-    let adoption = AnchorExtensionKey::try_from("mindcore_adoption").expect("valid extension key");
+    assert_eq!(anchor.source_scope_id.as_str(), SHARED_SCOPE);
+    assert_eq!(anchor.source_entry_id.as_str(), "ke_shared_north_gate");
+    assert_eq!(anchor.source_revision, 3);
     assert_eq!(
-        anchor
-            .extensions
-            .get(&adoption)
-            .and_then(|fields| fields.get("basis")),
-        Some(&json!(basis))
+        *anchor.schema_version,
+        NonZeroU64::new(1).expect("non-zero")
     );
-    assert!(anchor.span.is_none());
-    assert!(anchor.label.is_none());
-    assert!(anchor.mime_type.is_none());
+    assert!(anchor.extensions.is_empty());
 
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../fixtures/iteration-01/shared-collection.json"
@@ -920,7 +911,7 @@ fn adoption_anchor_shape() {
     let entries: Vec<KnowledgeEntry> = serde_json::from_value(fixture["entries"].clone())
         .expect("fixture entries are wire entries");
     assert_eq!(entries.len(), 1);
-    assert_eq!(format!("shared:{}", entries[0].entry_id), anchor.source_id);
+    assert_eq!(entries[0].entry_id, anchor.source_entry_id.as_str());
 }
 
 #[tokio::test]
@@ -2260,7 +2251,7 @@ async fn an_adoption_anchor_resolves_to_the_first_live_successor() {
         "retire the second stage",
     );
 
-    let one_hop = adopted_entry("ke_mine_one_hop", "ke_stage_two", None);
+    let one_hop = adopted_entry("ke_mine_one_hop", "ke_stage_two", 1);
     assert_eq!(
         expect_ok(
             port.resolve_adoption_anchor(&one_hop).await,
@@ -2268,23 +2259,23 @@ async fn an_adoption_anchor_resolves_to_the_first_live_successor() {
         ),
         "ke_stage_three"
     );
-    let two_hops = adopted_entry("ke_mine_two_hops", "ke_stage_one", None);
+    let two_hops = adopted_entry("ke_mine_two_hops", "ke_stage_one", 1);
     assert_eq!(
         expect_ok(
             port.resolve_adoption_anchor(&two_hops).await,
-            "a legacy anchor two hops from a live entry"
+            "an anchor two hops from a live entry"
         ),
         "ke_stage_three"
     );
-    let versioned = adopted_entry("ke_mine_versioned", "ke_stage_one", Some(3));
+    let versioned = adopted_entry("ke_mine_versioned", "ke_stage_one", 3);
     assert_eq!(
         expect_ok(
             port.resolve_adoption_anchor(&versioned).await,
-            "a versioned anchor two hops from a live entry"
+            "a later-revision anchor two hops from a live entry"
         ),
         "ke_stage_three"
     );
-    let current = adopted_entry("ke_mine_current", "ke_stage_three", None);
+    let current = adopted_entry("ke_mine_current", "ke_stage_three", 1);
     assert_eq!(
         expect_ok(
             port.resolve_adoption_anchor(&current).await,
@@ -2323,7 +2314,7 @@ async fn an_unresolvable_adoption_anchor_answers_one_absence() {
         ("ke_mine_hidden_start", "ke_private", "ke_private"),
         ("ke_mine_hidden_hop", "ke_chain", "ke_chain"),
     ] {
-        let anchored = adopted_entry(anchored_id, source, None);
+        let anchored = adopted_entry(anchored_id, source, 1);
         match port.resolve_adoption_anchor(&anchored).await {
             SpokeResult::Ok(resolved) => {
                 panic!("an unresolvable anchor answered {resolved}")
@@ -2351,16 +2342,96 @@ async fn an_unresolvable_adoption_anchor_answers_one_absence() {
         ),
         SpokeRejectCode::InvalidInput
     );
-    let empty_locator = adopted_entry("ke_mine_empty", "", None);
-    assert_eq!(
-        expect_reject(
-            port.resolve_adoption_anchor(&empty_locator).await,
-            "an anchor naming no shared entry"
-        ),
-        SpokeRejectCode::InvalidInput
-    );
+    // An anchor naming no shared entry is unconstructible: `AdoptionAnchorSourceEntryId` rejects an
+    // empty id on both its `TryFrom` and its decode, so the absent-anchor case above is the only
+    // shape the type admits.
 
     store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn a_local_put_preserves_a_stored_adoption_anchor_or_refuses() {
+    let path = database_path("put-anchor-gate");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+    let reader = second_connection(&path).await;
+
+    let created = adopted_entry("ke_mine", "ke_shared_north_gate", 1);
+    let stored = expect_ok(
+        port.put_knowledge_entry(created, None).await,
+        "a create may carry an anchor",
+    );
+    assert_eq!(stored.revision, Some(1));
+    let before = stored_state(&reader, "ke_mine").await;
+
+    for (submitted, context) in [
+        (
+            adopted_elsewhere("ke_mine", "ke_shared_north_gate", 1),
+            "another source scope",
+        ),
+        (
+            adopted_entry("ke_mine", "ke_shared_north_gate", 2),
+            "another source revision",
+        ),
+        (
+            adopted_entry("ke_mine", "ke_shared_other_gate", 1),
+            "another source entry",
+        ),
+        (entry_with("ke_mine", "an adopted copy"), "a dropped anchor"),
+    ] {
+        match port.put_knowledge_entry(submitted, Some(1)).await {
+            SpokeResult::Ok(written) => {
+                panic!("{context}: a put over a stored anchor was accepted with {written:?}")
+            }
+            SpokeResult::Reject(reject) => {
+                assert_eq!(
+                    reject.code,
+                    SpokeRejectCode::AdoptionAnchorImmutable,
+                    "{context}"
+                );
+                assert_eq!(
+                    reject
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("entry_id")),
+                    Some(&json!("ke_mine")),
+                    "{context}: the refusal names the destination entry"
+                );
+            }
+        }
+        assert_eq!(
+            stored_state(&reader, "ke_mine").await,
+            before,
+            "{context}: a refused put leaves the row byte-identical"
+        );
+    }
+
+    let mut identical = adopted_entry("ke_mine", "ke_shared_north_gate", 1);
+    identical.body.summary = Some("the same anchor, edited".to_string());
+    let updated = expect_ok(
+        port.put_knowledge_entry(identical, Some(1)).await,
+        "an identical anchor passes",
+    );
+    assert_eq!(updated.revision, Some(2));
+    assert_eq!(summary_of(&updated), Some("the same anchor, edited"));
+
+    let mut plain = entry_with("ke_plain", "never adopted");
+    plain.body.summary = Some("a plain entry".to_string());
+    expect_ok(
+        port.put_knowledge_entry(plain, None).await,
+        "create without an anchor",
+    );
+    let mut plain_update = entry_with("ke_plain", "still never adopted");
+    plain_update.body.summary = Some("a plain entry, edited".to_string());
+    let rewritten = expect_ok(
+        port.put_knowledge_entry(plain_update, Some(1)).await,
+        "an entry without an anchor takes no anchor",
+    );
+    assert!(rewritten.adoption_anchor.is_none());
+
+    store.close().await;
+    reader.close().await;
     remove_database(&path);
 }
 
@@ -2389,7 +2460,7 @@ async fn a_cycle_in_stored_markers_is_a_storage_failure() {
         .await
         .expect("seed the cyclic marker");
     }
-    let anchored = adopted_entry("ke_mine_cycle", "ke_cycle_a", None);
+    let anchored = adopted_entry("ke_mine_cycle", "ke_cycle_a", 1);
     match port.resolve_adoption_anchor(&anchored).await {
         SpokeResult::Ok(resolved) => panic!("a cyclic chain answered {resolved}"),
         SpokeResult::Reject(reject) => {
@@ -2608,7 +2679,7 @@ async fn stored_row(connection: &SqlitePool, collection: &str, entry_id: &str) -
 fn adoption_anchor_json(entry: &KnowledgeEntry) -> Value {
     serde_json::to_value(
         entry
-            .source_anchor
+            .adoption_anchor
             .as_ref()
             .expect("the adopted copy carries its anchor"),
     )
@@ -2616,7 +2687,7 @@ fn adoption_anchor_json(entry: &KnowledgeEntry) -> Value {
 }
 
 fn anchor_source_revision(entry: &KnowledgeEntry) -> Option<u64> {
-    adoption_anchor_json(entry)["extensions"]["mindcore_adoption"]["source_revision"].as_u64()
+    adoption_anchor_json(entry)["source_revision"].as_u64()
 }
 
 /// A fixed instant, so a copy that inherited its source's timestamps would show one.
@@ -2663,6 +2734,15 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     );
     shared.created_at = Some(instant("2026-11-01T09:00:00Z"));
     shared.updated_at = Some(Shared3(instant("2026-11-02T09:00:00Z")));
+    shared.source_anchor = Some(
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "source_id": "notes/north-gate.md",
+            "label": "the gate log",
+            "extensions": {},
+        }))
+        .expect("source anchor fixture parses"),
+    );
     let seeded = expect_ok(
         src.put_knowledge_entry(shared.clone(), None).await,
         "seed the shared source",
@@ -2671,10 +2751,14 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
         seeded.created_at.is_some() && seeded.updated_at.is_some(),
         "the source carries both timestamps, so the copy's cleared ones mean something"
     );
+    assert!(
+        seeded.source_anchor.is_some(),
+        "the source carries an ordinary provenance anchor, so the copy's cleared one means something"
+    );
     let source_before = stored_row(&reader, "shared", shared_id).await;
 
     let created = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
         "first adoption",
     ) {
         AdoptionOutcome::Created(created) => created,
@@ -2687,12 +2771,13 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     assert_eq!(created.entry_type, shared.entry_type);
     assert_eq!(created.status, shared.status);
     let anchor = adoption_anchor_json(&created);
-    assert_eq!(anchor["source_id"], json!(format!("shared:{shared_id}")));
-    assert_eq!(
-        anchor["extensions"]["mindcore_adoption"]["basis"],
-        json!("shared-entry")
-    );
+    assert_eq!(anchor["source_scope_id"], json!(SHARED_SCOPE));
+    assert_eq!(anchor["source_entry_id"], json!(shared_id));
     assert_eq!(anchor_source_revision(&created), Some(1));
+    assert!(
+        created.source_anchor.is_none(),
+        "the copy leaves the ordinary provenance pointer to its own writes"
+    );
     assert!(
         module_of(&created).is_some_and(|module| module.contains_key("world_facts")),
         "the cognition envelope and its members survive"
@@ -2721,7 +2806,7 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     assert_eq!(advanced.revision, Some(2));
 
     let repeat = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
         "repeat at the adopted revision",
     ) {
         AdoptionOutcome::AlreadyPresent(existing) => existing,
@@ -2729,17 +2814,29 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     };
     assert_eq!(as_json(&repeat), as_json(&created));
     assert_eq!(anchor_source_revision(&repeat), Some(1));
-    assert_eq!(
-        expect_reject(
-            adopt_knowledge_entry(&src, &dst, shared_id, 2).await,
-            "a request naming the advanced source revision rather than the adopted one",
-        ),
-        SpokeRejectCode::RevisionConflict
-    );
+    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 2).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::RevisionConflict,
+                "a request naming the advanced source revision rather than the adopted one"
+            );
+            assert_eq!(
+                reject
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("adopted_revision"))
+                    .and_then(Value::as_u64),
+                Some(1),
+                "the conflict names the revision the copy was adopted at"
+            );
+        }
+        other => panic!("a newer request must not be answered by an older copy, got {other:?}"),
+    }
 
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, shared_id, 3).await,
+            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 3).await,
             "a request naming neither revision",
         ),
         SpokeRejectCode::RevisionConflict
@@ -2775,7 +2872,7 @@ async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded(
         "seed the source",
     );
     let adopted = match expect_ok(
-        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
         "first adoption",
     ) {
         AdoptionOutcome::Created(created) => created,
@@ -2794,7 +2891,7 @@ async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded(
     let copy_before = stored_row(&reader, "wren", shared_id).await;
 
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 1).await,
         "a repeat whose source turned superseded",
     );
     assert_eq!(
@@ -2824,7 +2921,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
     let reader = second_connection(&path).await;
 
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, "ke_absent", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_absent", 1).await,
         "a missing source",
     );
 
@@ -2834,7 +2931,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
         "seed an owner-private source",
     );
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, "ke_private", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_private", 1).await,
         "an owner-private source",
     );
 
@@ -2851,7 +2948,7 @@ async fn adoption_answers_one_generic_absence_for_missing_private_and_superseded
     );
     let superseded_before = stored_row(&reader, "shared", "ke_stage_one").await;
     expect_source_absent(
-        adopt_knowledge_entry(&src, &dst, "ke_stage_one", 1).await,
+        adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_stage_one", 1).await,
         "a superseded source",
     );
     assert_eq!(
@@ -2891,7 +2988,7 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
     );
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, "ke_shared_gate", 1).await,
+            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_shared_gate", 1).await,
             "an unrelated occupant",
         ),
         SpokeRejectCode::KnowledgeEntryAlreadyExists
@@ -2905,31 +3002,31 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
     );
 
     expect_ok(
-        src.put_knowledge_entry(entry_with("ke_legacy_gate", "shared fact"), None)
+        src.put_knowledge_entry(entry_with("ke_other_scope_gate", "shared fact"), None)
             .await,
-        "seed the legacy source",
+        "seed the other-scope source",
     );
-    let legacy = expect_ok(
+    let elsewhere = expect_ok(
         dst.put_knowledge_entry(
-            adopted_entry("ke_legacy_gate", "ke_legacy_gate", None),
+            adopted_elsewhere("ke_other_scope_gate", "ke_other_scope_gate", 1),
             None,
         )
         .await,
-        "seed a legacy occupant",
+        "seed an occupant anchored to another source scope",
     );
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, "ke_legacy_gate", 1).await,
-            "a legacy anchor without a revision",
+            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_other_scope_gate", 1).await,
+            "an occupant anchored to another source scope",
         ),
         SpokeRejectCode::KnowledgeEntryAlreadyExists
     );
     assert_eq!(
         as_json(&expect_ok(
-            dst.get_knowledge_entry("ke_legacy_gate").await,
-            "read the legacy occupant back"
+            dst.get_knowledge_entry("ke_other_scope_gate").await,
+            "read the other-scope occupant back"
         )),
-        as_json(&legacy)
+        as_json(&elsewhere)
     );
 
     expect_ok(
@@ -2939,7 +3036,7 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
     );
     assert_eq!(
         expect_reject(
-            adopt_knowledge_entry(&src, &dst, "ke_fresh_gate", 5).await,
+            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_fresh_gate", 5).await,
             "a stale expected revision",
         ),
         SpokeRejectCode::RevisionConflict
@@ -2983,7 +3080,7 @@ async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
     );
     let occupant_before = stored_state(&reader, "ke_shared_gate").await;
 
-    match adopt_knowledge_entry(&src, &dst, "ke_shared_gate", 1).await {
+    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_shared_gate", 1).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
             assert_eq!(
@@ -3021,7 +3118,7 @@ async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
     module.insert("records".to_string(), Value::Null);
     let src = FixedSource(broken);
 
-    match adopt_knowledge_entry(&src, &dst, "ke_broken_carrier", 1).await {
+    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, "ke_broken_carrier", 1).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
             assert!(
@@ -3149,8 +3246,8 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
     );
 
     let (left, right) = tokio::join!(
-        adopt_knowledge_entry(&left_src, &left_gated, shared_id, 1),
-        adopt_knowledge_entry(&right_src, &right_gated, shared_id, 1),
+        adopt_knowledge_entry(&left_src, &left_gated, SHARED_SCOPE, shared_id, 1),
+        adopt_knowledge_entry(&right_src, &right_gated, SHARED_SCOPE, shared_id, 1),
     );
     assert!(
         left_gated.observed_absent() && right_gated.observed_absent(),

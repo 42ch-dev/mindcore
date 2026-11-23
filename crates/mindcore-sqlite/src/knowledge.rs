@@ -10,9 +10,10 @@ use std::sync::Arc;
 use mindcore_base::cognition::carrier_record_violation;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use spoke_operations::{
-    filter_knowledge_entries_by_scope, knowledge_entry_visible_to_viewpoint, spoke_reject,
-    validate_cognition_module, validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort,
-    SpokeReject, SpokeRejectCode, SpokeResult,
+    assert_adoption_anchor_preserved, filter_knowledge_entries_by_scope,
+    knowledge_entry_visible_to_viewpoint, spoke_reject, validate_cognition_module,
+    validate_cognition_record, KnowledgeEntryPort, ScopedKnowledgePort, SpokeReject,
+    SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
 use spoke_schemas::{KnowledgeEntry, Scope};
@@ -387,7 +388,7 @@ impl ScopedKnowledgeStore {
         }
     }
 
-    /// The live entry an adoption anchor resolves to: the anchor's shared id, then each
+    /// The live entry an adoption anchor resolves to: the anchor's source entry id, then each
     /// same-collection marker until the first live entry.
     ///
     /// One read transaction pins the whole chain to one snapshot. Every hop passes the
@@ -395,9 +396,9 @@ impl ScopedKnowledgeStore {
     /// hop answers with the one absence keyed to the id the anchor names, never a partial chain.
     /// Ids are tracked, so a cycle in stored markers is a storage failure instead.
     pub async fn resolve_adoption_anchor(&self, adopted: &KnowledgeEntry) -> SpokeResult<String> {
-        let Some((source_id, _)) = adoption_anchor_parts(adopted) else {
+        let Some((_, source_id, _)) = adoption_anchor_parts(adopted) else {
             return invalid_input(format!(
-                "knowledge entry {} carries no mindcore adoption anchor",
+                "knowledge entry {} carries no adoption anchor",
                 adopted.entry_id
             ));
         };
@@ -1236,6 +1237,10 @@ where
     }
 }
 
+/// The stored row `write_entry` reads: revision, creation instant, liveness marker and the payload
+/// whose anchor the put must preserve.
+type StoredEntryRow = (i64, String, Option<String>, String);
+
 /// Write one entry of `collection` against `expected_base_revision` through the
 /// caller's transaction, assigning `1` on create and `stored + 1` on update.
 ///
@@ -1250,6 +1255,8 @@ where
 ///
 /// The caller holds the write reservation, so the revision comparison and the
 /// write cannot interleave with another handle on the same file.
+/// The stored payload carries the `adoption_anchor` the put must preserve, so the
+/// statement this read issues is the gate's only read.
 pub async fn write_entry(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
@@ -1269,8 +1276,8 @@ pub async fn write_entry(
         }
     }
 
-    let stored: Result<Option<(i64, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
-        "SELECT revision, created_at, superseded_by FROM knowledge_entries \
+    let stored: Result<Option<StoredEntryRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT revision, created_at, superseded_by, payload FROM knowledge_entries \
          WHERE collection = ? AND entry_id = ?",
     )
     .bind(collection)
@@ -1281,20 +1288,21 @@ pub async fn write_entry(
         Ok(stored) => stored,
         Err(error) => return internal(format!("stored revision could not be read: {error}")),
     };
-    if let Some((_, _, Some(superseded_by))) = stored.as_ref() {
-        let mut details = Map::new();
-        details.insert(
-            "superseded_by".to_string(),
-            Value::from(superseded_by.clone()),
-        );
-        return spoke_reject(
-            SpokeRejectCode::InvalidInput,
-            format!("knowledge entry {} is superseded", entry.entry_id),
-            Some(details),
-        );
-    }
-    let stored_created_at = stored.as_ref().map(|(_, created_at, _)| created_at.clone());
-    let stored = stored.map(|(revision, _, _)| revision as u64);
+    let (stored, stored_created_at, stored_payload) = match stored {
+        Some((revision, created_at, superseded_by, payload)) => {
+            if let Some(superseded_by) = superseded_by {
+                let mut details = Map::new();
+                details.insert("superseded_by".to_string(), Value::from(superseded_by));
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    format!("knowledge entry {} is superseded", entry.entry_id),
+                    Some(details),
+                );
+            }
+            (Some(revision as u64), Some(created_at), Some(payload))
+        }
+        None => (None, None, None),
+    };
     let mut submitted_records: Vec<Value> = match entry.modules.get_mut(&module_key()) {
         Some(KnowledgeEntryModulesValue::Object(module)) => match module.get_mut("records") {
             Some(records) => match std::mem::replace(records, Value::Array(Vec::new())) {
@@ -1337,6 +1345,21 @@ pub async fn write_entry(
             entry.entry_id
         ));
     };
+
+    // The stored payload this read already fetched carries the anchor the put must preserve, so
+    // the gate adds no statement.
+    let stored_entry = match stored_payload {
+        Some(payload) => match decode(&payload) {
+            SpokeResult::Ok(stored) => Some(stored),
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        },
+        None => None,
+    };
+    if let SpokeResult::Reject(reject) =
+        assert_adoption_anchor_preserved(&entry, stored_entry.as_ref())
+    {
+        return SpokeResult::Reject(reject);
+    }
 
     let now = Utc::now();
     entry.revision = Some(next);
@@ -1634,6 +1657,7 @@ mod tests {
 
     fn plain_carrier(entry_id: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            adoption_anchor: None,
             body: KnowledgeEntryBody::default(),
             canonical_name: KnowledgeEntryCanonicalName::try_from(format!("{entry_id} name"))
                 .expect("non-empty canonical name"),

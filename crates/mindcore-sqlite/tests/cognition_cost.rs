@@ -217,6 +217,7 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         .expect("open logging pool");
 
     let carrier = KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody::default(),
         canonical_name: KnowledgeEntryCanonicalName::try_from("ke_wren name")
             .expect("non-empty canonical name"),

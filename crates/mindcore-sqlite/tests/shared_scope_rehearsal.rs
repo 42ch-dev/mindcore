@@ -36,6 +36,8 @@ const SHARED: &str = "shared:world";
 const PERSONAL: &str = "wren";
 /// The one route the served face admits for the shared collection.
 const ROUTE: &str = "shared-route";
+/// The wire scope id naming the shared source collection.
+const SHARED_SCOPE: &str = "spc_shared_world";
 const OWNER_VIEWPOINT: &str = "holder_one";
 const FOREIGN_VIEWPOINT: &str = "holder_two";
 
@@ -315,7 +317,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     );
 
     match expect_ok(
-        adopt_knowledge_entry(&shared, &personal, "ke_gate", 2).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "ke_gate", 2).await,
         "item 2: adopt ke_gate at revision 2",
     ) {
         AdoptionOutcome::Created(_) => {}
@@ -329,7 +331,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     );
     assert_eq!(
         adoption_anchor_parts(&adopted),
-        Some(("ke_gate", Some(2))),
+        Some((SHARED_SCOPE, "ke_gate", 2)),
         "I-000009 item 2 (references): the copy anchors to its shared source id and adopted revision"
     );
     for (entry_id, summary) in [
@@ -491,7 +493,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     );
     assert_eq!(
         adoption_anchor_parts(&promoted),
-        Some(("ke_gate", Some(2))),
+        Some((SHARED_SCOPE, "ke_gate", 2)),
         "item 4: the personal write keeps the copy's anchor"
     );
     assert_eq!(
@@ -632,7 +634,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     );
     assert_eq!(
         adoption_anchor_parts(&restored_copy),
-        Some(("ke_gate", Some(2))),
+        Some((SHARED_SCOPE, "ke_gate", 2)),
         "I-000009 item 6 (backup/restore): the personal copy keeps its anchor to the shared source \
          id and adopted revision"
     );

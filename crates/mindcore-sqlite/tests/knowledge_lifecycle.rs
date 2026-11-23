@@ -25,6 +25,9 @@ use sqlx::SqlitePool;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The scope id naming the shared source collection this lifecycle reads from.
+const SHARED_SCOPE: &str = "spc_shared";
+
 fn database_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -48,6 +51,7 @@ fn remove_database(path: &Path) {
 
 fn entry_with(entry_id: &str, summary: &str) -> KnowledgeEntry {
     KnowledgeEntry {
+        adoption_anchor: None,
         body: KnowledgeEntryBody {
             summary: Some(summary.to_string()),
             ..KnowledgeEntryBody::default()
@@ -392,7 +396,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "read the source before adoption",
     );
     let copy = match expect_ok(
-        adopt_knowledge_entry(&shared, &personal, "entry-a", 3).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", 3).await,
         "adoption at revision 3",
     ) {
         AdoptionOutcome::Created(copy) => copy,
@@ -407,7 +411,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
     assert_eq!(
         adoption_anchor_parts(&copy),
-        Some(("entry-a", Some(3))),
+        Some((SHARED_SCOPE, "entry-a", 3)),
         "the anchor records the id and the exact copied revision"
     );
     assert_eq!(
@@ -427,7 +431,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
 
     let repeat = match expect_ok(
-        adopt_knowledge_entry(&shared, &personal, "entry-a", 3).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", 3).await,
         "repeat adoption at the adopted revision",
     ) {
         AdoptionOutcome::AlreadyPresent(existing) => existing,
@@ -532,11 +536,11 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
 
     expect_source_absent(
-        adopt_knowledge_entry(&shared, &personal, "entry-a", 3).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-a", 3).await,
         "adopting a superseded source",
     );
     expect_source_absent(
-        adopt_knowledge_entry(&shared, &personal, "entry-never-seeded", 1).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-never-seeded", 1).await,
         "adopting a missing source",
     );
     let marked_after = expect_ok(
@@ -579,7 +583,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
 
     assert_eq!(
         adoption_anchor_parts(&copy),
-        Some(("entry-a", Some(3))),
+        Some((SHARED_SCOPE, "entry-a", 3)),
         "the supersede does not rewrite the anchor's recorded revision"
     );
     assert_eq!(
@@ -610,7 +614,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
         "seed an owner-private entry",
     );
     expect_source_absent(
-        adopt_knowledge_entry(&shared, &personal, "entry-p", 1).await,
+        adopt_knowledge_entry(&shared, &personal, SHARED_SCOPE, "entry-p", 1).await,
         "adopting an owner-private entry",
     );
     let copy_after = expect_ok(
@@ -624,7 +628,7 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
     );
     assert_eq!(
         adoption_anchor_parts(&copy_after),
-        Some(("entry-a", Some(3))),
+        Some((SHARED_SCOPE, "entry-a", 3)),
         "a refused adoption leaves the destination anchor unchanged"
     );
     assert_eq!(
