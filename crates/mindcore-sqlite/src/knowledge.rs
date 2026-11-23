@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use spoke_operations::{
     validate_cognition_record, HistoryPort, HistoryPruneResult, KnowledgeEntryPort,
     ScopedKnowledgePort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
-use spoke_schemas::data::revision_snapshot::RevisionSnapshotSnapshot;
+use spoke_schemas::data::revision_snapshot::{RevisionSnapshotSnapshot, Shared2};
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
 use spoke_schemas::{KnowledgeEntry, Principal, RevisionSnapshot, Scope};
 
@@ -756,11 +756,11 @@ impl RoutedKnowledgeStore {
         entity_id: &str,
         keep: u64,
     ) -> SpokeResult<HistoryPruneResult> {
-        if keep == 0 {
-            return invalid_input("a history prune keeps at least one checkpoint");
-        }
         if let SpokeResult::Reject(reject) = self.admit_history(scope, entity_kind) {
             return SpokeResult::Reject(reject);
+        }
+        if keep == 0 {
+            return invalid_input("a history prune keeps at least one checkpoint");
         }
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
@@ -852,15 +852,16 @@ fn history_snapshot(
             ))
         }
     };
-    let envelope = json!({
-        "schema_version": 1,
-        "entity_kind": KNOWLEDGE_ENTRY_KIND,
-        "entity_id": entity_id,
-        "revision": revision,
-        "snapshot": snapshot,
-        "extensions": {},
-    });
-    match serde_json::from_value::<RevisionSnapshot>(envelope) {
+    let envelope = RevisionSnapshot::try_from(
+        RevisionSnapshot::builder()
+            .entity_id(entity_id)
+            .entity_kind(KNOWLEDGE_ENTRY_KIND)
+            .extensions(Shared2::from(HashMap::new()))
+            .revision(revision)
+            .schema_version(1u64)
+            .snapshot(snapshot),
+    );
+    match envelope {
         Ok(snapshot) => SpokeResult::Ok(snapshot),
         Err(error) => internal(format!("history snapshot could not project: {error}")),
     }
@@ -1166,13 +1167,17 @@ type RevisionSelection = (i64, i64, String, Option<i64>, i64);
 /// row is not one; a prune that removes nothing reports `deleted: 0, floor: None` and leaves the
 /// stored floor and every checkpoint alone. Only `history_floor_revision` is written on the entry
 /// row, so the `BEFORE UPDATE OF revision` trigger saves no checkpoint of this update. A superseded
-/// or missing entry answers the same absence; the caller commits.
+/// or missing entry answers the same absence; the caller commits. A zero `keep` is refused: the
+/// helper is public, so its own boundary keeps the input rule the scoped callers hold.
 pub async fn prune_entry_history(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,
     keep: u64,
 ) -> SpokeResult<PruneReport> {
+    if keep == 0 {
+        return invalid_input("a history prune keeps at least one checkpoint");
+    }
     let live: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
         "SELECT 1 FROM knowledge_entries \
          WHERE collection = ? AND entry_id = ? AND superseded_by IS NULL",

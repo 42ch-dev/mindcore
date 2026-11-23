@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
-use mindcore_sqlite::{append_cognition, MindStore, PruneReport};
+use mindcore_sqlite::{append_cognition, prune_entry_history, MindStore, PruneReport};
 use serde_json::{json, Map, Value};
 use spoke_operations::{
     revision_snapshots_equal_canonical, HistoryPort, KnowledgeEntryPort, SpokeRejectCode,
@@ -1429,13 +1429,27 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         assert!(details.is_empty(), "{context} carries no details on prune");
     }
 
-    // keep = 0 never opens a transaction, and an unconfigured route never reaches storage.
+    // Admission runs before the keep boundary: a zero keep cannot mask an unconfigured route or
+    // an unserved kind.
     expect_history_reject(
         port.prune_history(&peer, &admitted, "knowledge_entry", "entry-l", 0)
             .await,
         SpokeRejectCode::InvalidInput,
         "a prune that keeps no checkpoint",
     );
+    expect_history_reject(
+        port.prune_history(&peer, &scope_of("spc_other"), "knowledge_entry", "entry-l", 0)
+            .await,
+        SpokeRejectCode::NotAuthorized,
+        "a zero-keep prune on an unconfigured route",
+    );
+    let details = expect_history_reject(
+        port.prune_history(&peer, &admitted, "relation", "entry-l", 0)
+            .await,
+        SpokeRejectCode::HistoryEntityUnsupported,
+        "a zero-keep prune of an unserved kind",
+    );
+    assert_eq!(details.get("entity_kind"), Some(&json!("relation")));
     expect_history_reject(
         port.get_history_snapshot(
             &peer,
@@ -1487,6 +1501,84 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
             .await,
         "a revision at the floor still replays",
     );
+
+    store.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn the_history_port_redacts_a_stored_decode_fault() {
+    let path = database_path("history-fault");
+    remove_database(&path);
+    let store = MindStore::open(&path).await.expect("open store");
+    let shared = store.knowledge(KnowledgeScope::new("shared"));
+    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let peer = principal("peer-a");
+    let admitted = scope_of("spc_shared");
+
+    expect_ok(
+        shared
+            .put_knowledge_entry(entry_with("entry-f", REVISION_ONE), None)
+            .await,
+        "seed entry-f",
+    );
+
+    // The public prune helper keeps the input rule at its own boundary.
+    let mut transaction = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin the direct prune");
+    match prune_entry_history(&mut transaction, "shared", "entry-f", 0).await {
+        SpokeResult::Ok(report) => panic!("unexpectedly pruned with zero keep: {report:?}"),
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::InvalidInput,
+                "zero keep: {reject:?}"
+            );
+        }
+    }
+    drop(transaction);
+
+    // A stored payload that cannot decode reaches the served face as a redacted storage refusal.
+    sqlx::query(
+        "UPDATE knowledge_entries SET payload = 'not a knowledge entry' \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind("shared")
+    .bind("entry-f")
+    .execute(&store.pool())
+    .await
+    .expect("corrupt the stored payload");
+
+    let reject = match port
+        .get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-f", 1)
+        .await
+    {
+        SpokeResult::Reject(reject) => reject,
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(
+        reject.message, "knowledge storage is unavailable",
+        "the served refusal carries no decode detail: {reject:?}"
+    );
+    assert!(reject.details.is_none(), "{reject:?} carries no details");
+
+    let reject = match port
+        .prune_history(&peer, &admitted, "knowledge_entry", "entry-f", 1)
+        .await
+    {
+        SpokeResult::Reject(reject) => reject,
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError, "{reject:?}");
+    assert_eq!(
+        reject.message, "knowledge storage is unavailable",
+        "the served refusal carries no decode detail: {reject:?}"
+    );
+    assert!(reject.details.is_none(), "{reject:?} carries no details");
 
     store.close().await;
     remove_database(&path);
