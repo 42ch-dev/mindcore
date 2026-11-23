@@ -14,10 +14,14 @@ use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
 use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
 use mindcore_sqlite::{
-    append_cognition, write_entry, MindStore, ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
+    append_cognition, load_retirement_entry, retirement_successors_of, write_entry, MindStore,
+    ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
 };
 use serde_json::{json, Map, Value};
-use spoke_operations::{KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    resolve_retirement_chain, KnowledgeEntryPort, RetirementChainEntry, RetirementTerminal,
+    SpokeRejectCode, SpokeResult,
+};
 use spoke_schemas::knowledge_entry::{
     ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
     KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner, Shared3,
@@ -404,6 +408,184 @@ fn adopted_elsewhere(entry_id: &str, shared_id: &str, revision: u64) -> Knowledg
     let mut entry = adopted_entry(entry_id, shared_id, revision);
     entry.adoption_anchor = adoption_anchor("spc_elsewhere", shared_id, revision);
     entry
+}
+
+/// Resolve `requested`'s retirement chain over real rows in one read transaction, the way the
+/// adoption port's two closures share theirs.
+async fn resolve_chain(store: &MindStore, requested: &str) -> SpokeResult<RetirementTerminal> {
+    let mut tx = store.pool().begin().await.expect("begin chain read");
+    let cell = tokio::sync::Mutex::new(&mut tx);
+    let requested = {
+        let mut guard = cell.lock().await;
+        load_retirement_entry(&mut guard, "wren", "wren", requested).await
+    }
+    .expect("the requested entry is present");
+    resolve_retirement_chain(
+        requested,
+        |current: &RetirementChainEntry| {
+            let cell = &cell;
+            let entry_id = current.entry_id.clone();
+            async move {
+                let mut guard = cell.lock().await;
+                retirement_successors_of(&mut guard, "wren", &entry_id).await
+            }
+        },
+        |entry_id: &str| {
+            let cell = &cell;
+            let entry_id = entry_id.to_string();
+            async move {
+                let mut guard = cell.lock().await;
+                load_retirement_entry(&mut guard, "wren", "wren", &entry_id).await
+            }
+        },
+    )
+    .await
+}
+
+/// The `retirement_chain` ids a `SOURCE_RETIRED` rejection carries.
+fn expect_source_retired(result: SpokeResult<RetirementTerminal>) -> Vec<String> {
+    let SpokeResult::Reject(reject) = result else {
+        panic!("expected SOURCE_RETIRED, got {result:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::SourceRetired);
+    let chain = reject
+        .details
+        .as_ref()
+        .and_then(|details| details.get("retirement_chain"))
+        .expect("a retired chain names its visited ids");
+    chain
+        .as_array()
+        .expect("the chain is an array")
+        .iter()
+        .map(|id| id.as_str().expect("an id is a string").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_retirement_chain_resolves_to_its_live_terminal() {
+    let path = database_path("retirement-chain");
+    let store = MindStore::open(&path).await.expect("open store");
+    let port = store.knowledge(KnowledgeScope::new("wren"));
+
+    for (entry_id, summary) in [
+        ("ke_live", "the terminal"),
+        ("ke_one", "retired once"),
+        ("ke_e0", "three edges, first"),
+        ("ke_e1", "three edges, second"),
+        ("ke_e2", "three edges, third"),
+        ("ke_e3", "three edges, terminal"),
+    ] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, summary), None)
+                .await,
+            "create the chain entry",
+        );
+    }
+
+    let live = expect_ok(resolve_chain(&store, "ke_live").await, "a live source");
+    assert_eq!(
+        live,
+        RetirementTerminal {
+            source_scope_id: "wren".to_string(),
+            source_entry_id: "ke_live".to_string(),
+            source_revision: 1,
+        },
+        "a live source resolves to itself"
+    );
+
+    expect_ok(
+        supersede(&port, "ke_one", 1, "ke_live").await,
+        "retire the one-edge source",
+    );
+    let one_edge = expect_ok(resolve_chain(&store, "ke_one").await, "one edge");
+    assert_eq!(
+        one_edge,
+        RetirementTerminal {
+            source_scope_id: "wren".to_string(),
+            source_entry_id: "ke_live".to_string(),
+            source_revision: 1,
+        },
+        "one edge reaches the live terminal"
+    );
+
+    expect_ok(
+        supersede(&port, "ke_e0", 1, "ke_e1").await,
+        "retire the first of three edges",
+    );
+    expect_ok(
+        supersede(&port, "ke_e1", 1, "ke_e2").await,
+        "retire the second of three edges",
+    );
+    expect_ok(
+        supersede(&port, "ke_e2", 1, "ke_e3").await,
+        "retire the third of three edges",
+    );
+    let three_edges = expect_ok(resolve_chain(&store, "ke_e0").await, "three edges");
+    assert_eq!(
+        three_edges,
+        RetirementTerminal {
+            source_scope_id: "wren".to_string(),
+            source_entry_id: "ke_e3".to_string(),
+            source_revision: 1,
+        },
+        "three edges reach the live terminal"
+    );
+
+    let long: Vec<String> = (0..=33).map(|index| format!("ke_c{index:02}")).collect();
+    for (index, entry_id) in long.iter().enumerate() {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, "long chain"), None)
+                .await,
+            "create a long-chain entry",
+        );
+        if index > 0 {
+            expect_ok(
+                supersede(&port, &long[index - 1], 1, entry_id).await,
+                "retire the long-chain predecessor",
+            );
+        }
+    }
+    let refused = expect_source_retired(resolve_chain(&store, "ke_c00").await);
+    assert_eq!(refused.len(), 33, "a 33rd edge is refused with 33 ids");
+    assert_eq!(refused.first().map(String::as_str), Some("ke_c00"));
+    assert_eq!(
+        refused.last().map(String::as_str),
+        Some("ke_c32"),
+        "the successor beyond the rejected edge is never listed"
+    );
+
+    for entry_id in ["ke_a", "ke_b"] {
+        expect_ok(
+            port.put_knowledge_entry(entry_with(entry_id, "cycle member"), None)
+                .await,
+            "create a cycle member",
+        );
+    }
+    let mut seed = store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("begin cycle seed");
+    for (entry_id, successor) in [("ke_a", "ke_b"), ("ke_b", "ke_a")] {
+        sqlx::query(
+            "UPDATE knowledge_entries SET superseded_by = ? \
+             WHERE collection = 'wren' AND entry_id = ?",
+        )
+        .bind(successor)
+        .bind(entry_id)
+        .execute(&mut *seed)
+        .await
+        .expect("seed the cycle marker");
+    }
+    seed.commit().await.expect("commit the cycle seed");
+    assert_eq!(
+        expect_source_retired(resolve_chain(&store, "ke_a").await),
+        vec!["ke_a".to_string(), "ke_b".to_string(), "ke_a".to_string()],
+        "a two-node cycle repeats the first id last"
+    );
+
+    store.close().await;
+    remove_database(&path);
 }
 
 #[tokio::test]
