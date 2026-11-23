@@ -3628,7 +3628,10 @@ async fn deliberate_refuses_a_cited_revision_the_released_validator_rejects() {
     };
     assert_eq!(reject.code, SpokeRejectCode::InternalError);
     assert_eq!(
-        reject.details.as_ref().and_then(|details| details.get("kind")),
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind")),
         Some(&json!("judgment_projection"))
     );
     assert!(

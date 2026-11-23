@@ -90,9 +90,8 @@ pub(crate) fn deliberate_judgment(
         "created_at": created_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
         "extensions": {},
     });
-    let judgment: Judgment = serde_json::from_value(wire).map_err(|error| {
-        projection_refused(&format!("the projection does not decode: {error}"))
-    })?;
+    let judgment: Judgment = serde_json::from_value(wire)
+        .map_err(|error| projection_refused(&format!("the projection does not decode: {error}")))?;
     match validate_judgment_typed(&judgment) {
         SpokeResult::Ok(()) => Ok(judgment),
         SpokeResult::Reject(reject) => Err(projection_refused(&reject.message)),
@@ -266,9 +265,8 @@ mod tests {
     fn cited_records_pin_their_stored_revisions_and_none_leave_evidence_empty() {
         let (holder, target, evidence) = (holder(), target("proposition"), []);
         let request = request(&holder, &target, &evidence);
-        let judgment =
-            deliberate_judgment(&principal(), &request, "settled", &verdict(), &cited())
-                .expect("the projection validates");
+        let judgment = deliberate_judgment(&principal(), &request, "settled", &verdict(), &cited())
+            .expect("the projection validates");
         assert_eq!(
             serde_json::to_value(&judgment).expect("wire")["evidence"],
             json!([{
@@ -279,9 +277,8 @@ mod tests {
             }])
         );
 
-        let judgment =
-            deliberate_judgment(&principal(), &request, "no_change", &verdict(), &[])
-                .expect("an uncited judgment validates");
+        let judgment = deliberate_judgment(&principal(), &request, "no_change", &verdict(), &[])
+            .expect("an uncited judgment validates");
         assert!(judgment.evidence.is_empty());
     }
 

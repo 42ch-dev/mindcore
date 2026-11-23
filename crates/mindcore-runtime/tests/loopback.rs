@@ -1077,8 +1077,7 @@ async fn a_deliberation_judgment_identity_follows_the_attempt_content() {
     let (_held_dir, _held_serve, held) =
         deliberation_session(SETTLING_RATIONALE, Arc::new(HoldingPolicy)).await;
     let first = expect_ok(
-        held
-            .adapter
+        held.adapter
             .invoke_tool(DELIBERATE, deliberate_arguments())
             .await,
         "the first served deliberation",

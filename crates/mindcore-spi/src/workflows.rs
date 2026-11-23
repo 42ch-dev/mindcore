@@ -1012,8 +1012,7 @@ impl SpiMindWorkflows {
         }
         ensure_time_left(deadline)?;
         let Some(record) = record else {
-            let judgment =
-                deliberate_judgment(principal, request, "no_change", &verdict, &cited)?;
+            let judgment = deliberate_judgment(principal, request, "no_change", &verdict, &cited)?;
             // No write follows, but a response built past the deadline is a
             // phase that overran it; the check stays the last step either way.
             ensure_time_left(deadline)?;
