@@ -98,8 +98,6 @@ fn decode_row(error: sqlx::Error) -> SqliteRepositoryError {
     }
 }
 
-// note: candidate row family
-
 /// The `Placement` one candidate/record visibility column pair encodes, shared
 /// by the head lookups and the full-row decoders.
 fn placement_of(visibility: &str, context_id: Option<String>, what: &str) -> RepoResult<Placement> {
@@ -136,8 +134,6 @@ struct CandidateRow {
 fn candidate_ir(row: CandidateRow) -> RepoResult<MemoryCandidateIr> {
     let status = row.status;
     let mut proposed = Map::new();
-    // why: a consumed row with an empty stored kind has no representable proposal;
-    // the consumed codec accepts `proposed` absent.
     if !row.kind.is_empty() {
         proposed.insert("kind".into(), row.kind.into());
     }
@@ -221,8 +217,6 @@ fn placement_wire_value(
 }
 
 struct CandidateColumns {
-    // why: `None` when the row has no representable kind (a consumed candidate whose
-    // IR dropped `proposed_kind`): writes keep the stored kind instead.
     kind: Option<String>,
     content: Option<String>,
     provenance: String,
@@ -253,8 +247,6 @@ fn candidate_columns(candidate: &MemoryCandidateIr) -> RepoResult<CandidateColum
                         .ok_or_else(|| invalid_row("pending candidate kind is empty"))?,
                 ),
                 content: Some(to_json(
-                    // why: unreachable via public IR today; kept as a defensive guard so a future
-                    // encoder change cannot silently write an unreadable row
                     &content.ok_or_else(|| {
                         invalid_row("pending candidate wire misses proposed.content")
                     })?,
@@ -366,10 +358,6 @@ async fn candidate_by_key(
 
 async fn insert_candidate_row(tx: &mut Tx<'_>, candidate: &MemoryCandidateIr) -> RepoResult<()> {
     let columns = candidate_columns(candidate)?;
-    // invariant: C-2 policy — the `kind` column is `NOT NULL` and must decode back to a non-empty
-    // `proposed.kind`. A consume update without `proposed_kind` therefore preserves the
-    // stored kind; a fresh row has nothing to preserve and is rejected instead of
-    // writing an empty string it could never read back.
     let kind = columns
         .kind
         .clone()
@@ -411,8 +399,6 @@ fn placement_columns(scope: &Placement) -> (&'static str, Option<String>) {
     }
 }
 
-// note: record row family
-
 struct RecordRow {
     record_id: String,
     space_id: String,
@@ -451,9 +437,6 @@ fn record_ir(row: RecordRow) -> RepoResult<MemoryRecordIr> {
         "provenance".into(),
         from_json(&row.provenance_json, "record provenance")?,
     );
-    // why: pinned projection — the tombstone marks the row dead; a surviving
-    // `import_ref_json` (the native delete leaves it) is dropped, and an explicit
-    // JSON null `reason` normalizes to the wire's optional-member shape.
     if let Some(raw) = row.tombstone_json {
         let mut tombstone = from_json(&raw, "record tombstone")?;
         if let Some(object) = tombstone.as_object_mut() {
@@ -600,8 +583,6 @@ async fn insert_record_row(tx: &mut Tx<'_>, record: &MemoryRecordIr) -> RepoResu
     Ok(())
 }
 
-// note: receipt row family
-
 struct ReceiptRow {
     receipt_id: String,
     space_id: String,
@@ -724,8 +705,6 @@ async fn insert_receipt_row(
     .map_err(|error| conflict(error, &receipt.receipt_id))?;
     Ok(())
 }
-
-// note: remaining row families
 
 struct SpaceRow {
     space_id: String,
@@ -1005,8 +984,6 @@ fn placement_predicate(placement: &PlacementSelection) -> RepoResult<(bool, bool
 }
 
 fn reflection_row(row: ReflectionRow) -> RepoResult<MemoryReflectionRow> {
-    // why: a stored JSON null reads as absent — a persisted `null` filter is not a
-    // malformed filter and must not poison the row.
     let filter = row
         .filter_json
         .map(|raw| from_json(&raw, "reflection filter"))
@@ -1885,9 +1862,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         tx: &mut Self::Tx<'_>,
         query: &RecallQuery,
     ) -> RepoResult<Vec<MemoryRecordIr>> {
-        // why: `context: None` admits shared rows and every context; `Some` admits only rows
-        // placed in that context (the legacy `context_id` predicate, restated over the
-        // Nexus placement columns).
         sqlx::query_as!(
             RecordRow,
             "SELECT record_id, space_id, subject_id, kind, content_json, \
@@ -2224,9 +2198,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         selection: &CandidateSelection,
     ) -> RepoResult<Vec<MemoryCandidateIr>> {
         let (all, shared_only, contexts) = placement_predicate(&selection.placement)?;
-        // why: one fixed statement covers the admitted-placement superset plus the
-        // optional status: the flags and the json_each list are parameters, so
-        // prepare checks this read like every point query.
         sqlx::query_as!(
             CandidateRow,
             "SELECT candidate_id, space_id, subject_id, capture_visibility, \
@@ -2261,8 +2232,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         observed_revision: &Number,
     ) -> RepoResult<bool> {
         let columns = candidate_columns(row)?;
-        // why: a consume without `proposed_kind` keeps the stored kind (C-2 policy in
-        // `insert_candidate_row`); a miss means the guarded update cannot match.
         let kind = match &columns.kind {
             Some(kind) => kind.clone(),
             None => {
@@ -2318,10 +2287,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         let (all, shared_only, contexts) = placement_predicate(&selection.placement)?;
         let kinds = to_json(&json!(selection.kinds), "record kinds")?;
         let provenance = to_json(&json!(selection.provenance_filter), "provenance filter")?;
-        // why: the variable-width kind/provenance lists arrive as json_each
-        // parameters instead of spliced placeholders: an empty kind list
-        // selects every kind, an absent provenance filter selects every row
-        // and an empty one selects none — the same predicate, now checked.
         sqlx::query_as!(
             RecordRow,
             "SELECT record_id, space_id, subject_id, kind, content_json, \
@@ -2434,8 +2399,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         observed_owner: Option<&str>,
     ) -> RepoResult<bool> {
         let columns = receipt_columns(row)?;
-        // invariant: owner matching is exact — only the persisted lease owner settles a pending row,
-        // and a `NULL` observed owner matches an unleased (`NULL`) owner exactly.
         let updated = sqlx::query!(
             "UPDATE memory_receipts SET status = ?, result_json = ?, error_json = ?, \
              completed_at = ? \
@@ -2462,12 +2425,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         owner_id: &str,
         lease_seconds: i64,
     ) -> RepoResult<bool> {
-        // contract §7.0.3 lease takeover — the claim stamps a fresh owner and expiry, guarded by the
-        // persisted lease instant already having passed, so a lost claim races a live or
-        // re-leased row rather than overwriting it. The expiry is measured from the claim
-        // instant — never the request instant — so the stamped lease always outlives this
-        // transaction's own probe. Stamps keep the same `%Y-%m-%dT%H:%M:%S%.3fZ` spelling
-        // `policy::timestamp` writes, so text order is instant order.
         let now = Utc::now();
         let expires_at = (now + chrono::Duration::seconds(lease_seconds))
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -2613,7 +2570,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         let mut reflections = Vec::with_capacity(rows.len());
         for row in rows {
             let reflection = reflection_row(row)?;
-            // invariant: the pinned selection is validated on every read, filter or not.
             let pinned = pinned_selection(&reflection.selection)?;
             if let Some(scope) = selection {
                 if !selection_covers(&pinned, scope) {
@@ -2705,10 +2661,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         space: &SpaceId,
         subject: &SubjectId,
     ) -> RepoResult<bool> {
-        // why: existence only — the literal `state <> 'applied'` predicate matches the
-        // partial index `idx_memory_journal_unsettled` and no payload column is
-        // selected, so an unreadable `targets_json`/`result_json` cannot mask
-        // the withhold.
         Ok(sqlx::query_scalar!(
             "SELECT 1 FROM memory_journal \
              WHERE space_id = ? AND subject_id = ? AND state <> 'applied' \
@@ -2786,8 +2738,6 @@ impl MemoryRepository for SqliteMemoryRepository {
         space: &SpaceId,
         key: &str,
     ) -> RepoResult<Option<MemoryProviderMetaRow>> {
-        // why: keys are caller-composed and already carry their space; `space` scopes the
-        // caller's intent, the table keys on `key` alone.
         let _ = space;
         sqlx::query_as!(
             MemoryProviderMetaRow,
@@ -2858,8 +2808,6 @@ mod tests {
         }
     }
 
-    // invariant: BUG-02 — the reader-side contract is that a pending row whose `content_json` is SQL
-    // NULL (or JSON null) cannot decode; the writer guard that mirrors it is defensive.
     #[test]
     fn pending_candidate_content_refusal_is_defensive_reader_contract() {
         for content in [None, Some("null")] {
@@ -2870,7 +2818,6 @@ mod tests {
         }
     }
 
-    // why: a count that cannot be a `u64` is a corrupt row, not a saturated one.
     #[test]
     fn space_row_rejects_negative_pending_receipts() {
         let row = SpaceRow {

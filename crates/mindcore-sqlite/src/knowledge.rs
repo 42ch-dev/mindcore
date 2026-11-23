@@ -188,16 +188,11 @@ impl ScopedKnowledgeStore {
             SpokeResult::Ok(source) => source,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        // invariant: the trigger snapshots on the revision column, so the CAS must compare that column. A
-        // payload whose DTO revision disagrees with it is corrupt stored state, not a stale caller:
-        // accepting it would write the marker without advancing the revision and skip the preimage.
         let Ok(stored) = u64::try_from(source.revision) else {
             return internal(format!(
                 "knowledge entry {entry_id} revision column is not a valid revision"
             ));
         };
-        // why: the marker settles the already-retired refusal before the payload is decoded — a retired
-        // row's payload may be unreadable, and that must not surface as a storage failure.
         if source.superseded_by.is_some() {
             return invalid_input(format!("knowledge entry {entry_id} is already superseded"));
         }
@@ -225,8 +220,6 @@ impl ScopedKnowledgeStore {
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         if target.superseded_by.is_some() {
-            // why: a marked entry is no longer current, so naming it as the successor would close a
-            // cycle or point readers at another retired row.
             return invalid_input(format!(
                 "knowledge entry {superseding_entry_id} is already superseded"
             ));
@@ -234,8 +227,6 @@ impl ScopedKnowledgeStore {
         let Some(next) = stored.checked_add(1) else {
             return internal(format!("knowledge entry {entry_id} revision is exhausted"));
         };
-        // invariant: the revision column is a signed INTEGER — refuse an unrepresentable revision before any
-        // row write, so a reported success is always a revision a replay can address.
         let Ok(revision) = i64::try_from(next) else {
             return internal(format!("knowledge entry {entry_id} revision is exhausted"));
         };
@@ -287,9 +278,6 @@ impl ScopedKnowledgeStore {
             Ok(transaction) => transaction,
             Err(error) => return internal(format!("history prune could not begin: {error}")),
         };
-        // why: the live-only predicate is the current-entry read's — an absent entry and a retired one
-        // answer the same generic absence, so a prune never reaches a retired row's history. The
-        // probe selects no payload, so a `keep` larger than the history loads nothing but a row.
         let live: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
             "SELECT 1 FROM knowledge_entries \
              WHERE collection = ? AND entry_id = ? AND superseded_by IS NULL",
@@ -303,9 +291,6 @@ impl ScopedKnowledgeStore {
             Ok(None) => return entry_not_found(&self.scope.collection, entry_id),
             Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
         }
-        // why: two rows decide the window, newest first — the `keep`-th newest is the oldest surviving
-        // checkpoint, and the row just older is the newest deleted one. The revision column is a
-        // signed INTEGER, so a `keep` past that range offsets past every row.
         let offset = i64::try_from(keep - 1).unwrap_or(i64::MAX);
         let checkpoints: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
             "SELECT revision FROM knowledge_entry_revisions \
@@ -323,7 +308,6 @@ impl ScopedKnowledgeStore {
                 return internal(format!("history checkpoints could not be read: {error}"))
             }
         };
-        // why: fewer than two rows means the window already holds every checkpoint — nothing older.
         if checkpoints.len() < 2 {
             if let Err(error) = transaction.commit().await {
                 return internal(format!("history prune could not commit: {error}"));
@@ -333,9 +317,6 @@ impl ScopedKnowledgeStore {
                 floor: None,
             });
         }
-        // why: newest first — the second row is the newest deleted checkpoint, so the first revision
-        // whose preimage is gone is one above it. An append leaves no preimage, so the surviving
-        // checkpoint can still replay the revisions below it and must not set the floor.
         let new_floor = checkpoints[1] + 1;
         let deleted = match sqlx::query(
             "DELETE FROM knowledge_entry_revisions \
@@ -447,8 +428,6 @@ impl ScopedKnowledgeStore {
                 }
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             };
-            // why: the binding carries no admitted viewpoint — a private hop is a generic absence, and
-            // its successor is never read or exposed.
             if !knowledge_entry_visible_to_viewpoint(&lifecycle.entry, None) {
                 return entry_not_found(&self.scope.collection, &source_id);
             }
@@ -595,10 +574,6 @@ impl RoutedKnowledgeStore {
         if let SpokeResult::Reject(reject) = self.admit(scope) {
             return SpokeResult::Reject(reject);
         }
-        // why: one read transaction pins the snapshot — the carrier payload and its record
-        // rows project from one committed state, the same whole read the scoped
-        // port's get makes. A missing row and a row hidden by the admission reach
-        // the same refusal.
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(_) => return storage_unavailable(),
@@ -638,8 +613,6 @@ impl RoutedKnowledgeStore {
             SpokeResult::Ok(false) => return not_authorized(),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
-        // why: hold SQLite's write reservation across the existing-row check and the write, like the
-        // scoped store above.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
             Err(_) => return storage_unavailable(),
@@ -661,9 +634,6 @@ impl RoutedKnowledgeStore {
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         if let Some(existing) = existing {
-            // why: a superseded row is no more writable than a hidden one, and neither is an absent
-            // create candidate nor leaks its revision. The marker is decided before the payload:
-            // a retired row's unreadable payload must stay `NotAuthorized`, not a storage failure.
             if existing.superseded_by.is_some() {
                 return not_authorized();
             }
@@ -673,7 +643,6 @@ impl RoutedKnowledgeStore {
             };
             match visible(&existing, scope) {
                 SpokeResult::Ok(true) => {}
-                // why: a hidden row is neither overwritten nor allowed to leak its revision.
                 SpokeResult::Ok(false) => return not_authorized(),
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             }
@@ -764,8 +733,6 @@ fn not_found<T>(entry_id: &str) -> SpokeResult<T> {
     )
 }
 
-// why: one rejection for every absent revision — an unassigned revision, one outside the stored range
-// and a missing entry are indistinguishable, and the message names no collection or timestamp.
 fn revision_not_found<T>() -> SpokeResult<T> {
     spoke_reject(
         SpokeRejectCode::KnowledgeEntryNotFound,
@@ -774,9 +741,6 @@ fn revision_not_found<T>() -> SpokeResult<T> {
     )
 }
 
-// why: one rejection for a revision below the entry's persisted floor — its preimage was pruned, and
-// the entry still exists, so this is not the generic absence above. The code is shared with that
-// absence; the `reason` token is what a caller matches.
 fn revision_pruned<T>() -> SpokeResult<T> {
     let mut details = Map::new();
     details.insert(
@@ -856,7 +820,6 @@ fn over_capacity(reject: &SpokeReject) -> bool {
         == Some(OVER_CAPACITY_REASON)
 }
 
-// why: one absence names its collection — this is the local port, whose caller already knows it.
 fn entry_not_found<T>(collection: &str, entry_id: &str) -> SpokeResult<T> {
     spoke_reject(
         SpokeRejectCode::KnowledgeEntryNotFound,
@@ -879,7 +842,6 @@ fn encode(entry: &KnowledgeEntry) -> SpokeResult<String> {
     }
 }
 
-// invariant: fixed-width fractional seconds keep TEXT ordering identical to instant ordering.
 fn encode_timestamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -895,9 +857,6 @@ fn cognition_module(entry: &KnowledgeEntry) -> Option<Value> {
     }
 }
 
-// why: what a dedicated append is about to change in the carrier envelope, stored on its record row so
-// a replay can reverse the first append without a preimage: 0 keeps the `records` member, 1 seeds
-// the module, 2 adds the missing member to an existing module.
 fn append_prior_shape(entry: &KnowledgeEntry) -> i64 {
     match entry.modules.get(&module_key()) {
         None => 1,
@@ -906,8 +865,6 @@ fn append_prior_shape(entry: &KnowledgeEntry) -> i64 {
     }
 }
 
-// why: names no collection — a served put forwards this message to an admitted peer, and an absent
-// or foreign-only id must answer exactly like a stale visible one.
 fn stale<T>(entry_id: &str, expected: Option<u64>, stored: Option<u64>) -> SpokeResult<T> {
     let mut details = Map::new();
     details.insert("expected_base_revision".to_string(), Value::from(expected));
@@ -944,9 +901,6 @@ async fn read_entry_seeded(
     entry_id: &str,
     seam: &SnapshotSeam,
 ) -> SpokeResult<KnowledgeEntry> {
-    // why: the current-entry lookup serves live rows only — the marker rides in its one payload
-    // statement, so a marked row answers like an absent one without its payload being decoded;
-    // [`get_entry_including_superseded`] is the explicit request that still reads a superseded row.
     let stored = match read_stored_row(tx, collection, entry_id, true).await {
         SpokeResult::Ok(stored) => stored,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -1065,10 +1019,6 @@ async fn read_entry_revision(
     if assigned < 1 {
         return revision_not_found();
     }
-    // why: one entry-led statement carries the floor and live revision that decide the two refusals.
-    // The join is gated to the floor-to-live window, so an out-of-window request matches no saved
-    // row; checkpoint fields are chosen by saved-row presence, never by the head's nullness,
-    // because a checkpoint may itself have no head.
     let selected: Result<Option<RevisionSelection>, sqlx::Error> = sqlx::query_as(
         "SELECT k.history_floor_revision, COALESCE(r.revision, k.revision), \
                 COALESCE(r.payload, k.payload), \
@@ -1098,13 +1048,9 @@ async fn read_entry_revision(
             ))
         }
     };
-    // why: the floor gate runs before any checkpoint is used — the live fallback would otherwise answer
-    // a pruned revision with current content.
-    // A below-floor request has already scanned the retained rows: a caller error, not a hot path.
     if assigned < floor {
         return revision_pruned();
     }
-    // why: above the live revision no checkpoint exists; that stays the generic absence.
     if assigned > live {
         return revision_not_found();
     }
@@ -1130,9 +1076,6 @@ async fn read_entry_revision(
         ));
     }
     if gap > 0 {
-        // why: a gap is advanced by dedicated appends alone. If the stored rows contradict that — a
-        // position missing or one a full put committed — the checkpoint cannot be this revision's
-        // successor, so that state is a storage failure rather than a replayable history.
         let dedicated =
             match gap_is_dedicated_appends(&mut **tx, collection, entry_id, head, gap).await {
                 SpokeResult::Ok(dedicated) => dedicated,
@@ -1155,8 +1098,6 @@ async fn read_entry_revision(
             module.insert("records".to_string(), Value::Array(records));
         }
     } else if gap > 0 {
-        // why: the checkpoint keeps the envelope the first append left; its recorded shape says which
-        // member that append added, so the pre-append envelope is restored without a saved row.
         let shape = match read_append_prior_shape(&mut **tx, collection, entry_id, 1).await {
             SpokeResult::Ok(shape) => shape,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -1210,7 +1151,6 @@ async fn hydrate_cognition_records(
         Ok(holders) => holders,
         Err(error) => return internal(format!("cognition holders could not be rendered: {error}")),
     };
-    // note: unit-test seam — suspends the page projection between its two statements.
     seam.interleave().await;
     let rows: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
         "SELECT entry_id, payload FROM cognition_records \
@@ -1316,14 +1256,10 @@ pub async fn write_entry(
     mut entry: KnowledgeEntry,
     expected_base_revision: Option<u64>,
 ) -> SpokeResult<KnowledgeEntry> {
-    // why: single persistence boundary — gate the carrier module before the revision read or any row
-    // write, so a refusal leaves the stored row untouched.
     if let Some(module) = cognition_module(&entry) {
         if let SpokeResult::Reject(reject) = validate_cognition_module(&module) {
             return SpokeResult::Reject(reject);
         }
-        // why: the module validator carries no entry identity; the carrier contract also requires
-        // every stored record to be held by this entry.
         if let Some(records) = module.get("records").and_then(Value::as_array) {
             for record in records {
                 if let Some(violation) = carrier_record_violation(record, &entry.entry_id) {
@@ -1345,9 +1281,6 @@ pub async fn write_entry(
         Ok(stored) => stored,
         Err(error) => return internal(format!("stored revision could not be read: {error}")),
     };
-    // why: a superseded entry is not current — a full put may neither rewrite it nor clear its marker.
-    // The refusal keeps its `InvalidInput` code and names the marker as a structured detail, so a
-    // caller that must classify the occupied slot never decodes this message.
     if let Some((_, _, Some(superseded_by))) = stored.as_ref() {
         let mut details = Map::new();
         details.insert(
@@ -1362,18 +1295,10 @@ pub async fn write_entry(
     }
     let stored_created_at = stored.as_ref().map(|(_, created_at, _)| created_at.clone());
     let stored = stored.map(|(revision, _, _)| revision as u64);
-    // why: the submitted history moves out of the envelope instead of being copied — the
-    // module gate above pinned `records` to an array, the replace leaves exactly the
-    // empty member the stored payload requires, and the suffix inserts plus the
-    // returned DTO reuse the taken values — the old code copied this history twice,
-    // once here and once into the whole-entry clone before encoding.
     let mut submitted_records: Vec<Value> = match entry.modules.get_mut(&module_key()) {
         Some(KnowledgeEntryModulesValue::Object(module)) => match module.get_mut("records") {
             Some(records) => match std::mem::replace(records, Value::Array(Vec::new())) {
                 Value::Array(records) => records,
-                // why: the module gate above rejects a non-array `records` member, so this arm is not
-                // reachable through the public write path. It still refuses instead of aborting:
-                // a library must not take the process down on a shape its own validator missed.
                 _ => {
                     return spoke_reject(
                         SpokeRejectCode::InvalidInput,
@@ -1406,8 +1331,6 @@ pub async fn write_entry(
             stored => return stale(&entry.entry_id, Some(expected), stored),
         },
     };
-    // invariant: the revision column is a signed INTEGER — refuse an unrepresentable revision before any row
-    // write, so a reported success is always a revision a replay can address.
     let Ok(revision) = i64::try_from(next) else {
         return internal(format!(
             "knowledge entry {} revision is exhausted",
@@ -1415,8 +1338,6 @@ pub async fn write_entry(
         ));
     };
 
-    // why: store bookkeeping stays in the SQL timestamp columns; the payload keeps
-    // the caller's, except the creation instant an update never moves.
     let now = Utc::now();
     entry.revision = Some(next);
     if let Some(stored_created_at) = stored_created_at {
@@ -1429,15 +1350,9 @@ pub async fn write_entry(
                 ))
             }
         };
-        // why: the row column is not rewritten by an update, so the payload carries
-        // the stored instant: payload and column never diverge on it.
         entry.created_at = Some(created_at);
     }
 
-    // invariant: record rows are immutable once committed — an update must carry every committed record
-    // unchanged and may only append its validated suffix. Reading the rows is fine here — a full
-    // DTO put processes its full payload anyway; only the dedicated append and current lookup are
-    // bounded independently of history.
     let committed = match stored {
         Some(_) => match read_records(&mut **tx, collection, &entry.entry_id).await {
             SpokeResult::Ok(records) => records,
@@ -1471,9 +1386,6 @@ pub async fn write_entry(
         }
     }
 
-    // why: the stored payload keeps the cognition envelope only — the record rows carry the
-    // values, and the emptied `records` member preserves its presence — the encoding
-    // borrows the entry, no whole-entry copy.
     let payload = match encode(&entry) {
         SpokeResult::Ok(payload) => payload,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -1484,8 +1396,6 @@ pub async fn write_entry(
     let suffix = &submitted_records[committed.len()..];
 
     if stored.is_none() {
-        // why: the carrier row exists before the record rows that reference it; the head foreign
-        // key can only be set once those rows exist.
         let written = sqlx::query(
             "INSERT INTO knowledge_entries \
              (collection, entry_id, revision, cognition_head_seq, payload, created_at, updated_at)
@@ -1549,7 +1459,6 @@ pub async fn write_entry(
     if let Err(error) = written {
         return internal(format!("knowledge entry could not be written: {error}"));
     }
-    // why: the returned DTO owns the submitted history — put the taken values back.
     if let Some(KnowledgeEntryModulesValue::Object(module)) = entry.modules.get_mut(&module_key()) {
         if let Some(records) = module.get_mut("records") {
             *records = Value::Array(std::mem::take(&mut submitted_records));
@@ -1595,7 +1504,6 @@ pub async fn append_cognition(
         }
         Err(error) => return internal(format!("carrier header could not be read: {error}")),
     };
-    // why: a superseded carrier takes no new judgment — refuse before the record row and the revision.
     if superseded_by.is_some() {
         return invalid_input(format!("knowledge entry {entry_id} is superseded"));
     }
@@ -1603,8 +1511,6 @@ pub async fn append_cognition(
     if stored_revision != expected_revision {
         return stale(entry_id, Some(expected_revision), Some(stored_revision));
     }
-    // why: the record rules are the carrier contract's, not this adapter's — the same gate a full
-    // put applies before any row write.
     if let SpokeResult::Reject(reject) = validate_cognition_record(record) {
         return SpokeResult::Reject(reject);
     }
@@ -1612,14 +1518,10 @@ pub async fn append_cognition(
         return spoke_reject(SpokeRejectCode::InvalidInput, violation, None);
     }
     let append_seq = head_seq.map_or(1, |head| head + 1);
-    // invariant: the revision column is a signed INTEGER — refuse exhaustion before the record row and the
-    // carrier update, so a reported success is always a revision a replay can address.
     let next = stored_revision + 1;
     let Ok(next_revision) = i64::try_from(next) else {
         return internal(format!("knowledge entry {entry_id} revision is exhausted"));
     };
-    // why: the classification comes from the envelope this append is about to change, so the stored
-    // payload is decoded before the row write and re-encoded once below.
     let mut entry = match decode(&payload) {
         SpokeResult::Ok(entry) => entry,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -1637,21 +1539,14 @@ pub async fn append_cognition(
         return SpokeResult::Reject(reject);
     }
 
-    // why: re-encode the carrier envelope with the advanced revision — records live in their own
-    // rows, so this touches the carrier row only — never an earlier record.
     entry.revision = Some(next);
     let module = entry.modules.entry(module_key()).or_insert_with(|| {
-        // why: first record of a carrier without a module — seed the same envelope a full
-        // put would have committed.
         KnowledgeEntryModulesValue::Object(Map::from_iter([
             ("records".to_string(), Value::Array(Vec::new())),
             ("world_facts".to_string(), Value::Array(Vec::new())),
             ("extensions".to_string(), Value::Object(Map::new())),
         ]))
     });
-    // why: the record rows carry the values and only a present `records` member is hydrated, so a
-    // module stored without one gains the empty member here: the appended row is projected
-    // instead of landing behind a member no read can see.
     if let KnowledgeEntryModulesValue::Object(module) = module {
         module.insert("records".to_string(), Value::Array(Vec::new()));
     }
@@ -1681,9 +1576,6 @@ pub async fn append_cognition(
 #[async_trait]
 impl KnowledgeEntryPort for ScopedKnowledgeStore {
     async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
-        // why: one read transaction pins the snapshot — the carrier payload and its record
-        // rows project from one committed state, the same whole read `list_entries`
-        // makes, even if another connection appends between the two statements.
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(error) => return internal(format!("knowledge entry could not be read: {error}")),
@@ -1702,8 +1594,6 @@ impl KnowledgeEntryPort for ScopedKnowledgeStore {
         entry: KnowledgeEntry,
         expected_base_revision: Option<u64>,
     ) -> SpokeResult<KnowledgeEntry> {
-        // why: hold SQLite's write reservation across the read and the write — the revision comparison and
-        // the put must not interleave with another handle on the same file.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
             Err(error) => return internal(format!("knowledge write could not begin: {error}")),
@@ -1776,7 +1666,6 @@ mod tests {
         entry
     }
 
-    // note: one current-view belief record held by ke_wren, the shape an append accepts.
     fn belief(record_id: &str) -> Value {
         json!({
             "kind": "belief",
@@ -1902,7 +1791,6 @@ mod tests {
             "create module-less carrier",
         );
 
-        // note: the entry read — revision 1's payload pairs with revision 1's records.
         let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
         store.seam.install(hook_to_test, hook_rx);
@@ -1936,14 +1824,10 @@ mod tests {
             record_ids(&dto)
         );
 
-        // note: the append really committed during the read — a fresh read sees revision 2.
         let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
         assert_eq!(fresh.revision, Some(2));
         assert_eq!(record_ids(&fresh), vec!["cog_hearsay"]);
 
-        // why: the listing path — ke_wren's payload was read at revision 2, so its
-        // records must stay revision 2's even though the append commits before
-        // the listing reaches its records statement.
         let (hook_to_test, mut test_rx) = mpsc::unbounded_channel();
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
         store.seam.install(hook_to_test, hook_rx);
@@ -1990,7 +1874,6 @@ mod tests {
             "wren's records must come from its own snapshot"
         );
 
-        // note: the second append really committed during the listing.
         let fresh = expect_ok(port.get_knowledge_entry("ke_wren").await, "fresh read");
         assert_eq!(fresh.revision, Some(3));
         assert_eq!(record_ids(&fresh), vec!["cog_hearsay", "cog_newer"]);
@@ -2030,7 +1913,6 @@ mod tests {
         let (test_to_hook, hook_rx) = mpsc::unbounded_channel();
         store.seam.install(hook_to_test, hook_rx);
 
-        // note: the other store's read completes without suspending on this store's seam.
         let other_port = other.knowledge(KnowledgeScope::new("wren"));
         let dto = timeout(
             Duration::from_secs(10),
@@ -2040,7 +1922,6 @@ mod tests {
         .expect("another store's read suspended on this store's seam");
         expect_ok(dto, "other store read");
 
-        // why: the seam is still installed for the store that owns it.
         let read_port = store.knowledge(KnowledgeScope::new("wren"));
         let reader = tokio::spawn(async move { read_port.get_knowledge_entry("ke_wren").await });
         wait_for_seam(&mut test_rx).await;

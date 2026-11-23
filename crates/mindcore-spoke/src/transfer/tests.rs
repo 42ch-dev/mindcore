@@ -368,14 +368,11 @@ async fn whole_space_bundle_round_trips_and_digests() {
     assert!(bundle.reflections.is_empty(), "not requested");
     assert_eq!(artifact.digest.len(), 64);
 
-    // The digest is the JCS SHA-256 of the bundle with `digest` removed, computed
-    // here through the plain helper rather than the builder's excluding one.
     assert_eq!(
         hex_digest_excluding(&artifact.bundle, "digest"),
         artifact.digest
     );
 
-    // Chunks are contiguous from zero and verify independently.
     let chunk_count = artifact.chunks.len() as u64;
     assert_eq!(
         artifact.chunks[0]["chunk_count"].as_u64(),
@@ -401,7 +398,6 @@ async fn whole_space_bundle_round_trips_and_digests() {
         assert_eq!(chunk["header"].is_object(), ordinal == 0);
     }
 
-    // Reassembly rebuilds the sealed bundle.
     let reassembled = reassemble(&artifact.chunks);
     let mut expected = artifact.bundle.clone();
     expected.as_object_mut().expect("object").remove("digest");
@@ -515,8 +511,6 @@ async fn reflection_with_an_unverifiable_basis_is_withheld() {
         "the pinned basis still verifies"
     );
 
-    // A source tombstoned after generation changes the live set; the derived body
-    // may encode deleted content, so the envelope is withheld.
     let mut tx = fixture.begin().await;
     let mut moved = record("r_1", "s_1", None, true);
     moved.revision = serde_json::Number::from(2);
@@ -571,7 +565,6 @@ async fn a_subject_with_an_unsettled_intent_contributes_nothing() {
     );
     tx.rollback().await.expect("rollback");
 
-    // The filtered bundle still satisfies the pinned schema.
     let bundle = decode_bundle(&artifact.bundle);
     let subject_ids: Vec<&str> = artifact.bundle["subjects"]
         .as_array()
@@ -598,8 +591,6 @@ async fn a_subject_with_an_unsettled_intent_contributes_nothing() {
     assert!(bundle.candidates.is_empty(), "no withheld candidate");
     assert!(bundle.profiles.is_empty(), "no withheld profile");
     assert!(bundle.reflections.is_empty(), "no withheld reflection");
-    // A live grant scoped to the withheld subject contributes no summary: naming its
-    // `subject_id` would disclose the subject and dangle at the target's own check.
     let grants: Vec<&Value> = artifact.bundle["grants"]
         .as_array()
         .expect("array")
@@ -618,8 +609,6 @@ async fn a_subject_with_an_unsettled_intent_contributes_nothing() {
         "the bundle names no trace of the withheld subject"
     );
 
-    // The provider's own artifact must pass its own final verification when it is
-    // staged into an empty target.
     elevate(&fixture).await;
     target_space(&fixture).await;
     let chunks = sealed_partition(&artifact.bundle);
@@ -751,8 +740,6 @@ fn synthetic_record(record_id: &str, text_length: usize) -> Value {
 #[test]
 fn a_partitioned_bundle_must_carry_the_seal_it_was_given() {
     let bundle = synthetic_bundle(json!({ "records": [synthetic_record("r_1", 16)] }));
-    // The seal is computed once, at assembly; a bundle whose published digest
-    // disagrees with the one hand-carried here is refused, not re-hashed.
     match super::chunk::partition(&bundle, &"0".repeat(64), policy::EXPORT_CHUNK_BYTES) {
         Ok(chunks) => panic!("a mismatched seal emitted {} chunks", chunks.len()),
         Err(error) => assert!(
@@ -895,7 +882,6 @@ fn an_element_the_header_cannot_hold_starts_ordinal_one() {
         chunks[0]["bytes"].as_u64().expect("bytes")
     };
 
-    // Sized so that header plus element overflows while the element alone fits.
     let target = limit - header_bytes + 32;
     let base = spoke_operations::content_serialized_bytes(&synthetic_record("r_edge", 0)) as u64;
     let record = synthetic_record("r_edge", (target - base) as usize);
@@ -995,7 +981,6 @@ async fn create_then_page_reassembles_the_same_bundle() {
     let mut chunks = Vec::new();
     for ordinal in 0..chunk_count {
         let chunk = read_page(&fixture, &export_id, ordinal, "p_1").await;
-        // A second read of the same page is byte-identical.
         let again = read_page(&fixture, &export_id, ordinal, "p_1").await;
         assert_eq!(chunk, again, "an export page is stable across reads");
         chunks.push(chunk["chunk"].clone());
@@ -1013,7 +998,6 @@ async fn create_then_page_reassembles_the_same_bundle() {
         .sum();
     assert_eq!(result["total_bytes"], json!(total));
 
-    // Same key, same digest: the recorded outcome replays and stores nothing new.
     let replay = create_export(&fixture, "export-key-1").await;
     assert_eq!(replay["result"]["export_id"], json!(export_id));
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_exports WHERE space_id = ?")
@@ -1105,8 +1089,6 @@ async fn the_next_transfer_write_reclaims_an_expired_export_payload() {
         "the metadata row stays so the expiry answer still resolves"
     );
 
-    // why: the reclaim decision is persisted, so a clock that rolls back inside the retention
-    // window cannot resurrect an export whose payload is already gone.
     sqlx::query("UPDATE memory_exports SET expires_at = ? WHERE export_id = ?")
         .bind("2999-01-01T00:00:00.000Z")
         .bind(&expired_id)
@@ -1137,8 +1119,6 @@ async fn a_scope_the_caller_cannot_read_answers_absence_rather_than_expiry() {
         .as_str()
         .expect("export id")
         .to_string();
-    // Even an expired export answers absence first: `p_2` holds only a
-    // subject/context grant, and this export is space-wide.
     expire(&fixture, &export_id).await;
 
     let adapter = crate::MemoryAdapter::new(false);
@@ -1156,8 +1136,6 @@ async fn a_scope_the_caller_cannot_read_answers_absence_rather_than_expiry() {
         spoke_operations::SpokeRejectCode::NotFound
     );
 }
-
-// ---- §7.31/§7.32 imports.stage ----
 
 /// Stage admission needs `admin` beside `transfer` on the target space.
 async fn elevate(fixture: &Fixture) {
@@ -1313,8 +1291,6 @@ async fn a_valid_single_chunk_sequence_reaches_staged() {
         import_state(&fixture, &import_id).await,
         ("staged".to_string(), 1)
     );
-    // §7.31: the final chunk fixes the mapping and report, and consumes the raw
-    // sequence — nothing downstream re-reads the chunks.
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
     let report = &body["result"]["staged_report"];
     assert_eq!(report["counts"]["subjects"], json!(2));
@@ -1585,7 +1561,6 @@ async fn repeated_ordinals_conflict_without_ending_the_import() {
         .expect("import id")
         .to_string();
 
-    // The header again, while its import is still staging.
     let repeated_header = stage_chunk(&fixture, chunks[0].clone(), "stage-2-0b").await;
     assert_eq!(
         detail(rejected(&repeated_header), "reason"),
@@ -1594,8 +1569,6 @@ async fn repeated_ordinals_conflict_without_ending_the_import() {
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
 
     ready(stage_chunk(&fixture, chunks[1].clone(), "stage-2-1").await);
-    // A repeat of an ordinal the import already holds is a retry, not a gap: it
-    // conflicts and leaves the sequence completable.
     let repeated_tail = stage_chunk(&fixture, chunks[1].clone(), "stage-2-1b").await;
     let reject = rejected(&repeated_tail);
     assert_eq!(
@@ -1666,7 +1639,6 @@ async fn an_ordinal_ahead_of_the_import_is_refused_and_the_sequence_still_comple
         .expect("import id")
         .to_string();
 
-    // Ordinal 2 arrives while ordinal 1 is missing.
     let gap = stage_chunk(&fixture, chunks[2].clone(), "gap-2").await;
     let reject = rejected(&gap);
     assert_eq!(
@@ -1687,14 +1659,12 @@ async fn an_ordinal_ahead_of_the_import_is_refused_and_the_sequence_still_comple
         "the refusal deletes nothing"
     );
 
-    // The chunk that showed the gap is still a repeat, not a second chance.
     let repeated = stage_chunk(&fixture, chunks[2].clone(), "gap-2b").await;
     assert_eq!(
         detail(rejected(&repeated), "reason"),
         &json!("out_of_order")
     );
 
-    // The missing ordinal lands and the sequence completes.
     ready(stage_chunk(&fixture, chunks[1].clone(), "gap-1").await);
     let body = ready(stage_chunk(&fixture, chunks[2].clone(), "gap-2c").await);
     assert_eq!(body["result"]["chunks_received"], json!(3));
@@ -1721,8 +1691,6 @@ async fn a_corrupt_final_chunk_conflicts_and_leaves_the_import_staging() {
         .to_string();
     ready(stage_chunk(&fixture, chunks[1].clone(), "stage-3-1").await);
 
-    // The fixture's profile trails the oversized record, so it rides the final
-    // chunk; altering a schema-valid field keeps every per-chunk check true.
     let last = chunks.last_mut().expect("a final chunk");
     let profile = last["profiles"]
         .as_array_mut()
@@ -1774,7 +1742,6 @@ async fn an_expired_import_is_reclaimed_by_the_next_stage_of_its_source_export()
         .await
         .expect("expire the import");
 
-    // A later chunk names a dead import: refuse it and write nothing.
     let result = stage_chunk(&fixture, chunks[1].clone(), "stage-4-1").await;
     let reject = rejected(&result);
     assert_eq!(
@@ -1788,8 +1755,6 @@ async fn an_expired_import_is_reclaimed_by_the_next_stage_of_its_source_export()
     );
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 1);
 
-    // The same source export stages again: the expired row is content-free and its key
-    // no longer blocks, so a fresh import starts under the same export id.
     let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "stage-4-0b").await);
     let restarted_id = restarted["result"]["import_id"]
         .as_str()
@@ -1853,7 +1818,6 @@ async fn an_unrelated_reclaim_names_the_dead_import_and_frees_its_source_export(
         .await
         .expect("expire the import");
 
-    // A different source export's create succeeds in the same space and owns the reclaim.
     create_export(&fixture, "sweep-other").await;
 
     let (state, payload, report): (String, Option<String>, Option<String>) = sqlx::query_as(
@@ -1876,8 +1840,6 @@ async fn an_unrelated_reclaim_names_the_dead_import_and_frees_its_source_export(
         "the expired chunks are released"
     );
 
-    // A late chunk names the dead import and its expiry: a timed-out import is not the
-    // same answer as an import this store never held.
     let late = stage_chunk(&fixture, chunks[1].clone(), "sweep-late").await;
     let reject = rejected(&late);
     assert_eq!(
@@ -1891,8 +1853,6 @@ async fn an_unrelated_reclaim_names_the_dead_import_and_frees_its_source_export(
         &json!("2000-01-01T00:00:00.000Z")
     );
 
-    // The expired predecessor does not hold the source export: its header stages again
-    // under a fresh import.
     let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "sweep-0b").await);
     let restarted_id = restarted["result"]["import_id"]
         .as_str()
@@ -1927,8 +1887,6 @@ async fn a_reclaimed_import_stays_dead_after_the_clock_moves_back() {
         .expect("import id")
         .to_string();
 
-    // Retention reclaims the abandoned import, then the expiry moves past the clock,
-    // as a rollback across that instant leaves the reclaimed row.
     sqlx::query("UPDATE memory_imports SET expires_at = ? WHERE import_id = ?")
         .bind("2000-01-01T00:00:00.000Z")
         .bind(&import_id)
@@ -1948,7 +1906,6 @@ async fn a_reclaimed_import_stays_dead_after_the_clock_moves_back() {
         .await
         .expect("move the expiry past the clock");
 
-    // A mid-sequence chunk names the dead import and its expiry, not a live header.
     let late = stage_chunk(&fixture, chunks[1].clone(), "clock-1").await;
     let reject = rejected(&late);
     assert_eq!(
@@ -1967,7 +1924,6 @@ async fn a_reclaimed_import_stays_dead_after_the_clock_moves_back() {
         "the refusal writes no chunk into the dead import"
     );
 
-    // A new header for the source export still starts a fresh import.
     let restarted = ready(stage_chunk(&fixture, chunks[0].clone(), "clock-0b").await);
     let restarted_id = restarted["result"]["import_id"]
         .as_str()
@@ -2068,8 +2024,6 @@ async fn an_unreadable_local_source_stages_exactly_like_a_foreign_export() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
     target_space(&fixture).await;
-    // p_2 may write TARGET, but inside the source space it holds only a
-    // subject-scoped grant, so a whole-space export is not readable there.
     {
         let mut tx = fixture.begin().await;
         let mut row = grant("g_target_p2", None, "p_2", &[], false, false);
@@ -2089,7 +2043,6 @@ async fn an_unreadable_local_source_stages_exactly_like_a_foreign_export() {
     let local = staged_source(&fixture, "stage-key-read").await;
     assert_eq!(local.len(), 1, "the fixture export is one chunk");
 
-    // The same snapshot under an export id this store never held: a foreign bundle.
     let mut foreign_spec = spec(None, PlacementSelection::SubjectAll);
     foreign_spec.export_id = "exp_never_held".to_string();
     let mut tx = fixture.begin().await;
@@ -2279,7 +2232,6 @@ async fn a_grant_summary_principal_ref_is_screened_for_credentials_not_for_our_g
     let label = grant["principal_ref"].as_str().expect("principal ref");
     assert!(label.starts_with("prl_"), "the export labels the principal");
 
-    // A verified bundle with a foreign opaque label stages: the screen is not a grammar.
     grant["principal_ref"] = json!("prn_label_9f2c");
     reseal(&mut bundle);
     let chunks = sealed_partition(&bundle);
@@ -2439,7 +2391,6 @@ async fn a_header_that_omits_empty_extensions_still_reassembles() {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
-// ---- §7.32/§7.33 imports.activate and imports.discard ----
 const TARGET: &str = "spc_target";
 
 /// A second, empty space where `p_1` holds `transfer` and `admin`.
@@ -2543,7 +2494,6 @@ async fn activation_applies_the_staged_bundle_exactly_once() {
         .expect("import id")
         .to_string();
 
-    // Invisible until the caller commits the borrowed transaction.
     {
         let adapter = crate::MemoryAdapter::new(false);
         let mut tx = fixture.begin().await;
@@ -2590,7 +2540,6 @@ async fn activation_applies_the_staged_bundle_exactly_once() {
     assert_eq!(result["authority_generation"], json!(2));
     assert_eq!(result["import_id"], json!(import_id));
 
-    // Fully visible after commit: rows, generation, revision, import state.
     assert_eq!(
         count(
             &fixture,
@@ -2656,7 +2605,6 @@ async fn activation_applies_the_staged_bundle_exactly_once() {
     );
     assert_eq!(staged_chunk_count(&fixture, &import_id).await, 0);
 
-    // Every record carries the import provenance, and no candidate dangles.
     assert_eq!(
         count(
             &fixture,
@@ -2680,7 +2628,6 @@ async fn activation_applies_the_staged_bundle_exactly_once() {
         0
     );
 
-    // The same key and digest replays the recorded outcome without a second write.
     let replay = ready(activate(&fixture, &import_id, "activate-1").await);
     assert_eq!(replay["result"], *result);
     assert_eq!(
@@ -2693,7 +2640,6 @@ async fn activation_applies_the_staged_bundle_exactly_once() {
         3
     );
 
-    // A second activation under a fresh key names the state the import has left.
     let again = activate(&fixture, &import_id, "activate-2").await;
     let reject = rejected(&again);
     assert_eq!(
@@ -2756,7 +2702,6 @@ async fn discard_deletes_staging_and_refuses_an_activated_import() {
     );
     assert_eq!(detail(reject, "state"), &json!("discarded"));
 
-    // An activated import has left the state discard requires.
     let chunks = staged_source(&fixture, "discard-export-2").await;
     let staged =
         ready(stage_into(&fixture, TARGET, chunks[0].clone(), "discard-stage-1", None).await);
@@ -2971,8 +2916,6 @@ async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
     target_space(&fixture).await;
-    // The caller's own cover stays live but expires; a non-expiring adopted
-    // grant would then outlive the grant it was copied from.
     sqlx::query("UPDATE memory_grants SET expires_at = ? WHERE grant_id = 'g_target'")
         .bind("2030-01-01T00:00:00.000Z")
         .execute(&fixture.pool)
@@ -2980,8 +2923,6 @@ async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
         .expect("expire the target grant");
 
     let chunks = staged_source(&fixture, "adopt-export-2").await;
-    // Adoption is decided at the final chunk: a stated grant the caller cannot cover
-    // refuses the stage instead of freezing an import that cannot activate.
     let refused = stage_into(
         &fixture,
         TARGET,
@@ -3015,14 +2956,11 @@ async fn adoption_refuses_a_cover_that_would_outlive_the_caller_grant() {
 async fn adoption_refuses_capabilities_that_only_separate_grants_cover() {
     let fixture = Fixture::open().await;
     target_space(&fixture).await;
-    // Admission needs a live space-wide admin grant, but it expires: it can open the
-    // stage yet cannot cover a permanent adopted grant.
     sqlx::query("UPDATE memory_grants SET expires_at = ? WHERE grant_id = 'g_target'")
         .bind("2030-01-01T00:00:00.000Z")
         .execute(&fixture.pool)
         .await
         .expect("expire the target admin cover");
-    // Two non-expiring grants hold one adopted capability each.
     for (grant_id, capability) in [
         ("g_target_transfer", "transfer"),
         ("g_target_records", "records_read"),
@@ -3039,7 +2977,6 @@ async fn adoption_refuses_capabilities_that_only_separate_grants_cover() {
         tx.commit().await.expect("commit the split grant");
     }
 
-    // g_2 asks for transfer and records_read together.
     let chunks = staged_source(&fixture, "split-cover-export").await;
     let refused = stage_into(
         &fixture,
@@ -3091,8 +3028,6 @@ async fn activation_refuses_adoption_when_the_callers_cover_now_expires() {
         .expect("import id")
         .to_string();
 
-    // The cover survives staging and stays live for the activation's own admission, but it
-    // now expires: the adopted grant it would copy has no expiry of its own.
     sqlx::query("UPDATE memory_grants SET expires_at = ? WHERE grant_id = 'g_target'")
         .bind("2030-01-01T00:00:00.000Z")
         .execute(&fixture.pool)
@@ -3138,7 +3073,6 @@ async fn activation_rechecks_a_subject_the_target_gained_after_staging() {
         .expect("import id")
         .to_string();
 
-    // Someone ensures the staged subject id in the target between the two calls.
     let mut row = subject("s_1", "active", &[]);
     row.space_id = SpaceId::new(TARGET);
     let mut tx = fixture.begin().await;
@@ -3250,7 +3184,6 @@ async fn a_second_import_keeps_the_original_import_provenance() {
     elevate(&fixture).await;
     target_space(&fixture).await;
 
-    // First hop: SPACE -> TARGET.
     let chunks = staged_source(&fixture, "lineage-export-1").await;
     let staged =
         ready(stage_into(&fixture, TARGET, chunks[0].clone(), "lineage-stage-0", None).await);
@@ -3271,7 +3204,6 @@ async fn a_second_import_keeps_the_original_import_provenance() {
         "the first hop stamps its own identity"
     );
 
-    // Second hop: TARGET -> TARGET, renamed so nothing collides.
     let adapter = crate::MemoryAdapter::new(false);
     let mut tx = fixture.begin().await;
     let created = ready(
@@ -3370,9 +3302,6 @@ async fn a_colliding_subject_is_refused_by_fail_and_renamed_on_request() {
     let fixture = Fixture::open().await;
     elevate(&fixture).await;
 
-    // Importing the space into itself collides on both subject ids. The collision is a
-    // staging decision now: the final chunk refuses it rather than freezing a staged
-    // import that cannot activate.
     let chunks = staged_source(&fixture, "rename-export-1").await;
     let refused = stage_into(
         &fixture,
@@ -3409,7 +3338,6 @@ async fn a_colliding_subject_is_refused_by_fail_and_renamed_on_request() {
         "a refused final chunk applies nothing"
     );
 
-    // `rename_subject` mints the colliding subjects and rebases every row on them.
     let chunks = staged_source(&fixture, "rename-export-2").await;
     let staged = ready(
         stage_into(

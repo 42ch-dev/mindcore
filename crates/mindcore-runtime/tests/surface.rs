@@ -302,7 +302,6 @@ async fn an_adoption_source_beside_the_routes_assembles() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
         serve.surface(ServeFaces {
-            // no row exists in this collection: adoption does not require one at assembly.
             adoption: Some(AdoptionRoute {
                 source: KnowledgeScope::new("shared"),
             }),
@@ -320,9 +319,7 @@ async fn an_adoption_source_beside_the_routes_assembles() {
 async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly() {
     let serve = Fixture::open().await.serve();
     for (routes, source) in [
-        // the admitted principal's own destination.
         (routes(), COLLECTION),
-        // a route whose principal holds no admission on this surface.
         (
             BTreeMap::from([
                 ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),

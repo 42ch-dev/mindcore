@@ -208,8 +208,6 @@ fn external_impls_bind_to_every_capability_trait() {
     let lens = MockLens;
     let workflows = MockWorkflows;
 
-    // why: object-safety — every capability trait takes `&dyn`, and the workflows
-    // surface itself is object-safe.
     let embedder_dyn: &dyn Embedder = &embedder;
     let reasoner_dyn: &dyn Reasoner = &reasoner;
     let policy_dyn: &dyn PolicyHook = &policy;
@@ -223,9 +221,6 @@ fn external_impls_bind_to_every_capability_trait() {
         workflows_dyn,
     );
 
-    // why: the bundle accepting the injected implementors is the compile-time
-    // proof; asserting on `Some(x).is_some()` would pin the literal, not the
-    // contract.
     let _caps = MindCapabilities {
         embedder: Some(embedder_dyn),
         reasoner: Some(reasoner_dyn),
@@ -328,7 +323,6 @@ async fn default_policy_holds_every_draft_for_human_review() {
 async fn prompt_reasoner_wraps_full_text_in_the_wire_envelope() {
     let captured = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&captured);
-    // note: the Nexus PromptExecutor seam — execute(PromptRequest) → full_text.
     let reasoner = PromptReasoner::new(move |prompt: String| {
         let sink = Arc::clone(&sink);
         async move {
@@ -349,8 +343,6 @@ async fn prompt_reasoner_wraps_full_text_in_the_wire_envelope() {
         .strip_prefix("fixed skeleton\n\n```json\n")
         .and_then(|rest| rest.strip_suffix("\n```"))
         .expect("prompt is the system prompt plus one fenced JSON block");
-    // why: decode the outbound envelope — all three fields travel as values, so a
-    // dropped output_schema or a reshaped payload fails here.
     let envelope: Value = serde_json::from_str(body).expect("envelope is JSON");
     assert_eq!(envelope["task_kind"], json!("absorb"));
     assert_eq!(envelope["user_payload"], json!("{}"));
@@ -366,9 +358,6 @@ async fn prompt_reasoner_rejects_malformed_full_text() {
         let counter = Arc::clone(&counter);
         async move {
             counter.fetch_add(1, Ordering::SeqCst);
-            // why: a valid JSON value embedded in prose — a bridge that extracted
-            // the JSON would wrongly succeed instead of reporting
-            // InvalidReasonerOutput on the complete reply.
             Ok(r#"the verdict is {"verdict": "settle"}, trust me"#.to_string())
         }
     });
@@ -527,8 +516,6 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
     let src = MemoryKnowledgeEntries::default();
     let dst = MemoryKnowledgeEntries::default();
 
-    // why: a store may hold an empty key — the create path binds the id as given. Anchoring that copy
-    // would write the bare `shared:` locator the parser rejects, so the call refuses first.
     let empty_source = match src.put_knowledge_entry(shared_entry(""), None).await {
         SpokeResult::Ok(entry) => entry,
         SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
@@ -565,8 +552,6 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
 async fn adoption_refuses_a_copy_from_another_source_revision() {
     let entry_id = "ke_shared_gate";
 
-    // why: a copy adopted at revision 1 stays that copy after the source advances — a request naming
-    // revision 2 asks for content this slot never adopted.
     let src = MemoryKnowledgeEntries::default();
     let dst = MemoryKnowledgeEntries::default();
     let first = match src.put_knowledge_entry(shared_entry(entry_id), None).await {

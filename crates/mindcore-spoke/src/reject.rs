@@ -102,16 +102,9 @@ impl Reject {
 
 impl From<SqliteRepositoryError> for Reject {
     fn from(error: SqliteRepositoryError) -> Self {
-        // why: a write SQLite refused because another handle holds the database —
-        // an exhausted busy timeout or the lost snapshot itself — applied
-        // nothing from this transaction, so the retryable pre-commit class is
-        // honest; only the message names the lost race. A phase-2 caller
-        // upgrades this class through `unsettled` once a publication is durable.
         if contended(&error) {
             return Self::internal("a concurrent writer refused this transaction before commit");
         }
-        // why: a driver failure before the caller's commit is retryable and its
-        // diagnostics stay local: the protocol names no storage vocabulary.
         Self::internal("storage failure before commit")
     }
 }

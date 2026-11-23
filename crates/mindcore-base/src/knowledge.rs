@@ -31,7 +31,6 @@ impl KnowledgeScope {
 /// recorded revision answers as an unrelated occupant on a repeat. New callers use
 /// [`adoption_anchor_at_revision`]; this builder stays for fixtures that predate it.
 pub fn adoption_anchor(shared_entry_id: &str, basis: &str) -> SourceAnchor {
-    // invariant: both constants satisfy the pinned wire pattern `^[a-z][a-z0-9_-]*$` and the `>= 1` bound.
     let namespace = ExtensionKey::try_from("mindcore_adoption").expect("valid extension key");
     let mut extensions = HashMap::new();
     extensions.insert(
@@ -62,7 +61,6 @@ pub fn adoption_anchor_at_revision(
     if shared_entry_id.is_empty() || source_revision == 0 {
         return None;
     }
-    // invariant: both constants satisfy the pinned wire pattern `^[a-z][a-z0-9_-]*$` and the `>= 1` bound.
     let namespace = EntryExtensionKey::try_from("mindcore_adoption").expect("valid extension key");
     let extension = Map::from_iter([
         (

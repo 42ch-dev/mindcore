@@ -211,8 +211,6 @@ impl WorkflowBinding for StubBinding {
         expected: &[PageFact],
     ) -> Result<PageVectors, SpiError> {
         self.inner.vector_reads.fetch_add(1, Ordering::SeqCst);
-        // why: storage serves the page the recall just read; a caller that queued a
-        // newer snapshot sees it on the next recall read.
         let page = self.page(self.inner.calls.load(Ordering::SeqCst).saturating_sub(1));
         if page_fact(&page.records) != expected {
             return Err(revision_conflict());
@@ -827,8 +825,6 @@ async fn a_new_query_with_warm_records_embeds_only_the_query() {
 
 #[tokio::test]
 async fn a_stale_revision_embeds_only_that_record() {
-    // why: the table holds revision 1, then the guards record moves — only its stored
-    // vector is stale.
     let binding = StubBinding::new(vec![snapshot(vector_page(2), Vec::new())])
         .seeded(&planted("1"), &warm_vectors());
     let workflows = SpiMindWorkflows::new(binding.clone());
@@ -855,8 +851,6 @@ async fn a_stale_revision_embeds_only_that_record() {
 async fn a_new_identity_embeds_every_record_again() {
     let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())])
         .seeded(&planted("1"), &warm_vectors());
-    // why: a second identity starts with a cold query slot too — nothing the first
-    // one stored belongs to it.
     let workflows = SpiMindWorkflows::new(binding.clone());
     let other = PlantedEmbedder {
         identity: planted("2"),
@@ -907,8 +901,6 @@ async fn an_embedder_free_or_unavailable_recall_probes_no_vector_cache() {
     assert_eq!(ids(&pack), ["rec_b", "rec_a", "rec_c"], "adapter order");
     assert_eq!(binding.vector_reads(), 0, "no embedder probes nothing");
 
-    // why: a cold `EmbeddingsUnavailable` stops before any table I/O too, even over
-    // a page the double already holds vectors for.
     let workflows = SpiMindWorkflows::new(binding.clone());
     let cold = UnavailableEmbedder(planted("1"));
     let pack = workflows
@@ -951,7 +943,6 @@ async fn a_miss_batch_that_goes_unavailable_keeps_the_warm_slot() {
 
     let binding = StubBinding::new(vec![snapshot(vector_page(1), Vec::new())]);
     let workflows = SpiMindWorkflows::new(binding.clone());
-    // why: warm the slot for one query under this identity and scope.
     let warm = planted_embedder();
     let warm_pack = workflows
         .recall_context(
@@ -964,9 +955,6 @@ async fn a_miss_batch_that_goes_unavailable_keeps_the_warm_slot() {
         .expect("warm pack");
     assert_eq!(ids(&warm_pack), ["rec_a", "rec_c", "rec_b"]);
 
-    // why: a different query embeds its own vector, then its miss batch goes
-    // unavailable: lexical order, nothing written, and the warm slot for the
-    // first query must survive.
     let cold = DistinctQueryEmbedder(planted("1"));
     let pack = workflows
         .recall_context(
@@ -984,7 +972,6 @@ async fn a_miss_batch_that_goes_unavailable_keeps_the_warm_slot() {
     );
     assert_eq!(binding.vector_reads(), 2, "a read-only lookup may have run");
 
-    // why: the warmed query still hits its slot — only the page is embedded.
     let after = planted_embedder();
     let pack = workflows
         .recall_context(
@@ -1002,7 +989,6 @@ async fn a_miss_batch_that_goes_unavailable_keeps_the_warm_slot() {
     );
     assert_eq!(ids(&pack), ["rec_a", "rec_c", "rec_b"]);
 
-    // why: the unavailable recall cached nothing for its own query either.
     let market = planted_embedder();
     workflows
         .recall_context(
@@ -1022,8 +1008,6 @@ async fn a_miss_batch_that_goes_unavailable_keeps_the_warm_slot() {
 
 #[tokio::test]
 async fn a_refused_recall_leaves_no_cached_query_vector() {
-    // why: the page moves while the miss batch is embedded, so the recall is
-    // refused after the query vector was computed and validated.
     let binding = StubBinding::new(vec![
         snapshot(vector_page(1), Vec::new()),
         snapshot(vector_page(2), Vec::new()),
@@ -1456,9 +1440,6 @@ impl WorkflowBinding for AbsorbDouble {
         _principal: &Principal,
         _request: &MemoryCaptureRequest,
     ) -> Result<CaptureOutcome, SpiError> {
-        // why: the first capture commits the receipt; every later one replays it,
-        // reporting the state each candidate is in — or the Pending decision
-        // the receipt's own run recorded, which wins over that state.
         let call = self.captures.fetch_add(1, Ordering::SeqCst);
         let decision = self
             .recorded
@@ -1549,7 +1530,6 @@ impl WorkflowBinding for AbsorbDouble {
         let mut object = serde_json::to_value(request).expect("review request");
         object["cited"] = cited_json(cited);
         self.recorded.reviews.lock().expect("reviews").push(object);
-        // why: the review mints fresh records, so its settlement commits revision 1.
         Ok(vec![SettledRevision {
             record_id: "rec_new".to_string(),
             revision: 1,
@@ -1570,8 +1550,6 @@ impl WorkflowBinding for AbsorbDouble {
             "dismiss": serde_json::to_value(dismiss).expect("dismiss request"),
             "cited": cited_json(cited),
         }));
-        // why: the update CAS-writes `expected_revision + 1`, so that is what the
-        // settlement committed.
         Ok(vec![SettledRevision {
             record_id: rendered["record_id"]
                 .as_str()
@@ -1967,8 +1945,6 @@ async fn update_hands_policy_the_typed_target_and_settles_it() {
     let seen = seen.lock().expect("seen");
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0]["kind"], "update");
-    // why: the policy sees the record and the revision the snapshot read, and the
-    // candidate's own content — not anything the model supplied.
     assert_eq!(seen[0]["proposed"]["record_id"], "rec_gate");
     assert_eq!(seen[0]["proposed"]["expected_revision"], 3);
     assert_eq!(
@@ -2102,9 +2078,6 @@ async fn no_reasoner_keeps_the_capture_result_pending() {
         }]
     );
     assert_eq!(replay, outcomes);
-    // why: neither run read the candidate back — a fresh capture's candidate is
-    // pending by construction, and a replay reports a pending candidate
-    // straight from its receipt, needing no review or recall grant.
     assert_eq!(
         recorded.snapshots.load(Ordering::SeqCst),
         0,
@@ -2124,7 +2097,6 @@ async fn a_replay_that_finds_no_marker_writes_none() {
     let caps = MindCapabilities::default();
     recorded.fail_pending_write.store(true, Ordering::SeqCst);
 
-    // why: the capture commits and the marker write fails — the run records nothing.
     let failed = workflows
         .absorb(&principal(), &capture_request(), None, &caps)
         .await;
@@ -2134,9 +2106,6 @@ async fn a_replay_that_finds_no_marker_writes_none() {
     );
     assert!(recorded.pending.lock().expect("pending writes").is_empty());
 
-    // why: the replay sees a wholly pending receipt and no marker, and writes none —
-    // a snapshot cannot tell this failed run from one still in flight, so the
-    // decision stays unrecorded and each candidate reports its own state.
     let replayed = workflows
         .absorb(&principal(), &capture_request(), None, &caps)
         .await
@@ -2223,8 +2192,6 @@ async fn a_replay_never_settles_what_a_policy_held() {
         }]
     );
 
-    // why: the same capture replayed under a policy that would settle it — the replay
-    // reports the recorded hold instead of deciding again.
     let policy = RecordingPolicy {
         decision: PolicyDecision::AutoSettle,
         seen: Arc::clone(&seen),
@@ -2287,8 +2254,6 @@ async fn a_policy_rejection_drops_over_the_cited_evidence() {
         reviews[0]["decision"]["rationale"],
         "the gate record is not trusted"
     );
-    // why: the refusal is the policy's, but the drop consumes the candidate over the
-    // same page the decision cited, so the binding revalidates it first.
     assert_eq!(
         reviews[0]["cited"],
         json!([{ "record_id": "rec_gate", "revision": 3 }])
@@ -2320,8 +2285,6 @@ async fn a_consumed_candidate_reports_its_recorded_outcome() {
 
 #[tokio::test]
 async fn no_reasoner_replay_reports_the_recorded_outcome() {
-    // why: the capture key is already held — this call is a replay, and its consumed
-    // candidate still projects the recorded outcome without a reasoner.
     let (workflows, recorded, _) = absorb_replayed(consumed_candidate());
     let caps = MindCapabilities::default();
 
@@ -2360,7 +2323,6 @@ async fn a_dismissed_candidate_reports_the_record_it_updated() {
             record_ids: vec!["rec_gate".to_string()],
         }]
     );
-    // why: the update leg's own receipt is read under this capture's stable key.
     let keys = recorded.update_keys.lock().expect("update keys");
     assert_eq!(keys.len(), 1);
     assert!(keys[0].starts_with("absorb-"));
@@ -2886,7 +2848,6 @@ async fn an_empty_explicit_assessment_context_is_a_caller_input_error() {
     let binding = DeliberateDouble::new();
     let settlements = binding.settlements();
     let workflows = SpiMindWorkflows::new(binding);
-    // why: a valid provider draft — only the caller's own context id is malformed.
     let reasoner = DeliberateReasoner {
         verdict: promote_verdict(),
         calls: Arc::new(AtomicUsize::new(0)),
@@ -2946,26 +2907,21 @@ async fn deliberate_refuses_fabricated_references_before_any_write() {
             verdict
         },
         {
-            // why: visible id, fabricated identity — not the admitted reference.
             let mut verdict = promote_verdict();
             verdict["record"]["basis"]["evidence"][0]["namespace"] = json!("external");
             verdict
         },
         {
-            // why: visible id, fabricated kind — not the admitted reference either.
             let mut verdict = promote_verdict();
             verdict["record"]["basis"]["evidence"][0]["kind"] = json!("knowledge_entry");
             verdict
         },
         {
-            // why: a visible record the verdict never cited has no revision the
-            // commit could revalidate.
             let mut verdict = promote_verdict();
             verdict["record_ids"] = json!([]);
             verdict
         },
         {
-            // why: supplied evidence carries no record identity a basis can bind to.
             let mut verdict = promote_verdict();
             verdict["record"]["basis"]["evidence"][0]["id"] = json!("ev_test");
             verdict
@@ -3378,7 +3334,6 @@ async fn deliberate_retries_a_stale_carrier_until_the_snapshot_holds() {
 
 #[tokio::test]
 async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
-    // why: a snapshot refusal is terminal — nothing was reasoned and no write ran.
     let holder = deliberate_holder();
     let target = deliberate_target();
     let evidence = [Evidence {
@@ -3419,7 +3374,6 @@ async fn deliberate_does_not_retry_a_refusal_or_an_uncertain_write() {
         SpiError::Settlement(ref reject) if reject.code == SpokeRejectCode::NotAuthorized
     ));
 
-    // why: an uncertain write is surfaced once, never turned into a fresh attempt.
     let binding = DeliberateDouble::failing(uncertain_write());
     let snapshots = binding.snapshots();
     let settlements = binding.settlements();
@@ -3612,7 +3566,6 @@ async fn deliberate_clamps_an_absurd_timeout_and_still_settles() {
         holder: &holder,
         target: &target,
         evidence: &evidence,
-        // why: a timeout no instant can hold — the deadline is clamped, not dropped.
         timeout: std::time::Duration::MAX,
     };
 
@@ -3796,8 +3749,6 @@ impl DomainLens for EngineeringEvaluatorLens {
             ..
         } = draft
         else {
-            // why: the redline binds ADR promotion only — an absorb decision or a
-            // `none` recommendation rests on the engine's own checks.
             return Ok(());
         };
         if target_kind != "adr" {
@@ -3979,8 +3930,6 @@ async fn an_engineering_adr_needs_a_verified_citation_before_the_hook() {
         text: "the gate test passed on this commit",
     }];
 
-    // why: the proposal rests on the resolvable local observation only; the prose
-    // claiming CI verification is model text.
     let reasoner = DeliberateReasoner {
         verdict: adr_verdict(
             "verified: the gate test passed in CI on the head commit",
@@ -4018,7 +3967,6 @@ async fn an_engineering_adr_needs_a_verified_citation_before_the_hook() {
         "the carrier is unchanged"
     );
 
-    // why: the same proposal resting on the fixture-verified observation settles.
     let reasoner = DeliberateReasoner {
         verdict: adr_verdict(
             "the gate test passed on the supplied evidence",

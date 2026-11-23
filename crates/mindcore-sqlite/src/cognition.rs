@@ -109,8 +109,6 @@ where
     ordered_records(executor, collection, entry_id, Some(head_seq)).await
 }
 
-// why: one decoder and one refusal path for both record reads — the bound differs, the storage order,
-// the JSON shape and the failure message do not.
 async fn ordered_records<'e, E>(
     executor: E,
     collection: &str,
@@ -174,9 +172,6 @@ pub(crate) async fn gap_is_dedicated_appends<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    // why: positions, not a count — `append_seq` is a non-`STRICT` `INTEGER`, so a fractional value is
-    // storable. Reading it as `REAL` keeps such a row in the result instead of letting a cast
-    // drop it, so every row in the interval reaches the position comparison below.
     let rows: Result<Vec<(f64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
         "SELECT CAST(append_seq AS REAL), append_prior_shape FROM cognition_records \
          WHERE collection = ? AND entry_id = ? AND append_seq > ? AND append_seq <= ? \

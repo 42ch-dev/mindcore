@@ -95,8 +95,6 @@ fn is_state_digest(raw: &str) -> bool {
 }
 
 impl MemoryAdapter {
-    // contract §7.25 reflections.state
-
     pub async fn get_reflection_state(
         &self,
         tx: &mut Tx<'_>,
@@ -179,8 +177,6 @@ impl MemoryAdapter {
         }))
     }
 
-    // contract §7.26 reflections.list
-
     pub async fn list_reflections(
         &self,
         tx: &mut Tx<'_>,
@@ -210,8 +206,6 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let subject_id = request.subject_id.to_string();
-        // why: an absent selection lists subject-wide, which admission treats as the
-        // unrestricted selection rather than as no requirement.
         let requested = match object.get("selection") {
             None | Some(Value::Null) => PlacementSelection::SubjectAll,
             Some(_) => wire::selection(object, "selection")?.ir(),
@@ -287,8 +281,6 @@ impl MemoryAdapter {
         )
     }
 
-    // contract §7.27 reflections.generate
-
     pub async fn generate_reflection(
         &self,
         tx: &mut Tx<'_>,
@@ -320,8 +312,6 @@ impl MemoryAdapter {
             .get("selection")
             .cloned()
             .ok_or_else(|| Reject::invalid("selection is required"))?;
-        // why: a request `filter: null` stages as absent — the persisted row must not
-        // carry a literal null the readers would later treat as malformed.
         let filter_json = object
             .get("filter")
             .filter(|value| !value.is_null())
@@ -416,10 +406,6 @@ impl MemoryAdapter {
             "source_set_digest": policy::reflection_source_set_digest(&basis.records)?,
             "state_digest": current,
         });
-        // contract §7.0.3 — transaction 1 publishes the pending receipt and its lease; the
-        // caller commits, composes, and completes in transaction 2. A retry that
-        // found the abandoned pending row keeps its receipt id and re-leases it in
-        // this same transaction, so the returned work's owner is the persisted one.
         let (receipt_id, owner_id) = match take_over {
             Some(receipt_id) => {
                 let owner_id = mint("own");
@@ -437,9 +423,6 @@ impl MemoryAdapter {
                     )
                     .await?;
                 if !claimed {
-                    // why: the abandoned row raced — the loser follows the same
-                    // replay/uncertainty contract as a live pending probe, never
-                    // a fresh attempt or work item.
                     match admission::probe(&self.repository, tx, &op).await? {
                         Some(receipt) => {
                             return Self::replay::<MemoryReflectionsGenerateResponse>(&receipt)
@@ -479,8 +462,6 @@ impl MemoryAdapter {
             engine_policy_version: policy::ENGINE_POLICY_VERSION,
         }))
     }
-
-    // contract §7.27 generate completion (transaction 2)
 
     /// Complete a leased generation in a fresh caller transaction: insert
     /// the envelope and settle the pending receipt only while that receipt
@@ -524,8 +505,6 @@ impl MemoryAdapter {
             Some(ReceiptRead::Retained(receipt)) => receipt,
         };
         match &receipt.state {
-            // why: an already-committed completion returns its stored result; only
-            // the pending transition writes the envelope.
             ReceiptState::Committed { .. } => {
                 return project::checked::<MemoryReflectionsGenerateResponse>(
                     project::receipt_body(&receipt),

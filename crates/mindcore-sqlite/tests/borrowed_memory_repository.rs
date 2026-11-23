@@ -156,7 +156,6 @@ async fn caller_commit_persists_effect_and_receipt() {
     {
         let pool = prepared(&path).await;
         let mut tx = pool.begin().await.unwrap();
-        // why: read in the open transaction: the seeded subject is visible.
         let subject = repo
             .subject(&mut tx, &SpaceId::new("spc_workshop"), "sub_mira")
             .await
@@ -167,7 +166,6 @@ async fn caller_commit_persists_effect_and_receipt() {
         repo.insert_review(&mut tx, &live_record(), &committed_receipt())
             .await
             .unwrap();
-        // why: reads in the same open transaction observe the staged effect and receipt.
         assert!(repo
             .record(&mut tx, &SpaceId::new("spc_workshop"), "rec_1")
             .await
@@ -270,7 +268,6 @@ async fn candidate_insert_and_guarded_consume() {
         .update_candidate(&mut tx, &consumed, &Number::from(1))
         .await
         .unwrap());
-    // why: a stale observation does not match.
     assert!(!repo
         .update_candidate(&mut tx, &consumed, &Number::from(1))
         .await
@@ -308,7 +305,6 @@ async fn leased_receipt_settle_guarded_by_owner() {
         state: ReceiptState::Pending,
         extensions: Map::new(),
     };
-    // why: a lease that stays live for the test's lifetime keeps the wrong-owner guard intact.
     let lease = mindcore_base::ir::ReceiptLease {
         owner_id: "instance-1".into(),
         expires_at: "9999-01-01T00:00:00.000Z".into(),
@@ -326,12 +322,10 @@ async fn leased_receipt_settle_guarded_by_owner() {
         },
         ..pending.clone()
     };
-    // why: wrong owner cannot settle while the lease is live.
     assert!(!repo
         .update_receipt(&mut tx, &settled, "pending", Some("instance-2"))
         .await
         .unwrap());
-    // why: the observed owner can.
     assert!(repo
         .update_receipt(&mut tx, &settled, "pending", Some("instance-1"))
         .await
@@ -371,7 +365,6 @@ async fn expired_lease_pending_receipt_taken_over() {
         state: ReceiptState::Pending,
         extensions: Map::new(),
     };
-    // note: the crashed owner leased this receipt long enough ago that its lease is expired.
     let lease = mindcore_base::ir::ReceiptLease {
         owner_id: "instance-crashed".into(),
         expires_at: "2020-01-01T00:00:00.000Z".into(),
@@ -382,9 +375,6 @@ async fn expired_lease_pending_receipt_taken_over() {
         .await
         .unwrap();
 
-    // why: a different owner claims the abandoned pending row: the CAS persists the new
-    // owner and expiry inside this caller-owned transaction. The expiry is measured
-    // from the claim instant (30s lease), not from when the transaction began.
     let claim_start = chrono::Utc::now();
     assert!(repo
         .claim_receipt_lease(
@@ -397,16 +387,12 @@ async fn expired_lease_pending_receipt_taken_over() {
         .await
         .unwrap());
     let claim_end = chrono::Utc::now();
-    // why: the stamped lease is in the future: a takeover stamped from the request
-    // instant could already be expired and re-leasable on the very next retry.
     let stamped = repo
         .receipt_lease(&mut tx, &SpaceId::new("spc_workshop"), "rcp_gen_crash")
         .await
         .unwrap()
         .expect("claimed row carries a lease");
     let stamped_at = chrono::DateTime::parse_from_rfc3339(&stamped).expect("lease stamp");
-    // why: the stamp is millisecond-truncated, so its instant can sit a millisecond
-    // below the full-precision claim start.
     let earliest = claim_start + chrono::Duration::seconds(30) - chrono::Duration::milliseconds(1);
     let latest = claim_end + chrono::Duration::seconds(30);
     assert!(
@@ -414,8 +400,6 @@ async fn expired_lease_pending_receipt_taken_over() {
         "stamped lease {stamped} must sit inside the measured claim interval +30s \
          ({earliest}..={latest})"
     );
-    // why: the claim is lost when the row no longer qualifies — already re-leased here, so the
-    // second claimant gets no work and the crashed owner still cannot settle.
     assert!(!repo
         .claim_receipt_lease(
             &mut tx,
@@ -434,15 +418,12 @@ async fn expired_lease_pending_receipt_taken_over() {
         },
         ..pending.clone()
     };
-    // why: neither the crashed nor the losing owner can settle: owner matching is exact, and
-    // the expiry bypass is gone.
     for stale_owner in ["instance-crashed", "instance-3"] {
         assert!(!repo
             .update_receipt(&mut tx, &settled, "pending", Some(stale_owner))
             .await
             .unwrap());
     }
-    // why: the persisted takeover owner settles.
     assert!(repo
         .update_receipt(&mut tx, &settled, "pending", Some("instance-2"))
         .await
@@ -502,7 +483,6 @@ async fn settled_receipt_not_taken_over_past_expiry() {
         .await
         .unwrap());
 
-    // why: past expiry another owner still cannot rewrite the committed receipt.
     let forged = ReviewReceiptIr {
         state: ReceiptState::Committed {
             completed_at: LATER.into(),
@@ -549,7 +529,6 @@ async fn insert_conflict_reports_without_overwrite() {
         outcome,
         Err(mindcore_sqlite::SqliteRepositoryError::Conflict(_))
     ));
-    // why: the first row survives the collision.
     let kept = repo
         .record(&mut tx, &SpaceId::new("spc_workshop"), "rec_1")
         .await
@@ -726,7 +705,6 @@ async fn candidate_list_filters_by_admitted_placement() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].candidate_id, "cand_1");
 
-    // why: with shared included the shared row appears; ctx_b stays invisible.
     let admitted = CandidateSelection {
         placement: PlacementSelection::SelectedContexts {
             context_ids: vec![ContextId::new("ctx_a")],
@@ -747,7 +725,6 @@ async fn candidate_list_filters_by_admitted_placement() {
     ids.sort_unstable();
     assert_eq!(ids, ["cand_1", "cand_shared"]);
 
-    // why: shared-only yields exactly the shared row.
     let admitted = CandidateSelection {
         placement: PlacementSelection::SharedOnly,
         status: None,
@@ -812,7 +789,6 @@ async fn guarded_updates_do_not_cross_spaces() {
     };
     repo.insert_grant(&mut tx, &grant).await.unwrap();
 
-    // why: a replacement row claiming the wrong space must not mutate the real row.
     let mut forged = grant.clone();
     forged.space_id = SpaceId::new("spc_other");
     forged.revoked_at = Some(LATER.into());
@@ -828,7 +804,6 @@ async fn guarded_updates_do_not_cross_spaces() {
         .unwrap();
     assert!(kept.revoked_at.is_none());
 
-    // why: same scoping for receipts, including the unleased (NULL owner) path.
     repo.insert_receipt(&mut tx, &committed_receipt(), None)
         .await
         .unwrap();
@@ -860,8 +835,6 @@ async fn guarded_updates_do_not_cross_spaces() {
 async fn malformed_reflection_selections_fail_invalid_row() {
     use mindcore_base::ir::PlacementSelection;
 
-    // why: each malformed shape gets its own record and its own evaluation so every
-    // `InvalidRow` cause is asserted independently of row order.
     for selection in [
         json!({"mode": "everywhere"}),
         json!({"mode": "selected_contexts", "context_ids": ["ctx_a", 3], "include_shared": false}),
@@ -920,7 +893,6 @@ async fn update_persists_supplied_revision() {
     let mut tx = pool.begin().await.unwrap();
     repo.insert_record(&mut tx, &live_record()).await.unwrap();
 
-    // note: observed=1, supplied revision=7 → stored revision is 7, not 2.
     let mut bumped = live_record();
     bumped.kind = "renamed_kind".into();
     bumped.revision = Number::from(7);
@@ -937,7 +909,6 @@ async fn update_persists_supplied_revision() {
     assert_eq!(stored.revision, Number::from(7));
     assert_eq!(stored.kind, "renamed_kind");
 
-    // why: a stale observed revision (1 against stored 7) misses and writes nothing.
     let mut stale = live_record();
     stale.kind = "stale_kind".into();
     stale.revision = Number::from(2);
@@ -970,7 +941,6 @@ async fn evicted_receipt_distinguishes_expiry_from_conflict() {
     repo.insert_receipt(&mut tx, &committed_receipt(), None)
         .await
         .unwrap();
-    // why: retention reclaims both payload columns in place (dedup tombstone shape).
     sqlx::query!(
         "UPDATE memory_receipts SET result_json = NULL, error_json = NULL \
          WHERE receipt_id = 'rcp_1'",
@@ -1055,7 +1025,6 @@ async fn consumed_candidate_without_kind_preserves_stored_kind() {
         } if kind == "local_note"
     ));
 
-    // why: the same shape on a fresh insert is rejected instead of written.
     let mut kindless = pending_candidate();
     kindless.candidate_id = "cand_kindless".into();
     kindless.state = consumed.state.clone();
@@ -1097,8 +1066,6 @@ async fn tombstoned_record_with_null_reason_and_import_ref_reads() {
         }),
     };
     repo.insert_record(&mut tx, &record).await.unwrap();
-    // why: the pinned delete scrubs content, writes `reason: null` and leaves
-    // `import_ref_json` in place.
     sqlx::query!(
         "UPDATE memory_records \
          SET content_json = '{\"text\":\"\"}', tombstone_json = ?, updated_at = ?, \
@@ -1311,7 +1278,6 @@ async fn nonempty_extensions_dropped_on_write() {
         other => panic!("expected retained receipt, got {other:?}"),
     }
 
-    // why: positive control: the only persisted extension map survives intact.
     let mut extensions = Map::new();
     extensions.insert("kept".into(), json!({"model": "sonnet"}));
     let reflection = mindcore_base::ir::MemoryReflectionRow {
@@ -1400,8 +1366,6 @@ async fn absent_include_shared_and_null_filter_decode() {
     let pool = prepared(&path).await;
     let mut tx = pool.begin().await.unwrap();
 
-    // note: legacy row — `include_shared` omitted entirely, `filter_json` holds the
-    // literal text 'null'.
     sqlx::query(
         "INSERT INTO memory_reflections \
          (seq, reflection_id, space_id, subject_id, requester_principal_id, \
@@ -1418,8 +1382,6 @@ async fn absent_include_shared_and_null_filter_decode() {
     .await
     .unwrap();
 
-    // why: the omitted flag defaults to false: a requested selection that covers
-    // the pinned context does not widen into shared visibility.
     let rows = repo
         .list_reflections(
             &mut tx,
@@ -1435,10 +1397,6 @@ async fn absent_include_shared_and_null_filter_decode() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].reflection_id, "rfl_legacy");
     assert_eq!(rows[0].filter, None);
-    // why: a request pinning the same context with `include_shared: false` still
-    // covers the row: the stored flag decodes as `false` (had it decoded as
-    // `true`, this request would see nothing — unlike `SharedOnly`, which
-    // rejects a pinned selected-contexts row either way).
     let covered = repo
         .list_reflections(
             &mut tx,
@@ -1453,7 +1411,6 @@ async fn absent_include_shared_and_null_filter_decode() {
         .unwrap();
     assert_eq!(covered.len(), 1);
 
-    // why: a present non-boolean `include_shared` still fails strict decode.
     sqlx::query(
         "INSERT INTO memory_reflections \
          (seq, reflection_id, space_id, subject_id, requester_principal_id, \
@@ -1558,8 +1515,6 @@ async fn has_unsettled_intent_covers_non_applied_states() {
 
     let space = SpaceId::new("spc_workshop");
     let subject = SubjectId::new("sub_mira");
-    // why: the existence probe decodes no payload column: it holds while one of the
-    // three unsettled states exists for this subject, and never otherwise.
     assert!(repo
         .has_unsettled_intent(&mut tx, &space, &subject)
         .await
@@ -1595,7 +1550,6 @@ async fn has_unsettled_intent_covers_non_applied_states() {
     .await
     .unwrap();
 
-    // why: a subject with no intents at all probes false rather than erroring.
     assert!(!repo
         .has_unsettled_intent(&mut tx, &space, &SubjectId::new("sub_ava_new"))
         .await
