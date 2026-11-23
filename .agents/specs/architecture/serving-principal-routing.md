@@ -3,7 +3,7 @@
 ## Scope
 
 How one Mindcore serving surface selects the knowledge collection a served call reads and writes:
-the routed workflow calls and the shared-entry adoption tool. It does not define memory semantics,
+the routed workflow calls and the shared-entry adoption face. It does not define memory semantics,
 the Connect handshake, or carrier record storage.
 
 ## Current state
@@ -62,25 +62,36 @@ additional, not a condition of the call.
 
 ### Adoption
 
-`tools.mindcore.adopt` reads one host-configured shared collection and writes the admitted
-principal's routed collection. `ServeFaces.adoption: Option<AdoptionRoute>` names the source
-(`crates/mindcore-runtime/src/lib.rs:191-193,225`); the destination is that principal's own
-`workflow_routes` entry, resolved from the same map the workflow binding takes. Neither collection
-is named by the request.
+`knowledge.adopt` reads one host-configured shared collection and writes the admitted principal's
+routed collection. `ServeFaces.adoption: Option<AdoptionRoute>` names the source by its wire
+`scope_id` and its collection (`crates/mindcore-runtime/src/lib.rs:245-250,287`); the destination is
+that principal's own `workflow_routes` entry, resolved from the same map the workflow binding takes.
+Neither collection is selected by a request member: `destination_scope_id` only has to equal the
+admitted scope id, and answers `NOT_AUTHORIZED` before the source is read; `source_scope_id` only
+has to equal `AdoptionRoute.scope_id`, and any other value answers the same generic `NOT_FOUND` as a
+missing source.
 
-- Assembly refuses a source collection that is empty or equal to any route destination, including
-  the route of a principal that is not currently connected
-  (`crates/mindcore-runtime/src/lib.rs:98-120`). Without that refusal an adopted copy could become
-  the shared entry another principal reads.
+- Assembly refuses an empty source scope id, an empty source collection, a source scope id equal to
+  `ServeFaces.scope_id`, and a source collection equal to any route destination, including the route
+  of a principal that is not currently connected
+  (`crates/mindcore-runtime/src/lib.rs:104-141`). Without the collection refusal an adopted copy
+  could become the shared entry another principal reads; the scope refusal keeps a principal from
+  adopting out of its own destination scope.
+- Admission is the knowledge face's, composed as `(principals(peer)?, knowledge_admission(peer)?)`:
+  a peer outside either callback gets that callback's refusal, so a routed principal the knowledge
+  admission does not admit answers `NOT_AUTHORIZED` instead of adopting.
 - An admitted principal without a route is refused `NotAuthorized` with the fixed message
   `principal has no workflow knowledge route` and no target detail
-  (`crates/mindcore-runtime/src/tools.rs:294-312`); the call falls back to no collection and never
+  (`crates/mindcore-runtime/src/adoption.rs`); the call falls back to no collection and never
   reaches another principal's destination.
 - The source is read-only to the call and only the routed destination is written, both on one
   `BEGIN IMMEDIATE` transaction, so adoption adds no write outside the routed collection. The
   source handle is a distinct type from the destination handle, and the one write its port must
   expose refuses before any statement runs, so no caller can write the shared collection through
   the source side.
+- The source resolves through its retirement chain before the copy is read, so the write lands a
+  copy whose anchor names the terminal, never a retired hop; `.agents/specs/data/knowledge-lifecycle.md`
+  § Adoption owns the anchor, copy and refusal rules.
 
 ### Construction
 
@@ -104,21 +115,23 @@ is named by the request.
 - No refusal discloses another principal's route, collection or entry.
 - No wire value selects the authenticated principal, the source collection or the destination
   collection: admission supplies the principal, `AdoptionRoute` the source, and the principal's
-  route-map entry the destination. Adoption's arguments name one entry and its expected source
-  revision, and its result carries that copy, whose stored provenance selects nothing.
+  route-map entry the destination. Adoption's arguments name one source entry, its expected source
+  revision, an optional destination entry id and an idempotency key, and its result carries that
+  copy, whose stored provenance selects nothing.
 - The carrier record format is unchanged.
 
 ## Where it lives
 
-- `crates/mindcore-runtime/src/lib.rs` — `ServeFaces` (`:197-238`) with `workflow_routes`
-  (`:226-233`) and `adoption` (`:220-225`), `AdoptionRoute` (`:191-193`), and the assembly-time
-  refusals in `MindcoreRuntime::surface` (`:93-142`), the adoption source checks among them
-  (`:98-120`).
+- `crates/mindcore-runtime/src/lib.rs` — `ServeFaces` (`:254-300`) with `workflow_routes`
+  (`:288-295`) and `adoption` (`:281-287`), `AdoptionRoute` (`:245-250`), the admission
+  composition (`:186-208`), and the assembly-time refusals in `MindcoreServe::surface`
+  (`:104-141`), the adoption source checks among them (`:106-141`).
 - `crates/mindcore-spoke/src/workflows.rs` — `MemoryWorkflowBinding::new` (`:92-99`),
   `with_knowledge_routes` (`:295-326`) and the one `knowledge_route` lookup (`:346-348`) both
   routed workflow calls share.
-- `crates/mindcore-runtime/src/tools.rs` — the call-time route lookup for adoption and its
-  target-free refusal (`:301-312`).
+- `crates/mindcore-runtime/src/adoption.rs` — the adoption port: the call-time route lookup, its
+  target-free refusal, and the one `BEGIN IMMEDIATE` transaction around the chain resolution and
+  the copy.
 - `.agents/specs/architecture/serving-seam.md` — the served tool ABI and the advertisement rule.
 - `crates/mindcore-runtime/tests/loopback.rs` — the signed-session assertions for each route and
   each advertisement case.

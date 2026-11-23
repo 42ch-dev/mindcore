@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+- **Breaking — `mindcore-runtime`:** the private product tool `tools.mindcore.adopt` is removed, not
+  deprecated. Adoption is served only as the published protocol operation `knowledge.adopt` under the
+  `spoke-knowledge-adoption` capability, which requires `spoke-knowledge`; the runtime filters the
+  reserved id out of every host registration, so no manifest advertises it and no handler answers it.
+  A caller migrates the call as `entry_id` → `source_entry_id`, `expected_source_revision` →
+  `source_revision`, and expects `outcome` `adopted` instead of `created` (`already_present` and
+  `entry` keep their meanings). The request gains required `source_scope_id` — it must equal
+  `AdoptionRoute.scope_id`, and any other value is the same generic `NOT_FOUND` as a missing source —
+  required `destination_scope_id` — it must equal the peer's admitted scope id, or `NOT_AUTHORIZED`
+  before the source is read — required `idempotency_key`, and optional `destination_entry_id`, which
+  names the copy and defaults to the resolved terminal's entry id. `ServeFaces.adoption`'s
+  `AdoptionRoute` gains `scope_id` beside `source`, and assembly now also refuses a source scope
+  equal to `ServeFaces.scope_id`. Two behaviour changes: adoption admits through the knowledge
+  face's `(principals, knowledge_admission)` pair, so a routed principal that face does not admit
+  answers `NOT_AUTHORIZED` where the product tool served it; and the source resolves through
+  `resolve_retirement_chain` before the copy, so the anchor and the copy name the live terminal, a
+  live source that moved off `source_revision` is `REVISION_CONFLICT` with no details, and a chain
+  that cannot resolve is `SOURCE_RETIRED` with `details.retirement_chain`. The local refusal
+  vocabulary is the protocol's — `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT` with
+  `details.adopted_revision` only for a copy adopted at another revision, `SOURCE_RETIRED`,
+  `ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` — and the `owner`/`disclosure` reset is not
+  applied, so a copy inherits the source's governance. Connect's `AdoptionPortService` supplies the
+  idempotency envelope, including `IDEMPOTENCY_CONFLICT` and `RECEIPT_EXPIRED`.
 - `mindcore-spoke` / `mindcore-runtime`: `ServeFaces.memory` takes an `Arc<dyn ServedMemory>` — a
   `RemoteMemoryService` that reports the `memory.*` operations it dispatches — and the runtime
   advertises `spoke-memory-transfer` exactly when the attached service reports all five §7.29–§7.33
