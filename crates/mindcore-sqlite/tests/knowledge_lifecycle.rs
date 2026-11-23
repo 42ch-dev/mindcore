@@ -518,7 +518,11 @@ async fn knowledge_lifecycle_preserves_history_and_adopted_provenance() {
                 .details
                 .as_ref()
                 .expect("the superseded refusal names its marker");
-            assert_eq!(details.get("superseded_by"), Some(&Value::from("entry-b")));
+            assert_eq!(
+                details.get("superseded_by"),
+                Some(&Value::Bool(true)),
+                "the refusal reports occupancy, never the successor's id"
+            );
         }
     }
     assert_eq!(

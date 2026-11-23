@@ -125,7 +125,9 @@ selects and how admission reaches it.
 - No wire value selects the authenticated principal, the source collection or the destination
   collection: admission supplies the principal, `AdoptionRoute` the source, and `ServeFaces.knowledge`
   the destination. Adoption's arguments name one source entry, its expected source
-  revision, an optional destination entry id and an idempotency key, and its result carries that
+  revision, an optional destination entry id, an idempotency key, and the required
+  `source_scope_id` and `destination_scope_id`: the two scope members are compared against the
+  host-configured source and the admitted scope and never select either, and its result carries that
   copy, whose stored provenance selects nothing.
 - The carrier record format is unchanged.
 
