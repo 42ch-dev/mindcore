@@ -1,5 +1,5 @@
-//! The `spoke-knowledge-adoption` face: one shared source read for the whole surface, and each
-//! admitted principal's routed collection as the destination.
+//! The `spoke-knowledge-adoption` face: one shared source read for the whole surface, and the
+//! knowledge face's own collection as the destination.
 //!
 //! The port owns the one `BEGIN IMMEDIATE` transaction that covers the scope checks, the
 //! retirement-chain resolution, the destination read and the create-only write, and commits only
@@ -7,9 +7,8 @@
 //! module supplies the two borrowed-transaction port handles, the store reads the chain needs and
 //! the refusal hygiene.
 
-use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -44,24 +43,25 @@ const DESTINATION_SELECTION: &str = "adoption destination entry is outside the a
 
 /// The adoption port over one host store.
 ///
-/// `routes` is the one validated route map the workflow binding also holds: a principal resolves
-/// to one destination collection for both faces, so an adopted copy lands where that principal's
-/// knowledge face reads and writes.
+/// `destination` is the collection the knowledge face itself serves, so an adopted copy is
+/// readable through that face's `knowledge.get`/`list` by the same admitted peer. It is not the
+/// workflow route map: that map selects a *workflow* collection per principal, and the knowledge
+/// face takes no per-principal collection.
 pub(crate) struct AdoptionService {
     pool: SqlitePool,
-    routes: Arc<BTreeMap<String, KnowledgeScope>>,
+    destination: KnowledgeScope,
     source: AdoptionRoute,
 }
 
 impl AdoptionService {
     pub(crate) fn new(
         pool: SqlitePool,
-        routes: Arc<BTreeMap<String, KnowledgeScope>>,
+        destination: KnowledgeScope,
         source: AdoptionRoute,
     ) -> Self {
         Self {
             pool,
-            routes,
+            destination,
             source,
         }
     }
@@ -71,7 +71,7 @@ impl AdoptionService {
 impl AdoptionPort for AdoptionService {
     async fn adopt_knowledge_entry(
         &self,
-        principal: &Principal,
+        _principal: &Principal,
         scope: &Scope,
         request: &KnowledgeAdoptRequest,
     ) -> SpokeResult<KnowledgeAdoptResponse> {
@@ -92,15 +92,18 @@ impl AdoptionPort for AdoptionService {
                 None,
             );
         }
-        let Some(destination) = self.routes.get(principal.principal_id.as_str()) else {
-            return not_authorized("principal has no workflow knowledge route");
-        };
-
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
             Err(error) => return SpokeResult::Reject(adoption_fault("begin", error)),
         };
-        let outcome = adopt_in(&mut transaction, &self.source, destination, scope, request).await;
+        let outcome = adopt_in(
+            &mut transaction,
+            &self.source,
+            &self.destination,
+            scope,
+            request,
+        )
+        .await;
         let outcome = match outcome {
             SpokeResult::Ok(outcome) => outcome,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(adoption_refusal(reject)),
@@ -274,11 +277,11 @@ impl KnowledgeEntryPort for AdoptionSource<'_, '_, '_> {
     }
 }
 
-/// The call's write half: the caller's routed destination, under the admitted selection.
+/// The call's write half: the knowledge face's own collection, under the admitted selection.
 ///
-/// The principal's route remains the collection selector; the admitted `Scope` additionally
-/// refines which entries of that collection this call may serve or write, so an entry the host
-/// admitted the scope without is neither returned nor copied.
+/// The host's configured collection is the selector; the admitted `Scope` additionally refines
+/// which entries of that collection this call may serve or write, so an entry the host admitted the
+/// scope without is neither returned nor copied.
 struct AdoptionDestination<'a, 'b, 'tx> {
     collection: &'a str,
     scope: &'a Scope,
@@ -495,8 +498,8 @@ mod tests {
         .expect("request JSON matches the schema")
     }
 
-    /// One store with the shared source's rows and the port over it: the owner is routed to
-    /// `wren`, a stranger is admitted by nobody.
+    /// One store with the shared source's rows and the port over it: the destination is the
+    /// knowledge face's own collection, the same one it serves to every admitted peer.
     async fn service() -> (TempDir, MindStore, AdoptionService) {
         let dir = TempDir::new().expect("temporary directory");
         let store = MindStore::open(&dir.path().join("adoption.db"))
@@ -512,10 +515,7 @@ mod tests {
         }
         let service = AdoptionService::new(
             store.pool(),
-            Arc::new(BTreeMap::from([(
-                "prn_owner".to_string(),
-                KnowledgeScope::new(DESTINATION_COLLECTION),
-            )])),
+            KnowledgeScope::new(DESTINATION_COLLECTION),
             AdoptionRoute {
                 scope_id: SHARED_SCOPE.to_string(),
                 source: KnowledgeScope::new("shared"),
@@ -543,8 +543,8 @@ mod tests {
     /// The first call writes the copy the anchor names, and the repeat serves that stored copy
     /// instead of writing a second one.
     #[tokio::test]
-    async fn a_routed_principal_adopts_once_and_repeats_from_the_stored_anchor() {
-        let (_dir, _store, service) = service().await;
+    async fn an_admitted_principal_adopts_once_and_repeats_from_the_stored_anchor() {
+        let (_dir, store, service) = service().await;
         let owner = principal("prn_owner");
         let admitted = scope(DESTINATION_SCOPE);
 
@@ -614,21 +614,30 @@ mod tests {
         );
         assert_eq!(unauthorized.code, SpokeRejectCode::NotAuthorized);
 
-        let unrouted = refused(
+        // No route map gates adoption: a second admitted principal adopts into the same collection
+        // the knowledge face serves, which is where `knowledge.get` reads it back.
+        let second = ok(
             service
                 .adopt_knowledge_entry(
-                    &principal("prn_stranger"),
+                    &principal("prn_second"),
                     &admitted,
-                    &request("ke_source", 1),
+                    &request("ke_terminal", 1),
                 )
                 .await,
-            "a principal with no route",
+            "a second admitted principal",
         );
-        assert_eq!(unrouted.code, SpokeRejectCode::NotAuthorized);
-        assert!(
-            !unrouted.message.contains(DESTINATION_COLLECTION),
-            "the refusal names no destination collection: {unrouted:?}"
+        assert_eq!(
+            serde_json::to_value(&second).expect("response serializes")["entry"]["entry_id"],
+            "ke_terminal"
         );
+        let stored = ok(
+            store
+                .knowledge(KnowledgeScope::new(DESTINATION_COLLECTION))
+                .get_knowledge_entry("ke_terminal")
+                .await,
+            "read the second principal's copy from the knowledge face's collection",
+        );
+        assert_eq!(stored.entry_id, "ke_terminal");
 
         let zero = refused(
             service

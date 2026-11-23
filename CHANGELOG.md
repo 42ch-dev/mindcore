@@ -13,7 +13,17 @@
   required `destination_scope_id` — it must equal the peer's admitted scope id, or `NOT_AUTHORIZED`
   before the source is read — required `idempotency_key`, and optional `destination_entry_id`, which
   names the copy and defaults to the resolved terminal's entry id; assembly now also refuses a
-  source scope equal to `ServeFaces.scope_id`. Two further refusals: the admitted scope's
+  source scope equal to `ServeFaces.scope_id`. The destination is no longer per-principal: the copy
+  is written into the collection the knowledge face serves (`ServeFaces.knowledge`), not the
+  adopting principal's `workflow_routes` entry, so it is readable through the `knowledge.get`/`list`
+  that share the adoption's admission. `workflow_routes` now selects and authorizes only the
+  routed workflow calls and plays no part in adoption. This is a breaking assembly change: a host
+  whose adoption source collection equals that knowledge collection assembled before — the copy
+  went to the principal's distinct route collection — and is now refused with `InvalidInput` ("the
+  adoption source collection is the collection the knowledge face serves"). Migrate by naming a
+  distinct adoption source collection, different from `ServeFaces.knowledge.collection` and from
+  every `workflow_routes` destination, and by dropping any expectation that a route names an
+  adoption destination. Two further refusals: the admitted scope's
   `entry_ids`/`entry_types` selection now applies to the destination, so an excluded entry is
   neither served nor written, and a resolved terminal revision above `2^53-1` refuses before the
   write instead of committing a copy whose response the wire cannot carry. Two behaviour changes:

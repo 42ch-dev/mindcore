@@ -13,7 +13,7 @@ use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
 use spoke_connect::core::{
     CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_JUDGMENT, CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION,
 };
@@ -22,7 +22,8 @@ use spoke_connect::remote::{
     MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler, KNOWLEDGE_OP_ADOPT,
 };
 use spoke_operations::{
-    spoke_ok, spoke_reject, validate_manifest_tools, SpokeReject, SpokeRejectCode, SpokeResult,
+    spoke_ok, spoke_reject, validate_manifest_tools, KnowledgeEntryPort, SpokeReject,
+    SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
@@ -415,38 +416,57 @@ async fn an_adoption_source_beside_the_routes_assembles() {
 #[tokio::test]
 async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly() {
     let serve = Fixture::open().await.serve();
-    for (routes, source) in [
-        (routes(), COLLECTION),
-        (
-            BTreeMap::from([
-                ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
-                ("prn_unconnected".to_string(), KnowledgeScope::new("shared")),
-            ]),
-            "shared",
+    // An unconnected principal's route is a refusal too: the copy it would write is one no
+    // knowledge-face read of the sharing principal reaches.
+    let reject = match serve.surface(ServeFaces {
+        workflow_routes: BTreeMap::from([
+            ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
+            ("prn_unconnected".to_string(), KnowledgeScope::new("shared")),
+        ]),
+        adoption: Some(AdoptionRoute {
+            scope_id: "spc_shared".to_string(),
+            source: KnowledgeScope::new("shared"),
+        }),
+        ..faces(metadata("runtime"))
+    }) {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(surface) => panic!(
+            "a route destination became the adoption source {:?}",
+            capabilities(&surface)
         ),
-    ] {
-        let reject = match serve.surface(ServeFaces {
-            workflow_routes: routes,
-            adoption: Some(AdoptionRoute {
-                scope_id: "spc_shared".to_string(),
-                source: KnowledgeScope::new(source),
-            }),
-            ..faces(metadata("runtime"))
-        }) {
-            SpokeResult::Reject(reject) => reject,
-            SpokeResult::Ok(surface) => {
-                panic!(
-                    "a route destination became the adoption source {:?}",
-                    capabilities(&surface)
-                )
-            }
-        };
-        assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
-        assert!(
-            reject.details.is_none(),
-            "the assembly refusal carries no route details: {reject:?}"
-        );
-    }
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+    assert!(
+        reject.details.is_none(),
+        "the assembly refusal carries no route details: {reject:?}"
+    );
+}
+
+/// A source naming the collection the knowledge face serves would copy the destination into
+/// itself, so assembly refuses it even with no route map at all.
+#[tokio::test]
+async fn an_adoption_source_in_the_knowledge_faces_collection_is_refused() {
+    let serve = Fixture::open().await.serve();
+    let reject = match serve.surface(ServeFaces {
+        workflow_routes: BTreeMap::new(),
+        adoption: Some(AdoptionRoute {
+            scope_id: "spc_shared".to_string(),
+            source: KnowledgeScope::new(COLLECTION),
+        }),
+        ..faces(metadata("runtime"))
+    }) {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(surface) => panic!(
+            "the served collection became the adoption source {:?}",
+            capabilities(&surface)
+        ),
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        reject.message,
+        "the adoption source collection is the collection the knowledge face serves"
+    );
+    assert!(reject.details.is_none(), "{reject:?}");
 }
 
 /// A source scope equal to the destination scope would let a principal adopt from its own
@@ -713,8 +733,8 @@ async fn tool_registrations_drive_advertisement_and_installation() {
 
 /// The admitted scope id must be the one this surface serves, not merely a well-formed selection:
 /// a resolver that admits another id is refused on both faces. Without the id check, an adoption
-/// whose destination names that foreign id matches the admitted context and writes to the
-/// principal's routed collection, while the knowledge face denies the same peer.
+/// whose destination names that foreign id matches the admitted context and writes into the
+/// knowledge face's collection, while the knowledge face denies the same peer.
 #[tokio::test]
 async fn an_admitted_scope_id_outside_the_served_one_is_refused() {
     let serve = Fixture::open().await.serve();
@@ -815,4 +835,118 @@ async fn admission_is_validated_where_the_face_is_assembled() {
         SpokeRejectCode::InvalidInput,
         "a caller-declared unsupported selection stays the caller's input error"
     );
+}
+
+/// A second admitted principal and the shared source's seed rows: an entry the adoption copies,
+/// and the knowledge face's own collection.
+fn two_principal_faces(manifest: HostCapabilityManifest) -> ServeFaces {
+    ServeFaces {
+        adoption: Some(adoption_source()),
+        admission: Arc::new(|peer_id: &str| match peer_id {
+            "peer-owner" => SpokeResult::Ok(scope_of(SCOPE_ID)),
+            // Admitted with knowledge access but routed to no workflow collection at all.
+            "peer-second" => SpokeResult::Ok(scope_of(SCOPE_ID)),
+            _ => spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                format!("peer {peer_id} holds no knowledge admission"),
+                None,
+            ),
+        }),
+        principals: Arc::new(|peer_id: &str| match peer_id {
+            "peer-owner" | "peer-second" => SpokeResult::Ok(
+                serde_json::from_value(json!({ "principal_id": peer_id, "extensions": {} }))
+                    .expect("principal JSON matches the schema"),
+            ),
+            _ => spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                format!("peer {peer_id} holds no workflow admission"),
+                None,
+            ),
+        }),
+        // One routed principal whose workflow collection is deliberately *not* the one the
+        // knowledge face serves, and one admitted principal with no workflow route at all: under a
+        // route-derived destination both copies would land where `knowledge.get` never reads.
+        workflow_routes: BTreeMap::from([(
+            "peer-owner".to_string(),
+            KnowledgeScope::new("workflow-only"),
+        )]),
+        ..faces(manifest)
+    }
+}
+
+fn adopt_payload(entry_id: &str, key: &str) -> Value {
+    json!({
+        "source_scope_id": "spc_shared",
+        "source_entry_id": entry_id,
+        "source_revision": 1,
+        "destination_scope_id": SCOPE_ID,
+        "idempotency_key": key,
+    })
+}
+
+/// An adopted copy lands in the collection `knowledge.get` serves for the same admitted peer: two
+/// principals adopt into that one collection, both copies read back through the knowledge face, and
+/// a principal with knowledge admission but no workflow route adopts too. Without this, a copy could
+/// be written into a collection no knowledge-face read ever reaches.
+#[tokio::test]
+async fn an_adopted_copy_is_readable_through_the_knowledge_face_by_its_own_principal() {
+    let fixture = Fixture::open().await;
+    let store = ScopedKnowledgeStore::new(fixture.store.pool(), KnowledgeScope::new("shared"));
+    for entry_id in ["ke_owner", "ke_second"] {
+        expect_ok(
+            store
+                .put_knowledge_entry(
+                    serde_json::from_value(json!({
+                        "schema_version": 1,
+                        "entry_id": entry_id,
+                        "entry_type": "note",
+                        "canonical_name": format!("{entry_id} source"),
+                        "status": "confirmed",
+                        "body": { "summary": format!("{entry_id} summary") },
+                        "extensions": {},
+                    }))
+                    .expect("entry JSON matches the schema"),
+                    None,
+                )
+                .await,
+            "seed the shared source",
+        );
+    }
+    let surface = expect_ok(
+        fixture
+            .serve()
+            .surface(two_principal_faces(metadata("runtime"))),
+        "assemble a two-principal adopting surface",
+    );
+    let adoption = surface.ports.as_adoption().expect("adoption face composed");
+    let face = surface
+        .ports
+        .as_knowledge()
+        .expect("knowledge face composed");
+    let admitted = scope_of(SCOPE_ID);
+
+    for (peer, entry_id) in [("peer-owner", "ke_owner"), ("peer-second", "ke_second")] {
+        let adopted = expect_ok(
+            adoption
+                .invoke(peer, KNOWLEDGE_OP_ADOPT, adopt_payload(entry_id, peer))
+                .await,
+            "adopt",
+        );
+        assert_eq!(adopted["outcome"], "adopted", "{adopted}");
+
+        let read = expect_ok(
+            face.store
+                .get_scoped_knowledge_entry(&admitted, entry_id)
+                .await,
+            "read the copy back through the knowledge face",
+        );
+        assert_eq!(read.entry_id, entry_id, "{read:?}");
+        assert_eq!(
+            read.adoption_anchor
+                .as_ref()
+                .map(|anchor| anchor.source_scope_id.as_str()),
+            Some("spc_shared"),
+            "the knowledge face serves the adopted copy: {read:?}"
+        );
+    }
 }

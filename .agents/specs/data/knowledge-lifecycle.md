@@ -94,7 +94,7 @@ behavior over the two ports it is given.
   `revision`, `created_at` and `updated_at` are left for the store to assign.
 - **Governance is inherited, not reset.** The copy keeps the source's `owner` and `disclosure`.
   The contract resets them to the destination's; Mindcore defines no destination governance, because
-  the destination is a principal's whole route collection — the access boundary itself — and the
+  the destination is the collection the knowledge face serves — the access boundary itself — and the
   served face refuses every source the viewpoint-free predicate does not see. An inherited policy
   therefore cannot disclose anything the admitted principal could not already read. This is a
   recorded deviation, not an open task.
@@ -148,7 +148,7 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 - The disclosure predicate is unchanged: a hidden entry, or a retired one read through the ordinary reads and lists, is one generic local absence. The explicit lifecycle read and revision replay still see a retired entry (§ Retirement). The served face's read and prune denials are `.agents/specs/architecture/serving-seam.md`'s.
 - The current-row read, the header read, the default list and the scoped put keep their statement counts; the filter is an added predicate.
 - A retired row and its history are never deleted; no committed cognition record is rewritten.
-- The CAS compares the stored revision **column** against the caller's expectation; the marking path additionally refuses a column/payload disagreement before writing, while the full put never decodes the stored payload and therefore cannot detect that drift.
+- The CAS compares the stored revision **column** against the caller's expectation; the marking path additionally refuses a column/payload disagreement before writing, while the full put decodes the stored payload for the anchor gate but never compares that payload's revision with the revision column, so it cannot detect that drift.
 
 ## Where it lives
 
