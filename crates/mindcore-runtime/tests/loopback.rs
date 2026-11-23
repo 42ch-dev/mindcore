@@ -32,15 +32,16 @@ use mindcore_spi::{
 };
 use mindcore_spoke::{ServedMemory, TransferService};
 use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
-use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
+use spoke_connect::core::{derive_peer_id_from_ed25519_pubkey, CAPABILITY_SPOKE_JUDGMENT};
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
     ConnectResponderOptions, KnowledgeAdmission, MemoryAdmission, RemoteAdapter,
     RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
 };
 use spoke_operations::{
-    revision_snapshots_equal_canonical, spoke_ok, spoke_reject, AdoptionPort, HistoryPort,
-    KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
+    revision_snapshots_equal_canonical, spoke_ok, spoke_reject, validate_judgment, AdoptionPort,
+    HistoryPort, KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode,
+    SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::knowledge_entry::{KnowledgeEntryDisclosure, KnowledgeEntryOwner};
@@ -449,9 +450,13 @@ impl Reasoner for NoChangeReasoner {
     }
 }
 
+/// The rationale the settling reasoner states, so a test can restate the verdict without
+/// changing the branch.
+const SETTLING_RATIONALE: &str = "the cited record carries the north gate state";
+
 /// The host's reasoner when a deliberation must write: one promotion over the evidence, so the
 /// settlement policy's `AutoSettle` appends a cognition record to the routed carrier.
-struct SettlingReasoner;
+struct SettlingReasoner(&'static str);
 
 #[async_trait]
 impl Reasoner for SettlingReasoner {
@@ -471,7 +476,7 @@ impl Reasoner for SettlingReasoner {
         );
         Ok(json!({
             "recommendation": { "kind": "promote", "target_kind": "belief" },
-            "rationale": "the cited record carries the north gate state",
+            "rationale": self.0,
             "evidence_ids": ["ev_gate"],
             "record_ids": ["rec_north_gate"],
             "record": {
@@ -505,6 +510,22 @@ impl PolicyHook for AutoPolicy {
         _draft: SettlementDraft<'_>,
     ) -> Result<PolicyDecision, SpiError> {
         Ok(PolicyDecision::AutoSettle)
+    }
+}
+
+/// The host's settlement policy that holds every valid draft: a promotion reaches `needs_review`
+/// and writes nothing.
+struct HoldingPolicy;
+
+#[async_trait]
+impl PolicyHook for HoldingPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::RequireHumanReview {
+            reason: "the host withholds automatic settlement".to_string(),
+        })
     }
 }
 
@@ -964,7 +985,8 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
 }
 
 /// A remote consumer reaches the carrier: `deliberate` reads the real memory page and the real
-/// carrier entry through the composed surface and returns the reasoner's validated verdict.
+/// carrier entry through the composed surface and returns the reasoner's validated verdict beside
+/// a judgment the released validator accepts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_consumer_deliberates_through_the_composed_surface() {
     let fixture = Fixture::open().await;
@@ -1000,6 +1022,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
         "the evidence carries nothing the carrier does not already hold"
     );
     assert_eq!(result["verdict"]["record_ids"], json!(["rec_north_gate"]));
+    assert_judgment(&result, "mindcore:no_change");
     let revision: i64 = sqlx::query_scalar(
         "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
     )
@@ -1011,6 +1034,264 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     assert_eq!(
         revision, 1,
         "a no_change verdict leaves the carrier untouched"
+    );
+}
+
+/// A judgment's identity as the served response carries it.
+fn judgment_id(response: &Value) -> &str {
+    response["judgment"]["judgment_id"]
+        .as_str()
+        .expect("the served judgment carries its id")
+}
+
+/// One signed session serving `deliberate` over a fresh fixture: the seeded rows give every call
+/// the same attempt content, so the calls differ only in what the host's policy does.
+async fn deliberation_session(
+    rationale: &'static str,
+    policy: Arc<dyn PolicyHook>,
+) -> (TempDir, MindcoreServe, Session) {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    let (dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders {
+                reasoner: Some(Arc::new(SettlingReasoner(rationale))),
+                policy_hook: Some(policy),
+                ..MindProviders::default()
+            },
+            routes(&[PRINCIPAL]),
+        ),
+    );
+    let session = connect(&surface, &[DELIBERATE]).await;
+    (dir, serve, session)
+}
+
+/// The judgment identity is the attempt content, not the clock: equal content answers an equal id
+/// on a repeated call, while another verdict or another branch answers another id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deliberation_judgment_identity_follows_the_attempt_content() {
+    let (_held_dir, _held_serve, held) =
+        deliberation_session(SETTLING_RATIONALE, Arc::new(HoldingPolicy)).await;
+    let first = expect_ok(
+        held.adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the first served deliberation",
+    );
+    let again = expect_ok(
+        held.adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the same served deliberation again",
+    );
+    assert_eq!(first["status"], "needs_review");
+    assert_eq!(again["status"], "needs_review");
+    assert_eq!(
+        judgment_id(&first),
+        judgment_id(&again),
+        "equal attempt content answers the same judgment identity: {first} / {again}"
+    );
+
+    // A second store answers the same attempt content: nothing the store generates — the draft's
+    // own record id, the carrier revision, the clock — reaches the identity.
+    let (_peer_dir, _peer_serve, peer) =
+        deliberation_session(SETTLING_RATIONALE, Arc::new(HoldingPolicy)).await;
+    let peer = expect_ok(
+        peer.adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the same deliberation over another store",
+    );
+    assert_eq!(peer["status"], "needs_review");
+    assert_eq!(
+        judgment_id(&peer),
+        judgment_id(&first),
+        "equal attempt content answers the same identity over another store: {peer} / {first}"
+    );
+
+    let (_settled_dir, _settled_serve, settled) =
+        deliberation_session(SETTLING_RATIONALE, Arc::new(AutoPolicy)).await;
+    let settled = expect_ok(
+        settled
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the settling served deliberation",
+    );
+    assert_eq!(settled["status"], "settled");
+    assert_ne!(
+        judgment_id(&settled),
+        judgment_id(&first),
+        "the same verdict on another branch answers another identity: {settled} / {first}"
+    );
+
+    let (_restated_dir, _restated_serve, restated) = deliberation_session(
+        "the cited record leaves the north gate undecided",
+        Arc::new(HoldingPolicy),
+    )
+    .await;
+    let restated = expect_ok(
+        restated
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the restated served deliberation",
+    );
+    assert_eq!(restated["status"], "needs_review");
+    assert_ne!(
+        judgment_id(&restated),
+        judgment_id(&first),
+        "another verdict on the same branch answers another identity: {restated} / {first}"
+    );
+}
+
+/// The `needs_review` branch over a signed session: the host's holding policy keeps the promotion
+/// as a draft, so the response carries `draft` and writes nothing, beside the same valid judgment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let providers = MindProviders {
+        reasoner: Some(Arc::new(SettlingReasoner(SETTLING_RATIONALE))),
+        policy_hook: Some(Arc::new(HoldingPolicy)),
+        ..MindProviders::default()
+    };
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
+    );
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the served deliberate tool under a holding policy",
+    );
+
+    assert_eq!(result["status"], "needs_review");
+    assert_eq!(
+        result["verdict"]["recommendation"],
+        json!({ "kind": "promote", "target_kind": "belief" }),
+        "the held verdict keeps the reasoner's recommendation: {result}"
+    );
+    assert_eq!(result["verdict"]["rationale"], SETTLING_RATIONALE);
+    assert_eq!(result["verdict"]["evidence_ids"], json!(["ev_gate"]));
+    assert_eq!(result["verdict"]["record_ids"], json!(["rec_north_gate"]));
+    assert_eq!(result["draft"]["kind"], "belief");
+    assert!(
+        result.get("record").is_none(),
+        "a held draft settles nothing: {result}"
+    );
+    assert_judgment(&result, "mindcore:needs_review");
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION, CARRIER).await,
+        1,
+        "a needs_review verdict writes no cognition record"
+    );
+}
+
+/// The `settled` branch over a signed session: the host's policy settles the promotion, so the
+/// response carries `record` and `mind_state_version` beside the same valid judgment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let providers = MindProviders {
+        reasoner: Some(Arc::new(SettlingReasoner(SETTLING_RATIONALE))),
+        policy_hook: Some(Arc::new(AutoPolicy)),
+        ..MindProviders::default()
+    };
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
+    );
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the served deliberate tool under an automatic policy",
+    );
+
+    assert_eq!(result["status"], "settled");
+    assert_eq!(
+        result["verdict"]["recommendation"],
+        json!({ "kind": "promote", "target_kind": "belief" }),
+        "the settled verdict keeps the reasoner's recommendation: {result}"
+    );
+    assert_eq!(result["verdict"]["rationale"], SETTLING_RATIONALE);
+    assert_eq!(result["verdict"]["evidence_ids"], json!(["ev_gate"]));
+    assert_eq!(result["verdict"]["record_ids"], json!(["rec_north_gate"]));
+    assert_eq!(result["record"]["assessor"]["id"], PRINCIPAL);
+    assert_eq!(result["mind_state_version"], 2);
+    assert_judgment(&result, "mindcore:settled");
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION, CARRIER).await,
+        2,
+        "the settled branch commits the cognition record"
+    );
+}
+
+/// One deliberation response's judgment, held to the additive contract on every branch: the
+/// released validator accepts the wire value, it carries the request target and the cited record's
+/// stored revision, its outcome follows the response branch and its basis is the verdict rationale.
+fn assert_judgment(response: &Value, outcome: &str) {
+    let judgment = &response["judgment"];
+    expect_ok(
+        validate_judgment(judgment),
+        "the released validator accepts the served judgment",
+    );
+    assert!(
+        judgment["judgment_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("jd_")),
+        "the judgment carries its deterministic identity: {judgment}"
+    );
+    assert_eq!(judgment["judgment_kind"], "mindcore:deliberate");
+    assert_eq!(
+        judgment["target"],
+        json!({ "kind": "proposition", "id": "prop_north_gate", "namespace": "mindcore" }),
+        "the judgment carries the request target and no revision: {judgment}"
+    );
+    assert_eq!(
+        judgment["evidence"],
+        json!([{
+            "kind": "memory_record",
+            "namespace": "mindcore",
+            "id": "rec_north_gate",
+            "revision": 1,
+        }]),
+        "the evidence pins the cited record's stored revision: {judgment}"
+    );
+    assert_eq!(
+        judgment["verdict"]["outcome"], outcome,
+        "the outcome follows the response branch: {judgment}"
+    );
+    assert!(
+        judgment["verdict"].get("confidence").is_none(),
+        "no confidence is invented: {judgment}"
+    );
+    assert_eq!(
+        judgment["basis"], response["verdict"]["rationale"],
+        "the basis is the verdict's rationale: {judgment}"
+    );
+    assert!(
+        judgment["created_at"]
+            .as_str()
+            .is_some_and(|stamp| stamp.len() >= 20 && stamp.ends_with('Z')),
+        "created_at is a UTC RFC 3339 instant: {judgment}"
     );
 }
 
@@ -1040,7 +1321,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         hello("runtime", &[]),
         None,
         MindProviders {
-            reasoner: Some(Arc::new(SettlingReasoner)),
+            reasoner: Some(Arc::new(SettlingReasoner(SETTLING_RATIONALE))),
             policy_hook: Some(Arc::new(AutoPolicy)),
             ..MindProviders::default()
         },
@@ -1602,6 +1883,11 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
     assert!(
         !capabilities(&surface).contains(&DELIBERATE),
         "an unwired deliberation route is never advertised: {:?}",
+        capabilities(&surface)
+    );
+    assert!(
+        !capabilities(&surface).contains(&CAPABILITY_SPOKE_JUDGMENT),
+        "no `deliberate` registration, so no judgment family is advertised: {:?}",
         capabilities(&surface)
     );
 

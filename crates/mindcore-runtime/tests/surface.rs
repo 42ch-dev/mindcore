@@ -14,7 +14,9 @@ use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
-use spoke_connect::core::{CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION};
+use spoke_connect::core::{
+    CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_JUDGMENT, CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION,
+};
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
     MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler, KNOWLEDGE_OP_ADOPT,
@@ -234,10 +236,16 @@ async fn manifest_follows_the_composed_faces() {
         [
             "spoke-knowledge",
             "ke-ownership",
+            CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
             DELIBERATE
         ]
+    );
+    assert!(
+        capabilities(&surface).contains(&CAPABILITY_SPOKE_JUDGMENT),
+        "the wire map registers `deliberate`, so its judgment family is advertised: {:?}",
+        capabilities(&surface)
     );
     let tools: Vec<&str> = surface
         .manifest
@@ -289,6 +297,7 @@ async fn manifest_follows_the_composed_faces() {
             "spoke-knowledge",
             "ke-ownership",
             CAPABILITY_SPOKE_HISTORY,
+            CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
             DELIBERATE
@@ -321,6 +330,7 @@ async fn manifest_follows_the_composed_faces() {
             "spoke-knowledge",
             "ke-ownership",
             CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION,
+            CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
             DELIBERATE
@@ -580,6 +590,7 @@ async fn attached_memory_service_is_advertised_and_served() {
             "spoke-knowledge",
             "ke-ownership",
             "spoke-memory",
+            CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
             DELIBERATE
@@ -663,6 +674,7 @@ async fn tool_registrations_drive_advertisement_and_installation() {
         [
             "spoke-knowledge",
             "ke-ownership",
+            CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
             DELIBERATE,

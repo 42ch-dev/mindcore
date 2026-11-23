@@ -20,8 +20,9 @@ use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows}
 use mindcore_spoke::{MemoryWorkflowBinding, ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::{validate_admission_scope, vectors, MindStore, RoutedKnowledgeStore};
 use spoke_connect::core::{
-    CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_KNOWLEDGE,
-    CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION, CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
+    CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_JUDGMENT,
+    CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION, CAPABILITY_SPOKE_MEMORY,
+    CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
     AdoptionAdmission, AdoptionPortService, ConnectResponder, HistoryAdmission, HistoryPortService,
@@ -434,6 +435,16 @@ fn derive_manifest(
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
     manifest.capabilities = face_capabilities(memory, history, adoption);
+    if tools
+        .iter()
+        .any(|tool| tool.descriptor.capability_id.as_str() == tools::DELIBERATE)
+    {
+        // `spoke-judgment` gates no op: it is advertised exactly when the tool that carries a
+        // `Judgment` is registered, and never stands in for one.
+        manifest
+            .capabilities
+            .push(CAPABILITY_SPOKE_JUDGMENT.to_string());
+    }
     for tool in tools {
         manifest
             .capabilities

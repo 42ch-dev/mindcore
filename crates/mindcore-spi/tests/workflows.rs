@@ -18,7 +18,7 @@ use mindcore_spi::{
     SettledRevision, SettlementDraft, SnapshotFact, SpiError, SpiMindWorkflows,
     StructuredReasonRequest, WorkflowBinding,
 };
-use spoke_operations::SpokeRejectCode;
+use spoke_operations::{validate_judgment_typed, SpokeRejectCode};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::{
     KnowledgeEntry, MemoryCandidate, MemoryCandidatesDismissRequest, MemoryCandidatesReviewRequest,
@@ -2434,9 +2434,15 @@ struct DeliberateDouble {
 
 impl DeliberateDouble {
     fn new() -> Self {
+        Self::serving(3)
+    }
+
+    /// One double whose single served record carries `revision`, so a test can
+    /// hand the projection a stored revision the judgment wire cannot carry.
+    fn serving(revision: u64) -> Self {
         Self {
             snapshot: DeliberateSnapshot {
-                records: vec![record("rec_gate", "the north gate is closed", 3)],
+                records: vec![record("rec_gate", "the north gate is closed", revision)],
                 cognition: Vec::new(),
                 carrier_revision: 1,
             },
@@ -2710,6 +2716,21 @@ impl PolicyHook for AutoPolicy {
     }
 }
 
+/// Holds every cognition draft for human review.
+struct HoldingPolicy;
+
+#[async_trait]
+impl PolicyHook for HoldingPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::RequireHumanReview {
+            reason: "a human must read this one".to_string(),
+        })
+    }
+}
+
 /// Records the validated draft it was handed, then refuses an ADR promotion.
 struct RefusingAdrLens(Arc<Mutex<Option<String>>>);
 
@@ -2815,12 +2836,37 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
     let DeliberateOutcome::Settled {
         record,
         mind_state_version,
+        judgment,
         ..
     } = outcome
     else {
         panic!("expected a settlement, got {outcome:?}");
     };
     assert_eq!(mind_state_version, 2);
+    assert!(
+        validate_judgment_typed(&judgment).is_ok(),
+        "a returned judgment always passes the released validator"
+    );
+    let wire = serde_json::to_value(&judgment).expect("judgment serializes");
+    assert_eq!(wire["verdict"]["outcome"], json!("mindcore:settled"));
+    assert_eq!(
+        wire["target"],
+        json!({
+            "kind": "proposition",
+            "id": "prop_gate_closed",
+            "namespace": "mindcore",
+        })
+    );
+    assert_eq!(
+        wire["evidence"],
+        json!([{
+            "kind": "memory_record",
+            "namespace": "mindcore",
+            "id": "rec_gate",
+            "revision": 3,
+        }]),
+        "the evidence pins the revisions the snapshot served"
+    );
     let settled = settlements.lock().expect("settlements");
     assert_eq!(settled.len(), 1);
     let stored = &settled[0];
@@ -3458,8 +3504,140 @@ async fn deliberate_none_recommendation_writes_nothing() {
         .await
         .expect("deliberate");
 
-    assert!(matches!(outcome, DeliberateOutcome::NoChange { .. }));
+    let DeliberateOutcome::NoChange { judgment, .. } = outcome else {
+        panic!("expected no change, got {outcome:?}");
+    };
+    assert!(
+        validate_judgment_typed(&judgment).is_ok(),
+        "an uncited judgment still validates"
+    );
+    let wire = serde_json::to_value(&judgment).expect("judgment serializes");
+    assert_eq!(wire["verdict"]["outcome"], json!("mindcore:no_change"));
+    assert_eq!(
+        wire["evidence"],
+        json!([]),
+        "no record is cited, so the evidence is empty rather than invented"
+    );
     assert!(settlements.lock().expect("settlements").is_empty());
+}
+
+#[tokio::test]
+async fn deliberate_needs_review_carries_the_pending_judgment_and_writes_nothing() {
+    let binding = DeliberateDouble::new();
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = HoldingPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        assessment_context_id: None,
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("deliberate");
+
+    let DeliberateOutcome::NeedsReview { judgment, .. } = outcome else {
+        panic!("expected a held draft, got {outcome:?}");
+    };
+    assert!(
+        validate_judgment_typed(&judgment).is_ok(),
+        "a held judgment always passes the released validator"
+    );
+    let wire = serde_json::to_value(&judgment).expect("judgment serializes");
+    assert_eq!(wire["verdict"]["outcome"], json!("mindcore:needs_review"));
+    assert_eq!(
+        wire["evidence"],
+        json!([{
+            "kind": "memory_record",
+            "namespace": "mindcore",
+            "id": "rec_gate",
+            "revision": 3,
+        }])
+    );
+    assert!(
+        settlements.lock().expect("settlements").is_empty(),
+        "a held judgment commits nothing"
+    );
+}
+
+/// A cited revision above the judgment wire's `2^53 - 1` integer ceiling is
+/// one the page can serve and the released validator refuses. On an
+/// auto-settle branch that refusal must land before `commit_cognition`: the
+/// double records the settlement and answers success, so a misordered call
+/// would still answer this projection refusal, and only the empty settlement
+/// log below would catch it.
+#[tokio::test]
+async fn deliberate_refuses_a_cited_revision_the_released_validator_rejects() {
+    let binding = DeliberateDouble::serving(u64::pow(2, 53));
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        assessment_context_id: None,
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("a judgment the validator refuses is never returned");
+
+    let SpiError::Settlement(reject) = &error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind")),
+        Some(&json!("judgment_projection"))
+    );
+    assert!(
+        settlements.lock().expect("settlements").is_empty(),
+        "the projection refusal lands before the commit"
+    );
 }
 
 #[tokio::test]
