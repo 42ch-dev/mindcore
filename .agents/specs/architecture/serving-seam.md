@@ -50,7 +50,7 @@ Coverage is `knowledge_entry` alone, because the store keeps no relation revisio
 
 Prune is deduplicated by Connect's recorded-outcome store, keyed by `(op, effective scope, requester principal id, idempotency_key)` and holding the request digest plus the settled outcome. Both services keep the released in-memory default. That default bounds **live outcome records** only — 1024 by default — and an evicted key leaves a tombstone so a same-key replay answers `RECEIPT_EXPIRED` instead of re-executing; tombstones are never evicted, so the store's memory grows with the number of distinct evicted keys. The store belongs to one `HistoryPortService`, so its records and tombstones live for exactly that service instance: `MindcoreServe::surface` builds a new service per assembled surface, so a reassembly in the same process starts with no record and no tombstone, exactly as a restart does. Connect's standalone `HistoryPortService::with_dedup_store` accepts a durable store, but that builder is not an injection point into this runtime: `MindcoreServe::surface` constructs `HistoryPortService::new` itself and `ServeFaces` exposes no dedup store and no history service, so every host of this surface serves the in-memory default.
 
-**Dedup consequence:** the default does not outlive the service instance, so a prune whose outcome was lost to a crash — or to a reassembled surface — can be re-executed by a same-key retry after new checkpoints exist, deleting checkpoints the original call never saw — permanent data loss. A durable store narrows that exposure without closing it: Connect records the settled outcome only after the port returns, while the SQLite prune commits inside the port, so a crash between commit and record leaves a committed prune with no record, and a same-key retry executes it again. No dedup store on either side removes that window, and this surface offers no way to inject one. Adoption has no equivalent permanent-loss replay path: when the source read succeeds and the destination already holds the copy, its create-only CAS and anchor repeat rules make a retried copy answer `already_present` or `REVISION_CONFLICT` and write nothing, so replaying an adoption whose outcome was lost is safe. `I-000096` tracks the durable store as a medium-severity residual for the upstream builder.
+**Dedup consequence:** the default does not outlive the service instance, so a prune whose outcome was lost to a crash — or to a reassembled surface — can be re-executed by a same-key retry after new checkpoints exist, deleting checkpoints the original call never saw — permanent data loss. A durable store narrows that exposure without closing it: Connect records the settled outcome only after the port returns, while the SQLite prune commits inside the port, so a crash between commit and record leaves a committed prune with no record, and a same-key retry executes it again. No dedup store on either side removes that window, and this surface offers no way to inject one. Adoption has no equivalent permanent-loss replay path, but it is not a guaranteed no-write repeat either. While the source still resolves to the terminal the first call copied and the destination already holds the copy, the create-only CAS and the anchor rules make the retry answer `already_present` or `REVISION_CONFLICT` and write nothing. After a reassembly dropped the record, a source since retired to a different terminal resolves the same request to that new terminal; with `destination_entry_id` omitted the copy is then addressed by the new terminal's id, so the retry writes a second copy. The original copy stays intact and nothing is lost — the repeat is simply not guaranteed to write nothing once the terminal changed and no destination id was supplied. `I-000096` tracks the durable store as a medium-severity residual for the upstream builder.
 
 ### Workflow tools
 
@@ -130,12 +130,14 @@ destination.
 
 **Terminal anchor.** The requested source resolves through `spoke_operations::resolve_retirement_chain`
 inside the same transaction before anything is read for the copy: a live source resolves to itself,
-and a retired source resolves to the first live entry along its markers, so the copy and its anchor
-both name that terminal's `(source_scope_id, source_entry_id, source_revision)`. A chain that cannot
-resolve — a cycle, an ambiguous merge, a missing hop, more than the resolver's 32 edges — answers
-`SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order. A retired source's
-requested revision is not compared, because the anchor records the terminal's own revision; a live
-source that moved off the requested revision answers `REVISION_CONFLICT` with no details.
+and a retired source resolves to the first live entry along its markers, so the copy's
+`adoption_anchor` names that terminal's `(source_scope_id, source_entry_id, source_revision)` while
+the copy's own `entry_id` is `destination_entry_id` when supplied and the terminal's id otherwise.
+A chain that cannot resolve — a cycle, an ambiguous merge, a missing hop, more than the resolver's
+32 edges — answers `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order. A
+retired source's requested revision is not compared, because the anchor records the terminal's own
+revision; a live source that moved off the requested revision answers `REVISION_CONFLICT` with no
+details.
 
 **Copy and inherited governance.** `body`, `canonical_name`, `entry_type` and `status` come from the
 terminal; `modules` loses `cognition` rather than keeping an emptied envelope; `source_anchor` stays

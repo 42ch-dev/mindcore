@@ -17,7 +17,8 @@
   equal to `ServeFaces.scope_id`. Two behaviour changes: adoption admits through the knowledge
   face's `(principals, knowledge_admission)` pair, so a routed principal that face does not admit
   answers `NOT_AUTHORIZED` where the product tool served it; and the source resolves through
-  `resolve_retirement_chain` before the copy, so the anchor and the copy name the live terminal, a
+  `resolve_retirement_chain` before the copy, so the anchor names the live terminal (the copy's own
+  entry id is the supplied `destination_entry_id` or, when absent, that terminal's id), a
   live source that moved off `source_revision` is `REVISION_CONFLICT` with no details, and a chain
   that cannot resolve is `SOURCE_RETIRED` with `details.retirement_chain`. The local refusal
   vocabulary is the protocol's — `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT` with

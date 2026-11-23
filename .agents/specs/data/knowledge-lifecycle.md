@@ -105,12 +105,12 @@ source this function sees is already the terminal.
 - An adoption anchor naming a retired entry resolves to the first live entry along the chain. A hidden or missing hop answers the generic absence keyed by the anchor's original id; a cycle is `InternalError`.
 - A retired carrier has no current judgment: the current-record lookup joins the live predicate, while explicit historical reads and revision replay stay available.
 - Adoption never copies a retired row: the served face resolves the requested source to the first
-  live entry along the chain and copies that terminal, so the copy's anchor and stored entry both
-  name a live row. A chain that cannot resolve — a cycle, an ambiguous merge, a missing hop, more
-  than 32 edges — answers `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in
-  order, and writes nothing. A live source that has moved off the requested revision since is
-  `REVISION_CONFLICT`, never a silent copy of the newer state; an existing copy keeps its original
-  provenance.
+  live entry along the chain and copies that terminal, so the copy's anchor names a live row — and
+  its stored `entry_id` is that terminal's id only when `destination_entry_id` was omitted. A chain
+  that cannot resolve — a cycle, an ambiguous merge, a missing hop, more than 32 edges — answers
+  `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order, and writes nothing. A
+  live source that has moved off the requested revision since is `REVISION_CONFLICT`, never a silent
+  copy of the newer state; an existing copy keeps its original provenance.
 
 ### Shared scope rehearsal
 
