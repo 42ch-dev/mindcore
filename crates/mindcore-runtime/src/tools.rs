@@ -353,21 +353,30 @@ fn absorb_outcome(outcome: AbsorbCandidateOutcome) -> Value {
 
 fn deliberate_outcome(outcome: DeliberateOutcome) -> Value {
     match outcome {
-        DeliberateOutcome::NoChange { verdict } => {
-            json!({ "status": "no_change", "verdict": verdict })
+        DeliberateOutcome::NoChange { verdict, judgment } => {
+            json!({ "status": "no_change", "verdict": verdict, "judgment": judgment })
         }
-        DeliberateOutcome::NeedsReview { verdict, draft } => {
-            json!({ "status": "needs_review", "verdict": verdict, "draft": draft })
-        }
+        DeliberateOutcome::NeedsReview {
+            verdict,
+            draft,
+            judgment,
+        } => json!({
+            "status": "needs_review",
+            "verdict": verdict,
+            "draft": draft,
+            "judgment": judgment,
+        }),
         DeliberateOutcome::Settled {
             verdict,
             record,
             mind_state_version,
+            judgment,
         } => json!({
             "status": "settled",
             "verdict": verdict,
             "record": record,
             "mind_state_version": mind_state_version,
+            "judgment": judgment,
         }),
     }
 }
@@ -907,7 +916,7 @@ fn deliberate_output() -> Value {
             {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["status", "verdict"],
+                "required": ["status", "verdict", "judgment"],
                 "properties": {
                     "status": { "const": "no_change" },
                     "verdict": {
@@ -915,12 +924,17 @@ fn deliberate_output() -> Value {
                         "additionalProperties": {},
                         "description": "The validated reasoner verdict.",
                     },
+                    "judgment": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The SPOKE Judgment of this deliberation (spoke-judgment)",
+                    },
                 },
             },
             {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["status", "verdict", "draft"],
+                "required": ["status", "verdict", "draft", "judgment"],
                 "properties": {
                     "status": { "const": "needs_review" },
                     "verdict": {
@@ -933,12 +947,23 @@ fn deliberate_output() -> Value {
                         "additionalProperties": {},
                         "description": "The pinned SPOKE CognitionRecord under review.",
                     },
+                    "judgment": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The SPOKE Judgment of this deliberation (spoke-judgment)",
+                    },
                 },
             },
             {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["status", "verdict", "record", "mind_state_version"],
+                "required": [
+                    "status",
+                    "verdict",
+                    "record",
+                    "mind_state_version",
+                    "judgment",
+                ],
                 "properties": {
                     "status": { "const": "settled" },
                     "verdict": {
@@ -952,6 +977,11 @@ fn deliberate_output() -> Value {
                         "description": "The pinned SPOKE CognitionRecord the carrier holds.",
                     },
                     "mind_state_version": { "type": "integer", "minimum": 0 },
+                    "judgment": {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The SPOKE Judgment of this deliberation (spoke-judgment)",
+                    },
                 },
             },
         ],

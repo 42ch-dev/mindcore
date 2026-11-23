@@ -14,7 +14,7 @@ use mindcore_spi::{
     MindCapabilities, MindWorkflows, SpiError,
 };
 use spoke_operations::{spoke_reject, validate_tool_arguments};
-use spoke_schemas::{CognitionRecord, KnowledgeEntry, RetainedRecord};
+use spoke_schemas::{CognitionRecord, Judgment, KnowledgeEntry, RetainedRecord};
 
 use super::*;
 
@@ -218,6 +218,34 @@ fn cognition() -> CognitionRecord {
     .expect("cognition record JSON matches the schema")
 }
 
+/// One validated `spoke-judgment` projection, as the workflow emits it.
+fn judgment() -> Judgment {
+    serde_json::from_value(json!({
+        "schema_version": 1,
+        "judgment_id": "jd_test",
+        "judgment_kind": "mindcore:deliberate",
+        "target": {
+            "kind": "proposition",
+            "id": "prop_gate_closed",
+            "namespace": "mindcore"
+        },
+        "evidence": [{
+            "kind": "memory_record",
+            "namespace": "mindcore",
+            "id": "rec_1",
+            "revision": 3
+        }],
+        "verdict": {
+            "outcome": "mindcore:settled",
+            "detail": { "recommendation": { "kind": "promote" } }
+        },
+        "basis": "the gate test passed on the supplied evidence",
+        "created_at": "2026-11-24T00:00:00Z",
+        "extensions": {}
+    }))
+    .expect("judgment JSON matches the schema")
+}
+
 fn recall_arguments() -> Value {
     json!({
         "request": {
@@ -350,6 +378,7 @@ async fn deliberate_round_trips_every_outcome_branch() {
 
     fake.reply_deliberate(Ok(DeliberateOutcome::NoChange {
         verdict: json!({ "recommendation": { "kind": "none" } }),
+        judgment: judgment(),
     }));
     let value = expect_ok(
         tool.call(DELIBERATE, "peer-driver", deliberate_arguments())
@@ -358,16 +387,22 @@ async fn deliberate_round_trips_every_outcome_branch() {
     );
     assert_eq!(value["status"], "no_change");
     assert_eq!(value["verdict"]["recommendation"]["kind"], "none");
+    assert_eq!(value["judgment"]["judgment_id"], "jd_test");
     assert!(value.get("draft").is_none(), "no draft is written");
     let output = output_of(&tool, DELIBERATE);
     assert!(
         accepts(&output, &output, &value),
         "a no_change outcome matches its advertised branch: {value}"
     );
+    assert!(
+        !accepts(&output, &output, &without_judgment(&value)),
+        "a no_change outcome carries its judgment"
+    );
 
     fake.reply_deliberate(Ok(DeliberateOutcome::NeedsReview {
         verdict: json!({ "recommendation": { "kind": "promote" } }),
         draft: cognition(),
+        judgment: judgment(),
     }));
     let value = expect_ok(
         tool.call(DELIBERATE, "peer-driver", deliberate_arguments())
@@ -381,11 +416,16 @@ async fn deliberate_round_trips_every_outcome_branch() {
         accepts(&output, &output, &value),
         "a needs_review outcome matches its advertised branch: {value}"
     );
+    assert!(
+        !accepts(&output, &output, &without_judgment(&value)),
+        "a needs_review outcome carries its judgment"
+    );
 
     fake.reply_deliberate(Ok(DeliberateOutcome::Settled {
         verdict: json!({ "recommendation": { "kind": "promote" } }),
         record: cognition(),
         mind_state_version: 3,
+        judgment: judgment(),
     }));
     let value = expect_ok(
         tool.call(DELIBERATE, "peer-driver", deliberate_arguments())
@@ -399,6 +439,10 @@ async fn deliberate_round_trips_every_outcome_branch() {
     assert!(
         accepts(&output, &output, &value),
         "a settled outcome matches its advertised branch: {value}"
+    );
+    assert!(
+        !accepts(&output, &output, &without_judgment(&value)),
+        "a settled outcome carries its judgment"
     );
     assert!(
         !accepts(
@@ -664,9 +708,10 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
                 tokens_used: 0,
             })),
             ABSORB => fake.reply_absorb(Ok(Vec::new())),
-            DELIBERATE => {
-                fake.reply_deliberate(Ok(DeliberateOutcome::NoChange { verdict: json!({}) }))
-            }
+            DELIBERATE => fake.reply_deliberate(Ok(DeliberateOutcome::NoChange {
+                verdict: json!({}),
+                judgment: judgment(),
+            })),
             other => panic!("unadvertised tool {other}"),
         }
 
@@ -740,6 +785,13 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
             .is_none(),
         "a refused member is never advertised"
     );
+}
+
+/// The same response with the required `judgment` member removed: the schema must not accept it.
+fn without_judgment(value: &Value) -> Value {
+    let mut object = value.as_object().expect("a result is an object").clone();
+    object.remove("judgment");
+    Value::Object(object)
 }
 
 /// One advertised output, resolved against itself: the result ABI a manifest-only consumer reads.
