@@ -59,12 +59,14 @@ every stored space.
 
 ## Why This Matters
 
-The planner's shape decides what a read's cost grows with, and the two reads here grow with
-different things. The visible set bounds the revision projection only: that statement costs
-what the caller can see. The listing itself is not bounded by it — the scan decodes the
-principal's whole grant history and `list_spaces` fetches every stored space before the
-caller filters — so the listing's work grows with the grant history and the stored spaces
-while its peak memory does not. The `EXISTS` and `+space_id` spellings keep the index probes
+The planner's shape decides what a read's cost grows with, and the reads here are bounded in
+different ways. The visible set bounds the revision projection only, and it bounds that
+statement's output — the `(grant_id, revision)` pairs of the visible spaces — not the walk
+over the principal's grant rows that produces them. The scan decodes the principal's whole
+grant history one row at a time, and `list_spaces` materializes every stored space before
+the caller filters, so the listing's memory is not bounded by the visible set either: the
+pair bounds only the grant side of it, one decoded grant row and the visible-id set instead
+of the whole grant history. The `EXISTS` and `+space_id` spellings keep the index probes
 proportional to one principal's rows rather than to every stored space. None of this shows
 in the SQL text's result; it shows only in the plan, so a "simpler" rewrite of either
 predicate passes every assertion and still changes the cost.
