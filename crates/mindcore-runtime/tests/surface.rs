@@ -863,10 +863,12 @@ fn two_principal_faces(manifest: HostCapabilityManifest) -> ServeFaces {
                 None,
             ),
         }),
-        // One routed principal and one admitted principal without any workflow route.
+        // One routed principal whose workflow collection is deliberately *not* the one the
+        // knowledge face serves, and one admitted principal with no workflow route at all: under a
+        // route-derived destination both copies would land where `knowledge.get` never reads.
         workflow_routes: BTreeMap::from([(
             "peer-owner".to_string(),
-            KnowledgeScope::new(COLLECTION),
+            KnowledgeScope::new("workflow-only"),
         )]),
         ..faces(manifest)
     }
