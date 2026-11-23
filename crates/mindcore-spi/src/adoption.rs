@@ -11,7 +11,9 @@
 
 use serde_json::{Map, Value};
 
-use mindcore_base::knowledge::{adoption_anchor, adoption_anchor_parts};
+use mindcore_base::knowledge::{
+    adoption_anchor, adoption_anchor_parts, adoption_fault, SERVED_REVISION_BOUND,
+};
 use spoke_operations::{
     knowledge_entry_visible_to_viewpoint, spoke_reject, KnowledgeEntryPort, SpokeReject,
     SpokeRejectCode, SpokeResult,
@@ -178,7 +180,17 @@ where
                     source_entry_id,
                     expected_source_revision,
                 ),
-                SpokeResult::Reject(_) => SpokeResult::Reject(reject),
+                SpokeResult::Reject(refusal) => match refusal.code {
+                    // The slot's occupant is not visible to this call: absence and occupancy are
+                    // the same unanswered slot claim, so both answer the occupancy refusal.
+                    SpokeRejectCode::KnowledgeEntryNotFound
+                    | SpokeRejectCode::KnowledgeEntryAlreadyExists => {
+                        occupied(destination_entry_id)
+                    }
+                    // A selection or revision refusal is the destination's own answer, and a
+                    // storage fault stays one: forwarding it keeps the refusal hygiene honest.
+                    _ => SpokeResult::Reject(refusal),
+                },
             }
         }
         SpokeResult::Reject(reject) if rejects_superseded_occupant(&reject) => {
@@ -199,7 +211,14 @@ fn classify(
     source_entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
-    match adopted_revision(&existing, source_scope_id, source_entry_id) {
+    let adopted = adopted_revision(&existing, source_scope_id, source_entry_id);
+    // The anchor's revision is the only carrier of this value onto the wire, so a stored one above
+    // the served ceiling has no conformant copy or refusal to report: refuse as a store fault
+    // rather than interpolate it.
+    if adopted.is_some_and(|adopted| adopted > SERVED_REVISION_BOUND) {
+        return SpokeResult::Reject(adoption_fault("store"));
+    }
+    match adopted {
         Some(adopted) if expected_source_revision == adopted => {
             SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing))
         }
@@ -505,6 +524,137 @@ mod tests {
                     "a same-triple race winner must answer AlreadyPresent, got {other:?} \
                      (remote refusal: {remote})"
                 ),
+            }
+        }
+    }
+
+    /// A destination that answers absence, then claims the slot on the put, then answers a fixed
+    /// refusal on the re-read: the raced occupant is invisible one step later than the race.
+    struct RacedReadRefusal {
+        refusal: SpokeRejectCode,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RacedReadRefusal {
+        fn new(refusal: SpokeRejectCode) -> Self {
+            Self {
+                refusal,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeEntryPort for RacedReadRefusal {
+        async fn get_knowledge_entry(&self, _entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+            match self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => absent_from_store(),
+                _ => spoke_reject(self.refusal, "the re-read refusal", None),
+            }
+        }
+
+        async fn put_knowledge_entry(
+            &self,
+            _entry: KnowledgeEntry,
+            _expected_base_revision: Option<u64>,
+        ) -> SpokeResult<KnowledgeEntry> {
+            spoke_reject(
+                SpokeRejectCode::KnowledgeEntryAlreadyExists,
+                "knowledge entry ke_shared_gate already exists",
+                None,
+            )
+        }
+    }
+
+    /// A re-read that refuses the caller's authority is the destination's own answer, not the put
+    /// refusal it replaced: the caller must not read a permanent selection denial as a storage
+    /// fault.
+    #[tokio::test]
+    async fn a_raced_slot_whose_reread_is_unauthorized_keeps_the_selection_refusal() {
+        match adopt_knowledge_entry(
+            &SourceAtTwo(source_at_two()),
+            &RacedReadRefusal::new(SpokeRejectCode::NotAuthorized),
+            "spc_shared",
+            "ke_shared_gate",
+            "ke_shared_gate",
+            2,
+        )
+        .await
+        {
+            SpokeResult::Reject(reject) => {
+                assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+                assert_eq!(reject.message, "the re-read refusal");
+            }
+            other => panic!("a re-read refusal must travel, got {other:?}"),
+        }
+    }
+
+    /// A re-read that fails for storage reasons keeps its own code, so the runtime's refusal
+    /// hygiene turns it into the fixed store fault rather than the put's occupancy refusal.
+    #[tokio::test]
+    async fn a_raced_slot_whose_reread_is_a_storage_fault_forwards_that_fault() {
+        match adopt_knowledge_entry(
+            &SourceAtTwo(source_at_two()),
+            &RacedReadRefusal::new(SpokeRejectCode::InternalError),
+            "spc_shared",
+            "ke_shared_gate",
+            "ke_shared_gate",
+            2,
+        )
+        .await
+        {
+            SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InternalError),
+            other => panic!("a storage fault must travel, got {other:?}"),
+        }
+    }
+
+    /// A stored anchor at the served ceiling is still a conformant conflict; one above it has no
+    /// conformant refusal to report, so the call answers the fixed store fault instead.
+    #[tokio::test]
+    async fn a_stored_adopted_revision_above_the_served_bound_is_a_store_fault() {
+        match adopt_knowledge_entry(
+            &SourceAtTwo(source_at_two()),
+            &RacedDestination::at(SERVED_REVISION_BOUND, false),
+            "spc_shared",
+            "ke_shared_gate",
+            "ke_shared_gate",
+            2,
+        )
+        .await
+        {
+            SpokeResult::Reject(reject) => {
+                assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+                assert_eq!(
+                    reject
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get(ADOPTED_REVISION_DETAIL))
+                        .and_then(Value::as_u64),
+                    Some(SERVED_REVISION_BOUND)
+                );
+            }
+            other => panic!("the ceiling itself stays a conflict, got {other:?}"),
+        }
+
+        for out_of_range in [SERVED_REVISION_BOUND + 1, u64::MAX] {
+            match adopt_knowledge_entry(
+                &SourceAtTwo(source_at_two()),
+                &RacedDestination::at(out_of_range, false),
+                "spc_shared",
+                "ke_shared_gate",
+                "ke_shared_gate",
+                2,
+            )
+            .await
+            {
+                SpokeResult::Reject(reject) => {
+                    assert_eq!(reject, adoption_fault("store"));
+                    assert!(
+                        !reject.message.contains(&out_of_range.to_string()),
+                        "the out-of-range revision is never interpolated: {reject:?}"
+                    );
+                }
+                other => panic!("an unservable stored revision must fault, got {other:?}"),
             }
         }
     }
