@@ -86,7 +86,7 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 
 - History, adoption and retirement share the existing immediate-transaction discipline: the write reservation is taken before claim state is read.
 - Pruning shares that discipline: one `BEGIN IMMEDIATE` reservation covers the entry read, the window computation, the deletes and the floor update. It writes only `history_floor_revision` on the entry row — never the revision — so the capture trigger saves no checkpoint of the prune itself. A retired entry's history is never deleted, and no cognition record or live payload is touched.
-- The disclosure predicate is unchanged: a hidden or retired entry is one generic local absence. The served face's read and prune denials are `.agents/specs/architecture/serving-seam.md`'s.
+- The disclosure predicate is unchanged: a hidden entry, or a retired one read through the ordinary reads and lists, is one generic local absence. The explicit lifecycle read and revision replay still see a retired entry (§ Retirement). The served face's read and prune denials are `.agents/specs/architecture/serving-seam.md`'s.
 - The current-row read, the header read, the default list and the scoped put keep their statement counts; the filter is an added predicate.
 - A retired row and its history are never deleted; no committed cognition record is rewritten.
 - The CAS compares the stored revision **column** against the caller's expectation; the marking path additionally refuses a column/payload disagreement before writing, while the full put never decodes the stored payload and therefore cannot detect that drift.
