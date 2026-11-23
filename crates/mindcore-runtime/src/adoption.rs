@@ -31,16 +31,13 @@ use spoke_schemas::{
 
 use crate::AdoptionRoute;
 
-/// The refusal a destination entry outside the admitted selection answers with, on both the read
-/// that classifies an existing copy and the write that would create one.
-const DESTINATION_SELECTION: &str = "adoption destination entry is outside the admitted context";
-
 /// The adoption port over one host store.
 ///
-/// `destination` is the collection the knowledge face itself serves, so an adopted copy is
-/// readable through that face's `knowledge.get`/`list` by the same admitted peer. It is not the
-/// workflow route map: that map selects a *workflow* collection per principal, and the knowledge
-/// face takes no per-principal collection.
+/// `destination` is the one collection the knowledge face itself serves, shared by every peer the
+/// host admits to that scope: the first adoption claims a slot, later adopters of the same source
+/// are served that stored copy, and every admitted peer reads it through the face's
+/// `knowledge.get`/`list`. It is not the workflow route map: that map selects a *workflow*
+/// collection per principal, and the knowledge face takes no per-principal collection.
 pub(crate) struct AdoptionService {
     pool: SqlitePool,
     destination: KnowledgeScope,
@@ -275,7 +272,9 @@ impl KnowledgeEntryPort for AdoptionSource<'_, '_, '_> {
 ///
 /// The host's configured collection is the selector; the admitted `Scope` additionally refines
 /// which entries of that collection this call may serve or write, so an entry the host admitted the
-/// scope without is neither returned nor copied.
+/// scope without is neither returned nor copied. An occupant outside that selection answers the
+/// ordinary occupancy refusal, never a distinct "not authorized": the caller learns that the slot is
+/// taken, not that an entry it cannot see exists there.
 struct AdoptionDestination<'a, 'b, 'tx> {
     collection: &'a str,
     scope: &'a Scope,
@@ -288,9 +287,12 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
         let mut gate = self.gate.lock().await;
         let entry = read_entry(&mut gate, self.collection, entry_id).await;
         match entry {
+            // An occupant outside the admitted selection answers the ordinary occupancy refusal,
+            // byte for byte the one a visible occupant gets: the caller learns occupied or free,
+            // never whether an entry it cannot see holds the slot.
             SpokeResult::Ok(entry) => match admitted_destination(&entry, self.scope) {
                 SpokeResult::Ok(true) => SpokeResult::Ok(entry),
-                SpokeResult::Ok(false) => not_authorized(DESTINATION_SELECTION),
+                SpokeResult::Ok(false) => occupied(&entry.entry_id),
                 SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
             },
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
@@ -302,9 +304,12 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
         entry: KnowledgeEntry,
         expected_base_revision: Option<u64>,
     ) -> SpokeResult<KnowledgeEntry> {
+        // A copy outside the admitted selection is not a slot this call may claim; it answers the
+        // same occupancy as an occupied slot, so a free-but-unusable slot is not distinguishable
+        // from an occupied one either.
         match admitted_destination(&entry, self.scope) {
             SpokeResult::Ok(true) => {}
-            SpokeResult::Ok(false) => return not_authorized(DESTINATION_SELECTION),
+            SpokeResult::Ok(false) => return occupied(&entry.entry_id),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
         let mut gate = self.gate.lock().await;
@@ -413,6 +418,17 @@ fn source_absent<T>() -> SpokeResult<T> {
     spoke_reject(
         SpokeRejectCode::NotFound,
         "source knowledge entry not found",
+        None,
+    )
+}
+
+/// The ordinary occupancy answer: the slot is taken, and the caller learns nothing else about its
+/// occupant. A visible occupant and one the admitted selection hides answer byte-identically, so a
+/// guessed destination id never reports whether an entry outside the caller's reach exists.
+fn occupied<T>(entry_id: &str) -> SpokeResult<T> {
+    spoke_reject(
+        SpokeRejectCode::RevisionConflict,
+        format!("knowledge entry {entry_id} already exists"),
         None,
     )
 }
@@ -878,5 +894,84 @@ mod tests {
         );
         assert_eq!(header.revision, 1);
         transaction.rollback().await.expect("roll back the read");
+    }
+
+    /// An occupied destination slot answers one occupancy whatever the admitted selection makes of
+    /// the occupant: a hidden occupant's refusal is byte-identical to a visible one's, so a guessed
+    /// destination id never reports whether an entry the caller cannot see exists. A free slot the
+    /// selection cannot claim answers the same refusal and writes nothing.
+    #[tokio::test]
+    async fn a_hidden_occupant_answers_the_same_occupancy_as_a_visible_one() {
+        let (_dir, store, service) = service().await;
+        let owner = principal("prn_owner");
+        // An occupant neither anchor names: the SPI answers the ordinary occupancy for it.
+        ok(
+            store
+                .knowledge(KnowledgeScope::new(DESTINATION_COLLECTION))
+                .put_knowledge_entry(entry("ke_source"), None)
+                .await,
+            "seed the destination occupant",
+        );
+        // The same admitted id, once with an entry-id selection that never holds the occupant.
+        let hidden: Scope = serde_json::from_value(json!({
+            "scope_id": DESTINATION_SCOPE,
+            "entry_ids": ["ke_somebody_else"],
+        }))
+        .expect("scope JSON matches the schema");
+
+        let shown = refused(
+            service
+                .adopt_knowledge_entry(&owner, &scope(DESTINATION_SCOPE), &request("ke_source", 1))
+                .await,
+            "a visible occupant",
+        );
+        let concealed = refused(
+            service
+                .adopt_knowledge_entry(&owner, &hidden, &request("ke_source", 1))
+                .await,
+            "a hidden occupant",
+        );
+        assert_eq!(shown.code, SpokeRejectCode::RevisionConflict);
+        assert!(shown.details.is_none(), "{shown:?}");
+        assert_eq!(
+            concealed, shown,
+            "a hidden occupant must not be distinguishable from a visible one"
+        );
+
+        // A free slot the selection cannot claim is not adoptable either: same refusal, no row.
+        let claimed = refused(
+            service
+                .adopt_knowledge_entry(&owner, &hidden, &request("ke_terminal", 1))
+                .await,
+            "a free slot outside the admitted selection",
+        );
+        assert_eq!(
+            claimed.code,
+            SpokeRejectCode::RevisionConflict,
+            "an unusable free slot answers the occupancy: {claimed:?}"
+        );
+        assert!(claimed.details.is_none(), "{claimed:?}");
+        assert!(
+            matches!(
+                store
+                    .knowledge(KnowledgeScope::new(DESTINATION_COLLECTION))
+                    .get_knowledge_entry("ke_terminal")
+                    .await,
+                SpokeResult::Reject(_)
+            ),
+            "the unusable slot stays free"
+        );
+
+        // The same slot under an admitting selection still creates.
+        ok(
+            service
+                .adopt_knowledge_entry(
+                    &owner,
+                    &scope(DESTINATION_SCOPE),
+                    &request("ke_terminal", 1),
+                )
+                .await,
+            "the admitting selection claims the free slot",
+        );
     }
 }

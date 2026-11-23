@@ -40,8 +40,10 @@ manifest carries it in no configuration and no handler answers it. A caller move
 The destination is no longer per-principal. `knowledge.adopt` writes the copy into the collection
 the knowledge face serves (`ServeFaces.knowledge`), not the adopting principal's `workflow_routes`
 entry, so a copy is readable through the same `knowledge.get`/`list` that admitted the adoption.
-`workflow_routes` now selects and authorizes workflow calls only, and authorizes nothing for
-adoption; a principal with knowledge admission and no workflow route adopts normally.
+That collection is one shared slot per source: the first adoption claims it, a later adoption of
+the same source answers `already_present` with the stored copy, and every peer admitted to the
+scope reads it. `workflow_routes` now selects and authorizes workflow calls only, and authorizes
+nothing for adoption; a principal with knowledge admission and no workflow route adopts normally.
 
 That destination move is a breaking assembly change. A host that set the adoption source and
 `ServeFaces.knowledge` to the same collection still assembled, because the copy went to the

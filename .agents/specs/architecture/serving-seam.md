@@ -128,10 +128,12 @@ The destination collection is `ServeFaces.knowledge` and nothing else; the admit
 `entry_ids`, `entry_types`, `source_id` and `viewpoint` refinements still apply to it, because the
 admitted scope is the host's statement about which entries of that collection the peer may reach.
 Adoption applies them to the destination entry it would return and to the copy it would write: an
-entry outside the admitted selection answers `NOT_AUTHORIZED` with no details and is neither served
-nor written, exactly as the routed knowledge face hides it. The host's configured collection selects the
-destination; the
-admitted selection narrows what the call may touch inside it.
+entry outside the admitted selection is neither served nor written, and answers the ordinary
+occupancy refusal — `REVISION_CONFLICT` with no details, byte-identical to a visible occupant's —
+so the answer tells the caller occupied or free and never whether an entry it cannot see holds the
+slot. `NOT_AUTHORIZED` is reserved for a `destination_scope_id` that is not the admitted scope. The
+host's configured collection selects the destination; the admitted selection narrows what the call
+may touch inside it.
 
 **Assembly** refuses an empty source scope id, an empty source collection, a source collection equal
 to `ServeFaces.knowledge`'s collection or to any route destination — including the route of a

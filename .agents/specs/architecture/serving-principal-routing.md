@@ -114,10 +114,12 @@ selects and how admission reaches it.
 - A served workflow's knowledge access produces no write, disclosure, revision change, entry-count
   change or knowledge-slot entry outside the collection routed to its own admitted principal.
   Adoption is the one served call that touches a second collection: it reads only the
-  host-configured source and writes only the knowledge face's own collection, so its copy is
-  readable through that face by the peer that adopted it; assembly refuses a source that is the
-  destination collection or any route destination. Read-only access beyond the routed collection is
-  otherwise not observable through the served surface and is therefore not asserted.
+  host-configured source and writes only the knowledge face's own collection, which every peer
+  admitted to that scope shares — the first adoption claims the slot, a later adoption of the same
+  source is served that stored copy, and any admitted peer reads it through that face; assembly
+  refuses a source that is the destination collection or any route destination. Read-only access
+  beyond the routed collection is otherwise not observable through the served surface and is
+  therefore not asserted.
 - No refusal discloses another principal's route, collection or entry.
 - No wire value selects the authenticated principal, the source collection or the destination
   collection: admission supplies the principal, `AdoptionRoute` the source, and `ServeFaces.knowledge`
