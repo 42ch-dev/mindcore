@@ -9,7 +9,7 @@
 //! leans on the destination port's atomic create-only CAS; without that CAS the slot can be
 //! claimed twice.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use mindcore_base::knowledge::{adoption_anchor, adoption_anchor_parts};
 use spoke_operations::{
@@ -24,6 +24,9 @@ const COGNITION_MODULE: &str = "cognition";
 
 /// Detail a destination adapter attaches to the create refusal for a slot it holds superseded.
 const SUPERSEDED_OCCUPANT_DETAIL: &str = "superseded_by";
+
+/// Detail naming the source revision the destination copy was actually adopted at.
+const ADOPTED_REVISION_DETAIL: &str = "adopted_revision";
 
 /// What one adoption call did with the destination slot.
 #[derive(Debug, Clone)]
@@ -44,12 +47,12 @@ pub enum AdoptionOutcome {
 /// [`SpokeRejectCode::KnowledgeEntryNotFound`], repeat calls included: no anchor is ever written
 /// for a source the caller cannot see now. An occupied slot is recognized only by this adoption's
 /// own anchor, and only at the revision that anchor records: a copy adopted at another revision is
-/// [`SpokeRejectCode::RevisionConflict`] naming the revision it was adopted at, even when the
-/// source now sits at the requested one, so a stale copy is never served as the revision asked
-/// for. Any other occupant — an anchor naming another scope or entry, or a superseded row the
-/// live read hides — is [`SpokeRejectCode::KnowledgeEntryAlreadyExists`] and is never overwritten
-/// or refreshed. An empty scope id, an empty `entry_id` and a zero revision name no anchor and
-/// are [`SpokeRejectCode::InvalidInput`].
+/// [`SpokeRejectCode::RevisionConflict`] with `details.adopted_revision` naming the revision it was
+/// adopted at, even when the source now sits at the requested one, so a stale copy is never served
+/// as the revision asked for. Any other occupant — an anchor naming another scope or entry, or a
+/// superseded row the live read hides — is [`SpokeRejectCode::KnowledgeEntryAlreadyExists`] and is
+/// never overwritten or refreshed. An empty scope id, an empty `entry_id` and a zero revision name
+/// no anchor and are [`SpokeRejectCode::InvalidInput`].
 pub async fn adopt_knowledge_entry(
     src: &dyn KnowledgeEntryPort,
     dst: &dyn KnowledgeEntryPort,
@@ -183,11 +186,15 @@ fn classify(
         Some(adopted) if expected_source_revision == adopted => {
             SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing))
         }
-        Some(adopted) => spoke_reject(
-            SpokeRejectCode::RevisionConflict,
-            format!("adopted copy of {entry_id} carries source revision {adopted}"),
-            None,
-        ),
+        Some(adopted) => {
+            let mut details = Map::new();
+            details.insert(ADOPTED_REVISION_DETAIL.to_string(), Value::from(adopted));
+            spoke_reject(
+                SpokeRejectCode::RevisionConflict,
+                format!("adopted copy of {entry_id} carries source revision {adopted}"),
+                Some(details),
+            )
+        }
         None => occupied(entry_id),
     }
 }
@@ -289,5 +296,117 @@ mod tests {
             "ke_entry",
             1,
         ));
+    }
+
+    /// A source serving one entry at revision 2.
+    struct SourceAtTwo(KnowledgeEntry);
+
+    #[async_trait::async_trait]
+    impl KnowledgeEntryPort for SourceAtTwo {
+        async fn get_knowledge_entry(&self, _entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+            SpokeResult::Ok(self.0.clone())
+        }
+
+        async fn put_knowledge_entry(
+            &self,
+            _entry: KnowledgeEntry,
+            _expected_base_revision: Option<u64>,
+        ) -> SpokeResult<KnowledgeEntry> {
+            panic!("the source is only ever read")
+        }
+    }
+
+    /// A destination whose slot is empty on the first read but claimed by another adoption before
+    /// this one writes: the create refusal then re-reads a copy at another revision.
+    struct RacedDestination {
+        entry_id: String,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeEntryPort for RacedDestination {
+        async fn get_knowledge_entry(&self, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return source_absent();
+            }
+            let mut copy = self.own_copy();
+            copy.entry_id = entry_id.to_string();
+            SpokeResult::Ok(copy)
+        }
+
+        async fn put_knowledge_entry(
+            &self,
+            _entry: KnowledgeEntry,
+            _expected_base_revision: Option<u64>,
+        ) -> SpokeResult<KnowledgeEntry> {
+            spoke_reject(
+                SpokeRejectCode::KnowledgeEntryAlreadyExists,
+                format!("knowledge entry {} already exists", self.entry_id),
+                None,
+            )
+        }
+    }
+
+    impl RacedDestination {
+        /// The copy the racing adoption wrote: anchored at source revision 1.
+        fn own_copy(&self) -> KnowledgeEntry {
+            let mut copy: KnowledgeEntry = serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "entry_id": self.entry_id,
+                "entry_type": "location",
+                "canonical_name": "the north gate",
+                "status": "confirmed",
+                "body": { "summary": "the north gate is shut after dusk" },
+                "extensions": {},
+                "modules": {},
+            }))
+            .expect("copy fixture parses");
+            copy.adoption_anchor = adoption_anchor("spc_shared", &self.entry_id, 1);
+            copy
+        }
+    }
+
+    #[tokio::test]
+    async fn a_race_lost_to_a_copy_at_another_revision_carries_the_adopted_revision() {
+        let mut source: KnowledgeEntry = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "entry_id": "ke_shared_gate",
+            "entry_type": "location",
+            "canonical_name": "the north gate",
+            "status": "confirmed",
+            "body": { "summary": "the north gate is shut after dusk" },
+            "extensions": {},
+            "modules": {},
+        }))
+        .expect("source fixture parses");
+        source.revision = Some(2);
+        let dst = RacedDestination {
+            entry_id: "ke_shared_gate".to_string(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        match adopt_knowledge_entry(
+            &SourceAtTwo(source),
+            &dst,
+            "spc_shared",
+            "ke_shared_gate",
+            2,
+        )
+        .await
+        {
+            SpokeResult::Reject(reject) => {
+                assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
+                assert_eq!(
+                    reject
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get(ADOPTED_REVISION_DETAIL))
+                        .and_then(Value::as_u64),
+                    Some(1),
+                    "the create-race classification names the revision the copy was adopted at"
+                );
+            }
+            other => panic!("a lost create race must answer the conflict, got {other:?}"),
+        }
     }
 }

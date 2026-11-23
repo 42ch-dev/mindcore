@@ -591,6 +591,15 @@ async fn adoption_refuses_a_copy_from_another_source_revision() {
                 reject.message,
                 format!("adopted copy of {entry_id} carries source revision 1")
             );
+            assert_eq!(
+                reject
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("adopted_revision"))
+                    .and_then(Value::as_u64),
+                Some(1),
+                "the refusal carries the revision the copy was adopted at"
+            );
         }
         other => panic!("a newer request must not be answered by an older copy, got {other:?}"),
     }
@@ -622,6 +631,15 @@ async fn adoption_refuses_a_copy_from_another_source_revision() {
             assert_eq!(
                 reject.message,
                 format!("adopted copy of {entry_id} carries source revision 2")
+            );
+            assert_eq!(
+                reject
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("adopted_revision"))
+                    .and_then(Value::as_u64),
+                Some(2),
+                "the refusal carries the revision the copy was adopted at"
             );
         }
         other => panic!("a newer request must not be answered by an older copy, got {other:?}"),

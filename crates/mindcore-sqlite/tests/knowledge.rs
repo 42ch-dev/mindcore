@@ -2342,14 +2342,9 @@ async fn an_unresolvable_adoption_anchor_answers_one_absence() {
         ),
         SpokeRejectCode::InvalidInput
     );
-    let empty_locator = adopted_entry("ke_mine_empty", "", 1);
-    assert_eq!(
-        expect_reject(
-            port.resolve_adoption_anchor(&empty_locator).await,
-            "an anchor naming no shared entry"
-        ),
-        SpokeRejectCode::InvalidInput
-    );
+    // An anchor naming no shared entry is unconstructible: `AdoptionAnchorSourceEntryId` rejects an
+    // empty id on both its `TryFrom` and its decode, so the absent-anchor case above is the only
+    // shape the type admits.
 
     store.close().await;
     remove_database(&path);
@@ -2654,6 +2649,15 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     );
     shared.created_at = Some(instant("2026-11-01T09:00:00Z"));
     shared.updated_at = Some(Shared3(instant("2026-11-02T09:00:00Z")));
+    shared.source_anchor = Some(
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "source_id": "notes/north-gate.md",
+            "label": "the gate log",
+            "extensions": {},
+        }))
+        .expect("source anchor fixture parses"),
+    );
     let seeded = expect_ok(
         src.put_knowledge_entry(shared.clone(), None).await,
         "seed the shared source",
@@ -2661,6 +2665,10 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     assert!(
         seeded.created_at.is_some() && seeded.updated_at.is_some(),
         "the source carries both timestamps, so the copy's cleared ones mean something"
+    );
+    assert!(
+        seeded.source_anchor.is_some(),
+        "the source carries an ordinary provenance anchor, so the copy's cleared one means something"
     );
     let source_before = stored_row(&reader, "shared", shared_id).await;
 
@@ -2721,13 +2729,25 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     };
     assert_eq!(as_json(&repeat), as_json(&created));
     assert_eq!(anchor_source_revision(&repeat), Some(1));
-    assert_eq!(
-        expect_reject(
-            adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 2).await,
-            "a request naming the advanced source revision rather than the adopted one",
-        ),
-        SpokeRejectCode::RevisionConflict
-    );
+    match adopt_knowledge_entry(&src, &dst, SHARED_SCOPE, shared_id, 2).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::RevisionConflict,
+                "a request naming the advanced source revision rather than the adopted one"
+            );
+            assert_eq!(
+                reject
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("adopted_revision"))
+                    .and_then(Value::as_u64),
+                Some(1),
+                "the conflict names the revision the copy was adopted at"
+            );
+        }
+        other => panic!("a newer request must not be answered by an older copy, got {other:?}"),
+    }
 
     assert_eq!(
         expect_reject(
