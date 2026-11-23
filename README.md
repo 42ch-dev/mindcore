@@ -37,6 +37,20 @@ manifest carries it in no configuration and no handler answers it. A caller move
 | `outcome` `created` | `outcome` `adopted` |
 | `outcome` `already_present`, `entry` | unchanged |
 
+The destination is no longer per-principal. `knowledge.adopt` writes the copy into the collection
+the knowledge face serves (`ServeFaces.knowledge`), not the adopting principal's `workflow_routes`
+entry, so a copy is readable through the same `knowledge.get`/`list` that admitted the adoption.
+`workflow_routes` now selects and authorizes workflow calls only, and authorizes nothing for
+adoption; a principal with knowledge admission and no workflow route adopts normally.
+
+That destination move is a breaking assembly change. A host that set the adoption source and
+`ServeFaces.knowledge` to the same collection still assembled, because the copy went to the
+principal's distinct route collection; assembly now refuses that configuration (`InvalidInput`, "the
+adoption source collection is the collection the knowledge face serves"). Migrate by naming a
+distinct adoption source collection — it must differ from `ServeFaces.knowledge.collection` and from
+every `workflow_routes` destination — and by no longer expecting a route to name an adoption
+destination.
+
 Two behaviour changes come with the move. The knowledge-face admission is now required as well:
 adoption admits through `(principals(peer)?, knowledge_admission(peer)?)`, so a routed principal the
 knowledge face does not admit answers `NOT_AUTHORIZED` where the product tool served it. And the
