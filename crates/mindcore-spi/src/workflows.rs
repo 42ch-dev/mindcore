@@ -1014,6 +1014,9 @@ impl SpiMindWorkflows {
         let Some(record) = record else {
             let judgment =
                 deliberate_judgment(principal, request, "no_change", &verdict, &cited)?;
+            // No write follows, but a response built past the deadline is a
+            // phase that overran it; the check stays the last step either way.
+            ensure_time_left(deadline)?;
             return Ok(DeliberateOutcome::NoChange { verdict, judgment });
         };
         let fallback = DefaultPolicy;
@@ -1028,6 +1031,7 @@ impl SpiMindWorkflows {
             PolicyDecision::RequireHumanReview { .. } => {
                 let judgment =
                     deliberate_judgment(principal, request, "needs_review", &verdict, &cited)?;
+                ensure_time_left(deadline)?;
                 return Ok(DeliberateOutcome::NeedsReview {
                     verdict,
                     draft: record,
@@ -1036,10 +1040,14 @@ impl SpiMindWorkflows {
             }
             PolicyDecision::Reject { reason } => return Err(SpiError::PolicyRejected(reason)),
         }
-        ensure_time_left(deadline)?;
-        // Built before the commit so a projection defect refuses while nothing
-        // is written (compass D18).
+        // The whole response is built before the commit so a projection defect
+        // refuses while nothing is written (compass D18), and the deadline is
+        // checked after that work with nothing left to run before the write
+        // begins.
         let judgment = deliberate_judgment(principal, request, "settled", &verdict, &cited)?;
+        let stored = serde_json::to_value(&record)
+            .map_err(|error| SpiError::InvalidInput(error.to_string()))?;
+        ensure_time_left(deadline)?;
         let mind_state_version = self
             .binding
             .commit_cognition(
@@ -1048,8 +1056,7 @@ impl SpiMindWorkflows {
                 request.subject_id,
                 request.holder,
                 snapshot.carrier_revision,
-                serde_json::to_value(&record)
-                    .map_err(|error| SpiError::InvalidInput(error.to_string()))?,
+                stored,
                 &cited,
             )
             .await?;

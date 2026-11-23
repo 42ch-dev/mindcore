@@ -29,7 +29,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - A candidate is not recallable before review; a rejected write changes neither payload nor revision.
 - An entry is resolvable only through a port bound to its own collection, even when two collections hold the same raw `entry_id`; no API accepts a caller-supplied collection, `owner` or `viewpoint` as a selector.
 - Only an explicit carrier update changes the current judgment; adoption, a shared-content change and a read never do. Appending preserves the previously committed records byte-for-byte.
-- A returned judgment is one the released validator accepted at build time, and on the `settled` branch it is built and validated before `commit_cognition`, so a projection defect refuses while nothing is written.
+- A returned judgment is one the released validator accepted at build time, and on the `settled` branch it is built and validated, and the record serialized, before the last deadline check; `commit_cognition` follows that check, so a projection defect or an expired deadline refuses while nothing is written.
 - `ScopedKnowledgeStore` keeps the caller's timestamp values in the `KnowledgeEntry` payload without that memory round-trip refusal; the store encodes only its separate SQL bookkeeping columns. Raw timestamp spelling is not a guarantee of the typed knowledge port — wire fidelity belongs to the IR codec (`storage-ir-boundary.md`).
 
 ## Where it lives
@@ -38,7 +38,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - `crates/mindcore-sqlite/src/{store,repository,knowledge,cognition,vectors}.rs`
 - Decisions: [standalone embedded SQLite store](../../adr/implemented/architecture/2026-11-20-embedded-sqlite-storage.md), [one initial migration and no second memory schema](../../adr/implemented/architecture/2026-11-21-single-migration-store-bootstrap.md)
 - `crates/mindcore-sqlite/migrations/0001_init.sql`
-- `crates/mindcore-spi/src/workflows.rs` owns workflow admission and the settlement transaction; `crates/mindcore-spi/src/judgment.rs` owns the `spoke-judgment` projection every deliberation response carries.
+- `crates/mindcore-spi/src/workflows.rs` owns workflow orchestration — the snapshot, reasoner, lens and policy phases and the order that builds and validates the judgment before the commit — while the storage transaction that appends the record is `crates/mindcore-spoke/src/workflows.rs`'s; `crates/mindcore-spi/src/judgment.rs` owns the `spoke-judgment` projection every deliberation response carries.
 - Tests: `crates/mindcore-sqlite/tests/{store_bootstrap,borrowed_memory_repository,concurrent_settlement,knowledge,cognition,cognition_cost,embedded_mind,embed_parity}.rs`; runnable scenario: `crates/mindcore-sqlite/examples/iteration_01.rs`
 - Fixture: `fixtures/iteration-01/shared-collection.json`
 - Commands: `cargo test --locked -p mindcore-sqlite`, `cargo run --locked -p mindcore-sqlite --example iteration_01`, `cargo clippy --locked --workspace --all-targets -- -D warnings`

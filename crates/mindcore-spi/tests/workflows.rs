@@ -2434,9 +2434,15 @@ struct DeliberateDouble {
 
 impl DeliberateDouble {
     fn new() -> Self {
+        Self::serving(3)
+    }
+
+    /// One double whose single served record carries `revision`, so a test can
+    /// hand the projection a stored revision the judgment wire cannot carry.
+    fn serving(revision: u64) -> Self {
         Self {
             snapshot: DeliberateSnapshot {
-                records: vec![record("rec_gate", "the north gate is closed", 3)],
+                records: vec![record("rec_gate", "the north gate is closed", revision)],
                 cognition: Vec::new(),
                 carrier_revision: 1,
             },
@@ -3572,6 +3578,61 @@ async fn deliberate_needs_review_carries_the_pending_judgment_and_writes_nothing
     assert!(
         settlements.lock().expect("settlements").is_empty(),
         "a held judgment commits nothing"
+    );
+}
+
+/// A cited revision above the judgment wire's `2^53 - 1` integer ceiling is
+/// one the page can serve and the released validator refuses. On an
+/// auto-settle branch that refusal must land before `commit_cognition`: if
+/// the projection moved under the commit, this call would write first and
+/// fail with a stale citation instead of this projection refusal.
+#[tokio::test]
+async fn deliberate_refuses_a_cited_revision_the_released_validator_rejects() {
+    let binding = DeliberateDouble::serving(u64::pow(2, 53));
+    let settlements = binding.settlements();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        assessment_context_id: None,
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: std::time::Duration::from_secs(30),
+    };
+
+    let error = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("a judgment the validator refuses is never returned");
+
+    let SpiError::Settlement(reject) = &error else {
+        panic!("expected a settlement refusal, got {error:?}");
+    };
+    assert_eq!(reject.code, SpokeRejectCode::InternalError);
+    assert_eq!(
+        reject.details.as_ref().and_then(|details| details.get("kind")),
+        Some(&json!("judgment_projection"))
+    );
+    assert!(
+        settlements.lock().expect("settlements").is_empty(),
+        "the projection refusal lands before the commit"
     );
 }
 
