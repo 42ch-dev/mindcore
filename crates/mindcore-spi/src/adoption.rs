@@ -39,7 +39,8 @@ use spoke_schemas::KnowledgeEntry;
 /// Module namespace holding a carrier's cognition envelope.
 const COGNITION_MODULE: &str = "cognition";
 
-/// Detail a destination adapter attaches to the create refusal for a slot it holds superseded.
+/// Presence-only detail a destination adapter attaches to the create refusal for a slot it holds
+/// superseded; its value never names the successor.
 const SUPERSEDED_OCCUPANT_DETAIL: &str = "superseded_by";
 
 /// Detail naming the source revision the destination copy was actually adopted at.
@@ -286,11 +287,10 @@ fn rejects_occupied_create(reject: &SpokeReject) -> bool {
 /// failure of the copy and propagates untouched.
 fn rejects_superseded_occupant(reject: &SpokeReject) -> bool {
     reject.code == SpokeRejectCode::InvalidInput
-        && reject.details.as_ref().is_some_and(|details| {
-            details
-                .get(SUPERSEDED_OCCUPANT_DETAIL)
-                .is_some_and(Value::is_string)
-        })
+        && reject
+            .details
+            .as_ref()
+            .is_some_and(|details| details.contains_key(SUPERSEDED_OCCUPANT_DETAIL))
 }
 
 /// The revision a copy's adoption anchor records for this source, when it names it.

@@ -1635,9 +1635,11 @@ pub async fn write_entry(
     };
     let (stored, stored_created_at, stored_payload) = match stored {
         Some((revision, created_at, superseded_by, payload)) => {
-            if let Some(superseded_by) = superseded_by {
+            if superseded_by.is_some() {
+                // Presence only: the refusal says the slot is held, never by which entry, since
+                // the caller's admitted selection may hide the successor.
                 let mut details = Map::new();
-                details.insert("superseded_by".to_string(), Value::from(superseded_by));
+                details.insert("superseded_by".to_string(), Value::Bool(true));
                 return spoke_reject(
                     SpokeRejectCode::InvalidInput,
                     format!("knowledge entry {} is superseded", entry.entry_id),
