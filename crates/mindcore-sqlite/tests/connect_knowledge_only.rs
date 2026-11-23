@@ -472,9 +472,7 @@ async fn knowledge_only_session_serves_get_conditional_put_and_scoped_list() {
     assert_eq!(stale.code, SpokeRejectCode::StoredRevisionStale);
     let details = stale.details.expect("stale reject carries the revisions");
     assert_eq!(
-        details
-            .get("expectedBaseRevision")
-            .and_then(Value::as_u64),
+        details.get("expectedBaseRevision").and_then(Value::as_u64),
         Some(1)
     );
     assert_eq!(
@@ -1071,7 +1069,10 @@ async fn refused_put_names_no_collection() {
         .details
         .clone()
         .expect("stale reject carries revisions");
-    assert_eq!(foreign_details.remove("entry_id"), Some(json!("ke_elsewhere")));
+    assert_eq!(
+        foreign_details.remove("entry_id"),
+        Some(json!("ke_elsewhere"))
+    );
     assert_eq!(absent_details.remove("entry_id"), Some(json!("ke_absent")));
     assert_eq!(
         absent_details, foreign_details,
