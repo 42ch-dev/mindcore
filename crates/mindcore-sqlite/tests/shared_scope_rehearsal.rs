@@ -279,8 +279,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
     let personal = store.knowledge(KnowledgeScope::new(PERSONAL));
     let served = store.served_knowledge(ROUTE, KnowledgeScope::new(SHARED));
 
-    // note: item 1 — revisions: a read as of an earlier revision returns that revision's
-    // payload, not the head's.
     expect_ok(
         shared
             .put_knowledge_entry(entry("ke_gate", "location", GATE_ONE), None)
@@ -316,9 +314,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
         "I-000009 item 1 (revisions): revision 2 must replay its own payload"
     );
 
-    // note: item 2 — references: the personal copy carries an adoption anchor naming its shared
-    // source id and adopted revision; resolving from that copy outward through the shared
-    // collection follows retirement markers to the first live entry.
     match expect_ok(
         adopt_knowledge_entry(&shared, &personal, "ke_gate", 2).await,
         "item 2: adopt ke_gate at revision 2",
@@ -328,9 +323,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
             "I-000009 item 2 (references): the first adoption must create the copy, got {other:?}"
         ),
     }
-    // why: the anchor is a persisted property of the copy, so it is read back from the personal
-    // collection: a later write that added the missing anchor would pass an assertion on the
-    // adoption return value alone.
     let adopted = expect_ok(
         personal.get_knowledge_entry("ke_gate").await,
         "item 2: re-read the adopted copy from the personal collection",
@@ -377,9 +369,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
         "I-000009 item 2 (references): resolution must follow same-collection markers to the first live entry"
     );
 
-    // note: item 3 — holder/binding disclosure: two admitted viewpoints get different answers
-    // for the same live entry; once it is retired, ordinary reads hide it from both, while the
-    // explicit lifecycle read exposes the marker with no viewpoint input.
     expect_ok(
         shared
             .put_knowledge_entry(
@@ -483,8 +472,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
         "I-000009 item 3 (holder disclosure): the explicit lifecycle read returns the retired row"
     );
 
-    // note: item 4 — promotion: writing the personal copy leaves the shared source's revision
-    // and stored payload bytes untouched.
     let source_before = source_row(&pool, SHARED, "ke_gate").await;
     let mut promoted_copy = adopted.clone();
     promoted_copy.body.summary = Some(PERSONAL_NOTE.to_string());
@@ -514,8 +501,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
          payload bytes unchanged"
     );
 
-    // note: item 5 — carrier transaction invariants: the carrier head and the entry land in one
-    // `BEGIN IMMEDIATE`, and a rollback leaves neither visible.
     let mut write = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -608,25 +593,17 @@ async fn shared_scope_holds_the_seven_named_facts() {
         "I-000009 item 5 (carrier transaction): the rolled-back rewrite left no checkpoint behind"
     );
 
-    // note: item 6 — backup / restore: a closed store, copied as a file and reopened, carries
-    // items 1–5's persisted results, and items 3 and 5 run again on the copy.
-    //
-    // The copy happens only after `close`: a copy of a live WAL database's main file is not a
-    // consistent snapshot, because committed frames may still sit in `-wal` rather than the main
-    // file. Closing the last connection checkpoints them, so the copied file is the whole store.
     store.close().await;
     let restored_path = temp.root().join("restored.db");
     std::fs::copy(&path, &restored_path).expect("copy the closed store as a file");
     let restored = MindStore::open(&restored_path)
         .await
         .expect("reopen the copied store");
-    // note: the same bindings against the copy, so the earlier probes run unchanged on it.
     let pool = restored.pool();
     let shared = restored.knowledge(KnowledgeScope::new(SHARED));
     let personal = restored.knowledge(KnowledgeScope::new(PERSONAL));
     let served = restored.served_knowledge(ROUTE, KnowledgeScope::new(SHARED));
 
-    // why: persisted facts are read off the copy before any setup write lands on it.
     assert_eq!(
         expect_ok(
             shared.get_entry_at_revision("ke_gate", 1).await,
@@ -724,9 +701,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
          copy"
     );
 
-    // why: item 3 is re-probed on the copy under ids this file has not written yet: the same viewpoint
-    // split for a live entry, the same ordinary absence for both viewpoints once retired, and the
-    // same viewpoint-free explicit marker read.
     expect_ok(
         shared
             .put_knowledge_entry(
@@ -824,7 +798,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
          a viewpoint on the copy"
     );
 
-    // why: item 5 is re-probed on the copy with a carrier id this file has not written yet.
     let mut write = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -904,16 +877,9 @@ async fn shared_scope_holds_the_seven_named_facts() {
         "I-000009 item 6 (backup/restore): the rolled-back rewrite left no checkpoint on the copy"
     );
 
-    // note: item 7 — single-writer switch: two stores opened on the same file before any
-    // reservation is taken. The second store's valid write is refused while the first holds the
-    // write reservation, leaves no row, and succeeds once the first closes. This asserts SQLite
-    // exclusion, not supported simultaneous writers: `MindStore`'s invariant is one store per
-    // file, and two stores on one file are unsupported rather than refused.
     let second = MindStore::open(&restored_path)
         .await
         .expect("open a second store on the restored file");
-    // why: only the second store's sole connection gets a short timeout, so contention fails fast
-    // instead of paying the production five-second busy handler.
     let mut connection = second
         .pool()
         .acquire()
@@ -978,7 +944,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
             .await,
         "item 7: the same write after the first store closes",
     );
-    // why: read through the second store: the put's return value is the submission, not the row.
     let landed = expect_ok(
         second_shared.get_knowledge_entry("ke_switch_probe").await,
         "item 7: read the switched entry through the second store",

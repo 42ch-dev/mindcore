@@ -77,7 +77,6 @@ impl RemoteMemoryService for TransferService {
             SpokeResult::Ok(principal) => principal,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        // why: no op ran, so a refused reservation has no outcome in doubt.
         let read = op == transfer::GET || op == RECEIPT_GET;
         let begun = match read {
             true => self.pool.begin().await,
@@ -120,8 +119,6 @@ impl RemoteMemoryService for TransferService {
         };
         let body = match staged {
             SpokeResult::Ok(MemoryStage::Ready(body)) => body,
-            // why: every routed op above settles inside its own transaction; a staged settlement
-            // would need a second caller phase this seam does not own.
             SpokeResult::Ok(MemoryStage::JournalPending { .. })
             | SpokeResult::Ok(MemoryStage::ReflectionPending(_)) => {
                 return reject(Reject::internal(format!(
@@ -132,8 +129,6 @@ impl RemoteMemoryService for TransferService {
         };
         match tx.commit().await {
             Ok(()) => SpokeResult::Ok(body),
-            // §14.2/§14.3: the effect may or may not be durable; never claim either way,
-            // and name the receipt the client can poll so it can resolve without a retry.
             Err(_) => reject(commit_uncertain(op, &body)),
         }
     }

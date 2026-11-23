@@ -208,8 +208,6 @@ pub(crate) fn candidate_requirement<'a>(
     }
 }
 
-// note: rows and grants — admission primitives
-
 pub(crate) async fn space(
     repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
@@ -328,7 +326,6 @@ pub(crate) fn expiry_passed(expires_at: Option<&str>, now: DateTime<Utc>) -> boo
     };
     match chrono::DateTime::parse_from_rfc3339(raw) {
         Ok(at) => at.with_timezone(&Utc) <= now,
-        // why: an unparseable stored expiry fails closed — it cannot be shown live.
         Err(_) => true,
     }
 }
@@ -420,8 +417,6 @@ pub(crate) fn require_write_allowed(
     Ok(())
 }
 
-// note: admission gate and probe
-
 fn refuse_coverage(admission: &Admission<'_>, requirements: &[GrantRequirement<'_>]) -> Reject {
     let capability = requirements
         .first()
@@ -464,8 +459,6 @@ pub(crate) async fn authorize(
                 .map(|capability| scope.requirement(capability, subject.as_str()))
                 .collect();
             if !one_grant_covers(&wire, admission.principal, space_id, now, &requirements) {
-                // contract §7.13/C-102 — incomplete coverage hides the row exactly as an
-                // id this store never held.
                 return Err(Reject::not_found(format!("candidate {candidate_id}")));
             }
         }
@@ -487,8 +480,6 @@ pub(crate) async fn authorize(
                 }
             }
             if !one_grant_covers(&wire, admission.principal, space_id, now, &requirements) {
-                // contract §7.13/C-102 — parity: incomplete coverage hides the row exactly as
-                // an id this store never held, indistinguishable from missing.
                 return Err(Reject::not_found(format!("record {record_id}")));
             }
         }
@@ -603,8 +594,6 @@ pub(crate) async fn probe(
         }
     }
 }
-
-// note: receipts and requests
 
 /// One pending receipt row stamped for this effect.
 pub(crate) fn pending_receipt(op: &Op<'_>, receipt_id: &str) -> ReviewReceiptIr {

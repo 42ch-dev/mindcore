@@ -149,7 +149,6 @@ fn decision_of(value: &Value) -> AResult<Decision> {
             )?;
             let kind = wire::optional(decision, "kind")?;
             let content = match decision.get("content_override") {
-                // why: the DTO decodes an explicit null as absent; match it.
                 None | Some(Value::Null) => None,
                 Some(content) => Some(content_wire(content)?),
             };
@@ -188,8 +187,6 @@ fn decision_of(value: &Value) -> AResult<Decision> {
 }
 
 impl MemoryAdapter {
-    // contract §7.11 capture
-
     pub async fn capture(
         &self,
         tx: &mut Tx<'_>,
@@ -308,8 +305,6 @@ impl MemoryAdapter {
             .map(|stage| (stage, false))
     }
 
-    // contract §7.12/§7.13 candidate reads
-
     pub async fn list_candidates(
         &self,
         tx: &mut Tx<'_>,
@@ -334,8 +329,6 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let subject_id = request.subject_id.to_string();
-        // why: the status filter is a closed union on the wire; its stored column is
-        // the same lowercase member name.
         let status = match request.status.as_ref() {
             Some(status) => Some(
                 serde_json::to_value(status)
@@ -449,8 +442,6 @@ impl MemoryAdapter {
         let space = SpaceId::new(request.space_id.to_string());
         let candidate_id = request.candidate_id.to_string();
         admission::space(&self.repository, tx, &space).await?;
-        // why: metadata first — the row's own subject and placement admit and conceal
-        // before any payload column is selected.
         let Some(head) =
             admission::candidate_head(&self.repository, tx, &space, candidate_id.as_str()).await?
         else {
@@ -466,12 +457,9 @@ impl MemoryAdapter {
             Utc::now(),
             &admission::candidate_requirement("review", subject_id, &head.capture_scope),
         ) {
-            // contract §7.13 — incomplete coverage hides the row exactly as an absent id.
             return Err(Reject::not_found(format!("candidate {candidate_id}")));
         }
         self.withhold_if_unsettled(tx, &space, subject_id).await?;
-        // why: only an admitted, settled read selects and decodes the candidate's
-        // content.
         let Some(candidate) =
             admission::candidate(&self.repository, tx, &space, candidate_id.as_str()).await?
         else {
@@ -481,8 +469,6 @@ impl MemoryAdapter {
             json!({ "candidate": project::candidate_body(&candidate) }),
         )
     }
-
-    // contract §7.15 candidates.review
 
     pub async fn review_candidate(
         &self,
@@ -543,8 +529,6 @@ impl MemoryAdapter {
         .await
     }
 
-    // contract §7.14 candidates.dismiss
-
     pub async fn dismiss_candidate(
         &self,
         tx: &mut Tx<'_>,
@@ -596,8 +580,6 @@ impl MemoryAdapter {
         )
         .await
     }
-
-    // contract §7.16 records.create
 
     pub async fn create_record(
         &self,
@@ -692,8 +674,6 @@ impl MemoryAdapter {
         .await
     }
 
-    // contract §7.17 records.get
-
     pub async fn get_record(
         &self,
         tx: &mut Tx<'_>,
@@ -717,8 +697,6 @@ impl MemoryAdapter {
         let rows = admission::grants(&self.repository, tx, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let now = Utc::now();
-        // why: metadata first — the row's own subject, scope and tombstone admit and
-        // conceal before any payload column is selected.
         let Some(head) =
             admission::record_head(&self.repository, tx, &space, record_id.as_str()).await?
         else {
@@ -753,14 +731,10 @@ impl MemoryAdapter {
                 subject_all: false,
             },
         );
-        // contract §7.17 — an unauthorized record, or a tombstone without `admin`, reads
-        // exactly as an absent id.
         if !reads || (tombstoned && !admin) {
             return Err(Reject::not_found(format!("record {record_id}")));
         }
         self.withhold_if_unsettled(tx, &space, subject_id).await?;
-        // why: only an admitted, settled read selects and decodes the record's
-        // content.
         let Some(record) =
             admission::record(&self.repository, tx, &space, record_id.as_str()).await?
         else {
@@ -768,8 +742,6 @@ impl MemoryAdapter {
         };
         Self::ready::<MemoryRecordsGetResponse>(json!({ "record": project::record_body(&record) }))
     }
-
-    // contract §7.20 records.list
 
     pub async fn list_records(
         &self,
@@ -912,8 +884,6 @@ impl MemoryAdapter {
         }))
     }
 
-    // contract §7.18 records.update
-
     pub async fn update_record(
         &self,
         tx: &mut Tx<'_>,
@@ -972,9 +942,6 @@ impl MemoryAdapter {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
-        // contract §7.7/MEM-R024 — the fresh-effect gate binds the persisted subject and
-        // the record's own placement before any tombstone/revision check or
-        // effect, so a fenced subject or fenced context refuses without a write.
         let record_scope = Scope::from(&current.scope);
         let gated = Admission {
             operation: op.operation,
@@ -1046,8 +1013,6 @@ impl MemoryAdapter {
         .await
     }
 
-    // contract §7.21 records.promote
-
     pub async fn promote_record(
         &self,
         tx: &mut Tx<'_>,
@@ -1103,9 +1068,6 @@ impl MemoryAdapter {
         };
         let subject_id = current.subject_id.to_string();
         let source_scope = Scope::from(&current.scope);
-        // contract §7.7/MEM-R024 — the lifecycle gate covers both placements the move
-        // touches — a fenced source or a fenced target refuses before the row
-        // is rewritten.
         if let Some(subject) =
             admission::subject(&self.repository, tx, &op.space, subject_id.as_str()).await?
         {
@@ -1149,7 +1111,6 @@ impl MemoryAdapter {
             "scope": placement_wire(&target),
         });
         if revision == current.revision {
-            // contract §7.0.4 — no-op: the stored row is unchanged, so its projection is too.
             let receipt = admission::committed_receipt(&op, &mint("rct"), result);
             self.repository.insert_receipt(tx, &receipt, None).await?;
             return Self::ready::<MemoryRecordsPromoteResponse>(project::receipt_body(&receipt));
@@ -1178,8 +1139,6 @@ impl MemoryAdapter {
         )
         .await
     }
-
-    // contract §7.19 records.delete
 
     pub async fn delete_record(
         &self,
@@ -1234,11 +1193,6 @@ impl MemoryAdapter {
             return Err(Reject::not_found(format!("record {record_id}")));
         };
         let subject_id = current.subject_id.to_string();
-        // contract §7.7/MEM-R024 — the fresh-effect gate binds the persisted subject and
-        // the record's own placement before any tombstone/revision check or
-        // effect, so a fenced subject or fenced context refuses without a write.
-        // Mindcore's selected policy applies the placement fence to delete too;
-        // SPOKE does not mandate it for erasure.
         let record_scope = Scope::from(&current.scope);
         let gated = Admission {
             operation: op.operation,
@@ -1251,8 +1205,6 @@ impl MemoryAdapter {
             freeze_gated: true,
         };
         admission::gate(&self.repository, tx, &gated).await?;
-        // contract §7.19 — deleting a tombstone mirrors records.update: a fresh key gets
-        // INVALID_STATUS_TRANSITION; only the same key replays the old outcome.
         if matches!(current.state, RecordState::Tombstoned { .. }) {
             return Err(Reject::terminal(
                 SpokeRejectCode::InvalidStatusTransition,
@@ -1270,7 +1222,6 @@ impl MemoryAdapter {
         let members = next
             .as_object_mut()
             .expect("record projection is an object");
-        // note: MEM-R014 — tombstoning scrubs the body and keeps only the deletion mark.
         members.insert("content".to_string(), json!({ "text": "" }));
         members.remove("import_ref");
         let mut tombstone = json!({
@@ -1297,9 +1248,6 @@ impl MemoryAdapter {
                 "record revision changed while the tombstone was written",
             ));
         }
-        // why: a tombstone keeps no vector — the row is unreachable and would only grow. The delete is
-        // cache-only — a storage failure leaves that stale row rather than refusing the durable
-        // tombstone, and the prune runs in the tombstone's own transaction so a rollback keeps it.
         let _ = mindcore_sqlite::vectors::delete_record_vectors(&mut **tx, &record_id).await;
         let effect = effects::record_effect(
             &updated,
@@ -1311,8 +1259,6 @@ impl MemoryAdapter {
                     .unwrap_or_default(),
             )?),
         )?;
-        // contract §7.19 — the committed receipt's result is the pinned delete outcome,
-        // so a same-key replay decodes as a CommittedReceipt.
         let result = json!({
             "record_id": record_id,
             "tombstoned": true,
@@ -1328,8 +1274,6 @@ impl MemoryAdapter {
         )
         .await
     }
-
-    // contract §7.22 recall
 
     pub async fn recall(
         &self,
@@ -1376,7 +1320,6 @@ impl MemoryAdapter {
             .await?;
         let subject = admission::subject(&self.repository, tx, &space, subject_id.as_str()).await?;
         let subject_status = subject.as_ref().map(|row| row.status.clone());
-        // contract §7.7 — `archived` excludes the subject's records from recall.
         let archived = subject_status.as_deref() == Some("archived");
         let selection = RecordSelection {
             placement,
@@ -1478,8 +1421,6 @@ impl MemoryAdapter {
             }
             bodies.push(body);
         }
-        // why: the page cut — `bodies` are the kept candidates this page disposed of;
-        // a deferred overflow is not consumed, so the next cursor reaches it.
         let consumed = start + bodies.len();
         let truncated = consumed < ranked.len();
         let next_cursor = truncated
@@ -1493,8 +1434,6 @@ impl MemoryAdapter {
             "engine_policy_version": policy::ENGINE_POLICY_VERSION,
         }))
     }
-
-    // contract §7.23/§7.24 profile
 
     pub async fn get_profile(
         &self,
@@ -1632,9 +1571,6 @@ impl MemoryAdapter {
                 updated
             }
             None => {
-                // contract §7.24 — a supplied expectation names the revision the caller
-                // read. An absent row was at no such revision, so the write is
-                // refused before anything is staged.
                 if let Some(expected) = &expected {
                     return Err(Reject::terminal(
                         SpokeRejectCode::RevisionConflict,
@@ -1676,8 +1612,6 @@ impl MemoryAdapter {
         .await
     }
 
-    // contract §7.28 receipts.get (Y04)
-
     pub async fn get_receipt(
         &self,
         tx: &mut Tx<'_>,
@@ -1701,9 +1635,6 @@ impl MemoryAdapter {
         let rows = admission::grants(&self.repository, tx, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let now = Utc::now();
-        // why: Y04 — current space participation is decided *before* the receipt
-        // lookup, so an unparticipating caller cannot learn that an id exists.
-        // An expired-but-unrevoked grant is not participation.
         let participates = rows.iter().any(|row| {
             row.principal_id.as_str() == principal_id && admission::live_grant(row, now)
         });
@@ -1738,9 +1669,6 @@ impl MemoryAdapter {
                         "receipt {receipt_id} belongs to another requester"
                     )));
                 }
-                // contract §7.28 — the poll union carries no pending variant, so a
-                // still-pending receipt answers the same uncertainty the
-                // replay probe reports.
                 if matches!(receipt.state, ReceiptState::Pending) {
                     return Err(Reject::uncertain(format!(
                         "receipt {receipt_id} is still pending"
@@ -1766,8 +1694,6 @@ impl MemoryAdapter {
             }
         }
     }
-
-    // contract §7.14/§7.15 shared staging
 
     /// §7.14/§7.15 consumption: authorize, replay, gate, stage records, scrub
     /// the candidate and leave the intent for its publisher.
@@ -1870,9 +1796,6 @@ impl MemoryAdapter {
                 ))
             }
         };
-        // why: retained-record content keeps absence semantics — optional members
-        // stay absent instead of being invented as explicit `null`
-        // (content_from_wire rejects a null cognition).
         let mut content_members = Map::new();
         content_members.insert("text".to_string(), json!(content.text));
         if let Some(structured) = &content.structured {
@@ -2009,8 +1932,6 @@ impl MemoryAdapter {
         })
     }
 
-    // contract §5.2 phase 2 journal settlement
-
     /// Settle one journaled intent and its pending receipt together in a
     /// fresh caller transaction. The caller invokes this only after it has
     /// confirmed the publication of every effect target the intent staged —
@@ -2049,8 +1970,6 @@ impl MemoryAdapter {
             Some(ReceiptRead::Retained(receipt)) => receipt,
         };
         match &receipt.state {
-            // why: a second settle of an already-committed receipt returns the
-            // stored outcome; only the pending-to-committed transition writes.
             ReceiptState::Committed { .. } => {
                 return Ok(project::receipt_body(&receipt));
             }

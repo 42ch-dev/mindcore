@@ -526,7 +526,6 @@ pub(super) async fn prepare(
             )),
             None => None,
         };
-        // The row keeps the source identity until the coverage check has named it.
         grants.push(MemoryGrantRow {
             grant_id: grant_id.clone(),
             space_id: space.clone(),
@@ -543,8 +542,6 @@ pub(super) async fn prepare(
         });
     }
     not_subsumed(&grants, caller_grants, space, principal, now)?;
-    // `grant_id` is a store-wide primary key, so an adopted grant takes a fresh target identity
-    // like any imported row; §7.31's report carries only the adoption counts, not that mapping.
     for grant in &mut grants {
         grant.grant_id = mint("grt");
     }
@@ -586,7 +583,6 @@ pub(super) async fn prepare(
         "reflections": reflections.len(),
         "subjects": subjects.len(),
     });
-    // §7.31 `StagedReport`: the fixed identity mapping and what the sequence verified.
     let report = json!({
         "candidate_id_map": candidate_map,
         "counts": counts,
@@ -596,8 +592,6 @@ pub(super) async fn prepare(
         "subject_id_map": subject_map,
         "verification": { "bundle_digest_ok": true, "errors": [] },
     });
-    // The translated rows to apply, plus the content-free source provenance the
-    // activation retains. Every id in here is final; activation decodes and rechecks it.
     let payload = json!({
         "candidates": candidates.iter().map(project::candidate_body).collect::<Vec<_>>(),
         "grants": grants.iter().map(project::grant_body).collect::<Vec<_>>(),
@@ -841,7 +835,6 @@ fn stored_reflection(
         body_text: text(body, "body")?.to_string(),
         body_format: text(body, "format")?.to_string(),
         cost,
-        // why: the target's live inputs are not the ones the source derived from.
         stale_cache: true,
     })
 }
@@ -920,8 +913,6 @@ async fn recheck(
 }
 
 impl MemoryAdapter {
-    // contract §7.32 imports.activate
-
     pub async fn activate_import(
         &self,
         tx: &mut Tx<'_>,
@@ -962,8 +953,6 @@ impl MemoryAdapter {
             issuance: None,
             subject_gate: None,
             placement_gate: None,
-            // why: the transfer family is on the §8.2 freeze allowlist, so an import
-            // applies into a frozen space as a maintenance path.
             freeze_gated: false,
         };
         if let Err(reject) = admission::authorize(&self.repository, tx, &admission, op.now).await {
@@ -989,9 +978,6 @@ impl MemoryAdapter {
             return Err(state_conflict(&import));
         }
 
-        // The frozen payload is the applied source: staging fixed the mapping, the
-        // translations and the report, and released the raw chunks. Activation
-        // decodes those rows and rechecks them against the live target.
         let Some(payload) = import.staged_payload.clone() else {
             return Err(Reject::internal(
                 "the staged import carries no translated rows",
@@ -999,9 +985,6 @@ impl MemoryAdapter {
         };
         let staged = decode_staged(&payload, &op.space, principal_id)?;
         recheck(&self.repository, tx, &op.space, &staged).await?;
-        // why: an adopted grant is written without an expiry, so the cover that justified it at
-        // staging is re-derived from the activating caller's current grants — a live but expiring
-        // `admin` at cutover must not install one permanently.
         let caller_grants = admission::grants(&self.repository, tx, &op.space).await?;
         not_subsumed(
             &staged.grants,
@@ -1041,7 +1024,6 @@ impl MemoryAdapter {
             .mark_import_activated(tx, &import_id, &policy::timestamp(op.now), &provenance)
             .await?
         {
-            // Another activation won the same import: refuse rather than apply twice.
             return Err(state_conflict(&import));
         }
 
@@ -1079,8 +1061,6 @@ impl MemoryAdapter {
         self.repository.insert_receipt(tx, &receipt, None).await?;
         Self::ready::<MemoryImportsActivateResponse>(project::receipt_body(&receipt))
     }
-
-    // contract §7.33 imports.discard
 
     pub async fn discard_import(
         &self,

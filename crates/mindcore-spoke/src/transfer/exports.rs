@@ -71,8 +71,6 @@ fn read_requirements<'a>(
 }
 
 impl MemoryAdapter {
-    // contract §7.29 exports.create
-
     pub async fn create_export(
         &self,
         tx: &mut Tx<'_>,
@@ -225,8 +223,6 @@ impl MemoryAdapter {
         Self::ready::<MemoryExportsCreateResponse>(project::receipt_body(&receipt))
     }
 
-    // contract §7.30 exports.get
-
     pub async fn get_export(
         &self,
         tx: &mut Tx<'_>,
@@ -278,8 +274,6 @@ impl MemoryAdapter {
         let expires = DateTime::parse_from_rfc3339(&row.expires_at)
             .map_err(|_| Reject::internal("stored export expiry is unreadable"))?
             .with_timezone(&Utc);
-        // why: the reclaim's persisted mark outlives the clock, which a rollback would move back
-        // inside the retention window after the payload is already gone.
         if row.expired || op.now >= expires {
             return Err(Reject::terminal(
                 SpokeRejectCode::ExportExpired,

@@ -403,8 +403,6 @@ async fn knowledge_only_signed_negotiation() {
         .expect("dialer manifest present after handshake");
     assert_eq!(dialer_manifest.capabilities, vec!["spoke-knowledge"]);
 
-    // why: the Knowledge-only face never answers a baseline operation: `port.rule.list` needs
-    // `spoke-baseline`, which neither hello negotiated.
     assert_op_unsupported(
         RuleQueryPort::list_rules(&*session.adapter, &[]).await,
         "port.rule.list",
@@ -982,8 +980,6 @@ async fn a_marked_row_with_unreadable_payload_is_served_like_a_missing_one() {
     assert_eq!(overwrite.code, SpokeRejectCode::NotAuthorized);
     assert!(overwrite.details.is_none());
 
-    // why: the marking path settles on the marker before decoding too: an already-retired row with an
-    // unreadable payload refuses as already superseded, never as a storage failure.
     let remark = expect_reject(
         local.supersede_entry("ke_beta", 2, "ke_alpha").await,
         "supersede an already-marked row with an unreadable payload",
@@ -995,7 +991,6 @@ async fn a_marked_row_with_unreadable_payload_is_served_like_a_missing_one() {
         remark.message
     );
 
-    // why: explicit reads and live rows keep the decode failure.
     let explicit = expect_reject(
         local.get_entry_including_superseded("ke_beta").await,
         "explicit read of the unreadable marked row",
@@ -1150,7 +1145,6 @@ async fn a_storage_failure_names_no_table_to_the_peer() {
         None,
     )
     .await;
-    // note: a real driver failure — every knowledge statement now answers `no such table`.
     let raw = raw_connection(&fixture._dir.path().join("knowledge_connect.db")).await;
     sqlx::query("DROP TABLE knowledge_entries")
         .execute(&raw)
@@ -1551,8 +1545,6 @@ async fn served_list_refuses_a_collection_over_the_bound() {
         "the served refusal names the bound it crossed: {refused:?}"
     );
 
-    // why: the same class over a signed session: the served collection crosses the same bound, so the
-    // peer must receive the capacity refusal with its reason and limit, not a generic storage fault.
     let served_writer = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
     for index in 0..SERVED_KNOWLEDGE_LIST_LIMIT {
         expect_ok(

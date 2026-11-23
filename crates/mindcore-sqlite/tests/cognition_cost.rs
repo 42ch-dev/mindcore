@@ -204,7 +204,6 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     let dir = TempDir::new().expect("temporary directory");
     let path = dir.path().join("mindcore.db");
 
-    // note: the migrator owns the schema; the logging pool below owns the measurement.
     let store = MindStore::open(&path).await.expect("open store");
     store.close().await;
     let pool = SqlitePoolOptions::new()
@@ -218,7 +217,6 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         .await
         .expect("open logging pool");
 
-    // note: the empty carrier row: revision 1, no records, no head.
     let carrier = KnowledgeEntry {
         body: KnowledgeEntryBody::default(),
         canonical_name: KnowledgeEntryCanonicalName::try_from("ke_wren name")
@@ -246,7 +244,6 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     }
     tx.commit().await.expect("commit the carrier row");
 
-    // why: nothing to point at yet: the lookup is still one statement over no record.
     let (headless_lookup_statements, _, headless) = measured_lookup(&pool).await;
     assert_eq!(
         headless, None,
@@ -257,8 +254,6 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         "the headless lookup is one statement"
     );
 
-    // note: history of one: the first append is unmeasured setup, the second is measured
-    // while the scope holds one record.
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -274,7 +269,6 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         measured_append(&pool, 2, "cog_second").await;
     assert_eq!(assigned_at_1, 3);
 
-    // note: history of one thousand: filler appends 3..=1000 in one transaction.
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -300,7 +294,6 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
     }
     tx.commit().await.expect("commit the filler appends");
 
-    // note: the measured operations now run while the scope holds one thousand records.
     let (lookup_at_1000, steps_at_1000, current_at_1000) = measured_lookup(&pool).await;
     assert_eq!(
         current_at_1000.as_deref(),
@@ -365,7 +358,6 @@ async fn append_and_current_lookup_cost_the_same_at_one_and_at_one_thousand_reco
         "the counter must see the lookup itself: {lookup_at_1}"
     );
 
-    // why: every append really landed and the head points at the newest row.
     let header = match read_carrier_header(&pool, COLLECTION, CARRIER).await {
         SpokeResult::Ok(header) => header,
         SpokeResult::Reject(reject) => panic!("header read rejected: {reject:?}"),

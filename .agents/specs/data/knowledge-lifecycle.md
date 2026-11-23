@@ -38,6 +38,7 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 - The anchor's recorded revision is the copy's identity. A repeat at that revision returns the existing copy (`AlreadyPresent`) with its original anchor; a request naming the source's current revision instead is `RevisionConflict` naming the revision the copy was adopted at, even when the source now sits at the requested one. A repeat never rewrites the copy and never re-points the anchor at a newer source revision.
 - A missing, retired or undisclosable source answers one generic `KnowledgeEntryNotFound`; a source the caller cannot see is indistinguishable from one that does not exist. An empty source id or a zero revision is refused before any I/O.
 - A destination slot occupied by anything else — including a retired entry — answers `KnowledgeEntryAlreadyExists` and is left byte-identical. The store distinguishes that case from a genuine validation failure by a structured refusal detail, never by matching a message.
+- The copy's cognition envelope is emptied in place: only a present `records` array is cleared, and every other shape is left for the destination to validate rather than being masked as an empty history.
 
 ### Retirement
 

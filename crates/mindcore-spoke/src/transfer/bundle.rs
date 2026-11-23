@@ -194,8 +194,6 @@ pub(super) fn assemble(
     let mut candidate_values = candidate_values;
     candidate_values
         .sort_by(|left, right| key(left, "candidate_id").cmp(key(right, "candidate_id")));
-    // why: the typed encoding below must omit a member the pinned content type cannot carry, so a
-    // document that spells an explicit null is refused here instead of sealing changed content.
     if carries_explicit_null(&record_values, &candidate_values) {
         return Err(explicit_null_refusal());
     }
@@ -209,8 +207,6 @@ pub(super) fn assemble(
     let mut grant_values: Vec<Value> = grants
         .iter()
         .filter(|grant| grant_in_scope(grant, spec, spec.created_at))
-        // why: a withheld subject contributes no subject-scoped summary; naming its
-        // `subject_id` would disclose it and dangle at the target's own verification.
         .filter(|grant| match grant.subject_id.as_ref() {
             Some(subject) => kept_subjects.contains(subject.as_str()),
             None => true,
@@ -219,8 +215,6 @@ pub(super) fn assemble(
         .collect::<AResult<Vec<_>>>()?;
     grant_values.sort_by(|left, right| key(left, "grant_id").cmp(key(right, "grant_id")));
 
-    // A receipt row carries no subject or placement, so no summary can be scoped to
-    // a subject without disclosing unrelated operations.
     let mut receipt_values = if whole_space {
         receipts
             .iter()

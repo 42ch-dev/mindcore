@@ -72,12 +72,7 @@ pub(super) fn unverified(errors: Vec<String>) -> Reject {
 }
 
 pub(super) fn expired(row: &MemoryImportRow, now: DateTime<Utc>) -> AResult<bool> {
-    // why: only an import nobody has activated carries a deadline. `activated` and
-    // `discarded` are terminal, so a late chunk or a repeat activation against one must
-    // answer its state, never the clock that its staging once ran against.
     match row.state.as_str() {
-        // why: a reclaimed row is dead whatever the clock says; deciding it by time alone
-        // would let a backward clock step revive the import as a live header.
         "expired" => return Ok(true),
         "staging" | "staged" => {}
         _ => return Ok(false),
@@ -189,7 +184,6 @@ fn correlation_label(value: &str) -> bool {
 
 /// Prefix paired with the tail a real credential carries, never the bare prefix.
 fn credential_shaped(value: &str) -> bool {
-    // Stripe-style live/test secrets: `sk_live_`/`rk_live_` + 24+ base62.
     for prefix in ["sk_live_", "sk_test_", "rk_live_", "rk_test_", "pk_live_"] {
         if let Some(tail) = value.strip_prefix(prefix) {
             if tail.len() >= 24 && tail.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -197,7 +191,6 @@ fn credential_shaped(value: &str) -> bool {
             }
         }
     }
-    // GitHub tokens: `ghp_`/`gho_`/`ghs_`/`ghu_` + exactly 36 base62.
     for prefix in ["ghp_", "gho_", "ghs_", "ghu_"] {
         if let Some(tail) = value.strip_prefix(prefix) {
             if tail.len() == 36 && tail.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -205,7 +198,6 @@ fn credential_shaped(value: &str) -> bool {
             }
         }
     }
-    // Slack tokens: `xoxb-`/`xoxp-` + long digit groups.
     for prefix in ["xoxb-", "xoxp-", "xoxa-", "xoxo-"] {
         if let Some(tail) = value.strip_prefix(prefix) {
             if tail.len() >= 24
@@ -217,7 +209,6 @@ fn credential_shaped(value: &str) -> bool {
             }
         }
     }
-    // AWS access key id: exactly `AKIA` + 16 uppercase alphanumerics.
     if let Some(tail) = value.strip_prefix("AKIA") {
         if tail.len() == 16
             && tail
@@ -410,8 +401,6 @@ pub(super) fn verification_errors(
 }
 
 impl MemoryAdapter {
-    // contract §7.31 imports.stage
-
     pub async fn stage_import(
         &self,
         tx: &mut Tx<'_>,
@@ -513,10 +502,6 @@ impl MemoryAdapter {
                 live = None;
             }
         }
-        // why: retention purges expired staging and expired export payloads on any
-        // successful transfer write for the space, so neither abandoned transfer state
-        // holds storage until its own source returns. The exact-source reclaim above runs
-        // first, so a late chunk still names its expiry.
         self.repository
             .expire_imports(tx, &op.space, &policy::timestamp(op.now))
             .await?;
@@ -617,8 +602,6 @@ impl MemoryAdapter {
             bundle = reassemble(&sequence);
             if let Some(logical) = &bundle {
                 let array = |field: &str| logical.get(field).and_then(Value::as_array);
-                // why: defence in depth. These bytes verified, but the pinned content type cannot
-                // carry a present null, so activating them would change the document.
                 if carries_explicit_null(
                     array("records").map(Vec::as_slice).unwrap_or_default(),
                     array("candidates").map(Vec::as_slice).unwrap_or_default(),
@@ -662,8 +645,6 @@ impl MemoryAdapter {
             })?;
             let bundle = bundle
                 .ok_or_else(|| Reject::internal("the verified sequence carries no header"))?;
-            // §7.31/§12.1: the final chunk is where the identity mapping, the translated
-            // payload and the report are fixed. Activation applies this frozen result.
             let prepared = super::activate::prepare(
                 &self.repository,
                 tx,
@@ -693,7 +674,6 @@ impl MemoryAdapter {
                     "the staging import left staging under its final chunk",
                 ));
             }
-            // The frozen result replaces the raw sequence: nothing downstream re-reads it.
             self.repository.delete_import_chunks(tx, &import_id).await?;
 
             let result = json!({

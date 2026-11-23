@@ -695,7 +695,6 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
                 .expect("the advertised argument is an object")
                 .remove(&member);
 
-            // why: the advertised schema refuses the argument, not only serde.
             match validate_tool_arguments(&descriptor, &missing) {
                 SpokeResult::Reject(reject) => {
                     assert_eq!(
@@ -722,7 +721,6 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
                 ),
             }
 
-            // why: the handler requires it too, so advertisement and behavior agree.
             let reject = expect_reject(
                 tool.call(capability_id, "peer-driver", missing).await,
                 &format!("{capability_id}: argument without {member}"),
@@ -735,7 +733,6 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
         }
     }
 
-    // why: the provider refuses `cognition_filter`, so the served shape does not advertise it either.
     let recall = tool
         .descriptors()
         .into_iter()
@@ -975,7 +972,6 @@ async fn adoption_tool() -> (TempDir, AdoptionTool) {
     for (collection, entry_id) in [
         ("shared", "ke_shared"),
         ("shared", "ke_occupant"),
-        // the destination holds an entry this adoption does not own under the source's id.
         ("wren", "ke_occupant"),
     ] {
         let mut seeded = entry();
@@ -1185,8 +1181,6 @@ async fn adoption_refusals_carry_no_raw_diagnostics() {
         "{reject:?}"
     );
 
-    // why: a stored payload the store cannot decode fails the source read itself, which is the
-    // storage fault whose decoder text must not travel.
     sqlx::query(
         "UPDATE knowledge_entries SET payload = 'not an entry' \
          WHERE collection = 'shared' AND entry_id = 'ke_shared'",
@@ -1241,7 +1235,6 @@ impl std::io::Write for ClosedSink {
 fn an_unwritable_fault_diagnostic_still_yields_the_refusal() {
     let attempts = Rc::new(Cell::new(0));
     let reject = adoption_fault(ClosedSink(Rc::clone(&attempts)), "store", "boom");
-    // why: the refusal alone also holds for a handler that never offers the diagnostic to the sink.
     assert!(
         attempts.get() > 0,
         "the fault diagnostic was never offered to the host sink: {reject:?}"

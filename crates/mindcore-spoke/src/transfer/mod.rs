@@ -119,8 +119,6 @@ pub(crate) async fn build(
     }
 
     let grants = repository.list_grants(tx, &spec.space_id, None).await?;
-    // A receipt row carries no subject or placement, so only a whole-space export
-    // can summarize the space's receipts.
     let receipts = if spec.subject_id.is_none() {
         repository.receipt_summaries(tx, &spec.space_id).await?
     } else {

@@ -308,8 +308,6 @@ pub(crate) fn profile_document_has_content(document: &Value) -> bool {
     }
 }
 
-// contract §6.7 advisory class, §9 ranking — content policy
-
 /// §6.7 advisory classification of a capture; the reviewer stays authoritative.
 pub(crate) struct Classification {
     pub(crate) disposition: &'static str,

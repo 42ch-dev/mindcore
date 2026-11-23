@@ -49,8 +49,6 @@ fn subject_scoped<'a>(capability: &'a str, subject_id: &'a str) -> GrantRequirem
 }
 
 impl MemoryAdapter {
-    // contract §7.1 describe
-
     pub async fn describe(
         &self,
         _tx: &mut Tx<'_>,
@@ -64,8 +62,6 @@ impl MemoryAdapter {
         let _request: MemoryDescribeRequest = wire::decode(&raw, "memory.describe request")?;
         Self::ready::<MemoryDescribeResponse>(policy::describe_body(self.reflections))
     }
-
-    // contract §7.2 spaces.list
 
     pub async fn list_spaces(
         &self,
@@ -141,8 +137,6 @@ impl MemoryAdapter {
         policy::verify_cursor(claimed.as_deref(), &marker)?;
         Self::ready::<MemorySpacesListResponse>(body)
     }
-
-    // contract §7.3/§7.4 space status
 
     pub async fn freeze_space(
         &self,
@@ -286,8 +280,6 @@ impl MemoryAdapter {
         Ok(MemoryStage::Ready(project::receipt_body(&receipt)))
     }
 
-    // contract §7.5 subjects.ensure
-
     pub async fn ensure_subject(
         &self,
         tx: &mut Tx<'_>,
@@ -307,8 +299,6 @@ impl MemoryAdapter {
             wire::decode(&raw, "memory.subjects.ensure request")?;
         let principal_id = principal_id(principal);
         let subject_id = request.subject_id.as_str();
-        // contract §7.0.5 — the one keyless op, so its receipt never replays and always
-        // records its own outcome.
         let op = Self::op(
             request.space_id.as_str(),
             principal_id,
@@ -361,8 +351,6 @@ impl MemoryAdapter {
         Self::ready::<MemorySubjectsEnsureResponse>(project::receipt_body(&receipt))
     }
 
-    // contract §7.6 subjects.get
-
     pub async fn get_subject(
         &self,
         tx: &mut Tx<'_>,
@@ -384,7 +372,6 @@ impl MemoryAdapter {
         admission::space(&self.repository, tx, &space).await?;
         let subject_id = request.subject_id.as_str();
         let rows = admission::grants(&self.repository, tx, &space).await?;
-        // contract §7.6/S-4 — no live grant on the subject hides the subject entirely.
         if !admission::any_grant_for_subject(
             &rows,
             principal_id,
@@ -392,8 +379,6 @@ impl MemoryAdapter {
             subject_id,
             Utc::now(),
         ) {
-            // contract §7.6/S-4 — no coverage is `NOT_AUTHORIZED` before the row is read,
-            // so a revoked or expired grant cannot disclose the subject either.
             return Err(Reject::not_authorized(format!(
                 "principal {principal_id} holds no live grant on subject {subject_id}"
             )));
@@ -403,8 +388,6 @@ impl MemoryAdapter {
         };
         Self::ready::<MemorySubjectsGetResponse>(json!({ "subject": project::subject_body(&row) }))
     }
-
-    // contract §7.7 subjects.fence
 
     pub async fn fence_subject(
         &self,
@@ -506,8 +489,6 @@ impl MemoryAdapter {
         Self::ready::<MemorySubjectsFenceResponse>(project::receipt_body(&receipt))
     }
 
-    // contract §7.8 grants.list
-
     pub async fn list_grants(
         &self,
         tx: &mut Tx<'_>,
@@ -550,7 +531,6 @@ impl MemoryAdapter {
         let applied = if admin {
             requested
         } else {
-            // contract §7.8 — a non-admin sees exactly its own grants and nothing else.
             if !rows.iter().any(|row| {
                 row.principal_id.as_str() == principal_id && admission::live_grant(row, now)
             }) {
@@ -607,8 +587,6 @@ impl MemoryAdapter {
             json!({ "grants": bodies, "next_cursor": next_cursor }),
         )
     }
-
-    // contract §7.9 grants.grant
 
     pub async fn grant(
         &self,
@@ -704,8 +682,6 @@ impl MemoryAdapter {
         self.repository.insert_receipt(tx, &receipt, None).await?;
         Self::ready::<MemoryGrantsGrantResponse>(project::receipt_body(&receipt))
     }
-
-    // contract §7.10 grants.revoke
 
     pub async fn revoke_grant(
         &self,

@@ -43,7 +43,6 @@ fn database_path(label: &str) -> PathBuf {
     ))
 }
 
-// why: WAL leaves siblings next to the database; a rerun must start from an empty store.
 fn remove_database(path: &Path) {
     let _ = std::fs::remove_file(path);
     for suffix in ["-wal", "-shm"] {
@@ -53,7 +52,6 @@ fn remove_database(path: &Path) {
     }
 }
 
-// note: a second pool on the same file, so a test can hold SQLite's write reservation without writing.
 async fn second_connection(path: &Path) -> SqlitePool {
     SqlitePoolOptions::new()
         .max_connections(1)
@@ -66,7 +64,6 @@ async fn second_connection(path: &Path) -> SqlitePool {
         .expect("open second connection")
 }
 
-// note: a connection enforcing foreign keys the way `MindStore::open` configures the production pool.
 async fn foreign_keys_connection(path: &Path) -> SqlitePool {
     SqlitePoolOptions::new()
         .max_connections(1)
@@ -156,7 +153,6 @@ fn cognition_entry(entry_id: &str, summary: &str, records: Vec<Value>) -> Knowle
     entry
 }
 
-// note: one current-view belief record held by `holder`: the shape a dedicated append accepts.
 fn belief(holder: &str, record_id: &str) -> Value {
     json!({
         "kind": "belief",
@@ -558,8 +554,6 @@ async fn update_keeps_the_stored_creation_instant_in_the_payload() {
     );
     expect_ok(port.put_knowledge_entry(submitted, None).await, "create");
 
-    // why: the update submits a fresher creation instant. The row column keeps the
-    // original, so the committed payload must carry that original too.
     let mut update = entry_with("ke_gate", "closed from dusk to dawn");
     update.created_at = Some("2026-03-04T05:06:07Z".parse().expect("valid RFC 3339"));
     let updated = expect_ok(port.put_knowledge_entry(update, Some(1)).await, "update");
@@ -637,7 +631,6 @@ async fn stale_update_is_refused_without_change() {
         SpokeRejectCode::StoredRevisionStale
     );
 
-    // why: an update aimed at an absent row is stale too, not a create.
     let absent = port
         .put_knowledge_entry(entry_with("ke_missing", "never written"), Some(1))
         .await;
@@ -645,7 +638,6 @@ async fn stale_update_is_refused_without_change() {
         expect_reject(absent, "update of absent entry"),
         SpokeRejectCode::StoredRevisionStale
     );
-    // why: a refusal must leave no row behind.
     let absent_get = port.get_knowledge_entry("ke_missing").await;
     assert_eq!(
         expect_reject(absent_get, "get of absent entry"),
@@ -717,7 +709,6 @@ async fn cross_handle_cas_lets_exactly_one_writer_win() {
     };
     assert_eq!(winner.revision, Some(2));
 
-    // why: both handles must see the winner's payload and revision, never the loser's.
     for port in [&left, &right] {
         let fetched = expect_ok(port.get_knowledge_entry("ke_gate").await, "get");
         assert_eq!(as_json(&fetched), as_json(&winner));
@@ -741,7 +732,6 @@ async fn cross_handle_cas_lets_exactly_one_writer_win() {
 async fn put_takes_the_write_reservation_before_the_claim_read() {
     let path = database_path("reservation");
     let store = MindStore::open(&path).await.expect("open store");
-    // why: the tested port never waits: contention must fail at begin, not after a timeout.
     let port = ScopedKnowledgeStore::new(
         SqlitePoolOptions::new()
             .max_connections(1)
@@ -755,8 +745,6 @@ async fn put_takes_the_write_reservation_before_the_claim_read() {
         KnowledgeScope::new("wren"),
     );
 
-    // note: a held write reservation that writes nothing: the put below can only fail at `BEGIN
-    // IMMEDIATE` if the reservation is taken before the claim read.
     let holder = second_connection(&path).await;
     let reservation = holder
         .begin_with("BEGIN IMMEDIATE")
@@ -784,7 +772,6 @@ async fn put_takes_the_write_reservation_before_the_claim_read() {
         reject.message
     );
 
-    // why: the refused put wrote no row: the collection is still empty.
     assert!(expect_ok(port.list_entries().await, "list after refused put").is_empty());
 
     reservation
@@ -874,7 +861,6 @@ async fn list_entries_is_scoped_and_ordered() {
     let wren = store.knowledge(KnowledgeScope::new("wren"));
     let studio = store.knowledge(KnowledgeScope::new("studio"));
 
-    // why: insertion order is the reverse of the expected result order.
     for (entry_id, summary) in [
         ("ke_zulu", "Wren mill lane"),
         ("ke_alpha", "Wren north gate"),
@@ -926,7 +912,6 @@ fn adoption_anchor_shape() {
     assert!(anchor.label.is_none());
     assert!(anchor.mime_type.is_none());
 
-    // note: the shared fixture is the pinned wire shape the anchor points back to.
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../fixtures/iteration-01/shared-collection.json"
     ))
@@ -950,7 +935,6 @@ async fn a_create_saves_no_preimage() {
             .await,
         "create a module-less entry",
     );
-    // why: a create carrying a record only patches the head: nothing is displaced.
     expect_ok(
         port.put_knowledge_entry(
             cognition_entry(
@@ -1167,8 +1151,6 @@ async fn a_refused_or_rolled_back_write_leaves_no_preimage() {
         SpokeRejectCode::StoredRevisionStale
     );
 
-    // why: a write that succeeded inside the caller's transaction, then rolled back, leaves nothing —
-    // including the record row of the new suffix it submitted.
     let mut tx = writer
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -1276,7 +1258,6 @@ async fn every_assigned_revision_replays_the_dto_it_observed() {
         );
     }
 
-    // why: head truncation — each replay carries only the records committed at that revision.
     let at_three = expect_ok(
         port.get_entry_at_revision("ke_gate", 3).await,
         "replay revision 3",
@@ -1288,7 +1269,6 @@ async fn every_assigned_revision_replays_the_dto_it_observed() {
     );
     assert_eq!(record_ids(&at_four), ["cog_first", "cog_second"]);
 
-    // why: replaying the live revision agrees with the current read.
     let current = expect_ok(port.get_knowledge_entry("ke_gate").await, "current");
     let replayed_current = expect_ok(
         port.get_entry_at_revision("ke_gate", 5).await,
@@ -1394,8 +1374,6 @@ async fn replay_keeps_the_other_members_when_the_first_append_added_records() {
     let port = store.knowledge(KnowledgeScope::new("wren"));
     let writer = second_connection(&path).await;
 
-    // why: the write path rejects a cognition module without `records`, so only that pre-append
-    // envelope is seeded; the record row and its shape come from the real append path.
     let world_facts = json!([{"kind": "world_fact", "world_fact_id": "wf_gate"}]);
     let extensions = json!({"mindcore_test": {"viewpoint": "studio"}});
     let mut live = entry_with("ke_gate", "closed after dusk");
@@ -1463,9 +1441,6 @@ async fn replay_refuses_a_gap_its_append_metadata_contradicts() {
     let port = store.knowledge(KnowledgeScope::new("wren"));
     let seed = second_connection(&path).await;
 
-    // why: live revision 3 with head 2 and no saved revision 2: revision 2 is reachable only through a
-    // dedicated append at position 2, yet the row there was committed by a full put, which always
-    // saves its preimage. The store contradicts itself, so the gap is not replayable.
     let mut live = cognition_entry("ke_gate", "current", Vec::new());
     live.revision = Some(3);
     sqlx::query(
@@ -1519,9 +1494,6 @@ async fn replay_refuses_a_fractional_position_masking_a_missing_one() {
     let port = store.knowledge(KnowledgeScope::new("wren"));
     let seed = second_connection(&path).await;
 
-    // note: a gap of two that a count accepts: position 2 is missing, yet a classified fractional row at
-    // 1.5 sits inside the crossed interval alongside position 3, which the head points at. The
-    // positions, not their number, decide whether the interval is a run of dedicated appends.
     let mut live = cognition_entry("ke_gate", "current", Vec::new());
     live.revision = Some(4);
     sqlx::query(
@@ -1583,9 +1555,6 @@ async fn replay_refuses_a_fractional_position_beside_every_expected_one() {
     let port = store.knowledge(KnowledgeScope::new("wren"));
     let seed = second_connection(&path).await;
 
-    // note: every crossed position is present and classified — 1 and 2, with the head at 2 — and a
-    // classified fractional row at 1.5 sits inside the same interval. A row that is not one of
-    // the crossed positions contradicts the gap, so the interval is not a run of dedicated appends.
     let mut live = cognition_entry("ke_gate", "current", Vec::new());
     live.revision = Some(3);
     sqlx::query(
@@ -1654,7 +1623,6 @@ async fn an_exhausted_revision_space_is_refused_before_any_write() {
             .await,
         "create",
     );
-    // note: the last storable revision — the next one is not representable in the revision column.
     sqlx::query(
         "UPDATE knowledge_entries SET revision = ? \
          WHERE collection = 'wren' AND entry_id = 'ke_gate'",
@@ -1729,8 +1697,6 @@ async fn deleting_a_headless_parent_with_history_is_refused() {
     let port = store.knowledge(KnowledgeScope::new("wren"));
     let enforcing = foreign_keys_connection(&path).await;
 
-    // note: a headless entry — no record row references it, so only the preimage key can refuse the
-    // delete — the non-cascading foreign key D11 declares.
     expect_ok(
         port.put_knowledge_entry(entry_with("ke_gate", "first"), None)
             .await,
@@ -1804,8 +1770,6 @@ async fn supersede_marks_only_the_source_and_saves_its_preimage() {
     );
     assert_eq!(stored_revision(&reader, "ke_old_gate").await, 2);
 
-    // why: only the marker, the revision and the store instant move: the payload keeps every field with
-    // the advanced DTO revision, and the cognition history is untouched.
     let marked: KnowledgeEntry =
         serde_json::from_str(&stored_payload(&reader, "ke_old_gate").await)
             .expect("the marked payload is an entry");
@@ -1818,7 +1782,6 @@ async fn supersede_marks_only_the_source_and_saves_its_preimage() {
     assert_eq!(record_rows(&reader, "ke_old_gate").await, records);
     assert!(stored_updated_at(&reader, "ke_old_gate").await > source_written_at);
 
-    // why: the revision trigger captures the displaced preimage, exactly as it does for a full put.
     let saved = revision_rows(&reader, "ke_old_gate").await;
     assert_eq!(saved.len(), 1, "marking saves one preimage");
     assert_eq!(saved[0].0, 1);
@@ -1832,7 +1795,6 @@ async fn supersede_marks_only_the_source_and_saves_its_preimage() {
         "the preimage carries the instant the replaced state was written"
     );
 
-    // why: the target is not written at all.
     assert_eq!(stored_marker(&reader, "ke_new_gate").await, None);
     assert_eq!(stored_revision(&reader, "ke_new_gate").await, 1);
     assert_eq!(stored_payload(&reader, "ke_new_gate").await, target_payload);
@@ -1908,7 +1870,6 @@ async fn supersede_refusals_change_neither_row() {
     assert_eq!(stored_state(&reader, "ke_target").await, target);
     assert_eq!(stored_state(&reader, "ke_retired").await, retired);
 
-    // why: a cycle cannot close on write — once the source is marked, the reverse names it as a target.
     expect_ok(
         supersede(&port, "ke_source", 1, "ke_target").await,
         "mark the source",
@@ -1981,7 +1942,6 @@ async fn a_superseded_entry_refuses_puts_and_appends() {
         SpokeRejectCode::InvalidInput
     );
 
-    // why: a dedicated append refuses the marked carrier before any record row is written.
     let mut tx = reader
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -2028,8 +1988,6 @@ async fn a_failed_supersede_leaves_no_marker() {
             .await,
         "create the target",
     );
-    // why: a preimage already occupies the revision the trigger would save, so the update fails after
-    // both ids were accepted — the one failure that runs past every refusal.
     sqlx::query(
         "INSERT INTO knowledge_entry_revisions \
          (collection, entry_id, revision, payload, cognition_head_seq, recorded_at) \
@@ -2071,7 +2029,6 @@ async fn the_supersede_cas_reads_the_stored_revision_column() {
             .await,
         "create the target",
     );
-    // note: stored drift — the column sits at revision 2 while the payload still claims revision 1.
     let mut drifted = entry_with("ke_drift", "the gate was closed");
     drifted.revision = Some(1);
     let payload = serde_json::to_string(&drifted).expect("entry serializes");
@@ -2147,7 +2104,6 @@ async fn default_reads_and_the_list_hide_a_superseded_entry() {
         "mark the middle entry superseded",
     );
 
-    // why: the default read hides the marked row behind the one local absence.
     match port.get_knowledge_entry("ke_mid").await {
         SpokeResult::Ok(value) => {
             panic!("default read of a superseded entry returned {value:?}")
@@ -2162,7 +2118,6 @@ async fn default_reads_and_the_list_hide_a_superseded_entry() {
         }
     }
 
-    // why: the list keeps its order and statement shape and simply omits the marked row.
     let listed = expect_ok(port.list_entries().await, "list with one marked entry");
     let ids: Vec<&str> = listed.iter().map(|entry| entry.entry_id.as_str()).collect();
     assert_eq!(ids, ["ke_alpha", "ke_zulu"]);
@@ -2183,7 +2138,6 @@ async fn default_reads_and_the_list_hide_a_superseded_entry() {
         Some("north gate")
     );
 
-    // why: the shared transaction projection and the carrier header read are the same default view.
     let mut tx = reader.begin().await.expect("begin read");
     let shared = expect_ok(
         mindcore_sqlite::list_entries_in(&mut tx, "wren").await,
@@ -2208,7 +2162,6 @@ async fn default_reads_and_the_list_hide_a_superseded_entry() {
     );
     assert_eq!(live.revision, 1);
 
-    // why: explicit revision replay stays independent: the history it addresses does not move.
     let replayed = expect_ok(
         port.get_entry_at_revision("ke_mid", 1).await,
         "replay of the superseded entry",
@@ -2425,8 +2378,6 @@ async fn a_cycle_in_stored_markers_is_a_storage_failure() {
             "seed the cyclic pair",
         );
     }
-    // why: marking cannot close a cycle; corrupt stored data can, and the resolver must fail rather
-    // than return a partial chain.
     for (entry_id, successor) in [("ke_cycle_a", "ke_cycle_b"), ("ke_cycle_b", "ke_cycle_a")] {
         sqlx::query(
             "UPDATE knowledge_entries SET superseded_by = ? \
@@ -2496,7 +2447,6 @@ async fn the_list_bound_counts_live_rows() {
     );
     assert_eq!(listed[0].entry_id, "ke_0001", "the order is unchanged");
 
-    // why: retirement freed the budget: the stored row now sits past the bound while the live set fits.
     let mut tx = reader
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -2527,7 +2477,6 @@ async fn the_list_bound_counts_live_rows() {
         "the order is unchanged"
     );
 
-    // why: the bound still refuses a live set one row past it.
     let mut tx = reader
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -2595,7 +2544,6 @@ async fn the_marker_foreign_key_binds_successors_to_the_same_collection() {
         "seed the other collection",
     );
 
-    // why: a direct write naming a successor that exists only in another collection fails.
     let foreign = sqlx::query(
         "UPDATE knowledge_entries SET superseded_by = 'ke_studio' \
          WHERE collection = 'wren' AND entry_id = 'ke_source'",
@@ -2611,7 +2559,6 @@ async fn the_marker_foreign_key_binds_successors_to_the_same_collection() {
     );
     assert_eq!(stored_marker(&enforcing, "ke_source").await, None);
 
-    // why: after a valid mark, the referenced successor cannot be deleted: no cascade removes it.
     expect_ok(
         supersede(&port, "ke_source", 1, "ke_target").await,
         "mark the source",
@@ -2760,13 +2707,11 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
         "the copy's cognition history is an explicit empty array, not a dropped member"
     );
 
-    // why: the source is only ever read: payload and revision are byte-identical afterwards.
     assert_eq!(
         stored_row(&reader, "shared", shared_id).await,
         source_before
     );
 
-    // why: the source advances; the copy's identity stays the revision its anchor recorded.
     let mut advanced = shared;
     advanced.body.summary = Some("The north gate reopens at dawn.".to_string());
     let advanced = expect_ok(
@@ -2775,7 +2720,6 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
     );
     assert_eq!(advanced.revision, Some(2));
 
-    // why: a repeat at the adopted revision is idempotent; the source's newer revision is not this copy.
     let repeat = match expect_ok(
         adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
         "repeat at the adopted revision",
@@ -2793,7 +2737,6 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
         SpokeRejectCode::RevisionConflict
     );
 
-    // why: a request naming neither revision is a conflict, never a second write.
     assert_eq!(
         expect_reject(
             adopt_knowledge_entry(&src, &dst, shared_id, 3).await,
@@ -2802,7 +2745,6 @@ async fn adoption_writes_one_anchored_copy_and_returns_it_on_repeat() {
         SpokeRejectCode::RevisionConflict
     );
 
-    // why: no repeat refreshed or rewrote the copy, and only that one row exists.
     assert_eq!(stored_row(&reader, "wren", shared_id).await.0, 1);
     let rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM knowledge_entries WHERE collection = 'wren' AND entry_id = ?",
@@ -2851,8 +2793,6 @@ async fn adoption_answers_generic_absence_when_the_adopted_source_is_superseded(
     );
     let copy_before = stored_row(&reader, "wren", shared_id).await;
 
-    // why: the source gate runs before the repeat path: an adopted source that is now hidden answers
-    // the same generic absence as a missing one, and the stored copy stays exactly as adopted.
     expect_source_absent(
         adopt_knowledge_entry(&src, &dst, shared_id, 1).await,
         "a repeat whose source turned superseded",
@@ -2944,7 +2884,6 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
         "seed the source",
     );
 
-    // why: an unrelated occupant of the exact key is a conflict, never overwritten.
     let occupant = expect_ok(
         dst.put_knowledge_entry(entry_with("ke_shared_gate", "wren's own note"), None)
             .await,
@@ -2965,7 +2904,6 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
         as_json(&occupant)
     );
 
-    // why: a legacy anchor without a recorded revision is still not this adoption.
     expect_ok(
         src.put_knowledge_entry(entry_with("ke_legacy_gate", "shared fact"), None)
             .await,
@@ -2994,7 +2932,6 @@ async fn adoption_never_overwrites_a_destination_occupant_or_adopts_a_stale_revi
         as_json(&legacy)
     );
 
-    // why: an absent slot with a stale expectation is a revision conflict and stays empty.
     expect_ok(
         src.put_knowledge_entry(entry_with("ke_fresh_gate", "shared fact"), None)
             .await,
@@ -3046,8 +2983,6 @@ async fn adoption_answers_occupancy_for_a_superseded_destination_occupant() {
     );
     let occupant_before = stored_state(&reader, "ke_shared_gate").await;
 
-    // why: the live read hides the marked row, but the slot is occupied — a superseded occupant answers
-    // the same occupancy refusal as any unrelated one, and it is never overwritten.
     match adopt_knowledge_entry(&src, &dst, "ke_shared_gate", 1).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
@@ -3076,13 +3011,6 @@ async fn adoption_propagates_a_create_refusal_that_names_no_occupant() {
     let store = MindStore::open(&path).await.expect("open store");
     let dst = store.knowledge(KnowledgeScope::new("wren"));
 
-    // why: a source whose cognition module is otherwise valid but whose `records` member is present and
-    // not an array. Only a port double can hand adoption that shape: a stored row is read back with
-    // `records` projected from the record rows. Only the narrowed branch leaves the member
-    // untouched, so the destination gate refuses the copy and that plain `InvalidInput` must
-    // surface as itself: only the adapter's structured superseded detail means occupancy. The
-    // pre-fix unconditional replacement would mask the member as `[]`, the copy would validate, and
-    // the adoption would commit — which this test rejects.
     let mut broken = cognition_entry("ke_broken_carrier", "shared fact", Vec::new());
     broken.revision = Some(1);
     let Some(KnowledgeEntryModulesValue::Object(module)) =
@@ -3175,8 +3103,6 @@ impl KnowledgeEntryPort for GatedDestination {
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound
         );
-        // why: only this port's first absent read reports; both reports must be in before either side
-        // may reach its create.
         if absent && !self.saw_empty.swap(true, Ordering::SeqCst) {
             self.first_absent.wait().await;
         }
@@ -3203,8 +3129,6 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
     let right_src = right_store.knowledge(KnowledgeScope::new("shared"));
     let left_dst = left_store.knowledge(KnowledgeScope::new("wren"));
     let right_dst = right_store.knowledge(KnowledgeScope::new("wren"));
-    // why: one rendezvous for both ports — a side leaves its first absent read only once its peer has
-    // reported the same absence, so neither create can precede the other read.
     let first_absent = Arc::new(Barrier::new(2));
     let left_gated = GatedDestination::new(
         left_store.knowledge(KnowledgeScope::new("wren")),
@@ -3224,8 +3148,6 @@ async fn two_handles_adopt_one_copy_and_agree_on_it() {
         "seed the source",
     );
 
-    // why: both destination reads see the empty slot before either write starts, so the create that
-    // loses the claim can only answer `AlreadyPresent` through the post-conflict re-read.
     let (left, right) = tokio::join!(
         adopt_knowledge_entry(&left_src, &left_gated, shared_id, 1),
         adopt_knowledge_entry(&right_src, &right_gated, shared_id, 1),

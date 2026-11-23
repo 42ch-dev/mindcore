@@ -119,14 +119,11 @@ impl Embedder for BoundaryEmbedder {
         match self.side_effect {
             SideEffect::None => {}
             SideEffect::RevokeGrant => revoke_recall_grant(&self.pool).await,
-            // why: a cold recall embeds the query first and its record batch second,
-            // so the second call is where the grant is revoked.
             SideEffect::RevokeGrantOnRecordBatch if call == 1 => {
                 revoke_recall_grant(&self.pool).await
             }
             SideEffect::RevokeGrantOnRecordBatch => {}
             SideEffect::RevokeKnowledgeGrant => {
-                // why: only the knowledge admission is revoked; the recall grant stays live.
                 sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = ?")
                     .bind(NOW)
                     .bind("grt_knowledge")
@@ -145,8 +142,6 @@ impl Embedder for BoundaryEmbedder {
                     .execute(&self.pool)
                     .await
                     .expect("bump the record revision");
-                // why: the moved page's row carries the new revision but cannot be
-                // decoded: a probe of the new revision is a storage error.
                 sqlx::query(
                     "UPDATE memory_embedding_vectors \
                      SET record_revision = record_revision + 1, vector = X'0000C07F00000000' \
@@ -690,8 +685,6 @@ async fn one_recall_page_is_packed_whole_with_its_provenance() {
         .await
         .expect("pack");
 
-    // why: the SPOKE budget cut the page to two items; the workflow never asks for
-    // a second page.
     assert_eq!(record_ids(&pack), ["rec_a", "rec_b"]);
     let spoke_schemas::RetainedRecord::LiveRecord(first) = &pack.records[0] else {
         panic!("expected a live record");
@@ -1073,8 +1066,6 @@ async fn changed_revision_during_provider_work_refuses_the_pack() {
 #[tokio::test]
 async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
     let harness = Harness::open().await;
-    // why: `recall` is a memory capability; it admits no knowledge read, so the slot stays empty
-    // while the memory pack the grant does authorize is released.
     harness.grant(&["recall"]).await;
     harness
         .record(
@@ -1112,7 +1103,6 @@ async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
 #[tokio::test]
 async fn an_unrouted_principal_recalls_with_an_empty_slot() {
     let harness = Harness::open().await;
-    // why: the reader's own memory admission is complete; only another principal is routed.
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
     harness
@@ -1264,7 +1254,6 @@ async fn promote_settles_one_record_and_consumes_the_candidate() {
         .root
         .join(format!("records/{}.md", record_ids[0]))
         .exists());
-    // why: the seeded record is untouched.
     assert_eq!(
         harness
             .stored_record("rec_gate")
@@ -1318,7 +1307,6 @@ async fn update_replaces_the_target_in_place_and_consumes_the_candidate() {
             .expect("updated record"),
         (2, "the north gate is closed at dusk".to_string())
     );
-    // why: one record in place, no second record minted, and the candidate consumed.
     assert_eq!(harness.count_from("memory_records").await, 1);
     assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
     assert_eq!(
@@ -1382,7 +1370,6 @@ async fn dismiss_drops_the_candidate_without_a_record() {
         (1, "the north gate is closed".to_string())
     );
 
-    // why: replaying the same capture reports the same drop and writes nothing more.
     let replay = workflows
         .absorb(
             &principal(),
@@ -1479,8 +1466,6 @@ async fn stale_target_revision_rejects_without_a_second_write() {
         panic!("expected a settlement refusal, got {error:?}");
     };
     assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
-    // why: the reasoner's bump is the only change; the update and the dismissal
-    // both rolled back with the staging transaction.
     assert_eq!(
         harness
             .stored_record("rec_gate")
@@ -1537,8 +1522,6 @@ async fn default_policy_leaves_the_candidate_pending() {
             .await,
         0
     );
-    // why: no settlement intent — the held decision is one applied, target-free
-    // marker that names the candidate it left pending.
     assert_eq!(
         harness
             .count_from("memory_journal WHERE op <> 'mindcore.absorb.decision'")
@@ -1594,8 +1577,6 @@ async fn absent_reasoner_matches_deterministic_capture() {
 #[tokio::test]
 async fn a_capture_only_principal_absorbs_a_pending_candidate() {
     let harness = Harness::open().await;
-    // why: capture admission only — reading the candidate back needs `review`, and
-    // the evidence page needs `recall`.
     harness.grant(&["capture"]).await;
     let workflows = harness.absorb_binding();
 
@@ -1696,8 +1677,6 @@ async fn replay_of_an_update_reports_the_record_it_settled() {
         .await
         .expect("replayed absorb");
 
-    // why: the dismissal consumes the candidate without a record id; the replay
-    // reads the update leg's own receipt instead of reporting a drop.
     assert_eq!(replay, first);
     assert!(matches!(
         replay.as_slice(),
@@ -1760,8 +1739,6 @@ async fn no_reasoner_replay_reports_the_recorded_outcome() {
 #[tokio::test]
 async fn a_capture_only_replay_of_a_pending_capture_reports_pending() {
     let harness = Harness::open().await;
-    // why: capture authority only — the caller never held the recall or review grant
-    // an absorb decision reads back through.
     harness.grant(&["capture"]).await;
     let workflows = harness.absorb_binding();
     let request = capture("cap_capture_only", "the north gate is closed at dusk");
@@ -1775,9 +1752,6 @@ async fn a_capture_only_replay_of_a_pending_capture_reports_pending() {
         [AbsorbCandidateOutcome::Pending { .. }]
     ));
 
-    // why: the identical retry replays the capture receipt — the recorded run left the
-    // candidate pending, and the caller holds the receipt that names it, so the
-    // replay reports that state without demanding review or recall grants.
     let replay = workflows
         .absorb(&principal(), &request, None, &MindCapabilities::default())
         .await
@@ -1827,8 +1801,6 @@ async fn a_changed_non_target_citation_refuses_the_settlement() {
         panic!("expected a settlement refusal, got {error:?}");
     };
     assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
-    // why: neither settlement effect was staged — the target, the candidate and the
-    // journal are exactly what the failed run found.
     assert_eq!(
         harness
             .stored_record("rec_wall")
@@ -1871,7 +1843,6 @@ async fn a_citation_that_loses_its_admission_refuses_the_settlement() {
         .await
         .expect_err("an unauthorized citation must not settle");
 
-    // contract §7.17 — the revoked record reads as absent rather than admitted.
     let SpiError::Settlement(reject) = error else {
         panic!("expected a settlement refusal, got {error:?}");
     };
@@ -1923,7 +1894,6 @@ async fn a_binding_without_a_publisher_refuses_before_staging_anything() {
         assert!(matches!(error, SpiError::InvalidInput(_)));
     }
 
-    // why: the refusal is a normal input error with no write at all.
     assert_eq!(
         harness
             .stored_record("rec_gate")
@@ -1950,7 +1920,6 @@ async fn a_binding_without_a_publisher_refuses_before_staging_anything() {
 #[tokio::test]
 async fn a_publisher_that_fails_after_staging_reports_an_uncertain_outcome() {
     let harness = granted_harness().await;
-    // why: the medium is installed and refuses after the intents were staged.
     let workflows = SpiMindWorkflows::new(
         MemoryWorkflowBinding::new(harness.pool.clone(), true).with_publisher(|_| {
             Err(SpiError::InvalidInput(
@@ -1984,8 +1953,6 @@ async fn a_publisher_that_fails_after_staging_reports_an_uncertain_outcome() {
     };
     assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
     assert_eq!(retry_class(&reject), Some("uncertain"));
-    // why: the staged intent is durable and unsettled — its receipt is the recovery
-    // identity, and the cause survives.
     let receipt: String =
         sqlx::query_scalar("SELECT receipt_id FROM memory_journal WHERE state = 'pending'")
             .fetch_one(&harness.pool)
@@ -1997,20 +1964,15 @@ async fn a_publisher_that_fails_after_staging_reports_an_uncertain_outcome() {
         "{}",
         reject.message
     );
-    // why: the staged promotion is durable and unconfirmed — the seeded record plus
-    // the one the pending intent would publish.
     assert_eq!(harness.count_from("memory_records").await, 2);
 }
 
 #[tokio::test]
 async fn a_settlement_that_cannot_begin_after_staging_reports_an_uncertain_outcome() {
     let harness = granted_harness().await;
-    // why: the publisher closes the pool, so the settlement transaction cannot open
-    // after the staging commit.
     let pool = harness.pool.clone();
     let workflows = SpiMindWorkflows::new(
         MemoryWorkflowBinding::new(pool.clone(), true).with_publisher(move |_| {
-            // note: marking the pool closed is eager; the returned future is dropped.
             let _closing = pool.close();
             Ok(())
         }),
@@ -2041,7 +2003,6 @@ async fn a_settlement_that_cannot_begin_after_staging_reports_an_uncertain_outco
     };
     assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
     assert_eq!(retry_class(&reject), Some("uncertain"));
-    // why: the staged intent is durable — its receipt is the recovery identity.
     let mut reader = SqliteConnection::connect_with(
         &SqliteConnectOptions::new().filename(harness.root.join("workflows.db")),
     )
@@ -2070,7 +2031,6 @@ async fn a_replay_never_settles_what_a_policy_left_pending() {
         &harness.pool,
     );
 
-    // why: the default policy holds every settlement, so the candidate stays pending.
     let held = workflows
         .absorb(
             &principal(),
@@ -2084,8 +2044,6 @@ async fn a_replay_never_settles_what_a_policy_left_pending() {
         .await
         .expect("held absorb");
 
-    // why: the replay runs under a policy that would settle it, over a reasoner that
-    // marks every call by bumping the record it read.
     let bumping = FixedReasoner::new(
         json!({ "action": "promote", "evidence_ids": [] }),
         &harness.pool,
@@ -2111,8 +2069,6 @@ async fn a_replay_never_settles_what_a_policy_left_pending() {
         replay.as_slice(),
         [AbsorbCandidateOutcome::Pending { .. }]
     ));
-    // why: the reasoner never ran again — the record it would have bumped and the
-    // promotion it would have written are both absent.
     assert_eq!(
         harness
             .stored_record("rec_gate")
@@ -2160,13 +2116,9 @@ async fn a_held_then_externally_resolved_capture_replays_as_pending() {
         "the held decision is recorded once"
     );
 
-    // note: a human resolves it outside absorb — the stand-alone adapter dismisses
-    // and settles the candidate.
     resolve_externally(&harness, candidate_id).await;
     assert_eq!(harness.candidate_status(candidate_id).await, "consumed");
 
-    // note: the host reopens and replays twice with an auto-settle policy available,
-    // over a reasoner that marks every call it receives.
     let reopened = harness.absorb_binding();
     let bumping = FixedReasoner::new(
         json!({ "action": "promote", "evidence_ids": [] }),
@@ -2191,8 +2143,6 @@ async fn a_held_then_externally_resolved_capture_replays_as_pending() {
         assert_eq!(replay, held, "the replay reports the original decision");
     }
 
-    // why: the replay decided and settled nothing — no reasoner or policy call, no
-    // review, no second marker and no new settlement.
     assert_eq!(
         harness
             .stored_record("rec_gate")
@@ -2246,8 +2196,6 @@ async fn a_marker_under_another_subject_fails_the_replay_closed() {
         [AbsorbCandidateOutcome::Pending { .. }]
     ));
 
-    // why: a row under the capture receipt that keeps its decision but names another
-    // subject cannot vouch for this caller's capture.
     sqlx::query(
         "UPDATE memory_journal SET subject_id = 'subj_other' \
          WHERE op = 'mindcore.absorb.decision'",
@@ -2280,7 +2228,6 @@ async fn a_repeated_recorded_decision_fails_the_replay_closed() {
         panic!("expected one held candidate, got {held:?}");
     };
 
-    // why: a repeated id is not the ordered set the capture receipt holds.
     rewrite_decision(
         &harness,
         json!({ "pending_candidate_ids": [candidate_id, candidate_id] }),
@@ -2310,8 +2257,6 @@ async fn an_empty_recorded_decision_fails_the_replay_closed() {
         panic!("expected one held candidate, got {held:?}");
     };
 
-    // why: an empty decision would fall back to the candidate's current state — after
-    // an external resolution that projects Dropped over a recorded Pending.
     resolve_externally(&harness, candidate_id).await;
     rewrite_decision(&harness, json!({ "pending_candidate_ids": [] })).await;
     let error = workflows
@@ -2337,12 +2282,8 @@ async fn a_marker_under_another_space_fails_the_replay_closed() {
     let [AbsorbCandidateOutcome::Pending { candidate_id }] = held.as_slice() else {
         panic!("expected one held candidate, got {held:?}");
     };
-    // why: resolved elsewhere — a replay that cannot vouch for the marker would
-    // project this resolution instead of refusing.
     resolve_externally(&harness, candidate_id).await;
 
-    // why: the receipt id is globally unique, so a row that keeps the decision but
-    // names another space is corruption, not a capture that never decided.
     sqlx::query(
         "UPDATE memory_journal SET space_id = 'spc_elsewhere' \
          WHERE op = 'mindcore.absorb.decision'",
@@ -2375,7 +2316,6 @@ async fn an_unexpected_decision_member_fails_the_replay_closed() {
         panic!("expected one held candidate, got {held:?}");
     };
 
-    // why: the repeat write refuses this shape, so the replay must refuse it too.
     rewrite_decision(
         &harness,
         json!({ "pending_candidate_ids": [candidate_id], "unexpected": true }),
@@ -2416,8 +2356,6 @@ async fn a_direct_capture_replay_projects_the_external_resolution() {
     resolve_externally(&harness, &candidate_id).await;
     assert_eq!(harness.candidate_status(&candidate_id).await, "consumed");
 
-    // why: no absorb run ever decided this capture, so no marker exists and the
-    // replay takes the pre-existing read-only projection of its resolution.
     let workflows = harness.absorb_binding();
     let bumping = FixedReasoner::new(
         json!({ "action": "promote", "evidence_ids": [] }),
@@ -2493,8 +2431,6 @@ async fn a_policy_rejection_revalidates_the_cited_evidence_it_consumes() {
         panic!("expected a settlement refusal, got {error:?}");
     };
     assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
-    // why: the drop never reached staging — the candidate is still pending and no
-    // review intent was journaled or settled.
     assert_eq!(
         harness
             .count_from("memory_candidates WHERE status = 'pending'")
@@ -2754,7 +2690,6 @@ fn long_timeout() -> std::time::Duration {
 
 #[tokio::test]
 async fn another_principal_cannot_write_the_bound_carrier() {
-    // why: a principal with no route never reaches a carrier, whatever grants it holds.
     let harness = deliberate_harness().await;
     let reasoner =
         DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
@@ -2808,11 +2743,9 @@ async fn deliberate_commits_a_cognition_record_onto_the_carrier() {
     };
     let (record, mind_state_version) = cases;
 
-    // why: the settled view descends from the committed carrier, not a draft.
     assert_eq!(mind_state_version, 2);
     let (revision, payload) = stored_carrier(&harness).await;
     assert_eq!(revision, 2);
-    // why: the payload keeps only the module envelope; the committed record lives in its own row.
     assert_eq!(payload["modules"]["cognition"]["records"], json!([]));
     let records = committed_records(&harness).await;
     assert_eq!(records.len(), 1);
@@ -2995,7 +2928,6 @@ async fn a_revoked_knowledge_grant_refuses_the_carrier_write() {
 
 #[tokio::test]
 async fn a_read_only_caller_refuses_the_carrier_write() {
-    // why: the read admission alone reaches the snapshot; it never authorizes the write.
     let harness = deliberate_harness().await;
     sqlx::query("DELETE FROM memory_grants WHERE grant_id = 'grt_carrier'")
         .execute(&harness.pool)
@@ -3408,8 +3340,6 @@ async fn a_revision_moved_during_the_warm_keeps_no_row() {
 #[tokio::test]
 async fn a_subject_withheld_during_the_warm_keeps_no_row() {
     let harness = granted_harness().await;
-    // why: the provider stages an unsettled intent while it runs, so the subject is
-    // withheld from the settlement's live read onwards — before the fill.
     let embedder = harness.embedder(SideEffect::PendingIntent);
 
     let outcomes = promote_with(
@@ -3705,7 +3635,6 @@ async fn a_cold_unavailable_query_leaves_a_pre_populated_table_untouched() {
         .await
         .expect("lexical pack");
 
-    // why: the adapter's own order for that query, read with no embedder at all.
     let lexical = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true))
         .recall_context(
             &principal(),
@@ -3726,8 +3655,6 @@ async fn a_cold_unavailable_query_leaves_a_pre_populated_table_untouched() {
 #[tokio::test]
 async fn an_embedder_free_recall_never_probes_the_vector_table() {
     let (harness, _workflows) = vector_page().await;
-    // why: with no embedder no statement may touch the table, so removing it leaves
-    // the recall working.
     sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
         .execute(&harness.pool)
         .await
@@ -3803,10 +3730,7 @@ async fn a_miss_batch_that_goes_unavailable_writes_nothing() {
 #[tokio::test]
 async fn a_withheld_read_with_a_warm_page_probes_nothing() {
     let (harness, workflows) = vector_page().await;
-    // note: warm both caches — the query slot and every page row.
     warm_page(&workflows, &AxisEmbedder::new("1")).await;
-    // why: any vector probe from here is a storage error, so a refusal that still
-    // probed could not be reported as the withheld guard.
     sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
         .execute(&harness.pool)
         .await
@@ -3846,8 +3770,6 @@ async fn a_withheld_read_with_a_warm_page_probes_nothing() {
 #[tokio::test]
 async fn a_subject_withheld_after_the_query_call_is_refused_before_any_probe() {
     let (harness, workflows) = vector_page().await;
-    // why: a vector probe from here is a storage error, so the refusal must be the
-    // withheld guard rebuilding admission after the query provider call.
     sqlx::raw_sql("DROP TABLE memory_embedding_vectors")
         .execute(&harness.pool)
         .await
@@ -3887,9 +3809,6 @@ async fn a_subject_withheld_after_the_query_call_is_refused_before_any_probe() {
 #[tokio::test]
 async fn a_refused_recall_keeps_no_query_vector() {
     let (harness, workflows) = vector_page().await;
-    // why: the grant is revoked while the record batch is embedded, so the final
-    // reauthorization refuses a recall whose query vector was already
-    // validated.
     let embedder = harness.embedder(SideEffect::RevokeGrantOnRecordBatch);
 
     let error = workflows
@@ -3941,8 +3860,6 @@ async fn a_refused_recall_keeps_no_query_vector() {
 #[tokio::test]
 async fn a_release_that_cannot_reserve_its_write_serves_nothing() {
     let (harness, _) = vector_page().await;
-    // why: the binding never waits, so contention must refuse at begin, not inside
-    // the fill after the reauthorization already ran.
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -3954,9 +3871,6 @@ async fn a_release_that_cannot_reserve_its_write_serves_nothing() {
         .expect("open zero-wait pool");
     let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(pool, true));
 
-    // why: another connection holds SQLite's write reservation with a revocation
-    // staged: the commit that would invalidate a deferred release
-    // transaction's read snapshot.
     let holder = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -4010,8 +3924,6 @@ async fn a_release_that_cannot_reserve_its_write_serves_nothing() {
         .expect("release the write reservation");
     holder.close().await;
 
-    // why: nothing was released and no query vector survived the refusal — a retry
-    // re-embeds its query.
     workflows
         .recall_context(
             &principal(),
@@ -4032,8 +3944,6 @@ async fn a_release_that_cannot_reserve_its_write_serves_nothing() {
 async fn a_moved_page_conflicts_before_its_stored_vector_is_read() {
     let (harness, workflows) = vector_page().await;
     warm_page(&workflows, &AxisEmbedder::new("1")).await;
-    // why: the query provider call moves every record and poisons the moved
-    // record's row at its new revision: a probe would fail to decode.
     let embedder = harness.embedder(SideEffect::MovePageAndPoisonVector);
 
     let error = workflows
@@ -4062,7 +3972,6 @@ async fn a_retired_identity_never_serves_another_partition() {
     let retired_embedder = AxisEmbedder::new("1");
     warm_page(&workflows, &retired_embedder).await;
 
-    // why: a new serving identity cannot hit the rows another one wrote.
     let other_engine =
         SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
     let other = AxisEmbedder::new("2");
@@ -4105,8 +4014,6 @@ async fn a_retired_identity_never_serves_another_partition() {
     );
     assert_eq!(harness.vector_rows().await.len(), 3);
 
-    // why: retirement also clears the identity's query slot — nothing the retired
-    // identity produced may be reused.
     workflows.retire_identity(&axes_identity("1"));
     let before = retired_embedder.embedded().len();
     warm_page(&workflows, &retired_embedder).await;
@@ -4121,7 +4028,6 @@ async fn a_retired_identity_never_serves_another_partition() {
         "a retired identity re-embeds its query and its missing rows"
     );
 
-    // why: retiring one identity leaves another identity's slot and rows warm.
     let before = other.embedded().len();
     other_engine.retire_identity(&axes_identity("1"));
     other_engine
@@ -4144,7 +4050,6 @@ async fn a_retired_identity_never_serves_another_partition() {
 async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
-    // note: rec_a and rec_c share their text, so the page carries a real tie.
     harness
         .record(
             "rec_a",
@@ -4198,7 +4103,6 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         "the tied pair keeps adapter order"
     );
 
-    // note: the components the fill wrote, read back through the store's own codec.
     let rows = harness.vector_rows().await;
     let stored: Vec<Vec<f32>> = page
         .iter()
@@ -4230,9 +4134,6 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         );
     }
 
-    // invariant: Task 3's parity evidence — the same page and fixed query must score bit for
-    // bit the same from fresh provider vectors and from the reloaded BLOBs, so a
-    // score change that happens to preserve order cannot slip through.
     let query_vector = axis_vector("north gate");
     let fresh_scores = mindcore_spi::workflows::scored_bits_for_test(
         &texts,
@@ -4247,9 +4148,6 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         "every item keeps its exact score bits once its vector is reloaded"
     );
 
-    // why: a second engine starts with a cold query slot — every record vector it
-    // scores comes back through the stored BLOB, and it serves exactly the
-    // page those scores dictate.
     let reloaded_engine =
         SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
     let reloaded = reloaded_engine

@@ -86,7 +86,6 @@ impl MindStore {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
-            // why: cap the busy-handler wait; paths that bypass it can return SQLITE_BUSY sooner.
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

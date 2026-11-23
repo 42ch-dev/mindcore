@@ -299,11 +299,7 @@ impl AdoptionTool {
     }
 
     async fn adopt(&self, principal: &Principal, arguments: Value) -> SpokeResult<Value> {
-        // why: routing is this tool's authorization, so it is answered before the payload is looked
-        // at: an unrouted principal learns nothing about the arguments, well-formed or not.
         let Some(destination) = self.routes.get(principal.principal_id.as_str()) else {
-            // why: target-free — a caller never learns whether another principal holds a route, so no
-            // message names a collection or a principal.
             return spoke_reject(
                 SpokeRejectCode::NotAuthorized,
                 "principal has no workflow knowledge route",
@@ -312,8 +308,6 @@ impl AdoptionTool {
         };
         let arguments: AdoptArguments = match serde_json::from_value(arguments) {
             Ok(arguments) => arguments,
-            // why: a serde diagnostic describes the payload that was refused; the wire carries the
-            // advertised argument shape instead.
             Err(_) => {
                 return spoke_reject(
                     SpokeRejectCode::InvalidInput,
@@ -322,16 +316,12 @@ impl AdoptionTool {
                 )
             }
         };
-        // why: one write reservation for the shared source read and the routed destination write, so a
-        // concurrent adoption or put cannot interleave between them.
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
             Err(error) => {
                 return SpokeResult::Reject(adoption_fault(std::io::stderr(), "begin", error))
             }
         };
-        // why: the two handles borrow this one transaction; each takes the guard only for its own await,
-        // and both are dropped here so the commit below owns the transaction again.
         let outcome = {
             let gate = Mutex::new(&mut transaction);
             let src = AdoptionSource {
@@ -352,8 +342,6 @@ impl AdoptionTool {
         };
         let outcome = match outcome {
             SpokeResult::Ok(outcome) => outcome,
-            // why: nothing was written, so the dropped transaction rolls back. The adoption's own four
-            // refusals travel unchanged; a port fault is a storage fault that stays host-side.
             SpokeResult::Reject(reject) => return adoption_refusal(reject),
         };
         if let Err(error) = transaction.commit().await {
@@ -373,8 +361,6 @@ fn adoption_fault(
     stage: &str,
     diagnostic: impl std::fmt::Display,
 ) -> SpokeReject {
-    // why: the host-side diagnostic is best-effort — a sink that cannot be written (a closed
-    // descriptor) must not panic the handler out of the refusal the caller is owed.
     let _ = writeln!(sink, "mindcore adoption {stage} fault: {diagnostic}");
     SpokeReject {
         code: SpokeRejectCode::InternalError,
@@ -656,16 +642,12 @@ fn deliberate_outcome(outcome: DeliberateOutcome) -> Value {
 /// One workflow failure as the wire reject the seam documents.
 fn workflow_reject(error: SpiError) -> SpokeReject {
     match error {
-        // why: the settlement refusal travels whole — code, message and structured details.
         SpiError::Settlement(reject) => reject,
         SpiError::InvalidInput(message) => SpokeReject {
             code: SpokeRejectCode::InvalidInput,
             message,
             details: None,
         },
-        // why: a policy veto is the host's decision about the proposal, not a failure and not a lost
-        // admission: it carries its own kind and the host's reason. `NotAuthorized` stays the
-        // lost-admission code.
         SpiError::PolicyRejected(reason) => SpokeReject {
             code: SpokeRejectCode::InvalidInput,
             message: reason,

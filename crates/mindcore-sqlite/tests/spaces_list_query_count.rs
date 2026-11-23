@@ -190,8 +190,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
     let dir = TempDir::new().expect("temporary directory");
     let path = dir.path().join("spaces.db");
     MindStore::open(&path).await.expect("open store");
-    // why: `MindStore` offers no statement logging; reconnect to the prepared file
-    // without rerunning DDL so the counter sees the adapter's reads.
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -204,8 +202,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         .await
         .expect("open pool");
 
-    // why: zero spaces: the scan and the revision projection still run, so the count
-    // does not depend on there being anything to list.
     assert_eq!(
         listing(&pool).await,
         (3, vec![]),
@@ -229,9 +225,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         "five spaces cost the same three SELECTs",
     );
 
-    // why: a grant whose space row is gone still carries an unconstrained payload;
-    // decoding it would fail the whole page, and the existing-space filter runs
-    // before the decode.
     seed_grant(
         &pool,
         Grant {
@@ -251,9 +244,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         "an orphan grant is skipped instead of decoded",
     );
 
-    // note: grant history in a space this principal cannot see: a live grant for
-    // another principal, and an expired one of its own. The rows stream past
-    // the scan and are not retained.
     seed_space_row(&pool, "spc_hidden").await;
     seed_grant(
         &pool,
@@ -287,8 +277,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         "invisible grant history neither lists a space nor costs a statement",
     );
 
-    // why: the marker is equal across calls, so a cursor minted on this snapshot
-    // serves the next page.
     let (selects, stage) = list_call(&pool, json!({ "limit": 2 })).await;
     assert_eq!(selects, 3, "a partial page costs the same three SELECTs");
     let (first, cursor) = page_of(&stage);
@@ -302,7 +290,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         "the same snapshot serves the second page",
     );
 
-    // why: a visible-space grant revision moves the marker from under the cursor.
     sqlx::query("UPDATE memory_grants SET revision = 2 WHERE grant_id = 'grt_3'")
         .execute(&pool)
         .await
@@ -313,8 +300,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         "a visible-space grant revision must invalidate the cursor: {stage:?}",
     );
 
-    // why: expired and revoked grants in a visible space show nothing, but their
-    // revisions are part of the marker the cursor invalidates on.
     seed_grant(
         &pool,
         Grant {
@@ -358,7 +343,6 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         "a revoked grant in a visible space must invalidate the cursor: {stage:?}",
     );
 
-    // why: corruption in a space the principal can see still fails the page.
     seed_grant(
         &pool,
         Grant {
