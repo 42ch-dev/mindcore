@@ -39,8 +39,9 @@ use spoke_connect::remote::{
     RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
 };
 use spoke_operations::{
-    revision_snapshots_equal_canonical, spoke_ok, spoke_reject, AdoptionPort, HistoryPort,
-    KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
+    revision_snapshots_equal_canonical, spoke_ok, spoke_reject, validate_judgment, AdoptionPort,
+    HistoryPort, KnowledgeEntryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode,
+    SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::knowledge_entry::{KnowledgeEntryDisclosure, KnowledgeEntryOwner};
@@ -508,6 +509,22 @@ impl PolicyHook for AutoPolicy {
     }
 }
 
+/// The host's settlement policy that holds every valid draft: a promotion reaches `needs_review`
+/// and writes nothing.
+struct HoldingPolicy;
+
+#[async_trait]
+impl PolicyHook for HoldingPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: SettlementDraft<'_>,
+    ) -> Result<PolicyDecision, SpiError> {
+        Ok(PolicyDecision::RequireHumanReview {
+            reason: "the host withholds automatic settlement".to_string(),
+        })
+    }
+}
+
 /// The host's side of the surface. `workflow_routes` is the per-principal workflow route map;
 /// an empty map serves and advertises no `deliberate` at all.
 fn faces(
@@ -964,7 +981,8 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
 }
 
 /// A remote consumer reaches the carrier: `deliberate` reads the real memory page and the real
-/// carrier entry through the composed surface and returns the reasoner's validated verdict.
+/// carrier entry through the composed surface and returns the reasoner's validated verdict beside
+/// a judgment the released validator accepts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_consumer_deliberates_through_the_composed_surface() {
     let fixture = Fixture::open().await;
@@ -1000,6 +1018,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
         "the evidence carries nothing the carrier does not already hold"
     );
     assert_eq!(result["verdict"]["record_ids"], json!(["rec_north_gate"]));
+    assert_judgment(&result, "mindcore:no_change");
     let revision: i64 = sqlx::query_scalar(
         "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
     )
@@ -1011,6 +1030,140 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     assert_eq!(
         revision, 1,
         "a no_change verdict leaves the carrier untouched"
+    );
+}
+
+/// The `needs_review` branch over a signed session: the host's holding policy keeps the promotion
+/// as a draft, so the response carries `draft` and writes nothing, beside the same valid judgment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let providers = MindProviders {
+        reasoner: Some(Arc::new(SettlingReasoner)),
+        policy_hook: Some(Arc::new(HoldingPolicy)),
+        ..MindProviders::default()
+    };
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
+    );
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the served deliberate tool under a holding policy",
+    );
+
+    assert_eq!(result["status"], "needs_review");
+    assert_eq!(
+        result["verdict"]["rationale"],
+        "the cited record carries the north gate state"
+    );
+    assert_eq!(result["draft"]["kind"], "belief");
+    assert!(
+        result.get("record").is_none(),
+        "a held draft settles nothing: {result}"
+    );
+    assert_judgment(&result, "mindcore:needs_review");
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION, CARRIER).await,
+        1,
+        "a needs_review verdict writes no cognition record"
+    );
+}
+
+/// The `settled` branch over a signed session: the host's policy settles the promotion, so the
+/// response carries `record` and `mind_state_version` beside the same valid judgment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
+    let fixture = Fixture::open().await;
+    fixture.seed_carrier().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let providers = MindProviders {
+        reasoner: Some(Arc::new(SettlingReasoner)),
+        policy_hook: Some(Arc::new(AutoPolicy)),
+        ..MindProviders::default()
+    };
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
+    );
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    let result = expect_ok(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the served deliberate tool under an automatic policy",
+    );
+
+    assert_eq!(result["status"], "settled");
+    assert_eq!(result["record"]["assessor"]["id"], PRINCIPAL);
+    assert_eq!(result["mind_state_version"], 2);
+    assert_judgment(&result, "mindcore:settled");
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION, CARRIER).await,
+        2,
+        "the settled branch commits the cognition record"
+    );
+}
+
+/// One deliberation response's judgment, held to the additive contract on every branch: the
+/// released validator accepts the wire value, it carries the request target and the cited record's
+/// stored revision, its outcome follows the response branch and its basis is the verdict rationale.
+fn assert_judgment(response: &Value, outcome: &str) {
+    let judgment = &response["judgment"];
+    expect_ok(
+        validate_judgment(judgment),
+        "the released validator accepts the served judgment",
+    );
+    assert!(
+        judgment["judgment_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("jd_")),
+        "the judgment carries its deterministic identity: {judgment}"
+    );
+    assert_eq!(judgment["judgment_kind"], "mindcore:deliberate");
+    assert_eq!(
+        judgment["target"],
+        json!({ "kind": "proposition", "id": "prop_north_gate", "namespace": "mindcore" }),
+        "the judgment carries the request target and no revision: {judgment}"
+    );
+    assert_eq!(
+        judgment["evidence"],
+        json!([{
+            "kind": "memory_record",
+            "namespace": "mindcore",
+            "id": "rec_north_gate",
+            "revision": 1,
+        }]),
+        "the evidence pins the cited record's stored revision: {judgment}"
+    );
+    assert_eq!(
+        judgment["verdict"]["outcome"], outcome,
+        "the outcome follows the response branch: {judgment}"
+    );
+    assert!(
+        judgment["verdict"].get("confidence").is_none(),
+        "no confidence is invented: {judgment}"
+    );
+    assert_eq!(
+        judgment["basis"], response["verdict"]["rationale"],
+        "the basis is the verdict's rationale: {judgment}"
+    );
+    assert!(
+        judgment["created_at"]
+            .as_str()
+            .is_some_and(|stamp| stamp.len() >= 20 && stamp.ends_with('Z')),
+        "created_at is a UTC RFC 3339 instant: {judgment}"
     );
 }
 
