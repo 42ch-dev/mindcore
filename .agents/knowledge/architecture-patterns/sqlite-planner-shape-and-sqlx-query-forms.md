@@ -71,18 +71,25 @@ either predicate passes every assertion and still changes the cost.
 
 ## Examples
 
+Both examples read the revisions of one principal's visible spaces; only the membership
+predicate differs.
+
 ### Before
 
+The `IN (SELECT space_id FROM memory_spaces)` spelling probes the grant index once per
+stored space, whatever the caller can see.
+
 ```sql
--- One index probe per stored space, and one index probe per visible space.
 SELECT grant_id, revision FROM memory_grants
  WHERE principal_id = ? AND space_id IN (SELECT space_id FROM memory_spaces);
 ```
 
 ### After
 
+The unary `+` takes `space_id` off the index, so SQLite reads the grant index once over the
+principal and tests the visible set there.
+
 ```sql
--- One index read over the principal; the visible set is tested there.
 SELECT grant_id, revision FROM memory_grants
  WHERE principal_id = ? AND +space_id IN (SELECT value FROM json_each(?));
 ```

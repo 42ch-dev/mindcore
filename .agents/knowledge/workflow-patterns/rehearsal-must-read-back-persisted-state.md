@@ -70,6 +70,12 @@ all reads. The negative side is only meaningful once the positive side is proven
    plus a tail of the provider's own length and alphabet for a key) so the fixture source never
    carries a token- or key-shaped literal. The assembled values still exercise the screen, while a
    literal in the tree trips secret scanners and reads as a leaked credential in review.
+8. **Enumerate the forms a screen must reject, not the assembly trick.** Assembling the fixtures says
+   nothing about which shapes were exercised. For a JWT screen the coverage is every compact
+   serialisation: a signed JWS, the same with an empty signature, one with the signature stripped,
+   and an encrypted JWE. They differ in segment count and in whether the last segment is
+   empty, and each needs its own assembled value and its own assertion, or a screen that misses
+   one form stays green.
 
 ## What did not work
 
