@@ -25,6 +25,9 @@ use spoke_schemas::{
     Principal,
 };
 
+/// The scope id naming the shared source these adoption proofs read from.
+const SOURCE_SCOPE: &str = "spc_shared";
+
 fn pending_candidate() -> MemoryCandidate {
     serde_json::from_str(
         r#"{
@@ -467,25 +470,27 @@ async fn adoption_over_a_port_double_creates_once_and_refuses_an_absent_source()
         SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
     };
 
-    let created = match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+    let created = match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 1).await {
         SpokeResult::Ok(AdoptionOutcome::Created(created)) => created,
         other => panic!("the first adoption must create, got {other:?}"),
     };
     assert_eq!(created.revision, Some(1));
-    let anchor = serde_json::to_value(created.source_anchor.as_ref().expect("anchor"))
+    let anchor = serde_json::to_value(created.adoption_anchor.as_ref().expect("anchor"))
         .expect("anchor serializes");
-    assert_eq!(anchor["source_id"], json!("shared:ke_shared_gate"));
-    assert_eq!(
-        anchor["extensions"]["mindcore_adoption"]["source_revision"],
-        json!(1)
+    assert_eq!(anchor["source_scope_id"], json!(SOURCE_SCOPE));
+    assert_eq!(anchor["source_entry_id"], json!(entry_id));
+    assert_eq!(anchor["source_revision"], json!(1));
+    assert!(
+        created.source_anchor.is_none(),
+        "the copy carries no ordinary provenance pointer"
     );
     assert_eq!(
         mindcore_base::knowledge::adoption_anchor_parts(&created),
-        Some((entry_id, Some(1))),
+        Some((SOURCE_SCOPE, entry_id, 1)),
         "every created anchor round-trips through the shared parser"
     );
 
-    let repeat = match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+    let repeat = match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 1).await {
         SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing)) => existing,
         other => panic!("a repeat must return the existing copy, got {other:?}"),
     };
@@ -501,7 +506,7 @@ async fn adoption_over_a_port_double_creates_once_and_refuses_an_absent_source()
     assert_eq!(source_after.revision, source.revision);
     assert!(source_after.source_anchor.is_none());
 
-    match adopt_knowledge_entry(&src, &dst, "ke_absent", 1).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, "ke_absent", 1).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(reject.code, SpokeRejectCode::KnowledgeEntryNotFound);
             assert_eq!(reject.message, "source knowledge entry not found");
@@ -521,15 +526,25 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
         SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
     };
     assert_eq!(empty_source.revision, Some(1));
-    match adopt_knowledge_entry(&src, &dst, "", 1).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, "", 1).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
             assert_eq!(
                 reject.message,
-                "an adoption anchors a non-empty entry id at a positive source revision"
+                "an adoption anchors a non-empty scope id and entry id at a positive source revision"
             );
         }
         other => panic!("an empty entry id must be refused, got {other:?}"),
+    }
+    match adopt_knowledge_entry(&src, &dst, "", "ke_shared_gate", 1).await {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+            assert_eq!(
+                reject.message,
+                "an adoption anchors a non-empty scope id and entry id at a positive source revision"
+            );
+        }
+        other => panic!("an empty source scope id must be refused, got {other:?}"),
     }
 
     let entry_id = "ke_shared_gate";
@@ -537,12 +552,12 @@ async fn adoption_refuses_an_entry_id_or_revision_no_anchor_can_name() {
         SpokeResult::Ok(entry) => assert_eq!(entry.revision, Some(1)),
         SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
     }
-    match adopt_knowledge_entry(&src, &dst, entry_id, 0).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 0).await {
         SpokeResult::Reject(reject) => assert_eq!(reject.code, SpokeRejectCode::InvalidInput),
         other => panic!("a zero revision must be refused, got {other:?}"),
     }
 
-    match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 1).await {
         SpokeResult::Ok(AdoptionOutcome::Created(created)) => assert_eq!(created.revision, Some(1)),
         other => panic!("the refusals must leave the slot empty, got {other:?}"),
     }
@@ -558,10 +573,10 @@ async fn adoption_refuses_a_copy_from_another_source_revision() {
         SpokeResult::Ok(entry) => entry,
         SpokeResult::Reject(reject) => panic!("seed refused: {reject:?}"),
     };
-    match adopt_knowledge_entry(&src, &dst, entry_id, 1).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 1).await {
         SpokeResult::Ok(AdoptionOutcome::Created(copy)) => assert_eq!(
             mindcore_base::knowledge::adoption_anchor_parts(&copy),
-            Some((entry_id, Some(1)))
+            Some((SOURCE_SCOPE, entry_id, 1))
         ),
         other => panic!("the first adoption must create, got {other:?}"),
     }
@@ -569,7 +584,7 @@ async fn adoption_refuses_a_copy_from_another_source_revision() {
         SpokeResult::Ok(advanced) => assert_eq!(advanced.revision, Some(2)),
         SpokeResult::Reject(reject) => panic!("advance refused: {reject:?}"),
     }
-    match adopt_knowledge_entry(&src, &dst, entry_id, 2).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 2).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
             assert_eq!(
@@ -590,10 +605,10 @@ async fn adoption_refuses_a_copy_from_another_source_revision() {
         SpokeResult::Ok(entry) => entry,
         SpokeResult::Reject(reject) => panic!("advance refused: {reject:?}"),
     };
-    match adopt_knowledge_entry(&src, &dst, entry_id, 2).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 2).await {
         SpokeResult::Ok(AdoptionOutcome::Created(copy)) => assert_eq!(
             mindcore_base::knowledge::adoption_anchor_parts(&copy),
-            Some((entry_id, Some(2)))
+            Some((SOURCE_SCOPE, entry_id, 2))
         ),
         other => panic!("the adoption at revision 2 must create, got {other:?}"),
     }
@@ -601,7 +616,7 @@ async fn adoption_refuses_a_copy_from_another_source_revision() {
         SpokeResult::Ok(advanced) => assert_eq!(advanced.revision, Some(3)),
         SpokeResult::Reject(reject) => panic!("advance refused: {reject:?}"),
     }
-    match adopt_knowledge_entry(&src, &dst, entry_id, 3).await {
+    match adopt_knowledge_entry(&src, &dst, SOURCE_SCOPE, entry_id, 3).await {
         SpokeResult::Reject(reject) => {
             assert_eq!(reject.code, SpokeRejectCode::RevisionConflict);
             assert_eq!(

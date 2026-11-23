@@ -45,6 +45,8 @@ use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, MemoryRecallRequest, Principal, Scope};
 
 const SCOPE_ID: &str = "spoke-scope-001";
+/// The id naming the adoption source (`SHARED`) on the wire.
+const SHARED_SCOPE: &str = "spc_shared";
 const COLLECTION: &str = "wren";
 const CARRIER: &str = "ke_wren";
 /// The second principal's own collection and carrier holder entry.
@@ -1677,6 +1679,7 @@ async fn a_configured_adoption_surface_advertises_and_serves_the_tool() {
         routes(&[PRINCIPAL]),
     );
     faces.adoption = Some(AdoptionRoute {
+        scope_id: SHARED_SCOPE.to_string(),
         source: KnowledgeScope::new(SHARED),
     });
     let surface = surface(&serve, faces);
@@ -1734,6 +1737,7 @@ async fn an_unrouted_principal_cannot_adopt_on_a_serving_surface() {
     );
     faces.principals = two_principal_admission();
     faces.adoption = Some(AdoptionRoute {
+        scope_id: SHARED_SCOPE.to_string(),
         source: KnowledgeScope::new(SHARED),
     });
     let surface = surface(&serve, faces);
@@ -1777,6 +1781,7 @@ async fn adoption_is_advertised_beside_an_empty_route_map() {
         routes(&[]),
     );
     faces.adoption = Some(AdoptionRoute {
+        scope_id: SHARED_SCOPE.to_string(),
         source: KnowledgeScope::new(SHARED),
     });
     let surface = surface(&serve, faces);
@@ -1850,6 +1855,7 @@ async fn a_routed_principal_adopts_a_shared_entry_into_its_own_collection() {
         routes(&[PRINCIPAL]),
     );
     faces.adoption = Some(AdoptionRoute {
+        scope_id: SHARED_SCOPE.to_string(),
         source: KnowledgeScope::new(SHARED),
     });
     let surface = surface(&serve, faces);
@@ -1875,7 +1881,7 @@ async fn a_routed_principal_adopts_a_shared_entry_into_its_own_collection() {
     assert_eq!(copy.entry_id, "ke_shared");
     assert_eq!(
         adoption_anchor_parts(&copy),
-        Some(("ke_shared", Some(source_revision))),
+        Some((SHARED_SCOPE, "ke_shared", source_revision)),
         "the copy's anchor resolves to the source entry at the revision adopted: {copy:?}"
     );
     let source = expect_ok(

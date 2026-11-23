@@ -93,6 +93,13 @@ impl MindcoreServe {
     pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
         if let Some(adoption) = &faces.adoption {
             let source = &adoption.source.collection;
+            if adoption.scope_id.is_empty() {
+                return spoke_reject(
+                    SpokeRejectCode::InvalidInput,
+                    "the adoption source names an empty scope id",
+                    None,
+                );
+            }
             if source.is_empty() {
                 return spoke_reject(
                     SpokeRejectCode::InvalidInput,
@@ -119,6 +126,7 @@ impl MindcoreServe {
             tools::AdoptionTool::new(
                 self.store.pool(),
                 Arc::clone(&faces.principals),
+                route.scope_id,
                 route.source.collection,
                 Arc::clone(&routes),
             )
@@ -172,6 +180,9 @@ impl MindcoreServe {
 /// Assembly refuses a source that names a route destination, so a principal's write can never
 /// become the source another reads.
 pub struct AdoptionRoute {
+    /// The id naming this source on the wire; recorded in every adopted copy's anchor triple and
+    /// compared against a served request's `source_scope_id`.
+    pub scope_id: String,
     pub source: KnowledgeScope,
 }
 

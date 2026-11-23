@@ -4,13 +4,14 @@
 //! the destination is the one `dst` serves. Neither port is selected from the payload, so one
 //! host-supplied pairing decides where a copy can land.
 //!
-//! The destination key is the source `entry_id`. A repeat call recognizes the copy by its Mindcore
-//! adoption anchor and returns it instead of writing a second one, so the guarantee leans on the
-//! destination port's atomic create-only CAS; without that CAS the slot can be claimed twice.
+//! The destination key is the source `entry_id`. A repeat call recognizes the copy by the protocol
+//! adoption anchor it carries and returns it instead of writing a second one, so the guarantee
+//! leans on the destination port's atomic create-only CAS; without that CAS the slot can be
+//! claimed twice.
 
 use serde_json::Value;
 
-use mindcore_base::knowledge::{adoption_anchor_at_revision, adoption_anchor_parts};
+use mindcore_base::knowledge::{adoption_anchor, adoption_anchor_parts};
 use spoke_operations::{
     knowledge_entry_visible_to_viewpoint, spoke_reject, KnowledgeEntryPort, SpokeReject,
     SpokeRejectCode, SpokeResult,
@@ -35,9 +36,9 @@ pub enum AdoptionOutcome {
 
 /// Adopts the shared entry `entry_id` into the collection `dst` serves.
 ///
-/// The copy carries an adoption anchor pinned to the source revision it was taken from and keeps
-/// the source's knowledge metadata, but none of its cognition records. The source entry is only
-/// ever read.
+/// The copy carries an adoption anchor naming `source_scope_id`, the entry id and the source
+/// revision it was taken from, and keeps the source's knowledge metadata, but none of its cognition
+/// records. The source entry is only ever read.
 ///
 /// A missing, superseded or undisclosable source is reported as one generic
 /// [`SpokeRejectCode::KnowledgeEntryNotFound`], repeat calls included: no anchor is ever written
@@ -45,17 +46,25 @@ pub enum AdoptionOutcome {
 /// own anchor, and only at the revision that anchor records: a copy adopted at another revision is
 /// [`SpokeRejectCode::RevisionConflict`] naming the revision it was adopted at, even when the
 /// source now sits at the requested one, so a stale copy is never served as the revision asked
-/// for. Any other occupant, including a legacy anchor without a recorded revision or a
-/// superseded row the live read hides, is [`SpokeRejectCode::KnowledgeEntryAlreadyExists`] and is
-/// never overwritten or refreshed. An empty `entry_id` and a zero revision name no anchor and are
-/// [`SpokeRejectCode::InvalidInput`].
+/// for. Any other occupant — an anchor naming another scope or entry, or a superseded row the
+/// live read hides — is [`SpokeRejectCode::KnowledgeEntryAlreadyExists`] and is never overwritten
+/// or refreshed. An empty scope id, an empty `entry_id` and a zero revision name no anchor and
+/// are [`SpokeRejectCode::InvalidInput`].
 pub async fn adopt_knowledge_entry(
     src: &dyn KnowledgeEntryPort,
     dst: &dyn KnowledgeEntryPort,
+    source_scope_id: &str,
     entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
-    adopt(src, dst, entry_id, expected_source_revision).await
+    adopt(
+        src,
+        dst,
+        source_scope_id,
+        entry_id,
+        expected_source_revision,
+    )
+    .await
 }
 
 /// The same adoption for callers holding concrete ports.
@@ -66,6 +75,7 @@ pub async fn adopt_knowledge_entry(
 pub async fn adopt_knowledge_entry_typed<S, D>(
     src: &S,
     dst: &D,
+    source_scope_id: &str,
     entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome>
@@ -73,13 +83,21 @@ where
     S: KnowledgeEntryPort + Sync,
     D: KnowledgeEntryPort + Sync,
 {
-    adopt(src, dst, entry_id, expected_source_revision).await
+    adopt(
+        src,
+        dst,
+        source_scope_id,
+        entry_id,
+        expected_source_revision,
+    )
+    .await
 }
 
 /// The one implementation of the adoption rules; both public entries dispatch here.
 async fn adopt<S, D>(
     src: &S,
     dst: &D,
+    source_scope_id: &str,
     entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome>
@@ -87,10 +105,10 @@ where
     S: KnowledgeEntryPort + ?Sized,
     D: KnowledgeEntryPort + ?Sized,
 {
-    let Some(anchor) = adoption_anchor_at_revision(entry_id, expected_source_revision) else {
+    let Some(anchor) = adoption_anchor(source_scope_id, entry_id, expected_source_revision) else {
         return spoke_reject(
             SpokeRejectCode::InvalidInput,
-            "an adoption anchors a non-empty entry id at a positive source revision",
+            "an adoption anchors a non-empty scope id and entry id at a positive source revision",
             None,
         );
     };
@@ -105,7 +123,14 @@ where
     let visible_source_revision = source.revision;
 
     let mut copy = match dst.get_knowledge_entry(entry_id).await {
-        SpokeResult::Ok(existing) => return classify(existing, entry_id, expected_source_revision),
+        SpokeResult::Ok(existing) => {
+            return classify(
+                existing,
+                source_scope_id,
+                entry_id,
+                expected_source_revision,
+            )
+        }
         SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::KnowledgeEntryNotFound => {
             source
         }
@@ -120,7 +145,8 @@ where
     copy.created_at = None;
     copy.updated_at = None;
     empty_cognition_records(&mut copy);
-    copy.source_anchor = Some(anchor);
+    copy.source_anchor = None;
+    copy.adoption_anchor = Some(anchor);
 
     match dst.put_knowledge_entry(copy, None).await {
         SpokeResult::Ok(created) => SpokeResult::Ok(AdoptionOutcome::Created(created)),
@@ -128,7 +154,12 @@ where
             if reject.code == SpokeRejectCode::KnowledgeEntryAlreadyExists =>
         {
             match dst.get_knowledge_entry(entry_id).await {
-                SpokeResult::Ok(existing) => classify(existing, entry_id, expected_source_revision),
+                SpokeResult::Ok(existing) => classify(
+                    existing,
+                    source_scope_id,
+                    entry_id,
+                    expected_source_revision,
+                ),
                 SpokeResult::Reject(_) => SpokeResult::Reject(reject),
             }
         }
@@ -139,14 +170,16 @@ where
 
 /// Answers one occupancy of the destination slot by the anchor rule.
 ///
-/// The revision the anchor records is the copy's identity, never the source's current revision: a
-/// request naming anything else is a stale copy, not the revision it asked for.
+/// Only an anchor naming the same source triple belongs to this adoption. The revision the anchor
+/// records is the copy's identity, never the source's current revision: a request naming anything
+/// else is a stale copy, not the revision it asked for.
 fn classify(
     existing: KnowledgeEntry,
+    source_scope_id: &str,
     entry_id: &str,
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
-    match adopted_revision(&existing, entry_id) {
+    match adopted_revision(&existing, source_scope_id, entry_id) {
         Some(adopted) if expected_source_revision == adopted => {
             SpokeResult::Ok(AdoptionOutcome::AlreadyPresent(existing))
         }
@@ -181,10 +214,14 @@ fn rejects_superseded_occupant(reject: &SpokeReject) -> bool {
         })
 }
 
-/// The revision a copy's adoption anchor records for `entry_id`, when it names that entry.
-fn adopted_revision(entry: &KnowledgeEntry, entry_id: &str) -> Option<u64> {
+/// The revision a copy's adoption anchor records for this source, when it names it.
+fn adopted_revision(entry: &KnowledgeEntry, source_scope_id: &str, entry_id: &str) -> Option<u64> {
     match adoption_anchor_parts(entry) {
-        Some((source_id, adopted)) if source_id == entry_id => adopted,
+        Some((scope_id, source_id, adopted))
+            if scope_id == source_scope_id && source_id == entry_id =>
+        {
+            Some(adopted)
+        }
         _ => None,
     }
 }
@@ -248,6 +285,7 @@ mod tests {
         assert_send(adopt_knowledge_entry_typed(
             &AbsentKnowledge,
             &AbsentKnowledge,
+            "spc_shared",
             "ke_entry",
             1,
         ));

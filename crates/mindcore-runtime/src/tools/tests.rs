@@ -22,6 +22,9 @@ use spoke_schemas::{CognitionRecord, KnowledgeEntry, RetainedRecord};
 
 use super::*;
 
+/// The scope id naming the adoption source collection these tool proofs read from.
+const SHARED_SCOPE: &str = "spc_shared";
+
 /// A workflow engine that records what it was handed and answers a configured result.
 #[derive(Default)]
 struct Fake {
@@ -999,6 +1002,7 @@ async fn adoption_tool() -> (TempDir, AdoptionTool) {
                 None,
             ),
         }),
+        SHARED_SCOPE.to_string(),
         "shared".to_string(),
         Arc::new(BTreeMap::from([(
             "prn_driver".to_string(),

@@ -239,6 +239,8 @@ fn authenticated_peer(session: &Weak<ConnectResponder>) -> Result<String, SpokeR
 pub(crate) struct AdoptionTool {
     pool: SqlitePool,
     principals: MemoryAdmission,
+    /// The id naming `source` on the wire, recorded in every copy's anchor triple.
+    source_scope_id: String,
     source: String,
     /// The one validated route map, shared with the workflow binding: both hold this `Arc` and
     /// neither mutates it, so a principal resolves to one destination collection for both.
@@ -249,12 +251,14 @@ impl AdoptionTool {
     pub(crate) fn new(
         pool: SqlitePool,
         principals: MemoryAdmission,
+        source_scope_id: String,
         source: String,
         routes: Arc<BTreeMap<String, KnowledgeScope>>,
     ) -> Self {
         Self {
             pool,
             principals,
+            source_scope_id,
             source,
             routes,
         }
@@ -335,6 +339,7 @@ impl AdoptionTool {
             adopt_knowledge_entry_typed(
                 &src,
                 &dst,
+                &self.source_scope_id,
                 &arguments.entry_id,
                 arguments.expected_source_revision,
             )

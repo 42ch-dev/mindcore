@@ -303,6 +303,7 @@ async fn an_adoption_source_beside_the_routes_assembles() {
     let surface = expect_ok(
         serve.surface(ServeFaces {
             adoption: Some(AdoptionRoute {
+                scope_id: "spc_shared".to_string(),
                 source: KnowledgeScope::new("shared"),
             }),
             ..faces(metadata("runtime"))
@@ -331,6 +332,7 @@ async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly(
         let reject = match serve.surface(ServeFaces {
             workflow_routes: routes,
             adoption: Some(AdoptionRoute {
+                scope_id: "spc_shared".to_string(),
                 source: KnowledgeScope::new(source),
             }),
             ..faces(metadata("runtime"))
@@ -351,26 +353,35 @@ async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly(
     }
 }
 
-/// An empty source collection names no source to read, so assembly refuses it.
+/// An empty source collection or an empty source scope id names no source, so assembly refuses it.
 #[tokio::test]
 async fn an_empty_adoption_source_is_refused_at_assembly() {
     let serve = Fixture::open().await.serve();
-    let reject = match serve.surface(ServeFaces {
-        adoption: Some(AdoptionRoute {
+    for route in [
+        AdoptionRoute {
+            scope_id: "spc_shared".to_string(),
             source: KnowledgeScope::new(""),
-        }),
-        ..faces(metadata("runtime"))
-    }) {
-        SpokeResult::Reject(reject) => reject,
-        SpokeResult::Ok(surface) => {
-            panic!(
-                "an empty adoption source assembled {:?}",
-                capabilities(&surface)
-            )
-        }
-    };
-    assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
-    assert!(reject.details.is_none(), "{reject:?}");
+        },
+        AdoptionRoute {
+            scope_id: String::new(),
+            source: KnowledgeScope::new("shared"),
+        },
+    ] {
+        let reject = match serve.surface(ServeFaces {
+            adoption: Some(route),
+            ..faces(metadata("runtime"))
+        }) {
+            SpokeResult::Reject(reject) => reject,
+            SpokeResult::Ok(surface) => {
+                panic!(
+                    "an empty adoption source assembled {:?}",
+                    capabilities(&surface)
+                )
+            }
+        };
+        assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
+        assert!(reject.details.is_none(), "{reject:?}");
+    }
 }
 
 /// The adoption id is the runtime's: a host registration cannot supply it on a surface that serves
@@ -402,6 +413,7 @@ async fn a_host_registration_cannot_shadow_the_adoption_tool() {
 
     let source = || {
         Some(AdoptionRoute {
+            scope_id: "spc_shared".to_string(),
             source: KnowledgeScope::new("shared"),
         })
     };

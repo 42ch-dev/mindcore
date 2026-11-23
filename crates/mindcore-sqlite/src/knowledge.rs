@@ -387,7 +387,7 @@ impl ScopedKnowledgeStore {
         }
     }
 
-    /// The live entry an adoption anchor resolves to: the anchor's shared id, then each
+    /// The live entry an adoption anchor resolves to: the anchor's source entry id, then each
     /// same-collection marker until the first live entry.
     ///
     /// One read transaction pins the whole chain to one snapshot. Every hop passes the
@@ -395,9 +395,9 @@ impl ScopedKnowledgeStore {
     /// hop answers with the one absence keyed to the id the anchor names, never a partial chain.
     /// Ids are tracked, so a cycle in stored markers is a storage failure instead.
     pub async fn resolve_adoption_anchor(&self, adopted: &KnowledgeEntry) -> SpokeResult<String> {
-        let Some((source_id, _)) = adoption_anchor_parts(adopted) else {
+        let Some((_, source_id, _)) = adoption_anchor_parts(adopted) else {
             return invalid_input(format!(
-                "knowledge entry {} carries no mindcore adoption anchor",
+                "knowledge entry {} carries no adoption anchor",
                 adopted.entry_id
             ));
         };
