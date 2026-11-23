@@ -64,12 +64,16 @@ different ways. The visible set bounds the revision projection only, and it boun
 statement's output — the `(grant_id, revision)` pairs of the visible spaces — not the walk
 over the principal's grant rows that produces them. The scan decodes the principal's whole
 grant history one row at a time, and `list_spaces` materializes every stored space before
-the caller filters, so the listing's memory is not bounded by the visible set either: the
-pair bounds only the grant side of it, one decoded grant row and the visible-id set instead
-of the whole grant history. The `EXISTS` and `+space_id` spellings keep the index probes
-proportional to one principal's rows rather than to every stored space. None of this shows
-in the SQL text's result; it shows only in the plan, so a "simpler" rewrite of either
-predicate passes every assertion and still changes the cost.
+the caller filters, so the listing's memory is not bounded by the visible set either. What
+the scan bounds is its own side: one decoded grant row at a time and the visible-id set,
+instead of the whole grant history held as rows. The projection is then materialized in
+full — one pair for every grant of the principal in the visible spaces, expired and revoked
+grants included — so the revision materialization grows with the grant history of the
+visible spaces, and a single visible space can retain many pairs. The `EXISTS` and
+`+space_id` spellings keep the index probes proportional to one principal's rows rather than
+to every stored space. None of this shows in the SQL text's result; it shows only in the
+plan, so a "simpler" rewrite of either predicate passes every assertion and still changes
+the cost.
 
 ## When to Apply
 
