@@ -34,8 +34,9 @@ use crate::AdoptionRoute;
 /// The adoption port over one host store.
 ///
 /// `destination` is the one collection the knowledge face itself serves, shared by every peer the
-/// host admits to that scope: the first adoption claims a slot, later adopters of the same source
-/// are served that stored copy, and every admitted peer reads it through the face's
+/// host admits to that scope: it holds one slot per `destination_entry_id`, the first adoption of a
+/// given id claims it, a repeat is served that stored copy only at the anchor revision the copy
+/// records, and a peer whose own admitted selection admits it reads the copy through the face's
 /// `knowledge.get`/`list`. It is not the workflow route map: that map selects a *workflow*
 /// collection per principal, and the knowledge face takes no per-principal collection.
 pub(crate) struct AdoptionService {
@@ -273,8 +274,8 @@ impl KnowledgeEntryPort for AdoptionSource<'_, '_, '_> {
 /// The host's configured collection is the selector; the admitted `Scope` additionally refines
 /// which entries of that collection this call may serve or write, so an entry the host admitted the
 /// scope without is neither returned nor copied. An occupant outside that selection answers the
-/// ordinary occupancy refusal, never a distinct "not authorized": the caller learns that the slot is
-/// taken, not that an entry it cannot see exists there.
+/// ordinary occupancy refusal, never a distinct "not authorized": the answer reports the slot as
+/// taken either way, and never what the occupant holds.
 struct AdoptionDestination<'a, 'b, 'tx> {
     collection: &'a str,
     scope: &'a Scope,
@@ -288,8 +289,8 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
         let entry = read_entry(&mut gate, self.collection, entry_id).await;
         match entry {
             // An occupant outside the admitted selection answers the ordinary occupancy refusal,
-            // byte for byte the one a visible occupant gets: the caller learns occupied or free,
-            // never whether an entry it cannot see holds the slot.
+            // byte for byte the one a visible occupant gets: the answer reports the slot as taken
+            // either way, and never what the occupant holds.
             SpokeResult::Ok(entry) => match admitted_destination(&entry, self.scope) {
                 SpokeResult::Ok(true) => SpokeResult::Ok(entry),
                 SpokeResult::Ok(false) => occupied(&entry.entry_id),
@@ -422,9 +423,10 @@ fn source_absent<T>() -> SpokeResult<T> {
     )
 }
 
-/// The ordinary occupancy answer: the slot is taken, and the caller learns nothing else about its
-/// occupant. A visible occupant and one the admitted selection hides answer byte-identically, so a
-/// guessed destination id never reports whether an entry outside the caller's reach exists.
+/// The ordinary occupancy answer: the slot is taken, and it reports nothing about its occupant
+/// beyond occupancy. A visible occupant and one the admitted selection hides answer byte-identically
+/// — the same disclosure a create-only `put_knowledge_entry` on this face already makes — so the
+/// answer never reports the occupying entry's content, revision or visibility.
 fn occupied<T>(entry_id: &str) -> SpokeResult<T> {
     spoke_reject(
         SpokeRejectCode::RevisionConflict,
@@ -897,9 +899,9 @@ mod tests {
     }
 
     /// An occupied destination slot answers one occupancy whatever the admitted selection makes of
-    /// the occupant: a hidden occupant's refusal is byte-identical to a visible one's, so a guessed
-    /// destination id never reports whether an entry the caller cannot see exists. A free slot the
-    /// selection cannot claim answers the same refusal and writes nothing.
+    /// the occupant: a hidden occupant's refusal is byte-identical to a visible one's, so the answer
+    /// reports occupancy and never what the occupant holds. A free slot the selection cannot claim
+    /// answers the same refusal and writes nothing.
     #[tokio::test]
     async fn a_hidden_occupant_answers_the_same_occupancy_as_a_visible_one() {
         let (_dir, store, service) = service().await;

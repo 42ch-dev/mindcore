@@ -101,8 +101,8 @@ The host enables the face with `ServeFaces.adoption: Option<AdoptionRoute>`, who
 the configured source on the wire and whose `source` names the `KnowledgeScope` the store reads
 (`crates/mindcore-runtime/src/lib.rs:247-257,288-296`). There is no destination setting: the
 destination is `ServeFaces.knowledge`, the one collection `knowledge.get`/`list` serve for the
-admitted peer, so an adopted copy is always readable back through the face that admitted it.
-`workflow_routes` selects workflow collections only and plays no part in adoption. With
+admitted peer, so a copy is readable back through that face whenever the peer's admitted selection
+admits it. `workflow_routes` selects workflow collections only and plays no part in adoption. With
 `adoption: None` `face_capabilities` adds no capability and no service is composed; with `Some` it
 adds `spoke-knowledge-adoption` and `RemoteServePortsComposite::with_adoption` composes
 `spoke-connect`'s `AdoptionPortService` over the runtime's `AdoptionService`
@@ -124,16 +124,28 @@ would have served it. Neither the principal nor the admitted scope comes from th
 | `destination_entry_id` | absent → the resolved terminal's `source_entry_id`; a supplied value may name that same id | — |
 | `idempotency_key` | 1–128 code points | `INVALID_INPUT`, refused by Connect's decoder |
 
-The destination collection is `ServeFaces.knowledge` and nothing else; the admitted `Scope`'s
-`entry_ids`, `entry_types`, `source_id` and `viewpoint` refinements still apply to it, because the
-admitted scope is the host's statement about which entries of that collection the peer may reach.
+The destination collection is `ServeFaces.knowledge` and nothing else. It is one shared collection
+with one slot per `destination_entry_id`: the first adoption of a given id claims that slot, and a
+later call naming the same id is answered from the stored copy's anchor instead of writing a second
+one. The admitted `Scope`'s `entry_ids`, `entry_types`, `source_id` and `viewpoint` refinements
+still apply to it, because the admitted scope is the host's statement about which entries of that
+collection the peer may reach.
 Adoption applies them to the destination entry it would return and to the copy it would write: an
 entry outside the admitted selection is neither served nor written, and answers the ordinary
 occupancy refusal — `REVISION_CONFLICT` with no details, byte-identical to a visible occupant's —
-so the answer tells the caller occupied or free and never whether an entry it cannot see holds the
-slot. `NOT_AUTHORIZED` is reserved for a `destination_scope_id` that is not the admitted scope. The
-host's configured collection selects the destination; the admitted selection narrows what the call
-may touch inside it.
+so a hidden occupant and a visible one are the same answer. `NOT_AUTHORIZED` is reserved for a
+`destination_scope_id` that is not the admitted scope. The host's configured collection selects the
+destination; the admitted selection narrows what the call may touch inside it.
+
+**Slot occupancy is a permitted disclosure.** A create-only destination answers occupied for an
+occupied id and success for a free one, so the answer reports whether the `destination_entry_id`
+slot is taken. That is permitted and discloses nothing wider than the knowledge face the copy lands
+on: a create-only `KnowledgeEntryPort::put_knowledge_entry` over that same face already
+distinguishes an occupied id from a free one while hiding the entry. Adoption therefore reports
+occupancy and nothing about a concealed occupant — never its content, revision or visibility; the
+one occupant detail it can return, `details.adopted_revision`, needs the destination port to have
+handed that occupant back, so only a copy the caller can already read carries it. An absolute
+"existence is never revealed" claim would be false and is not made here.
 
 **Assembly** refuses an empty source scope id, an empty source collection, a source collection equal
 to `ServeFaces.knowledge`'s collection or to any route destination — including the route of a
@@ -217,6 +229,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 - No caller-provided principal, scope route, or manifest capability can bypass a host admission or storage guard.
 - No baseline provider is required for either face and an absent face/tool is denied. Advertisements and handler registrations describe the same capabilities.
 - The adoption source is host configuration and the adoption destination is the knowledge face's own collection: no wire value selects either, the request's scope members are only compared against those two, and a source equal to the destination collection, to any route destination or to the destination scope is refused before serving.
+- Adoption's answer reports `destination_entry_id` slot occupancy — occupied or free — and nothing about the occupant: a concealed occupant is byte-identical to a visible one. That disclosure is permitted and no wider than the knowledge face it lands on, whose create-only `put_knowledge_entry` already distinguishes occupied from free while hiding the entry; entry content, revision and visibility stay undisclosed.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.
 - History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes. The `spoke-history` capability is advertised only when `ServeFaces.history` composes the service.

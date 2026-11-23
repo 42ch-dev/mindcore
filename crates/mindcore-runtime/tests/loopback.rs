@@ -2477,10 +2477,9 @@ async fn knowledge_adopt_refuses_with_the_contract_codes() {
 }
 
 /// An occupied destination slot answers the ordinary occupancy refusal whatever the admitted
-/// selection makes of its occupant: hidden and visible occupants are byte-identical, so a guessed
-/// destination id never reveals whether an entry outside the caller's reach exists. A slot the
-/// selection cannot claim answers the same refusal and writes nothing, and a genuinely free, usable
-/// slot still creates.
+/// selection makes of its occupant: hidden and visible occupants are byte-identical, so the answer
+/// reports occupancy and nothing about the occupant. A slot the selection cannot claim answers the
+/// same refusal and writes nothing, and a genuinely free, usable slot still creates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_occupied_destination_answers_occupancy_whatever_the_selection_shows() {
     let fixture = Fixture::open().await;
