@@ -444,11 +444,12 @@ async fn deliberate_round_trips_every_outcome_branch() {
         !accepts(&output, &output, &without_judgment(&value)),
         "a settled outcome carries its judgment"
     );
+    let judgment_value = serde_json::to_value(judgment()).expect("judgment serializes");
     assert!(
         !accepts(
             &output,
             &output,
-            &json!({ "status": "needs_review", "verdict": {} })
+            &json!({ "status": "needs_review", "verdict": {}, "judgment": &judgment_value })
         ),
         "a review outcome carries its draft"
     );
@@ -456,7 +457,12 @@ async fn deliberate_round_trips_every_outcome_branch() {
         !accepts(
             &output,
             &output,
-            &json!({ "status": "no_change", "verdict": {}, "draft": {} })
+            &json!({
+                "status": "no_change",
+                "verdict": {},
+                "draft": {},
+                "judgment": &judgment_value
+            })
         ),
         "a no_change outcome carries no draft"
     );
