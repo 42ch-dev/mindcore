@@ -21,7 +21,7 @@ use mindcore_spi::{adopt_knowledge_entry_typed, AdoptionOutcome};
 use mindcore_sqlite::{load_retirement_entry, read_entry, retirement_successors_of, write_entry};
 use spoke_operations::{
     resolve_retirement_chain, spoke_reject, AdoptionPort, KnowledgeEntryPort, RetirementChainEntry,
-    SpokeReject, SpokeRejectCode, SpokeResult,
+    RetirementTerminal, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::{
     KnowledgeAdoptRequest, KnowledgeAdoptResponse, KnowledgeEntry, Principal, Scope,
@@ -138,7 +138,7 @@ async fn adopt_in(
     // The resolver's closures answer `None` for both absence and a storage fault, so the fault
     // is recorded here and replaces the retirement refusal the resolver builds from that `None`.
     let fault: StdMutex<Option<SpokeReject>> = StdMutex::new(None);
-    let terminal = match resolve_retirement_chain(
+    let resolved = resolve_retirement_chain(
         requested,
         |current: &RetirementChainEntry| {
             let gate = &gate;
@@ -146,13 +146,10 @@ async fn adopt_in(
             let entry_id = current.entry_id.clone();
             async move {
                 let mut guard = gate.lock().await;
-                match retirement_successors_of(&mut guard, collection, &entry_id).await {
-                    SpokeResult::Ok(successors) => successors,
-                    SpokeResult::Reject(reject) => {
-                        *fault.lock().expect("fault slot") = Some(reject);
-                        None
-                    }
-                }
+                chain_lookup(
+                    retirement_successors_of(&mut guard, collection, &entry_id).await,
+                    fault,
+                )
             }
         },
         |entry_id: &str| {
@@ -161,25 +158,17 @@ async fn adopt_in(
             let entry_id = entry_id.to_string();
             async move {
                 let mut guard = gate.lock().await;
-                match load_retirement_entry(&mut guard, collection, scope_id, &entry_id).await {
-                    SpokeResult::Ok(entry) => entry,
-                    SpokeResult::Reject(reject) => {
-                        *fault.lock().expect("fault slot") = Some(reject);
-                        None
-                    }
-                }
+                chain_lookup(
+                    load_retirement_entry(&mut guard, collection, scope_id, &entry_id).await,
+                    fault,
+                )
             }
         },
     )
-    .await
-    {
+    .await;
+    let terminal = match chain_outcome(resolved, fault.into_inner().expect("fault slot")) {
         SpokeResult::Ok(terminal) => terminal,
-        SpokeResult::Reject(reject) => {
-            return match fault.into_inner().expect("fault slot") {
-                Some(fault) => SpokeResult::Reject(fault),
-                None => SpokeResult::Reject(reject),
-            };
-        }
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
     // A live source must sit at the revision asked for; a retired one is never compared, because
     // the anchor records the terminal's own revision.
@@ -316,6 +305,34 @@ fn adopted(outcome: AdoptionOutcome) -> SpokeResult<KnowledgeAdoptResponse> {
     match serde_json::from_value(json!({ "outcome": word, "entry": entry })) {
         Ok(response) => SpokeResult::Ok(response),
         Err(error) => SpokeResult::Reject(adoption_fault("response", error)),
+    }
+}
+
+/// One chain lookup as the resolver's closures answer it: absence as `None`, and a storage fault
+/// recorded in the slot before its own `None`, so the resolver's refusal is not the last word.
+fn chain_lookup<T>(
+    looked_up: SpokeResult<Option<T>>,
+    fault: &StdMutex<Option<SpokeReject>>,
+) -> Option<T> {
+    match looked_up {
+        SpokeResult::Ok(found) => found,
+        SpokeResult::Reject(reject) => {
+            *fault.lock().expect("fault slot") = Some(reject);
+            None
+        }
+    }
+}
+
+/// The resolver's outcome with the recorded fault preferred over it: the resolver builds a
+/// `SOURCE_RETIRED` from the `None` a fault produced, so the fault must win or a storage fault
+/// would read as retirement.
+fn chain_outcome(
+    resolved: SpokeResult<RetirementTerminal>,
+    fault: Option<SpokeReject>,
+) -> SpokeResult<RetirementTerminal> {
+    match (resolved, fault) {
+        (_, Some(fault)) => SpokeResult::Reject(fault),
+        (resolved, None) => resolved,
     }
 }
 
@@ -656,6 +673,98 @@ mod tests {
                 .as_ref()
                 .and_then(|details| details.get("kind")),
             Some(&json!("store"))
+        );
+    }
+
+    /// A recorded fault wins over the `SOURCE_RETIRED` the resolver builds from the `None` that
+    /// fault produced; without a fault the resolver's own outcome stands. The successor lookup and
+    /// the mid-chain load share this interpretation, so both load sites are covered here.
+    #[test]
+    fn a_recorded_chain_fault_replaces_the_resolvers_retirement_refusal() {
+        let retired = SpokeReject {
+            code: SpokeRejectCode::SourceRetired,
+            message: "retirement chain is broken: the successor entry is missing".to_string(),
+            details: Some(Map::from_iter([(
+                "retirement_chain".to_string(),
+                json!(["ke_retired"]),
+            )])),
+        };
+        let fault = SpokeReject {
+            code: SpokeRejectCode::InternalError,
+            message: "knowledge retirement marker could not be read: no such table".to_string(),
+            details: None,
+        };
+
+        let replaced = refused(
+            chain_outcome(SpokeResult::Reject(retired.clone()), Some(fault.clone())),
+            "a fault under a retirement refusal",
+        );
+        assert_eq!(
+            replaced, fault,
+            "the fault is preferred, not the retirement"
+        );
+        assert_ne!(
+            replaced.code,
+            SpokeRejectCode::SourceRetired,
+            "a storage fault never reads as retirement"
+        );
+
+        let preserved = refused(
+            chain_outcome(SpokeResult::Reject(retired.clone()), None),
+            "a retirement refusal with no recorded fault",
+        );
+        assert_eq!(
+            preserved, retired,
+            "genuine absence or retirement keeps its refusal"
+        );
+
+        let terminal = RetirementTerminal {
+            source_scope_id: SHARED_SCOPE.to_string(),
+            source_entry_id: "ke_terminal".to_string(),
+            source_revision: 1,
+        };
+        let resolved = ok(
+            chain_outcome(SpokeResult::Ok(terminal), None),
+            "a resolved chain",
+        );
+        assert_eq!(resolved.source_entry_id, "ke_terminal");
+    }
+
+    /// A lookup answers the resolver with absence and records its fault in the shared slot, so the
+    /// interpretation above has something to prefer.
+    #[test]
+    fn a_failed_chain_lookup_records_its_fault_and_answers_absence() {
+        let fault = StdMutex::new(None);
+        let successors: SpokeResult<Option<Vec<String>>> = spoke_reject(
+            SpokeRejectCode::InternalError,
+            "knowledge retirement marker could not be read: no such table",
+            None,
+        );
+        assert!(
+            chain_lookup(successors, &fault).is_none(),
+            "a fault reads as absence to the resolver"
+        );
+        assert_eq!(
+            fault.lock().expect("fault slot").as_ref().map(|f| f.code),
+            Some(SpokeRejectCode::InternalError)
+        );
+
+        let quiet = StdMutex::new(None);
+        assert_eq!(
+            chain_lookup(
+                SpokeResult::Ok(Some(vec!["ke_terminal".to_string()])),
+                &quiet
+            ),
+            Some(vec!["ke_terminal".to_string()])
+        );
+        assert!(
+            quiet.lock().expect("fault slot").is_none(),
+            "a good read records nothing"
+        );
+        assert!(chain_lookup::<String>(SpokeResult::Ok(None), &quiet).is_none());
+        assert!(
+            quiet.lock().expect("fault slot").is_none(),
+            "absence records nothing"
         );
     }
 
