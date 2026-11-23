@@ -246,15 +246,15 @@ fn expect_source_absent(result: SpokeResult<AdoptionOutcome>, context: &str) {
     }
 }
 
-fn expect_history_truncated<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) {
+fn expect_history_truncated<T: std::fmt::Debug>(
+    result: SpokeResult<T>,
+    floor: i64,
+    context: &str,
+) {
     match result {
         SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
         SpokeResult::Reject(reject) => {
-            assert_eq!(
-                reject.code,
-                SpokeRejectCode::KnowledgeEntryNotFound,
-                "{context}"
-            );
+            assert_eq!(reject.code, SpokeRejectCode::HistoryTruncated, "{context}");
             assert_eq!(
                 reject.message, "knowledge entry revision was pruned",
                 "{context}"
@@ -263,9 +263,9 @@ fn expect_history_truncated<T: std::fmt::Debug>(result: SpokeResult<T>, context:
                 reject
                     .details
                     .as_ref()
-                    .and_then(|details| details.get("reason")),
-                Some(&Value::from("HISTORY_TRUNCATED")),
-                "{context}: the truncation refusal names its class"
+                    .and_then(|details| details.get("floor_revision")),
+                Some(&Value::from(floor)),
+                "{context}: the truncation refusal names the retained floor"
             );
         }
     }
@@ -711,6 +711,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
 
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
+        2,
         "a revision below the seeded floor",
     );
 
@@ -765,6 +766,7 @@ async fn knowledge_history_floor_refuses_pruned_revisions_across_reopen() {
     assert_eq!(history_floor(&store.pool(), "shared", "entry-f").await, 2);
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
+        2,
         "a pruned revision after reopen",
     );
     assert_eq!(
@@ -884,6 +886,7 @@ async fn knowledge_prune_bounds_history_and_keeps_replay_above_the_floor() {
     }
     expect_history_truncated(
         shared.get_entry_at_revision("entry-f", 1).await,
+        2,
         "the revision just below the new floor",
     );
 
@@ -1142,6 +1145,7 @@ async fn knowledge_prune_keeps_revisions_derived_across_a_gap_replayable() {
     }
     expect_history_truncated(
         shared.get_entry_at_revision("entry-p", 1).await,
+        2,
         "the revision whose preimage the prune removed",
     );
 

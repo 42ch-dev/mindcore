@@ -131,7 +131,7 @@ impl ScopedKnowledgeStore {
     /// Checkpoint selection and record hydration share one read transaction, so the replay is a
     /// whole committed state. Revision `0`, a revision the entry never held and a missing entry
     /// answer the same generic `KnowledgeEntryNotFound`; a revision below the entry's persisted
-    /// floor answers `KnowledgeEntryNotFound` with `details.reason` `HISTORY_TRUNCATED`. A
+    /// floor answers `HistoryTruncated` with `details.floor_revision`. A
     /// superseded entry still replays from its own history.
     pub async fn get_entry_at_revision(
         &self,
@@ -742,14 +742,11 @@ fn revision_not_found<T>() -> SpokeResult<T> {
     )
 }
 
-fn revision_pruned<T>() -> SpokeResult<T> {
+fn revision_pruned<T>(floor: i64) -> SpokeResult<T> {
     let mut details = Map::new();
-    details.insert(
-        "reason".to_string(),
-        Value::String("HISTORY_TRUNCATED".to_string()),
-    );
+    details.insert("floor_revision".to_string(), Value::from(floor));
     spoke_reject(
-        SpokeRejectCode::KnowledgeEntryNotFound,
+        SpokeRejectCode::HistoryTruncated,
         "knowledge entry revision was pruned",
         Some(details),
     )
@@ -1050,7 +1047,7 @@ async fn read_entry_revision(
         }
     };
     if assigned < floor {
-        return revision_pruned();
+        return revision_pruned(floor);
     }
     if assigned > live {
         return revision_not_found();
