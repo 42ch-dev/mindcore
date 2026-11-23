@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -130,32 +130,56 @@ async fn adopt_in(
         )
         .await
     };
-    let Some(requested) = requested else {
-        return source_absent();
+    let requested = match requested {
+        SpokeResult::Ok(Some(requested)) => requested,
+        SpokeResult::Ok(None) => return source_absent(),
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
+    // The resolver's closures answer `None` for both absence and a storage fault, so the fault
+    // is recorded here and replaces the retirement refusal the resolver builds from that `None`.
+    let fault: StdMutex<Option<SpokeReject>> = StdMutex::new(None);
     let terminal = match resolve_retirement_chain(
         requested,
         |current: &RetirementChainEntry| {
             let gate = &gate;
+            let fault = &fault;
             let entry_id = current.entry_id.clone();
             async move {
                 let mut guard = gate.lock().await;
-                retirement_successors_of(&mut guard, collection, &entry_id).await
+                match retirement_successors_of(&mut guard, collection, &entry_id).await {
+                    SpokeResult::Ok(successors) => successors,
+                    SpokeResult::Reject(reject) => {
+                        *fault.lock().expect("fault slot") = Some(reject);
+                        None
+                    }
+                }
             }
         },
         |entry_id: &str| {
             let gate = &gate;
+            let fault = &fault;
             let entry_id = entry_id.to_string();
             async move {
                 let mut guard = gate.lock().await;
-                load_retirement_entry(&mut guard, collection, scope_id, &entry_id).await
+                match load_retirement_entry(&mut guard, collection, scope_id, &entry_id).await {
+                    SpokeResult::Ok(entry) => entry,
+                    SpokeResult::Reject(reject) => {
+                        *fault.lock().expect("fault slot") = Some(reject);
+                        None
+                    }
+                }
             }
         },
     )
     .await
     {
         SpokeResult::Ok(terminal) => terminal,
-        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        SpokeResult::Reject(reject) => {
+            return match fault.into_inner().expect("fault slot") {
+                Some(fault) => SpokeResult::Reject(fault),
+                None => SpokeResult::Reject(reject),
+            };
+        }
     };
     // A live source must sit at the revision asked for; a retired one is never compared, because
     // the anchor records the terminal's own revision.
@@ -548,6 +572,91 @@ mod tests {
         assert_eq!(anchor["source_entry_id"], "ke_terminal");
         assert_eq!(anchor["source_scope_id"], SHARED_SCOPE);
         assert_eq!(anchor["source_revision"], 1);
+    }
+
+    /// A storage fault on the requested entry is `INTERNAL_ERROR` with the fixed message, never
+    /// the `NOT_FOUND` its absence answers.
+    #[tokio::test]
+    async fn an_initial_retirement_fault_is_internal_error() {
+        let (_dir, store, service) = service().await;
+        let seed = store.pool();
+        sqlx::query(
+            "INSERT INTO knowledge_entries \
+             (collection, entry_id, revision, payload, created_at, updated_at) \
+             VALUES ('shared', 'ke_broken', 1, '{ not an entry', \
+                     '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+        )
+        .execute(&seed)
+        .await
+        .expect("seed an undecodable stored payload");
+
+        let refused = refused(
+            service
+                .adopt_knowledge_entry(
+                    &principal("prn_owner"),
+                    &scope(DESTINATION_SCOPE),
+                    &request("ke_broken", 1),
+                )
+                .await,
+            "an undecodable source",
+        );
+        assert_eq!(refused.code, SpokeRejectCode::InternalError);
+        assert_eq!(refused.message, ADOPTION_FAULT);
+        assert_eq!(
+            refused
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind")),
+            Some(&json!("store"))
+        );
+        assert!(
+            !refused.message.contains("payload"),
+            "the diagnostic stays host-side: {refused:?}"
+        );
+    }
+
+    /// A fault on a mid-chain hop is not retirement: the chain cannot be resolved, so the call
+    /// answers `INTERNAL_ERROR` rather than `SOURCE_RETIRED`.
+    #[tokio::test]
+    async fn a_mid_chain_retirement_fault_is_internal_error() {
+        let (_dir, store, service) = service().await;
+        let seed = store.pool();
+        sqlx::query(
+            "INSERT INTO knowledge_entries \
+             (collection, entry_id, revision, payload, created_at, updated_at) \
+             VALUES ('shared', 'ke_broken', 1, '{ not an entry', \
+                     '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+        )
+        .execute(&seed)
+        .await
+        .expect("seed an undecodable stored payload");
+        sqlx::query(
+            "UPDATE knowledge_entries SET superseded_by = 'ke_broken' \
+             WHERE collection = 'shared' AND entry_id = 'ke_source'",
+        )
+        .execute(&seed)
+        .await
+        .expect("retire the source into the undecodable hop");
+
+        let refused = refused(
+            service
+                .adopt_knowledge_entry(
+                    &principal("prn_owner"),
+                    &scope(DESTINATION_SCOPE),
+                    &request("ke_source", 1),
+                )
+                .await,
+            "a mid-chain undecodable hop",
+        );
+        assert_eq!(refused.code, SpokeRejectCode::InternalError);
+        assert_eq!(refused.message, ADOPTION_FAULT);
+        assert_eq!(
+            refused
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind")),
+            Some(&json!("store"))
+        );
     }
 
     /// The adoption only reads its source: the write its port must expose refuses before it

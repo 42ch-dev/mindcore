@@ -17,10 +17,10 @@ use mindcore_sqlite::MindStore;
 use spoke_connect::core::{CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION};
 use spoke_connect::remote::{
     connect_responder, loopback_transport_pair, ConnectResponderOptions, KnowledgeAdmission,
-    MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler,
+    MemoryAdmission, RemoteIdentity, RemoteMemoryService, ToolHandler, KNOWLEDGE_OP_ADOPT,
 };
 use spoke_operations::{
-    spoke_ok, spoke_reject, validate_manifest_tools, SpokeRejectCode, SpokeResult,
+    spoke_ok, spoke_reject, validate_manifest_tools, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
@@ -85,11 +85,13 @@ fn unsupported_scope() -> Scope {
 }
 
 /// The host's admission: one admitted peer, one peer whose admitted scope carries a selection the
-/// face does not serve, and a stranger.
+/// face does not serve, one peer the host admits under a scope id this surface does not serve, and
+/// a stranger.
 fn admission() -> KnowledgeAdmission {
     Arc::new(|peer_id: &str| match peer_id {
         "peer-owner" => SpokeResult::Ok(scope_of(SCOPE_ID)),
         "peer-cognition" => SpokeResult::Ok(unsupported_scope()),
+        "peer-elsewhere" => SpokeResult::Ok(scope_of("spoke-scope-other")),
         _ => spoke_reject(
             SpokeRejectCode::NotAuthorized,
             format!("peer {peer_id} holds no knowledge admission"),
@@ -98,10 +100,11 @@ fn admission() -> KnowledgeAdmission {
     })
 }
 
-/// The host's peer-to-principal admission: the driver is admitted, a stranger is not.
+/// The host's peer-to-principal admission: the driver is admitted, and the mismatch peer is
+/// admitted as the same principal so only the admitted scope id can refuse it. A stranger is not.
 fn principals() -> MemoryAdmission {
     Arc::new(|peer_id: &str| match peer_id {
-        "peer-owner" => SpokeResult::Ok(
+        "peer-owner" | "peer-elsewhere" => SpokeResult::Ok(
             serde_json::from_value(json!({ "principal_id": "prn_owner", "extensions": {} }))
                 .expect("principal JSON matches the schema"),
         ),
@@ -207,6 +210,13 @@ fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
     match result {
         SpokeResult::Ok(value) => value,
         SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
+    }
+}
+
+fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
+    match result {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value:?}"),
     }
 }
 
@@ -687,6 +697,57 @@ async fn tool_registrations_drive_advertisement_and_installation() {
     .await;
     expect_ok(surface.register(&responder), "install handlers");
     responder.close();
+}
+
+/// The admitted scope id must be the one this surface serves, not merely a well-formed selection:
+/// a resolver that admits another id is refused on both faces. Without the id check, an adoption
+/// whose destination names that foreign id matches the admitted context and writes to the
+/// principal's routed collection, while the knowledge face denies the same peer.
+#[tokio::test]
+async fn an_admitted_scope_id_outside_the_served_one_is_refused() {
+    let serve = Fixture::open().await.serve();
+    let surface = expect_ok(
+        serve.surface(ServeFaces {
+            adoption: Some(adoption_source()),
+            ..faces(metadata("runtime"))
+        }),
+        "assemble an adopting surface",
+    );
+    let face = surface
+        .ports
+        .as_knowledge()
+        .expect("knowledge face composed");
+
+    let refused = match (face.admission)("peer-elsewhere") {
+        SpokeResult::Reject(reject) => reject,
+        SpokeResult::Ok(scope) => panic!("a foreign admitted id reached Connect with {scope:?}"),
+    };
+    assert_eq!(refused.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(refused.message, "knowledge scope not authorized");
+    assert!(refused.details.is_none(), "{refused:?}");
+
+    let adoption = surface.ports.as_adoption().expect("adoption face composed");
+    let denied = expect_reject(
+        adoption
+            .invoke(
+                "peer-elsewhere",
+                KNOWLEDGE_OP_ADOPT,
+                json!({
+                    "source_scope_id": "spc_shared",
+                    "source_entry_id": "ke_source",
+                    "source_revision": 1,
+                    "destination_scope_id": "spoke-scope-other",
+                    "idempotency_key": "mismatch",
+                }),
+            )
+            .await,
+        "adoption under a foreign admitted id",
+    );
+    assert_eq!(
+        denied.code,
+        SpokeRejectCode::NotAuthorized,
+        "the adoption face refuses what the knowledge face denies"
+    );
 }
 
 /// The runtime validates the scope the host admits, before Connect merges any request selection.

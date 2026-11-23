@@ -170,7 +170,7 @@ impl MindcoreServe {
             SpokeResult::Ok(manifest) => manifest,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        let admission = validated(faces.admission);
+        let admission = validated(faces.admission, &faces.scope_id);
         let store: Arc<RoutedKnowledgeStore> =
             Arc::new(self.store.served_knowledge(faces.scope_id, faces.knowledge));
         let knowledge: Arc<dyn ScopedKnowledgePort + Send + Sync> = store.clone();
@@ -462,16 +462,28 @@ fn derive_manifest(
 /// the request's cognition selection, so a selection the face does not serve must be refused
 /// before the merge can drop it.
 ///
+/// The admitted id must also be the one this surface serves: the routed store refuses any other
+/// id, so a resolver returning a different one would otherwise be admitted here and denied there.
+/// Both faces share this admission, so one check covers them.
+///
 /// Host admission is not peer input, so an unsupported admitted selection is refused as the same
 /// generic `NotAuthorized` a rejecting resolver returns, never as the caller-declared
 /// `InvalidInput` the routed store keeps for request scopes: the peer learns nothing about what
 /// the face does not serve. The resolver's own refusal passes through unchanged.
-fn validated(admission: KnowledgeAdmission) -> KnowledgeAdmission {
+fn validated(admission: KnowledgeAdmission, scope_id: &str) -> KnowledgeAdmission {
+    let scope_id = scope_id.to_string();
     Arc::new(move |peer_id: &str| -> SpokeResult<Scope> {
         let scope = match admission(peer_id) {
             SpokeResult::Ok(scope) => scope,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
+        if scope.scope_id != scope_id {
+            return spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                "knowledge scope not authorized",
+                None,
+            );
+        }
         match validate_admission_scope(&scope) {
             SpokeResult::Ok(()) => SpokeResult::Ok(scope),
             SpokeResult::Reject(_) => spoke_reject(

@@ -417,9 +417,14 @@ async fn resolve_chain(store: &MindStore, requested: &str) -> SpokeResult<Retire
     let cell = tokio::sync::Mutex::new(&mut tx);
     let requested = {
         let mut guard = cell.lock().await;
-        load_retirement_entry(&mut guard, "wren", "wren", requested).await
-    }
-    .expect("the requested entry is present");
+        expect_ok(
+            load_retirement_entry(&mut guard, "wren", "wren", requested).await,
+            "the requested entry read",
+        )
+    };
+    let Some(requested) = requested else {
+        panic!("the requested entry is present");
+    };
     resolve_retirement_chain(
         requested,
         |current: &RetirementChainEntry| {
@@ -427,7 +432,10 @@ async fn resolve_chain(store: &MindStore, requested: &str) -> SpokeResult<Retire
             let entry_id = current.entry_id.clone();
             async move {
                 let mut guard = cell.lock().await;
-                retirement_successors_of(&mut guard, "wren", &entry_id).await
+                expect_ok(
+                    retirement_successors_of(&mut guard, "wren", &entry_id).await,
+                    "the successor read",
+                )
             }
         },
         |entry_id: &str| {
@@ -435,7 +443,10 @@ async fn resolve_chain(store: &MindStore, requested: &str) -> SpokeResult<Retire
             let entry_id = entry_id.to_string();
             async move {
                 let mut guard = cell.lock().await;
-                load_retirement_entry(&mut guard, "wren", "wren", &entry_id).await
+                expect_ok(
+                    load_retirement_entry(&mut guard, "wren", "wren", &entry_id).await,
+                    "a chain entry read",
+                )
             }
         },
     )
@@ -586,6 +597,68 @@ async fn a_retirement_chain_resolves_to_its_live_terminal() {
 
     store.close().await;
     remove_database(&path);
+}
+
+/// A stored payload that does not decode is a storage fault, not absence: the entry loader answers
+/// `INTERNAL_ERROR` while a missing row still answers `Ok(None)`, so the caller never reports a
+/// corrupt row as `NOT_FOUND` or `SOURCE_RETIRED`.
+#[tokio::test]
+async fn a_retirement_payload_fault_is_not_absence() {
+    let path = database_path("retirement-payload-fault");
+    let store = MindStore::open(&path).await.expect("open store");
+    let seed = second_connection(&path).await;
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_broken', 1, '{ not an entry', \
+                 '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .execute(&seed)
+    .await
+    .expect("seed an undecodable stored payload");
+
+    let mut tx = store.pool().begin().await.expect("begin a fault read");
+    let broken = load_retirement_entry(&mut tx, "wren", "wren", "ke_broken").await;
+    assert_eq!(
+        expect_reject(broken, "an undecodable payload"),
+        SpokeRejectCode::InternalError,
+        "a payload fault is not absence"
+    );
+    let missing = expect_ok(
+        load_retirement_entry(&mut tx, "wren", "wren", "ke_absent").await,
+        "a missing entry read",
+    );
+    assert!(missing.is_none(), "an absent row stays absence");
+    drop(tx);
+
+    seed.close().await;
+    store.close().await;
+    remove_database(&path);
+}
+
+/// A failed statement answers `INTERNAL_ERROR` from both loaders instead of the `None` absence they
+/// return for a missing row.
+#[tokio::test]
+async fn a_retirement_read_fault_is_not_absence() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("open an empty database");
+
+    let mut tx = pool.begin().await.expect("begin a fault read");
+    let entry = load_retirement_entry(&mut tx, "wren", "wren", "ke_live").await;
+    assert_eq!(
+        expect_reject(entry, "a read of a missing table"),
+        SpokeRejectCode::InternalError
+    );
+    let successors = retirement_successors_of(&mut tx, "wren", "ke_live").await;
+    assert_eq!(
+        expect_reject(successors, "a successor read of a missing table"),
+        SpokeRejectCode::InternalError
+    );
+    drop(tx);
+    pool.close().await;
 }
 
 #[tokio::test]

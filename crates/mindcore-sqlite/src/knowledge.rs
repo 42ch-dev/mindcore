@@ -1172,14 +1172,15 @@ pub(crate) async fn read_lifecycle(
     }
 }
 
-/// `Some` with the entry's successors: its `superseded_by` when the row is retired, none while it
-/// is live. `None` when the row cannot be read, which the chain resolver reports as an ambiguous
-/// merge.
+/// `Ok(Some(..))` with the entry's successors: its `superseded_by` when the row is retired, none
+/// while it is live. `Ok(None)` when the row is missing, which the chain resolver reports as an
+/// ambiguous merge. A failed read is a storage fault, so it answers `InternalError` instead of
+/// reading as absence.
 pub async fn retirement_successors_of(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,
-) -> Option<Vec<String>> {
+) -> SpokeResult<Option<Vec<String>>> {
     let marker: Result<Option<Option<String>>, sqlx::Error> = sqlx::query_scalar(
         "SELECT superseded_by FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
     )
@@ -1188,23 +1189,28 @@ pub async fn retirement_successors_of(
     .fetch_optional(&mut **tx)
     .await;
     match marker {
-        Ok(Some(marker)) => Some(marker.into_iter().collect()),
-        Ok(None) | Err(_) => None,
+        Ok(Some(marker)) => SpokeResult::Ok(Some(marker.into_iter().collect())),
+        Ok(None) => SpokeResult::Ok(None),
+        Err(error) => internal(format!(
+            "knowledge retirement marker could not be read: {error}"
+        )),
     }
 }
 
 /// One retirement-chain node of `collection`, read through the caller's transaction.
 ///
-/// `None` when the row is missing, unreadable, or hidden from the viewpoint-free disclosure
-/// predicate, so a hidden hop never enters the chain. `scope_id` is the source scope the row is
-/// read under; `status` is `merged` while the row carries a marker and `live` otherwise — the
-/// store never holds a `deleted` entry — and `revision` is the row's revision column.
+/// `Ok(None)` when the row is missing or hidden from the viewpoint-free disclosure predicate, so a
+/// hidden hop never enters the chain. A failed read or a stored payload that does not decode is a
+/// storage fault, so it answers `InternalError` instead of reading as absence. `scope_id` is the
+/// source scope the row is read under; `status` is `merged` while the row carries a marker and
+/// `live` otherwise — the store never holds a `deleted` entry — and `revision` is the row's
+/// revision column.
 pub async fn load_retirement_entry(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     scope_id: &str,
     entry_id: &str,
-) -> Option<RetirementChainEntry> {
+) -> SpokeResult<Option<RetirementChainEntry>> {
     let stored: Result<Option<(i64, String, Option<String>)>, sqlx::Error> = sqlx::query_as(
         "SELECT revision, payload, superseded_by FROM knowledge_entries \
          WHERE collection = ? AND entry_id = ?",
@@ -1215,15 +1221,26 @@ pub async fn load_retirement_entry(
     .await;
     let (revision, payload, superseded_by) = match stored {
         Ok(Some(stored)) => stored,
-        Ok(None) | Err(_) => return None,
+        Ok(None) => return SpokeResult::Ok(None),
+        Err(error) => {
+            return internal(format!(
+                "knowledge retirement entry could not be read: {error}"
+            ))
+        }
     };
-    let SpokeResult::Ok(entry) = decode(&payload) else {
-        return None;
+    let entry = match decode(&payload) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => {
+            return internal(format!(
+                "stored retirement entry does not decode: {}",
+                reject.message
+            ))
+        }
     };
     if !knowledge_entry_visible_to_viewpoint(&entry, None) {
-        return None;
+        return SpokeResult::Ok(None);
     }
-    Some(RetirementChainEntry {
+    SpokeResult::Ok(Some(RetirementChainEntry {
         entry_id: entry_id.to_string(),
         scope_id: scope_id.to_string(),
         status: if superseded_by.is_some() {
@@ -1233,7 +1250,7 @@ pub async fn load_retirement_entry(
         }
         .to_string(),
         revision: u64::try_from(revision).ok(),
-    })
+    }))
 }
 
 /// One entry-led replay selection: the stored floor, the chosen checkpoint's revision, its payload
