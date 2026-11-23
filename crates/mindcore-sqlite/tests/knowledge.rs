@@ -19,8 +19,8 @@ use mindcore_sqlite::{
 };
 use serde_json::{json, Map, Value};
 use spoke_operations::{
-    resolve_retirement_chain, KnowledgeEntryPort, RetirementChainEntry, RetirementTerminal,
-    SpokeRejectCode, SpokeResult,
+    resolve_retirement_chain, spoke_reject, KnowledgeEntryPort, RetirementChainEntry,
+    RetirementTerminal, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::knowledge_entry::{
     ExtensionKey, KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
@@ -3357,6 +3357,70 @@ async fn adoption_drops_a_cognition_module_the_copy_would_not_accept() {
 
     store.close().await;
     remove_database(&path);
+}
+
+#[tokio::test]
+async fn adoption_propagates_a_destination_refusal_that_names_no_occupant() {
+    let mut source = entry_with("ke_shared_gate", "shut after dusk");
+    source.revision = Some(1);
+    let src = FixedSource(source);
+    let dst = RefusingDestination {
+        message: "the copy's canonical name is not a wire name",
+    };
+
+    match adopt_knowledge_entry(
+        &src,
+        &dst,
+        SHARED_SCOPE,
+        "ke_shared_gate",
+        "ke_mine_gate",
+        1,
+    )
+    .await
+    {
+        SpokeResult::Reject(reject) => {
+            assert_eq!(
+                reject.code,
+                SpokeRejectCode::InvalidInput,
+                "a validation refusal is not an occupancy conflict"
+            );
+            assert_eq!(
+                reject.message, dst.message,
+                "the destination's own wording survives"
+            );
+            assert!(
+                reject.details.is_none(),
+                "an unstructured refusal gains no adopted_revision or superseded_by detail"
+            );
+        }
+        other => panic!("a refused create must refuse the adoption, got {other:?}"),
+    }
+}
+
+/// A destination port whose empty slot refuses every create with one unstructured
+/// `InvalidInput`: the shape a destination adapter raises for a copy it considers invalid, which
+/// the adoption must forward rather than read as an occupancy.
+struct RefusingDestination {
+    message: &'static str,
+}
+
+#[async_trait]
+impl KnowledgeEntryPort for RefusingDestination {
+    async fn get_knowledge_entry(&self, _entry_id: &str) -> SpokeResult<KnowledgeEntry> {
+        spoke_reject(
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            "knowledge entry not found",
+            None,
+        )
+    }
+
+    async fn put_knowledge_entry(
+        &self,
+        _entry: KnowledgeEntry,
+        _expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        spoke_reject(SpokeRejectCode::InvalidInput, self.message, None)
+    }
 }
 
 /// A source port answering one fixed entry: a stored row is read back with
