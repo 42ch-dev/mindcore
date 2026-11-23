@@ -32,7 +32,7 @@ use mindcore_spi::{
 };
 use mindcore_spoke::{ServedMemory, TransferService};
 use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
-use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
+use spoke_connect::core::{derive_peer_id_from_ed25519_pubkey, CAPABILITY_SPOKE_JUDGMENT};
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
     ConnectResponderOptions, KnowledgeAdmission, MemoryAdmission, RemoteAdapter,
@@ -1602,6 +1602,11 @@ async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
     assert!(
         !capabilities(&surface).contains(&DELIBERATE),
         "an unwired deliberation route is never advertised: {:?}",
+        capabilities(&surface)
+    );
+    assert!(
+        !capabilities(&surface).contains(&CAPABILITY_SPOKE_JUDGMENT),
+        "no `deliberate` registration, so no judgment family is advertised: {:?}",
         capabilities(&surface)
     );
 
