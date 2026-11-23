@@ -2476,63 +2476,110 @@ async fn knowledge_adopt_refuses_with_the_contract_codes() {
     }
 }
 
-/// A host may admit the correct destination scope id while restricting which of its entries the
-/// peer reaches. Adoption must honour that selection: a copy whose entry is outside it is neither
-/// written nor returned, and the destination slot stays as it was.
+/// An occupied destination slot answers the ordinary occupancy refusal whatever the admitted
+/// selection makes of its occupant: hidden and visible occupants are byte-identical, so the answer
+/// reports occupancy and nothing about the occupant. A slot the selection cannot claim answers the
+/// same refusal and writes nothing, and a genuinely free, usable slot still creates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adoption_honours_the_admitted_destination_selection() {
+async fn an_occupied_destination_answers_occupancy_whatever_the_selection_shows() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
     seed_shared_source(&pool).await;
+    // A destination occupant the caller may or may not be shown, depending on the admitted
+    // selection: either way it holds the slot `ke_shared` names.
+    expect_ok(
+        ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(COLLECTION))
+            .put_knowledge_entry(shared_entry(SHARED_ENTRY, "somebody else's row"), None)
+            .await,
+        "seed the destination occupant",
+    );
     let (_dir, serve) = fixture.serve();
+    let surface_of = |admission: KnowledgeAdmission| {
+        let mut admitted = adopting_faces(routes(&[PRINCIPAL]));
+        admitted.admission = admission;
+        surface(&serve, admitted)
+    };
 
-    for (context, restriction) in [
+    let mut refusals = Vec::new();
+    for (context, surface) in [
+        ("a visible occupant", surface_of(knowledge_admission())),
         (
-            "an entry-id selection that excludes the copy",
-            json!({ "entry_ids": ["ke_somebody_else"] }),
+            "an entry-id selection that hides the occupant",
+            surface_of(restricted_knowledge_admission(
+                json!({ "entry_ids": ["ke_somebody_else"] }),
+            )),
         ),
         (
-            "an entry-type selection that excludes the copy",
-            json!({ "entry_types": ["belief"] }),
+            "an entry-type selection that hides the occupant",
+            surface_of(restricted_knowledge_admission(
+                json!({ "entry_types": ["belief"] }),
+            )),
         ),
     ] {
-        let mut admitted = adopting_faces(routes(&[PRINCIPAL]));
-        admitted.admission = restricted_knowledge_admission(restriction.clone());
-        let surface = surface(&serve, admitted);
         let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
         let reject = expect_reject(
             AdoptionPort::adopt_knowledge_entry(
                 &*session.adapter,
                 &principal(),
                 &scope_of(SCOPE_ID),
-                &adopt_request(SHARED_ENTRY, 1, "restricted-selection"),
+                &adopt_request(SHARED_ENTRY, 1, context),
             )
             .await,
             context,
         );
         assert_eq!(
             reject.code,
-            SpokeRejectCode::NotAuthorized,
-            "{context}: {reject:?}"
+            SpokeRejectCode::RevisionConflict,
+            "{context} is an occupancy, not an authorization answer: {reject:?}"
         );
         assert!(
-            reject.details.clone().unwrap_or_default().is_empty(),
+            reject.details.is_none(),
             "{context} carries no details: {reject:?}"
         );
-        assert_eq!(
-            destination_rows(&pool, SHARED_ENTRY).await,
-            0,
-            "{context} writes nothing"
-        );
         drop(session);
+        refusals.push((context, reject));
+    }
+    let (_, visible) = &refusals[0];
+    for (context, hidden) in &refusals[1..] {
+        assert_eq!(
+            hidden, visible,
+            "{context} must not be distinguishable from a visible occupant"
+        );
     }
 
-    // The same source and route adopt normally once the selection admits the copy's entry.
-    let surface_of = |admission: KnowledgeAdmission| {
-        let mut admitted = adopting_faces(routes(&[PRINCIPAL]));
-        admitted.admission = admission;
-        surface(&serve, admitted)
-    };
+    // A slot the selection cannot claim is not adoptable either: it answers the same occupancy and
+    // leaves the collection without a copy.
+    let restricted = surface_of(restricted_knowledge_admission(
+        json!({ "entry_types": ["belief"] }),
+    ));
+    let session = connect(&restricted, &[ADOPTION, "spoke-knowledge"]).await;
+    let reject = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &adopt_request(TERMINAL_ENTRY, 1, "unusable-free-slot"),
+        )
+        .await,
+        "a free slot outside the admitted selection",
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::RevisionConflict,
+        "a free slot this call may not claim answers the occupancy: {reject:?}"
+    );
+    assert!(
+        reject.details.is_none(),
+        "the unusable-slot refusal carries no details: {reject:?}"
+    );
+    assert_eq!(
+        destination_rows(&pool, TERMINAL_ENTRY).await,
+        0,
+        "the unusable free slot writes nothing"
+    );
+    drop(session);
+
+    // The same free slot under an admitting selection still creates.
     let admitting = surface_of(knowledge_admission());
     let session = connect(&admitting, &[ADOPTION, "spoke-knowledge"]).await;
     let adopted = wire(expect_ok(
@@ -2540,62 +2587,58 @@ async fn adoption_honours_the_admitted_destination_selection() {
             &*session.adapter,
             &principal(),
             &scope_of(SCOPE_ID),
-            &adopt_request(SHARED_ENTRY, 1, "unrestricted-selection"),
+            &adopt_request(TERMINAL_ENTRY, 1, "unrestricted-selection"),
         )
         .await,
-        "an unrestricted admission still adopts",
+        "an unrestricted admission still adopts into a free slot",
     ));
     assert_eq!(adopted["outcome"], json!("adopted"), "{adopted}");
     assert_eq!(
-        destination_rows(&pool, SHARED_ENTRY).await,
+        destination_rows(&pool, TERMINAL_ENTRY).await,
         1,
         "the unrestricted admission writes the one copy"
     );
     let stored = wire(expect_ok(
-        KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, SHARED_ENTRY).await,
+        KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, TERMINAL_ENTRY).await,
         "read the stored copy back through the knowledge face",
     ));
     drop(session);
 
-    // The same slot re-read under a selection that excludes it: the repeat must not serve the
-    // excluded copy, and the slot is left byte-identical.
-    for (context, restriction) in [
-        (
-            "an entry-id selection that excludes the stored copy",
-            json!({ "entry_ids": ["ke_somebody_else"] }),
-        ),
-        (
-            "an entry-type selection that excludes the stored copy",
-            json!({ "entry_types": ["belief"] }),
-        ),
-    ] {
-        let surface = surface_of(restricted_knowledge_admission(restriction));
-        let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
-        let reject = expect_reject(
-            AdoptionPort::adopt_knowledge_entry(
-                &*session.adapter,
-                &principal(),
-                &scope_of(SCOPE_ID),
-                &adopt_request(SHARED_ENTRY, 1, "restricted-reread"),
-            )
-            .await,
-            context,
-        );
-        assert_eq!(
-            reject.code,
-            SpokeRejectCode::NotAuthorized,
-            "{context} hides the copy instead of serving it: {reject:?}"
-        );
-        drop(session);
-    }
+    // The same slot re-read under a selection that cannot see it: the repeat is the ordinary
+    // occupancy again — never the stored copy, never a distinct answer — and the slot is left
+    // byte-identical.
+    let surface = surface_of(restricted_knowledge_admission(
+        json!({ "entry_ids": ["ke_somebody_else"] }),
+    ));
+    let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+    let reject = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &adopt_request(TERMINAL_ENTRY, 1, "restricted-reread"),
+        )
+        .await,
+        "a repeat under a selection that hides the stored copy",
+    );
     assert_eq!(
-        destination_rows(&pool, SHARED_ENTRY).await,
+        reject.code,
+        SpokeRejectCode::RevisionConflict,
+        "the hidden repeat answers occupancy instead of serving the copy: {reject:?}"
+    );
+    assert!(
+        reject.details.is_none(),
+        "the hidden repeat carries no details: {reject:?}"
+    );
+    drop(session);
+    assert_eq!(
+        destination_rows(&pool, TERMINAL_ENTRY).await,
         1,
         "a refused repeat writes no second copy"
     );
     let session = connect(&admitting, &[ADOPTION, "spoke-knowledge"]).await;
     let after = wire(expect_ok(
-        KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, SHARED_ENTRY).await,
+        KnowledgeEntryPort::get_knowledge_entry(&*session.adapter, TERMINAL_ENTRY).await,
         "re-read the copy under an admitting scope",
     ));
     assert_eq!(

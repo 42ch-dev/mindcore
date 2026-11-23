@@ -2,7 +2,7 @@
 
 ## Scope
 
-How a knowledge entry behaves over time: the history a write leaves behind, the operation that adopts a shared entry into a personal collection, and the marker that retires one entry in favour of another. It also names which of these operations are served as protocol operations and which of this page's results they carry; the serving face's admission, wire decode, refusal set, snapshot projection and prune dedup are not this page's (`.agents/specs/architecture/serving-seam.md`). It does not define memory semantics, cognition record shape, or Connect transport behaviour.
+How a knowledge entry behaves over time: the history a write leaves behind, the operation that adopts a shared entry into the served destination collection, and the marker that retires one entry in favour of another. It also names which of these operations are served as protocol operations and which of this page's results they carry; the serving face's admission, wire decode, refusal set, snapshot projection and prune dedup are not this page's (`.agents/specs/architecture/serving-seam.md`). It does not define memory semantics, cognition record shape, or Connect transport behaviour.
 
 ## Current state
 
@@ -34,8 +34,8 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 ### Adoption
 
 `mindcore_spi::adopt_knowledge_entry(src, dst, source_scope_id, source_entry_id,
-destination_entry_id, expected_source_revision)` copies a shared entry into a personal collection
-through the caller's two scoped ports. It is the local half of the served `knowledge.adopt`
+destination_entry_id, expected_source_revision)` copies a shared entry into the destination
+collection through the caller's two scoped ports. It is the local half of the served `knowledge.adopt`
 operation; the retirement-chain resolution that precedes it belongs to the served face, so the
 source this function sees is already the terminal. The served defaults, refusal vocabulary, terminal
 resolution, destination selection and dedup are
@@ -76,8 +76,9 @@ behavior over the two ports it is given.
 - A missing, retired or undisclosable source answers one generic `NOT_FOUND`; a source the caller
   cannot see is indistinguishable from one that does not exist. An empty scope id, an empty source
   id, an empty destination id or a zero revision is refused before any I/O as `INVALID_INPUT`.
-- A destination slot occupied by anything else — including a retired entry, and including an anchor
-  naming another source scope or entry — answers `REVISION_CONFLICT` with no `details` and is left
+- A destination slot occupied by anything else — including a retired entry, including an anchor
+  naming another source scope or entry, and including an occupant the destination port's admitted
+  selection hides from the caller — answers `REVISION_CONFLICT` with no `details` and is left
   byte-identical. The store distinguishes "this slot holds a superseded entry" from a genuine
   validation failure by a structured refusal detail, never by matching a message.
 - A create-only put can meet the occupancy after the empty read: a local destination refuses it as

@@ -25,10 +25,13 @@
   every `workflow_routes` destination, and by dropping any expectation that a route names an
   adoption destination. Two further refusals: the admitted scope's
   `entry_ids`/`entry_types` selection now applies to the destination, so an excluded entry is
-  neither served nor written, and a resolved terminal revision above `2^53-1` refuses before the
-  write instead of committing a copy whose response the wire cannot carry. Two behaviour changes:
-  adoption admits through the knowledge
-  face's `(principals, knowledge_admission)` pair, so a routed principal that face does not admit
+  neither served nor written and answers the ordinary occupancy `REVISION_CONFLICT` with no
+  details — byte-identical to a visible occupant's, so the answer reports slot occupancy only and
+  never the occupying entry's content, revision or visibility — `NOT_AUTHORIZED` staying the answer
+  for a `destination_scope_id` that is not the admitted scope; and a resolved terminal revision above
+  `2^53-1` refuses before the write instead of committing a copy whose response the wire cannot
+  carry. Two behaviour changes: adoption admits through the knowledge face's `(principals,
+  knowledge_admission)` pair, so a routed principal that face does not admit
   answers `NOT_AUTHORIZED` where the product tool served it; and the source resolves through
   `resolve_retirement_chain` before the copy, so the anchor names the live terminal (the copy's own
   entry id is the supplied `destination_entry_id` or, when absent, that terminal's id), a

@@ -245,10 +245,13 @@ impl MindcoreServe {
 }
 
 /// The shared collection adoption reads from: one source for the whole surface. The destination is
-/// the collection the knowledge face serves, so an adopted copy is readable through that face by the
-/// peer that adopted it. Assembly refuses a source that names a route destination or the knowledge
-/// face's own collection, and a source scope equal to the destination scope, so a principal's write
-/// can never become the source another reads.
+/// the one collection the knowledge face serves, shared by every peer admitted to that scope: it
+/// holds one slot per `destination_entry_id`, the first adoption of a given id claims it, a repeat is
+/// served that stored copy as `already_present` only at the anchor revision the copy records, and
+/// every peer the host admits to the scope reads it through the knowledge face when its own admitted
+/// selection admits it. Assembly refuses a source that names a route destination or the
+/// knowledge face's own collection, and a source scope equal to the destination scope, so a
+/// principal's write can never become the source another reads.
 pub struct AdoptionRoute {
     /// The host-owned id naming this source on the wire, recorded in every adopted copy's anchor
     /// triple. Callers cannot supply it: this baseline forwards only the configured value.
@@ -291,8 +294,11 @@ pub struct ServeFaces {
     /// connected, and its scope id must differ from [`ServeFaces::scope_id`]; assembly refuses
     /// otherwise. The source need not hold rows. When it is configured, the
     /// `spoke-knowledge-adoption` face serves `knowledge.adopt` over the knowledge face's admission,
-    /// and writes into [`ServeFaces::knowledge`]'s collection — the same collection
-    /// `knowledge.get`/`list` serve for that peer.
+    /// and writes into [`ServeFaces::knowledge`]'s collection — one shared collection with one slot
+    /// per `destination_entry_id`: the first adoption of a given id claims it, a repeat is answered
+    /// `already_present` with the stored copy only at the anchor revision the copy records (another
+    /// revision is a conflict), and a peer whose own admitted selection hides the copy is answered
+    /// the occupancy refusal instead of the copy.
     pub adoption: Option<AdoptionRoute>,
     /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
     /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so

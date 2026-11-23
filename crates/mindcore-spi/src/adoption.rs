@@ -1,8 +1,22 @@
-//! Supported adoption of a shared knowledge entry into a personal collection.
+//! Supported adoption of a shared knowledge entry into the destination collection.
 //!
 //! The helper takes the caller's two scoped ports: the source collection is the one `src` serves,
 //! the destination is the one `dst` serves. Neither port is selected from the payload, so one
 //! host-supplied pairing decides where a copy can land.
+//!
+//! A served host wires `dst` to the one collection the knowledge face serves, and that collection
+//! is shared by every peer admitted to the scope: it holds one slot per `destination_entry_id`, and
+//! the first adoption of a given id claims it. A repeat answers `already_present` with that stored
+//! copy only at the anchor revision the copy records — a copy adopted at another revision is
+//! `RevisionConflict` naming `adopted_revision` — and a peer whose admitted selection hides the
+//! copy is answered the occupancy refusal, not the copy. The helper itself is per-slot, not
+//! per-caller: it takes no principal, so two callers naming one slot contend for the same row.
+//!
+//! A create-only destination answers occupied for an occupied id and success for a free one, so the
+//! refusal itself reports slot occupancy. That disclosure is permitted and no wider than the
+//! knowledge face the copy lands on: a create-only `KnowledgeEntryPort::put_knowledge_entry` over
+//! the same face already distinguishes an occupied id from a free one while hiding the entry, so
+//! adoption reports occupancy only — never the occupying entry's content, revision or visibility.
 //!
 //! The destination key is `destination_entry_id`, which the caller has already resolved: a served
 //! call defaults it to the source's resolved terminal entry id, and the request field is only the
@@ -53,10 +67,11 @@ pub enum AdoptionOutcome {
 /// only at the revision that anchor records: a copy adopted at another revision is
 /// [`SpokeRejectCode::RevisionConflict`] with `details.adopted_revision` naming the revision it was
 /// adopted at, even when the source now sits at the requested one, so a stale copy is never served
-/// as the revision asked for. Any other occupant — an anchor naming another scope or entry, or a
-/// superseded row the live read hides — is [`SpokeRejectCode::RevisionConflict`] without details,
-/// and is never overwritten or refreshed. An empty scope id, an empty `destination_entry_id` and a
-/// zero revision name no anchor and are [`SpokeRejectCode::InvalidInput`].
+/// as the revision asked for. Any other occupant — an anchor naming another scope or entry, a
+/// superseded row the live read hides, or an entry a served destination port's admitted selection
+/// conceals — is [`SpokeRejectCode::RevisionConflict`] without details, and is never overwritten or
+/// refreshed. An empty scope id, an empty `destination_entry_id` and a zero revision name no anchor
+/// and are [`SpokeRejectCode::InvalidInput`].
 ///
 /// An embedded helper caller asking for a copy whose matching stored anchor records a revision
 /// above the served ceiling gets no conformant conflict to report, so it receives the fixed
