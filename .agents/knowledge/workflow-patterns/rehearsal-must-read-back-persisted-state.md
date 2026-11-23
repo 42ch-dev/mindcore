@@ -60,11 +60,11 @@ all reads. The negative side is only meaningful once the positive side is proven
    that an assertion failed.
 6. **Give a negative control the look of the positive.** A label that must pass a credential screen
    is a control only when it shares the screen's trigger — the prefix, the alphabet, the segment
-   count. A dotless `eyJ…` value shares the JWT prefix but not its segment structure, and a
-   versioned three-segment label such as `eyJreport_42.v1` shares the prefix, the alphabet and the
-   count; both must still pass, because a JWT is decided by its first segment decoding to a JSON
-   object. Without the look-alikes the screen could reject on prefix alone and the probe would stay
-   green.
+   count. A dotless `eyJ…` value shares the JWT prefix but not its segment structure. A
+   dotted label such as `eyJreport_42.v1` shares the prefix, the base64url alphabet and a
+   place inside the accepted two-to-five segment range; both must still pass, because
+   a JWT is decided by its first segment decoding to a JSON object. Without the look-alikes
+   the screen could reject on prefix alone and the probe would stay green.
 7. **Build credential-shaped fixtures at run time.** Assemble the value from a prefix constant and a
    tail constant (`format!("{header}.{claims}.{signature}")` for each compact serialisation, prefix
    plus a tail of the provider's own length and alphabet for a key) so the fixture source never

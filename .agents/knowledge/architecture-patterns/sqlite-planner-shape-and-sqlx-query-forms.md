@@ -21,18 +21,21 @@ tags:
 
 `memory.spaces.list` needs two things before it pages: the set of spaces a principal
 can see, and the grant revisions of exactly those spaces for the cursor's snapshot marker.
-The obvious reads — load every grant of the principal into memory, or query once per
-visible space — make the cost follow the principal's whole grant history or the number of
-stored spaces, neither of which is what the caller asked for.
+Loading every grant of the principal into memory makes peak memory follow the whole grant
+history, and querying once per visible space makes the revision read cost one statement per
+visible space. The shape below removes both without making the listing read only what the
+caller can see: the scan still walks the whole grant history and the listing still fetches
+every stored space.
 
 ## Guidance
 
 1. **One streaming scan, then one projection over its result.** `scan_principal_grants`
    decodes the principal's grants one row at a time through a `fetch` stream and hands each
-   row to a visitor, so peak memory is a row plus the delivery buffer. The caller keeps
-   only the `space_id` of each live grant, then `principal_grant_revisions` takes that set
-   back as a JSON array and returns the `(grant_id, revision)` pairs of the visible spaces
-   only. Peak memory follows the visible grants, not the whole history.
+   row to a visitor, so peak memory on the grant side is a row plus the delivery buffer and
+   the set of `space_id`s the visitor keeps from live grants. The scan still walks the
+   principal's whole grant history, expired and revoked rows included; what it avoids is
+   holding that history. `principal_grant_revisions` then takes the visible set back as a
+   JSON array and returns the `(grant_id, revision)` pairs of the visible spaces only.
 2. **Filter orphans with `EXISTS`, not `IN`.**
    `WHERE principal_id = ? AND EXISTS (SELECT 1 FROM memory_spaces WHERE
    memory_spaces.space_id = memory_grants.space_id)` makes SQLite read the grant index once
@@ -56,11 +59,15 @@ stored spaces, neither of which is what the caller asked for.
 
 ## Why This Matters
 
-The planner's shape decides what a read's cost grows with. The scan-then-project pair makes
-it grow with what the caller can see; the `EXISTS` and `+space_id` spellings keep the index
-probes proportional to one principal's rows rather than to every stored space. Both are
-invisible in the SQL text's result and show only in the plan, so a "simpler" rewrite of
-either predicate passes every assertion and still changes the cost.
+The planner's shape decides what a read's cost grows with, and the two reads here grow with
+different things. The visible set bounds the revision projection only: that statement costs
+what the caller can see. The listing itself is not bounded by it — the scan decodes the
+principal's whole grant history and `list_spaces` fetches every stored space before the
+caller filters — so the listing's work grows with the grant history and the stored spaces
+while its peak memory does not. The `EXISTS` and `+space_id` spellings keep the index probes
+proportional to one principal's rows rather than to every stored space. None of this shows
+in the SQL text's result; it shows only in the plan, so a "simpler" rewrite of either
+predicate passes every assertion and still changes the cost.
 
 ## When to Apply
 
@@ -71,17 +78,16 @@ either predicate passes every assertion and still changes the cost.
 
 ## Examples
 
-Both examples read the revisions of one principal's visible spaces; only the membership
-predicate differs.
+The two statements differ only in the unary `+` and select the same rows: the revisions of
+one principal's grants in the caller's visible spaces.
 
 ### Before
 
-The `IN (SELECT space_id FROM memory_spaces)` spelling probes the grant index once per
-stored space, whatever the caller can see.
+With `space_id` written as is, SQLite probes the grant index once per visible space.
 
 ```sql
 SELECT grant_id, revision FROM memory_grants
- WHERE principal_id = ? AND space_id IN (SELECT space_id FROM memory_spaces);
+ WHERE principal_id = ? AND space_id IN (SELECT value FROM json_each(?));
 ```
 
 ### After
