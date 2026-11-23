@@ -473,12 +473,12 @@ async fn knowledge_only_session_serves_get_conditional_put_and_scoped_list() {
     let details = stale.details.expect("stale reject carries the revisions");
     assert_eq!(
         details
-            .get("expected_base_revision")
+            .get("expectedBaseRevision")
             .and_then(Value::as_u64),
         Some(1)
     );
     assert_eq!(
-        details.get("stored_revision").and_then(Value::as_u64),
+        details.get("storeRevision").and_then(Value::as_u64),
         Some(2),
         "the stale refusal preserves the stored revision"
     );
@@ -1056,30 +1056,35 @@ async fn refused_put_names_no_collection() {
     assert_eq!(foreign.code, SpokeRejectCode::StoredRevisionStale);
     assert_eq!(absent.code, foreign.code);
     assert_eq!(
-        foreign.message, "knowledge entry ke_elsewhere does not hold the expected revision",
+        foreign.message, "KnowledgeEntry not found for update: ke_elsewhere",
         "the stale refusal names no collection"
     );
     assert_eq!(
-        absent.message, "knowledge entry ke_absent does not hold the expected revision",
+        absent.message, "KnowledgeEntry not found for update: ke_absent",
         "an absent id reads exactly like a foreign-only one"
     );
-    assert_eq!(
-        absent.details, foreign.details,
-        "both report the same revisions"
-    );
-    let details = foreign
+    let mut foreign_details = foreign
         .details
         .clone()
         .expect("stale reject carries revisions");
+    let mut absent_details = absent
+        .details
+        .clone()
+        .expect("stale reject carries revisions");
+    assert_eq!(foreign_details.remove("entry_id"), Some(json!("ke_elsewhere")));
+    assert_eq!(absent_details.remove("entry_id"), Some(json!("ke_absent")));
     assert_eq!(
-        details
-            .get("expected_base_revision")
+        absent_details, foreign_details,
+        "both report the same revisions once the echoed entry id is set aside"
+    );
+    assert_eq!(
+        foreign_details
+            .get("expectedBaseRevision")
             .and_then(Value::as_u64),
         Some(1)
     );
-    assert_eq!(
-        details.get("stored_revision"),
-        Some(&Value::Null),
+    assert!(
+        !foreign_details.contains_key("storeRevision"),
         "a row outside the served collection has no stored revision"
     );
 
@@ -1092,9 +1097,9 @@ async fn refused_put_names_no_collection() {
         .await,
         "create-only put of a visible id",
     );
-    assert_eq!(collision.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
+    assert_eq!(collision.code, SpokeRejectCode::RevisionConflict);
     assert_eq!(
-        collision.message, "knowledge entry ke_alpha already exists",
+        collision.message, "Entry already exists: ke_alpha",
         "the collision refusal names no collection"
     );
     for reject in [&foreign, &absent, &collision] {
