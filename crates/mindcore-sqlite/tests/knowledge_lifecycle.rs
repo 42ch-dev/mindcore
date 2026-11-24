@@ -16,8 +16,8 @@ use mindcore_spi::{adopt_knowledge_entry, AdoptionOutcome};
 use mindcore_sqlite::{append_cognition, prune_entry_history, MindStore, PruneReport};
 use serde_json::{json, Map, Value};
 use spoke_operations::{
-    revision_snapshots_equal_canonical, HistoryPort, KnowledgeEntryPort, SpokeRejectCode,
-    SpokeResult,
+    revision_snapshots_equal_canonical, HistoryPort, KnowledgeEntryPort, SpokeReject,
+    SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::data::revision_snapshot::RevisionSnapshotSnapshot;
 use spoke_schemas::knowledge_entry::{
@@ -1272,6 +1272,15 @@ fn expect_history_reject<T: std::fmt::Debug>(
     }
 }
 
+/// The whole refusal one served history op answers, so two states can be compared as the caller
+/// sees them: comparing codes alone would miss a message that names the row's state.
+fn expect_prune_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
+    match result {
+        SpokeResult::Ok(value) => panic!("{context}: unexpectedly returned {value:?}"),
+        SpokeResult::Reject(reject) => reject,
+    }
+}
+
 #[tokio::test]
 async fn the_history_port_maps_store_refusals_to_contract_codes() {
     let path = database_path("history-port");
@@ -1413,28 +1422,38 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         assert!(details.is_empty(), "{context} carries no details on get");
     }
 
-    // Prune: a missing row is an absence; a retired or hidden row is the put's refusal.
-    let details = expect_history_reject(
+    // Prune: a missing, a retired and a hidden row are the one absence. The refusal names the id
+    // the caller asked for and nothing else, so the comparison swaps that id into the missing
+    // row's own refusal: any state-dependent member would survive the swap and fail.
+    let missing_prune = expect_prune_reject(
         port.prune_history(&peer, &admitted, "knowledge_entry", "entry-never-seeded", 1)
             .await,
-        SpokeRejectCode::NotFound,
         "a prune of a missing entry",
     );
+    assert_eq!(missing_prune.code, SpokeRejectCode::NotFound);
     assert!(
-        details.is_empty(),
+        missing_prune.details.is_none(),
         "a missing prune target carries no details"
     );
     for (entity_id, context) in [
         ("entry-live", "a retired entry"),
         ("entry-private", "an owner-private entry"),
     ] {
-        let details = expect_history_reject(
+        let concealed = expect_prune_reject(
             port.prune_history(&peer, &admitted, "knowledge_entry", entity_id, 1)
                 .await,
-            SpokeRejectCode::NotAuthorized,
             context,
         );
-        assert!(details.is_empty(), "{context} carries no details on prune");
+        assert_eq!(
+            concealed,
+            SpokeReject {
+                message: missing_prune
+                    .message
+                    .replace("entry-never-seeded", entity_id),
+                ..missing_prune.clone()
+            },
+            "{context} must not be distinguishable from a missing one on prune"
+        );
     }
 
     // Admission runs before the keep boundary: a zero keep cannot mask an unconfigured route or

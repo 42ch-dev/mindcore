@@ -296,6 +296,18 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
                 SpokeResult::Ok(false) => occupied(&entry.entry_id),
                 SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
             },
+            // `read_entry` is live-only, so a retired row arrives here as an absence. It is still a
+            // taken slot: answering `NotFound` would let the SPI helper's revision gate report the
+            // destination's retirement while a live occupant answers occupancy before that gate.
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+            {
+                match retirement_successors_of(&mut gate, self.collection, entry_id).await {
+                    SpokeResult::Ok(Some(_)) => occupied(entry_id),
+                    SpokeResult::Ok(None) => SpokeResult::Reject(reject),
+                    SpokeResult::Reject(fault) => SpokeResult::Reject(fault),
+                }
+            }
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
     }
@@ -544,6 +556,53 @@ mod tests {
         match result {
             SpokeResult::Reject(reject) => reject,
             SpokeResult::Ok(value) => panic!("{context}: unexpectedly accepted with {value:?}"),
+        }
+    }
+
+    /// The slot's live row still sits at `revision` and carries `marker`: a refused adoption wrote
+    /// nothing, so it neither advanced the revision nor wrote a retirement marker. Reading the live
+    /// row rather than a historical revision is what makes that a statement about current state.
+    async fn slot_unchanged(
+        destination: &mindcore_sqlite::ScopedKnowledgeStore,
+        revision: Option<u64>,
+        marker: Option<&str>,
+        context: &str,
+    ) {
+        let row = ok(
+            destination.get_entry_including_superseded("ke_slot").await,
+            "read the destination row",
+        );
+        assert_eq!(
+            (row.entry.revision, row.superseded_by),
+            (revision, marker.map(str::to_string)),
+            "{context}"
+        );
+    }
+
+    /// The adoption destination's own read of one slot, at the port boundary the SPI helper calls.
+    /// A test reaches it directly because the served face's earlier refusals can intercept a call
+    /// before this read runs, which would leave the read itself unpinned.
+    async fn destination_read(store: &MindStore, admitted: &Scope, entry_id: &str) -> SpokeReject {
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin the destination read");
+        let gate = Mutex::new(&mut transaction);
+        // The port borrows the gate's `&mut transaction`, so the read runs inside this block: its
+        // end is what releases the borrow before the rollback below.
+        let answer = {
+            let port = AdoptionDestination {
+                collection: DESTINATION_COLLECTION,
+                scope: admitted,
+                gate: &gate,
+            };
+            port.get_knowledge_entry(entry_id).await
+        };
+        transaction.rollback().await.expect("roll back the read");
+        match answer {
+            SpokeResult::Reject(reject) => reject,
+            SpokeResult::Ok(entry) => panic!("{entry_id}: unexpectedly served {entry:?}"),
         }
     }
 
@@ -975,5 +1034,116 @@ mod tests {
                 .await,
             "the admitting selection claims the free slot",
         );
+    }
+
+    /// One destination slot answers the same occupancy whether its occupant is live and admitted,
+    /// live and hidden by the admission, or retired. The retired row resolves inside the destination
+    /// read rather than through a create-only put, so only this comparison shows both states agree.
+    #[tokio::test]
+    async fn a_retired_destination_occupant_answers_the_same_occupancy_as_a_live_one() {
+        let (_dir, store, service) = service().await;
+        let owner = principal("prn_owner");
+        let destination = store.knowledge(KnowledgeScope::new(DESTINATION_COLLECTION));
+        for entry_id in ["ke_slot", "ke_successor"] {
+            ok(
+                destination.put_knowledge_entry(entry(entry_id), None).await,
+                "seed the destination occupant",
+            );
+        }
+        // The same admitted id, once with an entry-id selection that never holds the occupant.
+        let hidden: Scope = serde_json::from_value(json!({
+            "scope_id": DESTINATION_SCOPE,
+            "entry_ids": ["ke_somebody_else"],
+        }))
+        .expect("scope JSON matches the schema");
+        let mut claim = request("ke_source", 1);
+        claim.destination_entry_id = Some("ke_slot".parse().expect("non-empty destination id"));
+
+        let live = refused(
+            service
+                .adopt_knowledge_entry(&owner, &scope(DESTINATION_SCOPE), &claim)
+                .await,
+            "a live occupant",
+        );
+        slot_unchanged(
+            &destination,
+            Some(1),
+            None,
+            "a refused claim of a live slot",
+        )
+        .await;
+
+        let concealed = refused(
+            service.adopt_knowledge_entry(&owner, &hidden, &claim).await,
+            "a live occupant the selection hides",
+        );
+        slot_unchanged(
+            &destination,
+            Some(1),
+            None,
+            "a refused claim of a hidden live slot",
+        )
+        .await;
+
+        // The read the SPI helper reaches after a live occupant answers occupancy. A retired row
+        // must answer it identically: reporting an absence here is what lets a revision gate
+        // report the destination's retirement while the slot is in fact taken.
+        let read_live = destination_read(&store, &hidden, "ke_slot").await;
+
+        let retired = ok(
+            destination
+                .supersede_entry("ke_slot", 1, "ke_successor")
+                .await,
+            "retire the occupant",
+        );
+        let retired_shown = refused(
+            service
+                .adopt_knowledge_entry(&owner, &scope(DESTINATION_SCOPE), &claim)
+                .await,
+            "a retired occupant",
+        );
+        slot_unchanged(
+            &destination,
+            Some(retired),
+            Some("ke_successor"),
+            "a refused claim of a retired slot",
+        )
+        .await;
+
+        let retired_concealed = refused(
+            service.adopt_knowledge_entry(&owner, &hidden, &claim).await,
+            "a retired occupant the selection hides",
+        );
+        slot_unchanged(
+            &destination,
+            Some(retired),
+            Some("ke_successor"),
+            "a refused claim of a retired hidden slot",
+        )
+        .await;
+
+        // An unreachable destination read is what the SPI helper turns into a revision-gate answer,
+        // so the port itself must report the retired row as taken, byte for byte as it reports a
+        // live one.
+        let read_retired = destination_read(&store, &hidden, "ke_slot").await;
+        assert_eq!(
+            read_retired, read_live,
+            "a retired row must read as occupancy, never as an absence"
+        );
+        assert_eq!(read_retired.code, SpokeRejectCode::RevisionConflict);
+        assert!(read_retired.details.is_none(), "{read_retired:?}");
+
+        assert_eq!(live.code, SpokeRejectCode::RevisionConflict);
+        assert!(live.details.is_none(), "{live:?}");
+        for (state, reject) in [
+            ("hidden", &concealed),
+            ("retired", &retired_shown),
+            ("retired and hidden", &retired_concealed),
+        ] {
+            assert_eq!(
+                reject, &live,
+                "a {state} occupant must not be distinguishable from a live visible one"
+            );
+        }
     }
 }

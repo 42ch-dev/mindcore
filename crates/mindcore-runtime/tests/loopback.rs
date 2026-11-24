@@ -88,12 +88,19 @@ const HUGE_REVISION: u64 = (1 << 53) + 2;
 /// A stored two-node cycle, seeded with direct markers because the store never writes one.
 const CYCLE_A: &str = "ke_cycle_a";
 const CYCLE_B: &str = "ke_cycle_b";
+/// A destination slot holding a row retired into [`SLOT_SUCCESSOR`]: taken, yet hidden from the
+/// live-only read an adoption's destination half makes.
+const RETIRED_SLOT: &str = "ke_retired_slot";
+const SLOT_SUCCESSOR: &str = "ke_slot_successor";
 
 const DIALER_SEED: [u8; 32] = [0x42u8; 32];
 const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
 /// A second peer the host admits to its own principal, never the carrier route's caller.
 const PEER_TWO_SEED: [u8; 32] = [0x5Cu8; 32];
 const PEER_TWO_PRINCIPAL: &str = "prn_peer_two";
+
+/// The database file the fixture opens; a test may reopen the same path.
+const DB_FILE: &str = "loopback.db";
 
 /// One store the runtime serves: the protocol memory shape with two retained records, the
 /// grants the workflows read, and the knowledge collection the face serves.
@@ -107,7 +114,7 @@ impl Fixture {
     /// migration installs the protocol schema), then seed the rows the faces read.
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
-        let store = MindStore::open(&dir.path().join("loopback.db"))
+        let store = MindStore::open(&dir.path().join(DB_FILE))
             .await
             .expect("open store");
         let pool = store.pool();
@@ -214,6 +221,11 @@ impl Fixture {
                 .await,
             "write the carrier entry",
         );
+    }
+
+    /// The database file this fixture opened, for a test that reopens it after a restart.
+    fn db_path(&self) -> std::path::PathBuf {
+        self.dir.path().join(DB_FILE)
     }
 
     /// The store and its directory part company: the engine takes the store, the caller keeps the
@@ -2080,6 +2092,43 @@ async fn seed_cycle(pool: &sqlx::SqlitePool) {
     }
 }
 
+/// A destination slot holding a row retired into [`SLOT_SUCCESSOR`]: the slot is taken, and the
+/// live-only read an adoption's destination half makes answers absence for it.
+async fn seed_retired_destination(pool: &sqlx::SqlitePool) {
+    let destination = ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(COLLECTION));
+    for (entry_id, summary) in [
+        (RETIRED_SLOT, "somebody's retired row"),
+        (SLOT_SUCCESSOR, "somebody's live row"),
+    ] {
+        expect_ok(
+            destination
+                .put_knowledge_entry(shared_entry(entry_id, summary), None)
+                .await,
+            "seed the destination slot",
+        );
+    }
+    expect_ok(
+        destination
+            .supersede_entry(RETIRED_SLOT, 1, SLOT_SUCCESSOR)
+            .await,
+        "retire the destination occupant",
+    );
+}
+
+/// The slot a refused claim must leave alone: the stored revision and retirement marker of
+/// `entry_id` in the destination collection, read without the live-only predicate.
+async fn destination_slot(pool: &sqlx::SqlitePool, entry_id: &str) -> (i64, Option<String>) {
+    sqlx::query_as(
+        "SELECT revision, superseded_by FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the destination slot")
+}
+
 /// How many rows one collection stores under `entry_id`: the destination slot a copy claims.
 async fn destination_rows(pool: &sqlx::SqlitePool, entry_id: &str) -> i64 {
     sqlx::query_scalar(
@@ -2644,6 +2693,55 @@ async fn an_occupied_destination_answers_occupancy_whatever_the_selection_shows(
     assert_eq!(
         after, stored,
         "a refused repeat leaves the destination slot unchanged: {after}"
+    );
+}
+
+/// A destination slot whose occupant is retired reads as absent to the live-only destination read,
+/// so the adoption must answer the ordinary occupancy instead: `REVISION_CONFLICT` with no details
+/// over a signed session, and the slot's revision and retirement marker stay as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_destination_occupant_answers_occupancy_over_the_signed_session() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_shared_source(&pool).await;
+    seed_retired_destination(&pool).await;
+    let before = destination_slot(&pool, RETIRED_SLOT).await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+
+    let mut claim = adopt_request(SHARED_ENTRY, 1, "retired-destination");
+    claim.destination_entry_id = Some(RETIRED_SLOT.parse().expect("non-empty destination id"));
+    let reject = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &claim,
+        )
+        .await,
+        "a claim on a retired destination slot",
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::RevisionConflict,
+        "a retired occupant is occupancy, not an absence: {reject:?}"
+    );
+    assert!(
+        reject.details.is_none(),
+        "the retired-slot refusal carries no details: {reject:?}"
+    );
+    drop(session);
+
+    assert_eq!(
+        destination_slot(&pool, RETIRED_SLOT).await,
+        before,
+        "a refused claim leaves the retired slot's revision and marker unchanged"
+    );
+    assert_eq!(
+        destination_rows(&pool, RETIRED_SLOT).await,
+        1,
+        "the refused claim writes no second row into the slot"
     );
 }
 
@@ -3346,6 +3444,105 @@ async fn history_replays_prunes_and_refuses_over_a_signed_session() {
     assert_eq!(details.get("entity_kind"), Some(&json!("relation")));
 }
 
+/// Two history surfaces on one database route to different collections. They share a wire scope,
+/// a principal and an idempotency key, and the second surface's prune must run rather than replay
+/// the first surface's recorded outcome for a collection it does not serve.
+///
+/// This fails before the namespace: both surfaces derive the same dedup key, so the second answers
+/// the first's `{deleted: 1}` for an entry its own collection does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_does_not_replay_across_collections_on_one_database() {
+    let fixture = Fixture::open().await;
+    let store = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    let mut base = None;
+    for summary in [
+        "the gate opens at dawn",
+        "the gate closes at dusk",
+        "the gate opens again at dawn",
+    ] {
+        base = expect_ok(
+            store
+                .put_knowledge_entry(history_entry("ke_history", summary), base)
+                .await,
+            "seed the first collection's history",
+        )
+        .revision;
+    }
+    let scope = scope_of(SCOPE_ID);
+    let (dir, serve) = fixture.serve();
+
+    let mut first = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    first.history = true;
+    let first_surface = surface(&serve, first);
+    let first_session = connect(&first_surface, &["spoke-history"]).await;
+    let pruned = expect_ok(
+        first_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the first collection's prune",
+    );
+    assert_eq!(pruned.deleted, 1);
+    assert_eq!(pruned.floor_revision, Some(2));
+
+    // Same wire scope, same principal, same idempotency key — another collection.
+    let mut second = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    second.history = true;
+    second.knowledge = KnowledgeScope::new(COLLECTION_TWO);
+    let second_surface = surface(&serve, second);
+    let second_session = connect(&second_surface, &["spoke-history"]).await;
+
+    let reject = expect_reject(
+        second_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the second collection holds no such entry, so its own prune runs and refuses",
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::NotFound,
+        "the second surface executed its own prune instead of replaying the first's outcome"
+    );
+
+    // The refusal is now the second surface's own recorded outcome for that key.
+    let replay = expect_reject(
+        second_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the second surface's same-key replay",
+    );
+    assert_eq!(replay.code, SpokeRejectCode::NotFound);
+    assert_eq!(replay, reject, "the recorded refusal replays verbatim");
+
+    // And the first surface still replays its own recorded success.
+    let replay = expect_ok(
+        first_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the first surface's same-key replay",
+    );
+    assert_eq!(
+        serde_json::to_vec(&replay).expect("the result serializes"),
+        serde_json::to_vec(&pruned).expect("the result serializes"),
+        "the recorded outcome replays byte-equal within its own collection"
+    );
+
+    drop(dir);
+}
+
 /// The prune's idempotency contract over the wire: one key replays its recorded outcome, the same
 /// key with another payload conflicts, and a fresh key runs the prune again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3474,4 +3671,122 @@ async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
             .get("floor_revision"),
         Some(&json!(3))
     );
+}
+
+/// The record lives in the database file, not in the process: after the session, the surface and
+/// the serve are gone, a reopened file replays the prune's outcome instead of executing again
+/// against checkpoints the original call never saw.
+///
+/// This fails against the in-memory default — a fresh surface starts with an empty store, the
+/// retry answers `Unseen`, and the re-run deletes checkpoint 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
+    let fixture = Fixture::open().await;
+    let path = fixture.db_path();
+    let store = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    let mut base = None;
+    for summary in [
+        "the gate opens at dawn",
+        "the gate closes at dusk",
+        "the gate opens again at dawn",
+    ] {
+        base = expect_ok(
+            store
+                .put_knowledge_entry(history_entry("ke_history", summary), base)
+                .await,
+            "seed the entry's history",
+        )
+        .revision;
+    }
+    let scope = scope_of(SCOPE_ID);
+
+    let (dir, serve) = fixture.serve();
+    let first = {
+        let mut attached = faces(
+            hello("runtime", &["spoke-history"]),
+            None,
+            MindProviders::default(),
+            routes(&[]),
+        );
+        attached.history = true;
+        let surface = surface(&serve, attached);
+        let session = connect(&surface, &["spoke-history"]).await;
+        let first = expect_ok(
+            session
+                .adapter
+                .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+                .await,
+            "the first prune",
+        );
+        assert_eq!(first.deleted, 1);
+        assert_eq!(first.floor_revision, Some(2));
+        first
+    };
+
+    // One more revision leaves checkpoints 2 and 3 above the floor, so a retry that re-ran the
+    // prune instead of replaying its record would delete checkpoint 2 and report a higher floor.
+    expect_ok(
+        store
+            .put_knowledge_entry(
+                history_entry("ke_history", "the gate is bolted at midnight"),
+                base,
+            )
+            .await,
+        "write another revision after the first prune",
+    );
+
+    // The whole serving stack goes away: the record has to be on disk to survive this.
+    drop(store);
+    drop(serve);
+
+    let reopened = MindStore::open(&path)
+        .await
+        .expect("reopen the same database file");
+    let serve = MindcoreServe::new(reopened, false, |_targets| Ok(()));
+    let mut attached = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    attached.history = true;
+    let surface = surface(&serve, attached);
+    let session = connect(&surface, &["spoke-history"]).await;
+    let dialer = &*session.adapter;
+
+    let replay = expect_ok(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the same key and payload after a reopen",
+    );
+    assert_eq!(
+        serde_json::to_vec(&replay).expect("the result serializes"),
+        serde_json::to_vec(&first).expect("the result serializes"),
+        "the recorded outcome replays byte-equal across a reopen"
+    );
+    for revision in [2u64, 3] {
+        expect_ok(
+            HistoryPort::get_history_snapshot(
+                dialer,
+                &principal(),
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                revision,
+            )
+            .await,
+            "the replayed prune deleted nothing, so both checkpoints above the floor still exist",
+        );
+    }
+
+    let reject = expect_reject(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 2, Some("key-one"))
+            .await,
+        "the same key with another keep after a reopen",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::IdempotencyConflict);
+
+    drop(dir);
 }

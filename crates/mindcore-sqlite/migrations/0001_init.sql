@@ -426,6 +426,38 @@ BEGIN
     (OLD.collection, OLD.entry_id, OLD.revision, OLD.payload, OLD.cognition_head_seq, OLD.updated_at);
 END;
 
+-- Prune dedup: one row per retry identity, `(namespace, key)` — the collection its history surface
+-- routes to, and the Connect key — so two surfaces on one database that share a wire scope and
+-- principal still never replay each other's prunes. Nothing is ever deleted and no clock is read:
+-- `principal` carries the requester the key names, and each `(namespace, principal)` pair is capped
+-- at 4096 rows, so a pair at the bound answers a fresh key `RECEIPT_EXPIRED` instead of inserting
+-- past it, and one high-churn caller can exhaust only its own quota. `lookup` claims a key by
+-- inserting the both-NULL row, and `record` fills it: a claim whose outcome never arrived keeps the
+-- retry out of the port, so a prune that committed before a crash is never re-executed.
+CREATE TABLE history_dedup (
+  -- The collection whose history surface wrote the row, and Connect's opaque retry key. Two
+  -- columns, not one framed string: a collection name may contain any character, so no separator
+  -- can be unambiguous, and the capacity count needs an exact namespace equality.
+  namespace      TEXT NOT NULL,
+  key            TEXT NOT NULL,
+  -- The requester the key names, parsed out of Connect's canonical retry identity. Not derivable
+  -- from `key` by SQL, and the quota is per caller. A key that would not parse is charged to the
+  -- shared `unknown` bucket rather than to itself, so such keys cannot mint a fresh quota each.
+  principal      TEXT NOT NULL,
+  -- SHA-256 hex over the RFC 8785 canonical JSON of the whole request payload.
+  payload_digest TEXT,
+  -- The settled outcome as `{"ok": …}` or `{"reject": {"code", "message", "details"}}`.
+  outcome_json   TEXT,
+  PRIMARY KEY (namespace, key),
+  CHECK ((payload_digest IS NULL) = (outcome_json IS NULL))
+) WITHOUT ROWID;
+
+-- The quota count filters on `(namespace, principal)`, which the primary key does not cover: without
+-- this index the count walks every row of the namespace on each claim and each record. This index
+-- makes it a seek over one principal's rows, so the gate's cost tracks the quota and not the
+-- collection's key count.
+CREATE INDEX idx_history_dedup_principal ON history_dedup (namespace, principal);
+
 -- ── Retained Memory record vectors ──
 -- Optional cache of retained Memory record vectors: one row per record and embedding identity.
 -- `identity_hash` partitions rows by serving model, so retiring an identity is one indexed bulk

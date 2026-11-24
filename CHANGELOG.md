@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **`mindcore-runtime` / `mindcore-sqlite`:** `history.revisions.prune` is deduplicated durably. The
+  history face composes `SqliteHistoryDedupStore` over the knowledge store's own pool, keyed by
+  Connect's retry identity, so a same-key retry after a restart or a reassembled surface replays the
+  recorded `{deleted, floor_revision}` instead of executing the prune again and deleting checkpoints
+  the original call never saw. `lookup` claims the key before the port runs; a key claimed whose
+  outcome was never recorded — a crash after the claim and before `record` — answers
+  `RECEIPT_EXPIRED` and never reaches the port. Same-key different-payload still answers
+  `IDEMPOTENCY_CONFLICT`, but only when a recorded outcome exists to compare against: a retained
+  claim with no outcome answers `RECEIPT_EXPIRED` instead, whatever the new payload is. The record is
+  the new `history_dedup` table in `0001_init.sql`, keyed by `(namespace, key)` — the routed store's
+  collection and the retry key, in separate columns, because a collection name is arbitrary and no
+  separator framing keeps them unambiguous — so two history surfaces on one database that share
+  a wire scope, a principal and an idempotency key never replay or refuse each other's prunes; a
+  same-collection retry replays exactly as before. Each `(namespace, principal)` pair holds at most
+  4096 rows, claims included, and nothing is ever deleted: the table carries no timestamp column and
+  `lookup` reads no clock, so a recorded outcome replays for the database's lifetime and a forward
+  host-clock jump cannot age a live record into a re-executed prune. The quota is per caller — the
+  `principal` column is the third member of the retry identity — so one high-churn principal can
+  exhaust only its own and never disable prune for another on the same collection. A principal at
+  its quota answers an unseen key with `RECEIPT_EXPIRED` without executing the prune, and `record`
+  writes no row past the quota. A host that needs more headroom raises the cap or recreates the
+  database. One serving process per database is a host obligation. The adoption face keeps the
+  in-memory default.
+
 - **Breaking — `mindcore-runtime`:** the private product tool `tools.mindcore.adopt` is removed, not
   deprecated. Adoption is served only as the published protocol operation `knowledge.adopt` under the
   `spoke-knowledge-adoption` capability, which requires `spoke-knowledge`; the runtime filters the
@@ -42,6 +66,16 @@
   `ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` — and the `owner`/`disclosure` reset is not
   applied, so a copy inherits the source's governance. Connect's `AdoptionPortService` supplies the
   idempotency envelope, including `IDEMPOTENCY_CONFLICT` and `RECEIPT_EXPIRED`.
+- **`mindcore-sqlite` — served history prune answers the one absence.** `history.revisions.prune`
+  no longer distinguishes a retired or peer-hidden row from a missing one: all three row-level
+  answers are `NOT_FOUND` with no `details`, where a retired or hidden row used to answer
+  `NOT_AUTHORIZED`. **Only the row-level denial changed.** A caller that matched `NOT_AUTHORIZED` for
+  a prune *row* must match `NOT_FOUND` instead, and must keep its `NOT_AUTHORIZED` handling for
+  everything decided before any row is read: scope admission, Connect's own comparison of the
+  request's `scope` against the admitted scope, and the port's `admit` guard. An unserved
+  `entity_kind` keeps `HISTORY_ENTITY_UNSUPPORTED`. The refusal reuses the absent row's constructor,
+  so code, message shape and `details` are equal by construction and a peer admitted to the
+  collection can no longer probe membership or retirement through prune.
 - `mindcore-spoke` / `mindcore-runtime`: `ServeFaces.memory` takes an `Arc<dyn ServedMemory>` — a
   `RemoteMemoryService` that reports the `memory.*` operations it dispatches — and the runtime
   advertises `spoke-memory-transfer` exactly when the attached service reports all five §7.29–§7.33
@@ -121,3 +155,12 @@
   partition in one `identity_hash` statement, returning the rows deleted, and leaves another identity's
   rows and query slot warm. Call it between recalls: it does not drain a recall already in flight, and a
   fill that commits afterwards re-creates rows it deleted.
+- **Breaking — `mindcore-spi` / `mindcore-spoke`:** `WorkflowBinding::commit_cognition` takes the
+  request deadline as its last parameter, so every implementation and test double carries it. The
+  settlement binding bounds its pool-connection wait by that deadline: a settle whose deadline passes
+  while it waits for the store's only connection answers `DeadlineExceeded` and starts no write,
+  and a connection in hand is re-checked before `BEGIN IMMEDIATE`, so an expiry observed on either
+  of those waits refuses and writes nothing. A write that has already begun keeps its actual or
+  uncertain outcome, which may land after the deadline. The non-contended commit is unchanged.
+  `mindcore-spoke` now names `tokio` with the `time` feature directly; the lockfile is
+  unchanged. Closes the residual in which an expired settle could still wait on the store connection.

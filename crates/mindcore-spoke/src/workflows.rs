@@ -22,7 +22,7 @@ use spoke_schemas::{
     MemoryCaptureRequest, MemoryGrant, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
     RetainedRecord,
 };
-use sqlx::SqlitePool;
+use sqlx::{Connection, SqlitePool};
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::cognition::{carrier_records, CARRIER_NAMESPACE};
@@ -1162,9 +1162,25 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         expected_carrier_revision: u64,
         record: Value,
         cited: &[CitedRecord],
+        deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
-        let mut transaction = self
-            .pool
+        // The pool holds one connection in production, so an acquire can wait
+        // for another statement indefinitely: the request deadline bounds that
+        // wait, and a connection in hand is re-checked before the begin. Both
+        // refusals start no write; a transaction already begun keeps its
+        // outcome, and the write-lock wait inside the begin is outside this
+        // bound.
+        let mut connection =
+            tokio::time::timeout_at(tokio::time::Instant::from(deadline), self.pool.acquire())
+                .await
+                .map_err(|_| SpiError::DeadlineExceeded)?
+                .map_err(|error| {
+                    internal(format!(
+                        "cognition settlement transaction could not begin: {error}"
+                    ))
+                })?;
+        deadline_still_open(std::time::Instant::now(), deadline)?;
+        let mut transaction = connection
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|error| {
@@ -1508,6 +1524,21 @@ fn uncertain_commit(operation: &str, error: sqlx::Error) -> SpiError {
     )
 }
 
+/// An acquire can complete with the deadline already past: the pool hands out
+/// a connection that was idle when the wait began. The begin that follows is
+/// where the write starts, so the expiry is rechecked here rather than trusted
+/// to the acquire's own bound. Pure in `now` so the refusal is testable without
+/// a pool.
+fn deadline_still_open(
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> Result<(), SpiError> {
+    if now >= deadline {
+        return Err(SpiError::DeadlineExceeded);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1529,6 +1560,27 @@ mod tests {
         );
         assert!(result_record_ids(Some(&json!({ "outcome": "dismissed" }))).is_empty());
         assert!(result_record_ids(None).is_empty());
+    }
+
+    #[test]
+    fn an_acquired_connection_is_refused_once_its_deadline_elapsed() {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(1);
+        assert!(
+            deadline_still_open(start, deadline).is_ok(),
+            "time left lets the begin start"
+        );
+        let SpiError::DeadlineExceeded = deadline_still_open(deadline, deadline)
+            .expect_err("the deadline instant itself is closed")
+        else {
+            panic!("an elapsed deadline refuses with a deadline refusal");
+        };
+        let SpiError::DeadlineExceeded =
+            deadline_still_open(deadline + std::time::Duration::from_secs(1), deadline)
+                .expect_err("a passed deadline refuses")
+        else {
+            panic!("a passed deadline refuses with a deadline refusal");
+        };
     }
 
     #[test]

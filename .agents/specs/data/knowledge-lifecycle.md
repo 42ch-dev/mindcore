@@ -29,7 +29,7 @@ A revision below the entry's floor answers `HistoryTruncated` with the message `
 
 An unassigned revision, revision 0, a value above the representable range, a revision above the live one, and a missing entry all answer `KnowledgeEntryNotFound` with the message `knowledge entry revision not found` and no details.
 
-**Served reachability.** Both local operations are published as protocol operations when the host enables `ServeFaces.history`: `history.revisions.get` replays one revision and `history.revisions.prune` runs the same prune. `RoutedKnowledgeStore` implements `spoke_operations::HistoryPort` beside `ScopedKnowledgePort`, so the served ops reuse this page's replay, retention, admission and disclosure rules rather than a second history path: a served replay answers this page's `HistoryTruncated` and `KnowledgeEntryNotFound` cases, and a served prune answers the wire `HistoryPruneResult` whose `floor_revision` is this page's local `PruneReport.floor`. The wire decode, the protocol refusal set and its `details`, the `RevisionSnapshot` projection, the `knowledge_entry`-only coverage and the prune dedup, including how long its records live, belong to `.agents/specs/architecture/serving-seam.md` alone; that page is where the read and prune denials are distinguished.
+**Served reachability.** Both local operations are published as protocol operations when the host enables `ServeFaces.history`: `history.revisions.get` replays one revision and `history.revisions.prune` runs the same prune. `RoutedKnowledgeStore` implements `spoke_operations::HistoryPort` beside `ScopedKnowledgePort`, so the served ops reuse this page's replay, retention, admission and disclosure rules rather than a second history path: a served replay answers this page's `HistoryTruncated` and `KnowledgeEntryNotFound` cases, and a served prune answers the wire `HistoryPruneResult` whose `floor_revision` is this page's local `PruneReport.floor`. The wire decode, the protocol refusal set and its `details`, the `RevisionSnapshot` projection, the `knowledge_entry`-only coverage and the prune dedup, including how long its records live, belong to `.agents/specs/architecture/serving-seam.md` alone; that page carries the read and prune refusal sets, and its row-level refusals answer the same absence whether a row is missing, retired or peer-hidden.
 
 ### Adoption
 
@@ -168,7 +168,7 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
   refusal hygiene: `crates/mindcore-runtime/src/adoption.rs`; its wire contract is
   `.agents/specs/architecture/serving-seam.md`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
-- Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
+- Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; the prune dedup record in `crates/mindcore-runtime/src/history_dedup.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
 
 ## Served failure messages
 
@@ -177,6 +177,7 @@ A storage failure on the served knowledge face answers `InternalError` with the 
 ## Known limits
 
 - History is bounded only by an explicit `prune_history` call: there is no retention schedule, no default `keep`, and no archive, so a pruned preimage cannot be recovered.
+- The prune dedup record is bounded per `(served collection, principal)` at 4096 rows, claims included, and nothing is ever deleted: the table reads no clock and carries no timestamp column, so a recorded outcome replays for the database's lifetime and a forward host-clock jump cannot age one out. A principal at its quota answers a fresh `idempotency_key` with `RECEIPT_EXPIRED` and runs no prune, and one caller's churn spends only its own quota, never another's on the same collection. See `.agents/specs/architecture/serving-seam.md` § History.
 - A below-floor refusal means the revision's preimage is gone, not that the revision was never stored: a revision at or above the floor is derived from the next surviving checkpoint and still answers exactly.
 - The append classification column distinguishes a full-put record from a dedicated append; that classification is load-bearing for replay's positional proof.
 - Adoption resolves anchors by walking same-collection markers; a host that needs cross-collection provenance resolution does not get it here.

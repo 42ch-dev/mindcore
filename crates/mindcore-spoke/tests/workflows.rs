@@ -19,7 +19,7 @@ use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
     AbsorbCandidateOutcome, CognitiveTaskKind, Embedder, EmbeddingIdentity, MindCapabilities,
     PolicyDecision, PolicyHook, Reasoner, SettlementDraft, SpiError, SpiMindWorkflows,
-    StructuredReasonRequest,
+    StructuredReasonRequest, WorkflowBinding,
 };
 use mindcore_spoke::{MemoryAdapter, MemoryStage, MemoryWorkflowBinding};
 use mindcore_sqlite::{MindStore, ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT};
@@ -4171,4 +4171,245 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         6,
         "only the cold query is embedded for the reloaded page"
     );
+}
+
+/// The outer guard over one settle: a regression fails the run instead of
+/// hanging it.
+const CANCELLATION_GUARD: Duration = Duration::from_secs(5);
+
+/// A binding over `pool` routed like `deliberate_as` routes it.
+fn settle_binding(pool: &SqlitePool) -> MemoryWorkflowBinding {
+    MemoryWorkflowBinding::new(pool.clone(), true)
+        .with_knowledge_routes(routes(&[PRINCIPAL]))
+        .expect("the fixture route map is valid")
+}
+
+fn settle_holder() -> spoke_schemas::data::cognition::CognitionReference {
+    serde_json::from_value(cognition_reference(CARRIER)).expect("holder")
+}
+
+/// One valid current-view record for the seeded carrier; it cites nothing, so
+/// the commit revalidates no memory record.
+fn settle_record(record_id: &str) -> Value {
+    json!({
+        "kind": "belief",
+        "order": 1,
+        "record_id": record_id,
+        "holder": cognition_reference(CARRIER),
+        "target": {
+            "carrier": cognition_reference("ke_shared_gate"),
+            "target_id": "prop_gate_closed",
+            "kind": "proposition",
+        },
+        "assessor": cognition_reference(CARRIER),
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [{
+                "kind": "memory_record",
+                "namespace": "mindcore",
+                "id": "rec_gate",
+            }],
+        },
+        "assessment_context": { "context_id": SUBJECT },
+        "effective_at": "2026-11-20T09:00:00Z",
+        "assessed_at": "2026-11-20T09:00:00Z",
+        "view": "current",
+        "q": {
+            "value": 0.8,
+            "assertion": "belief_attribution",
+            "method": "two_witness_reports",
+            "calibration": "uncalibrated",
+        },
+        "extensions": {},
+    })
+}
+
+/// The production pool holds one connection, so a settle waiting behind any
+/// other statement waits forever: its deadline must end that wait without
+/// opening a transaction.
+#[tokio::test]
+async fn a_settle_refuses_at_its_deadline_while_the_only_connection_is_held() {
+    let harness = deliberate_harness().await;
+    let binding = settle_binding(&harness.pool);
+    let hold = harness
+        .pool
+        .acquire()
+        .await
+        .expect("hold the only connection");
+    let deadline = std::time::Instant::now() + Duration::from_millis(50);
+
+    let outcome = tokio::time::timeout(
+        CANCELLATION_GUARD,
+        binding.commit_cognition(
+            &principal(),
+            SPACE,
+            SUBJECT,
+            &settle_holder(),
+            1,
+            settle_record("cog_refused"),
+            &[],
+            deadline,
+        ),
+    )
+    .await
+    .expect("a held connection must not block the settle past its guard");
+    let error = outcome.expect_err("an expired acquire refuses the settle");
+    assert!(matches!(error, SpiError::DeadlineExceeded), "got {error:?}");
+
+    drop(hold);
+    let (revision, _) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1, "a refused settle moves no carrier");
+    assert_eq!(
+        harness.count_from("cognition_records").await,
+        0,
+        "a refused settle appends no record"
+    );
+}
+
+/// An acquire that finds a free connection can complete with the deadline
+/// already past: the re-check before `BEGIN IMMEDIATE` refuses it.
+///
+/// The pool pins `test_before_acquire(false)` so the acquire completes on its
+/// first poll instead of refusing at the ping, and `before_acquire` records
+/// that the hand-over happened. That record is the proof this test is about
+/// the re-check and not the acquire's own bound: the acquire ran far enough to
+/// give a connection out, so the elapsed deadline can only refuse it later.
+#[tokio::test]
+async fn a_settle_with_a_passed_deadline_opens_no_transaction_on_a_free_connection() {
+    let harness = deliberate_harness().await;
+    let handed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let acquired = handed_out.clone();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .test_before_acquire(false)
+        .before_acquire(move |_connection, _metadata| {
+            acquired.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(true) })
+        })
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(harness.root.join("workflows.db"))
+                .foreign_keys(true),
+        )
+        .await
+        .expect("open the free-connection pool");
+    let binding = settle_binding(&pool);
+    // `connect_with` releases one checked connection, so the acquire below
+    // takes an idle connection on its first poll.
+    let deadline = std::time::Instant::now() - Duration::from_millis(1);
+
+    let outcome = tokio::time::timeout(
+        CANCELLATION_GUARD,
+        binding.commit_cognition(
+            &principal(),
+            SPACE,
+            SUBJECT,
+            &settle_holder(),
+            1,
+            settle_record("cog_expired"),
+            &[],
+            deadline,
+        ),
+    )
+    .await
+    .expect("a free connection must not block the settle past its guard");
+    let error = outcome.expect_err("a passed deadline refuses the settle");
+    assert!(matches!(error, SpiError::DeadlineExceeded), "got {error:?}");
+    assert!(
+        handed_out.load(Ordering::SeqCst),
+        "the acquire handed out a connection, so the elapsed deadline was refused by the re-check"
+    );
+
+    let (revision, _) = stored_carrier(&harness).await;
+    assert_eq!(revision, 1, "a refused settle moves no carrier");
+    assert_eq!(
+        harness.count_from("cognition_records").await,
+        0,
+        "a refused settle appends no record"
+    );
+}
+
+/// The control: the same call on a free connection with time left commits the
+/// next carrier revision.
+#[tokio::test]
+async fn a_settle_commits_on_a_free_connection_within_its_deadline() {
+    let harness = deliberate_harness().await;
+    let binding = settle_binding(&harness.pool);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+    let version = tokio::time::timeout(
+        CANCELLATION_GUARD,
+        binding.commit_cognition(
+            &principal(),
+            SPACE,
+            SUBJECT,
+            &settle_holder(),
+            1,
+            settle_record("cog_settled"),
+            &[],
+            deadline,
+        ),
+    )
+    .await
+    .expect("a free connection must not block the settle past its guard")
+    .expect("a settle within its deadline commits");
+
+    assert_eq!(version, 2, "the carrier advances one revision");
+    let (revision, payload) = stored_carrier(&harness).await;
+    assert_eq!(revision, 2);
+    assert_eq!(payload["modules"]["cognition"]["records"], json!([]));
+    let records = committed_records(&harness).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], "cog_settled");
+}
+
+/// The bounded acquire waits rather than failing fast: a connection held only
+/// briefly, released well before the deadline, still lets the settle commit.
+#[tokio::test]
+async fn a_settle_waits_out_a_short_hold_until_its_deadline() {
+    /// How long the only connection stays held: short against the deadline,
+    /// long against any immediate refusal.
+    const HOLD: Duration = Duration::from_millis(150);
+
+    let harness = deliberate_harness().await;
+    let binding = settle_binding(&harness.pool);
+    let hold = harness
+        .pool
+        .acquire()
+        .await
+        .expect("hold the only connection");
+    let start = std::time::Instant::now();
+    let deadline = start + Duration::from_secs(30);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(HOLD).await;
+        drop(hold);
+    });
+
+    let version = tokio::time::timeout(
+        CANCELLATION_GUARD,
+        binding.commit_cognition(
+            &principal(),
+            SPACE,
+            SUBJECT,
+            &settle_holder(),
+            1,
+            settle_record("cog_waited"),
+            &[],
+            deadline,
+        ),
+    )
+    .await
+    .expect("the settle must not outlast its guard")
+    .expect("a connection released before the deadline lets the settle commit");
+    release.await.expect("the release task");
+
+    assert!(
+        start.elapsed() >= HOLD,
+        "the settle waited for the held connection instead of refusing at once"
+    );
+    assert_eq!(version, 2, "the carrier advances one revision");
+    let records = committed_records(&harness).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], "cog_waited");
 }

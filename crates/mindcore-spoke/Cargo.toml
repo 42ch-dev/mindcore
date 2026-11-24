@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 sqlx.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 # Test-only scorer probe: never enable `test-scoring` from a production dependency.
