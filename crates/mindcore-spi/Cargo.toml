@@ -9,7 +9,7 @@ description = "MIND ladder contract crate: capability and workflow seams over th
 include = ["src/**/*.rs", "Cargo.toml", "LICENSE"]
 
 [dependencies]
-mindcore-base = { path = "../mindcore-base", version = "0.1.0" }
+mindcore-base = { path = "../mindcore-base", version = "0.1.0-alpha.1" }
 spoke-schemas.workspace = true
 spoke-operations.workspace = true
 serde.workspace = true
