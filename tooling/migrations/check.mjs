@@ -8,7 +8,7 @@
 // working-tree lock — is what stops an edit of a published file together with its lock
 // hash from passing: the copy that shipped under the baseline tag has other bytes.
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,6 +22,20 @@ const NAME = /^(\d{4})_.*\.sql$/;
 const prefixOf = (file) => Number(NAME.exec(file)[1]);
 const sha256 = (file) =>
   createHash("sha256").update(readFileSync(join(migrationsDir, file))).digest("hex");
+
+const usage = `usage: node tooling/migrations/check.mjs [--write-lock]
+  (no flag)     verify the working tree against the published lock (read-only)
+  --write-lock  run the same checks, then rewrite ${lockInRepo} to every present migration`;
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  console.log(usage);
+  process.exit(0);
+}
+const unknown = process.argv.slice(2).filter((arg) => arg !== "--write-lock");
+if (unknown.length > 0) {
+  console.error(`error: unknown arguments: ${unknown.join(" ")}\n${usage}`);
+  process.exit(2);
+}
+const writeLock = process.argv.includes("--write-lock");
 
 const locked = JSON.parse(readFileSync(lockPath, "utf8"));
 if (!Array.isArray(locked)) {
@@ -148,6 +162,22 @@ for (const file of present) {
 }
 const named = present.filter((file) => NAME.test(file));
 
+// Two present files cannot share a prefix: sqlx records them by version, so the
+// second one can never be applied even if both sort after the published maximum.
+const byPrefix = new Map();
+for (const file of named) {
+  const prefix = prefixOf(file);
+  const earlier = byPrefix.get(prefix);
+  if (earlier) {
+    failures.push(
+      `migrations ${earlier} and ${file} share prefix ${NAME.exec(file)[1]}; each ` +
+        `NNNN number may appear only once — renumber one of them.`,
+    );
+  } else {
+    byPrefix.set(prefix, file);
+  }
+}
+
 const appended = [];
 for (const file of named) {
   if (lockedHashes.has(file)) continue;
@@ -171,4 +201,12 @@ console.log(`appended but unlocked: ${appended.join(", ") || "(none)"}`);
 if (failures.length > 0) {
   for (const failure of failures) console.error(`error: ${failure}`);
   process.exit(1);
+}
+
+// --write-lock: only after every check passed. The release workflow calls this to
+// fold appended migrations into the lock; a failed check must never rewrite it.
+if (writeLock) {
+  const entries = named.map((file) => ({ file, sha256: sha256(file) }));
+  writeFileSync(lockPath, `${JSON.stringify(entries, null, 2)}\n`);
+  console.log(`wrote ${lockInRepo}: ${entries.map((entry) => entry.file).join(", ") || "(none)"}`);
 }
