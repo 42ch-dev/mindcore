@@ -572,3 +572,22 @@ fn extension_values_are_opaque_and_round_trip() {
         })
     ));
 }
+
+#[test]
+fn timestamps_keep_the_shared_strict_rfc_3339_grammar() {
+    // `chrono` alone admits a space where RFC 3339 requires `T`; a record accepted
+    // on that spelling would be refused by the published DTO gate when re-sent.
+    let mut candidate = pending_candidate();
+    candidate["created_at"] = json!("2026-10-25 09:24:00Z");
+    assert!(matches!(
+        memory_candidate_from_wire(candidate),
+        Err(WireError::InvalidField {
+            field: "created_at",
+            ..
+        })
+    ));
+
+    let mut candidate = pending_candidate();
+    candidate["occurred_at"] = json!("2026-10-25T09:24:00Z");
+    assert!(memory_candidate_from_wire(candidate).is_ok());
+}

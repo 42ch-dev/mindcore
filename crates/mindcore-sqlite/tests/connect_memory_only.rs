@@ -1,9 +1,9 @@
-//! Memory-only Connect composition proof against SPOKE `spoke-connect =0.17.0`
+//! Memory-only Connect composition proof against SPOKE `spoke-connect =0.18.1`
 //! (`remote-adapter` feature).
 //!
 //! Both peers advertise exactly `["spoke-memory"]` in their signed hellos over
 //! an in-process `loopback_transport_pair`. The responder attaches a memory
-//! face only: 0.17 has no public empty or memory-only composite constructor, so
+//! face only: 0.18.1 has no public empty or memory-only composite constructor, so
 //! the test supplies a local [`RemoteServePorts`] whose single override is
 //! `as_memory`. That face drives a real `mindcore_spoke::MemoryAdapter`
 //! `memory.recall` on a caller-owned SQLite transaction, with the principal

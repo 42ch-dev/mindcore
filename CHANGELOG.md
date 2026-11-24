@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- Dependencies: the SPOKE cohort is pinned to `=0.18.1` — `spoke-schemas` and `spoke-operations` in
+  `[workspace.dependencies]`, and `spoke-connect` there too, so the SQLite test dependency inherits
+  the same pin with `remote-adapter` enabled. The published 0.18.1 wire changes ride along: shared
+  strict RFC 3339 parsing (`spoke_schemas::timestamp`), the inclusive `2^53` revision ceiling on the
+  generated DTOs (`spoke_schemas::integers`), and RFC 8785 canonicalization that re-spells a
+  revision-typed `±2^53` endpoint so Connect signatures agree with the TypeScript stack.
+  `mindcore-base`'s IR decode uses the same strict parser, so a space-separated timestamp that
+  `chrono` alone admits is now refused at the wire boundary instead of reaching storage.
+
 - **`mindcore-runtime` / `mindcore-sqlite`:** `history.revisions.prune` is deduplicated durably. The
   history face composes `SqliteHistoryDedupStore` over the knowledge store's own pool, keyed by
   Connect's retry identity, so a same-key retry after a restart or a reassembled surface replays the

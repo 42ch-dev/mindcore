@@ -1,4 +1,4 @@
-//! Knowledge-only Connect serving proof against SPOKE `spoke-connect =0.17.0`
+//! Knowledge-only Connect serving proof against SPOKE `spoke-connect =0.18.1`
 //! (`remote-adapter` feature).
 //!
 //! Both peers advertise `["spoke-knowledge"]` in their signed hellos over an
@@ -574,7 +574,7 @@ async fn one_sided_knowledge_capability_is_denied() {
 }
 
 /// A mid-session capability grant never authorizes a knowledge op: the serve gate reads the
-/// negotiated hello set (`spoke-connect 0.17.0/src/remote/responder.rs` — dispatch gate on
+/// negotiated hello set (`spoke-connect 0.18.1/src/remote/responder.rs` — dispatch gate on
 /// `negotiated_capabilities`), and `core::dispatch::token_authorizes_op` only checks that a grant
 /// names the op's capability. A grant lacking `spoke-knowledge` therefore denies, and one naming
 /// `spoke-knowledge` still denies because no hello negotiated the family.
