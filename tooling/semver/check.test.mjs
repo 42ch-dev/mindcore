@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { baselineTag } from '../git/baseline.mjs';
@@ -59,9 +59,16 @@ const cleanFixture = (root) => {
 
 const fixture = (fn) => {
   const root = mkdtempSync(join(tmpdir(), 'semver-check-'));
+  scratch.push(root);
   fn(root);
   return root;
 };
+
+// Scratch dirs from fixture()/gitRepo() are removed even when a test fails.
+const scratch = [];
+after(() => {
+  for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 test('isSemver accepts release, pre-release and build forms', () => {
   assert.ok(isSemver('0.1.0'));
@@ -70,6 +77,8 @@ test('isSemver accepts release, pre-release and build forms', () => {
   assert.ok(!isSemver('0.1'));
   assert.ok(!isSemver('v1.2.3'));
   assert.ok(!isSemver('1.2.3-'));
+  assert.ok(!isSemver('01.2.3'));
+  assert.ok(!isSemver('1.2.3-01'));
 });
 
 test('accepts an unset publish and every value that still targets crates.io', () => {
@@ -271,10 +280,45 @@ test('the API diff blocks off a tag commit only with --blocking', () => {
   });
 });
 
+test('the API diff blocks on a release tag commit without --blocking', () => {
+  gitRepo(({ root, git }) => {
+    cleanFixture(root);
+    mkdirSync(join(root, 'tooling', 'semver'), { recursive: true });
+    mkdirSync(join(root, 'tooling', 'git'), { recursive: true });
+    cpSync(join(HERE, 'check.mjs'), join(root, 'tooling', 'semver', 'check.mjs'));
+    cpSync(join(HERE, '..', 'git', 'baseline.mjs'), join(root, 'tooling', 'git', 'baseline.mjs'));
+
+    // Same fake cargo: the tool probe passes, every API diff reports a violation.
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, 'cargo'),
+      '#!/bin/sh\n[ "$1" = semver-checks ] && [ "$2" = --version ] && exit 0\nexit 1\n',
+      { mode: 0o755 },
+    );
+
+    git('add', '--all');
+    git('commit', '--quiet', '-m', 'release 0.1.0');
+    git('tag', 'v0.1.0');
+    git('commit', '--quiet', '--allow-empty', '-m', 'release 0.2.0');
+    git('tag', 'v0.2.0');
+
+    // HEAD is exactly v0.2.0: that tag is the release, so a break fails even
+    // without --blocking.
+    const run = spawnSync(process.execPath, ['tooling/semver/check.mjs'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+    });
+    assert.equal(run.status, 1, run.stderr);
+  });
+});
+
 function gitRepo(fn) {
-  const root = mkdtempSync(join(tmpdir(), 'semver-baseline-'));
+  const root = mkdtempSync(join(tmpdir(), 'semver-check-'));
+  scratch.push(root);
   const git = (...args) => {
-    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    const result = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd: root, encoding: 'utf8' });
     assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr}`);
   };
   git('init', '--quiet', '--initial-branch', 'main');
