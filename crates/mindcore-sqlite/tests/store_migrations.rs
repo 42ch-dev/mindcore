@@ -57,12 +57,15 @@ async fn applied_version_outside_the_embedded_set_is_refused() {
         .await;
 
     // A database that applied a version the embedded set does not contain — the shape a database
-    // migrated by a set this release does not ship has.
+    // migrated by a set this release does not ship has. The version must stay far above any real
+    // migration prefix, or the row stops being foreign as soon as that migration is appended.
+    const ABSENT: i64 = 9999;
     let pool = raw_pool(&path).await;
     sqlx::query(
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
-         VALUES (2, 'absent from the embedded set', TRUE, X'00', -1)",
+         VALUES (?1, 'absent from the embedded set', TRUE, X'00', -1)",
     )
+    .bind(ABSENT)
     .execute(&pool)
     .await
     .expect("record the foreign migration");
@@ -73,8 +76,8 @@ async fn applied_version_outside_the_embedded_set_is_refused() {
         .err()
         .expect("an applied version outside the embedded set is refused");
     match migrate_error(error) {
-        MigrateError::VersionMissing(version) => assert_eq!(version, 2),
-        other => panic!("expected VersionMissing(2), got {other:?}"),
+        MigrateError::VersionMissing(version) => assert_eq!(version, ABSENT),
+        other => panic!("expected VersionMissing({ABSENT}), got {other:?}"),
     }
 }
 

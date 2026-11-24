@@ -10,6 +10,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { baselineTag, git, isShallow, SHALLOW_HINT } from '../git/baseline.mjs';
+
 export const PUBLISHABLE = ['mindcore-base', 'mindcore-spi', 'mindcore-sqlite'];
 
 // Published manifests only carry [dependencies] / [build-dependencies] into the
@@ -72,6 +74,19 @@ function depNeedsVersion(spec) {
   return spec !== null && typeof spec === 'object' && 'path' in spec && !('version' in spec);
 }
 
+// `publish` gates where a crate may be uploaded. Unset and `true` mean the
+// default registry; `["crates-io"]` (or the bare string) names it explicitly.
+// Anything else — `false` or another registry — keeps the crate off crates.io.
+export function publishesToCratesIo(publish) {
+  if (publish === undefined || publish === 'true') return true;
+  const value = publish.trim();
+  const list = /^\[(.*)\]$/.exec(value);
+  const entries = (list ? list[1].split(',') : [value])
+    .map((entry) => unquote(entry.trim()))
+    .filter(Boolean);
+  return entries.length === 1 && entries[0] === 'crates-io';
+}
+
 // Basic/literal string values lose their quotes; other values (booleans, arrays,
 // inline tables) stay raw so checks match on their source text.
 function unquote(value) {
@@ -100,9 +115,10 @@ export function checkManifests(rootDir) {
     if (!toml) continue;
     const pkg = toml.package ?? {};
 
-    if (pkg.publish !== undefined && pkg.publish !== 'true') {
+    if (!publishesToCratesIo(pkg.publish)) {
       errors.push(
-        `${crate}: publishable crate still has \`publish = ${pkg.publish}\`; remove it (docs/semver.md § Publish scope)`,
+        `${crate}: publishable crate has \`publish = ${pkg.publish}\`; a published crate's ` +
+          `value must be unset, \`true\`, or \`["crates-io"]\``,
       );
     }
 
@@ -126,18 +142,6 @@ export function checkManifests(rootDir) {
   return errors;
 }
 
-function newestBaselineTag(cwd) {
-  try {
-    const out = execFileSync('git', ['tag', '--list', 'v*', '--sort=-v:refname'], {
-      cwd,
-      encoding: 'utf8',
-    });
-    return out.split('\n')[0].trim() || null;
-  } catch {
-    return null;
-  }
-}
-
 function hasSemverChecks(cwd) {
   try {
     execFileSync('cargo', ['semver-checks', '--version'], { cwd, stdio: 'ignore' });
@@ -155,10 +159,22 @@ export function main(rootDir = repoRoot()) {
     return 1;
   }
 
-  const tag = newestBaselineTag(rootDir);
+  const tag = baselineTag(rootDir);
   if (!tag) {
+    if (isShallow(rootDir)) {
+      console.error(`error: ${SHALLOW_HINT}`);
+      return 1;
+    }
     console.log('no baseline tag; API diff check skipped');
     return 0;
+  }
+
+  if (git(rootDir, ['cat-file', '-e', `${tag}^{commit}`]) === null) {
+    console.error(
+      `error: baseline tag ${tag} is not in this clone; a shallow checkout hides the previous ` +
+        'release. Fetch the tags and their history (actions/checkout: fetch-depth: 0).',
+    );
+    return 1;
   }
 
   if (!hasSemverChecks(rootDir)) {

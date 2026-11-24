@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { checkManifests, isSemver, main, PUBLISHABLE } from './check.mjs';
+import { baselineTag } from '../git/baseline.mjs';
+import {
+  checkManifests,
+  isSemver,
+  main,
+  publishesToCratesIo,
+  PUBLISHABLE,
+} from './check.mjs';
 
 const workspace = (root, version = '0.2.0') =>
   writeFileSync(
@@ -53,6 +61,28 @@ test('isSemver accepts release, pre-release and build forms', () => {
   assert.ok(!isSemver('0.1'));
   assert.ok(!isSemver('v1.2.3'));
   assert.ok(!isSemver('1.2.3-'));
+});
+
+test('accepts an unset publish and every value that still targets crates.io', () => {
+  assert.ok(publishesToCratesIo(undefined), 'an unset publish means the default registry');
+  for (const publish of ['true', '"crates-io"', '["crates-io"]', '[ "crates-io" ]']) {
+    const root = fixture(cleanFixture);
+    crateToml(root, 'mindcore-base', { publish });
+    assert.deepEqual(checkManifests(root), [], `publish = ${publish} must be accepted`);
+  }
+});
+
+test('rejects a publishable crate that lists another registry', () => {
+  for (const publish of ['["other-registry"]', '["crates-io", "other-registry"]']) {
+    const root = fixture(cleanFixture);
+    crateToml(root, 'mindcore-base', { publish });
+    assert.ok(
+      checkManifests(root).some(
+        (e) => e.includes('mindcore-base') && e.includes('other-registry'),
+      ),
+      `publish = ${publish} must be rejected`,
+    );
+  }
 });
 
 test('rejects a publishable crate that still has publish = false', () => {
@@ -104,4 +134,45 @@ test('accepts a clean publishable workspace', () => {
 test('main skips the API diff when the fixture dir has no v* tag', () => {
   const root = fixture(cleanFixture);
   assert.equal(main(root), 0);
+});
+
+function gitRepo(fn) {
+  const root = mkdtempSync(join(tmpdir(), 'semver-baseline-'));
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr}`);
+  };
+  git('init', '--quiet', '--initial-branch', 'main');
+  git('config', 'user.email', 'test@example.invalid');
+  git('config', 'user.name', 'test');
+  git('config', 'tag.gpgsign', 'false');
+  const commit = (name) => {
+    writeFileSync(join(root, name), name);
+    git('add', name);
+    git('commit', '--quiet', '-m', name);
+  };
+  fn({ root, git, commit });
+  return root;
+}
+
+test('baselineTag is null without a v* tag or any git history', () => {
+  // A directory that is not a repository at all answers "no baseline" too.
+  assert.equal(baselineTag(fixture(cleanFixture)), null);
+  gitRepo(({ root }) => assert.equal(baselineTag(root), null));
+});
+
+test('baselineTag is the previous tag on a tag commit and the newest tag elsewhere', () => {
+  gitRepo(({ root, git, commit }) => {
+    commit('one');
+    assert.equal(baselineTag(root), null);
+    git('tag', 'v0.1.0');
+    // On the first release's own commit there is no predecessor to diff against.
+    assert.equal(baselineTag(root), null);
+    commit('two');
+    assert.equal(baselineTag(root), 'v0.1.0');
+    git('tag', 'v0.2.0');
+    assert.equal(baselineTag(root), 'v0.1.0');
+    commit('three');
+    assert.equal(baselineTag(root), 'v0.2.0');
+  });
 });
