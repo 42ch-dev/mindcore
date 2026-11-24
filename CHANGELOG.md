@@ -2,22 +2,7 @@
 
 ## [Unreleased]
 
-- **Release readiness (v0.1.0):** `mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are
-  publishable (`publish = false` dropped, internal path dependencies carry `version`, explicit
-  `include` lists); `mindcore-spoke` and `mindcore-runtime` stay private. The SPOKE cohort is
-  declared as a caret range (`0.18.1`) instead of `=0.18.1`, so a downstream consumer can resolve
-  another `0.18.x` patch. `mindcore-spi`'s `test-scoring` feature and `scored_bits_for_test` are
-  removed, and `mindcore-sqlite` ships its `.sqlx` offline cache (82 files, via a
-  `crates/mindcore-sqlite/.sqlx` symlink) so a packaged tarball compiles without a database.
-  Publishing is `workflow_dispatch` in `.github/workflows/publish.yml`: base → spi → sqlite,
-  gated on the sparse index, with `dry_run`.
-
-- **Release policy (v0.1.0):** `docs/semver.md` states the pre-1.0, SPOKE-follow, sqlx-major and
-  storage-compatibility rules; `docs/storage-compatibility.md` states the migration accept/refuse
-  matrix; `docs/releasing.md` is the publish runbook. CI runs `tooling/semver/check.mjs` and
-  `tooling/migrations/check.mjs`, the latter against the locked migration set.
-
-- Dependencies: the SPOKE cohort moved to `0.18.1` (declared as a caret range) — `spoke-schemas` and `spoke-operations` in
+- Dependencies: the SPOKE cohort is pinned to `=0.18.1` — `spoke-schemas` and `spoke-operations` in
   `[workspace.dependencies]`, and `spoke-connect` there too, so the SQLite test dependency inherits
   the same pin with `remote-adapter` enabled. The published 0.18.1 wire changes ride along: shared
   strict RFC 3339 parsing (`spoke_schemas::timestamp`), the inclusive `2^53` revision ceiling on the
