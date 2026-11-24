@@ -118,7 +118,9 @@ jobs:
             exit 1
           fi
 
-          git add Cargo.toml Cargo.lock CHANGELOG.md
+          # The bump rewrites the internal dependency requirements in the member
+          # manifests as well as the workspace version, so stage them all.
+          git add Cargo.toml Cargo.lock CHANGELOG.md crates/*/Cargo.toml
           git commit -m "chore(release): bump version to ${VERSION}"
           # A dispatch whose PR was closed leaves the branch behind, so replace it;
           # learn the remote tip first or the lease has no expected value.
