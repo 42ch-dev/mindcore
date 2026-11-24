@@ -27,10 +27,12 @@ skipped.
 There is no manual publish step: publishing is the last job of the release
 workflow and starts by itself once the release job succeeded. Any SemVer
 prerelease — a version with a `-` suffix, such as `v0.2.0-beta.1` or
-`v0.2.0-alpha.1` — skips `semver-gate` and stops before `publish-crates`, so a
-prerelease never reaches the registry and never claims a version there. It is
-not gated because it is not uploaded: there is no registry version to keep
-compatible. A stable version is always gated.
+`v0.2.0-alpha.1` — skips the API diff and stops before `publish-crates`, so a
+prerelease never reaches the registry and never claims a version there. It
+skips the API diff because it is not uploaded: there is no registry version to
+keep compatible. The migration-lock step still runs for it, because a tagged
+prerelease ships the same migration set a stable release would. A stable
+version is always gated.
 
 The tag is created before the upload, so a failed upload leaves a tag whose version is not on the
 registry; the next release then diffs against that tag. Re-run the failed `publish-crates` job
@@ -125,8 +127,10 @@ trusted publisher. From that point `publish-crates` mints a short-lived OIDC tok
 (`rust-lang/crates-io-auth-action`); the repository stores no registry secret and no secret has to
 be rotated.
 
-The verification build runs with `CARGO_REGISTRY_TOKEN` removed (`env -u`), and only the upload
-step receives the minted token, so a dependency's build script cannot read it.
+The verification build runs with `CARGO_REGISTRY_TOKEN` and the two
+`ACTIONS_ID_TOKEN_REQUEST_*` variables removed (`env -u`), and only the upload
+step receives the minted token, so a dependency's build script can neither read
+it nor mint one.
 
 `publish-crates` has `contents: read` plus `id-token: write`; those are the only permissions the job
 needs.

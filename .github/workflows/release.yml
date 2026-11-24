@@ -31,7 +31,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
@@ -69,12 +69,13 @@ jobs:
         env:
           SQLX_OFFLINE: "true"
 
-      # The lock must already cover every migration in the tagged commit.
+      # The lock must already cover every migration in the tagged commit, for a
+      # prerelease too: a prerelease is Git-only but still ships the migration
+      # set, and its tag must not record an unlocked one.
       # --write-lock is a no-op when it does; when a migration landed after the
       # release PR opened, it writes the missing entry and the diff fails the
       # gate instead of tagging a migration the next check would not protect.
       - name: Migration lock is complete
-        if: ${{ !contains(steps.version.outputs.version, '-') }}
         run: |
           node tooling/migrations/check.mjs --write-lock
           git diff --exit-code -- tooling/migrations/migrations.lock.json
@@ -194,7 +195,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0

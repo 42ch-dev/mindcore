@@ -4,9 +4,10 @@
 # - Skips when <crate>@<workspace-version> is already on crates.io (safe re-run
 #   after a partial publish-crates job).
 # - Publishes with `--locked`, as every other Cargo command in this repository.
-# - Verifies with a `--dry-run` build that has no CARGO_REGISTRY_TOKEN, then
-#   uploads with `--no-verify`: a dependency's build script runs the build, so
-#   the token must not be present while it does.
+# - Verifies with a `--dry-run` build that has no publish credentials
+#   (CARGO_REGISTRY_TOKEN and the workflow OIDC request variables are unset),
+#   then uploads with `--no-verify`: a dependency's build script runs the
+#   build, so no credential may be present while it does.
 # - Retries transient registry responses (502/503/504) at a fixed interval.
 # - Treats the registry's duplicate-version answer as success (publish race):
 #   cargo's `is already uploaded` and the index's `already exists on crates.io`.
@@ -103,11 +104,12 @@ if crates_io_has_version; then
   exit 0
 fi
 
-# Verify before the token exists in the environment: a dependency's build script
-# runs during this build and could read CARGO_REGISTRY_TOKEN out of it.
-echo "verifying ${PKG} without CARGO_REGISTRY_TOKEN"
+# Verify without publish credentials in the environment: a dependency's build
+# script runs during this build, and it could read CARGO_REGISTRY_TOKEN or mint
+# a token from the workflow's OIDC request variables.
+echo "verifying ${PKG} without publish credentials"
 set +e
-verify_out="$(env -u CARGO_REGISTRY_TOKEN cargo publish -p "${PKG}" --locked --dry-run 2>&1)"
+verify_out="$(env -u CARGO_REGISTRY_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL cargo publish -p "${PKG}" --locked --dry-run 2>&1)"
 verify_status=$?
 set -e
 printf '%s\n' "${verify_out}"
@@ -117,11 +119,12 @@ if [[ "${verify_status}" -ne 0 ]]; then
 fi
 
 # The verification build ran dependency build scripts in this checkout. If one
-# changed a tracked file, the authenticated `cargo publish` would package that
-# change, so refuse to upload.
-if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
-  echo "error: tracked files changed during the verification build of ${PKG}:" >&2
-  git status --porcelain --untracked-files=no >&2
+# changed or added a file, the authenticated `cargo publish` would package that
+# change — an untracked file still ships when the manifest's `include` matches
+# it — so refuse to upload. Ignored paths stay out of `git status`.
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "error: files changed during the verification build of ${PKG}:" >&2
+  git status --porcelain >&2
   exit 1
 fi
 
