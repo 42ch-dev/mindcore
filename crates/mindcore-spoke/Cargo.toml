@@ -23,7 +23,5 @@ sqlx.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-# Test-only scorer probe: never enable `test-scoring` from a production dependency.
-mindcore-spi = { path = "../mindcore-spi", features = ["test-scoring"] }
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

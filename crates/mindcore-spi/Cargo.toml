@@ -5,16 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-publish = false
-
-[features]
-# Test-only ranking probe (`workflows::scored_bits_for_test`). Only
-# `mindcore-spoke`'s [dev-dependencies] enable it; it must never be enabled by a
-# production dependency edge.
-test-scoring = []
+description = "MIND ladder contract crate: capability and workflow seams over the published SPOKE DTOs"
+include = ["src/**/*.rs", "Cargo.toml"]
 
 [dependencies]
-mindcore-base = { path = "../mindcore-base" }
+mindcore-base = { path = "../mindcore-base", version = "0.1.0" }
 spoke-schemas.workspace = true
 spoke-operations.workspace = true
 serde.workspace = true
