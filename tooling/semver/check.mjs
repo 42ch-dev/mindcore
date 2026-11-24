@@ -49,17 +49,20 @@ export const isSemver = (value) => {
 export function parseToml(text) {
   const root = {};
   let table = root;
+  // Quoted keys are legal TOML (`"foo" = ...`); compare them unquoted or the
+  // dependency checks would look up `"foo"` and miss the entry.
+  const key = (part) => unquote(part.trim());
   for (const raw of text.split('\n')) {
     const line = stripComment(raw).trim();
     if (!line) continue;
     const header = /^\[([^\]]+)\]$/.exec(line);
     if (header) {
-      table = header[1].split('.').reduce((o, k) => (o[k] ??= {}), root);
+      table = header[1].split('.').map(key).reduce((o, k) => (o[k] ??= {}), root);
       continue;
     }
     const kv = /^([^=]+?)\s*=\s*(.+)$/.exec(line);
     if (!kv) continue;
-    const keys = kv[1].trim().split('.');
+    const keys = kv[1].trim().split('.').map(key);
     const leaf = keys.pop();
     const target = keys.reduce((o, k) => (o[k] ??= {}), table);
     target[leaf] = unquote(kv[2].trim());
