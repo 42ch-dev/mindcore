@@ -2128,7 +2128,7 @@ name = "mindcore-spoke"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "mindcore-base",
  "mindcore-spi",
