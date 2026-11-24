@@ -388,3 +388,50 @@ Hand-written curated body.
     );
   });
 });
+
+/**
+ * @param {string} root
+ * @param {string[]} args
+ */
+function git(root, args) {
+  const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+}
+
+describe("git-cliff", () => {
+  // The committed config decides which commits reach a release section; only a
+  // real git-cliff can prove the tagged range. Absent binary → skipped.
+  const cliff = spawnSync("git-cliff", ["--version"], { encoding: "utf8" });
+
+  it("renders only the commits after the previous tag", { skip: cliff.status !== 0 }, () => {
+    const root = mkdtempSync(join(tmpdir(), "mindcore-cliff-"));
+    tempDirs.push(root);
+    git(root, ["init", "--quiet", "--initial-branch", "main"]);
+    // A user's global config may sign tags or commits; this throwaway repo must not.
+    for (const [key, value] of [
+      ["user.name", "release-test"],
+      ["user.email", "release-test@example.invalid"],
+      ["commit.gpgsign", "false"],
+      ["tag.gpgsign", "false"],
+    ]) {
+      git(root, ["config", key, value]);
+    }
+
+    writeFileSync(join(root, "a.txt"), "1\n");
+    git(root, ["add", "a.txt"]);
+    git(root, ["commit", "--quiet", "-m", "feat: one"]);
+    git(root, ["tag", "v0.1.0"]);
+    writeFileSync(join(root, "a.txt"), "2\n");
+    git(root, ["commit", "--quiet", "-am", "fix: two"]);
+
+    const rendered = spawnSync(
+      "git-cliff",
+      ["--config", join(SCRIPT_DIR, "../../cliff.toml"), "--tag", "v0.1.1", "--unreleased"],
+      { cwd: root, encoding: "utf8" },
+    );
+    assert.equal(rendered.status, 0, rendered.stderr);
+    assert.match(rendered.stdout, /## \[0\.1\.1\]/);
+    assert.match(rendered.stdout, /Two/);
+    assert.doesNotMatch(rendered.stdout, /One/);
+  });
+});
