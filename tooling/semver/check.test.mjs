@@ -11,19 +11,24 @@ import {
   checkManifests,
   isSemver,
   main,
+  parseToml,
   publishesToCratesIo,
   PUBLISHABLE,
 } from './check.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-const workspace = (root, version = '0.2.0') =>
+const workspace = (root, version = '0.2.0', extra = '') =>
   writeFileSync(
     join(root, 'Cargo.toml'),
-    `[workspace]\n[workspace.package]\nversion = "${version}"\n`,
+    `[workspace]\n[workspace.package]\nversion = "${version}"\n${extra}`,
   );
 
-const crateToml = (root, name, { publish = 'true', deps = '', devDeps = '', features = '' } = {}) => {
+const crateToml = (
+  root,
+  name,
+  { publish = 'true', deps = '', devDeps = '', features = '', extra = '' } = {},
+) => {
   const dir = join(root, 'crates', name);
   mkdirSync(dir, { recursive: true });
   const body = [
@@ -31,6 +36,7 @@ const crateToml = (root, name, { publish = 'true', deps = '', devDeps = '', feat
     features && `[features]\n${features}\n`,
     `[dependencies]\n${deps}\n`,
     devDeps && `[dev-dependencies]\n${devDeps}\n`,
+    extra,
   ]
     .filter(Boolean)
     .join('');
@@ -108,6 +114,95 @@ test('rejects an internal path dependency without version', () => {
       (e) => e.includes('mindcore-sqlite') && e.includes('mindcore-base') && e.includes('version'),
     ),
   );
+});
+
+test('rejects a path dependency in [build-dependencies] without version', () => {
+  const root = fixture(cleanFixture);
+  crateToml(root, 'mindcore-base', {
+    extra: '\n[build-dependencies]\ncodegen = { path = "../codegen" }\n',
+  });
+  assert.ok(
+    checkManifests(root).some(
+      (e) =>
+        e.includes('mindcore-base') &&
+        e.includes('build-dependencies') &&
+        e.includes('codegen') &&
+        e.includes('version'),
+    ),
+  );
+});
+
+test('checks target-specific dependency tables', () => {
+  const root = fixture(cleanFixture);
+  crateToml(root, 'mindcore-base', {
+    extra: `\n[target.'cfg(unix)'.dependencies]\nfoo = { path = "../foo" }\n`,
+  });
+  assert.ok(
+    checkManifests(root).some(
+      (e) =>
+        e.includes('mindcore-base') &&
+        e.includes(`[target.'cfg(unix)'.dependencies]`) &&
+        e.includes('foo') &&
+        e.includes('version'),
+    ),
+  );
+});
+
+test('checks target-specific build-dependency tables', () => {
+  const root = fixture(cleanFixture);
+  crateToml(root, 'mindcore-base', {
+    extra: `\n[target.'cfg(unix)'.build-dependencies]\nfoo = { path = "../foo" }\n`,
+  });
+  assert.ok(
+    checkManifests(root).some(
+      (e) =>
+        e.includes('mindcore-base') &&
+        e.includes(`[target.'cfg(unix)'.build-dependencies]`) &&
+        e.includes('foo') &&
+        e.includes('version'),
+    ),
+  );
+});
+
+test('resolves a workspace-inherited dependency against the root entry', () => {
+  const root = fixture((r) => {
+    workspace(r, '0.2.0', '\n[workspace.dependencies]\nfoo = { path = "crates/foo" }\n');
+    for (const name of PUBLISHABLE) crateToml(r, name);
+    crateToml(r, 'mindcore-base', { deps: 'foo = { workspace = true }\n' });
+  });
+  assert.ok(
+    checkManifests(root).some(
+      (e) => e.includes('mindcore-base') && e.includes('foo') && e.includes('version'),
+    ),
+  );
+});
+
+test('accepts a workspace-inherited dependency whose root entry pins a version', () => {
+  const root = fixture((r) => {
+    workspace(
+      r,
+      '0.2.0',
+      '\n[workspace.dependencies]\nfoo = { path = "crates/foo", version = "0.2.0" }\n',
+    );
+    for (const name of PUBLISHABLE) crateToml(r, name);
+    crateToml(r, 'mindcore-base', { deps: 'foo = { workspace = true }\n' });
+  });
+  assert.deepEqual(checkManifests(root), []);
+});
+
+test('leaves path-only dev-dependencies alone', () => {
+  // cargo drops versionless dev-deps from the packaged manifest instead of
+  // failing, so a version there would flag a legal tree.
+  const root = fixture(cleanFixture);
+  crateToml(root, 'mindcore-base', {
+    extra: `\n[dev-dependencies]\nfoo = { path = "../foo" }\n\n[target.'cfg(unix)'.dev-dependencies]\nfoo = { path = "../foo" }\n`,
+  });
+  assert.deepEqual(checkManifests(root), []);
+});
+
+test('parseToml descends dotted headers into nested tables', () => {
+  const toml = parseToml(`[target.'cfg(unix)'.dependencies]\nfoo = { path = "../foo" }\n`);
+  assert.deepEqual(toml.target["'cfg(unix)'"].dependencies.foo, '{ path = "../foo" }');
 });
 
 test('rejects the test-scoring feature on mindcore-spi', () => {
