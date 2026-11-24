@@ -29,7 +29,7 @@ The `spoke-history` family publishes two operations over the same signed session
 
 One store fills two port roles: `RoutedKnowledgeStore` implements `spoke_operations::HistoryPort` beside `ScopedKnowledgePort`, so no second store module exists and the runtime owns no second history implementation — only the dedup record beside it. Admission is the knowledge face's, composed as `HistoryAdmission = (principals(peer)?, knowledge_admission(peer)?)`: a peer outside either callback gets that callback's refusal, and can therefore replay and prune exactly the scope it reads and writes through `port.knowledge.*`. Connect compares a present request `scope` with the admitted scope before calling the port — `NOT_FOUND` on get, `NOT_AUTHORIZED` on prune — and the port re-applies `RoutedKnowledgeStore::admit` as its own guard.
 
-Coverage is `knowledge_entry` alone, because the store keeps no relation revision table. Any other `entity_kind` answers `HISTORY_ENTITY_UNSUPPORTED` after admission and before any statement. The entity's own disclosure rules apply unchanged: a missing, retired or peer-hidden row is one `NOT_FOUND` on get; prune needs a put's permission, so a retired or hidden row answers `NOT_AUTHORIZED` and a missing one `NOT_FOUND`. Get checks two payloads, because visibility is a payload property: the live row decides existence and retirement, and the replayed entry is then held to the same admitted scope, so a revision whose own disclosure, viewpoint, source or entry-type fields fall outside that scope answers the same `NOT_FOUND` with no snapshot. Both ops run in one transaction — a read for get, one `BEGIN IMMEDIATE` covering the permission read and the delete for prune — and every answer passes through the same storage-failure generalization as the knowledge face, so no table or column name reaches a peer.
+Coverage is `knowledge_entry` alone, because the store keeps no relation revision table. Any other `entity_kind` answers `HISTORY_ENTITY_UNSUPPORTED` after admission and before any statement. The entity's own disclosure rules apply unchanged: a missing, a retired and a peer-hidden row are one `NOT_FOUND` on get and on prune, so neither op tells a peer admitted to the collection which of the three it asked for — the concealment answers reuse the absence constructor, so code, message shape and `details` are equal by construction. Get checks two payloads, because visibility is a payload property: the live row decides existence and retirement, and the replayed entry is then held to the same admitted scope, so a revision whose own disclosure, viewpoint, source or entry-type fields fall outside that scope answers the same `NOT_FOUND` with no snapshot. Both ops run in one transaction — a read for get, one `BEGIN IMMEDIATE` covering the permission read and the delete for prune — and every answer passes through the same storage-failure generalization as the knowledge face, so no table or column name reaches a peer.
 
 `RevisionSnapshot` carries `schema_version` `1`, `entity_kind` `knowledge_entry`, the requested `entity_id` and `revision`, `extensions = {}`, and the replayed entry as `snapshot`: the stored entry travels as entity data, so its timestamps keep their stored spelling and a second replay is byte-equal.
 
@@ -38,8 +38,7 @@ Coverage is `knowledge_entry` alone, because the store keeps no relation revisio
 | `entity_kind` other than `knowledge_entry` | `HISTORY_ENTITY_UNSUPPORTED` with exactly `entity_kind`, the requested kind |
 | Revision below the entry's persisted floor | `HISTORY_TRUNCATED` with exactly `floor_revision`, an integer ≥ 0 |
 | Revision `0`, above the live revision, or unassigned to the entry | `NOT_FOUND`, none |
-| Missing, retired or peer-hidden row on get; missing row on prune | `NOT_FOUND`, none |
-| Retired or peer-hidden row on prune | `NOT_AUTHORIZED`, none |
+| Missing, retired or peer-hidden row on get or on prune | `NOT_FOUND`, none |
 | `keep == 0` | `INVALID_INPUT`, none; refused by the port, since Connect's decoder admits `0` |
 | Malformed payload, or a prune integer outside the JCS exact-integer range | `INVALID_INPUT` with `details.op` |
 | A failed statement or a contradicted history gap | `INTERNAL_ERROR`, none after generalization |
@@ -146,9 +145,15 @@ collection the peer may reach.
 Adoption applies them to the destination entry it would return and to the copy it would write: an
 entry outside the admitted selection is neither served nor written, and answers the ordinary
 occupancy refusal — `REVISION_CONFLICT` with no details, byte-identical to a visible occupant's —
-so a hidden occupant and a visible one are the same answer. `NOT_AUTHORIZED` is reserved for a
-`destination_scope_id` that is not the admitted scope. The host's configured collection selects the
-destination; the admitted selection narrows what the call may touch inside it.
+so a hidden occupant, a visible one and a retired one are the same answer. What the caller observes
+is one occupancy whatever the row's state: the destination read returns a live occupant, which the
+adoption refuses before any write, and it resolves a retired row the store's live-only read reports
+as an absence by checking the row including superseded ones and answering the same occupancy. Either
+way no revision gate is reached and no put runs. The invariant is the observable answer — code,
+message shape and absent `details` — not a shared constructor, and no path reveals the occupant's
+content, revision or visibility. `NOT_AUTHORIZED` is reserved for a `destination_scope_id` that is
+not the admitted scope. The host's configured collection selects the destination; the admitted
+selection narrows what the call may touch inside it.
 
 **Slot occupancy is a permitted disclosure.** A create-only destination answers occupied for an
 occupied id and success for a free one, so the answer reports whether the `destination_entry_id`

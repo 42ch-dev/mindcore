@@ -55,6 +55,16 @@
   `ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` — and the `owner`/`disclosure` reset is not
   applied, so a copy inherits the source's governance. Connect's `AdoptionPortService` supplies the
   idempotency envelope, including `IDEMPOTENCY_CONFLICT` and `RECEIPT_EXPIRED`.
+- **`mindcore-sqlite` — served history prune answers the one absence.** `history.revisions.prune`
+  no longer distinguishes a retired or peer-hidden row from a missing one: all three row-level
+  answers are `NOT_FOUND` with no `details`, where a retired or hidden row used to answer
+  `NOT_AUTHORIZED`. **Only the row-level denial changed.** A caller that matched `NOT_AUTHORIZED` for
+  a prune *row* must match `NOT_FOUND` instead, and must keep its `NOT_AUTHORIZED` handling for
+  everything decided before any row is read: scope admission, Connect's own comparison of the
+  request's `scope` against the admitted scope, and the port's `admit` guard. An unserved
+  `entity_kind` keeps `HISTORY_ENTITY_UNSUPPORTED`. The refusal reuses the absent row's constructor,
+  so code, message shape and `details` are equal by construction and a peer admitted to the
+  collection can no longer probe membership or retirement through prune.
 - `mindcore-spoke` / `mindcore-runtime`: `ServeFaces.memory` takes an `Arc<dyn ServedMemory>` — a
   `RemoteMemoryService` that reports the `memory.*` operations it dispatches — and the runtime
   advertises `spoke-memory-transfer` exactly when the attached service reports all five §7.29–§7.33

@@ -755,8 +755,9 @@ impl RoutedKnowledgeStore {
         }
     }
 
-    /// One served prune: the permission is a put's, so a retired or hidden row is `NOT_AUTHORIZED`
-    /// and a missing one `NOT_FOUND`. The permission read and the cut share one `BEGIN IMMEDIATE`.
+    /// One served prune: a missing, a retired and a peer-hidden row are the one absence, so the
+    /// answer never tells a peer admitted to the collection which of the three it asked for. The
+    /// row read and the cut share one `BEGIN IMMEDIATE`.
     async fn served_history_prune(
         &self,
         scope: &Scope,
@@ -786,7 +787,7 @@ impl RoutedKnowledgeStore {
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             };
         if stored.superseded_by.is_some() {
-            return not_authorized();
+            return history_not_found(entity_id);
         }
         let entry = match decode(&stored.payload) {
             SpokeResult::Ok(entry) => entry,
@@ -794,7 +795,7 @@ impl RoutedKnowledgeStore {
         };
         match visible(&entry, scope) {
             SpokeResult::Ok(true) => {}
-            SpokeResult::Ok(false) => return not_authorized(),
+            SpokeResult::Ok(false) => return history_not_found(entity_id),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
         let report =
