@@ -113,9 +113,11 @@ function depTables(toml) {
     if (toml[table]) tables.push([table, toml[table]]);
   }
   for (const [cfg, section] of Object.entries(toml.target ?? {})) {
+    // parseToml unquotes keys, so re-quote a non-bare cfg key to keep the
+    // reported header valid TOML, e.g. `target.'cfg(unix)'.dependencies`.
+    const label = /^[A-Za-z0-9_-]+$/.test(cfg) ? cfg : `'${cfg}'`;
     for (const table of DEP_TABLES) {
-      // The header key keeps its own quoting, e.g. `'cfg(unix)'`.
-      if (section?.[table]) tables.push([`target.${cfg}.${table}`, section[table]]);
+      if (section?.[table]) tables.push([`target.${label}.${table}`, section[table]]);
     }
   }
   return tables;
