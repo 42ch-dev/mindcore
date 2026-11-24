@@ -73,13 +73,16 @@ via `sqlx::migrate!`.
 
 Once a `v*` tag exists it additionally runs
 `cargo semver-checks check-release -p <crate> --baseline-rev <tag>` for each
-publishable crate. The baseline is the previous `v*` release tag on a tag
-commit and the newest `v*` tag otherwise. A shallow clone that hides every
-`v*` tag is an error — fetch the tags and their history
-(`actions/checkout: fetch-depth: 0`) — not a pass. Only a repository with no
-`v*` tag at all prints `no baseline tag; API diff check skipped` and passes.
-A release tag with no previous `v*` tag — the first release — is skipped once
-for the same reason: there is no predecessor to compare against, so the API
-diff does not run (rather than comparing the tag against itself), and
-`tooling/migrations/check.mjs` treats the working tree as the first published
-set.
+publishable crate. The baseline is the newest stable `v*` tag — on a tag
+commit, the previous stable release reachable from its parent. The API diff
+fails the build only on a release tag commit (when the tag itself must carry a
+compatible API); off a tag commit violations are reported as non-blocking
+warnings, so a breaking change can land on `main` and be enforced by the
+release PR's version bump. A shallow clone that hides every `v*` tag is an
+error — fetch the tags and their history (`actions/checkout: fetch-depth: 0`)
+— not a pass. A repository with no `v*` tag at all, or a release tag with no
+previous `v*` tag — the first release — prints
+`no baseline tag; API diff check skipped` and passes: there is no predecessor
+to compare against, so the API diff does not run (rather than comparing the
+tag against itself), and `tooling/migrations/check.mjs` treats the working
+tree as the first published set.

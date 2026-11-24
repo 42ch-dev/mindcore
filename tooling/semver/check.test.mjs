@@ -189,3 +189,18 @@ test('baselineTag ignores a non-release tag between two releases', () => {
     assert.equal(baselineTag(root), 'v0.1.0');
   });
 });
+
+test('baselineTag prefers a stable tag over a newer prerelease', () => {
+  gitRepo(({ root, git, commit }) => {
+    commit('one');
+    git('tag', 'v0.1.0');
+    commit('two');
+    git('tag', 'v0.2.0-rc.1');
+    commit('three');
+    git('tag', 'v0.2.0');
+    // -v:refname puts v0.2.0-rc.1 first, but the rc is not a stable baseline.
+    assert.equal(baselineTag(root), 'v0.1.0');
+    commit('four');
+    assert.equal(baselineTag(root), 'v0.2.0');
+  });
+});

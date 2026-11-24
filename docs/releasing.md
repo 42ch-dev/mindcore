@@ -1,17 +1,20 @@
 # Releasing to crates.io
 
-A release has four ordered steps:
+A release is one flow, driven by two workflows:
 
 1. Dispatch `new-release.yml` (`workflow_dispatch`): it bumps the workspace
    version, renders the changelog section and opens the `release`-labelled
    bump pull request.
-2. Review and merge that pull request.
-3. `release.yml` runs on the merge: it creates the annotated `v<version>`
-   tag on the merge commit and the GitHub Release from that version's
-   `CHANGELOG.md` section.
-4. Dispatch `publish.yml` (`workflow_dispatch`) to upload the crates to
-   crates.io. `publish.yml` never creates a tag; it publishes the workspace
-   version that `release.yml` already tagged.
+2. Review and merge that pull request with the `release` label.
+3. `release.yml` runs on the merge. Its `release` job creates the annotated
+   `v<version>` tag on the merge commit and the GitHub Release from that
+   version's `CHANGELOG.md` section; its `publish-crates` job then uploads the
+   three public crates to crates.io.
+
+There is no manual publish step: publishing is the last job of the release
+workflow and starts by itself once the release job succeeded. Prerelease tags
+(any `v<version>-...`, e.g. `-rc.1`) stop before `publish-crates`, so a
+prerelease never reaches the registry.
 
 ## Publish order
 
@@ -26,18 +29,33 @@ each other through internal path edges:
 - `mindcore-spi` depends on `mindcore-base`.
 - `mindcore-sqlite` depends on `mindcore-base`.
 
-The workflow publishes in that order and waits for each version to appear in the crates.io sparse
-index before it starts the next crate. The index, not the web page or the API, is what the next
-`cargo publish` resolves dependencies against, so this wait is what stops a propagation delay from
-failing the next crate. It stops on the first failure: a crate that cannot be published leaves the
-later crates unpublished rather than half released. A version already in the index is skipped, so
-re-running the workflow after a partial failure continues from the first crate that is still missing
-— a version can never be uploaded twice.
+`publish-crates` publishes in that order, one `cargo publish` per step, and stops on the first
+failure: a crate that cannot be published leaves the later crates unpublished rather than half
+released.
+
+Each step is idempotent (`tooling/release/publish-crate.sh`): it reads the workspace version from
+`cargo metadata`, skips the crate when `https://crates.io/api/v1/crates/<crate>/<version>` already
+answers `200`, retries transient registry responses (502/503/504, timeouts) with backoff, and treats
+"already exists on crates.io" as success. Re-running the failed job therefore resumes from the first
+crate that is still missing — a version can never be uploaded twice.
+
+That check reads the crates.io API, which can answer before `cargo`'s own index view catches up. If
+the next crate still cannot resolve the one just uploaded, the job fails there and a re-run
+continues from that crate.
+
+## Breaking changes
+
+Land a breaking API change in ordinary pull requests — do not bump the
+workspace version outside the release PR. Off a tag commit
+`tooling/semver/check.mjs` reports the `cargo semver-checks` diff as
+non-blocking, so the PR merges; the release PR's minor bump is what makes the
+change releasable, and on the tag commit the same check turns blocking and
+verifies the new version against the previous release.
 
 ## Preconditions
 
-Check these before the first run; each one makes `cargo publish` fail rather than publish something
-wrong:
+Check these before the first release; each one makes `cargo publish` fail rather than publish
+something wrong:
 
 - Each of the three crates is publishable: `publish` is unset or lists `crates-io` (not `publish =
   false`).
@@ -48,39 +66,26 @@ wrong:
   compile-time `sqlx::query!` macros, so the packaged crate only builds when that cache is inside
   it. A symlink that is missing after clone means the publish fails during Cargo's verification
   build, not at the registry.
-- The workspace version in `Cargo.toml` is the version you intend to publish. The workflow reads it
-  when the `version` input is empty, and refuses an input that disagrees with it.
-- Steps 1–3 above are complete: the release pull request is merged and
-  `release.yml` has created the `v<version>` tag (`publish.yml` never creates
-  one). `cargo publish` does not need the tag, but the release notes and the
-  tag should describe what is on crates.io.
+- The workspace version in `Cargo.toml` is the version `release.yml` tagged: the script reads that
+  version, so the tag and the registry have to agree.
+- The `CARGO_REGISTRY_TOKEN` secret exists (see below).
 
 ## Token
 
-`CARGO_REGISTRY_TOKEN` is a repository secret holding a crates.io API token. The token must belong
-to an owner of all three crate names, because the first publish claims each name permanently.
-Crate ownership on crates.io is per crate, so verify all three names appear under the same account
-before the first run.
+`CARGO_REGISTRY_TOKEN` is a repository secret holding a crates.io API token. It must be configured
+before the first release: the workflow fails at the first `cargo publish` without it.
 
-Workflow permissions are `contents: read`; the only credential the job uses is that token.
+The token must belong to an owner of all three crate names, because the first publish claims each
+name permanently. Crate ownership on crates.io is per crate, so verify all three names appear under
+the same account before the first release.
 
-## Dry run first
+`publish-crates` has `contents: read`; the only credential the job uses is that token.
 
-Dispatch the workflow with `dry_run: true`. It passes `--dry-run` to all three `cargo publish`
-calls, which packages and verifies each crate without uploading, and skips the index wait.
-
-One limit: `mindcore-spi` and `mindcore-sqlite` resolve `mindcore-base` from the registry while
-packaging, so their dry run fails with `no matching package named mindcore-base found` whenever
-that `mindcore-base` version is not published yet — which is every release, since the version is
-new. A dry run therefore fully rehearses `mindcore-base` and stops at `mindcore-spi`. That is not a
-regression in the real publish: `cargo publish` verifies the packaged crate before it uploads, so a
-crate that would fail the dry run also fails before anything reaches the registry, and the workflow
-stops there as well.
-
-A local `cargo publish --dry-run` reproduces the same checks, but it fails on a workstation whose
-`~/.cargo/config.toml` replaces `crates-io` with a mirror (`crates-io is replaced with
-non-remote-registry source registry`); runners have no such config, so the workflow is the
-reliable place to run it.
+The secret is needed because the crate names do not exist on crates.io yet, so Trusted Publishing
+cannot be configured in advance. Once the first release has claimed the three names, crates.io
+Trusted Publishing (OIDC, no long-lived secret) can replace `CARGO_REGISTRY_TOKEN`: register
+`42ch-dev/mindcore` and `.github/workflows/release.yml` as the trusted publisher for each crate,
+then swap the token for `rust-lang/crates-io-auth-action` in the `publish-crates` job.
 
 ## Verify
 
@@ -92,10 +97,9 @@ cargo search mindcore-base
 curl -fsS -H 'User-Agent: mindcore-release-check' https://index.crates.io/mi/nd/mindcore-base
 ```
 
-The workflow performs the index check itself between crates, so a later crate never tries to
-resolve a dependency the registry cannot offer yet. `cargo search`, the crates.io web page and the
-API answer a few seconds to minutes before `cargo`'s own index refresh sees a new version; confirm
-all three versions match the workspace version, then confirm docs.rs built each one.
+`cargo search`, the crates.io web page and the API can answer a few seconds before `cargo`'s own
+index refresh sees a new version; confirm all three versions match the workspace version, then
+confirm docs.rs built each one.
 
 ## Rollback
 

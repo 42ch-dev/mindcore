@@ -183,6 +183,16 @@ export function main(rootDir = repoRoot()) {
     return 1;
   }
 
+  // Blocking only on a release tag commit (HEAD is an exact v* tag): that tag
+  // is the release, so an API break must fail. Off a tag commit a breaking
+  // change lands with the release PR's version bump — report it as a warning
+  // and let the tag-time check enforce it.
+  const blocking =
+    git(rootDir, ['describe', '--tags', '--exact-match', '--match', 'v*', 'HEAD']) !== null;
+  if (!blocking) {
+    console.log(`API diff against ${tag} is non-blocking until a release tag lands`);
+  }
+
   for (const crate of PUBLISHABLE) {
     try {
       execFileSync(
@@ -191,8 +201,11 @@ export function main(rootDir = repoRoot()) {
         { cwd: rootDir, stdio: 'inherit' },
       );
     } catch {
-      console.error(`error: cargo semver-checks reported violations in ${crate} vs ${tag}`);
-      return 1;
+      if (blocking) {
+        console.error(`error: cargo semver-checks reported violations in ${crate} vs ${tag}`);
+        return 1;
+      }
+      console.error(`warning: cargo semver-checks reported violations in ${crate} vs ${tag} (non-blocking)`);
     }
   }
   return 0;

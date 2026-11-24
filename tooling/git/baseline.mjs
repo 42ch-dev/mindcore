@@ -22,17 +22,26 @@ export function git(cwd, args) {
   }
 }
 
+// Newest stable v* tag from a `git tag --list` argument set: the first line
+// without a prerelease suffix (`-`), falling back to the newest tag when only
+// prereleases exist. `args` carries the list pattern and any --merged filter.
+function newestStable(cwd, args) {
+  const tags = git(cwd, ['tag', '--list', ...args, '--sort=-v:refname']);
+  if (tags === null) return null;
+  const lines = tags.split('\n').filter(Boolean);
+  return lines.find((tag) => !tag.includes('-')) ?? lines[0] ?? null;
+}
+
 export function baselineTag(cwd) {
   const current = git(cwd, ['describe', '--tags', '--exact-match', '--match', 'v*', 'HEAD']);
   if (current !== null) {
     // The first release has no predecessor: skip the diff rather than compare a
-    // tag against itself.
-    const previous = git(cwd, ['describe', '--tags', '--abbrev=0', '--match', 'v*', `${current.trim()}^`]);
-    return previous?.trim() || null;
+    // tag against itself. `--merged <current>^` keeps the lookup to tags that
+    // were already released when this tag shipped.
+    return newestStable(cwd, ['v*', '--merged', `${current.trim()}^`]);
   }
 
-  const tags = git(cwd, ['tag', '--list', 'v*', '--sort=-v:refname']);
-  return tags?.split('\n')[0].trim() || null;
+  return newestStable(cwd, ['v*']);
 }
 
 // A shallow clone hides the tags, which turns a real baseline into "no baseline".
