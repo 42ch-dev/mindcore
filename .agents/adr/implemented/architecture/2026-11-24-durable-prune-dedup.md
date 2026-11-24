@@ -35,7 +35,9 @@ There is no retention and no eviction: one row per retry identity for the databa
 ## Consequences
 
 - The commit-to-record window no longer re-executes. A prune whose process died between its committed port call and `record` answers `RECEIPT_EXPIRED` on retry — at most once, not exactly once. The retry does not replay the lost `{deleted, floor_revision}` either; closing that needs the port to receive the retry identity, which the released contract does not pass (`I-000107`).
-- A process that died before its port call settled is never executed under that key, and the caller must use a new `idempotency_key` (`I-000108`).
+- The claim is taken before the port runs, so `RECEIPT_EXPIRED` does not distinguish a port call that never happened from one whose outcome is unknown — the process may have died after the prune committed and before `record`. The refusal is identical, so it is not proof that nothing was deleted:
+  - a port call that never happened deleted nothing, and a retry under a new `idempotency_key` is safe;
+  - a port call in flight when the process died has an indeterminate outcome, and a new key can delete checkpoints the original call never saw. A caller verifies the entry's persisted floor and surviving checkpoints before pruning again (`I-000108`).
 - Two processes serving one database turn the later same-key caller into `RECEIPT_EXPIRED` instead of making it wait (`I-000109`). One serving process per database stays the host obligation and is stated in the module docs.
 - The table grows for the database lifetime with the number of distinct prune retry identities. A bounded retention policy would need a reader to order rows by age; none exists, so no timestamp column is written.
 - The claim, the port call and the record each take and release the pool's one connection in turn, so no operation holds two. A prune serializes behind whatever else shares that connection.
