@@ -3,7 +3,8 @@
 [![CI](https://github.com/42ch-dev/mindcore/actions/workflows/ci.yml/badge.svg)](https://github.com/42ch-dev/mindcore/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: stable](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Status: pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](#状态与边界)
+[![crates.io](https://img.shields.io/crates/v/mindcore-base.svg)](https://crates.io/crates/mindcore-base)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#状态与边界)
 
 **记忆、知识与认知的沉淀层。**
 
@@ -15,8 +16,10 @@ Mindcore 是一个可嵌入的 Rust 库，把三件事分开保存：agent **听
 只把构建 SPOKE Connect responder 所需的部件组装起来。
 
 > [!NOTE]
-> 预发布阶段。所有 crate 均为 `publish = false`，schema 仍会在提交之间变动，尚无升级路径。
-> 请从本仓库嵌入，而不是从 registry 安装。
+> `mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 已发布到 crates.io，registry 上目前是
+> alpha 版本。`mindcore-spoke` 与 `mindcore-runtime` 保持私有，由本仓库引入。migration 文件一经
+> 发布即不可变，migration lock 为打 tag 把关；`open` 接受与拒绝哪些数据库，见
+> [存储兼容性](docs/storage-compatibility.md)。
 
 [English](README.md) | **简体中文**
 
@@ -55,25 +58,33 @@ Mindcore 是一个可嵌入的 Rust 库，把三件事分开保存：agent **听
 
 ## Crates
 
-| Crate | 职责 |
-| --- | --- |
-| `mindcore-base` | 与存储无关的领域核心：id 与信任边界、memory 协议类型与 IR、knowledge scope 与采纳 provenance、cognition carrier 与 `MindState` 派生。无 I/O。 |
-| `mindcore-spi` | MIND ladder 契约，钉在已发布的 SPOKE DTO 上：recall、absorb、deliberate workflows，以及 prompt-reasoner bridge。契约面不含存储 crate、网络或模型 SDK。 |
-| `mindcore-sqlite` | SQLite（SQLx）后端：单连接池、单 migration、WAL 与 busy timeout；在 `MemoryAdapter` 之后实现协议 repository，以及 scoped `KnowledgeEntryPort`，并在唯一持久化边界守护 cognition 模块。 |
-| `mindcore-spoke` | 基于借用事务 repository 的 SPOKE memory 协议适配器：wire 校验、wire↔IR 边界、reject 映射、准入、重放与 staging。它从不开启、提交或回滚事务。 |
-| `mindcore-runtime` | served surface：`MindcoreServe` 把 workflow engine、SQLite knowledge face 与宿主的 memory face 组装成构建 Connect responder 所需的部件，并从实际提供的能力推导广告的 capabilities 与 tools。 |
+| Crate | 职责 | 发布 |
+| --- | --- | --- |
+| `mindcore-base` | 与存储无关的领域核心：id 与信任边界、memory 协议类型与 IR、knowledge scope 与采纳 provenance、cognition carrier 与 `MindState` 派生。无 I/O。 | [crates.io](https://crates.io/crates/mindcore-base) |
+| `mindcore-spi` | MIND ladder 契约，钉在已发布的 SPOKE DTO 上：recall、absorb、deliberate workflows，以及 prompt-reasoner bridge。契约面不含存储 crate、网络或模型 SDK。 | [crates.io](https://crates.io/crates/mindcore-spi) |
+| `mindcore-sqlite` | SQLite（SQLx）后端：单连接池、单 migration、WAL 与 busy timeout；在 `MemoryAdapter` 之后实现协议 repository，以及 scoped `KnowledgeEntryPort`，并在唯一持久化边界守护 cognition 模块。 | [crates.io](https://crates.io/crates/mindcore-sqlite) |
+| `mindcore-spoke` | 基于借用事务 repository 的 SPOKE memory 协议适配器：wire 校验、wire↔IR 边界、reject 映射、准入、重放与 staging。它从不开启、提交或回滚事务。 | 否 —— 从 git 引入 |
+| `mindcore-runtime` | served surface：`MindcoreServe` 把 workflow engine、SQLite knowledge face 与宿主的 memory face 组装成构建 Connect responder 所需的部件，并从实际提供的能力推导广告的 capabilities 与 tools。 | 否 —— 从 git 引入 |
 
 ## 快速开始
 
-从本仓库添加 crate（尚未发布）：
+从 crates.io 添加 crate（下面这行跟随已发布的版本）：
 
 ```toml
 [dependencies]
-mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
-mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-base = "0.1.0-alpha.1"
+mindcore-sqlite = "0.1.0-alpha.1"
 # 与本 workspace 的 Cargo.toml 中固定的 SPOKE 版本保持一致
-spoke-operations = "0.18"
+spoke-operations = ">=0.18.1, <0.19.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+`mindcore-spoke` 与 `mindcore-runtime` 尚未发布，从本仓库引入：
+
+```toml
+[dependencies]
+mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
 ```
 
 打开存储，并通过绑定 collection 的 port 读取：
@@ -118,12 +129,14 @@ cargo run --locked -p mindcore-sqlite --example iteration_01
 ## 状态与边界
 
 - **仅嵌入式。** `mindcore-runtime` 不开启 listener、transport 或身份；这些由宿主提供。
-- **尚无数据搬迁。** 把既有 store 或 provider 中的数据迁入 Mindcore 尚未实现；首个 release 之前
-  也没有升级路径。
+- **尚无数据搬迁。** 把既有 store 或 provider 中的数据迁入 Mindcore 尚未实现，也没有升级工具：
+  migration 早于已发布集合的数据库会被拒绝，而不是被转换。
 - **每个数据库文件一个 store。** 每个打开的 `MindStore` 拥有一个连接池；同一文件上开两个 store
   不受支持。
-- **预发布 schema 可变。** 已应用 migration 仍与内嵌集合一致的数据库可以正常重开；否则 `open`
-  会拒绝它，见[存储兼容性](docs/migrating-from-tools-adopt.md#storage-compatibility)。
+- **migration 按 release 不可变。** 已发布的 migration 文件永不改变（lock 记录其 sha256）；新
+  schema 以新增文件追加，在 release PR 中写入 lock，并在打 tag 时复核。已应用 migration 仍与内嵌
+  集合一致的数据库可以正常重开；否则 `open` 会拒绝它，而不是猜测升级路径，见
+  [存储兼容性](docs/storage-compatibility.md)。
 
 仓库检查：CI 会运行格式化、clippy 与完整测试套件，并额外校验 `.sqlx` 离线缓存。完整本地命令块见
 [docs/for-agents.md](docs/for-agents.md)，贡献约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。

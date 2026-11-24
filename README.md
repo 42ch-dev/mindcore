@@ -3,7 +3,8 @@
 [![CI](https://github.com/42ch-dev/mindcore/actions/workflows/ci.yml/badge.svg)](https://github.com/42ch-dev/mindcore/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: stable](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Status: pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](#status-and-limits)
+[![crates.io](https://img.shields.io/crates/v/mindcore-base.svg)](https://crates.io/crates/mindcore-base)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#status-and-limits)
 
 **A settlement layer for memory, knowledge and cognition.**
 
@@ -15,8 +16,10 @@ No server, no UI, no transport ships here. A host embeds the store and exposes w
 it wants; `mindcore-runtime` only composes the pieces a SPOKE Connect responder is built from.
 
 > [!NOTE]
-> Pre-release. Every crate is `publish = false`, the schema is still mutable between commits,
-> and there is no upgrade path yet. Embed from this repository, not from a registry.
+> `mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io; the registry currently
+> holds an alpha. `mindcore-spoke` and `mindcore-runtime` stay private and are used from this
+> repository. Migration files are immutable once published, and the migration lock gates the tag;
+> see [storage compatibility](docs/storage-compatibility.md) for what `open` accepts and refuses.
 
 **English** | [简体中文](README.zh-CN.md)
 
@@ -59,25 +62,33 @@ the revision and replay rules, the protocol adapter, and the persistence boundar
 
 ## Crates
 
-| Crate | Responsibility |
-| --- | --- |
-| `mindcore-base` | Storage-agnostic domain core: ids and trusted boundary, memory protocol types and IR, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. |
-| `mindcore-spi` | The MIND ladder contracts, pinned to the published SPOKE DTOs: recall, absorb and deliberate workflows plus the prompt-reasoner bridge. No storage crate, network or model SDK in the contract surface. |
-| `mindcore-sqlite` | SQLite (SQLx) backend: one connection pool, one migration, WAL and a busy timeout; implements the protocol repository behind `MemoryAdapter` and the scoped `KnowledgeEntryPort`, and guards the cognition module at the single persistence boundary. |
-| `mindcore-spoke` | SPOKE memory protocol adapter over the borrowed-transaction repository: wire validation, the wire↔IR boundary, reject mapping, admission, replay and staging. It never opens, commits or rolls back a transaction. |
-| `mindcore-runtime` | The served surface: `MindcoreServe` assembles the workflow engine, the SQLite knowledge face and the host's memory face into the pieces a Connect responder is built from, and derives the advertised capabilities and tools from what it serves. |
+| Crate | Responsibility | Published |
+| --- | --- | --- |
+| `mindcore-base` | Storage-agnostic domain core: ids and trusted boundary, memory protocol types and IR, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. | [crates.io](https://crates.io/crates/mindcore-base) |
+| `mindcore-spi` | The MIND ladder contracts, pinned to the published SPOKE DTOs: recall, absorb and deliberate workflows plus the prompt-reasoner bridge. No storage crate, network or model SDK in the contract surface. | [crates.io](https://crates.io/crates/mindcore-spi) |
+| `mindcore-sqlite` | SQLite (SQLx) backend: one connection pool, one migration, WAL and a busy timeout; implements the protocol repository behind `MemoryAdapter` and the scoped `KnowledgeEntryPort`, and guards the cognition module at the single persistence boundary. | [crates.io](https://crates.io/crates/mindcore-sqlite) |
+| `mindcore-spoke` | SPOKE memory protocol adapter over the borrowed-transaction repository: wire validation, the wire↔IR boundary, reject mapping, admission, replay and staging. It never opens, commits or rolls back a transaction. | no — from git |
+| `mindcore-runtime` | The served surface: `MindcoreServe` assembles the workflow engine, the SQLite knowledge face and the host's memory face into the pieces a Connect responder is built from, and derives the advertised capabilities and tools from what it serves. | no — from git |
 
 ## Quick start
 
-Add the crates from this repository (they are not published yet):
+Add the crates from crates.io; the line below tracks the released version:
 
 ```toml
 [dependencies]
-mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
-mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-base = "0.1.0-alpha.1"
+mindcore-sqlite = "0.1.0-alpha.1"
 # match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = "0.18"
+spoke-operations = ">=0.18.1, <0.19.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+`mindcore-spoke` and `mindcore-runtime` are not published; take them from this repository:
+
+```toml
+[dependencies]
+mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
 ```
 
 Open a store and read through a collection-bound port:
@@ -125,12 +136,15 @@ The story is the same code the integration test runs. For the guided version, st
 - **Embedded only.** `mindcore-runtime` opens no listener, transport or identity; the host
   supplies them.
 - **No data movement yet.** Moving an existing store or provider into Mindcore is not
-  implemented, and no migration path exists before the first release.
+  implemented; there is no upgrade tool, and a database whose migrations predate the published set
+  is refused rather than converted.
 - **One store per database file.** Each opened `MindStore` owns one pool; two stores on one file
   are unsupported.
-- **Mutable pre-release schema.** A database whose applied migrations still match the embedded
-  set reopens normally. Otherwise `open` refuses it; see
-  [storage compatibility](docs/migrating-from-tools-adopt.md#storage-compatibility).
+- **Immutable migrations per release.** A published migration file never changes — the lock
+  records its sha256 — and new schema arrives as appended files, locked in the release PR and
+  re-checked on the tag. A database whose applied migrations still match the embedded set reopens
+  normally; otherwise `open` refuses it rather than guessing an upgrade path; see
+  [storage compatibility](docs/storage-compatibility.md).
 
 Repository checks: CI runs formatting, clippy and the full test suite, and additionally verifies the
 `.sqlx` offline cache. The exact local command block lives in

@@ -74,18 +74,21 @@ The contract's `owner`/`disclosure` reset is not applied: a copy inherits the so
 
 ## Storage compatibility
 
-Pre-release migrations are mutable: the embedded set in `crates/mindcore-sqlite/migrations/` is one
-initial file, edited in place between commits, and nothing is published yet. There is no upgrade
-path until the first release. A database whose applied migrations still match the embedded file
-reopens normally and keeps its records.
+The first upload to crates.io fixed the migration set: migration files are immutable from then on,
+and new schema arrives only as appended files. The set is locked in
+`tooling/migrations/migrations.lock.json`, written in the release PR and re-checked on the tagged
+commit. A database whose applied migrations still match the embedded set reopens normally and keeps
+its records; a pre-release checkout whose `0001_init.sql` differs from the locked file is refused.
+[Storage compatibility](storage-compatibility.md) is the full contract for what `open` accepts and
+refuses.
 
 `MindStore::open` runs the embedded migrator and compares it with the rows recorded in
 `_sqlx_migrations`. The two migration mismatches it reports are:
 
 - A database that applied the removed `0002` is refused with SQLx's `VersionMissing(2)`, because
   the embedded set no longer contains that version.
-- A database whose applied version is still embedded but whose SQL has since changed is refused
-  with a migration checksum mismatch.
+- A database whose applied version is still embedded but whose checksum differs is refused with a
+  migration checksum mismatch — what a pre-release checkout's `0001_init.sql` hits.
 
 Recreate the file only for one of those two migration mismatches, or move it aside first if you
 want to keep it. A busy or locked database, an I/O error or a permissions problem is not a

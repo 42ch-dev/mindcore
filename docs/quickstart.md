@@ -20,16 +20,18 @@ repository's integration test runs. It is a guided path, not a complete API refe
 
 ## Add the dependency
 
-The crates are `publish = false`; depend on this repository directly.
+`mindcore-base` and `mindcore-sqlite` are on crates.io; the version below tracks the released one.
+`mindcore-spoke`, which the transaction examples below use, is not published and comes from this
+repository:
 
 ```toml
 [dependencies]
-mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
-mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-base = "0.1.0-alpha.1"
+mindcore-sqlite = "0.1.0-alpha.1"
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
 # match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = "0.18"
-spoke-schemas = "0.18"
+spoke-operations = ">=0.18.1, <0.19.0"
+spoke-schemas = ">=0.18.1, <0.19.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```
