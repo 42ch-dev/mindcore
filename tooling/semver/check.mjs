@@ -21,9 +21,27 @@ export const PUBLISHABLE = ['mindcore-base', 'mindcore-spi', 'mindcore-sqlite'];
 const DEP_TABLES = ['dependencies', 'build-dependencies'];
 
 const SEMVER =
-  /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
-export const isSemver = (v) => typeof v === 'string' && SEMVER.test(v);
+// SemVer forbids leading zeros in the numeric core and in numeric prerelease
+// identifiers; the plain regex above would accept `01.2.3` and `1.2.3-01`.
+export const isSemver = (value) => {
+  if (typeof value !== 'string') return false;
+  const match = SEMVER.exec(value);
+  if (!match) return false;
+  if ([match[1], match[2], match[3]].some((part) => part.length > 1 && part.startsWith('0'))) {
+    return false;
+  }
+  const prerelease = match[4];
+  if (prerelease) {
+    for (const identifier of prerelease.split('.')) {
+      if (/^\d+$/.test(identifier) && identifier.length > 1 && identifier.startsWith('0')) {
+        return false;
+      }
+    }
+  }
+  return true;
+};
 
 // The manifests this reads use single-line values only: scalars, arrays and
 // inline tables. Dotted keys descend into nested objects; `#` comments end a
