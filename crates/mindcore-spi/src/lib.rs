@@ -2,7 +2,7 @@
 //!
 //! Host-facing capability and workflow contracts for embedding, structured
 //! reasoning, settlement policy and domain lenses, pinned to the published
-//! SPOKE 0.18.1 DTOs. This crate depends on the SPOKE base crates, the storage-agnostic
+//! SPOKE DTOs. This crate depends on the SPOKE base crates, the storage-agnostic
 //! `mindcore-base` domain core, and serde/async infrastructure: no `mindcore-*` storage crate,
 //! no Nexus, no network or model SDK enters the contract surface.
 //!

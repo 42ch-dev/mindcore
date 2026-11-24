@@ -744,7 +744,7 @@ async fn candidate_list_filters_by_admitted_placement() {
     pool.close().await;
 }
 
-/// Upgrade regression: a candidate row written before the 0.18.1 strict RFC 3339
+/// Upgrade regression: a candidate row written before the strict RFC 3339
 /// gate carries the space spelling, and must stay readable — one such row must not
 /// fail the whole list.
 #[tokio::test]
