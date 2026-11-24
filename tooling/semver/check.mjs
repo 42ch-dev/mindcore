@@ -7,7 +7,7 @@
 // `--blocking` makes it blocking everywhere, for the release workflow's window
 // between the merged release PR and the tag it is about to create.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -251,19 +251,29 @@ export function main(rootDir = repoRoot(), { blocking: forceBlocking = false } =
   }
 
   for (const crate of PUBLISHABLE) {
-    try {
-      execFileSync(
-        'cargo',
-        ['semver-checks', 'check-release', '-p', crate, '--baseline-rev', tag],
-        { cwd: rootDir, stdio: 'inherit' },
+    // Exit status decides what happened: cargo-semver-checks exits 100 for a
+    // completed check with violations; any other failure — a build error, an
+    // invalid lint table, a signal or a spawn failure — means the API diff
+    // never ran, so it fails in every mode instead of passing as a warning.
+    const result = spawnSync(
+      'cargo',
+      ['semver-checks', 'check-release', '-p', crate, '--baseline-rev', tag],
+      { cwd: rootDir, encoding: 'utf8' },
+    );
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.status === 0) continue;
+    if (result.status !== 100) {
+      console.error(
+        `error: the API diff for ${crate} vs ${tag} could not run (cargo semver-checks tool failure)`,
       );
-    } catch {
-      if (blocking) {
-        console.error(`error: cargo semver-checks reported violations in ${crate} vs ${tag}`);
-        return 1;
-      }
-      console.error(`warning: cargo semver-checks reported violations in ${crate} vs ${tag} (non-blocking)`);
+      return 1;
     }
+    if (blocking) {
+      console.error(`error: cargo semver-checks reported violations in ${crate} vs ${tag}`);
+      return 1;
+    }
+    console.error(`warning: cargo semver-checks reported violations in ${crate} vs ${tag} (non-blocking)`);
   }
   return 0;
 }

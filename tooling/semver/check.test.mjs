@@ -277,12 +277,13 @@ test('the API diff blocks off a tag commit only with --blocking', () => {
     cpSync(join(HERE, 'check.mjs'), join(root, 'tooling', 'semver', 'check.mjs'));
     cpSync(join(HERE, '..', 'git', 'baseline.mjs'), join(root, 'tooling', 'git', 'baseline.mjs'));
 
-    // A fake cargo: the tool probe passes, every API diff reports a violation.
+    // A fake cargo: the tool probe passes; the diff exits 100, a completed
+    // check with violations.
     const bin = join(root, 'bin');
     mkdirSync(bin);
     writeFileSync(
       join(bin, 'cargo'),
-      '#!/bin/sh\n[ "$1" = semver-checks ] && [ "$2" = --version ] && exit 0\nexit 1\n',
+      '#!/bin/sh\n[ "$1" = semver-checks ] && [ "$2" = --version ] && exit 0\nexit 100\n',
       { mode: 0o755 },
     );
 
@@ -314,12 +315,12 @@ test('the API diff blocks on a release tag commit without --blocking', () => {
     cpSync(join(HERE, 'check.mjs'), join(root, 'tooling', 'semver', 'check.mjs'));
     cpSync(join(HERE, '..', 'git', 'baseline.mjs'), join(root, 'tooling', 'git', 'baseline.mjs'));
 
-    // Same fake cargo: the tool probe passes, every API diff reports a violation.
+    // Same fake cargo: the tool probe passes, every diff exits 100.
     const bin = join(root, 'bin');
     mkdirSync(bin);
     writeFileSync(
       join(bin, 'cargo'),
-      '#!/bin/sh\n[ "$1" = semver-checks ] && [ "$2" = --version ] && exit 0\nexit 1\n',
+      '#!/bin/sh\n[ "$1" = semver-checks ] && [ "$2" = --version ] && exit 0\nexit 100\n',
       { mode: 0o755 },
     );
 
@@ -339,6 +340,43 @@ test('the API diff blocks on a release tag commit without --blocking', () => {
     assert.equal(run.status, 1, run.stderr);
   });
 });
+
+test('a tool failure in the API diff fails even when non-blocking', () => {
+  gitRepo(({ root, git, commit }) => {
+    cleanFixture(root);
+    mkdirSync(join(root, 'tooling', 'semver'), { recursive: true });
+    mkdirSync(join(root, 'tooling', 'git'), { recursive: true });
+    cpSync(join(HERE, 'check.mjs'), join(root, 'tooling', 'semver', 'check.mjs'));
+    cpSync(join(HERE, '..', 'git', 'baseline.mjs'), join(root, 'tooling', 'git', 'baseline.mjs'));
+
+    // The tool probe passes, then every diff exits 101 with a diagnostic that
+    // matches none of the old text patterns — no diff ever ran, so
+    // non-blocking must not wave it through as a warning.
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, 'cargo'),
+      '#!/bin/sh\n[ "$1" = semver-checks ] && [ "$2" = --version ] && exit 0\necho "error: invalid lint table" >&2\nexit 101\n',
+      { mode: 0o755 },
+    );
+
+    git('add', '--all');
+    git('commit', '--quiet', '-m', 'release 0.1.0');
+    git('tag', 'v0.1.0');
+    commit('breaking change');
+
+    const run = (...args) =>
+      spawnSync(process.execPath, ['tooling/semver/check.mjs', ...args], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+
+    assert.equal(run().status, 1);
+    assert.equal(run('--blocking').status, 1);
+  });
+});
+
 
 function gitRepo(fn) {
   const root = mkdtempSync(join(tmpdir(), 'semver-check-'));
