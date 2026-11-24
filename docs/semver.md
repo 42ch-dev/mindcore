@@ -78,3 +78,8 @@ commit and the newest `v*` tag otherwise. A shallow clone that hides every
 `v*` tag is an error — fetch the tags and their history
 (`actions/checkout: fetch-depth: 0`) — not a pass. Only a repository with no
 `v*` tag at all prints `no baseline tag; API diff check skipped` and passes.
+A release tag with no previous `v*` tag — the first release — is skipped once
+for the same reason: there is no predecessor to compare against, so the API
+diff does not run (rather than comparing the tag against itself), and
+`tooling/migrations/check.mjs` treats the working tree as the first published
+set.
