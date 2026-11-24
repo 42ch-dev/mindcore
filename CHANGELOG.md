@@ -121,3 +121,11 @@
   partition in one `identity_hash` statement, returning the rows deleted, and leaves another identity's
   rows and query slot warm. Call it between recalls: it does not drain a recall already in flight, and a
   fill that commits afterwards re-creates rows it deleted.
+- **Breaking — `mindcore-spi` / `mindcore-spoke`:** `WorkflowBinding::commit_cognition` takes the
+  request deadline as its last parameter, so every implementation and test double carries it. The
+  settlement binding bounds its pool-connection wait by that deadline: a settle whose deadline passes
+  while it waits for the store's only connection answers `DeadlineExceeded` and opens no transaction,
+  and a connection in hand is re-checked before `BEGIN IMMEDIATE`, so no row is written after expiry.
+  The non-contended commit is unchanged, and a write that has begun keeps its actual or uncertain
+  outcome. `mindcore-spoke` now names `tokio` with the `time` feature directly; the lockfile is
+  unchanged. Closes the residual in which an expired settle could still wait on the store connection.
