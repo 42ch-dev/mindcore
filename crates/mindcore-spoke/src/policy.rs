@@ -92,9 +92,54 @@ pub(crate) fn payload_digest(request: &Value) -> AResult<String> {
 
 /// 64 lowercase hex over a canonical object.
 pub(crate) fn digest(value: &Value) -> AResult<String> {
-    match jcs_sha256_hex(value) {
+    canonical_digest(value, None)
+}
+
+/// `2^53`: the inclusive revision endpoint, an exact IEEE-754 integer the
+/// TypeScript canonicalizer spells without an exponent.
+const EXACT_INTEGER_BOUND: u64 = 1 << 53;
+
+/// RFC 8785 digest over `value` with `excluded` removed. An integer exactly at
+/// `±2^53` is re-spelled as its equal `f64` first: `serde_jcs` refuses the
+/// endpoint, while the peer stack (TypeScript `canonicalize`, and connect
+/// 0.18.1's own JCS) emits it. A value beyond the endpoint still refuses, so an
+/// unrepresentable integer never collapses onto a neighbour's digest.
+///
+/// shortcut: every member at the endpoint is re-spelled, not only the
+/// revision-typed paths the connect signature owns; upgrade if a product-owned
+/// bag member at exactly `±2^53` must stay refused here.
+pub(crate) fn canonical_digest(value: &Value, excluded: Option<&str>) -> AResult<String> {
+    let mut stripped = value.clone();
+    if let (Some(members), Some(field)) = (stripped.as_object_mut(), excluded) {
+        members.remove(field);
+    }
+    match jcs_sha256_hex(&respell_endpoint_digests(stripped)) {
         SpokeResult::Ok(digest) => Ok(digest),
         SpokeResult::Reject(reject) => Err(Reject::invalid(reject.message)),
+    }
+}
+
+fn respell_endpoint_digests(value: Value) -> Value {
+    match value {
+        Value::Number(number) => {
+            if number.as_u64() == Some(EXACT_INTEGER_BOUND) {
+                Value::from(EXACT_INTEGER_BOUND as f64)
+            } else if number.as_i64() == Some(-(EXACT_INTEGER_BOUND as i64)) {
+                Value::from(-(EXACT_INTEGER_BOUND as f64))
+            } else {
+                Value::Number(number)
+            }
+        }
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(respell_endpoint_digests).collect())
+        }
+        Value::Object(members) => Value::Object(
+            members
+                .into_iter()
+                .map(|(key, member)| (key, respell_endpoint_digests(member)))
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -366,4 +411,53 @@ pub(crate) fn recall_score(text: &str, terms: &[String]) -> usize {
         .iter()
         .filter(|term| text.contains(term.as_str()))
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upstream(value: &Value) -> String {
+        match jcs_sha256_hex(value) {
+            SpokeResult::Ok(digest) => digest,
+            SpokeResult::Reject(_) => panic!("expected a digest from the upstream canonicalizer"),
+        }
+    }
+
+    fn local(value: &Value, excluded: Option<&str>) -> String {
+        match canonical_digest(value, excluded) {
+            Ok(digest) => digest,
+            Err(_) => panic!("expected a digest"),
+        }
+    }
+
+    /// The inclusive `2^53` revision endpoint is an exact `f64`, so the digest must hash
+    /// the same bytes the peer stack emits instead of refusing the integer token.
+    #[test]
+    fn digest_admits_the_exact_revision_endpoint() {
+        let integer =
+            json!({"records": [{"record_id": "rec_a", "revision": 9_007_199_254_740_992u64}]});
+        let float =
+            json!({"records": [{"record_id": "rec_a", "revision": 9_007_199_254_740_992.0}]});
+        assert_eq!(local(&integer, None), upstream(&float));
+    }
+
+    #[test]
+    fn digest_refuses_an_integer_past_the_endpoint() {
+        let past =
+            json!({"records": [{"record_id": "rec_a", "revision": 9_007_199_254_740_993u64}]});
+        assert!(digest(&past).is_err());
+    }
+
+    /// The seal excludes its own member before hashing, endpoint re-spelling included.
+    #[test]
+    fn digest_excluding_removes_the_seal_member() {
+        let sealed = json!({
+            "chunk_digest": "seal",
+            "records": [{"record_id": "rec_a", "revision": 9_007_199_254_740_992u64}],
+        });
+        let unsealed =
+            json!({"records": [{"record_id": "rec_a", "revision": 9_007_199_254_740_992.0}]});
+        assert_eq!(local(&sealed, Some("chunk_digest")), upstream(&unsealed));
+    }
 }

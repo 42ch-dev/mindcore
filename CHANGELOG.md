@@ -8,8 +8,10 @@
   strict RFC 3339 parsing (`spoke_schemas::timestamp`), the inclusive `2^53` revision ceiling on the
   generated DTOs (`spoke_schemas::integers`), and RFC 8785 canonicalization that re-spells a
   revision-typed `±2^53` endpoint so Connect signatures agree with the TypeScript stack.
-  `mindcore-base`'s IR decode uses the same strict parser, so a space-separated timestamp that
-  `chrono` alone admits is now refused at the wire boundary instead of reaching storage.
+  `mindcore-base`'s IR decode accepts the pre-0.18.1 space spelling on stored reads — new input is
+  refused by the DTO gate — and the transfer digests re-spell the `±2^53` endpoint, so a chunk a
+  peer signed at the inclusive revision bound can still be sealed. Decision: `ADR 2026-11-24
+  stored wire compatibility`.
 
 - **`mindcore-runtime` / `mindcore-sqlite`:** `history.revisions.prune` is deduplicated durably. The
   history face composes `SqliteHistoryDedupStore` over the knowledge store's own pool, keyed by

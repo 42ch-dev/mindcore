@@ -334,6 +334,44 @@ fn ok<T>(result: crate::reject::AResult<T>, what: &str) -> T {
     }
 }
 
+/// Re-spell every RFC 3339 value in a frozen payload with the space separator the
+/// pre-0.18.1 gate admitted, as a row written by the previous release would carry.
+fn space_the_timestamps(payload: &str) -> String {
+    fn walk(value: Value) -> Value {
+        match value {
+            Value::String(text) => {
+                let bytes = text.as_bytes();
+                let shaped = bytes.len() > 11
+                    && bytes[10] == b'T'
+                    && text.is_char_boundary(10)
+                    && text.is_char_boundary(11)
+                    && bytes[..10]
+                        .iter()
+                        .enumerate()
+                        .all(|(index, byte)| match index {
+                            4 | 7 => *byte == b'-',
+                            _ => byte.is_ascii_digit(),
+                        });
+                Value::String(if shaped {
+                    format!("{} {}", &text[..10], &text[11..])
+                } else {
+                    text
+                })
+            }
+            Value::Array(items) => Value::Array(items.into_iter().map(walk).collect()),
+            Value::Object(members) => Value::Object(
+                members
+                    .into_iter()
+                    .map(|(key, member)| (key, walk(member)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    let value: Value = serde_json::from_str(payload).expect("staged payload is JSON");
+    serde_json::to_string(&walk(value)).expect("rewrite the staged payload")
+}
+
 fn decode_bundle(bundle: &Value) -> spoke_schemas::MemoryExportBundle {
     serde_json::from_value(bundle.clone()).expect("bundle decodes against its schema")
 }
@@ -2460,6 +2498,51 @@ async fn run_import(
         tx.rollback().await.expect("rollback import mutation");
     }
     result
+}
+
+/// Upgrade regression: a staged payload frozen before the 0.18.1 strict RFC 3339 gate
+/// carries the space spelling in its timestamps and must still activate.
+#[tokio::test]
+async fn activation_reads_a_staged_payload_frozen_before_the_strict_gate() {
+    let fixture = Fixture::open().await;
+    elevate(&fixture).await;
+    target_space(&fixture).await;
+    let chunks = staged_source(&fixture, "activate-export-legacy").await;
+    let staged = ready(
+        stage_into(
+            &fixture,
+            TARGET,
+            chunks[0].clone(),
+            "activate-stage-legacy",
+            None,
+        )
+        .await,
+    );
+    let import_id = staged["result"]["import_id"]
+        .as_str()
+        .expect("import id")
+        .to_string();
+
+    let payload: String =
+        sqlx::query_scalar("SELECT staged_payload_json FROM memory_imports WHERE import_id = ?")
+            .bind(&import_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("staged payload");
+    let legacy = space_the_timestamps(&payload);
+    assert_ne!(
+        legacy, payload,
+        "the fixture carries a timestamp to re-spell"
+    );
+    sqlx::query("UPDATE memory_imports SET staged_payload_json = ? WHERE import_id = ?")
+        .bind(&legacy)
+        .bind(&import_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("rewrite the frozen payload");
+
+    let body = ready(activate(&fixture, &import_id, "activate-legacy").await);
+    assert_eq!(body["status"], json!("committed"));
 }
 
 #[tokio::test]
