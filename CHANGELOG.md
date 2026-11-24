@@ -125,7 +125,8 @@
   request deadline as its last parameter, so every implementation and test double carries it. The
   settlement binding bounds its pool-connection wait by that deadline: a settle whose deadline passes
   while it waits for the store's only connection answers `DeadlineExceeded` and opens no transaction,
-  and a connection in hand is re-checked before `BEGIN IMMEDIATE`, so no row is written after expiry.
-  The non-contended commit is unchanged, and a write that has begun keeps its actual or uncertain
-  outcome. `mindcore-spoke` now names `tokio` with the `time` feature directly; the lockfile is
+  and a connection in hand is re-checked before `BEGIN IMMEDIATE`, so an expiry observed on either
+  of those waits refuses and writes nothing. A write that has already begun keeps its actual or
+  uncertain outcome, which may land after the deadline. The non-contended commit is unchanged.
+  `mindcore-spoke` now names `tokio` with the `time` feature directly; the lockfile is
   unchanged. Closes the residual in which an expired settle could still wait on the store connection.
