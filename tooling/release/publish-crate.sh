@@ -116,6 +116,15 @@ if [[ "${verify_status}" -ne 0 ]]; then
   exit "${verify_status}"
 fi
 
+# The verification build ran dependency build scripts in this checkout. If one
+# changed a tracked file, the authenticated `cargo publish` would package that
+# change, so refuse to upload.
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  echo "error: tracked files changed during the verification build of ${PKG}:" >&2
+  git status --porcelain --untracked-files=no >&2
+  exit 1
+fi
+
 attempt=1
 while true; do
   echo "cargo publish -p ${PKG} --locked --no-verify (attempt ${attempt}/${MAX_ATTEMPTS})"
