@@ -58,10 +58,10 @@ A claim with no outcome answers `RECEIPT_EXPIRED` and never reaches the port. Th
 
 Because the claim is taken before the port runs, `RECEIPT_EXPIRED` reports one thing only: no recorded outcome for that key. It says nothing about whether the original request executed.
 
-- **What history remains now** is observable: the entry's persisted `history_floor_revision` and which checkpoints still read. A floor that already moved, or an expected checkpoint that no longer reads, is evidence the earlier prune committed.
+- **What history remains now** is observable: the entry's persisted `history_floor_revision` and which checkpoints still read. That state tells the caller whether another prune is still needed — nothing more; it does not attribute the floor to any particular request.
 - **Whether the original request executed** is not observable. The same claim row covers a port that was never called, a port call still in flight, and a port call whose process died before `record` — and the last two may have committed.
 
-So the answer is not a case distinction a caller can act on, and a caller must not read `RECEIPT_EXPIRED` as proof the prune did not commit. Verifying the persisted floor and the surviving checkpoints is the only evidence available; only that check decides whether re-pruning under any `idempotency_key` is safe.
+So the answer is not a case distinction a caller can act on, and a caller must not read `RECEIPT_EXPIRED` as proof the prune did not commit. The persisted floor and surviving checkpoints are the only evidence available, and they decide whether re-pruning under any `idempotency_key` is still needed.
 
 Adoption keeps the released in-memory default and its own restart exposure. Adoption has no equivalent permanent-loss replay path, but it is not a guaranteed no-write repeat either. While the source still resolves to the terminal the first call copied and the destination already holds the copy, the create-only CAS and the anchor rules make the retry answer `already_present` or `REVISION_CONFLICT` and write nothing. After a reassembly dropped the record, a source since retired to a different terminal resolves the same request to that new terminal; with `destination_entry_id` omitted the copy is then addressed by the new terminal's id, so the retry writes a second copy. The original copy stays intact and nothing is lost — the repeat is simply not guaranteed to write nothing once the terminal changed and no destination id was supplied.
 

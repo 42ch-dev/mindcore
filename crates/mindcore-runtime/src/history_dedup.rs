@@ -136,11 +136,13 @@ fn encode_outcome(outcome: &SpokeResult<Value>) -> String {
     stored.to_string()
 }
 
-/// The inverse of [`encode_outcome`]; `None` for anything this module never wrote.
+/// The inverse of [`encode_outcome`].
 ///
 /// Strict: exactly one variant key, and a reject carries exactly `code`, `message` and `details`.
-/// A record with both keys, an unknown code or a malformed reject never came from this module, and
-/// replaying its `ok` would serve an outcome the store never recorded.
+/// It rejects any value that does not match the shape this writer emits, so a half-written or
+/// hand-edited row answers `Evicted` rather than replaying. This is a shape check, not authenticity
+/// or tamper detection: nothing here authenticates the row, and a writer with database access can
+/// store any well-formed outcome it likes.
 fn decode_outcome(stored: &str) -> Option<SpokeResult<Value>> {
     let value: Value = serde_json::from_str(stored).ok()?;
     let object = value.as_object()?;
