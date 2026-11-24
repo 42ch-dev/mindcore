@@ -9,11 +9,11 @@ on:
     inputs:
       version:
         description: >-
-          SemVer strictly greater than the current workspace version. No build
-          metadata (`+...`). The current version itself is refused, also before
-          the first `v*` tag exists, so a first dispatch either names a higher
-          version explicitly or takes the patch bump. Blank = the default bump:
-          next patch of a stable version (0.1.0 -> 0.1.1), or the core of a
+          SemVer greater than the current workspace version. No build metadata
+          (`+...`). First release only: before any `v*` tag exists, enter the
+          current workspace version explicitly — blank input bumps the patch
+          instead, which releases a version nobody chose. After that, blank =
+          the default bump: next patch of a stable version, or the core of a
           prerelease (0.2.0-rc.1 -> 0.2.0).
         required: false
         type: string

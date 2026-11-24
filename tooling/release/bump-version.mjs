@@ -56,11 +56,12 @@ export function parsePackageName(contents) {
  */
 export function replaceWorkspaceVersion(contents, version) {
   const section = workspacePackageSection(contents);
-  const replaced = section.replace(/^version\s*=\s*"[^"]*"/m, `version = "${version}"`);
-  if (replaced === section) {
+  const pattern = /^version\s*=\s*"[^"]*"/m;
+  // Match, not changed-string: a first release keeps the same version text.
+  if (!pattern.test(section)) {
     throw new Error('Cargo.toml: missing version = "..." in [workspace.package]');
   }
-  return contents.replace(section, () => replaced);
+  return contents.replace(section, () => section.replace(pattern, `version = "${version}"`));
 }
 
 /**
@@ -87,8 +88,9 @@ export function replaceLockVersion(contents, packageName, version) {
  */
 export function bumpVersion(root, target) {
   const current = readWorkspaceVersion(root);
-  // Same rule as next-version: an explicit version must be strictly greater.
-  if (resolveNextVersion(current, target) !== target) {
+  // Same rule as next-version: an explicit version must be strictly greater,
+  // except equality before the first release (no v* tag yet).
+  if (resolveNextVersion(current, target, root) !== target) {
     throw new Error(`Refusing to bump ${current} to ${target}.`);
   }
 

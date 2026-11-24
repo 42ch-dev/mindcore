@@ -7,9 +7,14 @@
  *   node tooling/release/next-version.mjs --current  # print the current version
  *   node tooling/release/next-version.mjs <X.Y.Z>    # validate an explicit version
  *
+ * An explicit version must exceed the current one, except before the first
+ * release: with no `v*` tag in the repository, the current version is still
+ * free, so naming it is how the first release ships.
+ *
  * @module tooling/release/next-version
  */
 
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,26 +134,47 @@ export function patchBump(current) {
 }
 
 /**
+ * Whether any `v*` release tag exists. A repository that cannot answer (not a
+ * git checkout, git missing) counts as tagged: the strict rule stays the safe
+ * default.
+ *
+ * @param {string} [root]
+ * @returns {boolean}
+ */
+export function hasReleaseTag(root = repoRoot()) {
+  const result = spawnSync("git", ["tag", "--list", "v*"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  return result.status !== 0 || result.stdout.trim() !== "";
+}
+
+/**
  * The one version rule: an explicit input must be strictly greater than the
- * current version; otherwise the next patch is the answer.
+ * current version — except before the first release, where the current version
+ * is not yet tagged and naming it is how it ships. Otherwise the next patch is
+ * the answer.
  *
  * @param {string} current
  * @param {string | undefined} input
+ * @param {string} [root]
  * @returns {string}
  */
-export function resolveNextVersion(current, input) {
+export function resolveNextVersion(current, input, root = repoRoot()) {
   if (input === undefined || input === "") {
     return patchBump(current);
   }
   if (!parseVersion(input)) {
     throw new Error(`Invalid SemVer: "${input}"`);
   }
-  if (compareVersions(input, current) <= 0) {
-    throw new Error(
-      `Version ${input} must be greater than the current workspace version ${current}.`,
-    );
+  const order = compareVersions(input, current);
+  if (order > 0 || (order === 0 && !hasReleaseTag(root))) {
+    return input;
   }
-  return input;
+  throw new Error(
+    `Version ${input} must be greater than the current workspace version ${current}; ` +
+      "equality is allowed only before the first release, when no v* tag exists yet.",
+  );
 }
 
 /**
@@ -212,11 +238,12 @@ function main(argv) {
     return;
   }
   if (argv.length === 1 && !argv[0].startsWith("-")) {
-    process.stdout.write(`${resolveNextVersion(current, argv[0])}\n`);
+    process.stdout.write(`${resolveNextVersion(current, argv[0], root)}\n`);
     return;
   }
   console.error(
-    "Usage: node tooling/release/next-version.mjs [--current | <X.Y.Z>]",
+    "Usage: node tooling/release/next-version.mjs [--current | <X.Y.Z>]\n" +
+      "<X.Y.Z> must be greater than the current version; it may equal it before the first release (no v* tag).",
   );
   process.exit(1);
 }
