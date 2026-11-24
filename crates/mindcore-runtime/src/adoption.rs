@@ -547,6 +547,26 @@ mod tests {
         }
     }
 
+    /// The slot's live row still sits at `revision` and carries `marker`: a refused adoption wrote
+    /// nothing, so it neither advanced the revision nor wrote a retirement marker. Reading the live
+    /// row rather than a historical revision is what makes that a statement about current state.
+    async fn slot_unchanged(
+        destination: &mindcore_sqlite::ScopedKnowledgeStore,
+        revision: Option<u64>,
+        marker: Option<&str>,
+        context: &str,
+    ) {
+        let row = ok(
+            destination.get_entry_including_superseded("ke_slot").await,
+            "read the destination row",
+        );
+        assert_eq!(
+            (row.entry.revision, row.superseded_by),
+            (revision, marker.map(str::to_string)),
+            "{context}"
+        );
+    }
+
     /// The first call writes the copy the anchor names, and the repeat serves that stored copy
     /// instead of writing a second one.
     #[tokio::test]
@@ -1007,10 +1027,26 @@ mod tests {
                 .await,
             "a live occupant",
         );
+        slot_unchanged(
+            &destination,
+            Some(1),
+            None,
+            "a refused claim of a live slot",
+        )
+        .await;
+
         let concealed = refused(
             service.adopt_knowledge_entry(&owner, &hidden, &claim).await,
             "a live occupant the selection hides",
         );
+        slot_unchanged(
+            &destination,
+            Some(1),
+            None,
+            "a refused claim of a hidden live slot",
+        )
+        .await;
+
         let retired = ok(
             destination
                 .supersede_entry("ke_slot", 1, "ke_successor")
@@ -1023,10 +1059,25 @@ mod tests {
                 .await,
             "a retired occupant",
         );
+        slot_unchanged(
+            &destination,
+            Some(retired),
+            Some("ke_successor"),
+            "a refused claim of a retired slot",
+        )
+        .await;
+
         let retired_concealed = refused(
             service.adopt_knowledge_entry(&owner, &hidden, &claim).await,
             "a retired occupant the selection hides",
         );
+        slot_unchanged(
+            &destination,
+            Some(retired),
+            Some("ke_successor"),
+            "a refused claim of a retired hidden slot",
+        )
+        .await;
 
         assert_eq!(live.code, SpokeRejectCode::RevisionConflict);
         assert!(live.details.is_none(), "{live:?}");
@@ -1040,12 +1091,5 @@ mod tests {
                 "a {state} occupant must not be distinguishable from a live visible one"
             );
         }
-
-        // The slot still holds the retired occupant at the revision the retirement gave it.
-        let held = ok(
-            destination.get_entry_at_revision("ke_slot", retired).await,
-            "read the retired occupant",
-        );
-        assert_eq!(held.revision, Some(retired));
     }
 }
