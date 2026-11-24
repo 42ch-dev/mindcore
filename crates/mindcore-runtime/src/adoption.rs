@@ -296,6 +296,18 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
                 SpokeResult::Ok(false) => occupied(&entry.entry_id),
                 SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
             },
+            // `read_entry` is live-only, so a retired row arrives here as an absence. It is still a
+            // taken slot: answering `NotFound` would let the SPI helper's revision gate report the
+            // destination's retirement while a live occupant answers occupancy before that gate.
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+            {
+                match retirement_successors_of(&mut gate, self.collection, entry_id).await {
+                    SpokeResult::Ok(Some(_)) => occupied(entry_id),
+                    SpokeResult::Ok(None) => SpokeResult::Reject(reject),
+                    SpokeResult::Reject(fault) => SpokeResult::Reject(fault),
+                }
+            }
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
     }
@@ -565,6 +577,30 @@ mod tests {
             (revision, marker.map(str::to_string)),
             "{context}"
         );
+    }
+
+    /// The adoption destination's own read of one slot, at the port boundary the SPI helper calls.
+    /// A test reaches it directly because the served face's earlier refusals can intercept a call
+    /// before this read runs, which would leave the read itself unpinned.
+    async fn destination_read(store: &MindStore, admitted: &Scope, entry_id: &str) -> SpokeReject {
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin the destination read");
+        let gate = Mutex::new(&mut transaction);
+        let port = AdoptionDestination {
+            collection: DESTINATION_COLLECTION,
+            scope: admitted,
+            gate: &gate,
+        };
+        let answer = port.get_knowledge_entry(entry_id).await;
+        drop(port);
+        transaction.rollback().await.expect("roll back the read");
+        match answer {
+            SpokeResult::Reject(reject) => reject,
+            SpokeResult::Ok(entry) => panic!("{entry_id}: unexpectedly served {entry:?}"),
+        }
     }
 
     /// The first call writes the copy the anchor names, and the repeat serves that stored copy
@@ -1047,6 +1083,11 @@ mod tests {
         )
         .await;
 
+        // The read the SPI helper reaches after a live occupant answers occupancy. A retired row
+        // must answer it identically: reporting an absence here is what lets a revision gate
+        // report the destination's retirement while the slot is in fact taken.
+        let read_live = destination_read(&store, &hidden, "ke_slot").await;
+
         let retired = ok(
             destination
                 .supersede_entry("ke_slot", 1, "ke_successor")
@@ -1078,6 +1119,17 @@ mod tests {
             "a refused claim of a retired hidden slot",
         )
         .await;
+
+        // An unreachable destination read is what the SPI helper turns into a revision-gate answer,
+        // so the port itself must report the retired row as taken, byte for byte as it reports a
+        // live one.
+        let read_retired = destination_read(&store, &hidden, "ke_slot").await;
+        assert_eq!(
+            read_retired, read_live,
+            "a retired row must read as occupancy, never as an absence"
+        );
+        assert_eq!(read_retired.code, SpokeRejectCode::RevisionConflict);
+        assert!(read_retired.details.is_none(), "{read_retired:?}");
 
         assert_eq!(live.code, SpokeRejectCode::RevisionConflict);
         assert!(live.details.is_none(), "{live:?}");
