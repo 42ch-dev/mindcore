@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-publish = false
+description = "Storage-agnostic MIND domain core: records, knowledge, cognition and boundary types"
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE"]
 
 [dependencies]
 spoke-schemas.workspace = true

@@ -5,10 +5,21 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-publish = false
+description = "SQLite storage adapter for the MIND core: records, knowledge, cognition and vectors"
+include = [
+    "src/**/*.rs",
+    "migrations/**/*.sql",
+    # The crate builds with compile-time `sqlx::query!` macros, so the package
+    # must carry the offline query cache or a consumer's build fails for lack of
+    # `DATABASE_URL`. `.sqlx` is a symlink to the workspace cache so CI's single
+    # freshness check in one place still governs it.
+    ".sqlx/*.json",
+    "Cargo.toml",
+    "LICENSE",
+]
 
 [dependencies]
-mindcore-base = { path = "../mindcore-base" }
+mindcore-base = { path = "../mindcore-base", version = "0.1.0" }
 spoke-schemas.workspace = true
 spoke-operations.workspace = true
 serde_json.workspace = true

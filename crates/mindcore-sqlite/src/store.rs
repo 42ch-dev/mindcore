@@ -74,12 +74,18 @@ impl MindStore {
     /// write whose WAL read snapshot another connection's commit already invalidated. The
     /// timeout is a cap, not a wait guarantee.
     ///
-    /// Pre-release migrations are mutable: the schema files change in place between commits, so
-    /// there is no upgrade path until the first release. `open` refuses a database whose applied
-    /// migrations no longer match the embedded set — SQLx's `VersionMissing` when an applied version
-    /// is no longer embedded, and a checksum mismatch when an applied version's SQL has since
-    /// changed. A database whose applied migrations still match reopens normally, whatever commit
-    /// created it — cross-commit compatibility is unsupported and untested.
+    /// The embedded migration set is append-only from the first published release: a published
+    /// file is immutable and a schema change appends a new one, so a database recorded at any
+    /// published set reopens here and the appended files are the only pending work. The release
+    /// checks lock this set by content, so editing a published file fails the release rather than
+    /// silently diverging from it.
+    ///
+    /// `open` accepts an applied set that is a subset of the embedded one — the remaining files are
+    /// then applied — and refuses a database that diverges from it: SQLx's `VersionMissing` when an
+    /// applied version is not embedded, `VersionMismatch` when an applied version's SQL has since
+    /// changed, and `ExecuteMigration` when a pending file reruns over tables that already exist.
+    /// There is no upgrade, downgrade or data-movement path: a refused database is recreated, not
+    /// converted.
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
