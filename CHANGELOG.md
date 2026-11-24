@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **`mindcore-runtime` / `mindcore-sqlite`:** `history.revisions.prune` is deduplicated durably. The
+  history face composes `SqliteHistoryDedupStore` over the knowledge store's own pool, keyed by
+  Connect's retry identity, so a same-key retry after a restart or a reassembled surface replays the
+  recorded `{deleted, floor_revision}` instead of executing the prune again and deleting checkpoints
+  the original call never saw. `lookup` claims the key before the port runs; a key claimed whose
+  outcome was never recorded — a crash after the claim and before `record` — answers
+  `RECEIPT_EXPIRED` and never reaches the port. Same-key different-payload still answers
+  `IDEMPOTENCY_CONFLICT`, but only when a recorded outcome exists to compare against: a retained
+  claim with no outcome answers `RECEIPT_EXPIRED` instead, whatever the new payload is. The record is
+  the new `history_dedup` table in `0001_init.sql`, retained for the database lifetime with no
+  eviction; one serving process per database is a host obligation. The adoption face keeps the
+  in-memory default.
+
 - **Breaking — `mindcore-runtime`:** the private product tool `tools.mindcore.adopt` is removed, not
   deprecated. Adoption is served only as the published protocol operation `knowledge.adopt` under the
   `spoke-knowledge-adoption` capability, which requires `spoke-knowledge`; the runtime filters the

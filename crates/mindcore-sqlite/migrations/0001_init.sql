@@ -426,6 +426,19 @@ BEGIN
     (OLD.collection, OLD.entry_id, OLD.revision, OLD.payload, OLD.cognition_head_seq, OLD.updated_at);
 END;
 
+-- Prune dedup: one row per retry identity — the Connect key itself — for the database lifetime.
+-- Nothing orders or expires rows, so there is no timestamp column. `lookup` claims a key by
+-- inserting the both-NULL row, and `record` fills it: a claim whose outcome never arrived keeps
+-- the retry out of the port, so a prune that committed before a crash is never re-executed.
+CREATE TABLE history_dedup (
+  key            TEXT PRIMARY KEY,
+  -- SHA-256 hex over the RFC 8785 canonical JSON of the whole request payload.
+  payload_digest TEXT,
+  -- The settled outcome as `{"ok": …}` or `{"reject": {"code", "message", "details"}}`.
+  outcome_json   TEXT,
+  CHECK ((payload_digest IS NULL) = (outcome_json IS NULL))
+) WITHOUT ROWID;
+
 -- ── Retained Memory record vectors ──
 -- Optional cache of retained Memory record vectors: one row per record and embedding identity.
 -- `identity_hash` partitions rows by serving model, so retiring an identity is one indexed bulk
