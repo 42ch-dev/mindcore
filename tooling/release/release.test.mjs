@@ -400,10 +400,18 @@ function git(root, args) {
 
 describe("git-cliff", () => {
   // The committed config decides which commits reach a release section; only a
-  // real git-cliff can prove the tagged range. Absent binary → skipped.
+  // real git-cliff can prove the tagged range. A local run without the binary
+  // skips; CI sets REQUIRE_GIT_CLIFF=1, where a missing binary must fail instead.
   const cliff = spawnSync("git-cliff", ["--version"], { encoding: "utf8" });
+  const available = cliff.status === 0;
+  const required = process.env.REQUIRE_GIT_CLIFF === "1";
+  const skip = available || required ? false : "git-cliff is not installed";
 
-  it("renders only the commits after the previous tag", { skip: cliff.status !== 0 }, () => {
+  it("renders only the commits after the previous tag", { skip }, () => {
+    assert.ok(
+      available,
+      "REQUIRE_GIT_CLIFF=1 but `git-cliff --version` did not succeed; install git-cliff@2",
+    );
     const root = mkdtempSync(join(tmpdir(), "mindcore-cliff-"));
     tempDirs.push(root);
     git(root, ["init", "--quiet", "--initial-branch", "main"]);

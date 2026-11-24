@@ -70,4 +70,7 @@ jobs:
         with:
           tool: git-cliff@2
       - name: Test release tooling
+        env:
+          # Without the binary the git-cliff range test would skip; fail instead.
+          REQUIRE_GIT_CLIFF: "1"
         run: node --test tooling/release/release.test.mjs
