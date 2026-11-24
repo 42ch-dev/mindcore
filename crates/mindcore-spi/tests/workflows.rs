@@ -2976,11 +2976,12 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
         deadline >= start + timeout,
         "the deadline is the call's own start plus the timeout, never shorter"
     );
-    // Anchored on the reasoner's entry, which happens at the call's start and a
-    // whole reasoner delay before the commit: a deadline recomputed at the
-    // commit would exceed this by that delay.
+    // Anchored on the call's start, which is the deadline's own computation
+    // point; the reasoner entry sits a snapshot read later, so anchoring there
+    // would hide that read inside the slack. A deadline recomputed at the
+    // commit would exceed this bound by the whole reasoner delay.
     assert!(
-        deadline <= entered + timeout + GRANULARITY,
+        deadline <= start + timeout + GRANULARITY,
         "the deadline is computed at the call's start, before the reasoner ran, \
          so it was not recomputed from now at the commit"
     );
