@@ -22,7 +22,7 @@ use spoke_schemas::{
     MemoryCaptureRequest, MemoryGrant, MemoryRecallRequest, MemoryRecordsUpdateRequest, Principal,
     RetainedRecord,
 };
-use sqlx::SqlitePool;
+use sqlx::{Connection, SqlitePool};
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::cognition::{carrier_records, CARRIER_NAMESPACE};
@@ -1162,10 +1162,25 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         expected_carrier_revision: u64,
         record: Value,
         cited: &[CitedRecord],
-        _deadline: std::time::Instant,
+        deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
-        let mut transaction = self
-            .pool
+        // The pool holds one connection in production, so an acquire can wait
+        // for another statement indefinitely: the request deadline bounds that
+        // wait, and a free connection is re-checked so nothing begins after
+        // expiry.
+        let mut connection =
+            tokio::time::timeout_at(tokio::time::Instant::from(deadline), self.pool.acquire())
+                .await
+                .map_err(|_| SpiError::DeadlineExceeded)?
+                .map_err(|error| {
+                    internal(format!(
+                        "cognition settlement transaction could not begin: {error}"
+                    ))
+                })?;
+        if std::time::Instant::now() >= deadline {
+            return Err(SpiError::DeadlineExceeded);
+        }
+        let mut transaction = connection
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|error| {
