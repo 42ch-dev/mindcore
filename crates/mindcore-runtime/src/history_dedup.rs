@@ -137,13 +137,23 @@ fn encode_outcome(outcome: &SpokeResult<Value>) -> String {
 }
 
 /// The inverse of [`encode_outcome`]; `None` for anything this module never wrote.
+///
+/// Strict: exactly one variant key, and a reject carries exactly `code`, `message` and `details`.
+/// A record with both keys, an unknown code or a malformed reject never came from this module, and
+/// replaying its `ok` would serve an outcome the store never recorded.
 fn decode_outcome(stored: &str) -> Option<SpokeResult<Value>> {
     let value: Value = serde_json::from_str(stored).ok()?;
     let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
     if let Some(ok) = object.get("ok") {
         return Some(SpokeResult::Ok(ok.clone()));
     }
     let reject = object.get("reject")?.as_object()?;
+    if reject.len() != 3 {
+        return None;
+    }
     let code = SpokeRejectCode::try_from_str(reject.get("code")?.as_str()?)?;
     let message = reject.get("message")?.as_str()?.to_string();
     let details = match reject.get("details")? {
@@ -276,18 +286,52 @@ mod tests {
         assert_eq!(dedup.lookup("key-one").await, HistoryDedupLookup::Evicted);
     }
 
+    /// Overwrite a claimed key with a stored outcome this module never writes.
+    async fn install_outcome(store: &MindStore, stored: &str) {
+        sqlx::query("UPDATE history_dedup SET payload_digest = ?, outcome_json = ? WHERE key = ?")
+            .bind("digest-invalid")
+            .bind(stored)
+            .bind("key-one")
+            .execute(&store.pool())
+            .await
+            .expect("install an invalid outcome");
+    }
+
     #[tokio::test]
     async fn an_outcome_that_does_not_decode_answers_evicted() {
         let dir = TempDir::new().expect("temporary directory");
         let (store, dedup) = open(&dir).await;
         dedup.lookup("key-one").await;
-        sqlx::query("UPDATE history_dedup SET payload_digest = ?, outcome_json = ? WHERE key = ?")
-            .bind("digest-undecodable")
-            .bind("{\"reject\":{\"code\":\"NOT_A_REJECT_CODE\"}}")
-            .bind("key-one")
-            .execute(&store.pool())
-            .await
-            .expect("install an undecodable outcome");
+        install_outcome(&store, "{\"reject\":{\"code\":\"NOT_A_REJECT_CODE\"}}").await;
+        assert_eq!(dedup.lookup("key-one").await, HistoryDedupLookup::Evicted);
+    }
+
+    #[tokio::test]
+    async fn a_parseable_record_with_both_variants_answers_evicted() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        dedup.lookup("key-one").await;
+        // Both keys parse, so the record must not be replayed as either variant.
+        install_outcome(
+            &store,
+            "{\"ok\":{\"deleted\":1},\"reject\":{\"code\":\"NO_SUCH_CODE\"}}",
+        )
+        .await;
+        assert_eq!(dedup.lookup("key-one").await, HistoryDedupLookup::Evicted);
+    }
+
+    #[tokio::test]
+    async fn a_reject_with_unexpected_members_answers_evicted() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        dedup.lookup("key-one").await;
+        // A well-formed reject plus a member this module never writes.
+        install_outcome(
+            &store,
+            "{\"reject\":{\"code\":\"INVALID_INPUT\",\"message\":\"m\",\"details\":null,\
+             \"extra\":1}}",
+        )
+        .await;
         assert_eq!(dedup.lookup("key-one").await, HistoryDedupLookup::Evicted);
     }
 }
