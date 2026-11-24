@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Mindcore embedded architecture",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "output": "docs/assets/architecture.html",
+    "repository": {
+      "url": "https://github.com/42ch-dev/mindcore.git",
+      "revision": "3d91e41b7f15863ae4e16113d0f3f04a95111687",
+      "provider": "github",
+      "link_mode": "web"
+    }
+  },
+  "components": [
+    {
+      "id": "host",
+      "type": "external",
+      "label": "Host application",
+      "sublabel": "transport, identity, admission",
+      "pos": [
+        330,
+        40
+      ],
+      "size": [
+        200,
+        68
+      ],
+      "sources": [
+        {
+          "path": "crates/mindcore-runtime/src/lib.rs",
+          "line": 1,
+          "end_line": 8,
+          "label": "host contract"
+        }
+      ]
+    },
+    {
+      "id": "runtime",
+      "type": "backend",
+      "label": "mindcore-runtime",
+      "sublabel": "MindcoreServe \u00b7 ServeFaces",
+      "pos": [
+        320,
+        160
+      ],
+      "size": [
+        220,
+        70
+      ],
+      "sources": [
+        {
+          "path": "crates/mindcore-runtime/src/lib.rs",
+          "line": 56,
+          "end_line": 65,
+          "label": "serve handle"
+        },
+        {
+          "path": "crates/mindcore-runtime/src/lib.rs",
+          "line": 128,
+          "end_line": 140,
+          "label": "surface assembly"
+        }
+      ]
+    },
+    {
+      "id": "spi",
+      "type": "backend",
+      "label": "mindcore-spi",
+      "sublabel": "recall \u00b7 absorb \u00b7 deliberate",
+      "pos": [
+        80,
+        300
+      ],
+      "size": [
+        220,
+        64
+      ],
+      "sources": [
+        {
+          "path": "crates/mindcore-spi/src/lib.rs",
+          "line": 1,
+          "end_line": 13,
+          "label": "workflow contracts"
+        }
+      ]
+    },
+    {
+      "id": "spoke",
+      "type": "backend",
+      "label": "mindcore-spoke",
+      "sublabel": "SPOKE memory adapter",
+      "pos": [
+        560,
+        300
+      ],
+      "size": [
+        220,
+        64
+      ],
+      "sources": [
+        {
+          "path": "crates/mindcore-spoke/src/lib.rs",
+          "line": 1,
+          "end_line": 9,
+          "label": "adapter boundary"
+        }
+      ]
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "mindcore-sqlite",
+      "sublabel": "MindStore \u00b7 WAL \u00b7 one migration",
+      "pos": [
+        320,
+        440
+      ],
+      "size": [
+        220,
+        64
+      ],
+      "sources": [
+        {
+          "path": "crates/mindcore-sqlite/src/lib.rs",
+          "line": 1,
+          "end_line": 19,
+          "label": "backend surface"
+        },
+        {
+          "path": "crates/mindcore-sqlite/src/store.rs",
+          "line": 72,
+          "end_line": 104,
+          "label": "open and migrate"
+        }
+      ]
+    },
+    {
+      "id": "base",
+      "type": "backend",
+      "label": "mindcore-base",
+      "sublabel": "records \u00b7 IR \u00b7 MindState",
+      "pos": [
+        320,
+        580
+      ],
+      "size": [
+        220,
+        64
+      ],
+      "sources": [
+        {
+          "path": "crates/mindcore-base/src/lib.rs",
+          "line": 1,
+          "end_line": 7,
+          "label": "storage-agnostic core"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Mindcore embedded library",
+      "wraps": [
+        "runtime",
+        "spi",
+        "spoke",
+        "sqlite",
+        "base"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "host-to-runtime",
+      "from": "host",
+      "to": "runtime",
+      "label": "Connect responder",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "runtime-to-spi",
+      "from": "runtime",
+      "to": "spi",
+      "label": "workflow calls",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "top",
+      "via": [
+        [
+          190,
+          195
+        ]
+      ]
+    },
+    {
+      "id": "runtime-to-spoke",
+      "from": "runtime",
+      "to": "spoke",
+      "label": "memory workflow binding",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          670,
+          195
+        ]
+      ]
+    },
+    {
+      "id": "runtime-to-sqlite",
+      "from": "runtime",
+      "to": "sqlite",
+      "label": "knowledge face",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "spoke-to-sqlite",
+      "from": "spoke",
+      "to": "sqlite",
+      "label": "borrowed transaction",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "via": [
+        [
+          670,
+          472
+        ]
+      ]
+    },
+    {
+      "id": "sqlite-to-base",
+      "from": "sqlite",
+      "to": "base",
+      "label": "implements domain traits",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Memory",
+      "items": [
+        "capture stages a pending candidate; review projects records or none",
+        "recall reads live records only and pages by a byte or item budget",
+        "an idempotency key replays the recorded outcome, never the effect"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Knowledge",
+      "items": [
+        "a port is bound to one collection when it is built",
+        "expected_base_revision makes every update compare-and-swap",
+        "adoption anchors resolve the source retirement chain before the write"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Cognition",
+      "items": [
+        "append-only records under one carrier entry",
+        "MindState is derived from the carrier, never stored twice",
+        "every record is validated at the single persistence boundary"
+      ]
+    }
+  ]
+}

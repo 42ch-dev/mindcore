@@ -269,7 +269,7 @@ fn occupied<T>(entry_id: &str) -> SpokeResult<T> {
 
 /// Whether a destination refusal reports that a create-only put found the slot occupied.
 ///
-/// The local store names it directly; a 0.18 `RemoteAdapter` destination refuses the create-only
+/// The local store names it directly; a remote `RemoteAdapter` destination refuses the create-only
 /// CAS in the port's OCC vocabulary (`REVISION_CONFLICT`) before the provider ever sees the put.
 /// The code is matched, never the message: a conflict raised for any other reason still re-reads
 /// the slot, and a re-read that reports absence or occupancy answers the occupancy, while its other

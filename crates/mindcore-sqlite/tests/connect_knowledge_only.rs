@@ -1,4 +1,4 @@
-//! Knowledge-only Connect serving proof against SPOKE `spoke-connect =0.18.1`
+//! Knowledge-only Connect serving proof against the pinned SPOKE `spoke-connect`
 //! (`remote-adapter` feature).
 //!
 //! Both peers advertise `["spoke-knowledge"]` in their signed hellos over an
@@ -574,7 +574,7 @@ async fn one_sided_knowledge_capability_is_denied() {
 }
 
 /// A mid-session capability grant never authorizes a knowledge op: the serve gate reads the
-/// negotiated hello set (`spoke-connect 0.18.1/src/remote/responder.rs` — dispatch gate on
+/// negotiated hello set (`spoke-connect/src/remote/responder.rs` — dispatch gate on
 /// `negotiated_capabilities`), and `core::dispatch::token_authorizes_op` only checks that a grant
 /// names the op's capability. A grant lacking `spoke-knowledge` therefore denies, and one naming
 /// `spoke-knowledge` still denies because no hello negotiated the family.
@@ -1603,8 +1603,8 @@ async fn served_list_refuses_a_collection_over_the_bound() {
 
 /// The served store, called below the responder, applies the anchor gate itself: a put that
 /// replaces or drops a stored `adoption_anchor` refuses `ADOPTION_ANCHOR_IMMUTABLE` naming the
-/// destination entry, so a peer that reaches the port without the responder's own check (0.18
-/// gates `port.knowledge.put` before the provider) still cannot rewrite provenance.
+/// destination entry, so a peer that reaches the port without the responder's own check (the
+/// pinned SPOKE gates `port.knowledge.put` before the provider) still cannot rewrite provenance.
 #[tokio::test]
 async fn the_served_put_is_the_anchor_gate_backstop() {
     let fixture = Fixture::open().await;
