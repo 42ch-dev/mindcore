@@ -16,10 +16,9 @@ import { baselineTag, git, isShallow, SHALLOW_HINT } from '../git/baseline.mjs';
 
 export const PUBLISHABLE = ['mindcore-base', 'mindcore-spi', 'mindcore-sqlite'];
 
-// Published manifests only carry [dependencies] / [build-dependencies] into the
-// crates.io graph; dev-dependencies never resolve there, so path deps in them
-// stay exempt from the version requirement.
-const VERSIONED_DEP_TABLES = ['dependencies', 'build-dependencies'];
+// Tables cargo rejects at package time when a path dep has no `version`.
+// dev-dependencies are absent on purpose: see depTables().
+const DEP_TABLES = ['dependencies', 'build-dependencies'];
 
 const SEMVER =
   /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -76,6 +75,31 @@ function depNeedsVersion(spec) {
   return spec !== null && typeof spec === 'object' && 'path' in spec && !('version' in spec);
 }
 
+// `{ workspace = true }` defers `path`/`version` to the root entry, which is
+// what cargo rewrites when packaging. Inline tables stay raw source text.
+function inheritsWorkspace(spec) {
+  if (typeof spec === 'string') return /\bworkspace\s*=\s*true\b/.test(spec);
+  return spec !== null && typeof spec === 'object' && String(spec.workspace).trim() === 'true';
+}
+
+// Every table cargo validates at package time, prefixed `target.<cfg>.` for
+// target-specific entries. dev-dependencies are excluded: cargo drops
+// versionless (and path-only) dev-deps from the packaged manifest instead of
+// failing, so a version cannot be required there.
+function depTables(toml) {
+  const tables = [];
+  for (const table of DEP_TABLES) {
+    if (toml[table]) tables.push([table, toml[table]]);
+  }
+  for (const [cfg, section] of Object.entries(toml.target ?? {})) {
+    for (const table of DEP_TABLES) {
+      // The header key keeps its own quoting, e.g. `'cfg(unix)'`.
+      if (section?.[table]) tables.push([`target.${cfg}.${table}`, section[table]]);
+    }
+  }
+  return tables;
+}
+
 // `publish` gates where a crate may be uploaded. Unset and `true` mean the
 // default registry; `["crates-io"]` (or the bare string) names it explicitly.
 // Anything else — `false` or another registry — keeps the crate off crates.io.
@@ -124,9 +148,14 @@ export function checkManifests(rootDir) {
       );
     }
 
-    for (const table of VERSIONED_DEP_TABLES) {
-      for (const [dep, spec] of Object.entries(toml[table] ?? {})) {
-        if (depNeedsVersion(spec)) {
+    for (const [table, deps] of depTables(toml)) {
+      for (const [dep, spec] of Object.entries(deps ?? {})) {
+        // `{ workspace = true }` carries no path of its own; the root entry it
+        // resolves to is what cargo rewrites on publish.
+        const resolved = inheritsWorkspace(spec)
+          ? root?.workspace?.dependencies?.[dep]
+          : spec;
+        if (resolved !== undefined && depNeedsVersion(resolved)) {
           errors.push(
             `${crate}: [${table}] \`${dep}\` uses \`path\` without \`version\`; it cannot resolve on crates.io`,
           );
