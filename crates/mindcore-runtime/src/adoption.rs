@@ -976,4 +976,76 @@ mod tests {
             "the admitting selection claims the free slot",
         );
     }
+
+    /// One destination slot answers the same occupancy whether its occupant is live and admitted,
+    /// live and hidden by the admission, or retired: a retired occupant reaches the answer through
+    /// the create-only put's superseded refusal rather than the destination read, so only this
+    /// comparison shows the two routes agree.
+    #[tokio::test]
+    async fn a_retired_destination_occupant_answers_the_same_occupancy_as_a_live_one() {
+        let (_dir, store, service) = service().await;
+        let owner = principal("prn_owner");
+        let destination = store.knowledge(KnowledgeScope::new(DESTINATION_COLLECTION));
+        for entry_id in ["ke_slot", "ke_successor"] {
+            ok(
+                destination.put_knowledge_entry(entry(entry_id), None).await,
+                "seed the destination occupant",
+            );
+        }
+        // The same admitted id, once with an entry-id selection that never holds the occupant.
+        let hidden: Scope = serde_json::from_value(json!({
+            "scope_id": DESTINATION_SCOPE,
+            "entry_ids": ["ke_somebody_else"],
+        }))
+        .expect("scope JSON matches the schema");
+        let mut claim = request("ke_source", 1);
+        claim.destination_entry_id = Some("ke_slot".parse().expect("non-empty destination id"));
+
+        let live = refused(
+            service
+                .adopt_knowledge_entry(&owner, &scope(DESTINATION_SCOPE), &claim)
+                .await,
+            "a live occupant",
+        );
+        let concealed = refused(
+            service.adopt_knowledge_entry(&owner, &hidden, &claim).await,
+            "a live occupant the selection hides",
+        );
+        let retired = ok(
+            destination
+                .supersede_entry("ke_slot", 1, "ke_successor")
+                .await,
+            "retire the occupant",
+        );
+        let retired_shown = refused(
+            service
+                .adopt_knowledge_entry(&owner, &scope(DESTINATION_SCOPE), &claim)
+                .await,
+            "a retired occupant",
+        );
+        let retired_concealed = refused(
+            service.adopt_knowledge_entry(&owner, &hidden, &claim).await,
+            "a retired occupant the selection hides",
+        );
+
+        assert_eq!(live.code, SpokeRejectCode::RevisionConflict);
+        assert!(live.details.is_none(), "{live:?}");
+        for (state, reject) in [
+            ("hidden", &concealed),
+            ("retired", &retired_shown),
+            ("retired and hidden", &retired_concealed),
+        ] {
+            assert_eq!(
+                reject, &live,
+                "a {state} occupant must not be distinguishable from a live visible one"
+            );
+        }
+
+        // The slot still holds the retired occupant at the revision the retirement gave it.
+        let held = ok(
+            destination.get_entry_at_revision("ke_slot", retired).await,
+            "read the retired occupant",
+        );
+        assert_eq!(held.revision, Some(retired));
+    }
 }
