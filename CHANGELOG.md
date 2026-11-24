@@ -11,8 +11,9 @@
   `RECEIPT_EXPIRED` and never reaches the port. Same-key different-payload still answers
   `IDEMPOTENCY_CONFLICT`, but only when a recorded outcome exists to compare against: a retained
   claim with no outcome answers `RECEIPT_EXPIRED` instead, whatever the new payload is. The record is
-  the new `history_dedup` table in `0001_init.sql`, keyed per serving collection — the routed
-  store's collection, a NUL and the retry key — so two history surfaces on one database that share
+  the new `history_dedup` table in `0001_init.sql`, keyed by `(namespace, key)` — the routed store's
+  collection and the retry key, in separate columns, because a collection name is arbitrary and no
+  separator framing keeps them unambiguous — so two history surfaces on one database that share
   a wire scope, a principal and an idempotency key never replay or refuse each other's prunes; a
   same-collection retry replays exactly as before. Rows are retained for the database lifetime with
   no eviction, but each namespace is capped at 4096 rows, claims included: at the bound an unseen

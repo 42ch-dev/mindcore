@@ -10,10 +10,12 @@
 //! Faults fail closed: a statement fault, and an outcome that does not decode, both answer
 //! `Evicted`. Re-executing a destructive prune is the outcome this store exists to prevent.
 //!
-//! Each store serves one namespace — the collection its history surface routes to — and stores the
-//! key as `<namespace>\0<key>`. Two history surfaces on one database can share a wire scope, a
-//! principal and an idempotency key while reading different collections; without the namespace the
-//! second would replay a prune of the first surface's collection, or refuse it.
+//! Each store serves one namespace — the collection its history surface routes to — and keeps it in
+//! a column beside the key rather than in a framed string: a collection name may contain any
+//! character, so no separator could keep `(namespace, key)` pairs distinct. Two history surfaces on
+//! one database can share a wire scope, a principal and an idempotency key while reading different
+//! collections; without the namespace the second would replay a prune of the first surface's
+//! collection, or refuse it.
 //!
 //! One serving process per database is the host's obligation (see `I-000109`): the claim row stops
 //! a second process from executing, but it answers `RECEIPT_EXPIRED` instead of waiting for the
@@ -49,36 +51,20 @@ pub(crate) struct SqliteHistoryDedupStore {
 }
 
 impl SqliteHistoryDedupStore {
-    /// `namespace` is the collection the routed store serves: it is stored in front of the key, so
-    /// two surfaces on one database that route to different collections never share a row.
+    /// `namespace` is the collection the routed store serves: it is stored beside the key in its
+    /// own column, so two surfaces on one database that route to different collections never share
+    /// a row, whatever characters either name contains.
     pub(crate) fn new(pool: SqlitePool, namespace: impl Into<String>) -> Self {
         Self {
             pool,
             namespace: namespace.into(),
         }
     }
-
-    /// The stored key: the namespace, a NUL that no SQLite `TEXT` comparison treats specially, and
-    /// the wire key. The NUL separates the two, so `ab` + `c` and `a` + `bc` stay distinct.
-    fn stored_key(&self, key: &str) -> String {
-        format!("{}\0{key}", self.namespace)
-    }
-
-    /// The half-open range holding exactly this namespace's rows: `\0` sorts before every other
-    /// character the suffix can start with, and `\u{1}` above it ends the range.
-    fn namespace_range(&self) -> (String, String) {
-        (
-            format!("{}\0", self.namespace),
-            format!("{}\u{1}", self.namespace),
-        )
-    }
 }
 
 #[async_trait]
 impl HistoryDedupStore for SqliteHistoryDedupStore {
     async fn lookup(&self, key: &str) -> HistoryDedupLookup {
-        let stored_key = self.stored_key(key);
-        let (low, high) = self.namespace_range();
         let mut conn = match self.pool.acquire().await {
             Ok(conn) => conn,
             Err(error) => return fault("claim", error),
@@ -89,13 +75,13 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         // so an unseen key stays unseen here and the read below answers `Evicted`. An existing key
         // is unaffected either way, so a replay still finds its recorded outcome at the bound.
         let claimed = match sqlx::query(
-            "INSERT INTO history_dedup (key) SELECT ? \
-             WHERE (SELECT COUNT(*) FROM history_dedup WHERE key >= ? AND key < ?) < ? \
-             ON CONFLICT(key) DO NOTHING",
+            "INSERT INTO history_dedup (namespace, key) SELECT ?, ? \
+             WHERE (SELECT COUNT(*) FROM history_dedup WHERE namespace = ?) < ? \
+             ON CONFLICT(namespace, key) DO NOTHING",
         )
-        .bind(&stored_key)
-        .bind(&low)
-        .bind(&high)
+        .bind(&self.namespace)
+        .bind(key)
+        .bind(&self.namespace)
         .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&mut *conn)
         .await
@@ -103,11 +89,14 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             Ok(result) => result.rows_affected() == 1,
             Err(error) => return fault("claim", error),
         };
-        let stored: Result<Option<(Option<String>, Option<String>)>, _> =
-            sqlx::query_as("SELECT payload_digest, outcome_json FROM history_dedup WHERE key = ?")
-                .bind(&stored_key)
-                .fetch_optional(&mut *conn)
-                .await;
+        let stored: Result<Option<(Option<String>, Option<String>)>, _> = sqlx::query_as(
+            "SELECT payload_digest, outcome_json FROM history_dedup \
+             WHERE namespace = ? AND key = ?",
+        )
+        .bind(&self.namespace)
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await;
         let row = match stored {
             Ok(row) => row,
             Err(error) => return fault("lookup", error),
@@ -135,25 +124,26 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
 
     async fn record(&self, key: &str, record: HistoryDedupRecord) {
         let outcome_json = encode_outcome(&record.outcome);
-        let stored_key = self.stored_key(key);
-        let (low, high) = self.namespace_range();
         // Insert only when `lookup` claimed the key or it is already present, and only while the
         // namespace has room. An unclaimed key at the bound would otherwise grow the table past
         // the cap through `record` alone; this write leaves the row count alone instead.
         let written = sqlx::query(
-            "INSERT INTO history_dedup (key, payload_digest, outcome_json) SELECT ?, ?, ? \
-             WHERE EXISTS (SELECT 1 FROM history_dedup WHERE key = ?) \
-                OR (SELECT COUNT(*) FROM history_dedup WHERE key >= ? AND key < ?) < ? \
-             ON CONFLICT(key) DO UPDATE SET \
+            "INSERT INTO history_dedup (namespace, key, payload_digest, outcome_json) \
+             SELECT ?, ?, ?, ? \
+             WHERE EXISTS \
+                     (SELECT 1 FROM history_dedup WHERE namespace = ? AND key = ?) \
+                OR (SELECT COUNT(*) FROM history_dedup WHERE namespace = ?) < ? \
+             ON CONFLICT(namespace, key) DO UPDATE SET \
                payload_digest = excluded.payload_digest, \
                outcome_json   = excluded.outcome_json",
         )
-        .bind(&stored_key)
+        .bind(&self.namespace)
+        .bind(key)
         .bind(&record.payload_digest)
         .bind(&outcome_json)
-        .bind(&stored_key)
-        .bind(&low)
-        .bind(&high)
+        .bind(&self.namespace)
+        .bind(key)
+        .bind(&self.namespace)
         .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&self.pool)
         .await;
@@ -268,9 +258,8 @@ mod tests {
     }
 
     async fn row_count(store: &MindStore, namespace: &str) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM history_dedup WHERE key >= ? AND key < ?")
-            .bind(format!("{namespace}\0"))
-            .bind(format!("{namespace}\u{1}"))
+        sqlx::query_scalar("SELECT COUNT(*) FROM history_dedup WHERE namespace = ?")
+            .bind(namespace)
             .fetch_one(&store.pool())
             .await
             .expect("count the namespace's rows")
@@ -364,13 +353,17 @@ mod tests {
 
     /// Overwrite a claimed key with a stored outcome this module never writes.
     async fn install_outcome(store: &MindStore, stored: &str) {
-        sqlx::query("UPDATE history_dedup SET payload_digest = ?, outcome_json = ? WHERE key = ?")
-            .bind("digest-invalid")
-            .bind(stored)
-            .bind("collection-one\u{0}key-one")
-            .execute(&store.pool())
-            .await
-            .expect("install an invalid outcome");
+        sqlx::query(
+            "UPDATE history_dedup SET payload_digest = ?, outcome_json = ? \
+             WHERE namespace = ? AND key = ?",
+        )
+        .bind("digest-invalid")
+        .bind(stored)
+        .bind("collection-one")
+        .bind("key-one")
+        .execute(&store.pool())
+        .await
+        .expect("install an invalid outcome");
     }
 
     #[tokio::test]
@@ -447,6 +440,51 @@ mod tests {
         assert_eq!(recorded(second.lookup("key-one").await, "mora"), other);
     }
 
+    /// A collection name is an arbitrary string, NUL included. Framing the namespace into the key
+    /// with a separator made `("a\0b", "c")` and `("a", "b\0c")` the same row, and put one
+    /// namespace's rows inside another's capacity range. Two columns keep both pairs apart.
+    #[tokio::test]
+    async fn a_nul_bearing_collection_keeps_its_rows_separate() {
+        let dir = TempDir::new().expect("temporary directory");
+        let store = MindStore::open(&dir.path().join("history_dedup.db"))
+            .await
+            .expect("open the store");
+        let nested = SqliteHistoryDedupStore::new(store.pool(), "a\u{0}b");
+        let plain = SqliteHistoryDedupStore::new(store.pool(), "a");
+        let nested_record = record("digest-nested", SpokeResult::Ok(json!({ "deleted": 1 })));
+        let plain_record = record("digest-plain", SpokeResult::Ok(json!({ "deleted": 7 })));
+
+        // The pair that a `\0` separator collapsed onto one stored key.
+        assert_eq!(
+            nested.lookup("c").await,
+            HistoryDedupLookup::Unseen,
+            "the NUL-bearing collection's own key is fresh"
+        );
+        nested.record("c", nested_record.clone()).await;
+        assert_eq!(
+            plain.lookup("b\u{0}c").await,
+            HistoryDedupLookup::Unseen,
+            "the other pair must not find the nested collection's row"
+        );
+        plain.record("b\u{0}c", plain_record.clone()).await;
+
+        // The pair that a prefix range swept into the neighbouring namespace's capacity count.
+        assert_eq!(plain.lookup("key-one").await, HistoryDedupLookup::Unseen);
+        plain.record("key-one", plain_record.clone()).await;
+
+        assert_eq!(recorded(nested.lookup("c").await, "nested"), nested_record);
+        assert_eq!(
+            recorded(plain.lookup("b\u{0}c").await, "plain, own key"),
+            plain_record
+        );
+        assert_eq!(
+            recorded(plain.lookup("key-one").await, "plain, second key"),
+            plain_record
+        );
+        assert_eq!(row_count(&store, "a\u{0}b").await, 1);
+        assert_eq!(row_count(&store, "a").await, 2);
+    }
+
     /// A namespace at its bound refuses an unseen key instead of inserting one more row, so a
     /// stream of fresh keys — refusals for a missing target included — cannot exhaust storage.
     #[tokio::test]
@@ -502,6 +540,50 @@ mod tests {
         assert_eq!(
             elsewhere.lookup("key-overflow").await,
             HistoryDedupLookup::Unseen
+        );
+    }
+
+    /// The bound counts one namespace's rows exactly. Under the old prefix range a collection whose
+    /// name extended another's — `"a\0b"` beside `"a"` — had its rows swept into the shorter name's
+    /// count, so a full neighbour could refuse a namespace that held nothing at all.
+    #[tokio::test]
+    async fn the_capacity_count_holds_only_the_named_namespace() {
+        let dir = TempDir::new().expect("temporary directory");
+        let store = MindStore::open(&dir.path().join("history_dedup.db"))
+            .await
+            .expect("open the store");
+        let nested = SqliteHistoryDedupStore::new(store.pool(), "a\u{0}b");
+
+        // Fill the NUL-bearing namespace to its bound, and nothing else.
+        for index in 0..HISTORY_DEDUP_CAPACITY {
+            let key = format!("key-{index}");
+            assert_eq!(nested.lookup(&key).await, HistoryDedupLookup::Unseen);
+            nested
+                .record(
+                    &key,
+                    record("digest", SpokeResult::Ok(json!({ "deleted": 0 }))),
+                )
+                .await;
+        }
+        assert_eq!(
+            row_count(&store, "a\u{0}b").await,
+            HISTORY_DEDUP_CAPACITY,
+            "the nested namespace is full"
+        );
+        assert_eq!(row_count(&store, "a").await, 0);
+
+        // The shorter name is empty, so its own bound is untouched: a fresh key still claims.
+        let plain = SqliteHistoryDedupStore::new(store.pool(), "a");
+        assert_eq!(
+            plain.lookup("key-fresh").await,
+            HistoryDedupLookup::Unseen,
+            "the full neighbour's rows are not this namespace's"
+        );
+        assert_eq!(row_count(&store, "a").await, 1);
+        assert_eq!(
+            row_count(&store, "a\u{0}b").await,
+            HISTORY_DEDUP_CAPACITY,
+            "the neighbour's claim left the full namespace alone"
         );
     }
 }

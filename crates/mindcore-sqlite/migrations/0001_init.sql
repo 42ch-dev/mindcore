@@ -434,11 +434,16 @@ END;
 -- inserting the both-NULL row, and `record` fills it: a claim whose outcome never arrived keeps
 -- the retry out of the port, so a prune that committed before a crash is never re-executed.
 CREATE TABLE history_dedup (
-  key            TEXT PRIMARY KEY,
+  -- The collection whose history surface wrote the row, and Connect's opaque retry key. Two
+  -- columns, not one framed string: a collection name may contain any character, so no separator
+  -- can be unambiguous, and the capacity count needs an exact namespace equality.
+  namespace      TEXT NOT NULL,
+  key            TEXT NOT NULL,
   -- SHA-256 hex over the RFC 8785 canonical JSON of the whole request payload.
   payload_digest TEXT,
   -- The settled outcome as `{"ok": …}` or `{"reject": {"code", "message", "details"}}`.
   outcome_json   TEXT,
+  PRIMARY KEY (namespace, key),
   CHECK ((payload_digest IS NULL) = (outcome_json IS NULL))
 ) WITHOUT ROWID;
 
