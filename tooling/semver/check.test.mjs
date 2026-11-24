@@ -125,6 +125,18 @@ test('rejects an internal path dependency without version', () => {
   );
 });
 
+test('rejects a quoted dependency key without version', () => {
+  const root = fixture(cleanFixture);
+  crateToml(root, 'mindcore-sqlite', {
+    deps: '"mindcore-base" = { path = "../mindcore-base" }\n',
+  });
+  assert.ok(
+    checkManifests(root).some(
+      (e) => e.includes('mindcore-sqlite') && e.includes('mindcore-base') && e.includes('version'),
+    ),
+  );
+});
+
 test('rejects a path dependency in [build-dependencies] without version', () => {
   const root = fixture(cleanFixture);
   crateToml(root, 'mindcore-base', {
@@ -186,6 +198,19 @@ test('resolves a workspace-inherited dependency against the root entry', () => {
   );
 });
 
+test('resolves a quoted key in [workspace.dependencies]', () => {
+  const root = fixture((r) => {
+    workspace(r, '0.2.0', '\n[workspace.dependencies]\n"foo" = { path = "crates/foo" }\n');
+    for (const name of PUBLISHABLE) crateToml(r, name);
+    crateToml(r, 'mindcore-base', { deps: 'foo = { workspace = true }\n' });
+  });
+  assert.ok(
+    checkManifests(root).some(
+      (e) => e.includes('mindcore-base') && e.includes('foo') && e.includes('version'),
+    ),
+  );
+});
+
 test('accepts a workspace-inherited dependency whose root entry pins a version', () => {
   const root = fixture((r) => {
     workspace(
@@ -211,7 +236,8 @@ test('leaves path-only dev-dependencies alone', () => {
 
 test('parseToml descends dotted headers into nested tables', () => {
   const toml = parseToml(`[target.'cfg(unix)'.dependencies]\nfoo = { path = "../foo" }\n`);
-  assert.deepEqual(toml.target["'cfg(unix)'"].dependencies.foo, '{ path = "../foo" }');
+  // Quoted TOML keys are the same keys unquoted, so the parser drops the quotes.
+  assert.deepEqual(toml.target['cfg(unix)'].dependencies.foo, '{ path = "../foo" }');
 });
 
 test('rejects the test-scoring feature on mindcore-spi', () => {
@@ -393,5 +419,30 @@ test('baselineTag prefers a stable tag over a newer prerelease', () => {
     assert.equal(baselineTag(root), 'v0.1.0');
     commit('four');
     assert.equal(baselineTag(root), 'v0.2.0');
+  });
+});
+
+test('baselineTag ignores a short alias tag that version sort ranks first', () => {
+  gitRepo(({ root, git, commit }) => {
+    commit('one');
+    git('tag', 'v1.9.0');
+    commit('two');
+    // `v2` is a moving alias, not a release; only a full vX.Y.Z is a baseline.
+    git('tag', 'v2');
+    assert.equal(baselineTag(root), 'v1.9.0');
+  });
+});
+
+test('baselineTag skips an alias tag on the parent of a release commit', () => {
+  gitRepo(({ root, git, commit }) => {
+    commit('one');
+    git('tag', 'v1.9.0');
+    commit('two');
+    git('tag', 'v2');
+    commit('three');
+    git('tag', 'v2.0.0');
+    // HEAD is the v2.0.0 release; the alias on its parent must not be the
+    // predecessor the API diff compares against.
+    assert.equal(baselineTag(root), 'v1.9.0');
   });
 });
