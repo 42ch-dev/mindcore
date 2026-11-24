@@ -1,7 +1,7 @@
 name: Release
 
 # Tags the merged release-bump PR and creates the GitHub Release.
-# No crate ships to a registry: the release is a tag plus a GitHub Release.
+# Crates.io upload is the separate, manually dispatched publish.yml step.
 #
 # Release notes are the `## [<version>]` section of the committed `CHANGELOG.md`,
 # i.e. the curated notes the release PR carried. Commits merged after the

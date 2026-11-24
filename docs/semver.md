@@ -29,9 +29,12 @@ While the workspace version is `0.x.y`:
 ## Dependency-follow rules
 
 - **SPOKE follow rule** — `spoke-schemas`, `spoke-operations` and
-  `spoke-connect` are pinned with `=x.y.z` and are part of the public crates'
-  API surface. A `spoke-*` **minor** bump forces a mindcore **minor** bump; a
-  `spoke-*` **patch** bump may ship as a mindcore **patch**.
+  `spoke-connect` are declared at the `0.18` minor line
+  (`>=0.18.0, <0.19.0`) and are part of the public crates' API surface.
+  `Cargo.lock` remains the build pin: it fixes the exact `0.18.x` version
+  every checkout, CI run and `cargo publish --dry-run` builds against. A
+  `spoke-*` **minor** bump forces a mindcore **minor** bump; a `spoke-*`
+  **patch** bump may ship as a mindcore **patch**.
 - **sqlx major rule** — `sqlx` types are public: `MindStore::pool()` hands
   callers a `sqlx::SqlitePool`. A sqlx **major** bump is therefore a breaking
   change for consumers and forces a mindcore major-level bump even while

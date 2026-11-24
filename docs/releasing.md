@@ -1,7 +1,17 @@
 # Releasing to crates.io
 
-The release workflow creates the tag and the GitHub Release. Publishing the crates is a separate,
-manually dispatched step: `.github/workflows/publish.yml`.
+A release has four ordered steps:
+
+1. Dispatch `new-release.yml` (`workflow_dispatch`): it bumps the workspace
+   version, renders the changelog section and opens the `release`-labelled
+   bump pull request.
+2. Review and merge that pull request.
+3. `release.yml` runs on the merge: it creates the annotated `v<version>`
+   tag on the merge commit and the GitHub Release from that version's
+   `CHANGELOG.md` section.
+4. Dispatch `publish.yml` (`workflow_dispatch`) to upload the crates to
+   crates.io. `publish.yml` never creates a tag; it publishes the workspace
+   version that `release.yml` already tagged.
 
 ## Publish order
 
@@ -40,8 +50,10 @@ wrong:
   build, not at the registry.
 - The workspace version in `Cargo.toml` is the version you intend to publish. The workflow reads it
   when the `version` input is empty, and refuses an input that disagrees with it.
-- The tag for that version exists (`release.yml` creates it). `cargo publish` does not need it, but
-  the release notes and the tag should describe what is on crates.io.
+- Steps 1–3 above are complete: the release pull request is merged and
+  `release.yml` has created the `v<version>` tag (`publish.yml` never creates
+  one). `cargo publish` does not need the tag, but the release notes and the
+  tag should describe what is on crates.io.
 
 ## Token
 
