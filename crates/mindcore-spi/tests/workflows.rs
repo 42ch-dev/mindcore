@@ -2913,9 +2913,10 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
     /// The provider delay, so the settle reaches the binding well after the
     /// call's start.
     const REASONER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
-    /// Clock granularity slack over the deadline's own computation, far below
-    /// the delay a commit-time recomputation would add.
-    const GRANULARITY: std::time::Duration = std::time::Duration::from_millis(1);
+    /// Slack over the deadline's own computation: room for a scheduler pause
+    /// between the test's `start` sample and the SPI's deadline, far below the
+    /// reasoner delay a commit-time recomputation would add.
+    const GRANULARITY: std::time::Duration = std::time::Duration::from_millis(20);
 
     let binding = DeliberateDouble::new();
     let deadlines = binding.deadlines();
