@@ -4349,3 +4349,53 @@ async fn a_settle_commits_on_a_free_connection_within_its_deadline() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["record_id"], "cog_settled");
 }
+
+/// The bounded acquire waits rather than failing fast: a connection held only
+/// briefly, released well before the deadline, still lets the settle commit.
+#[tokio::test]
+async fn a_settle_waits_out_a_short_hold_until_its_deadline() {
+    /// How long the only connection stays held: short against the deadline,
+    /// long against any immediate refusal.
+    const HOLD: Duration = Duration::from_millis(150);
+
+    let harness = deliberate_harness().await;
+    let binding = settle_binding(&harness.pool);
+    let hold = harness
+        .pool
+        .acquire()
+        .await
+        .expect("hold the only connection");
+    let start = std::time::Instant::now();
+    let deadline = start + Duration::from_secs(30);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(HOLD).await;
+        drop(hold);
+    });
+
+    let version = tokio::time::timeout(
+        CANCELLATION_GUARD,
+        binding.commit_cognition(
+            &principal(),
+            SPACE,
+            SUBJECT,
+            &settle_holder(),
+            1,
+            settle_record("cog_waited"),
+            &[],
+            deadline,
+        ),
+    )
+    .await
+    .expect("the settle must not outlast its guard")
+    .expect("a connection released before the deadline lets the settle commit");
+    release.await.expect("the release task");
+
+    assert!(
+        start.elapsed() >= HOLD,
+        "the settle waited for the held connection instead of refusing at once"
+    );
+    assert_eq!(version, 2, "the carrier advances one revision");
+    let records = committed_records(&harness).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["record_id"], "cog_waited");
+}
