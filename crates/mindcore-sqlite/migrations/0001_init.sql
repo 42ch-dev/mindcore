@@ -428,25 +428,26 @@ END;
 
 -- Prune dedup: one row per retry identity, `(namespace, key)` — the collection its history surface
 -- routes to, and the Connect key — so two surfaces on one database that share a wire scope and
--- principal still never replay each other's prunes. Nothing orders or expires rows, so there is no
--- timestamp column; each namespace is capped at 4096 rows, and a namespace at the bound answers a
--- fresh key `RECEIPT_EXPIRED` instead of inserting past it. `lookup` claims a key by inserting the
--- both-NULL row, and `record` fills it: a claim whose outcome never arrived keeps the retry out of
--- the port, so a prune that committed before a crash is never re-executed.
+-- principal still never replay each other's prunes. Nothing is ever deleted and no clock is read:
+-- `principal` carries the requester the key names, and each `(namespace, principal)` pair is capped
+-- at 4096 rows, so a pair at the bound answers a fresh key `RECEIPT_EXPIRED` instead of inserting
+-- past it, and one high-churn caller can exhaust only its own quota. `lookup` claims a key by
+-- inserting the both-NULL row, and `record` fills it: a claim whose outcome never arrived keeps the
+-- retry out of the port, so a prune that committed before a crash is never re-executed.
 CREATE TABLE history_dedup (
   -- The collection whose history surface wrote the row, and Connect's opaque retry key. Two
   -- columns, not one framed string: a collection name may contain any character, so no separator
   -- can be unambiguous, and the capacity count needs an exact namespace equality.
   namespace      TEXT NOT NULL,
   key            TEXT NOT NULL,
+  -- The requester the key names, parsed out of Connect's canonical retry identity. Not derivable
+  -- from `key` by SQL, and the quota is per caller: a row whose key would not parse stores the
+  -- whole key here, so it is accounted to itself and to nobody else.
+  principal      TEXT NOT NULL,
   -- SHA-256 hex over the RFC 8785 canonical JSON of the whole request payload.
   payload_digest TEXT,
   -- The settled outcome as `{"ok": …}` or `{"reject": {"code", "message", "details"}}`.
   outcome_json   TEXT,
-  -- Unix seconds at which the row was claimed or last settled. `lookup` reclaims a namespace's
-  -- rows older than its retention window before it claims, so a key past that window is a fresh
-  -- request rather than a permanent occupant of the namespace's bound.
-  recorded_at    INTEGER NOT NULL CHECK (typeof(recorded_at) = 'integer' AND recorded_at >= 0),
   PRIMARY KEY (namespace, key),
   CHECK ((payload_digest IS NULL) = (outcome_json IS NULL))
 ) WITHOUT ROWID;
