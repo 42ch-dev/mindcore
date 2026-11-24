@@ -82,6 +82,9 @@ jobs:
 
           git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "chore(release): bump version to ${VERSION}"
+          # A re-dispatch must be able to replace its own branch, so learn the
+          # remote tip first; otherwise the lease has no expected value.
+          git fetch origin "$BRANCH" 2>/dev/null || true
           git push --force-with-lease origin "$BRANCH"
 
       - name: Ensure release label
