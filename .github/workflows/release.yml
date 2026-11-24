@@ -67,6 +67,16 @@ jobs:
         if: ${{ !contains(steps.version.outputs.version, '-') }}
         run: node tooling/semver/check.mjs --blocking
 
+      # The lock must already cover every migration in the tagged commit.
+      # --write-lock is a no-op when it does; when a migration landed after the
+      # release PR opened, it writes the missing entry and the diff fails the
+      # gate instead of tagging a migration the next check would not protect.
+      - name: Migration lock is complete
+        if: ${{ !contains(steps.version.outputs.version, '-') }}
+        run: |
+          node tooling/migrations/check.mjs --write-lock
+          git diff --exit-code -- tooling/migrations/migrations.lock.json
+
       # A prerelease never uploads, so it claims no registry version and owes no
       # compatible API to one.
       - name: Skip SemVer policy check
