@@ -57,7 +57,8 @@ via `sqlx::migrate!`.
   path.
 - **Pre-release exception.** Before the first published release the migration
   files are still mutable and cross-commit database compatibility is
-  unsupported; the rules above take effect at the first `v*` tag.
+  unsupported; the rules above take effect at the first stable `v*` tag — a
+  prerelease tag ships nothing and is not a published set.
 
 `tooling/migrations/check.mjs` guards this policy in CI.
 
@@ -72,11 +73,12 @@ via `sqlx::migrate!`.
   must never ship;
 - `[workspace.package] version` is not valid SemVer.
 
-Once a `v*` tag exists it additionally runs
+Once a stable `v*` tag exists it additionally runs
 `cargo semver-checks check-release -p <crate> --baseline-rev <tag>` for each
 publishable crate. The baseline is the newest stable `v*` tag — on a tag
-commit, the previous stable release reachable from its parent — falling back to
-the newest tag, prerelease included, when no stable tag exists. The API diff
+commit, the previous stable release reachable from its parent. A prerelease tag
+never qualifies: it is Git-only, claims no registry version, and would otherwise
+be compared against as if it had shipped one. The API diff
 fails the build only on a release tag commit (when the tag itself must carry a
 compatible API), unless `--blocking` is passed: the flag forces the diff to
 block everywhere, which is how `release.yml`'s `semver-gate` job checks the
@@ -84,10 +86,11 @@ merged release PR before `release` creates the tag. Off a tag commit without
 the flag, violations are reported as non-blocking warnings, so a breaking
 change can land on `main` and be enforced by a release PR's version bump. A
 shallow clone that hides every `v*` tag is an error — fetch the tags and their
-history (`actions/checkout: fetch-depth: 0`) — not a pass. A repository with no
-`v*` tag at all, or a release tag with no previous `v*` tag — the first
-release — prints `no baseline tag; API diff check skipped` and passes: there is
-no predecessor to compare against, so the API diff does not run (rather than
+history (`actions/checkout: fetch-depth: 0`) — not a pass. No stable `v*` tag
+— a fresh repository, or one whose history holds only prerelease tags — prints
+`no baseline tag; API diff check skipped` and passes, as does a release tag with
+no previous stable `v*` tag, the first release: there is no predecessor to
+compare against, so the API diff does not run (rather than
 comparing the tag against itself), and `tooling/migrations/check.mjs` treats
 the working tree as the first published set.
 

@@ -2,12 +2,15 @@
 // Shared release baseline for the release-surface checkers.
 //
 // The baseline is the release this tree must stay compatible with:
-//   - on a tag commit, the previous tag (the one this release supersedes);
-//   - anywhere else, the newest tag (what consumers already have).
-// No tag at all means nothing has shipped yet, so callers fall back to their
-// "first published set" behaviour. CI must check out with `fetch-depth: 0`; a
-// shallow clone hides the tags, so the lookups below answer "no baseline" and
-// the callers turn that into an error instead of a silent pass.
+//   - on a tag commit, the previous stable release (the one this release
+//     supersedes);
+//   - anywhere else, the newest stable release (what consumers already have).
+// Only stable `v*` tags qualify: a prerelease tag is Git-only and claims no
+// registry version, so it is never a baseline. No stable tag at all means
+// nothing has shipped yet, so callers fall back to their "first published set"
+// behaviour. CI must check out with `fetch-depth: 0`; a shallow clone hides the
+// tags, so the lookups below answer "no baseline" and the callers turn that
+// into an error instead of a silent pass.
 
 import { execFileSync } from 'node:child_process';
 
@@ -23,13 +26,12 @@ export function git(cwd, args) {
 }
 
 // Newest stable v* tag from a `git tag --list` argument set: the first line
-// without a prerelease suffix (`-`), falling back to the newest tag when only
-// prereleases exist. `args` carries the list pattern and any --merged filter.
+// without a prerelease suffix (`-`), or null when every tag is a prerelease.
+// `args` carries the list pattern and any --merged filter.
 function newestStable(cwd, args) {
   const tags = git(cwd, ['tag', '--list', ...args, '--sort=-v:refname']);
   if (tags === null) return null;
-  const lines = tags.split('\n').filter(Boolean);
-  return lines.find((tag) => !tag.includes('-')) ?? lines[0] ?? null;
+  return tags.split('\n').find((tag) => tag && !tag.includes('-')) ?? null;
 }
 
 export function baselineTag(cwd) {

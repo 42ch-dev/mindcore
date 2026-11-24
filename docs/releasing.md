@@ -18,6 +18,12 @@ without persisted Git credentials: `cargo semver-checks` builds dependencies,
 and their build scripts must not run with a token that can write repository
 refs.
 
+Its baseline is the newest stable `v*` tag — the previous release actually on
+crates.io. Prerelease tags never qualify: a prerelease is Git-only, so comparing
+against one would diff against a version the registry never had. With no stable
+tag yet (the first release, or a history of prereleases only) the API diff is
+skipped.
+
 There is no manual publish step: publishing is the last job of the release
 workflow and starts by itself once the release job succeeded. Any SemVer
 prerelease — a version with a `-` suffix, such as `v0.2.0-beta.1` or

@@ -201,7 +201,7 @@ test('baselineTag is null without a v* tag or any git history', () => {
   gitRepo(({ root }) => assert.equal(baselineTag(root), null));
 });
 
-test('baselineTag is the previous tag on a tag commit and the newest tag elsewhere', () => {
+test('baselineTag is the previous stable tag on a tag commit and the newest stable tag elsewhere', () => {
   gitRepo(({ root, git, commit }) => {
     commit('one');
     assert.equal(baselineTag(root), null);
@@ -227,6 +227,18 @@ test('baselineTag ignores a non-release tag between two releases', () => {
     git('tag', 'v0.2.0');
     // The non-release tag sits on the parent commit but is not a baseline.
     assert.equal(baselineTag(root), 'v0.1.0');
+  });
+});
+
+test('baselineTag is null when only prerelease tags exist', () => {
+  gitRepo(({ root, git, commit }) => {
+    commit('one');
+    git('tag', 'v0.1.0-rc.1');
+    // A prerelease claims no registry version, so it is never a baseline.
+    assert.equal(baselineTag(root), null);
+    commit('two');
+    git('tag', 'v0.1.0-rc.2');
+    assert.equal(baselineTag(root), null);
   });
 });
 
