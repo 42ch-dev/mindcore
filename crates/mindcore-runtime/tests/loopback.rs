@@ -95,6 +95,9 @@ const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
 const PEER_TWO_SEED: [u8; 32] = [0x5Cu8; 32];
 const PEER_TWO_PRINCIPAL: &str = "prn_peer_two";
 
+/// The database file the fixture opens; a test may reopen the same path.
+const DB_FILE: &str = "loopback.db";
+
 /// One store the runtime serves: the protocol memory shape with two retained records, the
 /// grants the workflows read, and the knowledge collection the face serves.
 struct Fixture {
@@ -107,7 +110,7 @@ impl Fixture {
     /// migration installs the protocol schema), then seed the rows the faces read.
     async fn open() -> Self {
         let dir = TempDir::new().expect("temporary directory");
-        let store = MindStore::open(&dir.path().join("loopback.db"))
+        let store = MindStore::open(&dir.path().join(DB_FILE))
             .await
             .expect("open store");
         let pool = store.pool();
@@ -214,6 +217,11 @@ impl Fixture {
                 .await,
             "write the carrier entry",
         );
+    }
+
+    /// The database file this fixture opened, for a test that reopens it after a restart.
+    fn db_path(&self) -> std::path::PathBuf {
+        self.dir.path().join(DB_FILE)
     }
 
     /// The store and its directory part company: the engine takes the store, the caller keeps the
@@ -3474,4 +3482,122 @@ async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
             .get("floor_revision"),
         Some(&json!(3))
     );
+}
+
+/// The record lives in the database file, not in the process: after the session, the surface and
+/// the serve are gone, a reopened file replays the prune's outcome instead of executing again
+/// against checkpoints the original call never saw.
+///
+/// This fails against the in-memory default — a fresh surface starts with an empty store, the
+/// retry answers `Unseen`, and the re-run deletes checkpoint 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
+    let fixture = Fixture::open().await;
+    let path = fixture.db_path();
+    let store = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    let mut base = None;
+    for summary in [
+        "the gate opens at dawn",
+        "the gate closes at dusk",
+        "the gate opens again at dawn",
+    ] {
+        base = expect_ok(
+            store
+                .put_knowledge_entry(history_entry("ke_history", summary), base)
+                .await,
+            "seed the entry's history",
+        )
+        .revision;
+    }
+    let scope = scope_of(SCOPE_ID);
+
+    let (dir, serve) = fixture.serve();
+    let first = {
+        let mut attached = faces(
+            hello("runtime", &["spoke-history"]),
+            None,
+            MindProviders::default(),
+            routes(&[]),
+        );
+        attached.history = true;
+        let surface = surface(&serve, attached);
+        let session = connect(&surface, &["spoke-history"]).await;
+        let first = expect_ok(
+            session
+                .adapter
+                .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+                .await,
+            "the first prune",
+        );
+        assert_eq!(first.deleted, 1);
+        assert_eq!(first.floor_revision, Some(2));
+        first
+    };
+
+    // One more revision leaves checkpoints 2 and 3 above the floor, so a retry that re-ran the
+    // prune instead of replaying its record would delete checkpoint 2 and report a higher floor.
+    expect_ok(
+        store
+            .put_knowledge_entry(
+                history_entry("ke_history", "the gate is bolted at midnight"),
+                base,
+            )
+            .await,
+        "write another revision after the first prune",
+    );
+
+    // The whole serving stack goes away: the record has to be on disk to survive this.
+    drop(store);
+    drop(serve);
+
+    let reopened = MindStore::open(&path)
+        .await
+        .expect("reopen the same database file");
+    let serve = MindcoreServe::new(reopened, false, |_targets| Ok(()));
+    let mut attached = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    attached.history = true;
+    let surface = surface(&serve, attached);
+    let session = connect(&surface, &["spoke-history"]).await;
+    let dialer = &*session.adapter;
+
+    let replay = expect_ok(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the same key and payload after a reopen",
+    );
+    assert_eq!(
+        serde_json::to_vec(&replay).expect("the result serializes"),
+        serde_json::to_vec(&first).expect("the result serializes"),
+        "the recorded outcome replays byte-equal across a reopen"
+    );
+    for revision in [2u64, 3] {
+        expect_ok(
+            HistoryPort::get_history_snapshot(
+                dialer,
+                &principal(),
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                revision,
+            )
+            .await,
+            "the replayed prune deleted nothing, so both checkpoints above the floor still exist",
+        );
+    }
+
+    let reject = expect_reject(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 2, Some("key-one"))
+            .await,
+        "the same key with another keep after a reopen",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::IdempotencyConflict);
+
+    drop(dir);
 }
