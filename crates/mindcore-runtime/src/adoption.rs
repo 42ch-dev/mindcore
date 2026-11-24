@@ -589,13 +589,16 @@ mod tests {
             .await
             .expect("begin the destination read");
         let gate = Mutex::new(&mut transaction);
-        let port = AdoptionDestination {
-            collection: DESTINATION_COLLECTION,
-            scope: admitted,
-            gate: &gate,
+        // The port borrows the gate's `&mut transaction`, so the read runs inside this block: its
+        // end is what releases the borrow before the rollback below.
+        let answer = {
+            let port = AdoptionDestination {
+                collection: DESTINATION_COLLECTION,
+                scope: admitted,
+                gate: &gate,
+            };
+            port.get_knowledge_entry(entry_id).await
         };
-        let answer = port.get_knowledge_entry(entry_id).await;
-        drop(port);
         transaction.rollback().await.expect("roll back the read");
         match answer {
             SpokeResult::Reject(reject) => reject,
