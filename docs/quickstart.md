@@ -20,16 +20,23 @@ repository's integration test runs. It is a guided path, not a complete API refe
 
 ## Add the dependency
 
-The crates are `publish = false`; depend on this repository directly.
+`mindcore-base` and `mindcore-sqlite` are on crates.io; let Cargo resolve the version the registry
+holds. `[workspace.package].version` in this repository is the source of truth for what a release
+contains.
+
+```sh
+cargo add mindcore-base mindcore-sqlite
+```
+
+`mindcore-spoke`, which the transaction examples below use, is not published; it and the remaining
+pins go into `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
-mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
 # match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = "0.18"
-spoke-schemas = "0.18"
+spoke-operations = ">=0.18.1, <0.19.0"
+spoke-schemas = ">=0.18.1, <0.19.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```

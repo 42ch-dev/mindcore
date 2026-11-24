@@ -59,10 +59,12 @@ via `sqlx::migrate!`.
   database whose applied migrations no longer match the embedded set (sqlx's
   `VersionMissing`, or a checksum mismatch) rather than guessing an upgrade
   path.
-- **Pre-release exception.** Before the first published release the migration
-  files are still mutable and cross-commit database compatibility is
-  unsupported; the rules above take effect at the first stable `v*` tag — a
-  prerelease tag ships nothing and is not a published set.
+- **First upload, then immutable.** The first upload to crates.io closed the
+  pre-release window: its migration set is the published one and the rules
+  above hold from there — a prerelease tag locks the shipped set too, because
+  the release PR writes the lock. An upload does not move the *API* baseline:
+  that baseline is the latest stable `v*` tag, so an alpha upload claims no
+  compatible API.
 
 `tooling/migrations/check.mjs` guards this policy in CI. The release PR runs it with
 `--write-lock` so every migration it ships is locked before the tag; `release.yml`'s
