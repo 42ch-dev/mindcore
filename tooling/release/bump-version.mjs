@@ -101,14 +101,16 @@ export function replaceLockVersion(contents, packageName, version) {
  */
 export function replaceMemberDependencyVersions(contents, self, members, version) {
   const internalDirs = new Set(members.map((member) => resolve(member.dir)));
-  const internalNames = new Set(members.map((member) => member.name));
   return contents.replace(
-    /^(\s*)([A-Za-z0-9_-]+)\s*=\s*\{([^}]*)\}/gm,
-    (line, indent, name, body) => {
+    /^(\s*)([A-Za-z0-9_-]+)\s*=\s*\{([^}]*)\}(.*)$/gm,
+    (line, indent, name, body, tail) => {
       const path = body.match(/(?:^|,)\s*path\s*=\s*"([^"]+)"/)?.[1];
-      const internal = path === undefined
-        ? internalNames.has(name)
-        : internalDirs.has(resolve(self.dir, path));
+      // A path is what makes a dependency internal; a bare name that happens to
+      // match a member is an external crate with the same name.
+      if (path === undefined) {
+        return line;
+      }
+      const internal = internalDirs.has(resolve(self.dir, path));
       if (!internal) {
         return line;
       }
@@ -116,7 +118,7 @@ export function replaceMemberDependencyVersions(contents, self, members, version
       if (!requirement.test(body)) {
         return line;
       }
-      return `${indent}${name} = {${body.replace(requirement, `$1$2"${version}"`)}}`;
+      return `${indent}${name} = {${body.replace(requirement, `$1$2"${version}"`)}}${tail}`;
     },
   );
 }
