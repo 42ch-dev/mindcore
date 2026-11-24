@@ -32,18 +32,50 @@ jobs:
           node-version: 24.18.1
           package-manager-cache: false
 
-      - name: Tag the merge commit
-        id: tag
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: git-cliff@2
+
+      - name: Prepare release notes
+        id: notes
         run: |
           set -euo pipefail
+          # The merge commit's version, not the dispatch-time snapshot: git-cliff
+          # reads the commits that actually landed, including late merges.
           VERSION="$(node tooling/release/next-version.mjs --current)"
           TAG="v${VERSION}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          BODY_FILE="${RUNNER_TEMP}/release-body.md"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "body=${BODY_FILE}"
+          } >> "$GITHUB_OUTPUT"
 
+          # The note range runs from the previous release tag to HEAD.
+          git fetch --tags --force origin
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            # A rerun has no commits left to render: reuse the annotation the
+            # first run baked in, minus any signature appended to the tag object.
+            git tag -l --format='%(contents)' "${TAG}" \
+              | sed '/^-----BEGIN [A-Z ]*SIGNATURE-----/,$d' > "$BODY_FILE"
+          else
+            git-cliff --tag "${TAG}" -o "${RUNNER_TEMP}/release-notes.md"
+            # extract-changelog-notes reports its own reason on stderr.
+            node tooling/release/extract-changelog-notes.mjs "${VERSION}" "${RUNNER_TEMP}/release-notes.md" > "$BODY_FILE" || true
+          fi
+          if [ ! -s "$BODY_FILE" ]; then
+            echo "::error::No release notes for ${TAG}; the release body would be empty."
+            exit 1
+          fi
+
+      - name: Tag the merge commit
+        env:
+          TAG: ${{ steps.notes.outputs.tag }}
+          BODY_FILE: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch --tags --force origin
 
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
             if [ "$(git cat-file -t "refs/tags/${TAG}")" != "tag" ]; then
@@ -58,12 +90,8 @@ jobs:
             fi
             echo "Tag ${TAG} already exists; continuing."
           else
-            # The tag annotation may fall back; the Release body may not.
-            MESSAGE="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" 2>/dev/null)" || MESSAGE=""
-            if [ -z "$MESSAGE" ]; then
-              MESSAGE="Release ${TAG}"
-            fi
-            git tag -a "$TAG" -m "$MESSAGE" "${{ github.event.pull_request.merge_commit_sha }}"
+            # verbatim: the default cleanup strips Markdown `#` headings.
+            git tag -a "$TAG" --cleanup=verbatim -F "$BODY_FILE" "${{ github.event.pull_request.merge_commit_sha }}"
             git push origin "refs/tags/${TAG}"
             echo "Created and pushed ${TAG}"
           fi
@@ -71,26 +99,19 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.tag.outputs.version }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.notes.outputs.version }}
+          TAG: ${{ steps.notes.outputs.tag }}
+          BODY_FILE: ${{ steps.notes.outputs.body }}
         run: |
           set -euo pipefail
-          # No silent fallback: a missing or empty changelog section fails the job.
-          if ! BODY="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}")"; then
-            echo "::error::No CHANGELOG.md section for ${VERSION}; the release body would be empty."
-            exit 1
-          fi
-
           # Any SemVer prerelease (`-...`) is a prerelease release.
           PRERELEASE=()
           case "$VERSION" in
             *-*) PRERELEASE=(--prerelease) ;;
           esac
 
-          NOTES_FILE="$(mktemp)"
-          printf '%s\n' "$BODY" > "$NOTES_FILE"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release ${TAG} already exists; continuing."
           else
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" "${PRERELEASE[@]}"
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$BODY_FILE" "${PRERELEASE[@]}"
           fi

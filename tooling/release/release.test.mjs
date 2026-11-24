@@ -255,6 +255,25 @@ describe("extract-changelog-notes", () => {
     assert.equal(result.stdout, "");
     assert.match(result.stderr, /"## \[0\.2\.0\]" section is empty/);
   });
+
+  it("reads the changelog given as the second argument", () => {
+    const root = createFixture();
+    const file = join(root, "nightly.md");
+    writeFileSync(file, "# Changelog\n\n## [0.3.0] - 2026-01-05\n\n### Added\n\n- From a file.\n");
+
+    const relative = run(root, "extract-changelog-notes.mjs", ["0.3.0", "nightly.md"]);
+    assert.equal(relative.status, 0, relative.stderr);
+    assert.equal(relative.stdout, "### Added\n\n- From a file.\n");
+
+    const absolute = run(root, "extract-changelog-notes.mjs", ["0.3.0", file]);
+    assert.equal(absolute.status, 0, absolute.stderr);
+    assert.equal(absolute.stdout, "### Added\n\n- From a file.\n");
+
+    const missing = run(root, "extract-changelog-notes.mjs", ["0.3.0", "absent.md"]);
+    assert.equal(missing.status, 1);
+    assert.equal(missing.stdout, "");
+    assert.match(missing.stderr, /cannot read absent\.md/);
+  });
 });
 
 describe("render-changelog", () => {
