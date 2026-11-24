@@ -73,8 +73,14 @@ An unlocked file with a greater prefix is an append and passes; committing it pu
 lock entry lands. The script prints the locked set, the present set and the appended-but-unlocked
 files, reports every violation it found, and exits non-zero if there was any.
 
-Appending to the lock by hand is deliberate: it makes publishing a migration a reviewed change
-rather than a side effect of adding a file.
+The release PR runs `node tooling/migrations/check.mjs --write-lock`: it performs every check above
+first, and rewrites the lock to every present migration only if all of them pass. So each migration
+shipped in that release is locked before the tag is cut. A failed check never rewrites the lock —
+the run exits non-zero and `migrations.lock.json` keeps its previous contents.
+
+Appending to the lock by hand is deliberate for ordinary changes: it makes publishing a migration a
+reviewed change rather than a side effect of adding a file. `--write-lock` is only the release-time
+fold of migrations already merged and reviewed, and a second run on an unchanged tree is a no-op.
 
 ## Version 0.1.0
 

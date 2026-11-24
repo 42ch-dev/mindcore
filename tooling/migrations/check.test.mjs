@@ -39,7 +39,9 @@ function scratch() {
     git(root, 'add', '--all');
     git(root, 'commit', '--quiet', '-m', message);
   };
-  const run = () => spawnSync(process.execPath, ['tooling/migrations/check.mjs'], { cwd: root, encoding: 'utf8' });
+  const run = (args = []) =>
+    spawnSync(process.execPath, ['tooling/migrations/check.mjs', ...args], { cwd: root, encoding: 'utf8' });
+  const readLock = () => readFileSync(join(root, 'tooling', 'migrations', 'migrations.lock.json'), 'utf8');
 
   writeMigration('0001_init.sql', 'CREATE TABLE a (x);\n');
   writeLock(['0001_init.sql']);
@@ -49,7 +51,7 @@ function scratch() {
   git(root, 'config', 'tag.gpgsign', 'false');
   commit('first published set');
 
-  return { root, writeMigration, writeLock, commit, run, migrations };
+  return { root, writeMigration, writeLock, commit, run, readLock, migrations };
 }
 
 test('an unlocked first published set passes', () => {
@@ -111,6 +113,45 @@ test('an appended migration passes and one numbered before a published prefix fa
   const result = s.run();
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /append-only/);
+  rmSync(s.root, { recursive: true, force: true });
+});
+
+test('--write-lock folds an appended migration into the lock and is idempotent', () => {
+  const s = scratch();
+  s.writeMigration('0002_x.sql', 'CREATE TABLE b (x);\n');
+
+  const first = s.run(['--write-lock']);
+  assert.equal(first.status, 0, first.stderr);
+  const lock = JSON.parse(s.readLock());
+  assert.deepEqual(
+    lock.map((entry) => entry.file),
+    ['0001_init.sql', '0002_x.sql'],
+  );
+  assert.equal(lock[1].sha256, hash(join(s.migrations, '0002_x.sql')));
+
+  const written = s.readLock();
+  const second = s.run(['--write-lock']);
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(s.readLock(), written, 'a second --write-lock must not change the lock');
+  rmSync(s.root, { recursive: true, force: true });
+});
+
+test('two migrations sharing a prefix fail both modes and leave the lock untouched', () => {
+  const s = scratch();
+  s.writeMigration('0002_x.sql', 'CREATE TABLE b (x);\n');
+  assert.equal(s.run(['--write-lock']).status, 0);
+  s.commit('lock 0002_x');
+  const written = s.readLock();
+
+  s.writeMigration('0002_y.sql', 'CREATE TABLE c (x);\n');
+
+  for (const args of [[], ['--write-lock']]) {
+    const result = s.run(args);
+    assert.equal(result.status, 1, `check${args.length ? ' --write-lock' : ''} must fail`);
+    assert.match(result.stderr, /0002_x\.sql/);
+    assert.match(result.stderr, /0002_y\.sql/);
+    assert.equal(s.readLock(), written, 'a failed check must not rewrite the lock');
+  }
   rmSync(s.root, { recursive: true, force: true });
 });
 
