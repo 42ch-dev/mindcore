@@ -22,7 +22,10 @@
   `principal` column is the third member of the retry identity — so one high-churn principal can
   exhaust only its own and never disable prune for another on the same collection. A principal at
   its quota answers an unseen key with `RECEIPT_EXPIRED` without executing the prune, and `record`
-  writes no row past the quota. A host that needs more headroom raises the cap or recreates the
+  writes no row past the quota. A prune that commits when its key was never claimed and its
+  principal is already at quota keeps no receipt, and the store writes one fixed line to the host's
+  stderr at that path — naming no key, principal or payload — so a host can tell that a committed
+  prune's outcome went unretained. A host that needs more headroom raises the cap or recreates the
   database. One serving process per database is a host obligation. The adoption face keeps the
   in-memory default.
 

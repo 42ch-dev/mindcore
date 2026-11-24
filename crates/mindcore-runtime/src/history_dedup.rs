@@ -30,6 +30,12 @@
 //! identity, so one high-churn principal can exhaust only its own quota and never disable prune for
 //! another on the same collection. A host that wants more headroom raises
 //! [`HISTORY_DEDUP_CAPACITY`] or recreates the database; there is no eviction to wait for.
+//!
+//! One consequence is not observable through the wire: when a prune commits and `record` cannot
+//! store its outcome — the key was never claimed and the principal is already at its quota — the
+//! prune happened and no receipt exists to protect it. The store writes one fixed line to the
+//! host's stderr at that path, naming no key, principal or payload, so a host can tell that a
+//! committed prune's outcome went unretained.
 
 use std::io::Write;
 
@@ -179,13 +185,28 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&self.pool)
         .await;
-        if let Err(error) = written {
-            // The claim stays in place, so the key answers `RECEIPT_EXPIRED` rather than
-            // re-executing. The diagnostic names local columns and stays host-side.
-            let _ = writeln!(
-                std::io::stderr(),
-                "mindcore history dedup record fault: {error}"
-            );
+        match written {
+            Err(error) => {
+                // The claim stays in place, so the key answers `RECEIPT_EXPIRED` rather than
+                // re-executing. The diagnostic names local columns and stays host-side.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "mindcore history dedup record fault: {error}"
+                );
+            }
+            // The guard refused the row: the key was not claimed and this principal is at its
+            // quota, so the prune that just committed has no retained receipt. Say so — a host
+            // cannot otherwise tell a deduplicated prune from an unrecorded one. The sentence
+            // names no key, principal or payload: the identity stays out of the log.
+            Ok(done) if done.rows_affected() == 0 => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "mindcore history dedup quota exhausted: a committed prune's outcome was not \
+                     retained, so a retry of its key answers RECEIPT_EXPIRED instead of \
+                     replaying; this principal's quota for this collection is full"
+                );
+            }
+            Ok(_) => {}
         }
     }
 }
