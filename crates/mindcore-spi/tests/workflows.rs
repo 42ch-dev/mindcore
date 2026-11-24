@@ -2901,16 +2901,22 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
 }
 
 /// The settle hands the binding the request's one deadline, computed from the
-/// call's own start, so the binding can bound its store-connection wait.
+/// call's own start, so the binding can bound its store-connection wait. The
+/// reasoner delays long enough that a deadline computed at the commit would be
+/// visibly later than one computed at the call's start.
 #[tokio::test]
 async fn deliberate_hands_the_binding_its_request_deadline() {
+    /// The provider delay, so the settle reaches the binding well after the
+    /// call's start; longer than the assertion's upper slack.
+    const REASONER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+    /// Slack above `start + timeout` for the time between the test's start
+    /// reading and the deadline's computation inside the call.
+    const COMPUTATION_SLACK: std::time::Duration = std::time::Duration::from_millis(50);
+
     let binding = DeliberateDouble::new();
     let deadlines = binding.deadlines();
     let workflows = SpiMindWorkflows::new(binding);
-    let reasoner = DeliberateReasoner {
-        verdict: promote_verdict(),
-        calls: Arc::new(AtomicUsize::new(0)),
-    };
+    let reasoner = SlowReasoner(REASONER_DELAY);
     let policy = AutoPolicy;
     let caps = MindCapabilities {
         reasoner: Some(&reasoner),
@@ -2940,6 +2946,10 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
         .await
         .expect("deliberate");
     assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+    assert!(
+        start.elapsed() >= REASONER_DELAY,
+        "the reasoner delay must actually elapse"
+    );
 
     let handed = deadlines.lock().expect("deadlines");
     assert_eq!(
@@ -2947,17 +2957,14 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
         1,
         "one settlement hands one deadline to the binding"
     );
-    // The deadline is computed once, inside the call, from that instant plus the
-    // request timeout: never earlier than the call's start, and never more than
-    // one timeout past it plus the call's own elapsed time.
-    let elapsed = start.elapsed();
     assert!(
-        handed[0] >= start,
-        "the deadline cannot predate the call that computed it"
+        handed[0] >= start + timeout,
+        "the deadline is the call's own start plus the timeout, never shorter"
     );
     assert!(
-        handed[0] <= start + timeout + elapsed,
-        "the deadline stays one request timeout past the call's start"
+        handed[0] <= start + timeout + COMPUTATION_SLACK,
+        "the deadline is computed once at the call's start, never recomputed \
+         from now at the commit"
     );
 }
 
@@ -3235,6 +3242,21 @@ impl Reasoner for HungReasoner {
         _request: StructuredReasonRequest<'_>,
     ) -> Result<Value, SpiError> {
         std::future::pending().await
+    }
+}
+
+/// A reasoner that answers its verdict only after a real delay, so the settle
+/// reaches the binding long after the call's own start.
+struct SlowReasoner(std::time::Duration);
+
+#[async_trait]
+impl Reasoner for SlowReasoner {
+    async fn reason_structured(
+        &self,
+        _request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        tokio::time::sleep(self.0).await;
+        Ok(promote_verdict())
     }
 }
 
