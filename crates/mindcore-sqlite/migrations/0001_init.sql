@@ -426,13 +426,13 @@ BEGIN
     (OLD.collection, OLD.entry_id, OLD.revision, OLD.payload, OLD.cognition_head_seq, OLD.updated_at);
 END;
 
--- Prune dedup: one row per retry identity — the Connect key itself — prefixed with the collection
--- its history surface routes to and a NUL, so two surfaces on one database that share a wire scope
--- and principal still never replay each other's prunes. Nothing orders or expires rows, so there
--- is no timestamp column; each namespace is capped at 4096 rows, and a namespace at the bound
--- answers a fresh key `RECEIPT_EXPIRED` instead of inserting past it. `lookup` claims a key by
--- inserting the both-NULL row, and `record` fills it: a claim whose outcome never arrived keeps
--- the retry out of the port, so a prune that committed before a crash is never re-executed.
+-- Prune dedup: one row per retry identity, `(namespace, key)` — the collection its history surface
+-- routes to, and the Connect key — so two surfaces on one database that share a wire scope and
+-- principal still never replay each other's prunes. Nothing orders or expires rows, so there is no
+-- timestamp column; each namespace is capped at 4096 rows, and a namespace at the bound answers a
+-- fresh key `RECEIPT_EXPIRED` instead of inserting past it. `lookup` claims a key by inserting the
+-- both-NULL row, and `record` fills it: a claim whose outcome never arrived keeps the retry out of
+-- the port, so a prune that committed before a crash is never re-executed.
 CREATE TABLE history_dedup (
   -- The collection whose history surface wrote the row, and Connect's opaque retry key. Two
   -- columns, not one framed string: a collection name may contain any character, so no separator
