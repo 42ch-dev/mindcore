@@ -13,14 +13,13 @@ concurrency:
 
 permissions:
   contents: write
-  pull-requests: read
 
 jobs:
   release:
     name: release
     if: >
       github.event.pull_request.merged == true &&
-      contains(join(github.event.pull_request.labels.*.name, ','), 'release')
+      contains(github.event.pull_request.labels.*.name, 'release')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -51,6 +50,12 @@ jobs:
               echo "::error::Tag ${TAG} exists but is not an annotated tag."
               exit 1
             fi
+            # A rerun must tag the same commit; a stale tag means main moved on.
+            TAGGED="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+            if [ "$TAGGED" != "${{ github.event.pull_request.merge_commit_sha }}" ]; then
+              echo "::error::Tag ${TAG} points at ${TAGGED}, not the merged commit ${{ github.event.pull_request.merge_commit_sha }}."
+              exit 1
+            fi
             echo "Tag ${TAG} already exists; continuing."
           else
             MESSAGE="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" || true)"
@@ -77,9 +82,10 @@ jobs:
             BODY="Release ${TAG}"
           fi
 
+          # Any SemVer prerelease (`-...`) is a prerelease release.
           PRERELEASE=()
           case "$VERSION" in
-            *-rc.*) PRERELEASE=(--prerelease) ;;
+            *-*) PRERELEASE=(--prerelease) ;;
           esac
 
           NOTES_FILE="$(mktemp)"
@@ -87,5 +93,5 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release ${TAG} already exists; continuing."
           else
-            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" "${PRERELEASE[@]}"
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" "${PRERELEASE[@]}"
           fi

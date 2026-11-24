@@ -13,8 +13,10 @@ on:
         type: string
         default: ""
 
+# One group for every dispatch: an empty and an explicit input can compute the
+# same `release/<version>` branch, so they must never run side by side.
 concurrency:
-  group: new-release-${{ github.event.inputs.version || 'patch' }}
+  group: new-release
   cancel-in-progress: true
 
 permissions:
@@ -73,10 +75,14 @@ jobs:
           fi
 
           git-cliff --tag "v${VERSION}" -o CHANGELOG.md
+          if ! grep -qF "## [${VERSION}]" CHANGELOG.md; then
+            echo "::error::git-cliff produced no ## [${VERSION}] section (all commits filtered, or the tag landed on the previous release commit)."
+            exit 1
+          fi
 
           git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "chore(release): bump version to ${VERSION}"
-          git push --force origin "$BRANCH"
+          git push --force-with-lease origin "$BRANCH"
 
       - name: Ensure release label
         env:

@@ -14,22 +14,35 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SEMVER_PATTERN = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
+// Strict SemVer 2.0.0: no leading zeros in the core, non-empty identifiers,
+// no leading zeros in numeric prerelease identifiers.
+const SEMVER_PATTERN =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:[0-9A-Za-z-]+)(?:\.[0-9A-Za-z-]+)*))?$/;
+const NUMERIC_IDENTIFIER = /^\d+$/;
+const LEADING_ZERO_IDENTIFIER = /^0\d/;
+
+/**
+ * @typedef {{ major: bigint; minor: bigint; patch: bigint; prerelease: string[] | null }} ParsedVersion
+ */
 
 /**
  * @param {string} text
- * @returns {{ major: number; minor: number; patch: number; prerelease: string[] | null } | null}
+ * @returns {ParsedVersion | null}
  */
 export function parseVersion(text) {
   const match = SEMVER_PATTERN.exec(String(text).trim());
   if (!match) {
     return null;
   }
+  const prerelease = match[4] === undefined ? null : match[4].split(".");
+  if (prerelease && prerelease.some((id) => LEADING_ZERO_IDENTIFIER.test(id))) {
+    return null;
+  }
   return {
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3]),
-    prerelease: match[4] ? match[4].split(".") : null,
+    major: BigInt(match[1]),
+    minor: BigInt(match[2]),
+    patch: BigInt(match[3]),
+    prerelease,
   };
 }
 
@@ -48,7 +61,7 @@ export function compareVersions(a, b) {
   }
   for (const part of ["major", "minor", "patch"]) {
     if (left[part] !== right[part]) {
-      return left[part] - right[part];
+      return left[part] < right[part] ? -1 : 1;
     }
   }
   if (left.prerelease === null && right.prerelease === null) {
@@ -74,11 +87,14 @@ export function compareVersions(a, b) {
     if (l === r) {
       continue;
     }
-    const lNumeric = /^\d+$/.test(l);
-    const rNumeric = /^\d+$/.test(r);
+    const lNumeric = NUMERIC_IDENTIFIER.test(l);
+    const rNumeric = NUMERIC_IDENTIFIER.test(r);
     if (lNumeric && rNumeric) {
-      return Number(l) - Number(r);
+      const leftNumber = BigInt(l);
+      const rightNumber = BigInt(r);
+      return leftNumber < rightNumber ? -1 : 1;
     }
+    // Numeric identifiers rank below alphanumeric ones.
     if (lNumeric) {
       return -1;
     }
@@ -99,7 +115,7 @@ export function patchBump(current) {
   if (!parsed) {
     throw new Error(`Invalid current version: "${current}"`);
   }
-  return `${parsed.major}.${parsed.minor}.${parsed.patch + 1}`;
+  return `${parsed.major}.${parsed.minor}.${parsed.patch + 1n}`;
 }
 
 /**

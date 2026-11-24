@@ -125,6 +125,33 @@ describe("next-version", () => {
       assert.equal(result.stdout, "");
     }
   });
+
+  it("rejects non-strict SemVer inputs", () => {
+    const root = createFixture();
+    for (const bad of ["0.02.0", "0.2.0-rc.01", "0.2.0-", "0.2.0-alpha..1", "00.2.0"]) {
+      const result = run(root, "next-version.mjs", [bad]);
+      assert.notEqual(result.status, 0, `${bad} should be refused`);
+      assert.match(result.stderr, /Invalid SemVer/);
+    }
+  });
+
+  it("compares and bumps past 2^53 exactly", () => {
+    const root = createFixture();
+    writeFileSync(
+      join(root, "Cargo.toml"),
+      CARGO_TOML.replace('version = "0.1.0"', 'version = "1.0.9007199254740993"'),
+    );
+
+    const bumped = run(root, "next-version.mjs", []);
+    assert.equal(bumped.status, 0, bumped.stderr);
+    assert.equal(bumped.stdout.trim(), "1.0.9007199254740994");
+
+    const above = run(root, "next-version.mjs", ["1.0.9007199254740994"]);
+    assert.equal(above.status, 0, above.stderr);
+
+    const below = run(root, "next-version.mjs", ["1.0.9007199254740992"]);
+    assert.notEqual(below.status, 0);
+  });
 });
 
 describe("bump-version", () => {

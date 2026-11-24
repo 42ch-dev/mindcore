@@ -38,7 +38,7 @@ ignore_merges = true
 tag_pattern = "v[0-9].*"
 sort_commits = "oldest"
 commit_preprocessors = [
-  { pattern = '\\((\\w+\\s)?#([0-9]+)\\)', replace = "([#${2}](<REPO>/issues/${2}))" },
+  { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](<REPO>/issues/${2}))" },
 ]
 commit_parsers = [
   # Morning Star harness process ids — omit from consumer-facing release notes
