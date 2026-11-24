@@ -36,10 +36,7 @@ pub(super) const BUNDLE_FORMAT_VERSION: u64 = 1;
 
 /// SHA-256 over JCS of `value` with `field` removed — the bundle and chunk seal.
 pub(super) fn digest_excluding(value: &Value, field: &str) -> AResult<String> {
-    match spoke_operations::jcs_sha256_hex_excluding(value, field) {
-        spoke_operations::SpokeResult::Ok(digest) => Ok(digest),
-        spoke_operations::SpokeResult::Reject(reject) => Err(Reject::invalid(reject.message)),
-    }
+    policy::canonical_digest(value, Some(field))
 }
 
 /// A bundle member in the typed encoding a receiving client re-serialises it to. The client parses

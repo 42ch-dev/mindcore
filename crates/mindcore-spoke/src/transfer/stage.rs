@@ -168,7 +168,7 @@ fn key_set<'a>(bundle: &'a Value, field: &str, member: &str) -> BTreeSet<&'a str
 }
 
 /// `GrantSummary.principal_ref` is an opaque correlation label — "never credentials
-/// or tokens" (`spoke-schemas` 0.17.0 `PrincipalRef`). The published contract states
+/// or tokens" (`spoke-schemas` 0.18.1 `PrincipalRef`). The published contract states
 /// only that minimum, so the screen refuses a value that matches a known credential's
 /// *whole shape*: a live key prefix followed by that provider's token length and
 /// alphabet, or a JWT. A prefix alone is not evidence — a foreign exporter's plain

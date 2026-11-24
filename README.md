@@ -14,9 +14,9 @@ shared `KnowledgeEntry` records with conditional revisions, and the cognition ca
 | Crate | Responsibility |
 | --- | --- |
 | `mindcore-base` | Storage-agnostic domain core: ids and trusted boundary, memory protocol types and IR, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. |
-| `mindcore-spi` | The MIND ladder contracts, pinned to the published SPOKE 0.18.0 DTOs: recall, absorb and deliberate workflows plus the prompt-reasoner bridge. No storage crate, network or model SDK in the contract surface. |
+| `mindcore-spi` | The MIND ladder contracts, pinned to the published SPOKE 0.18.1 DTOs: recall, absorb and deliberate workflows plus the prompt-reasoner bridge. No storage crate, network or model SDK in the contract surface. |
 | `mindcore-sqlite` | SQLite (SQLx) backend: one connection pool, one migration, WAL and a busy timeout; implements the protocol repository behind `MemoryAdapter` and the scoped `KnowledgeEntryPort`, and guards the cognition module at the single persistence boundary. |
-| `mindcore-spoke` | SPOKE 0.18.0 memory protocol adapter over the borrowed-transaction repository: wire validation, the wire↔IR boundary, reject mapping, admission, replay and staging. It never opens, commits or rolls back a transaction. |
+| `mindcore-spoke` | SPOKE 0.18.1 memory protocol adapter over the borrowed-transaction repository: wire validation, the wire↔IR boundary, reject mapping, admission, replay and staging. It never opens, commits or rolls back a transaction. |
 | `mindcore-runtime` | The served surface: `MindcoreServe` assembles the workflow engine, the SQLite knowledge face and the host's memory face into the pieces a Connect responder is built from, and derives the advertised capabilities and tools from what it serves. It opens no listener, transport or identity; the host supplies those. |
 
 ## Migrating from `tools.mindcore.adopt`

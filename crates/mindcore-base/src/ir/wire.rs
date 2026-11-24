@@ -1,4 +1,4 @@
-//! SPOKE 0.17.0 structural mapping. Decode the original JSON, not a generated DTO:
+//! SPOKE 0.18.1 structural mapping. Decode the original JSON, not a generated DTO:
 //! deserialization defaults can erase presence, and typed timestamps can change spelling.
 //! Encoders consume valid IR values. Protocol version admission and operation-specific validation
 //! remain the adapter's responsibility.
@@ -143,7 +143,18 @@ fn nonempty(value: Value) -> Option<String> {
 }
 
 fn timestamp(value: Value) -> Option<String> {
-    string(value).filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+    let text = string(value)?;
+    // Rows stored before the 0.18.1 gate may carry the space spelling. New input is
+    // refused by the protocol DTOs, so only the stored-read path needs this leniency.
+    let strict = text
+        .char_indices()
+        .nth(10)
+        .filter(|(_, character)| *character == ' ')
+        .map(|(index, _)| format!("{}T{}", &text[..index], &text[index + 1..]))
+        .unwrap_or_else(|| text.clone());
+    spoke_schemas::timestamp::parse_strict(&strict)
+        .is_ok()
+        .then_some(text)
 }
 
 fn number(value: Value) -> Option<Number> {

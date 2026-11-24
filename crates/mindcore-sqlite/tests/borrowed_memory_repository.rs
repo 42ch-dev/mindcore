@@ -744,6 +744,46 @@ async fn candidate_list_filters_by_admitted_placement() {
     pool.close().await;
 }
 
+/// Upgrade regression: a candidate row written before the 0.18.1 strict RFC 3339
+/// gate carries the space spelling, and must stay readable — one such row must not
+/// fail the whole list.
+#[tokio::test]
+async fn candidate_list_reads_a_timestamp_written_before_the_strict_gate() {
+    use mindcore_base::ir::{CandidateSelection, PlacementSelection};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settlement.db");
+    let repo = SqliteMemoryRepository;
+    let pool = prepared(&path).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let mut legacy = pending_candidate();
+    legacy.created_at = "2026-11-20 09:20:01.123Z".into();
+    legacy.occurred_at = Some("2026-11-20 09:24:00Z".into());
+    repo.insert_candidate(&mut tx, &legacy).await.unwrap();
+
+    let rows = repo
+        .list_candidates(
+            &mut tx,
+            &SpaceId::new("spc_workshop"),
+            "sub_mira",
+            &CandidateSelection {
+                placement: PlacementSelection::SelectedContexts {
+                    context_ids: vec![ContextId::new("ctx_a")],
+                    include_shared: false,
+                },
+                status: Some("pending".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].created_at, "2026-11-20 09:20:01.123Z");
+    assert_eq!(rows[0].occurred_at.as_deref(), Some("2026-11-20 09:24:00Z"));
+    tx.commit().await.unwrap();
+    pool.close().await;
+}
+
 /// F2: a guarded update whose replacement row carries a different space misses — no
 /// mutation, not a false success.
 #[tokio::test]

@@ -572,3 +572,18 @@ fn extension_values_are_opaque_and_round_trip() {
         })
     ));
 }
+
+#[test]
+fn timestamps_admit_the_pre_upgrade_stored_spelling() {
+    // Rows written before the 0.18.1 gate keep their string; the protocol DTOs
+    // refuse the space spelling for new input, so only the stored-read path is lenient.
+    let mut candidate = pending_candidate();
+    candidate["created_at"] = json!("2026-10-25 09:24:00Z");
+    let (version, ir) = memory_candidate_from_wire(candidate.clone()).unwrap();
+    assert_eq!(ir.created_at, "2026-10-25 09:24:00Z");
+    assert_eq!(memory_candidate_to_wire(version, ir), candidate);
+
+    let mut candidate = pending_candidate();
+    candidate["occurred_at"] = json!("2026-10-25T09:24:00Z");
+    assert!(memory_candidate_from_wire(candidate).is_ok());
+}

@@ -592,7 +592,7 @@ fn recall_output() -> Value {
     })
 }
 
-/// The pinned `spoke-schemas` 0.17.0 cognition document, verbatim from spoke commit `470e7ad`,
+/// The pinned `spoke-schemas` cognition document, verbatim from spoke commit `470e7ad`,
 /// `schemas/data/cognition.schema.json` — the source that crate was generated from.
 const COGNITION_SCHEMA: &str = include_str!("schemas/cognition.schema.json");
 /// The same commit's `schemas/common/common.schema.json`; only the definitions the cognition
