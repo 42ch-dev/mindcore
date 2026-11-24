@@ -11,9 +11,15 @@
   `RECEIPT_EXPIRED` and never reaches the port. Same-key different-payload still answers
   `IDEMPOTENCY_CONFLICT`, but only when a recorded outcome exists to compare against: a retained
   claim with no outcome answers `RECEIPT_EXPIRED` instead, whatever the new payload is. The record is
-  the new `history_dedup` table in `0001_init.sql`, retained for the database lifetime with no
-  eviction; one serving process per database is a host obligation. The adoption face keeps the
-  in-memory default.
+  the new `history_dedup` table in `0001_init.sql`, keyed per serving collection — the routed
+  store's collection, a NUL and the retry key — so two history surfaces on one database that share
+  a wire scope, a principal and an idempotency key never replay or refuse each other's prunes; a
+  same-collection retry replays exactly as before. Rows are retained for the database lifetime with
+  no eviction, but each namespace is capped at 4096 rows, claims included: at the bound an unseen
+  key answers `RECEIPT_EXPIRED` without executing the prune, and `record` writes no row past the
+  cap, so a stream of fresh keys — refusals for a missing target included — cannot exhaust storage.
+  One serving process per database is a host obligation. The adoption face keeps the in-memory
+  default.
 
 - **Breaking — `mindcore-runtime`:** the private product tool `tools.mindcore.adopt` is removed, not
   deprecated. Adoption is served only as the published protocol operation `knowledge.adopt` under the

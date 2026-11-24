@@ -10,9 +10,20 @@
 //! Faults fail closed: a statement fault, and an outcome that does not decode, both answer
 //! `Evicted`. Re-executing a destructive prune is the outcome this store exists to prevent.
 //!
+//! Each store serves one namespace — the collection its history surface routes to — and stores the
+//! key as `<namespace>\0<key>`. Two history surfaces on one database can share a wire scope, a
+//! principal and an idempotency key while reading different collections; without the namespace the
+//! second would replay a prune of the first surface's collection, or refuse it.
+//!
 //! One serving process per database is the host's obligation (see `I-000109`): the claim row stops
 //! a second process from executing, but it answers `RECEIPT_EXPIRED` instead of waiting for the
 //! first, so two processes would turn a replay into a refusal.
+//!
+//! A namespace holds at most [`HISTORY_DEDUP_CAPACITY`] rows, claims and recorded outcomes alike.
+//! Nothing evicts: at the bound an unseen key answers `Evicted` — Connect's `RECEIPT_EXPIRED` —
+//! without the prune being executed, and `record` writes no row that would cross the bound. A
+//! caller that exhausts its namespace therefore gets refusals rather than a prune it cannot dedup,
+//! and the table's growth stays bounded per surface.
 
 use std::io::Write;
 
@@ -23,32 +34,68 @@ use sqlx::SqlitePool;
 use spoke_connect::remote::{HistoryDedupLookup, HistoryDedupRecord, HistoryDedupStore};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 
+/// The most rows one namespace may hold. A claim counts, because a claim is what keeps a replay
+/// out of the port; a namespace at the bound refuses unseen keys instead of inserting past it.
+const HISTORY_DEDUP_CAPACITY: i64 = 4096;
+
 /// One dedup record per retry identity, in the database file the knowledge store already serves
-/// with. The pool holds a single connection, so the claim, the port call and the record never
-/// hold two at once: each takes and releases its own.
+/// with, under the namespace of the collection this surface routes to. The pool holds a single
+/// connection, so the claim, the port call and the record never hold two at once: each takes and
+/// releases its own.
 pub(crate) struct SqliteHistoryDedupStore {
     pool: SqlitePool,
+    namespace: String,
 }
 
 impl SqliteHistoryDedupStore {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    /// `namespace` is the collection the routed store serves: it is stored in front of the key, so
+    /// two surfaces on one database that route to different collections never share a row.
+    pub(crate) fn new(pool: SqlitePool, namespace: impl Into<String>) -> Self {
+        Self {
+            pool,
+            namespace: namespace.into(),
+        }
+    }
+
+    /// The stored key: the namespace, a NUL that no SQLite `TEXT` comparison treats specially, and
+    /// the wire key. The NUL separates the two, so `ab` + `c` and `a` + `bc` stay distinct.
+    fn stored_key(&self, key: &str) -> String {
+        format!("{}\0{key}", self.namespace)
+    }
+
+    /// The half-open range holding exactly this namespace's rows: `\0` sorts before every other
+    /// character the suffix can start with, and `\u{1}` above it ends the range.
+    fn namespace_range(&self) -> (String, String) {
+        (
+            format!("{}\0", self.namespace),
+            format!("{}\u{1}", self.namespace),
+        )
     }
 }
 
 #[async_trait]
 impl HistoryDedupStore for SqliteHistoryDedupStore {
     async fn lookup(&self, key: &str) -> HistoryDedupLookup {
+        let stored_key = self.stored_key(key);
+        let (low, high) = self.namespace_range();
         let mut conn = match self.pool.acquire().await {
             Ok(conn) => conn,
             Err(error) => return fault("claim", error),
         };
         // Claim and read on the same connection: the insert decides whether the row is this
         // caller's, and the read shows what the row holds — `NULL`s for a claim still in flight.
+        // The insert is also the capacity gate: a namespace already at the bound takes no new row,
+        // so an unseen key stays unseen here and the read below answers `Evicted`. An existing key
+        // is unaffected either way, so a replay still finds its recorded outcome at the bound.
         let claimed = match sqlx::query(
-            "INSERT INTO history_dedup (key) VALUES (?) ON CONFLICT(key) DO NOTHING",
+            "INSERT INTO history_dedup (key) SELECT ? \
+             WHERE (SELECT COUNT(*) FROM history_dedup WHERE key >= ? AND key < ?) < ? \
+             ON CONFLICT(key) DO NOTHING",
         )
-        .bind(key)
+        .bind(&stored_key)
+        .bind(&low)
+        .bind(&high)
+        .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&mut *conn)
         .await
         {
@@ -57,7 +104,7 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         };
         let stored: Result<Option<(Option<String>, Option<String>)>, _> =
             sqlx::query_as("SELECT payload_digest, outcome_json FROM history_dedup WHERE key = ?")
-                .bind(key)
+                .bind(&stored_key)
                 .fetch_optional(&mut *conn)
                 .await;
         let row = match stored {
@@ -68,7 +115,8 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             return HistoryDedupLookup::Unseen;
         }
         match row {
-            // Another caller's unanswered claim, or one the process never settled.
+            // Another caller's unanswered claim, one the process never settled, or an unseen key
+            // the namespace had no room to claim.
             Some((None, None)) | None => HistoryDedupLookup::Evicted,
             Some((Some(payload_digest), Some(outcome_json))) => match decode_outcome(&outcome_json)
             {
@@ -86,15 +134,26 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
 
     async fn record(&self, key: &str, record: HistoryDedupRecord) {
         let outcome_json = encode_outcome(&record.outcome);
+        let stored_key = self.stored_key(key);
+        let (low, high) = self.namespace_range();
+        // Insert only when `lookup` claimed the key or it is already present, and only while the
+        // namespace has room. An unclaimed key at the bound would otherwise grow the table past
+        // the cap through `record` alone; this write leaves the row count alone instead.
         let written = sqlx::query(
-            "INSERT INTO history_dedup (key, payload_digest, outcome_json) VALUES (?, ?, ?) \
+            "INSERT INTO history_dedup (key, payload_digest, outcome_json) SELECT ?, ?, ? \
+             WHERE EXISTS (SELECT 1 FROM history_dedup WHERE key = ?) \
+                OR (SELECT COUNT(*) FROM history_dedup WHERE key >= ? AND key < ?) < ? \
              ON CONFLICT(key) DO UPDATE SET \
                payload_digest = excluded.payload_digest, \
                outcome_json   = excluded.outcome_json",
         )
-        .bind(key)
+        .bind(&stored_key)
         .bind(&record.payload_digest)
         .bind(&outcome_json)
+        .bind(&stored_key)
+        .bind(&low)
+        .bind(&high)
+        .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&self.pool)
         .await;
         if let Err(error) = written {
@@ -195,11 +254,25 @@ mod tests {
 
     /// One fresh database file through the production open path, and the store bound to its pool.
     async fn open(dir: &TempDir) -> (MindStore, SqliteHistoryDedupStore) {
+        open_in(dir, "collection-one").await
+    }
+
+    /// As [`open`], with the namespace the history surface's collection supplies.
+    async fn open_in(dir: &TempDir, namespace: &str) -> (MindStore, SqliteHistoryDedupStore) {
         let store = MindStore::open(&dir.path().join("history_dedup.db"))
             .await
             .expect("open the store");
-        let dedup = SqliteHistoryDedupStore::new(store.pool());
+        let dedup = SqliteHistoryDedupStore::new(store.pool(), namespace);
         (store, dedup)
+    }
+
+    async fn row_count(store: &MindStore, namespace: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM history_dedup WHERE key >= ? AND key < ?")
+            .bind(format!("{namespace}\0"))
+            .bind(format!("{namespace}\u{1}"))
+            .fetch_one(&store.pool())
+            .await
+            .expect("count the namespace's rows")
     }
 
     #[tokio::test]
@@ -293,7 +366,7 @@ mod tests {
         sqlx::query("UPDATE history_dedup SET payload_digest = ?, outcome_json = ? WHERE key = ?")
             .bind("digest-invalid")
             .bind(stored)
-            .bind("key-one")
+            .bind("collection-one\u{0}key-one")
             .execute(&store.pool())
             .await
             .expect("install an invalid outcome");
@@ -335,5 +408,99 @@ mod tests {
         )
         .await;
         assert_eq!(dedup.lookup("key-one").await, HistoryDedupLookup::Evicted);
+    }
+
+    /// Two history surfaces on one database, sharing a wire scope, a principal and an idempotency
+    /// key, route to different collections. The second must not replay the first's prune.
+    #[tokio::test]
+    async fn the_same_key_in_another_namespace_does_not_replay() {
+        let dir = TempDir::new().expect("temporary directory");
+        let store = MindStore::open(&dir.path().join("history_dedup.db"))
+            .await
+            .expect("open the store");
+        let first = SqliteHistoryDedupStore::new(store.pool(), "wren");
+        let second = SqliteHistoryDedupStore::new(store.pool(), "mora");
+        let written = record("digest-wren", SpokeResult::Ok(json!({ "deleted": 1 })));
+        first.lookup("key-one").await;
+        first.record("key-one", written.clone()).await;
+
+        assert_eq!(
+            recorded(first.lookup("key-one").await, "same collection"),
+            written
+        );
+        assert_eq!(
+            second.lookup("key-one").await,
+            HistoryDedupLookup::Unseen,
+            "another collection's key is unseen, so its own prune runs"
+        );
+        assert_eq!(row_count(&store, "wren").await, 1);
+        assert_eq!(row_count(&store, "mora").await, 1);
+
+        // The second surface's own outcome never reaches the first.
+        let other = record("digest-mora", SpokeResult::Ok(json!({ "deleted": 4 })));
+        second.record("key-one", other.clone()).await;
+        assert_eq!(
+            recorded(first.lookup("key-one").await, "still wren"),
+            written
+        );
+        assert_eq!(recorded(second.lookup("key-one").await, "mora"), other);
+    }
+
+    /// A namespace at its bound refuses an unseen key instead of inserting one more row, so a
+    /// stream of fresh keys — refusals for a missing target included — cannot exhaust storage.
+    #[tokio::test]
+    async fn an_unseen_key_at_capacity_answers_evicted_without_a_new_row() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        for index in 0..HISTORY_DEDUP_CAPACITY {
+            let key = format!("key-{index}");
+            assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
+            dedup
+                .record(
+                    &key,
+                    record("digest", SpokeResult::Ok(json!({ "deleted": 0 }))),
+                )
+                .await;
+        }
+        assert_eq!(
+            row_count(&store, "collection-one").await,
+            HISTORY_DEDUP_CAPACITY
+        );
+
+        assert_eq!(
+            dedup.lookup("key-overflow").await,
+            HistoryDedupLookup::Evicted,
+            "the bound refuses a fresh key, so Connect answers RECEIPT_EXPIRED"
+        );
+        assert_eq!(
+            row_count(&store, "collection-one").await,
+            HISTORY_DEDUP_CAPACITY,
+            "the refused claim inserted no row"
+        );
+
+        // `record` cannot grow the namespace either: an unclaimed key at the bound writes nothing.
+        dedup
+            .record(
+                "key-unclaimed",
+                record("digest", SpokeResult::Ok(json!({ "deleted": 0 }))),
+            )
+            .await;
+        assert_eq!(
+            row_count(&store, "collection-one").await,
+            HISTORY_DEDUP_CAPACITY
+        );
+
+        // A recorded outcome inside the namespace still replays at the bound.
+        assert_eq!(
+            recorded(dedup.lookup("key-0").await, "at the bound"),
+            record("digest", SpokeResult::Ok(json!({ "deleted": 0 })))
+        );
+
+        // Another namespace has its own bound and keeps working.
+        let (_, elsewhere) = open_in(&dir, "collection-two").await;
+        assert_eq!(
+            elsewhere.lookup("key-overflow").await,
+            HistoryDedupLookup::Unseen
+        );
     }
 }

@@ -480,6 +480,12 @@ impl RoutedKnowledgeStore {
         }
     }
 
+    /// The collection this port serves. The history dedup store namespaces its rows with it, so
+    /// two surfaces on one database that route to different collections never share a record.
+    pub fn collection(&self) -> &str {
+        &self.scope.collection
+    }
+
     /// The admission every op starts with: an unconfigured `scope_id` and a selection this face
     /// does not serve are refused instead of ignored.
     fn admit(&self, scope: &Scope) -> SpokeResult<()> {

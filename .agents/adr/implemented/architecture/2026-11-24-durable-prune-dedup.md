@@ -21,7 +21,9 @@ Faults fail closed. Any statement fault in `lookup`, and any stored outcome the 
 
 The codec is hand-written because `SpokeResult`, `SpokeReject` and `SpokeRejectCode` carry no serde implementation: `{"ok": <value>}` or `{"reject": {"code", "message", "details"}}`, the code as its `as_str()` wire string and read back through `try_from_str`. Decoding is strict — exactly one variant key and exactly the three reject members — so a stored row that does not carry the shape this writer emits answers `Evicted` instead of replaying a half-read outcome. That is a shape check on this module's own output, not a tamper defense: a writer that edits the database can store any well-formed outcome it likes, and nothing here authenticates it. `details: None` stores as `null`, so an empty `details` object cannot decode to `None`.
 
-There is no retention and no eviction: one row per retry identity for the database lifetime. Nothing orders or expires rows, so the table carries no timestamp column.
+There is no retention and no eviction: one row per retry identity, kept until the database is recreated. Nothing orders or expires rows, so the table carries no timestamp column.
+
+The row key names the collection its history surface routes to — the routed store's collection, a NUL and the retry key — and each namespace holds at most 4096 rows. Without the namespace, two history surfaces on one database that share a wire scope, a principal and an idempotency key replayed or refused each other's prunes: the second surface's prune found the first surface's recorded outcome for a different collection. Without the bound, every fresh key inserted a row forever, refusals for a missing target included, so a caller with an endless stream of keys could exhaust the file. At the bound an unseen key is not claimed: `lookup` answers `Evicted`, Connect answers `RECEIPT_EXPIRED`, and no destructive prune runs; `record` likewise writes no row that would cross the bound.
 
 ## Alternatives considered
 
@@ -37,7 +39,7 @@ There is no retention and no eviction: one row per retry identity for the databa
 - The commit-to-record window no longer re-executes. A prune whose process died between its committed port call and `record` answers `RECEIPT_EXPIRED` on retry — at most once, not exactly once. The retry does not replay the lost `{deleted, floor_revision}` either; closing that needs the port to receive the retry identity, which the released contract does not pass (`I-000107`).
 - The claim is taken before the port runs, so `RECEIPT_EXPIRED` reports only that no outcome was recorded for the key — never that the original request did not execute. What history remains is observable: the entry's persisted floor and which checkpoints still read, which tells the caller whether another prune is still needed but does not attribute the floor to that request. Whether the request executed is not observable, because one claim row covers a port never called, a port call still in flight, and a port call whose process died before `record` — the last two may have committed. A caller therefore re-reads the floor and the surviving checkpoints to decide whether another prune is needed under any `idempotency_key`, and never treats the refusal as that evidence (`I-000108`).
 - Two processes serving one database turn the later same-key caller into `RECEIPT_EXPIRED` instead of making it wait (`I-000109`). One serving process per database stays the host obligation and is stated in the module docs.
-- The table grows for the database lifetime with the number of distinct prune retry identities. A bounded retention policy would need a reader to order rows by age; none exists, so no timestamp column is written.
+- The table grows for the database lifetime with the number of distinct prune retry identities, up to 4096 per serving collection. A bounded retention policy would need a reader to order rows by age; none exists, so no timestamp column is written, and nothing evicts to make room. A collection that reaches the bound refuses fresh keys rather than running a prune it cannot dedup; the recorded outcomes it already holds keep replaying.
 - The claim, the port call and the record each take and release the pool's one connection in turn, so no operation holds two. A prune serializes behind whatever else shares that connection.
 - Adoption keeps the released in-memory default: the copy is not destructive, and its replay path is governed by the create-only CAS and the adoption anchor instead.
 - The table joins the schema's recreate-on-mismatch policy: no migration path, no back-fill.
@@ -47,6 +49,6 @@ There is no retention and no eviction: one row per retry identity for the databa
 - `.agents/specs/architecture/serving-seam.md` § History — the dedup paragraphs and the refusal table
 - `.agents/specs/data/store-schema.md` § Current state, § Where it lives
 - `.agents/specs/architecture/mind-model.md` § Current state
-- `crates/mindcore-runtime/src/history_dedup.rs` — `SqliteHistoryDedupStore`, `encode_outcome`, `decode_outcome`
+- `crates/mindcore-runtime/src/history_dedup.rs` — `SqliteHistoryDedupStore`, `HISTORY_DEDUP_CAPACITY`, `encode_outcome`, `decode_outcome`
 - `crates/mindcore-sqlite/migrations/0001_init.sql` — `history_dedup`
 - `crates/mindcore-runtime/tests/loopback.rs` — `a_prune_replays_its_recorded_outcome_after_the_store_is_reopened`

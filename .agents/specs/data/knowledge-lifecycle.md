@@ -177,6 +177,7 @@ A storage failure on the served knowledge face answers `InternalError` with the 
 ## Known limits
 
 - History is bounded only by an explicit `prune_history` call: there is no retention schedule, no default `keep`, and no archive, so a pruned preimage cannot be recovered.
+- The prune dedup record is bounded per served collection at 4096 rows. A collection at the bound answers a fresh `idempotency_key` with `RECEIPT_EXPIRED` and runs no prune; nothing evicts, so a recorded outcome for a key already in the namespace keeps replaying, and a refused key never becomes available through age. See `.agents/specs/architecture/serving-seam.md` § History.
 - A below-floor refusal means the revision's preimage is gone, not that the revision was never stored: a revision at or above the floor is derived from the next surviving checkpoint and still answers exactly.
 - The append classification column distinguishes a full-put record from a dedicated append; that classification is load-bearing for replay's positional proof.
 - Adoption resolves anchors by walking same-collection markers; a host that needs cross-collection provenance resolution does not get it here.
