@@ -147,7 +147,7 @@ while true; do
     exit 0
   fi
 
-  if printf '%s\n' "${out}" | grep -Eqi 'got 502|got 503|got 504|timed out|timeout|temporarily unavailable'; then
+  if printf '%s\n' "${out}" | grep -Eqi '(^|[^0-9])50[234]([^0-9]|$)|service unavailable|bad gateway|gateway timeout|timed out|timeout|temporarily unavailable|connection reset|connection refused'; then
     if (( attempt >= MAX_ATTEMPTS )); then
       echo "exhausted ${MAX_ATTEMPTS} attempts after transient registry failure" >&2
       exit "${status}"
