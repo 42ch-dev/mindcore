@@ -282,6 +282,15 @@ pub trait WorkflowBinding: Send + Sync {
     /// cited record revision against `cited`, and refuses a carrier that no
     /// longer holds `expected_carrier_revision`. Returns the carrier revision
     /// of the derived `MindState` after a confirmed commit.
+    ///
+    /// An implementation must observe `deadline` itself, because the caller
+    /// cannot bound the wait for its storage: while acquiring whatever the
+    /// implementation writes through, and again before beginning its write
+    /// transaction, an expiry answers [`SpiError::DeadlineExceeded`] and starts
+    /// no write. Once that transaction has begun the deadline no longer ends
+    /// it: the write's actual or uncertain outcome is preserved even when it
+    /// lands after `deadline`. The wait for SQLite's own write lock inside the
+    /// begin is outside the bound.
     async fn commit_cognition(
         &self,
         principal: &Principal,

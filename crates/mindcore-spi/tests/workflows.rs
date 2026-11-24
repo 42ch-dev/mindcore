@@ -2433,7 +2433,7 @@ struct DeliberateDouble {
     results: Mutex<std::collections::VecDeque<Result<u64, SpiError>>>,
     settlements: Arc<Mutex<Vec<Value>>>,
     citations: Arc<Mutex<Vec<(String, u64)>>>,
-    deadlines: Arc<Mutex<Vec<std::time::Instant>>>,
+    deadlines: Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
 }
 
 impl DeliberateDouble {
@@ -2485,7 +2485,8 @@ impl DeliberateDouble {
         Arc::clone(&self.citations)
     }
 
-    fn deadlines(&self) -> Arc<Mutex<Vec<std::time::Instant>>> {
+    /// Every received deadline paired with the instant the double observed it.
+    fn deadlines(&self) -> Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>> {
         Arc::clone(&self.deadlines)
     }
 }
@@ -2619,7 +2620,10 @@ impl WorkflowBinding for DeliberateDouble {
         cited: &[CitedRecord],
         deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
-        self.deadlines.lock().expect("deadlines").push(deadline);
+        self.deadlines
+            .lock()
+            .expect("deadlines")
+            .push((deadline, std::time::Instant::now()));
         self.settlements.lock().expect("settlements").push(record);
         self.citations.lock().expect("citations").extend(
             cited
@@ -2902,16 +2906,16 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
 
 /// The settle hands the binding the request's one deadline, computed from the
 /// call's own start, so the binding can bound its store-connection wait. The
-/// reasoner delays long enough that a deadline computed at the commit would be
-/// visibly later than one computed at the call's start.
+/// reasoner delays long enough that a deadline computed at the commit would
+/// lose that delay and land visibly later.
 #[tokio::test]
 async fn deliberate_hands_the_binding_its_request_deadline() {
     /// The provider delay, so the settle reaches the binding well after the
-    /// call's start; longer than the assertion's upper slack.
+    /// call's start.
     const REASONER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
-    /// Slack above `start + timeout` for the time between the test's start
-    /// reading and the deadline's computation inside the call.
-    const COMPUTATION_SLACK: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Clock granularity slack over the deadline's own computation, far below
+    /// the delay a commit-time recomputation would add.
+    const GRANULARITY: std::time::Duration = std::time::Duration::from_millis(1);
 
     let binding = DeliberateDouble::new();
     let deadlines = binding.deadlines();
@@ -2946,10 +2950,6 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
         .await
         .expect("deliberate");
     assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
-    assert!(
-        start.elapsed() >= REASONER_DELAY,
-        "the reasoner delay must actually elapse"
-    );
 
     let handed = deadlines.lock().expect("deadlines");
     assert_eq!(
@@ -2957,14 +2957,23 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
         1,
         "one settlement hands one deadline to the binding"
     );
+    let (deadline, entry) = handed[0];
     assert!(
-        handed[0] >= start + timeout,
+        deadline >= start + timeout,
         "the deadline is the call's own start plus the timeout, never shorter"
     );
     assert!(
-        handed[0] <= start + timeout + COMPUTATION_SLACK,
-        "the deadline is computed once at the call's start, never recomputed \
-         from now at the commit"
+        deadline <= entry + timeout + GRANULARITY,
+        "the deadline cannot be computed after the binding observed the call"
+    );
+    assert!(
+        deadline + REASONER_DELAY / 2 <= entry + timeout,
+        "the deadline carries the reasoner delay, so it was not recomputed from \
+         now at the commit"
+    );
+    assert!(
+        entry.saturating_duration_since(start) >= REASONER_DELAY,
+        "the reasoner delay must actually elapse before the binding is reached"
     );
 }
 
