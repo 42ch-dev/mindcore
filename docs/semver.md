@@ -3,7 +3,8 @@
 `mindcore` follows SemVer 2.0. This document is the single source of truth for
 how version numbers move and what storage compatibility is guaranteed. It is
 machine-checked by `tooling/semver/check.mjs`, which runs in CI on every push
-and pull request.
+and pull request and again in `release.yml`'s `publish-crates` job before the
+first upload.
 
 ## Publish scope
 
@@ -74,7 +75,8 @@ via `sqlx::migrate!`.
 Once a `v*` tag exists it additionally runs
 `cargo semver-checks check-release -p <crate> --baseline-rev <tag>` for each
 publishable crate. The baseline is the newest stable `v*` tag — on a tag
-commit, the previous stable release reachable from its parent. The API diff
+commit, the previous stable release reachable from its parent — falling back to
+the newest tag, prerelease included, when no stable tag exists. The API diff
 fails the build only on a release tag commit (when the tag itself must carry a
 compatible API); off a tag commit violations are reported as non-blocking
 warnings, so a breaking change can land on `main` and be enforced by the

@@ -85,6 +85,32 @@ function createFixture() {
 }
 
 /**
+ * A fixture the version rule can inspect for release tags.
+ *
+ * @param {string} [tag] Release tag to create; omitted leaves the repository untagged.
+ * @returns {string}
+ */
+function createTaggedFixture(tag) {
+  const root = createFixture();
+  git(root, ["init", "--quiet", "--initial-branch", "main"]);
+  // A user's global config may sign tags or commits; this throwaway repo must not.
+  for (const [key, value] of [
+    ["user.name", "release-test"],
+    ["user.email", "release-test@example.invalid"],
+    ["commit.gpgsign", "false"],
+    ["tag.gpgsign", "false"],
+  ]) {
+    git(root, ["config", key, value]);
+  }
+  git(root, ["add", "Cargo.toml"]);
+  git(root, ["commit", "--quiet", "-m", "chore: fixture"]);
+  if (tag !== undefined) {
+    git(root, ["tag", tag]);
+  }
+  return root;
+}
+
+/**
  * @param {string} root
  * @param {string} script
  * @param {string[]} args
@@ -144,13 +170,39 @@ describe("next-version", () => {
     assert.equal(result.stdout.trim(), "0.2.0-rc.1");
   });
 
-  it("refuses an equal, lower or malformed version", () => {
-    const root = createFixture();
-    for (const bad of ["0.1.0", "0.0.9", "not-a-version"]) {
-      const result = run(root, "next-version.mjs", [bad]);
-      assert.notEqual(result.status, 0, `${bad} should be refused`);
-      assert.equal(result.stdout, "");
-    }
+  it("accepts the current version before the first release", () => {
+    // No v* tag: 0.1.0 has never shipped, so naming it is the first release.
+    const result = run(createTaggedFixture(), "next-version.mjs", ["0.1.0"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "0.1.0");
+  });
+
+  it("takes the patch bump with no argument in an untagged repository", () => {
+    const result = run(createTaggedFixture(), "next-version.mjs", []);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "0.1.1");
+  });
+
+  it("refuses an equal version once a release tag exists", () => {
+    const root = createTaggedFixture("v0.1.0");
+    const result = run(root, "next-version.mjs", ["0.1.0"]);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /must be greater/);
+  });
+
+  it("refuses a lower version once a release tag exists", () => {
+    const root = createTaggedFixture("v0.1.0");
+    const result = run(root, "next-version.mjs", ["0.0.9"]);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /must be greater/);
+  });
+
+  it("refuses a malformed version", () => {
+    const result = run(createTaggedFixture(), "next-version.mjs", ["not-a-version"]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Invalid SemVer/);
   });
 
   it("rejects non-strict SemVer inputs", () => {
@@ -208,6 +260,14 @@ describe("bump-version", () => {
     const root = createFixture();
     const result = run(root, "bump-version.mjs", ["0.1.0"]);
     assert.notEqual(result.status, 0);
+    assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), CARGO_TOML);
+  });
+
+  it("accepts the current version before the first release", () => {
+    // Equality keeps the same version text; that must not read as a missing version.
+    const root = createTaggedFixture();
+    const result = run(root, "bump-version.mjs", ["0.1.0"]);
+    assert.equal(result.status, 0, result.stderr);
     assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), CARGO_TOML);
   });
 

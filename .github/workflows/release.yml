@@ -1,7 +1,7 @@
 name: Release
 
-# Tags the merged release-bump PR, creates the GitHub Release and publishes the
-# public crates to crates.io.
+# Tags the merged release-bump PR, creates the GitHub Release and, for a stable
+# version, publishes the public crates to crates.io.
 #
 # Release notes are the `## [<version>]` section of the committed `CHANGELOG.md`,
 # i.e. the curated notes the release PR carried. Commits merged after the
@@ -27,7 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.notes.outputs.version }}
-      tag: ${{ steps.notes.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -116,9 +115,11 @@ jobs:
   publish-crates:
     name: publish-crates
     needs: release
+    # Any SemVer prerelease (`-...`) skips the upload: a registry version is
+    # immutable, so a release candidate must not claim one.
     if: >
       needs.release.result == 'success' &&
-      !contains(needs.release.outputs.tag, '-rc.')
+      !contains(needs.release.outputs.version, '-')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -127,9 +128,32 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.18.1
+          package-manager-cache: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-semver-checks
+
+      # The tag exists by now, so the API diff is blocking: an incompatible
+      # release fails here, before anything reaches the registry. That holds
+      # only while HEAD is the tag commit, so assert it — otherwise the checker
+      # downgrades itself to warnings and the upload proceeds.
+      - name: SemVer policy check
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          if [ "$(git describe --tags --exact-match --match "v${VERSION}" HEAD 2>/dev/null)" != "v${VERSION}" ]; then
+            echo "::error::HEAD is not v${VERSION}; the API diff would not be blocking."
+            exit 1
+          fi
+          node tooling/semver/check.mjs
 
       # Dependency order: a crate's manifest pins the registry version of the
       # crate below it, so base must be resolvable before spi or sqlite package.

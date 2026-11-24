@@ -106,12 +106,14 @@ jobs:
           git checkout -B "$BRANCH" origin/main
 
           node tooling/release/bump-version.mjs "$VERSION"
+          node tooling/release/render-changelog.mjs "$VERSION"
+
+          # After both steps: a first release whose version is already current
+          # changes no Cargo file but always writes the CHANGELOG section.
           if git diff --quiet; then
             echo "::error::Version bump produced no changes."
             exit 1
           fi
-
-          node tooling/release/render-changelog.mjs "$VERSION"
 
           git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "chore(release): bump version to ${VERSION}"

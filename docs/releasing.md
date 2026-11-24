@@ -12,9 +12,10 @@ A release is one flow, driven by two workflows:
    three public crates to crates.io.
 
 There is no manual publish step: publishing is the last job of the release
-workflow and starts by itself once the release job succeeded. Prerelease tags
-(any `v<version>-...`, e.g. `-rc.1`) stop before `publish-crates`, so a
-prerelease never reaches the registry.
+workflow and starts by itself once the release job succeeded. Any SemVer
+prerelease — a version with a `-` suffix, such as `v0.2.0-beta.1` or
+`v0.2.0-alpha.1` — stops before `publish-crates`, so a prerelease never reaches
+the registry and never claims a version there.
 
 ## Publish order
 
@@ -35,13 +36,20 @@ released.
 
 Each step is idempotent (`tooling/release/publish-crate.sh`): it reads the workspace version from
 `cargo metadata`, skips the crate when `https://crates.io/api/v1/crates/<crate>/<version>` already
-answers `200`, retries transient registry responses (502/503/504, timeouts) with backoff, and treats
-"already exists on crates.io" as success. Re-running the failed job therefore resumes from the first
-crate that is still missing — a version can never be uploaded twice.
+answers `200`, publishes with `cargo publish --locked`, retries transient registry responses
+(502/503/504, timeouts) with backoff, and treats "already exists on crates.io" as success. Re-running
+the failed job therefore resumes from the first crate that is still missing — a version can never be
+uploaded twice.
 
-That check reads the crates.io API, which can answer before `cargo`'s own index view catches up. If
-the next crate still cannot resolve the one just uploaded, the job fails there and a re-run
-continues from that crate.
+After an upload the script waits until the version is listed in the sparse index
+(`https://index.crates.io/<path>`) before the next step runs, up to 30 attempts ten seconds apart.
+That is the view `cargo` resolves through: the crates.io API answers earlier, so the API check alone
+would let `mindcore-spi` start while `mindcore-base` is still unresolvable. A version already listed
+there passes on the first check, so a resumed job does not wait.
+
+The script does not run the SemVer check: `publish-crates` runs `node tooling/semver/check.mjs` itself
+before the first upload, with the tag in place, so its API diff is blocking and an incompatible release
+fails before any version reaches the registry.
 
 ## Breaking changes
 

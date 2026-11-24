@@ -3,8 +3,11 @@
 #
 # - Skips when <crate>@<workspace-version> is already on crates.io (safe re-run
 #   after a partial publish-crates job).
+# - Publishes with `--locked`, as every other Cargo command in this repository.
 # - Retries transient registry responses (502/503/504) with backoff.
 # - Treats "already exists on crates.io" as success (publish race).
+# - Waits for the version to appear in the sparse index after an upload: the
+#   next crate resolves it there, and the crates.io API answers earlier.
 #
 # Usage (repo root, CARGO_REGISTRY_TOKEN set):
 #   ./tooling/release/publish-crate.sh mindcore-base
@@ -18,6 +21,8 @@ fi
 PKG="$1"
 MAX_ATTEMPTS="${CARGO_PUBLISH_MAX_ATTEMPTS:-5}"
 SLEEP_SECS="${CARGO_PUBLISH_RETRY_SLEEP_SECS:-30}"
+INDEX_ATTEMPTS="${CARGO_INDEX_WAIT_ATTEMPTS:-30}"
+INDEX_SLEEP_SECS="${CARGO_INDEX_WAIT_SLEEP_SECS:-10}"
 USER_AGENT="${CARGO_PUBLISH_USER_AGENT:-mindcore-release/0.1 (github.com/42ch-dev/mindcore)}"
 
 VERSION="$(
@@ -47,26 +52,66 @@ crates_io_has_version() {
   [[ "${code}" == "200" ]]
 }
 
+# Sparse index layout: 1/<name>, 2/<name>, 3/<c>/<name>, <ab>/<cd>/<name>.
+index_url() {
+  local name="$1" path
+  case "${#name}" in
+    1) path="1/${name}" ;;
+    2) path="2/${name}" ;;
+    3) path="3/${name:0:1}/${name}" ;;
+    *) path="${name:0:2}/${name:2:2}/${name}" ;;
+  esac
+  printf 'https://index.crates.io/%s' "${path}"
+}
+
+index_has_version() {
+  local body
+  # A missing crate answers 404 with an empty body, which simply has no match.
+  body="$(curl -fsS -A "${USER_AGENT}" "$(index_url "${PKG}")" 2>/dev/null || true)"
+  grep -qF -- "\"vers\":\"${VERSION}\"" <<< "${body}"
+}
+
+wait_for_index() {
+  local attempt
+  for (( attempt = 1; attempt <= INDEX_ATTEMPTS; attempt++ )); do
+    if index_has_version; then
+      echo "${PKG}@${VERSION} is in the sparse index"
+      return 0
+    fi
+    if (( attempt < INDEX_ATTEMPTS )); then
+      echo "waiting for ${PKG}@${VERSION} in the sparse index (attempt ${attempt}/${INDEX_ATTEMPTS})"
+      sleep "${INDEX_SLEEP_SECS}"
+    fi
+  done
+  echo "error: ${PKG}@${VERSION} did not reach the sparse index after ${INDEX_ATTEMPTS} attempts" >&2
+  return 1
+}
+
 if crates_io_has_version; then
   echo "${PKG}@${VERSION} already on crates.io — skip"
+  # A resumed job still needs the index ready for the crate above this one; a
+  # version already listed there returns on the first check.
+  wait_for_index
   exit 0
 fi
 
 attempt=1
 while true; do
-  echo "cargo publish -p ${PKG} (attempt ${attempt}/${MAX_ATTEMPTS})"
+  echo "cargo publish -p ${PKG} --locked (attempt ${attempt}/${MAX_ATTEMPTS})"
   set +e
-  out="$(cargo publish -p "${PKG}" 2>&1)"
+  out="$(cargo publish -p "${PKG}" --locked 2>&1)"
   status=$?
   set -e
   printf '%s\n' "${out}"
 
   if [[ "${status}" -eq 0 ]]; then
+    wait_for_index
     exit 0
   fi
 
   if printf '%s\n' "${out}" | grep -q 'already exists on crates.io'; then
     echo "${PKG}@${VERSION} already on crates.io (publish race) — ok"
+    wait_for_index
     exit 0
   fi
 
