@@ -1166,8 +1166,10 @@ impl WorkflowBinding for MemoryWorkflowBinding {
     ) -> Result<u64, SpiError> {
         // The pool holds one connection in production, so an acquire can wait
         // for another statement indefinitely: the request deadline bounds that
-        // wait, and a free connection is re-checked so nothing begins after
-        // expiry.
+        // wait, and a connection in hand is re-checked before the begin. Both
+        // refusals start no write; a transaction already begun keeps its
+        // outcome, and the write-lock wait inside the begin is outside this
+        // bound.
         let mut connection =
             tokio::time::timeout_at(tokio::time::Instant::from(deadline), self.pool.acquire())
                 .await

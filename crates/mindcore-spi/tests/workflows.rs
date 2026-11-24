@@ -2920,7 +2920,13 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
     let binding = DeliberateDouble::new();
     let deadlines = binding.deadlines();
     let workflows = SpiMindWorkflows::new(binding);
-    let reasoner = SlowReasoner(REASONER_DELAY);
+    let reasoner_entered = Arc::new(Mutex::new(None));
+    let reasoner_handed = Arc::new(Mutex::new(None));
+    let reasoner = SlowReasoner::new(
+        REASONER_DELAY,
+        Arc::clone(&reasoner_entered),
+        Arc::clone(&reasoner_handed),
+    );
     let policy = AutoPolicy;
     let caps = MindCapabilities {
         reasoner: Some(&reasoner),
@@ -2958,18 +2964,34 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
         "one settlement hands one deadline to the binding"
     );
     let (deadline, entry) = handed[0];
+    let entered = reasoner_entered
+        .lock()
+        .expect("reasoner entry")
+        .expect("the reasoner must have run");
+    let verdict_handed = reasoner_handed
+        .lock()
+        .expect("reasoner hand-off")
+        .expect("the reasoner must have answered");
     assert!(
         deadline >= start + timeout,
         "the deadline is the call's own start plus the timeout, never shorter"
     );
+    // Anchored on the reasoner's entry, which happens at the call's start and a
+    // whole reasoner delay before the commit: a deadline recomputed at the
+    // commit would exceed this by that delay.
     assert!(
-        deadline <= entry + timeout + GRANULARITY,
-        "the deadline cannot be computed after the binding observed the call"
+        deadline <= entered + timeout + GRANULARITY,
+        "the deadline is computed at the call's start, before the reasoner ran, \
+         so it was not recomputed from now at the commit"
+    );
+    assert!(entered >= start, "the reasoner runs after the call starts");
+    assert!(
+        verdict_handed.saturating_duration_since(entered) >= REASONER_DELAY,
+        "the reasoner delay must actually elapse before it answers"
     );
     assert!(
-        deadline + REASONER_DELAY / 2 <= entry + timeout,
-        "the deadline carries the reasoner delay, so it was not recomputed from \
-         now at the commit"
+        entry >= verdict_handed,
+        "the binding is reached only after the verdict"
     );
     assert!(
         entry.saturating_duration_since(start) >= REASONER_DELAY,
@@ -3255,8 +3277,27 @@ impl Reasoner for HungReasoner {
 }
 
 /// A reasoner that answers its verdict only after a real delay, so the settle
-/// reaches the binding long after the call's own start.
-struct SlowReasoner(std::time::Duration);
+/// reaches the binding long after the call's own start. It records when it was
+/// entered and when it handed the verdict back.
+struct SlowReasoner {
+    delay: std::time::Duration,
+    entered: Arc<Mutex<Option<std::time::Instant>>>,
+    handed: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+impl SlowReasoner {
+    fn new(
+        delay: std::time::Duration,
+        entered: Arc<Mutex<Option<std::time::Instant>>>,
+        handed: Arc<Mutex<Option<std::time::Instant>>>,
+    ) -> Self {
+        Self {
+            delay,
+            entered,
+            handed,
+        }
+    }
+}
 
 #[async_trait]
 impl Reasoner for SlowReasoner {
@@ -3264,7 +3305,9 @@ impl Reasoner for SlowReasoner {
         &self,
         _request: StructuredReasonRequest<'_>,
     ) -> Result<Value, SpiError> {
-        tokio::time::sleep(self.0).await;
+        *self.entered.lock().expect("reasoner entry") = Some(std::time::Instant::now());
+        tokio::time::sleep(self.delay).await;
+        *self.handed.lock().expect("reasoner hand-off") = Some(std::time::Instant::now());
         Ok(promote_verdict())
     }
 }
