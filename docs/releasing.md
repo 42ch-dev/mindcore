@@ -10,8 +10,8 @@ A release is one flow, driven by two workflows:
    merged commit's API diff against the previous release — before any tag
    exists, so a rejected release leaves nothing behind. Its `release` job then
    creates the annotated `v<version>` tag on the merge commit and the GitHub
-   Release from that version's `CHANGELOG.md` section; its `publish-crates` job
-   then uploads the three public crates to crates.io.
+   Release from that version's `CHANGELOG.md` section; a six-job verify/publish
+   chain then uploads the three public crates to crates.io.
 
 `semver-gate` is read-only (`contents: read`) and checks out the merge commit
 without persisted Git credentials: `cargo semver-checks` builds dependencies,
@@ -27,7 +27,7 @@ skipped.
 There is no manual publish step: publishing is the last job of the release
 workflow and starts by itself once the release job succeeded. Any SemVer
 prerelease — a version with a `-` suffix, such as `v0.2.0-beta.1` or
-`v0.2.0-alpha.1` — skips the API diff and stops before `publish-crates`, so a
+`v0.2.0-alpha.1` — skips the API diff and the whole verify/publish chain, so a
 prerelease never reaches the registry and never claims a version there. It
 skips the API diff because it is not uploaded: there is no registry version to
 keep compatible. The migration-lock step still runs for it, because a tagged
@@ -35,9 +35,9 @@ prerelease ships the same migration set a stable release would. A stable
 version is always gated.
 
 The tag is created before the upload, so a failed upload leaves a tag whose version is not on the
-registry; the next release then diffs against that tag. Re-run the failed `publish-crates` job
-before starting a new release: a re-run skips every version already on the registry and resumes at
-the first missing crate.
+registry; the next release then diffs against that tag. Re-run the failed verify or publish job —
+`verify-*` and `publish-*` re-run as a pair — before starting a new release: a re-run skips every
+version already on the registry and resumes at the first missing crate.
 
 ## Publish order
 
@@ -52,19 +52,20 @@ each other through internal path edges:
 - `mindcore-spi` depends on `mindcore-base`.
 - `mindcore-sqlite` depends on `mindcore-base`.
 
-`publish-crates` publishes in that order, one `cargo publish` per step, and stops on the first
+The `verify-*`/`publish-*` chain publishes in that order, and stops on the first
 failure: a crate that cannot be published leaves the later crates unpublished rather than half
 released.
 
-Each step is idempotent (`tooling/release/publish-crate.sh`): it reads the workspace version from
-`cargo metadata`, skips the crate when `https://crates.io/api/v1/crates/<crate>/<version>` already
-answers `200`, publishes with `cargo publish --locked`, retries transient registry responses
-(502/503/504, timeouts) with backoff, and treats "already exists on crates.io" as success. Re-running
-the failed job therefore resumes from the first crate that is still missing — a version can never be
-uploaded twice.
+Each pair is idempotent. `tooling/release/verify-crate.sh` runs `cargo publish --locked --dry-run`;
+`tooling/release/publish-crate.sh` reads the workspace version from `cargo metadata`, skips the
+crate when `https://crates.io/api/v1/crates/<crate>/<version>` already answers `200`, uploads with
+`cargo publish --locked --no-verify`, retries transient registry responses (502/503/504, timeouts)
+with backoff, and treats "already exists on crates.io" as success. Re-running the failed job
+therefore resumes from the first crate that is still missing — a version can never be uploaded
+twice.
 
 After an upload the script waits until the version is listed in the sparse index
-(`https://index.crates.io/<path>`) before the next step runs, up to 30 attempts ten seconds apart.
+(`https://index.crates.io/<path>`) before its job finishes, up to 30 attempts ten seconds apart.
 That is the view `cargo` resolves through: the crates.io API answers earlier, so the API check alone
 would let `mindcore-spi` start while `mindcore-base` is still unresolvable. A version already listed
 there passes on the first check, so a resumed job does not wait.
@@ -123,17 +124,19 @@ stable versions only, and a prerelease is Git-only. Claiming the names with an a
 first stable version free for the normal release flow.
 
 Then, for each crate on crates.io, add this repository and `.github/workflows/release.yml` as a
-trusted publisher. From that point `publish-crates` mints a short-lived OIDC token
+trusted publisher. From that point each `publish-*` job mints a short-lived OIDC token
 (`rust-lang/crates-io-auth-action`); the repository stores no registry secret and no secret has to
 be rotated.
 
-The verification build runs with `CARGO_REGISTRY_TOKEN` and the two
-`ACTIONS_ID_TOKEN_REQUEST_*` variables removed (`env -u`), and only the upload
-step receives the minted token, so a dependency's build script can neither read
-it nor mint one.
-
-`publish-crates` has `contents: read` plus `id-token: write`; those are the only permissions the job
-needs.
+Verification and upload are separate jobs because verification needs a build and the upload needs
+a credential, and the two must never share a process. Unsetting `CARGO_REGISTRY_TOKEN` and the
+`ACTIONS_ID_TOKEN_REQUEST_*` variables with `env -u` is not enough: the step's parent shell still
+holds them, so a dependency's build script could read the token from the parent's environment or
+mint one from the OIDC request variables. Each `verify-*` job therefore runs `verify-crate.sh` with
+`contents: read` only, no `id-token` and `persist-credentials: false` — the job holds no publish
+credential at all. Each `publish-*` job has `contents: read` plus `id-token: write` (the only
+permissions it needs), receives the minted token only for its upload step, and publishes with
+`--no-verify`, so no dependency build script runs in a credential-bearing job.
 
 ## Verify
 

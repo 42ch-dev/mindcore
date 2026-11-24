@@ -182,11 +182,46 @@ jobs:
             gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$BODY_FILE" "${PRERELEASE[@]}"
           fi
 
-  publish-crates:
-    name: publish-crates
+  # The three crates publish in registry order — a manifest pins the registry
+  # version of the crate below it — and each pair splits verification from the
+  # credential-bearing upload.
+  #
+  # verify-*: `contents: read`, no `id-token`, credentials not persisted — the
+  # `cargo publish --dry-run` verification build runs dependency build scripts,
+  # and a process (not just its environment) must hold no credential it could
+  # read or mint.
+  #
+  # publish-*: `id-token: write` for crates.io Trusted Publishing; the upload
+  # runs `--no-verify`, so no dependency build script shares its job.
+  #
+  # The `needs` chain keeps the registry order: base before spi before sqlite.
+  verify-base:
+    name: verify-base
     needs: release
     # Any SemVer prerelease (`-...`) skips the upload: a registry version is
     # immutable, so a release candidate must not claim one.
+    if: >
+      needs.release.result == 'success' &&
+      !contains(needs.release.outputs.version, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Verify mindcore-base
+        run: ./tooling/release/verify-crate.sh mindcore-base
+
+  publish-base:
+    name: publish-base
+    needs: [release, verify-base]
     if: >
       needs.release.result == 'success' &&
       !contains(needs.release.outputs.version, '-')
@@ -209,16 +244,106 @@ jobs:
         id: crates-io-auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
-      # Dependency order: a crate's manifest pins the registry version of the
-      # crate below it, so base must be resolvable before spi or sqlite package.
       - name: Publish mindcore-base
         run: ./tooling/release/publish-crate.sh mindcore-base
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  verify-spi:
+    name: verify-spi
+    needs: [release, publish-base]
+    if: >
+      needs.release.result == 'success' &&
+      !contains(needs.release.outputs.version, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Verify mindcore-spi
+        run: ./tooling/release/verify-crate.sh mindcore-spi
+
+  publish-spi:
+    name: publish-spi
+    needs: [release, verify-spi]
+    if: >
+      needs.release.result == 'success' &&
+      !contains(needs.release.outputs.version, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Authenticate to crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
       - name: Publish mindcore-spi
         run: ./tooling/release/publish-crate.sh mindcore-spi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  verify-sqlite:
+    name: verify-sqlite
+    needs: [release, publish-spi]
+    if: >
+      needs.release.result == 'success' &&
+      !contains(needs.release.outputs.version, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Verify mindcore-sqlite
+        run: ./tooling/release/verify-crate.sh mindcore-sqlite
+
+  publish-sqlite:
+    name: publish-sqlite
+    needs: [release, verify-sqlite]
+    if: >
+      needs.release.result == 'success' &&
+      !contains(needs.release.outputs.version, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Authenticate to crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
       - name: Publish mindcore-sqlite
         run: ./tooling/release/publish-crate.sh mindcore-sqlite
         env:
