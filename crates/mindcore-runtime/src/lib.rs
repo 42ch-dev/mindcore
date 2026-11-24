@@ -227,12 +227,14 @@ impl MindcoreServe {
                     SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
                 }
             });
-            let port: Arc<dyn HistoryPort + Send + Sync> = store;
+            let port: Arc<dyn HistoryPort + Send + Sync> = store.clone();
             // The dedup record lives in the same file behind the same pool: a prune's outcome,
-            // and the claim that keeps a retry out of the port, outlive this surface.
+            // and the claim that keeps a retry out of the port, outlive this surface. Its rows are
+            // namespaced by the collection this surface routes to, so another surface on the same
+            // database that routes elsewhere cannot replay or refuse this one's prunes.
+            let dedup = SqliteHistoryDedupStore::new(self.store.pool(), store.collection());
             let service: Arc<dyn RemoteHistoryService> = Arc::new(
-                HistoryPortService::new(port, history_admission)
-                    .with_dedup_store(Arc::new(SqliteHistoryDedupStore::new(self.store.pool()))),
+                HistoryPortService::new(port, history_admission).with_dedup_store(Arc::new(dedup)),
             );
             ports = ports.with_history(service);
         }

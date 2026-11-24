@@ -3354,6 +3354,105 @@ async fn history_replays_prunes_and_refuses_over_a_signed_session() {
     assert_eq!(details.get("entity_kind"), Some(&json!("relation")));
 }
 
+/// Two history surfaces on one database route to different collections. They share a wire scope,
+/// a principal and an idempotency key, and the second surface's prune must run rather than replay
+/// the first surface's recorded outcome for a collection it does not serve.
+///
+/// This fails before the namespace: both surfaces derive the same dedup key, so the second answers
+/// the first's `{deleted: 1}` for an entry its own collection does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_does_not_replay_across_collections_on_one_database() {
+    let fixture = Fixture::open().await;
+    let store = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    let mut base = None;
+    for summary in [
+        "the gate opens at dawn",
+        "the gate closes at dusk",
+        "the gate opens again at dawn",
+    ] {
+        base = expect_ok(
+            store
+                .put_knowledge_entry(history_entry("ke_history", summary), base)
+                .await,
+            "seed the first collection's history",
+        )
+        .revision;
+    }
+    let scope = scope_of(SCOPE_ID);
+    let (dir, serve) = fixture.serve();
+
+    let mut first = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    first.history = true;
+    let first_surface = surface(&serve, first);
+    let first_session = connect(&first_surface, &["spoke-history"]).await;
+    let pruned = expect_ok(
+        first_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the first collection's prune",
+    );
+    assert_eq!(pruned.deleted, 1);
+    assert_eq!(pruned.floor_revision, Some(2));
+
+    // Same wire scope, same principal, same idempotency key — another collection.
+    let mut second = faces(
+        hello("runtime", &["spoke-history"]),
+        None,
+        MindProviders::default(),
+        routes(&[]),
+    );
+    second.history = true;
+    second.knowledge = KnowledgeScope::new(COLLECTION_TWO);
+    let second_surface = surface(&serve, second);
+    let second_session = connect(&second_surface, &["spoke-history"]).await;
+
+    let reject = expect_reject(
+        second_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the second collection holds no such entry, so its own prune runs and refuses",
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::NotFound,
+        "the second surface executed its own prune instead of replaying the first's outcome"
+    );
+
+    // The refusal is now the second surface's own recorded outcome for that key.
+    let replay = expect_reject(
+        second_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the second surface's same-key replay",
+    );
+    assert_eq!(replay.code, SpokeRejectCode::NotFound);
+    assert_eq!(replay, reject, "the recorded refusal replays verbatim");
+
+    // And the first surface still replays its own recorded success.
+    let replay = expect_ok(
+        first_session
+            .adapter
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the first surface's same-key replay",
+    );
+    assert_eq!(
+        serde_json::to_vec(&replay).expect("the result serializes"),
+        serde_json::to_vec(&pruned).expect("the result serializes"),
+        "the recorded outcome replays byte-equal within its own collection"
+    );
+
+    drop(dir);
+}
+
 /// The prune's idempotency contract over the wire: one key replays its recorded outcome, the same
 /// key with another payload conflicts, and a fresh key runs the prune again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
