@@ -25,11 +25,18 @@
 //! outcomes alike. Nothing is ever deleted and no clock is read: the table is a hard bound, not a
 //! working set that ages out, so a recorded outcome replays for the database's lifetime and no
 //! forward clock jump can turn a live dedup record into an executed prune. At the bound a fresh key
-//! answers `Evicted` — Connect's `RECEIPT_EXPIRED` — without the prune being executed, and `record`
-//! writes no row that would cross the bound. The quota is per caller, parsed out of the retry
-//! identity, so one high-churn principal can exhaust only its own quota and never disable prune for
-//! another on the same collection. A host that wants more headroom raises
+//! answers `Evicted` — Connect's `RECEIPT_EXPIRED` — without the prune being executed.
+//!
+//! The quota is per caller, parsed out of the retry identity, so one high-churn principal can
+//! exhaust only its own quota and never disable prune for another on the same collection. A key
+//! that is not the canonical retry identity is accounted to
+//! [`HISTORY_DEDUP_UNKNOWN_PRINCIPAL`] rather than to itself, so a stream of such keys shares one
+//! quota instead of minting a fresh one per key. A host that wants more headroom raises
 //! [`HISTORY_DEDUP_CAPACITY`] or recreates the database; there is no eviction to wait for.
+//!
+//! Claim capacity belongs to `lookup`: it inserts the claim and refuses an unseen key at the bound.
+//! `record` only fills a claim that already exists, so a caller that records without claiming
+//! writes nothing and can never produce an outcome for a prune that did not run.
 
 use std::io::Write;
 
@@ -45,13 +52,20 @@ use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 /// past it.
 const HISTORY_DEDUP_CAPACITY: i64 = 4096;
 
+/// The quota bucket every key that is not the canonical retry identity is accounted to.
+///
+/// One shared bucket, not one per key: a per-key fallback would let a caller mint unparsable keys
+/// and spend a fresh 4096-row quota with each, which is the hard bound bypassed.
+const HISTORY_DEDUP_UNKNOWN_PRINCIPAL: &str = "unknown";
+
 /// The requester a dedup key names, for the per-principal quota.
 ///
 /// The key is the RFC 8785 canonical serialization of `[op, effective_scope, principal_id,
-/// idempotency_key]`, so the principal is the third element and always a string. Anything else —
-/// a malformed key, a truncated array, a non-string member — accounts the row to the whole key:
-/// that can only over-count one such row against itself, never against a real principal, and a
-/// principal whose keys all parse is unaffected.
+/// idempotency_key]`, so the principal is the third element and a string. Anything else — an
+/// unparsable key, a truncated array, a non-string member — is accounted to
+/// [`HISTORY_DEDUP_UNKNOWN_PRINCIPAL`], so every such key shares one quota and none of them can
+/// widen the bound. Connect canonicalizes before it calls, so a well-formed deployment never
+/// reaches that bucket.
 fn principal_of(key: &str) -> String {
     serde_json::from_str::<Value>(key)
         .ok()
@@ -62,7 +76,7 @@ fn principal_of(key: &str) -> String {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-        .unwrap_or_else(|| key.to_owned())
+        .unwrap_or_else(|| HISTORY_DEDUP_UNKNOWN_PRINCIPAL.to_owned())
 }
 
 /// One dedup record per retry identity, in the database file the knowledge store already serves
@@ -153,16 +167,15 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
     async fn record(&self, key: &str, record: HistoryDedupRecord) {
         let outcome_json = encode_outcome(&record.outcome);
         let principal = principal_of(key);
-        // Insert only when `lookup` claimed the key or it is already present, and only while the
-        // principal has room. An unclaimed key at the bound would otherwise grow the table past
-        // the cap through `record` alone; this write leaves the row count alone instead.
+        // Only fill a claim `lookup` already inserted: the `EXISTS` gate is the whole condition.
+        // A trait caller that records without a claim writes nothing, so it can neither insert an
+        // outcome for a key no prune ran under nor grow the table; claim capacity is `lookup`'s,
+        // which refuses an unseen key at the bound. The upsert still replaces an outcome the same
+        // key already recorded.
         let written = sqlx::query(
             "INSERT INTO history_dedup (namespace, key, principal, payload_digest, outcome_json) \
              SELECT ?, ?, ?, ?, ? \
-             WHERE EXISTS \
-                     (SELECT 1 FROM history_dedup WHERE namespace = ? AND key = ?) \
-                OR (SELECT COUNT(*) FROM history_dedup \
-                    WHERE namespace = ? AND principal = ?) < ? \
+             WHERE EXISTS (SELECT 1 FROM history_dedup WHERE namespace = ? AND key = ?) \
              ON CONFLICT(namespace, key) DO UPDATE SET \
                payload_digest = excluded.payload_digest, \
                outcome_json   = excluded.outcome_json",
@@ -174,9 +187,6 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         .bind(&outcome_json)
         .bind(&self.namespace)
         .bind(key)
-        .bind(&self.namespace)
-        .bind(&principal)
-        .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&self.pool)
         .await;
         if let Err(error) = written {
@@ -572,7 +582,7 @@ mod tests {
             "the refused claim inserted no row"
         );
 
-        // `record` cannot grow the quota either: an unclaimed key at the bound writes nothing.
+        // `record` writes nothing for a key no claim covers, at the bound or anywhere else.
         dedup
             .record(
                 &key_for("prn_one", "key-unclaimed"),
@@ -681,27 +691,66 @@ mod tests {
         );
     }
 
-    /// A key that is not the canonical four-member identity still claims and replays; it is simply
-    /// accounted to itself rather than to a named principal, so it cannot spend a real caller's
-    /// quota.
+    /// Unparsable keys share one bucket, so a caller cannot mint a fresh quota per odd key.
     #[tokio::test]
-    async fn a_key_that_does_not_parse_is_its_own_principal() {
+    async fn keys_that_do_not_parse_share_one_principal_bucket() {
         let dir = TempDir::new().expect("temporary directory");
         let (store, dedup) = open(&dir).await;
+        for key in ["not-a-canonical-key", "[1,2]", "{\"not\":\"an array\"}"] {
+            assert_eq!(dedup.lookup(key).await, HistoryDedupLookup::Unseen);
+            let written = record("digest", SpokeResult::Ok(json!({ "deleted": 1 })));
+            dedup.record(key, written.clone()).await;
+            assert_eq!(recorded(dedup.lookup(key).await, key), written);
+        }
         assert_eq!(
-            dedup.lookup("not-a-canonical-key").await,
-            HistoryDedupLookup::Unseen
+            principal_row_count(&store, "collection-one", HISTORY_DEDUP_UNKNOWN_PRINCIPAL).await,
+            3,
+            "every unparsable key is accounted to the one shareable bucket"
         );
-        let written = record("digest", SpokeResult::Ok(json!({ "deleted": 1 })));
-        dedup.record("not-a-canonical-key", written.clone()).await;
+    }
+
+    /// A non-string third member is not a principal either, so it lands in the same bucket.
+    #[tokio::test]
+    async fn a_non_string_principal_member_uses_the_unknown_bucket() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let key = json!(["history.revisions.prune", { "scope_id": "s" }, 7, "k"]).to_string();
+        assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
+        dedup
+            .record(
+                &key,
+                record("digest", SpokeResult::Ok(json!({ "deleted": 1 }))),
+            )
+            .await;
         assert_eq!(
-            recorded(dedup.lookup("not-a-canonical-key").await, "unparsed"),
-            written
+            principal_row_count(&store, "collection-one", HISTORY_DEDUP_UNKNOWN_PRINCIPAL).await,
+            1
+        );
+    }
+
+    /// `record` only fills a claim. A caller that records without a preceding `lookup` writes
+    /// nothing, so no outcome can exist for a key whose prune never ran — and a later `lookup`
+    /// cannot replay one.
+    #[tokio::test]
+    async fn record_without_a_claim_writes_nothing() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let key = key_for("prn_one", "key-one");
+        dedup
+            .record(
+                &key,
+                record("digest", SpokeResult::Ok(json!({ "deleted": 4 }))),
+            )
+            .await;
+        assert_eq!(
+            row_count(&store, "collection-one").await,
+            0,
+            "an unclaimed record inserted no row"
         );
         assert_eq!(
-            principal_row_count(&store, "collection-one", "not-a-canonical-key").await,
-            1,
-            "the whole key is its own accounting bucket"
+            dedup.lookup(&key).await,
+            HistoryDedupLookup::Unseen,
+            "the key is still fresh, so its prune runs rather than replaying"
         );
     }
 
