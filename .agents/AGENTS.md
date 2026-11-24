@@ -16,5 +16,7 @@
   translated user entry; `docs/`, specs, ADR and knowledge files stay English.
 - `docs/` follows Diátaxis (tutorial / how-to / reference / explanation) and links to
   `{SPECS_DIR}` instead of restating it. `docs/assets/architecture.svg` is generated from
-  `docs/assets/architecture.archify.json`; regenerate rather than hand-edit the SVG.
+  `docs/assets/architecture.archify.json`: run Archify `finalize` to an untracked
+  `docs/assets/architecture.html`, then export the light/dark SVG from the viewer. Only the source
+  JSON and the SVG are tracked.
 - Do not restate `CONTRIBUTING.md` or `CHANGELOG.md` in either README; link to them.

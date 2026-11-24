@@ -21,8 +21,8 @@ let serve = MindcoreServe::new(
     store,
     false, // matches the memory adapter's reflection setting
     |targets| {
-        // publish the journal targets the adapter staged
-        Ok(())
+        // Must publish every staged target. Returning Ok(()) without writing loses them.
+        publish_journal_targets(targets)
     },
 );
 ```
@@ -48,7 +48,7 @@ let serve = MindcoreServe::new(
 | `providers` | embedder, reasoner and domain lens | injected into each workflow call |
 | `adoption` | the one shared source collection | see below |
 | `workflow_routes` | principal id → its one workflow collection | the allowlist; each destination belongs to one principal |
-| `tools` | extra host tools | the runtime refuses its own ids and the retired adoption id |
+| `tools` | extra host tools | the retired `tools.mindcore.adopt` id is dropped; `deliberate` is dropped when no workflow route is configured |
 
 `workflow_routes` maps the exact principal id — not a peer id — the host admitted. A principal
 without a route reads no knowledge and never writes a carrier; an empty map serves no deliberation

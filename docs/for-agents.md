@@ -68,8 +68,9 @@ The delivered contract is documented in `.agents/specs/architecture/mind-model.m
 - Everything under `docs/` is English and follows Diátaxis: tutorials, how-to guides, reference
   and explanation. Do not duplicate the specs; link to them.
 - `docs/assets/architecture.svg` is the README diagram. Its Archify candidate is
-  `docs/assets/architecture.archify.json`; regenerate the SVG from that source rather than editing
-  the SVG by hand.
+  `docs/assets/architecture.archify.json`. Run Archify `finalize` to an untracked
+  `docs/assets/architecture.html`, then export the light/dark SVG from the viewer; only the source
+  JSON and the SVG are tracked.
 - Do not restate `CONTRIBUTING.md` or `CHANGELOG.md` in the README.
 
 ## Decisions and specs

@@ -69,8 +69,9 @@ Mindcore 是一个可嵌入的 Rust 库，把三件事分开保存：agent **听
 
 ```toml
 [dependencies]
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
-mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+spoke-operations = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -123,7 +124,5 @@ cargo run --locked -p mindcore-sqlite --example iteration_01
 - **预发布 schema 可变。** 已应用 migration 仍与内嵌集合一致的数据库可以正常重开；否则 `open`
   会拒绝它，见[存储兼容性](docs/migrating-from-tools-adopt.md#storage-compatibility)。
 
-仓库检查使用 `cargo fmt --all -- --check`、
-`cargo clippy --locked --workspace --all-targets -- -D warnings` 与
-`cargo test --locked --workspace`；CI 还会校验 `.sqlx` 离线缓存。完整命令块与工具链说明见
-[docs/for-agents.md](docs/for-agents.md) 与 [CONTRIBUTING.md](CONTRIBUTING.md)。
+仓库检查：CI 会运行格式化、clippy 与完整测试套件，并额外校验 `.sqlx` 离线缓存。完整本地命令块见
+[docs/for-agents.md](docs/for-agents.md)，贡献约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。

@@ -27,6 +27,8 @@ The crates are `publish = false`; depend on this repository directly.
 mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+spoke-operations = "0.18"
+spoke-schemas = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```
@@ -140,16 +142,21 @@ match wren.get_knowledge_entry("ke_north_gate").await {
 ```
 
 A create passes `expected_base_revision = None`; an update passes `Some(stored_revision)` and is
-refused when the row has moved. The store assigns the next revision itself. To adopt a shared
-entry, copy it into the port's collection with an adoption anchor built by
-`mindcore_base::knowledge::adoption_anchor`; the source resolves through its retirement chain
-before the write. Full rules: [Concepts](concepts.md#knowledge) and
+refused when the row has moved. The store assigns the next revision itself.
+
+To adopt a shared entry, use the runtime's `knowledge.adopt` operation: it resolves the source's
+retirement chain, then writes the copy with an anchor naming the live terminal. A direct
+`put_knowledge_entry` with an anchor built by `mindcore_base::knowledge::adoption_anchor` stores
+that anchor verbatim — it preserves an existing anchor and refuses a change, but it performs no
+retirement resolution. Full rules: [Concepts](concepts.md#knowledge) and
 [Migrating from `tools.mindcore.adopt`](migrating-from-tools-adopt.md).
 
 ## Derive the current judgment
 
 Cognition lives in a carrier entry: an ordinary `KnowledgeEntry` whose cognition module holds
-append-only records, with one head pointer to the current judgment.
+append-only records, with one head pointer to the current judgment. A fresh store has no carrier,
+so create the holder entry and append records first (the story's steps 3–4 do this); until then the
+read refuses `KnowledgeEntryNotFound`.
 
 ```rust
 use mindcore_base::cognition::derive_mind_state;
@@ -171,6 +178,8 @@ than stored a second time. A catalog read never derives cognition; a shared sour
 moves the carrier.
 
 ## Run the full story
+
+Run this from a checkout of this repository; a consumer project does not carry the example.
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01

@@ -73,8 +73,9 @@ Add the crates from this repository (they are not published yet):
 
 ```toml
 [dependencies]
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
-mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+spoke-operations = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -130,8 +131,7 @@ The story is the same code the integration test runs. For the guided version, st
   set reopens normally. Otherwise `open` refuses it; see
   [storage compatibility](docs/migrating-from-tools-adopt.md#storage-compatibility).
 
-Repository checks run with `cargo fmt --all -- --check`,
-`cargo clippy --locked --workspace --all-targets -- -D warnings` and
-`cargo test --locked --workspace`; CI additionally verifies the `.sqlx` offline cache. The
-complete command block and toolchain notes live in [docs/for-agents.md](docs/for-agents.md) and
+Repository checks: CI runs formatting, clippy and the full test suite, and additionally verifies the
+`.sqlx` offline cache. The exact local command block lives in
+[docs/for-agents.md](docs/for-agents.md); contributor conventions live in
 [CONTRIBUTING.md](CONTRIBUTING.md).
