@@ -354,6 +354,7 @@ impl WorkflowBinding for StubBinding {
         _expected_carrier_revision: u64,
         _record: Value,
         _cited: &[CitedRecord],
+        _deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         unserved()
     }
@@ -497,6 +498,7 @@ impl WorkflowBinding for RefusingBinding {
         _expected_carrier_revision: u64,
         _record: Value,
         _cited: &[CitedRecord],
+        _deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         unserved()
     }
@@ -1631,6 +1633,7 @@ impl WorkflowBinding for AbsorbDouble {
         _expected_carrier_revision: u64,
         _record: Value,
         _cited: &[CitedRecord],
+        _deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         unserved()
     }
@@ -2430,6 +2433,7 @@ struct DeliberateDouble {
     results: Mutex<std::collections::VecDeque<Result<u64, SpiError>>>,
     settlements: Arc<Mutex<Vec<Value>>>,
     citations: Arc<Mutex<Vec<(String, u64)>>>,
+    deadlines: Arc<Mutex<Vec<std::time::Instant>>>,
 }
 
 impl DeliberateDouble {
@@ -2450,6 +2454,7 @@ impl DeliberateDouble {
             results: Mutex::new(std::collections::VecDeque::new()),
             settlements: Arc::new(Mutex::new(Vec::new())),
             citations: Arc::new(Mutex::new(Vec::new())),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2478,6 +2483,10 @@ impl DeliberateDouble {
 
     fn citations(&self) -> Arc<Mutex<Vec<(String, u64)>>> {
         Arc::clone(&self.citations)
+    }
+
+    fn deadlines(&self) -> Arc<Mutex<Vec<std::time::Instant>>> {
+        Arc::clone(&self.deadlines)
     }
 }
 
@@ -2608,7 +2617,9 @@ impl WorkflowBinding for DeliberateDouble {
         _expected_carrier_revision: u64,
         record: Value,
         cited: &[CitedRecord],
+        deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
+        self.deadlines.lock().expect("deadlines").push(deadline);
         self.settlements.lock().expect("settlements").push(record);
         self.citations.lock().expect("citations").extend(
             cited
@@ -2886,6 +2897,67 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
     assert_eq!(
         citations.lock().expect("citations").as_slice(),
         [("rec_gate".to_string(), 3)]
+    );
+}
+
+/// The settle hands the binding the request's one deadline, computed from the
+/// call's own start, so the binding can bound its store-connection wait.
+#[tokio::test]
+async fn deliberate_hands_the_binding_its_request_deadline() {
+    let binding = DeliberateDouble::new();
+    let deadlines = binding.deadlines();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner = DeliberateReasoner {
+        verdict: promote_verdict(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let timeout = std::time::Duration::from_secs(30);
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        assessment_context_id: None,
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout,
+    };
+
+    let start = std::time::Instant::now();
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("deliberate");
+    assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+
+    let handed = deadlines.lock().expect("deadlines");
+    assert_eq!(
+        handed.len(),
+        1,
+        "one settlement hands one deadline to the binding"
+    );
+    // The deadline is computed once, inside the call, from that instant plus the
+    // request timeout: never earlier than the call's start, and never more than
+    // one timeout past it plus the call's own elapsed time.
+    let elapsed = start.elapsed();
+    assert!(
+        handed[0] >= start,
+        "the deadline cannot predate the call that computed it"
+    );
+    assert!(
+        handed[0] <= start + timeout + elapsed,
+        "the deadline stays one request timeout past the call's start"
     );
 }
 

@@ -291,6 +291,7 @@ pub trait WorkflowBinding: Send + Sync {
         expected_carrier_revision: u64,
         record: Value,
         cited: &[CitedRecord],
+        deadline: std::time::Instant,
     ) -> Result<u64, SpiError>;
 }
 
@@ -1043,9 +1044,6 @@ impl SpiMindWorkflows {
         // refuses while nothing is written (compass D18), and the deadline is
         // checked after that work with nothing left to run before the write
         // begins.
-        // The check below only covers an expiry observed before the call: it
-        // does not bound the store-connection wait inside `commit_cognition`,
-        // so a request can expire there and still settle (residual I-000101).
         let judgment = deliberate_judgment(principal, request, "settled", &verdict, &cited)?;
         let stored = serde_json::to_value(&record)
             .map_err(|error| SpiError::InvalidInput(error.to_string()))?;
@@ -1060,6 +1058,7 @@ impl SpiMindWorkflows {
                 snapshot.carrier_revision,
                 stored,
                 &cited,
+                deadline,
             )
             .await?;
         Ok(DeliberateOutcome::Settled {
@@ -2580,6 +2579,7 @@ mod tests {
             _expected_carrier_revision: u64,
             _record: Value,
             _cited: &[CitedRecord],
+            _deadline: Instant,
         ) -> Result<u64, SpiError> {
             unreachable!("this double serves recall only")
         }

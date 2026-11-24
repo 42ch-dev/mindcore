@@ -1162,6 +1162,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         expected_carrier_revision: u64,
         record: Value,
         cited: &[CitedRecord],
+        _deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         let mut transaction = self
             .pool
