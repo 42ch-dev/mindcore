@@ -64,7 +64,10 @@ via `sqlx::migrate!`.
   unsupported; the rules above take effect at the first stable `v*` tag — a
   prerelease tag ships nothing and is not a published set.
 
-`tooling/migrations/check.mjs` guards this policy in CI.
+`tooling/migrations/check.mjs` guards this policy in CI. The release PR runs it with
+`--write-lock` so every migration it ships is locked before the tag; `release.yml`'s
+`semver-gate` runs the same command on the tagged commit and fails if the lock changes, which
+catches a migration merged after the release PR opened.
 
 ## Machine enforcement
 

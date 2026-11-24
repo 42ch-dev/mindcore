@@ -32,6 +32,11 @@ prerelease never reaches the registry and never claims a version there. It is
 not gated because it is not uploaded: there is no registry version to keep
 compatible. A stable version is always gated.
 
+The tag is created before the upload, so a failed upload leaves a tag whose version is not on the
+registry; the next release then diffs against that tag. Re-run the failed `publish-crates` job
+before starting a new release: a re-run skips every version already on the registry and resumes at
+the first missing crate.
+
 ## Publish order
 
 ```
