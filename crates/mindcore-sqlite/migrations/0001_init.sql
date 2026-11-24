@@ -443,6 +443,10 @@ CREATE TABLE history_dedup (
   payload_digest TEXT,
   -- The settled outcome as `{"ok": …}` or `{"reject": {"code", "message", "details"}}`.
   outcome_json   TEXT,
+  -- Unix seconds at which the row was claimed or last settled. `lookup` reclaims a namespace's
+  -- rows older than its retention window before it claims, so a key past that window is a fresh
+  -- request rather than a permanent occupant of the namespace's bound.
+  recorded_at    INTEGER NOT NULL CHECK (typeof(recorded_at) = 'integer' AND recorded_at >= 0),
   PRIMARY KEY (namespace, key),
   CHECK ((payload_digest IS NULL) = (outcome_json IS NULL))
 ) WITHOUT ROWID;
