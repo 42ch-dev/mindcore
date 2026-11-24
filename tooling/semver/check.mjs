@@ -251,9 +251,10 @@ export function main(rootDir = repoRoot(), { blocking: forceBlocking = false } =
   }
 
   for (const crate of PUBLISHABLE) {
-    // Output decides what a non-zero exit means: a build/tool failure (e.g. a
-    // missing sqlx offline cache) means no diff ever ran — it fails in every
-    // mode instead of passing as a violation warning.
+    // Exit status decides what happened: cargo-semver-checks exits 100 for a
+    // completed check with violations; any other failure — a build error, an
+    // invalid lint table, a signal or a spawn failure — means the API diff
+    // never ran, so it fails in every mode instead of passing as a warning.
     const result = spawnSync(
       'cargo',
       ['semver-checks', 'check-release', '-p', crate, '--baseline-rev', tag],
@@ -262,15 +263,9 @@ export function main(rootDir = repoRoot(), { blocking: forceBlocking = false } =
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     if (result.status === 0) continue;
-
-    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-    if (
-      result.error ||
-      result.status === null ||
-      /could not compile|error: failed to|error: could not/.test(output)
-    ) {
+    if (result.status !== 100) {
       console.error(
-        `error: the API diff for ${crate} vs ${tag} could not run (cargo semver-checks build/tool failure)`,
+        `error: the API diff for ${crate} vs ${tag} could not run (cargo semver-checks tool failure)`,
       );
       return 1;
     }
