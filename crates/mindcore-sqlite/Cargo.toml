@@ -19,7 +19,7 @@ sqlx.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 spoke-connect = { workspace = true, features = ["remote-adapter"] }
 tempfile = "3.27.0"
 # settle-parity Task 1: the embed_parity harness drives `MemoryAdapter` +
