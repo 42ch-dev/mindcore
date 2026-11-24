@@ -36,18 +36,33 @@ jobs:
           node-version: 24.18.1
           package-manager-cache: false
 
+      # Before any tag exists: a missing section must fail the run untouched.
+      - name: Prepare release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="$(node tooling/release/next-version.mjs --current)"
+          TAG="v${VERSION}"
+          BODY_FILE="${RUNNER_TEMP}/release-body.md"
+          if ! node tooling/release/extract-changelog-notes.mjs "${VERSION}" > "$BODY_FILE"; then
+            echo "::error::No committed CHANGELOG.md section for ${VERSION}; nothing tagged."
+            exit 1
+          fi
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "body=${BODY_FILE}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Tag the merge commit
-        id: tag
+        env:
+          TAG: ${{ steps.notes.outputs.tag }}
+          BODY_FILE: ${{ steps.notes.outputs.body }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --tags --force origin
-
-          VERSION="$(node tooling/release/next-version.mjs --current)"
-          TAG="v${VERSION}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
             if [ "$(git cat-file -t "refs/tags/${TAG}")" != "tag" ]; then
@@ -62,15 +77,10 @@ jobs:
             fi
             echo "Tag ${TAG} already exists; continuing."
           else
-            # The annotation may fall back; the Release body may not.
-            MESSAGE="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" 2>/dev/null)" || MESSAGE=""
-            if [ -z "$MESSAGE" ]; then
-              MESSAGE="Release ${TAG}"
-            fi
-            MESSAGE_FILE="${RUNNER_TEMP}/tag-message.md"
-            printf '%s\n' "$MESSAGE" > "$MESSAGE_FILE"
-            # verbatim: the default cleanup strips Markdown `#` headings.
-            git tag -a "$TAG" --cleanup=verbatim -F "$MESSAGE_FILE" "${{ github.event.pull_request.merge_commit_sha }}"
+            # Prepare release notes already failed on an empty body, so the
+            # annotation is that same body. `--cleanup=verbatim` keeps the
+            # Markdown headings the default cleanup would strip.
+            git tag -a "$TAG" --cleanup=verbatim -F "$BODY_FILE" "${{ github.event.pull_request.merge_commit_sha }}"
             git push origin "refs/tags/${TAG}"
             echo "Created and pushed ${TAG}"
           fi
@@ -78,14 +88,13 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.tag.outputs.version }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.notes.outputs.version }}
+          TAG: ${{ steps.notes.outputs.tag }}
+          BODY_FILE: ${{ steps.notes.outputs.body }}
         run: |
           set -euo pipefail
-          # The committed section is the body; no regeneration, no silent fallback.
-          BODY_FILE="${RUNNER_TEMP}/release-body.md"
-          if ! node tooling/release/extract-changelog-notes.mjs "${VERSION}" > "$BODY_FILE"; then
-            echo "::error::No committed CHANGELOG.md section for ${VERSION}; the release body would be empty."
+          if [ ! -s "$BODY_FILE" ]; then
+            echo "::error::Release body for ${TAG} is empty."
             exit 1
           fi
 

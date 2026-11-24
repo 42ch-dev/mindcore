@@ -5,7 +5,11 @@ import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { mergeVersionSection, unreleasedBody } from "./render-changelog.mjs";
+import {
+  renderRelease,
+  unreleasedBody,
+  withCuratedBody,
+} from "./render-changelog.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -277,37 +281,38 @@ describe("extract-changelog-notes", () => {
 });
 
 describe("render-changelog", () => {
-  it("keeps a present version section and injects the curated body under it", () => {
-    const generated = "# Changelog\n\n## [0.2.0] - 2026-01-03\n\n### Added\n\n- Thing.\n";
-    const merged = mergeVersionSection(generated, "0.2.0", {
+  it("injects the curated body under the new heading, before generated groups", () => {
+    const section = "## [0.2.0] - 2026-01-03\n\n### Added\n\n- Thing.\n";
+    const rendered = withCuratedBody(section, "0.2.0", {
       body: "Migration: rename `a` to `b`.",
       date: "2026-01-04",
     });
-    assert.ok(
-      merged.startsWith(
-        "# Changelog\n\n## [0.2.0] - 2026-01-03\n\nMigration: rename `a` to `b`.\n\n### Added\n",
+    assert.equal(
+      rendered,
+      "## [0.2.0] - 2026-01-03\n\nMigration: rename `a` to `b`.\n\n### Added\n\n- Thing.\n",
+    );
+  });
+
+  it("leaves a rendered section untouched without a curated body", () => {
+    const section = "## [0.2.0] - 2026-01-03\n\n### Added\n\n- Thing.";
+    assert.equal(
+      withCuratedBody(section, "0.2.0", { body: null, date: "2026-01-04" }),
+      `${section}\n`,
+    );
+  });
+
+  it("synthesizes a placeholder section when git-cliff rendered none", () => {
+    assert.equal(
+      withCuratedBody(null, "0.2.0", { body: null, date: "2026-01-04" }),
+      "## [0.2.0] - 2026-01-04\n\n_No user-visible changes._\n",
+    );
+    assert.equal(
+      withCuratedBody(
+        "## [0.2.0] - 2026-01-04\n\n_No user-visible changes._",
+        "0.2.0",
+        { body: "Curated note.", date: "2026-01-04" },
       ),
-      merged,
-    );
-  });
-
-  it("leaves a section untouched without a curated body", () => {
-    const generated = "# Changelog\n\n## [0.2.0] - 2026-01-03\n\n### Added\n\n- Thing.\n";
-    assert.equal(
-      mergeVersionSection(generated, "0.2.0", { body: null, date: "2026-01-04" }),
-      generated,
-    );
-  });
-
-  it("inserts a placeholder section when git-cliff produced none", () => {
-    const generated = "# Changelog\n\n## [0.1.0] - 2026-01-01\n\n- Initial.\n";
-    const merged = mergeVersionSection(generated, "0.2.0", {
-      body: null,
-      date: "2026-01-04",
-    });
-    assert.equal(
-      merged,
-      "# Changelog\n\n## [0.2.0] - 2026-01-04\n\n_No user-visible changes._\n\n## [0.1.0] - 2026-01-01\n\n- Initial.\n",
+      "## [0.2.0] - 2026-01-04\n\nCurated note.\n\n_No user-visible changes._\n",
     );
   });
 
@@ -318,5 +323,68 @@ describe("render-changelog", () => {
       "Migration notes.",
     );
     assert.equal(unreleasedBody("# Changelog\n\n## [0.1.0]\n"), null);
+  });
+
+  it("prepends the new section, keeps past ones and drops Unreleased", () => {
+    const existing = `# Changelog
+
+Intro prose.
+
+## [Unreleased]
+
+Curated migration note.
+
+## [0.1.0] - 2026-01-01
+
+Hand-written curated body.
+
+### Added
+
+- Initial.
+`;
+    const rendered = renderRelease(existing, "0.2.0", {
+      section: "## [0.2.0] - 2026-01-04\n\n### Added\n\n- Thing.",
+      body: "Curated migration note.",
+      date: "2026-01-04",
+      header: "# Changelog",
+    });
+    assert.equal(
+      rendered,
+      `# Changelog
+
+Intro prose.
+
+## [0.2.0] - 2026-01-04
+
+Curated migration note.
+
+### Added
+
+- Thing.
+
+## [0.1.0] - 2026-01-01
+
+Hand-written curated body.
+
+### Added
+
+- Initial.
+`,
+    );
+    assert.ok(!rendered.includes("## [Unreleased]"), rendered);
+    assert.ok(rendered.includes("Hand-written curated body."), rendered);
+  });
+
+  it("synthesizes the section when a cold file has no version sections", () => {
+    const rendered = renderRelease("# Changelog\n", "0.1.0", {
+      section: null,
+      body: null,
+      date: "2026-01-04",
+      header: "# Changelog\n\nGenerated header.",
+    });
+    assert.equal(
+      rendered,
+      "# Changelog\n\n## [0.1.0] - 2026-01-04\n\n_No user-visible changes._\n",
+    );
   });
 });

@@ -1,25 +1,30 @@
 #!/usr/bin/env node
 /**
- * Regenerate `CHANGELOG.md` for a release version with git-cliff, preserving the
- * curated `## [Unreleased]` body and guaranteeing a version section exists.
+ * Add a release version section to `CHANGELOG.md` from git-cliff, without
+ * rebuilding the file.
  *
  * CLI: node tooling/release/render-changelog.mjs <X.Y.Z>
  *
- * Why: git-cliff renders the whole file from commits, so a curated Unreleased
- * body (migration notes, breaking-change prose) would be lost, and an all-skipped
- * range would render no section at all.
+ * git-cliff renders only the new section (`--unreleased`); the committed file's
+ * past version sections — curated prose included — are kept verbatim. The curated
+ * `## [Unreleased]` body moves into the new section, and the emptied `[Unreleased]`
+ * section is dropped.
  *
  * @module tooling/release/render-changelog
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseVersion, repoRoot } from "./next-version.mjs";
 
 const CHANGELOG = "CHANGELOG.md";
-const PLACEHOLDER = "_No user-visible changes._";
+const SECTION_HEADING = /^## \[/m;
+
+/** Marks a version section with no user-visible change. */
+export const PLACEHOLDER = "_No user-visible changes._";
 
 /**
  * @param {string} value
@@ -30,14 +35,31 @@ function escapeRegex(value) {
 }
 
 /**
- * @param {string} version
- * @returns {RegExp}
+ * @param {string} markdown
+ * @returns {{ preamble: string; sections: string[] }} `preamble` is everything
+ *   before the first `## [` heading; each section starts at its heading.
  */
-function versionHeading(version) {
-  return new RegExp(
-    `^## \\[${escapeRegex(version)}\\](?:[ \\t]+-[ \\t]+\\d{4}-\\d{2}-\\d{2})?[ \\t]*$`,
-    "m",
-  );
+export function splitSections(markdown) {
+  const first = markdown.search(SECTION_HEADING);
+  if (first === -1) {
+    return { preamble: markdown.replace(/\s*$/, ""), sections: [] };
+  }
+  return {
+    preamble: markdown.slice(0, first).replace(/\s*$/, ""),
+    sections: markdown
+      .slice(first)
+      .split(/^(?=## \[)/m)
+      .map((section) => section.replace(/\s*$/, ""))
+      .filter((section) => section.length > 0),
+  };
+}
+
+/**
+ * @param {string} section
+ * @returns {string | null} The bracketed label of a `## [...]` heading.
+ */
+export function sectionLabel(section) {
+  return /^## \[([^\]]*)\]/.exec(section)?.[1] ?? null;
 }
 
 /**
@@ -47,48 +69,80 @@ function versionHeading(version) {
  * @returns {string | null}
  */
 export function unreleasedBody(changelog) {
-  const header = /^## \[Unreleased\][ \t]*$/m.exec(changelog);
-  if (!header) {
+  const { sections } = splitSections(changelog);
+  const unreleased = sections.find((section) => sectionLabel(section) === "Unreleased");
+  if (!unreleased) {
     return null;
   }
-  const rest = changelog.slice(header.index + header[0].length);
-  const next = rest.search(/^## \[/m);
-  const body = (next === -1 ? rest : rest.slice(0, next)).trim();
+  const body = unreleased.replace(/^## \[Unreleased\][^\n]*\n?/, "").trim();
   return body.length > 0 ? body : null;
 }
 
 /**
- * Ensure the file has a `## [<version>]` section and place `body` directly under
- * its heading, before any generated group. Pure: no I/O.
+ * Split a git-cliff render into its file header and its section block.
  *
- * A missing section is inserted as the newest section (before the first `## [`
- * heading, or at the end); with no `body` it carries the placeholder line.
+ * @param {string} output
+ * @returns {{ header: string; section: string | null }}
+ */
+export function cliffParts(output) {
+  const first = output.search(SECTION_HEADING);
+  if (first === -1) {
+    return { header: output.trim(), section: null };
+  }
+  return {
+    header: output.slice(0, first).replace(/\s*$/, ""),
+    section: output.slice(first).replace(/\s*$/, ""),
+  };
+}
+
+/**
+ * Place the curated body directly under a section's heading, before the
+ * generated groups. A missing section becomes one, carrying the placeholder when
+ * there is no curated body. Pure.
  *
- * @param {string} changelog Generated changelog text.
+ * @param {string | null} section Section text starting at its `## [` heading.
  * @param {string} version
  * @param {{ body?: string | null; date: string }} options `date` is YYYY-MM-DD.
  * @returns {string}
  */
-export function mergeVersionSection(changelog, version, { body, date }) {
+export function withCuratedBody(section, version, { body, date }) {
   const curated = body?.trim() ?? "";
-  const existing = versionHeading(version).exec(changelog);
-
-  if (existing) {
-    if (curated.length === 0) {
-      return changelog;
-    }
-    const afterHeading = existing.index + existing[0].length;
-    const tail = changelog.slice(afterHeading).replace(/^\n+/, "");
-    return `${changelog.slice(0, afterHeading)}\n\n${curated}\n\n${tail}`;
+  const heading = new RegExp(
+    `^## \\[${escapeRegex(version)}\\][^\\n]*$`,
+    "m",
+  ).exec(section ?? "");
+  if (!heading) {
+    return `## [${version}] - ${date}\n\n${curated.length > 0 ? curated : PLACEHOLDER}\n`;
   }
+  const rest = (section ?? "").slice(heading.index + heading[0].length).replace(/^\n+/, "");
+  const below = curated.length > 0 ? `${curated}\n\n${rest}` : rest;
+  return `${heading[0]}\n\n${below.replace(/\s*$/, "")}\n`;
+}
 
-  const section = `## [${version}] - ${date}\n\n${curated.length > 0 ? curated : PLACEHOLDER}\n`;
-  const firstHeading = changelog.search(/^## \[/m);
-  if (firstHeading === -1) {
-    const head = changelog.replace(/\s*$/, "");
-    return head.length > 0 ? `${head}\n\n${section}` : section;
-  }
-  return `${changelog.slice(0, firstHeading)}${section}\n${changelog.slice(firstHeading)}`;
+/**
+ * Prepend the new version section to the committed file and drop the
+ * `[Unreleased]` section (and any stale section for the same version). Every
+ * other section survives untouched. Pure.
+ *
+ * @param {string} existing Committed `CHANGELOG.md` ("" when there is none).
+ * @param {string} version
+ * @param {{ section?: string | null; body?: string | null; date: string; header?: string }} options
+ *   `section` is the git-cliff render; `header` supplies the preamble when the
+ *   committed file has none.
+ * @returns {string}
+ */
+export function renderRelease(existing, version, { section, body, date, header }) {
+  const { preamble, sections } = splitSections(existing);
+  const kept = sections.filter((entry) => {
+    const label = sectionLabel(entry);
+    return label !== "Unreleased" && label !== version;
+  });
+  const next = withCuratedBody(section ?? null, version, { body, date });
+  const head = preamble.length > 0 ? preamble : (header?.trim() ?? "");
+  const parts = [...(head.length > 0 ? [head] : []), next, ...kept].map((part) =>
+    part.replace(/\s*$/, ""),
+  );
+  return `${parts.join("\n\n")}\n`;
 }
 
 /**
@@ -114,40 +168,41 @@ function main(argv) {
 
   const root = repoRoot();
   const changelogPath = join(root, CHANGELOG);
-  // A cold tree may have no changelog yet; git-cliff writes the first one.
-  const curated = existsSync(changelogPath)
-    ? unreleasedBody(readFileSync(changelogPath, "utf8"))
-    : null;
+  const existing = existsSync(changelogPath) ? readFileSync(changelogPath, "utf8") : "";
+  const curated = unreleasedBody(existing);
 
-  const cliff = spawnSync(
-    "git-cliff",
-    ["--tag", `v${version}`, "-o", CHANGELOG],
-    { cwd: root, encoding: "utf8", stdio: ["ignore", "inherit", "inherit"] },
-  );
-  if (cliff.error) {
-    console.error(`render-changelog: git-cliff failed: ${cliff.error.message}`);
-    process.exit(1);
-  }
-  if (cliff.status !== 0) {
-    console.error(`render-changelog: git-cliff exited ${cliff.status}`);
-    process.exit(cliff.status ?? 1);
-  }
-
-  const generated = readFileSync(changelogPath, "utf8");
-  const rendered = mergeVersionSection(generated, version, {
-    body: curated,
-    date: todayUtc(),
-  });
-  if (rendered !== generated) {
-    writeFileSync(changelogPath, rendered, "utf8");
-  }
-
-  if (!versionHeading(version).test(rendered)) {
-    console.error(
-      `render-changelog: ${CHANGELOG} still has no "## [${version}]" section`,
+  const scratch = mkdtempSync(join(tmpdir(), "mindcore-cliff-"));
+  const renderPath = join(scratch, "section.md");
+  try {
+    const cliff = spawnSync(
+      "git-cliff",
+      ["--tag", `v${version}`, "--unreleased", "-o", renderPath],
+      { cwd: root, encoding: "utf8", stdio: ["ignore", "inherit", "inherit"] },
     );
-    process.exit(1);
+    if (cliff.error) {
+      console.error(`render-changelog: git-cliff failed: ${cliff.error.message}`);
+      process.exit(1);
+    }
+    if (cliff.status !== 0) {
+      console.error(`render-changelog: git-cliff exited ${cliff.status}`);
+      process.exit(cliff.status ?? 1);
+    }
+
+    const { header, section } = cliffParts(readFileSync(renderPath, "utf8"));
+    writeFileSync(
+      changelogPath,
+      renderRelease(existing, version, {
+        section,
+        body: curated,
+        date: todayUtc(),
+        header,
+      }),
+      "utf8",
+    );
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
+
   console.log(
     `Rendered ${CHANGELOG} for v${version}${curated ? " with the curated Unreleased body" : ""}.`,
   );
