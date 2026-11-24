@@ -85,6 +85,59 @@ function createFixture() {
 }
 
 /**
+ * A fixture whose second member requires the first by path *and* version.
+ *
+ * @returns {string}
+ */
+function createPathDependencyFixture() {
+  const root = mkdtempSync(join(tmpdir(), "mindcore-release-"));
+  tempDirs.push(root);
+  mkdirSync(join(root, "crates/a"), { recursive: true });
+  mkdirSync(join(root, "crates/b"), { recursive: true });
+  writeFileSync(join(root, "Cargo.toml"), CARGO_TOML.replaceAll("alpha", "a").replaceAll("beta", "b"));
+  writeFileSync(
+    join(root, "Cargo.lock"),
+    CARGO_LOCK.replaceAll("alpha", "a").replaceAll("beta", "b"),
+  );
+  writeFileSync(
+    join(root, "crates/a/Cargo.toml"),
+    `[package]\nname = "a"\nversion.workspace = true\npublish = false\n`,
+  );
+  writeFileSync(
+    join(root, "crates/b/Cargo.toml"),
+    `[package]\nname = "b"\nversion.workspace = true\npublish = false\n\n` +
+      `[dependencies]\na = { path = "../a", version = "0.1.0" }\n`,
+  );
+  return root;
+}
+
+/**
+ * A fixture the version rule can inspect for release tags.
+ *
+ * @param {string} [tag] Release tag to create; omitted leaves the repository untagged.
+ * @returns {string}
+ */
+function createTaggedFixture(tag) {
+  const root = createFixture();
+  git(root, ["init", "--quiet", "--initial-branch", "main"]);
+  // A user's global config may sign tags or commits; this throwaway repo must not.
+  for (const [key, value] of [
+    ["user.name", "release-test"],
+    ["user.email", "release-test@example.invalid"],
+    ["commit.gpgsign", "false"],
+    ["tag.gpgsign", "false"],
+  ]) {
+    git(root, ["config", key, value]);
+  }
+  git(root, ["add", "Cargo.toml"]);
+  git(root, ["commit", "--quiet", "-m", "chore: fixture"]);
+  if (tag !== undefined) {
+    git(root, ["tag", tag]);
+  }
+  return root;
+}
+
+/**
  * @param {string} root
  * @param {string} script
  * @param {string[]} args
@@ -144,13 +197,39 @@ describe("next-version", () => {
     assert.equal(result.stdout.trim(), "0.2.0-rc.1");
   });
 
-  it("refuses an equal, lower or malformed version", () => {
-    const root = createFixture();
-    for (const bad of ["0.1.0", "0.0.9", "not-a-version"]) {
-      const result = run(root, "next-version.mjs", [bad]);
-      assert.notEqual(result.status, 0, `${bad} should be refused`);
-      assert.equal(result.stdout, "");
-    }
+  it("accepts the current version before the first release", () => {
+    // No v* tag: 0.1.0 has never shipped, so naming it is the first release.
+    const result = run(createTaggedFixture(), "next-version.mjs", ["0.1.0"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "0.1.0");
+  });
+
+  it("takes the patch bump with no argument in an untagged repository", () => {
+    const result = run(createTaggedFixture(), "next-version.mjs", []);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "0.1.1");
+  });
+
+  it("refuses an equal version once a release tag exists", () => {
+    const root = createTaggedFixture("v0.1.0");
+    const result = run(root, "next-version.mjs", ["0.1.0"]);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /must be greater/);
+  });
+
+  it("refuses a lower version once a release tag exists", () => {
+    const root = createTaggedFixture("v0.1.0");
+    const result = run(root, "next-version.mjs", ["0.0.9"]);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /must be greater/);
+  });
+
+  it("refuses a malformed version", () => {
+    const result = run(createTaggedFixture(), "next-version.mjs", ["not-a-version"]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Invalid SemVer/);
   });
 
   it("rejects non-strict SemVer inputs", () => {
@@ -211,6 +290,14 @@ describe("bump-version", () => {
     assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), CARGO_TOML);
   });
 
+  it("accepts the current version before the first release", () => {
+    // Equality keeps the same version text; that must not read as a missing version.
+    const root = createTaggedFixture();
+    const result = run(root, "bump-version.mjs", ["0.1.0"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), CARGO_TOML);
+  });
+
   it("aborts when a workspace member is missing from the lock", () => {
     const root = createFixture();
     writeFileSync(join(root, "Cargo.lock"), CARGO_LOCK.replace(/\[\[package\]\]\nname = "beta"[\s\S]*$/, ""));
@@ -218,6 +305,34 @@ describe("bump-version", () => {
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /beta/);
     assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), CARGO_TOML);
+  });
+
+  it("rewrites a member's inline path-dependency requirement", () => {
+    const root = createPathDependencyFixture();
+    const result = run(root, "bump-version.mjs", ["0.2.0"]);
+    assert.equal(result.status, 0, result.stderr);
+
+    const member = readFileSync(join(root, "crates/b/Cargo.toml"), "utf8");
+    assert.match(member, /^a = \{ path = "\.\.\/a", version = "0\.2\.0" \}$/m);
+    assert.equal(readFileSync(join(root, "crates/a/Cargo.toml"), "utf8").includes("version ="), false);
+
+    const cargo = readFileSync(join(root, "Cargo.toml"), "utf8");
+    assert.match(cargo, /^version = "0\.2\.0"$/m);
+
+    const lock = readFileSync(join(root, "Cargo.lock"), "utf8");
+    assert.match(lock, /name = "a"\nversion = "0\.2\.0"/);
+    assert.match(lock, /name = "b"\nversion = "0\.2\.0"/);
+    assert.equal(lock.match(/version = "0\.1\.0"/g), null);
+  });
+
+  it("rewrites a path-dependency requirement for a prerelease target", () => {
+    const root = createPathDependencyFixture();
+    const result = run(root, "bump-version.mjs", ["0.2.0-rc.1"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(
+      readFileSync(join(root, "crates/b/Cargo.toml"), "utf8"),
+      /^a = \{ path = "\.\.\/a", version = "0\.2\.0-rc\.1" \}$/m,
+    );
   });
 });
 
