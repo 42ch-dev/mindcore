@@ -88,6 +88,10 @@ const HUGE_REVISION: u64 = (1 << 53) + 2;
 /// A stored two-node cycle, seeded with direct markers because the store never writes one.
 const CYCLE_A: &str = "ke_cycle_a";
 const CYCLE_B: &str = "ke_cycle_b";
+/// A destination slot holding a row retired into [`SLOT_SUCCESSOR`]: taken, yet hidden from the
+/// live-only read an adoption's destination half makes.
+const RETIRED_SLOT: &str = "ke_retired_slot";
+const SLOT_SUCCESSOR: &str = "ke_slot_successor";
 
 const DIALER_SEED: [u8; 32] = [0x42u8; 32];
 const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
@@ -2088,6 +2092,43 @@ async fn seed_cycle(pool: &sqlx::SqlitePool) {
     }
 }
 
+/// A destination slot holding a row retired into [`SLOT_SUCCESSOR`]: the slot is taken, and the
+/// live-only read an adoption's destination half makes answers absence for it.
+async fn seed_retired_destination(pool: &sqlx::SqlitePool) {
+    let destination = ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(COLLECTION));
+    for (entry_id, summary) in [
+        (RETIRED_SLOT, "somebody's retired row"),
+        (SLOT_SUCCESSOR, "somebody's live row"),
+    ] {
+        expect_ok(
+            destination
+                .put_knowledge_entry(shared_entry(entry_id, summary), None)
+                .await,
+            "seed the destination slot",
+        );
+    }
+    expect_ok(
+        destination
+            .supersede_entry(RETIRED_SLOT, 1, SLOT_SUCCESSOR)
+            .await,
+        "retire the destination occupant",
+    );
+}
+
+/// The slot a refused claim must leave alone: the stored revision and retirement marker of
+/// `entry_id` in the destination collection, read without the live-only predicate.
+async fn destination_slot(pool: &sqlx::SqlitePool, entry_id: &str) -> (i64, Option<String>) {
+    sqlx::query_as(
+        "SELECT revision, superseded_by FROM knowledge_entries \
+         WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the destination slot")
+}
+
 /// How many rows one collection stores under `entry_id`: the destination slot a copy claims.
 async fn destination_rows(pool: &sqlx::SqlitePool, entry_id: &str) -> i64 {
     sqlx::query_scalar(
@@ -2652,6 +2693,55 @@ async fn an_occupied_destination_answers_occupancy_whatever_the_selection_shows(
     assert_eq!(
         after, stored,
         "a refused repeat leaves the destination slot unchanged: {after}"
+    );
+}
+
+/// A destination slot whose occupant is retired reads as absent to the live-only destination read,
+/// so the adoption must answer the ordinary occupancy instead: `REVISION_CONFLICT` with no details
+/// over a signed session, and the slot's revision and retirement marker stay as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_destination_occupant_answers_occupancy_over_the_signed_session() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_shared_source(&pool).await;
+    seed_retired_destination(&pool).await;
+    let before = destination_slot(&pool, RETIRED_SLOT).await;
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
+
+    let mut claim = adopt_request(SHARED_ENTRY, 1, "retired-destination");
+    claim.destination_entry_id = Some(RETIRED_SLOT.parse().expect("non-empty destination id"));
+    let reject = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SCOPE_ID),
+            &claim,
+        )
+        .await,
+        "a claim on a retired destination slot",
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::RevisionConflict,
+        "a retired occupant is occupancy, not an absence: {reject:?}"
+    );
+    assert!(
+        reject.details.is_none(),
+        "the retired-slot refusal carries no details: {reject:?}"
+    );
+    drop(session);
+
+    assert_eq!(
+        destination_slot(&pool, RETIRED_SLOT).await,
+        before,
+        "a refused claim leaves the retired slot's revision and marker unchanged"
+    );
+    assert_eq!(
+        destination_rows(&pool, RETIRED_SLOT).await,
+        1,
+        "the refused claim writes no second row into the slot"
     );
 }
 
