@@ -31,7 +31,7 @@ While the workspace version is `0.x.y`:
 
 - **SPOKE follow rule** — `spoke-schemas`, `spoke-operations` and
   `spoke-connect` are declared at the `0.18` minor line
-  (`>=0.18.0, <0.19.0`) and are part of the public crates' API surface.
+  (`>=0.18.1, <0.19.0`) and are part of the public crates' API surface.
   `Cargo.lock` remains the build pin: it fixes the exact `0.18.x` version
   every checkout, CI run and `cargo publish --dry-run` builds against. A
   `spoke-*` **minor** bump forces a mindcore **minor** bump; a `spoke-*`
