@@ -354,6 +354,7 @@ impl WorkflowBinding for StubBinding {
         _expected_carrier_revision: u64,
         _record: Value,
         _cited: &[CitedRecord],
+        _deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         unserved()
     }
@@ -497,6 +498,7 @@ impl WorkflowBinding for RefusingBinding {
         _expected_carrier_revision: u64,
         _record: Value,
         _cited: &[CitedRecord],
+        _deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         unserved()
     }
@@ -1631,6 +1633,7 @@ impl WorkflowBinding for AbsorbDouble {
         _expected_carrier_revision: u64,
         _record: Value,
         _cited: &[CitedRecord],
+        _deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         unserved()
     }
@@ -2430,6 +2433,7 @@ struct DeliberateDouble {
     results: Mutex<std::collections::VecDeque<Result<u64, SpiError>>>,
     settlements: Arc<Mutex<Vec<Value>>>,
     citations: Arc<Mutex<Vec<(String, u64)>>>,
+    deadlines: Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
 }
 
 impl DeliberateDouble {
@@ -2450,6 +2454,7 @@ impl DeliberateDouble {
             results: Mutex::new(std::collections::VecDeque::new()),
             settlements: Arc::new(Mutex::new(Vec::new())),
             citations: Arc::new(Mutex::new(Vec::new())),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2478,6 +2483,11 @@ impl DeliberateDouble {
 
     fn citations(&self) -> Arc<Mutex<Vec<(String, u64)>>> {
         Arc::clone(&self.citations)
+    }
+
+    /// Every received deadline paired with the instant the double observed it.
+    fn deadlines(&self) -> Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>> {
+        Arc::clone(&self.deadlines)
     }
 }
 
@@ -2608,7 +2618,12 @@ impl WorkflowBinding for DeliberateDouble {
         _expected_carrier_revision: u64,
         record: Value,
         cited: &[CitedRecord],
+        deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
+        self.deadlines
+            .lock()
+            .expect("deadlines")
+            .push((deadline, std::time::Instant::now()));
         self.settlements.lock().expect("settlements").push(record);
         self.citations.lock().expect("citations").extend(
             cited
@@ -2889,6 +2904,101 @@ async fn deliberate_settles_the_stamped_record_onto_the_committed_carrier() {
     );
 }
 
+/// The settle hands the binding the request's one deadline, computed from the
+/// call's own start, so the binding can bound its store-connection wait. The
+/// reasoner delays long enough that a deadline computed at the commit would
+/// lose that delay and land visibly later.
+#[tokio::test]
+async fn deliberate_hands_the_binding_its_request_deadline() {
+    /// The provider delay, so the settle reaches the binding well after the
+    /// call's start.
+    const REASONER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+    /// Clock granularity slack over the deadline's own computation, far below
+    /// the delay a commit-time recomputation would add.
+    const GRANULARITY: std::time::Duration = std::time::Duration::from_millis(1);
+
+    let binding = DeliberateDouble::new();
+    let deadlines = binding.deadlines();
+    let workflows = SpiMindWorkflows::new(binding);
+    let reasoner_entered = Arc::new(Mutex::new(None));
+    let reasoner_handed = Arc::new(Mutex::new(None));
+    let reasoner = SlowReasoner::new(
+        REASONER_DELAY,
+        Arc::clone(&reasoner_entered),
+        Arc::clone(&reasoner_handed),
+    );
+    let policy = AutoPolicy;
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        policy_hook: Some(&policy),
+        ..MindCapabilities::default()
+    };
+    let holder = deliberate_holder();
+    let target = deliberate_target();
+    let evidence = [Evidence {
+        id: "ev_test",
+        text: "the gate test passed on this commit",
+    }];
+    let timeout = std::time::Duration::from_secs(30);
+    let request = DeliberateRequest {
+        space_id: "spc_1",
+        subject_id: "subj_1",
+        assessment_context_id: None,
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout,
+    };
+
+    let start = std::time::Instant::now();
+    let outcome = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect("deliberate");
+    assert!(matches!(outcome, DeliberateOutcome::Settled { .. }));
+
+    let handed = deadlines.lock().expect("deadlines");
+    assert_eq!(
+        handed.len(),
+        1,
+        "one settlement hands one deadline to the binding"
+    );
+    let (deadline, entry) = handed[0];
+    let entered = reasoner_entered
+        .lock()
+        .expect("reasoner entry")
+        .expect("the reasoner must have run");
+    let verdict_handed = reasoner_handed
+        .lock()
+        .expect("reasoner hand-off")
+        .expect("the reasoner must have answered");
+    assert!(
+        deadline >= start + timeout,
+        "the deadline is the call's own start plus the timeout, never shorter"
+    );
+    // Anchored on the reasoner's entry, which happens at the call's start and a
+    // whole reasoner delay before the commit: a deadline recomputed at the
+    // commit would exceed this by that delay.
+    assert!(
+        deadline <= entered + timeout + GRANULARITY,
+        "the deadline is computed at the call's start, before the reasoner ran, \
+         so it was not recomputed from now at the commit"
+    );
+    assert!(entered >= start, "the reasoner runs after the call starts");
+    assert!(
+        verdict_handed.saturating_duration_since(entered) >= REASONER_DELAY,
+        "the reasoner delay must actually elapse before it answers"
+    );
+    assert!(
+        entry >= verdict_handed,
+        "the binding is reached only after the verdict"
+    );
+    assert!(
+        entry.saturating_duration_since(start) >= REASONER_DELAY,
+        "the reasoner delay must actually elapse before the binding is reached"
+    );
+}
+
 #[tokio::test]
 async fn an_empty_explicit_assessment_context_is_a_caller_input_error() {
     let binding = DeliberateDouble::new();
@@ -3163,6 +3273,42 @@ impl Reasoner for HungReasoner {
         _request: StructuredReasonRequest<'_>,
     ) -> Result<Value, SpiError> {
         std::future::pending().await
+    }
+}
+
+/// A reasoner that answers its verdict only after a real delay, so the settle
+/// reaches the binding long after the call's own start. It records when it was
+/// entered and when it handed the verdict back.
+struct SlowReasoner {
+    delay: std::time::Duration,
+    entered: Arc<Mutex<Option<std::time::Instant>>>,
+    handed: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+impl SlowReasoner {
+    fn new(
+        delay: std::time::Duration,
+        entered: Arc<Mutex<Option<std::time::Instant>>>,
+        handed: Arc<Mutex<Option<std::time::Instant>>>,
+    ) -> Self {
+        Self {
+            delay,
+            entered,
+            handed,
+        }
+    }
+}
+
+#[async_trait]
+impl Reasoner for SlowReasoner {
+    async fn reason_structured(
+        &self,
+        _request: StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        *self.entered.lock().expect("reasoner entry") = Some(std::time::Instant::now());
+        tokio::time::sleep(self.delay).await;
+        *self.handed.lock().expect("reasoner hand-off") = Some(std::time::Instant::now());
+        Ok(promote_verdict())
     }
 }
 
