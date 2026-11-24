@@ -1,7 +1,8 @@
 name: Release
 
-# Tags the merged release-bump PR and creates the GitHub Release.
-# No crate ships to a registry: the release is a tag plus a GitHub Release.
+# Gates the merged release-bump PR on its API diff, then tags it, creates the
+# GitHub Release and, for a stable version, publishes the public crates to
+# crates.io.
 #
 # Release notes are the `## [<version>]` section of the committed `CHANGELOG.md`,
 # i.e. the curated notes the release PR carried. Commits merged after the
@@ -19,12 +20,70 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: release
+  semver-gate:
+    name: semver-gate
     if: >
       github.event.pull_request.merged == true &&
       contains(github.event.pull_request.labels.*.name, 'release')
     runs-on: ubuntu-latest
+    # Read-only: `cargo semver-checks` builds dependencies, and this job must
+    # not run their build scripts with a token that can write repository refs.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.18.1
+          package-manager-cache: false
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          echo "version=$(node tooling/release/next-version.mjs --current)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        if: ${{ !contains(steps.version.outputs.version, '-') }}
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        if: ${{ !contains(steps.version.outputs.version, '-') }}
+        with:
+          tool: cargo-semver-checks
+
+      # Before the tag exists: a rejected release must leave no tag behind, or
+      # the next patch would diff against an API that never shipped. HEAD is not
+      # a tag commit yet, so `--blocking` forces the API diff to apply; the
+      # baseline is the newest released stable tag. `fetch-depth: 0` above
+      # already carries every tag, so no fetch runs here: this checkout holds no
+      # credential to fetch with.
+      - name: SemVer policy check
+        if: ${{ !contains(steps.version.outputs.version, '-') }}
+        run: node tooling/semver/check.mjs --blocking
+
+      # A prerelease never uploads, so it claims no registry version and owes no
+      # compatible API to one.
+      - name: Skip SemVer policy check
+        if: ${{ contains(steps.version.outputs.version, '-') }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: echo "::notice::${VERSION} is a prerelease and never uploads; the API diff gate is skipped."
+
+  release:
+    name: release
+    needs: semver-gate
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.notes.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -109,3 +168,38 @@ jobs:
           else
             gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$BODY_FILE" "${PRERELEASE[@]}"
           fi
+
+  publish-crates:
+    name: publish-crates
+    needs: release
+    # Any SemVer prerelease (`-...`) skips the upload: a registry version is
+    # immutable, so a release candidate must not claim one.
+    if: >
+      needs.release.result == 'success' &&
+      !contains(needs.release.outputs.version, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      # Dependency order: a crate's manifest pins the registry version of the
+      # crate below it, so base must be resolvable before spi or sqlite package.
+      - name: Publish mindcore-base
+        run: ./tooling/release/publish-crate.sh mindcore-base
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish mindcore-spi
+        run: ./tooling/release/publish-crate.sh mindcore-spi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish mindcore-sqlite
+        run: ./tooling/release/publish-crate.sh mindcore-sqlite
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -20,3 +20,5 @@
   `docs/assets/architecture.html`, then export the light/dark SVG from the viewer. Only the source
   JSON and the SVG are tracked.
 - Do not restate `CONTRIBUTING.md` or `CHANGELOG.md` in either README; link to them.
+- SemVer & storage-compatibility policy → `docs/semver.md` (machine-checked by
+  `tooling/semver/check.mjs` in CI).
