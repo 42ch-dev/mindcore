@@ -3,8 +3,8 @@
 `mindcore` follows SemVer 2.0. This document is the single source of truth for
 how version numbers move and what storage compatibility is guaranteed. It is
 machine-checked by `tooling/semver/check.mjs`, which runs in CI on every push
-and pull request and again in `release.yml`'s `release` job, before the tag is
-created.
+and pull request and again in `release.yml`'s read-only `semver-gate` job,
+before the `release` job creates the tag.
 
 ## Publish scope
 
@@ -79,14 +79,19 @@ commit, the previous stable release reachable from its parent — falling back t
 the newest tag, prerelease included, when no stable tag exists. The API diff
 fails the build only on a release tag commit (when the tag itself must carry a
 compatible API), unless `--blocking` is passed: the flag forces the diff to
-block everywhere, which is how `release.yml` checks the merged release PR
-before it creates the tag. Off a tag commit without the flag, violations are
-reported as non-blocking warnings, so a breaking change can land on `main` and
-be enforced by a release PR's version bump. A shallow clone that hides every
-`v*` tag is an error — fetch the tags and their history
-(`actions/checkout: fetch-depth: 0`) — not a pass. A repository with no `v*`
-tag at all, or a release tag with no previous `v*` tag — the first release —
-prints `no baseline tag; API diff check skipped` and passes: there is no
-predecessor to compare against, so the API diff does not run (rather than
+block everywhere, which is how `release.yml`'s `semver-gate` job checks the
+merged release PR before `release` creates the tag. Off a tag commit without
+the flag, violations are reported as non-blocking warnings, so a breaking
+change can land on `main` and be enforced by a release PR's version bump. A
+shallow clone that hides every `v*` tag is an error — fetch the tags and their
+history (`actions/checkout: fetch-depth: 0`) — not a pass. A repository with no
+`v*` tag at all, or a release tag with no previous `v*` tag — the first
+release — prints `no baseline tag; API diff check skipped` and passes: there is
+no predecessor to compare against, so the API diff does not run (rather than
 comparing the tag against itself), and `tooling/migrations/check.mjs` treats
 the working tree as the first published set.
+
+`semver-gate` skips `check.mjs` entirely for a prerelease version (one with a
+`-` suffix): a prerelease is tagged and released from Git but never uploads, so
+it claims no registry version and owes no compatible API to one. Stable releases
+always run the gate.

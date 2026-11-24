@@ -6,16 +6,25 @@ A release is one flow, driven by two workflows:
    version, renders the changelog section and opens the `release`-labelled
    bump pull request.
 2. Review and merge that pull request with the `release` label.
-3. `release.yml` runs on the merge. Its `release` job runs the SemVer check,
+3. `release.yml` runs on the merge. Its `semver-gate` job first checks the
+   merged commit's API diff against the previous release — before any tag
+   exists, so a rejected release leaves nothing behind. Its `release` job then
    creates the annotated `v<version>` tag on the merge commit and the GitHub
    Release from that version's `CHANGELOG.md` section; its `publish-crates` job
    then uploads the three public crates to crates.io.
 
+`semver-gate` is read-only (`contents: read`) and checks out the merge commit
+without persisted Git credentials: `cargo semver-checks` builds dependencies,
+and their build scripts must not run with a token that can write repository
+refs.
+
 There is no manual publish step: publishing is the last job of the release
 workflow and starts by itself once the release job succeeded. Any SemVer
 prerelease — a version with a `-` suffix, such as `v0.2.0-beta.1` or
-`v0.2.0-alpha.1` — stops before `publish-crates`, so a prerelease never reaches
-the registry and never claims a version there.
+`v0.2.0-alpha.1` — skips `semver-gate` and stops before `publish-crates`, so a
+prerelease never reaches the registry and never claims a version there. It is
+not gated because it is not uploaded: there is no registry version to keep
+compatible. A stable version is always gated.
 
 ## Publish order
 
@@ -47,10 +56,12 @@ That is the view `cargo` resolves through: the crates.io API answers earlier, so
 would let `mindcore-spi` start while `mindcore-base` is still unresolvable. A version already listed
 there passes on the first check, so a resumed job does not wait.
 
-The script does not run the SemVer check: `release` runs `node tooling/semver/check.mjs --blocking`
-before it creates the tag. `--blocking` is required because HEAD is not yet a tag commit there, and
-checking first means a rejected release leaves no tag behind — the next release then still diffs
-against the last version that actually shipped.
+The script does not run the SemVer check: `semver-gate` runs
+`node tooling/semver/check.mjs --blocking` on the merge commit before `release`
+creates the tag. `--blocking` is required because HEAD is not yet a tag commit
+there, and checking before the tag means a rejected release leaves no tag behind
+— the next release then still diffs against the last version that actually
+shipped.
 
 ## Breaking changes
 
@@ -58,7 +69,7 @@ Land a breaking API change in ordinary pull requests — do not bump the
 workspace version outside the release PR. Off a tag commit
 `tooling/semver/check.mjs` reports the `cargo semver-checks` diff as
 non-blocking, so the PR merges; the release PR's minor bump is what makes the
-change releasable, and the `release` job then runs the same check with
+change releasable, and the `semver-gate` job then runs the same check with
 `--blocking` on the merged commit, verifying the new version against the
 previous release before the tag exists.
 
