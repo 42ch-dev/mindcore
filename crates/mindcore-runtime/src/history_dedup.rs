@@ -23,7 +23,8 @@
 //! Nothing evicts: at the bound an unseen key answers `Evicted` — Connect's `RECEIPT_EXPIRED` —
 //! without the prune being executed, and `record` writes no row that would cross the bound. A
 //! caller that exhausts its namespace therefore gets refusals rather than a prune it cannot dedup,
-//! and the table's growth stays bounded per surface.
+//! and the table's growth stays bounded per collection: the namespace is the collection, so every
+//! surface serving it shares one bound, and a different collection gets its own.
 
 use std::io::Write;
 
