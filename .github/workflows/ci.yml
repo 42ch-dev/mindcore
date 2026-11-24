@@ -62,7 +62,7 @@ jobs:
       - name: Migration compatibility check
         run: node tooling/migrations/check.mjs
       - name: Test the release checkers
-        run: node --test tooling/semver/check.test.mjs
+        run: node --test tooling/semver/check.test.mjs tooling/migrations/check.test.mjs
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         env:
           SQLX_OFFLINE: "true"
