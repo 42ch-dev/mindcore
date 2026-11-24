@@ -168,7 +168,7 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
   refusal hygiene: `crates/mindcore-runtime/src/adoption.rs`; its wire contract is
   `.agents/specs/architecture/serving-seam.md`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
-- Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
+- Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; the prune dedup record in `crates/mindcore-runtime/src/history_dedup.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
 
 ## Served failure messages
 
