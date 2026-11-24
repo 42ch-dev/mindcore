@@ -73,5 +73,8 @@ via `sqlx::migrate!`.
 
 Once a `v*` tag exists it additionally runs
 `cargo semver-checks check-release -p <crate> --baseline-rev <tag>` for each
-publishable crate. Before the first tag it prints
-`no baseline tag; API diff check skipped` and passes.
+publishable crate. The baseline is the previous `v*` release tag on a tag
+commit and the newest `v*` tag otherwise. A shallow clone that hides every
+`v*` tag is an error — fetch the tags and their history
+(`actions/checkout: fetch-depth: 0`) — not a pass. Only a repository with no
+`v*` tag at all prints `no baseline tag; API diff check skipped` and passes.

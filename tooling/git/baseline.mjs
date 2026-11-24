@@ -27,7 +27,7 @@ export function baselineTag(cwd) {
   if (current !== null) {
     // The first release has no predecessor: skip the diff rather than compare a
     // tag against itself.
-    const previous = git(cwd, ['describe', '--tags', '--abbrev=0', `${current.trim()}^`]);
+    const previous = git(cwd, ['describe', '--tags', '--abbrev=0', '--match', 'v*', `${current.trim()}^`]);
     return previous?.trim() || null;
   }
 

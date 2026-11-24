@@ -176,3 +176,16 @@ test('baselineTag is the previous tag on a tag commit and the newest tag elsewhe
     assert.equal(baselineTag(root), 'v0.2.0');
   });
 });
+
+test('baselineTag ignores a non-release tag between two releases', () => {
+  gitRepo(({ root, git, commit }) => {
+    commit('one');
+    git('tag', 'v0.1.0');
+    commit('two');
+    git('tag', 'nightly-1');
+    commit('three');
+    git('tag', 'v0.2.0');
+    // The non-release tag sits on the parent commit but is not a baseline.
+    assert.equal(baselineTag(root), 'v0.1.0');
+  });
+});
