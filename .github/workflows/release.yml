@@ -1,0 +1,91 @@
+name: Release
+
+# Tags the merged release-bump PR and creates the GitHub Release.
+# No crate ships to a registry: the release is a tag plus a GitHub Release.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: release-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release:
+    name: release
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(join(github.event.pull_request.labels.*.name, ','), 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.18.1
+          package-manager-cache: false
+
+      - name: Tag the merge commit
+        id: tag
+        run: |
+          set -euo pipefail
+          VERSION="$(node tooling/release/next-version.mjs --current)"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force origin
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            if [ "$(git cat-file -t "refs/tags/${TAG}")" != "tag" ]; then
+              echo "::error::Tag ${TAG} exists but is not an annotated tag."
+              exit 1
+            fi
+            echo "Tag ${TAG} already exists; continuing."
+          else
+            MESSAGE="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" || true)"
+            if [ -z "$MESSAGE" ]; then
+              MESSAGE="Release ${TAG}"
+            fi
+            git tag -a "$TAG" -m "$MESSAGE" "${{ github.event.pull_request.merge_commit_sha }}"
+            git push origin "refs/tags/${TAG}"
+            echo "Created and pushed ${TAG}"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          BODY="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" || true)"
+          if [ -z "$BODY" ]; then
+            BODY="$(git tag -l --format='%(contents)' "$TAG" || true)"
+          fi
+          if [ -z "$BODY" ]; then
+            BODY="Release ${TAG}"
+          fi
+
+          PRERELEASE=()
+          case "$VERSION" in
+            *-rc.*) PRERELEASE=(--prerelease) ;;
+          esac
+
+          NOTES_FILE="$(mktemp)"
+          printf '%s\n' "$BODY" > "$NOTES_FILE"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; continuing."
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" "${PRERELEASE[@]}"
+          fi
