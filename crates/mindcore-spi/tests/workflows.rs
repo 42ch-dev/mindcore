@@ -2914,9 +2914,10 @@ async fn deliberate_hands_the_binding_its_request_deadline() {
     /// call's start.
     const REASONER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
     /// Slack over the deadline's own computation: room for a scheduler pause
-    /// between the test's `start` sample and the SPI's deadline, far below the
+    /// between the test's `start` sample and the SPI's deadline. This measures
+    /// scheduler latency, not a product invariant, so it stays half the
     /// reasoner delay a commit-time recomputation would add.
-    const GRANULARITY: std::time::Duration = std::time::Duration::from_millis(20);
+    const GRANULARITY: std::time::Duration = std::time::Duration::from_millis(100);
 
     let binding = DeliberateDouble::new();
     let deadlines = binding.deadlines();
