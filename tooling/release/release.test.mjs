@@ -85,6 +85,33 @@ function createFixture() {
 }
 
 /**
+ * A fixture whose second member requires the first by path *and* version.
+ *
+ * @returns {string}
+ */
+function createPathDependencyFixture() {
+  const root = mkdtempSync(join(tmpdir(), "mindcore-release-"));
+  tempDirs.push(root);
+  mkdirSync(join(root, "crates/a"), { recursive: true });
+  mkdirSync(join(root, "crates/b"), { recursive: true });
+  writeFileSync(join(root, "Cargo.toml"), CARGO_TOML.replaceAll("alpha", "a").replaceAll("beta", "b"));
+  writeFileSync(
+    join(root, "Cargo.lock"),
+    CARGO_LOCK.replaceAll("alpha", "a").replaceAll("beta", "b"),
+  );
+  writeFileSync(
+    join(root, "crates/a/Cargo.toml"),
+    `[package]\nname = "a"\nversion.workspace = true\npublish = false\n`,
+  );
+  writeFileSync(
+    join(root, "crates/b/Cargo.toml"),
+    `[package]\nname = "b"\nversion.workspace = true\npublish = false\n\n` +
+      `[dependencies]\na = { path = "../a", version = "0.1.0" }\n`,
+  );
+  return root;
+}
+
+/**
  * A fixture the version rule can inspect for release tags.
  *
  * @param {string} [tag] Release tag to create; omitted leaves the repository untagged.
@@ -278,6 +305,34 @@ describe("bump-version", () => {
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /beta/);
     assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), CARGO_TOML);
+  });
+
+  it("rewrites a member's inline path-dependency requirement", () => {
+    const root = createPathDependencyFixture();
+    const result = run(root, "bump-version.mjs", ["0.2.0"]);
+    assert.equal(result.status, 0, result.stderr);
+
+    const member = readFileSync(join(root, "crates/b/Cargo.toml"), "utf8");
+    assert.match(member, /^a = \{ path = "\.\.\/a", version = "0\.2\.0" \}$/m);
+    assert.equal(readFileSync(join(root, "crates/a/Cargo.toml"), "utf8").includes("version ="), false);
+
+    const cargo = readFileSync(join(root, "Cargo.toml"), "utf8");
+    assert.match(cargo, /^version = "0\.2\.0"$/m);
+
+    const lock = readFileSync(join(root, "Cargo.lock"), "utf8");
+    assert.match(lock, /name = "a"\nversion = "0\.2\.0"/);
+    assert.match(lock, /name = "b"\nversion = "0\.2\.0"/);
+    assert.equal(lock.match(/version = "0\.1\.0"/g), null);
+  });
+
+  it("rewrites a path-dependency requirement for a prerelease target", () => {
+    const root = createPathDependencyFixture();
+    const result = run(root, "bump-version.mjs", ["0.2.0-rc.1"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(
+      readFileSync(join(root, "crates/b/Cargo.toml"), "utf8"),
+      /^a = \{ path = "\.\.\/a", version = "0\.2\.0-rc\.1" \}$/m,
+    );
   });
 });
 

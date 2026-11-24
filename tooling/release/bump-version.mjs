@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 /**
- * Bump the workspace version: `[workspace.package] version` in `Cargo.toml` and
- * every workspace member `[[package]]` version in `Cargo.lock`.
+ * Bump the workspace version: `[workspace.package] version` in `Cargo.toml`,
+ * every workspace member `[[package]]` version in `Cargo.lock`, and every inline
+ * `version = "..."` requirement on a path dependency between members.
  *
- * Path dependencies use `version.workspace = true`, so nothing else carries a number.
+ * Member manifests take their own version from `version.workspace = true`, but an
+ * inline dependency (`{ path = "../mindcore-base", version = "0.1.0" }`) still
+ * carries a number whose `^` requirement would reject the bumped version.
  *
  * CLI: node tooling/release/bump-version.mjs <X.Y.Z>
  *
@@ -11,7 +14,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readWorkspaceVersion,
@@ -82,6 +85,43 @@ export function replaceLockVersion(contents, packageName, version) {
 }
 
 /**
+ * Rewrite the `version` requirement of every inline dependency on a workspace
+ * member. A dependency counts as internal when its `path` resolves to a member
+ * directory, or when its name is a member package name. External dependencies
+ * carry no `path` and are left alone.
+ *
+ * shortcut: only single-line inline tables are rewritten; a member dependency
+ * spread over several lines is left as is.
+ *
+ * @param {string} contents A member Cargo.toml.
+ * @param {{ dir: string; name: string }} self
+ * @param {{ dir: string; name: string }[]} members
+ * @param {string} version
+ * @returns {string}
+ */
+export function replaceMemberDependencyVersions(contents, self, members, version) {
+  const internalDirs = new Set(members.map((member) => resolve(member.dir)));
+  const internalNames = new Set(members.map((member) => member.name));
+  return contents.replace(
+    /^(\s*)([A-Za-z0-9_-]+)\s*=\s*\{([^}]*)\}/gm,
+    (line, indent, name, body) => {
+      const path = body.match(/(?:^|,)\s*path\s*=\s*"([^"]+)"/)?.[1];
+      const internal = path === undefined
+        ? internalNames.has(name)
+        : internalDirs.has(resolve(self.dir, path));
+      if (!internal) {
+        return line;
+      }
+      const requirement = /(^|,)(\s*version\s*=\s*)"[^"]*"/;
+      if (!requirement.test(body)) {
+        return line;
+      }
+      return `${indent}${name} = {${body.replace(requirement, `$1$2"${version}"`)}}`;
+    },
+  );
+}
+
+/**
  * @param {string} root
  * @param {string} target
  * @returns {{ current: string; members: string[] }}
@@ -96,14 +136,24 @@ export function bumpVersion(root, target) {
 
   const cargoPath = join(root, "Cargo.toml");
   const cargo = readFileSync(cargoPath, "utf8");
-  const members = parseWorkspaceMembers(cargo).map((memberPath) =>
-    parsePackageName(readFileSync(join(root, memberPath, "Cargo.toml"), "utf8")),
-  );
+  const manifests = parseWorkspaceMembers(cargo).map((memberPath) => {
+    const dir = join(root, memberPath);
+    const contents = readFileSync(join(dir, "Cargo.toml"), "utf8");
+    return { dir, contents, name: parsePackageName(contents) };
+  });
+  const members = manifests.map((manifest) => manifest.name);
 
   const lockPath = join(root, "Cargo.lock");
   let lock = readFileSync(lockPath, "utf8");
   for (const member of members) {
     lock = replaceLockVersion(lock, member, target);
+  }
+
+  for (const manifest of manifests) {
+    const updated = replaceMemberDependencyVersions(manifest.contents, manifest, manifests, target);
+    if (updated !== manifest.contents) {
+      writeFileSync(join(manifest.dir, "Cargo.toml"), updated, "utf8");
+    }
   }
 
   writeFileSync(cargoPath, replaceWorkspaceVersion(cargo, target), "utf8");
