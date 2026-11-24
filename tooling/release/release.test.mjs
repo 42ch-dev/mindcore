@@ -128,11 +128,17 @@ describe("next-version", () => {
 
   it("rejects non-strict SemVer inputs", () => {
     const root = createFixture();
-    for (const bad of ["0.02.0", "0.2.0-rc.01", "0.2.0-", "0.2.0-alpha..1", "00.2.0"]) {
+    for (const bad of ["0.02.0", "0.2.0-rc.01", "0.2.0-01", "0.2.0-", "0.2.0-alpha..1", "00.2.0"]) {
       const result = run(root, "next-version.mjs", [bad]);
       assert.notEqual(result.status, 0, `${bad} should be refused`);
       assert.match(result.stderr, /Invalid SemVer/);
     }
+  });
+
+  it("accepts a leading zero in an alphanumeric prerelease identifier", () => {
+    const result = run(createFixture(), "next-version.mjs", ["0.2.0-01alpha"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "0.2.0-01alpha");
   });
 
   it("compares and bumps past 2^53 exactly", () => {

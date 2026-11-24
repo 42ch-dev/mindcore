@@ -35,7 +35,11 @@ export function parseVersion(text) {
     return null;
   }
   const prerelease = match[4] === undefined ? null : match[4].split(".");
-  if (prerelease && prerelease.some((id) => LEADING_ZERO_IDENTIFIER.test(id))) {
+  if (
+    prerelease?.some(
+      (id) => NUMERIC_IDENTIFIER.test(id) && LEADING_ZERO_IDENTIFIER.test(id),
+    )
+  ) {
     return null;
   }
   return {
