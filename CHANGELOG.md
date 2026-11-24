@@ -15,12 +15,16 @@
   collection and the retry key, in separate columns, because a collection name is arbitrary and no
   separator framing keeps them unambiguous — so two history surfaces on one database that share
   a wire scope, a principal and an idempotency key never replay or refuse each other's prunes; a
-  same-collection retry replays exactly as before. Rows are retained for the database lifetime with
-  no eviction, but each namespace is capped at 4096 rows, claims included: at the bound an unseen
-  key answers `RECEIPT_EXPIRED` without executing the prune, and `record` writes no row past the
-  cap, so a stream of fresh keys — refusals for a missing target included — cannot exhaust storage.
-  One serving process per database is a host obligation. The adoption face keeps the in-memory
-  default.
+  same-collection retry replays exactly as before. Each namespace is capped at 4096 rows, claims
+  included, and a row is retained for 30 days: before claiming, `lookup` deletes its namespace's
+  rows whose new `recorded_at` (unix seconds) is older than that window, so the cap is a working
+  set rather than a permanent lockout and a stream of fresh keys — refusals for a missing target
+  included — cannot exhaust storage. After reclamation a namespace still at the cap answers an
+  unseen key with `RECEIPT_EXPIRED` without executing the prune, and `record` writes no row past
+  the cap. A key older than the window has been reclaimed and is therefore a new request, so a
+  retry that late may run the prune again: dedup holds for the window, not the database's
+  lifetime. One serving process per database is a host obligation. The adoption face keeps the
+  in-memory default.
 
 - **Breaking — `mindcore-runtime`:** the private product tool `tools.mindcore.adopt` is removed, not
   deprecated. Adoption is served only as the published protocol operation `knowledge.adopt` under the
