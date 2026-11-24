@@ -1034,9 +1034,8 @@ mod tests {
     }
 
     /// One destination slot answers the same occupancy whether its occupant is live and admitted,
-    /// live and hidden by the admission, or retired: a retired occupant reaches the answer through
-    /// the create-only put's superseded refusal rather than the destination read, so only this
-    /// comparison shows the two routes agree.
+    /// live and hidden by the admission, or retired. The retired row resolves inside the destination
+    /// read rather than through a create-only put, so only this comparison shows both states agree.
     #[tokio::test]
     async fn a_retired_destination_occupant_answers_the_same_occupancy_as_a_live_one() {
         let (_dir, store, service) = service().await;
