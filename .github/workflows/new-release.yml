@@ -110,6 +110,9 @@ jobs:
 
           node tooling/release/bump-version.mjs "$VERSION"
           node tooling/release/render-changelog.mjs "$VERSION"
+          # Lock every migration this release ships; the next check reads the lock
+          # from this branch, so an unlocked append would be editable after release.
+          node tooling/migrations/check.mjs --write-lock
 
           # After both steps: a first release whose version is already current
           # changes no Cargo file but always writes the CHANGELOG section.
@@ -120,7 +123,8 @@ jobs:
 
           # The bump rewrites the internal dependency requirements in the member
           # manifests as well as the workspace version, so stage them all.
-          git add Cargo.toml Cargo.lock CHANGELOG.md crates/*/Cargo.toml
+          git add Cargo.toml Cargo.lock CHANGELOG.md crates/*/Cargo.toml \
+            tooling/migrations/migrations.lock.json
           git commit -m "chore(release): bump version to ${VERSION}"
           # A dispatch whose PR was closed leaves the branch behind, so replace it;
           # learn the remote tip first or the lease has no expected value.

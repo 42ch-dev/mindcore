@@ -4,13 +4,16 @@
 # - Skips when <crate>@<workspace-version> is already on crates.io (safe re-run
 #   after a partial publish-crates job).
 # - Publishes with `--locked`, as every other Cargo command in this repository.
+# - Verifies with a `--dry-run` build that has no CARGO_REGISTRY_TOKEN, then
+#   uploads with `--no-verify`: a dependency's build script runs the build, so
+#   the token must not be present while it does.
 # - Retries transient registry responses (502/503/504) at a fixed interval.
 # - Treats the registry's duplicate-version answer as success (publish race):
 #   cargo's `is already uploaded` and the index's `already exists on crates.io`.
 # - Waits for the version to appear in the sparse index after an upload: the
 #   next crate resolves it there, and the crates.io API answers earlier.
 #
-# Usage (repo root, CARGO_REGISTRY_TOKEN set):
+# Usage (repo root, CARGO_REGISTRY_TOKEN set for the upload):
 #   ./tooling/release/publish-crate.sh mindcore-base
 set -euo pipefail
 
@@ -100,11 +103,24 @@ if crates_io_has_version; then
   exit 0
 fi
 
+# Verify before the token exists in the environment: a dependency's build script
+# runs during this build and could read CARGO_REGISTRY_TOKEN out of it.
+echo "verifying ${PKG} without CARGO_REGISTRY_TOKEN"
+set +e
+verify_out="$(env -u CARGO_REGISTRY_TOKEN cargo publish -p "${PKG}" --locked --dry-run 2>&1)"
+verify_status=$?
+set -e
+printf '%s\n' "${verify_out}"
+if [[ "${verify_status}" -ne 0 ]]; then
+  echo "error: verification build of ${PKG} failed" >&2
+  exit "${verify_status}"
+fi
+
 attempt=1
 while true; do
-  echo "cargo publish -p ${PKG} --locked (attempt ${attempt}/${MAX_ATTEMPTS})"
+  echo "cargo publish -p ${PKG} --locked --no-verify (attempt ${attempt}/${MAX_ATTEMPTS})"
   set +e
-  out="$(cargo publish -p "${PKG}" --locked 2>&1)"
+  out="$(cargo publish -p "${PKG}" --locked --no-verify 2>&1)"
   status=$?
   set -e
   printf '%s\n' "${out}"
