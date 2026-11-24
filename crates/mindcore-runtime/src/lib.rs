@@ -40,6 +40,7 @@ use spoke_schemas::{HostCapabilityManifest, Scope};
 use sqlx::SqlitePool;
 
 use adoption::AdoptionService;
+use history_dedup::SqliteHistoryDedupStore;
 pub use tools::MindProviders;
 use tools::WorkflowTools;
 
@@ -227,8 +228,12 @@ impl MindcoreServe {
                 }
             });
             let port: Arc<dyn HistoryPort + Send + Sync> = store;
-            let service: Arc<dyn RemoteHistoryService> =
-                Arc::new(HistoryPortService::new(port, history_admission));
+            // The dedup record lives in the same file behind the same pool: a prune's outcome,
+            // and the claim that keeps a retry out of the port, outlive this surface.
+            let service: Arc<dyn RemoteHistoryService> = Arc::new(
+                HistoryPortService::new(port, history_admission)
+                    .with_dedup_store(Arc::new(SqliteHistoryDedupStore::new(self.store.pool()))),
+            );
             ports = ports.with_history(service);
         }
         if let Some(memory) = faces.memory {
