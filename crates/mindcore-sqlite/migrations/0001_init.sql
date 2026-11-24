@@ -441,8 +441,8 @@ CREATE TABLE history_dedup (
   namespace      TEXT NOT NULL,
   key            TEXT NOT NULL,
   -- The requester the key names, parsed out of Connect's canonical retry identity. Not derivable
-  -- from `key` by SQL, and the quota is per caller: a row whose key would not parse stores the
-  -- whole key here, so it is accounted to itself and to nobody else.
+  -- from `key` by SQL, and the quota is per caller. A key that would not parse is charged to the
+  -- shared `unknown` bucket rather than to itself, so such keys cannot mint a fresh quota each.
   principal      TEXT NOT NULL,
   -- SHA-256 hex over the RFC 8785 canonical JSON of the whole request payload.
   payload_digest TEXT,
