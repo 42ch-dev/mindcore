@@ -72,21 +72,22 @@ the revision and replay rules, the protocol adapter, and the persistence boundar
 
 ## Quick start
 
-Add the crates from crates.io; the line below tracks the released version:
+Add the published crates with Cargo; it resolves the version the registry holds, and
+`[workspace.package].version` in this repository is the source of truth for what a release contains:
+
+```sh
+cargo add mindcore-base mindcore-sqlite
+```
+
+`mindcore-spoke` and `mindcore-runtime` are not published, so they come from this repository; the
+SPOKE pin matches the one this workspace declares:
 
 ```toml
 [dependencies]
-mindcore-base = "0.1.0-alpha.1"
-mindcore-sqlite = "0.1.0-alpha.1"
 # match the SPOKE version pinned in this workspace's Cargo.toml
 spoke-operations = ">=0.18.1, <0.19.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-```
-
-`mindcore-spoke` and `mindcore-runtime` are not published; take them from this repository:
-
-```toml
-[dependencies]
+# not published: use them from this repository
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
 ```

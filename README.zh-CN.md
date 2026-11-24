@@ -68,21 +68,22 @@ Mindcore 是一个可嵌入的 Rust 库，把三件事分开保存：agent **听
 
 ## 快速开始
 
-从 crates.io 添加 crate（下面这行跟随已发布的版本）：
+用 Cargo 添加已发布的 crate；Cargo 解析 registry 上的版本，而本仓库的
+`[workspace.package].version` 才是某个 release 包含什么的唯一事实来源：
+
+```sh
+cargo add mindcore-base mindcore-sqlite
+```
+
+`mindcore-spoke` 与 `mindcore-runtime` 尚未发布，从本仓库引入。SPOKE 的 pin 与本 workspace
+声明的一致：
 
 ```toml
 [dependencies]
-mindcore-base = "0.1.0-alpha.1"
-mindcore-sqlite = "0.1.0-alpha.1"
 # 与本 workspace 的 Cargo.toml 中固定的 SPOKE 版本保持一致
 spoke-operations = ">=0.18.1, <0.19.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-```
-
-`mindcore-spoke` 与 `mindcore-runtime` 尚未发布，从本仓库引入：
-
-```toml
-[dependencies]
+# 未发布：从本仓库引入
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
 ```

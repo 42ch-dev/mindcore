@@ -20,14 +20,19 @@ repository's integration test runs. It is a guided path, not a complete API refe
 
 ## Add the dependency
 
-`mindcore-base` and `mindcore-sqlite` are on crates.io; the version below tracks the released one.
-`mindcore-spoke`, which the transaction examples below use, is not published and comes from this
-repository:
+`mindcore-base` and `mindcore-sqlite` are on crates.io; let Cargo resolve the version the registry
+holds. `[workspace.package].version` in this repository is the source of truth for what a release
+contains.
+
+```sh
+cargo add mindcore-base mindcore-sqlite
+```
+
+`mindcore-spoke`, which the transaction examples below use, is not published; it and the remaining
+pins go into `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-mindcore-base = "0.1.0-alpha.1"
-mindcore-sqlite = "0.1.0-alpha.1"
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
 # match the SPOKE version pinned in this workspace's Cargo.toml
 spoke-operations = ">=0.18.1, <0.19.0"
