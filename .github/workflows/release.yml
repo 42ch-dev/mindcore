@@ -56,6 +56,23 @@ jobs:
             echo "body=${BODY_FILE}"
           } >> "$GITHUB_OUTPUT"
 
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-semver-checks
+
+      # Before the tag exists: a rejected release must leave no tag behind, or
+      # the next patch would diff against an API that never shipped. HEAD is not
+      # a tag commit yet, so `--blocking` forces the API diff to apply; the
+      # baseline is the newest released stable tag.
+      - name: SemVer policy check
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          node tooling/semver/check.mjs --blocking
+
       - name: Tag the merge commit
         env:
           TAG: ${{ steps.notes.outputs.tag }}
@@ -128,32 +145,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24.18.1
-          package-manager-cache: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
-        with:
-          tool: cargo-semver-checks
-
-      # The tag exists by now, so the API diff is blocking: an incompatible
-      # release fails here, before anything reaches the registry. That holds
-      # only while HEAD is the tag commit, so assert it — otherwise the checker
-      # downgrades itself to warnings and the upload proceeds.
-      - name: SemVer policy check
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-        run: |
-          set -euo pipefail
-          git fetch --tags --force origin
-          if [ "$(git describe --tags --exact-match --match "v${VERSION}" HEAD 2>/dev/null)" != "v${VERSION}" ]; then
-            echo "::error::HEAD is not v${VERSION}; the API diff would not be blocking."
-            exit 1
-          fi
-          node tooling/semver/check.mjs
 
       # Dependency order: a crate's manifest pins the registry version of the
       # crate below it, so base must be resolvable before spi or sqlite package.

@@ -3,7 +3,9 @@
 //
 // Static checks always run. The `cargo semver-checks` API diff runs only once a
 // `v*` baseline tag exists — before the first tag this script skips it, so it
-// is safe on a brand-new history.
+// is safe on a brand-new history. The diff is blocking on a release tag commit;
+// `--blocking` makes it blocking everywhere, for the release workflow's window
+// between the merged release PR and the tag it is about to create.
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -151,7 +153,7 @@ function hasSemverChecks(cwd) {
   }
 }
 
-export function main(rootDir = repoRoot()) {
+export function main(rootDir = repoRoot(), { blocking: forceBlocking = false } = {}) {
   const errors = checkManifests(rootDir);
   if (errors.length) {
     for (const error of errors) console.error(`error: ${error}`);
@@ -183,11 +185,14 @@ export function main(rootDir = repoRoot()) {
     return 1;
   }
 
-  // Blocking only on a release tag commit (HEAD is an exact v* tag): that tag
-  // is the release, so an API break must fail. Off a tag commit a breaking
-  // change lands with the release PR's version bump — report it as a warning
-  // and let the tag-time check enforce it.
+  // Blocking on a release tag commit (HEAD is an exact v* tag): that tag is the
+  // release, so an API break must fail. Off a tag commit a breaking change lands
+  // with the release PR's version bump — report it as a warning and let the
+  // tag-time check enforce it. `--blocking` forces it for the release workflow,
+  // which checks the merged PR before creating the tag: the baseline is then
+  // still the newest released tag.
   const blocking =
+    forceBlocking ||
     git(rootDir, ['describe', '--tags', '--exact-match', '--match', 'v*', 'HEAD']) !== null;
   if (!blocking) {
     console.log(`API diff against ${tag} is non-blocking until a release tag lands`);
@@ -215,6 +220,16 @@ function repoRoot() {
   return join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 }
 
+// CLI: `--blocking` forces the API diff to block off a tag commit; any other
+// argument is a usage error.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  process.exit(main());
+  const args = process.argv.slice(2);
+  const unknown = args.filter((arg) => arg !== '--blocking');
+  if (unknown.length) {
+    console.error(
+      `Usage: node tooling/semver/check.mjs [--blocking]\nunknown argument: ${unknown[0]}`,
+    );
+    process.exit(1);
+  }
+  process.exit(main(undefined, { blocking: args.includes('--blocking') }));
 }

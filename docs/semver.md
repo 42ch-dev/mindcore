@@ -3,8 +3,8 @@
 `mindcore` follows SemVer 2.0. This document is the single source of truth for
 how version numbers move and what storage compatibility is guaranteed. It is
 machine-checked by `tooling/semver/check.mjs`, which runs in CI on every push
-and pull request and again in `release.yml`'s `publish-crates` job before the
-first upload.
+and pull request and again in `release.yml`'s `release` job, before the tag is
+created.
 
 ## Publish scope
 
@@ -78,13 +78,15 @@ publishable crate. The baseline is the newest stable `v*` tag — on a tag
 commit, the previous stable release reachable from its parent — falling back to
 the newest tag, prerelease included, when no stable tag exists. The API diff
 fails the build only on a release tag commit (when the tag itself must carry a
-compatible API); off a tag commit violations are reported as non-blocking
-warnings, so a breaking change can land on `main` and be enforced by the
-release PR's version bump. A shallow clone that hides every `v*` tag is an
-error — fetch the tags and their history (`actions/checkout: fetch-depth: 0`)
-— not a pass. A repository with no `v*` tag at all, or a release tag with no
-previous `v*` tag — the first release — prints
-`no baseline tag; API diff check skipped` and passes: there is no predecessor
-to compare against, so the API diff does not run (rather than comparing the
-tag against itself), and `tooling/migrations/check.mjs` treats the working
-tree as the first published set.
+compatible API), unless `--blocking` is passed: the flag forces the diff to
+block everywhere, which is how `release.yml` checks the merged release PR
+before it creates the tag. Off a tag commit without the flag, violations are
+reported as non-blocking warnings, so a breaking change can land on `main` and
+be enforced by a release PR's version bump. A shallow clone that hides every
+`v*` tag is an error — fetch the tags and their history
+(`actions/checkout: fetch-depth: 0`) — not a pass. A repository with no `v*`
+tag at all, or a release tag with no previous `v*` tag — the first release —
+prints `no baseline tag; API diff check skipped` and passes: there is no
+predecessor to compare against, so the API diff does not run (rather than
+comparing the tag against itself), and `tooling/migrations/check.mjs` treats
+the working tree as the first published set.

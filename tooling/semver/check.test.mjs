@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { baselineTag } from '../git/baseline.mjs';
 import {
@@ -13,6 +14,8 @@ import {
   publishesToCratesIo,
   PUBLISHABLE,
 } from './check.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const workspace = (root, version = '0.2.0') =>
   writeFileSync(
@@ -134,6 +137,43 @@ test('accepts a clean publishable workspace', () => {
 test('main skips the API diff when the fixture dir has no v* tag', () => {
   const root = fixture(cleanFixture);
   assert.equal(main(root), 0);
+});
+
+test('the API diff blocks off a tag commit only with --blocking', () => {
+  gitRepo(({ root, git, commit }) => {
+    cleanFixture(root);
+    mkdirSync(join(root, 'tooling', 'semver'), { recursive: true });
+    mkdirSync(join(root, 'tooling', 'git'), { recursive: true });
+    cpSync(join(HERE, 'check.mjs'), join(root, 'tooling', 'semver', 'check.mjs'));
+    cpSync(join(HERE, '..', 'git', 'baseline.mjs'), join(root, 'tooling', 'git', 'baseline.mjs'));
+
+    // A fake cargo: the tool probe passes, every API diff reports a violation.
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, 'cargo'),
+      '#!/bin/sh\n[ "$1" = semver-checks ] && [ "$2" = --version ] && exit 0\nexit 1\n',
+      { mode: 0o755 },
+    );
+
+    git('add', '--all');
+    git('commit', '--quiet', '-m', 'release 0.1.0');
+    git('tag', 'v0.1.0');
+    commit('breaking change');
+
+    const run = (...args) =>
+      spawnSync(process.execPath, ['tooling/semver/check.mjs', ...args], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+
+    // Off a tag commit the break is only a warning: the release PR's version
+    // bump makes it releasable.
+    assert.equal(run().status, 0);
+    // The release workflow checks before tagging, so there it must fail.
+    assert.equal(run('--blocking').status, 1);
+  });
 });
 
 function gitRepo(fn) {

@@ -6,10 +6,10 @@ A release is one flow, driven by two workflows:
    version, renders the changelog section and opens the `release`-labelled
    bump pull request.
 2. Review and merge that pull request with the `release` label.
-3. `release.yml` runs on the merge. Its `release` job creates the annotated
-   `v<version>` tag on the merge commit and the GitHub Release from that
-   version's `CHANGELOG.md` section; its `publish-crates` job then uploads the
-   three public crates to crates.io.
+3. `release.yml` runs on the merge. Its `release` job runs the SemVer check,
+   creates the annotated `v<version>` tag on the merge commit and the GitHub
+   Release from that version's `CHANGELOG.md` section; its `publish-crates` job
+   then uploads the three public crates to crates.io.
 
 There is no manual publish step: publishing is the last job of the release
 workflow and starts by itself once the release job succeeded. Any SemVer
@@ -47,9 +47,10 @@ That is the view `cargo` resolves through: the crates.io API answers earlier, so
 would let `mindcore-spi` start while `mindcore-base` is still unresolvable. A version already listed
 there passes on the first check, so a resumed job does not wait.
 
-The script does not run the SemVer check: `publish-crates` runs `node tooling/semver/check.mjs` itself
-before the first upload, with the tag in place, so its API diff is blocking and an incompatible release
-fails before any version reaches the registry.
+The script does not run the SemVer check: `release` runs `node tooling/semver/check.mjs --blocking`
+before it creates the tag. `--blocking` is required because HEAD is not yet a tag commit there, and
+checking first means a rejected release leaves no tag behind — the next release then still diffs
+against the last version that actually shipped.
 
 ## Breaking changes
 
@@ -57,8 +58,9 @@ Land a breaking API change in ordinary pull requests — do not bump the
 workspace version outside the release PR. Off a tag commit
 `tooling/semver/check.mjs` reports the `cargo semver-checks` diff as
 non-blocking, so the PR merges; the release PR's minor bump is what makes the
-change releasable, and on the tag commit the same check turns blocking and
-verifies the new version against the previous release.
+change releasable, and the `release` job then runs the same check with
+`--blocking` on the merged commit, verifying the new version against the
+previous release before the tag exists.
 
 ## Preconditions
 

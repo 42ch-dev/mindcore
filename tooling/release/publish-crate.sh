@@ -46,7 +46,7 @@ fi
 crates_io_has_version() {
   local code
   code="$(
-    curl -sS -o /dev/null -w '%{http_code}' -A "${USER_AGENT}" \
+    curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -A "${USER_AGENT}" \
       "https://crates.io/api/v1/crates/${PKG}/${VERSION}" || true
   )"
   [[ "${code}" == "200" ]]
@@ -67,7 +67,7 @@ index_url() {
 index_has_version() {
   local body
   # A missing crate answers 404 with an empty body, which simply has no match.
-  body="$(curl -fsS -A "${USER_AGENT}" "$(index_url "${PKG}")" 2>/dev/null || true)"
+  body="$(curl -fsS --max-time 10 -A "${USER_AGENT}" "$(index_url "${PKG}")" 2>/dev/null || true)"
   grep -qF -- "\"vers\":\"${VERSION}\"" <<< "${body}"
 }
 
