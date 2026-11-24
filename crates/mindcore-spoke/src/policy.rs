@@ -101,8 +101,8 @@ const EXACT_INTEGER_BOUND: u64 = 1 << 53;
 
 /// RFC 8785 digest over `value` with `excluded` removed. An integer exactly at
 /// `±2^53` is re-spelled as its equal `f64` first: `serde_jcs` refuses the
-/// endpoint, while the peer stack (TypeScript `canonicalize`, and connect
-/// 0.18.1's own JCS) emits it. A value beyond the endpoint still refuses, so an
+/// endpoint, while the peer stack (TypeScript `canonicalize`, and the connect
+/// stack's own JCS) emits it. A value beyond the endpoint still refuses, so an
 /// unrepresentable integer never collapses onto a neighbour's digest.
 ///
 /// shortcut: every member at the endpoint is re-spelled, not only the

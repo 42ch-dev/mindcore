@@ -335,7 +335,7 @@ fn ok<T>(result: crate::reject::AResult<T>, what: &str) -> T {
 }
 
 /// Re-spell every RFC 3339 value in a frozen payload with the space separator the
-/// pre-0.18.1 gate admitted, as a row written by the previous release would carry.
+/// earlier gate admitted, as a row written by the previous release would carry.
 fn space_the_timestamps(payload: &str) -> String {
     fn walk(value: Value) -> Value {
         match value {
@@ -2500,7 +2500,7 @@ async fn run_import(
     result
 }
 
-/// Upgrade regression: a staged payload frozen before the 0.18.1 strict RFC 3339 gate
+/// Upgrade regression: a staged payload frozen before the strict RFC 3339 gate
 /// carries the space spelling in its timestamps and must still activate.
 #[tokio::test]
 async fn activation_reads_a_staged_payload_frozen_before_the_strict_gate() {
