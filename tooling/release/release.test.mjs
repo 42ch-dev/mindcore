@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -375,6 +375,20 @@ Hand-written curated body.
     assert.ok(rendered.includes("Hand-written curated body."), rendered);
   });
 
+  it("emits the placeholder when the rendered section has an empty body", () => {
+    assert.equal(
+      withCuratedBody("## [0.2.0] - 2026-01-03", "0.2.0", { body: null, date: "2026-01-04" }),
+      "## [0.2.0] - 2026-01-03\n\n_No user-visible changes._\n",
+    );
+    assert.equal(
+      withCuratedBody("## [0.2.0] - 2026-01-03\n\n\n", "0.2.0", {
+        body: "   ",
+        date: "2026-01-04",
+      }),
+      "## [0.2.0] - 2026-01-03\n\n_No user-visible changes._\n",
+    );
+  });
+
   it("synthesizes the section when a cold file has no version sections", () => {
     const rendered = renderRelease("# Changelog\n", "0.1.0", {
       section: null,
@@ -386,6 +400,30 @@ Hand-written curated body.
       rendered,
       "# Changelog\n\n## [0.1.0] - 2026-01-04\n\n_No user-visible changes._\n",
     );
+  });
+
+  it("leaves no scratch directory behind when git-cliff fails", () => {
+    const root = createFixture();
+    const scratch = tmpdir();
+    const before = new Set(
+      readdirSync(scratch).filter((name) => name.startsWith("mindcore-cliff-")),
+    );
+    // An empty PATH makes the `git-cliff` spawn fail instead of rendering.
+    const result = spawnSync(
+      process.execPath,
+      [join(SCRIPT_DIR, "render-changelog.mjs"), "0.2.0"],
+      {
+        cwd: root,
+        env: { ...process.env, MINDCORE_REPO_ROOT: root, PATH: "" },
+        encoding: "utf8",
+      },
+    );
+    assert.notEqual(result.status, 0, "a failing git-cliff must fail the run");
+    assert.match(result.stderr, /git-cliff failed/);
+    const left = readdirSync(scratch).filter(
+      (name) => name.startsWith("mindcore-cliff-") && !before.has(name),
+    );
+    assert.deepEqual(left, [], `scratch dirs left behind: ${left.join(", ")}`);
   });
 });
 

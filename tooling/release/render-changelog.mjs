@@ -97,8 +97,8 @@ export function cliffParts(output) {
 
 /**
  * Place the curated body directly under a section's heading, before the
- * generated groups. A missing section becomes one, carrying the placeholder when
- * there is no curated body. Pure.
+ * generated groups. A missing — or rendered but empty — section carries the
+ * placeholder when there is no curated body. Pure.
  *
  * @param {string | null} section Section text starting at its `## [` heading.
  * @param {string} version
@@ -112,11 +112,14 @@ export function withCuratedBody(section, version, { body, date }) {
     "m",
   ).exec(section ?? "");
   if (!heading) {
-    return `## [${version}] - ${date}\n\n${curated.length > 0 ? curated : PLACEHOLDER}\n`;
+    return `## [${version}] - ${date}\n\n${curated || PLACEHOLDER}\n`;
   }
-  const rest = (section ?? "").slice(heading.index + heading[0].length).replace(/^\n+/, "");
-  const below = curated.length > 0 ? `${curated}\n\n${rest}` : rest;
-  return `${heading[0]}\n\n${below.replace(/\s*$/, "")}\n`;
+  const rest = (section ?? "")
+    .slice(heading.index + heading[0].length)
+    .replace(/^\n+/, "")
+    .replace(/\s*$/, "");
+  const below = [curated, rest].filter((part) => part.length > 0).join("\n\n");
+  return `${heading[0]}\n\n${below || PLACEHOLDER}\n`;
 }
 
 /**
@@ -158,12 +161,14 @@ export function todayUtc() {
 function main(argv) {
   if (argv.length !== 1) {
     console.error("Usage: node tooling/release/render-changelog.mjs <X.Y.Z>");
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
   const version = argv[0];
   if (!parseVersion(version)) {
     console.error(`render-changelog: invalid SemVer "${version}"`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const root = repoRoot();
@@ -171,6 +176,7 @@ function main(argv) {
   const existing = existsSync(changelogPath) ? readFileSync(changelogPath, "utf8") : "";
   const curated = unreleasedBody(existing);
 
+  // Failure paths set exitCode and return so the scratch dir still goes away.
   const scratch = mkdtempSync(join(tmpdir(), "mindcore-cliff-"));
   const renderPath = join(scratch, "section.md");
   try {
@@ -181,11 +187,13 @@ function main(argv) {
     );
     if (cliff.error) {
       console.error(`render-changelog: git-cliff failed: ${cliff.error.message}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
     if (cliff.status !== 0) {
       console.error(`render-changelog: git-cliff exited ${cliff.status}`);
-      process.exit(cliff.status ?? 1);
+      process.exitCode = cliff.status ?? 1;
+      return;
     }
 
     const { header, section } = cliffParts(readFileSync(renderPath, "utf8"));
