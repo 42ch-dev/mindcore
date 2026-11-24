@@ -1179,9 +1179,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                         "cognition settlement transaction could not begin: {error}"
                     ))
                 })?;
-        if std::time::Instant::now() >= deadline {
-            return Err(SpiError::DeadlineExceeded);
-        }
+        deadline_still_open(std::time::Instant::now(), deadline)?;
         let mut transaction = connection
             .begin_with("BEGIN IMMEDIATE")
             .await
@@ -1526,6 +1524,21 @@ fn uncertain_commit(operation: &str, error: sqlx::Error) -> SpiError {
     )
 }
 
+/// An acquire can complete with the deadline already past: the pool hands out
+/// a connection that was idle when the wait began. The begin that follows is
+/// where the write starts, so the expiry is rechecked here rather than trusted
+/// to the acquire's own bound. Pure in `now` so the refusal is testable without
+/// a pool.
+fn deadline_still_open(
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> Result<(), SpiError> {
+    if now >= deadline {
+        return Err(SpiError::DeadlineExceeded);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1547,6 +1560,27 @@ mod tests {
         );
         assert!(result_record_ids(Some(&json!({ "outcome": "dismissed" }))).is_empty());
         assert!(result_record_ids(None).is_empty());
+    }
+
+    #[test]
+    fn an_acquired_connection_is_refused_once_its_deadline_elapsed() {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(1);
+        assert!(
+            deadline_still_open(start, deadline).is_ok(),
+            "time left lets the begin start"
+        );
+        let SpiError::DeadlineExceeded = deadline_still_open(deadline, deadline)
+            .expect_err("the deadline instant itself is closed")
+        else {
+            panic!("an elapsed deadline refuses with a deadline refusal");
+        };
+        let SpiError::DeadlineExceeded =
+            deadline_still_open(deadline + std::time::Duration::from_secs(1), deadline)
+                .expect_err("a passed deadline refuses")
+        else {
+            panic!("a passed deadline refuses with a deadline refusal");
+        };
     }
 
     #[test]

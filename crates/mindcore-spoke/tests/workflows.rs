@@ -4268,15 +4268,25 @@ async fn a_settle_refuses_at_its_deadline_while_the_only_connection_is_held() {
 }
 
 /// An acquire that finds a free connection can complete with the deadline
-/// already past: the re-check before `BEGIN IMMEDIATE` refuses it. The pool
-/// pins `test_before_acquire(false)` so the acquire completes on its first
-/// poll instead of refusing at the ping.
+/// already past: the re-check before `BEGIN IMMEDIATE` refuses it.
+///
+/// The pool pins `test_before_acquire(false)` so the acquire completes on its
+/// first poll instead of refusing at the ping, and `before_acquire` records
+/// that the hand-over happened. That record is the proof this test is about
+/// the re-check and not the acquire's own bound: the acquire ran far enough to
+/// give a connection out, so the elapsed deadline can only refuse it later.
 #[tokio::test]
 async fn a_settle_with_a_passed_deadline_opens_no_transaction_on_a_free_connection() {
     let harness = deliberate_harness().await;
+    let handed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let acquired = handed_out.clone();
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .test_before_acquire(false)
+        .before_acquire(move |_connection, _metadata| {
+            acquired.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(true) })
+        })
         .connect_with(
             SqliteConnectOptions::new()
                 .filename(harness.root.join("workflows.db"))
@@ -4306,6 +4316,10 @@ async fn a_settle_with_a_passed_deadline_opens_no_transaction_on_a_free_connecti
     .expect("a free connection must not block the settle past its guard");
     let error = outcome.expect_err("a passed deadline refuses the settle");
     assert!(matches!(error, SpiError::DeadlineExceeded), "got {error:?}");
+    assert!(
+        handed_out.load(Ordering::SeqCst),
+        "the acquire handed out a connection, so the elapsed deadline was refused by the re-check"
+    );
 
     let (revision, _) = stored_carrier(&harness).await;
     assert_eq!(revision, 1, "a refused settle moves no carrier");
