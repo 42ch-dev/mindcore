@@ -71,6 +71,7 @@ Mindcore 是一个可嵌入的 Rust 库，把三件事分开保存：agent **听
 [dependencies]
 mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
+# 与本 workspace 的 Cargo.toml 中固定的 SPOKE 版本保持一致
 spoke-operations = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```

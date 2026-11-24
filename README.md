@@ -75,6 +75,7 @@ Add the crates from this repository (they are not published yet):
 [dependencies]
 mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
+# match the SPOKE version pinned in this workspace's Cargo.toml
 spoke-operations = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```

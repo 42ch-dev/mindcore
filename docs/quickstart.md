@@ -27,6 +27,7 @@ The crates are `publish = false`; depend on this repository directly.
 mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+# match the SPOKE version pinned in this workspace's Cargo.toml
 spoke-operations = "0.18"
 spoke-schemas = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -154,9 +155,10 @@ retirement resolution. Full rules: [Concepts](concepts.md#knowledge) and
 ## Derive the current judgment
 
 Cognition lives in a carrier entry: an ordinary `KnowledgeEntry` whose cognition module holds
-append-only records, with one head pointer to the current judgment. A fresh store has no carrier,
-so create the holder entry and append records first (the story's steps 3–4 do this); until then the
-read refuses `KnowledgeEntryNotFound`.
+append-only records, with one head pointer to the current judgment. A fresh store has no carrier, so
+`read_carrier` refuses `KnowledgeEntryNotFound` until the holder entry exists. Once it exists, the
+read succeeds even before the first append; `derive_mind_state` then answers `NoRecords` until a
+record is appended. The story's steps 3–4 create the holder and append the first records.
 
 ```rust
 use mindcore_base::cognition::derive_mind_state;
