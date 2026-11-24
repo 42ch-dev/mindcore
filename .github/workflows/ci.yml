@@ -55,6 +55,8 @@ jobs:
           tool: cargo-semver-checks
       - name: SemVer policy check
         run: node tooling/semver/check.mjs
+      - name: Test the release checkers
+        run: node --test tooling/semver/check.test.mjs
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         env:
           SQLX_OFFLINE: "true"
