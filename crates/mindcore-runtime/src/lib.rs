@@ -8,6 +8,7 @@
 //! registrations, never from a host-supplied capability string.
 
 mod adoption;
+mod history_dedup;
 pub mod tools;
 
 use std::collections::BTreeMap;
