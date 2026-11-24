@@ -52,6 +52,6 @@ The row key names the collection its history surface routes to and the retry key
 - `.agents/specs/architecture/serving-seam.md` § History — the dedup paragraphs and the refusal table
 - `.agents/specs/data/store-schema.md` § Current state, § Where it lives
 - `.agents/specs/architecture/mind-model.md` § Current state
-- `crates/mindcore-runtime/src/history_dedup.rs` — `SqliteHistoryDedupStore`, `HISTORY_DEDUP_CAPACITY`, `HISTORY_DEDUP_RETENTION_SECONDS`, `now_seconds`, `encode_outcome`, `decode_outcome`
-- `crates/mindcore-sqlite/migrations/0001_init.sql` — `history_dedup`
+- `crates/mindcore-runtime/src/history_dedup.rs` — `SqliteHistoryDedupStore`, `HISTORY_DEDUP_CAPACITY`, `principal_of`, `encode_outcome`, `decode_outcome`
+- `crates/mindcore-sqlite/migrations/0001_init.sql` — `history_dedup`, `idx_history_dedup_principal`
 - `crates/mindcore-runtime/tests/loopback.rs` — `a_prune_replays_its_recorded_outcome_after_the_store_is_reopened`

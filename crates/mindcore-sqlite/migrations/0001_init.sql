@@ -452,6 +452,12 @@ CREATE TABLE history_dedup (
   CHECK ((payload_digest IS NULL) = (outcome_json IS NULL))
 ) WITHOUT ROWID;
 
+-- The quota count filters on `(namespace, principal)`, which the primary key does not cover: without
+-- this index the count walks every row of the namespace on each claim and each record. This index
+-- makes it a seek over one principal's rows, so the gate's cost tracks the quota and not the
+-- collection's key count.
+CREATE INDEX idx_history_dedup_principal ON history_dedup (namespace, principal);
+
 -- ── Retained Memory record vectors ──
 -- Optional cache of retained Memory record vectors: one row per record and embedding identity.
 -- `identity_hash` partitions rows by serving model, so retiring an identity is one indexed bulk
