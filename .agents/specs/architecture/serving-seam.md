@@ -43,7 +43,7 @@ Coverage is `knowledge_entry` alone, because the store keeps no relation revisio
 | Malformed payload, or a prune integer outside the JCS exact-integer range | `INVALID_INPUT` with `details.op` |
 | A failed statement or a contradicted history gap | `INTERNAL_ERROR`, none after generalization |
 | Same `idempotency_key` with a different payload digest, when a recorded outcome exists to compare | `IDEMPOTENCY_CONFLICT`, none |
-| A claim with no outcome — another caller's live claim, one whose process never settled, or a fresh key its principal had no quota to claim (4096 rows already in the collection's namespace) | `RECEIPT_EXPIRED`, none; the prune is not re-executed |
+| A claim with no outcome — another caller's live claim, one whose process never settled, or a fresh key its principal had no quota to claim (4096 rows already held by that principal in the collection's namespace) | `RECEIPT_EXPIRED`, none; the prune is not re-executed |
 
 A key that is both a retained claim and a same-key different-payload retry answers `RECEIPT_EXPIRED`: there is no recorded outcome to conflict with, and the claim wins.
 
