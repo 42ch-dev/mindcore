@@ -21,20 +21,17 @@
 //! a second process from executing, but it answers `RECEIPT_EXPIRED` instead of waiting for the
 //! first, so two processes would turn a replay into a refusal.
 //!
-//! A namespace holds at most [`HISTORY_DEDUP_CAPACITY`] rows, claims and recorded outcomes alike.
-//! Before claiming, [`SqliteHistoryDedupStore::lookup`] reclaims the namespace's rows older than
-//! [`HISTORY_DEDUP_RETENTION_SECONDS`], so the bound is a working set and not a permanent lockout:
-//! a collection whose keys churn keeps claiming, and a namespace that reaches the bound after
-//! reclamation answers `Evicted` — Connect's `RECEIPT_EXPIRED` — without the prune being executed.
-//! `record` writes no row that would cross the bound.
-//!
-//! Retention trades at-most-once against growth. A key older than the window has been reclaimed,
-//! so a retry carrying it is a new request: the prune may execute a second time against whatever
-//! checkpoints exist by then. That is the documented bound on the dedup record — dedup holds for
-//! the window, not for the database's lifetime.
+//! Each principal holds at most [`HISTORY_DEDUP_CAPACITY`] rows per namespace, claims and recorded
+//! outcomes alike. Nothing is ever deleted and no clock is read: the table is a hard bound, not a
+//! working set that ages out, so a recorded outcome replays for the database's lifetime and no
+//! forward clock jump can turn a live dedup record into an executed prune. At the bound a fresh key
+//! answers `Evicted` — Connect's `RECEIPT_EXPIRED` — without the prune being executed, and `record`
+//! writes no row that would cross the bound. The quota is per caller, parsed out of the retry
+//! identity, so one high-churn principal can exhaust only its own quota and never disable prune for
+//! another on the same collection. A host that wants more headroom raises
+//! [`HISTORY_DEDUP_CAPACITY`] or recreates the database; there is no eviction to wait for.
 
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -43,21 +40,29 @@ use sqlx::SqlitePool;
 use spoke_connect::remote::{HistoryDedupLookup, HistoryDedupRecord, HistoryDedupStore};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 
-/// The most rows one namespace may hold. A claim counts, because a claim is what keeps a replay
-/// out of the port; a namespace at the bound refuses unseen keys instead of inserting past it.
+/// The most rows one principal may hold in one namespace. A claim counts, because a claim is what
+/// keeps a replay out of the port; a principal at the bound refuses unseen keys instead of inserting
+/// past it.
 const HISTORY_DEDUP_CAPACITY: i64 = 4096;
 
-/// How long a row keeps its key deduplicated, in seconds. `lookup` reclaims a namespace's older
-/// rows before it claims, so a namespace cannot fill permanently with keys nothing will retry.
-const HISTORY_DEDUP_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
-
-/// One unix second stamp for the retention decision. A clock before the epoch saturates at zero,
-/// which reclaims nothing and claims nothing early: the row is written as the oldest possible.
-fn now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs().min(i64::MAX as u64) as i64)
-        .unwrap_or_default()
+/// The requester a dedup key names, for the per-principal quota.
+///
+/// The key is the RFC 8785 canonical serialization of `[op, effective_scope, principal_id,
+/// idempotency_key]`, so the principal is the third element and always a string. Anything else —
+/// a malformed key, a truncated array, a non-string member — accounts the row to the whole key:
+/// that can only over-count one such row against itself, never against a real principal, and a
+/// principal whose keys all parse is unaffected.
+fn principal_of(key: &str) -> String {
+    serde_json::from_str::<Value>(key)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_array()
+                .and_then(|members| members.get(2))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| key.to_owned())
 }
 
 /// One dedup record per retry identity, in the database file the knowledge store already serves
@@ -88,33 +93,23 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             Ok(conn) => conn,
             Err(error) => return fault("claim", error),
         };
-        let now = now_seconds();
-        // Reclaim before claiming: rows past the window would otherwise hold the namespace's
-        // bound forever, and a key still inside the window is untouched, so a live replay keeps
-        // its outcome. The prune this reclaim forgets may run again; that is the window's bound.
-        let reclaimed =
-            sqlx::query("DELETE FROM history_dedup WHERE namespace = ? AND recorded_at < ?")
-                .bind(&self.namespace)
-                .bind(now - HISTORY_DEDUP_RETENTION_SECONDS)
-                .execute(&mut *conn)
-                .await;
-        if let Err(error) = reclaimed {
-            return fault("reclaim", error);
-        }
+        let principal = principal_of(key);
         // Claim and read on the same connection: the insert decides whether the row is this
         // caller's, and the read shows what the row holds — `NULL`s for a claim still in flight.
-        // The insert is also the capacity gate: a namespace already at the bound takes no new row,
+        // The insert is also the capacity gate: a principal already at the bound takes no new row,
         // so an unseen key stays unseen here and the read below answers `Evicted`. An existing key
         // is unaffected either way, so a replay still finds its recorded outcome at the bound.
         let claimed = match sqlx::query(
-            "INSERT INTO history_dedup (namespace, key, recorded_at) SELECT ?, ?, ? \
-             WHERE (SELECT COUNT(*) FROM history_dedup WHERE namespace = ?) < ? \
+            "INSERT INTO history_dedup (namespace, key, principal) SELECT ?, ?, ? \
+             WHERE (SELECT COUNT(*) FROM history_dedup \
+                    WHERE namespace = ? AND principal = ?) < ? \
              ON CONFLICT(namespace, key) DO NOTHING",
         )
         .bind(&self.namespace)
         .bind(key)
-        .bind(now)
+        .bind(&principal)
         .bind(&self.namespace)
+        .bind(&principal)
         .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&mut *conn)
         .await
@@ -157,28 +152,30 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
 
     async fn record(&self, key: &str, record: HistoryDedupRecord) {
         let outcome_json = encode_outcome(&record.outcome);
+        let principal = principal_of(key);
         // Insert only when `lookup` claimed the key or it is already present, and only while the
-        // namespace has room. An unclaimed key at the bound would otherwise grow the table past
+        // principal has room. An unclaimed key at the bound would otherwise grow the table past
         // the cap through `record` alone; this write leaves the row count alone instead.
         let written = sqlx::query(
-            "INSERT INTO history_dedup (namespace, key, payload_digest, outcome_json, recorded_at) \
+            "INSERT INTO history_dedup (namespace, key, principal, payload_digest, outcome_json) \
              SELECT ?, ?, ?, ?, ? \
              WHERE EXISTS \
                      (SELECT 1 FROM history_dedup WHERE namespace = ? AND key = ?) \
-                OR (SELECT COUNT(*) FROM history_dedup WHERE namespace = ?) < ? \
+                OR (SELECT COUNT(*) FROM history_dedup \
+                    WHERE namespace = ? AND principal = ?) < ? \
              ON CONFLICT(namespace, key) DO UPDATE SET \
                payload_digest = excluded.payload_digest, \
-               outcome_json   = excluded.outcome_json, \
-               recorded_at    = excluded.recorded_at",
+               outcome_json   = excluded.outcome_json",
         )
         .bind(&self.namespace)
         .bind(key)
+        .bind(&principal)
         .bind(&record.payload_digest)
         .bind(&outcome_json)
-        .bind(now_seconds())
         .bind(&self.namespace)
         .bind(key)
         .bind(&self.namespace)
+        .bind(&principal)
         .bind(HISTORY_DEDUP_CAPACITY)
         .execute(&self.pool)
         .await;
@@ -278,6 +275,18 @@ mod tests {
         }
     }
 
+    /// A key in the shape Connect sends: the RFC 8785 serialization of the four-member retry
+    /// identity. The per-principal quota reads the third member.
+    fn key_for(principal: &str, idempotency_key: &str) -> String {
+        json!([
+            "history.revisions.prune",
+            { "scope_id": "scope-one" },
+            principal,
+            idempotency_key
+        ])
+        .to_string()
+    }
+
     /// One fresh database file through the production open path, and the store bound to its pool.
     async fn open(dir: &TempDir) -> (MindStore, SqliteHistoryDedupStore) {
         open_in(dir, "collection-one").await
@@ -298,6 +307,17 @@ mod tests {
             .fetch_one(&store.pool())
             .await
             .expect("count the namespace's rows")
+    }
+
+    async fn principal_row_count(store: &MindStore, namespace: &str, principal: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM history_dedup WHERE namespace = ? AND principal = ?",
+        )
+        .bind(namespace)
+        .bind(principal)
+        .fetch_one(&store.pool())
+        .await
+        .expect("count the principal's rows")
     }
 
     #[tokio::test]
@@ -520,14 +540,14 @@ mod tests {
         assert_eq!(row_count(&store, "a").await, 2);
     }
 
-    /// A namespace at its bound refuses an unseen key instead of inserting one more row, so a
+    /// A principal at its bound refuses an unseen key instead of inserting one more row, so a
     /// stream of fresh keys — refusals for a missing target included — cannot exhaust storage.
     #[tokio::test]
     async fn an_unseen_key_at_capacity_answers_evicted_without_a_new_row() {
         let dir = TempDir::new().expect("temporary directory");
         let (store, dedup) = open(&dir).await;
         for index in 0..HISTORY_DEDUP_CAPACITY {
-            let key = format!("key-{index}");
+            let key = key_for("prn_one", &format!("key-{index}"));
             assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
             dedup
                 .record(
@@ -537,50 +557,157 @@ mod tests {
                 .await;
         }
         assert_eq!(
-            row_count(&store, "collection-one").await,
+            principal_row_count(&store, "collection-one", "prn_one").await,
             HISTORY_DEDUP_CAPACITY
         );
 
         assert_eq!(
-            dedup.lookup("key-overflow").await,
+            dedup.lookup(&key_for("prn_one", "key-overflow")).await,
             HistoryDedupLookup::Evicted,
             "the bound refuses a fresh key, so Connect answers RECEIPT_EXPIRED"
         );
         assert_eq!(
-            row_count(&store, "collection-one").await,
+            principal_row_count(&store, "collection-one", "prn_one").await,
             HISTORY_DEDUP_CAPACITY,
             "the refused claim inserted no row"
         );
 
-        // `record` cannot grow the namespace either: an unclaimed key at the bound writes nothing.
+        // `record` cannot grow the quota either: an unclaimed key at the bound writes nothing.
         dedup
             .record(
-                "key-unclaimed",
+                &key_for("prn_one", "key-unclaimed"),
                 record("digest", SpokeResult::Ok(json!({ "deleted": 0 }))),
             )
             .await;
         assert_eq!(
-            row_count(&store, "collection-one").await,
+            principal_row_count(&store, "collection-one", "prn_one").await,
             HISTORY_DEDUP_CAPACITY
         );
 
-        // A recorded outcome inside the namespace still replays at the bound.
+        // A recorded outcome inside the quota still replays at the bound.
         assert_eq!(
-            recorded(dedup.lookup("key-0").await, "at the bound"),
+            recorded(
+                dedup.lookup(&key_for("prn_one", "key-0")).await,
+                "at the bound"
+            ),
             record("digest", SpokeResult::Ok(json!({ "deleted": 0 })))
         );
 
         // Another namespace has its own bound and keeps working.
         let (_, elsewhere) = open_in(&dir, "collection-two").await;
         assert_eq!(
-            elsewhere.lookup("key-overflow").await,
+            elsewhere.lookup(&key_for("prn_one", "key-overflow")).await,
             HistoryDedupLookup::Unseen
         );
     }
 
-    /// The bound counts one namespace's rows exactly. Under the old prefix range a collection whose
-    /// name extended another's — `"a\0b"` beside `"a"` — had its rows swept into the shorter name's
-    /// count, so a full neighbour could refuse a namespace that held nothing at all.
+    /// The quota is per caller, so one principal filling its bound cannot disable prune for another
+    /// on the same collection — the failure a shared namespace bound allowed.
+    #[tokio::test]
+    async fn a_full_principal_quota_leaves_another_principal_claiming() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        for index in 0..HISTORY_DEDUP_CAPACITY {
+            let key = key_for("prn_noisy", &format!("key-{index}"));
+            assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
+            dedup
+                .record(
+                    &key,
+                    record("digest", SpokeResult::Ok(json!({ "deleted": 0 }))),
+                )
+                .await;
+        }
+        assert_eq!(
+            dedup.lookup(&key_for("prn_noisy", "key-overflow")).await,
+            HistoryDedupLookup::Evicted,
+            "the high-churn caller exhausted its own quota"
+        );
+
+        let quiet = key_for("prn_quiet", "key-one");
+        assert_eq!(
+            dedup.lookup(&quiet).await,
+            HistoryDedupLookup::Unseen,
+            "the quiet principal's quota is untouched"
+        );
+        let written = record("digest-quiet", SpokeResult::Ok(json!({ "deleted": 3 })));
+        dedup.record(&quiet, written.clone()).await;
+        assert_eq!(recorded(dedup.lookup(&quiet).await, "quiet"), written);
+
+        assert_eq!(
+            principal_row_count(&store, "collection-one", "prn_noisy").await,
+            HISTORY_DEDUP_CAPACITY
+        );
+        assert_eq!(
+            principal_row_count(&store, "collection-one", "prn_quiet").await,
+            1
+        );
+    }
+
+    /// The dedup record carries no clock, so a forward host-clock jump cannot make a live record
+    /// expire and let a same-key retry execute the destructive prune again.
+    #[tokio::test]
+    async fn the_record_carries_no_clock_column() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let key = key_for("prn_one", "key-one");
+        dedup.lookup(&key).await;
+        let written = record("digest", SpokeResult::Ok(json!({ "deleted": 2 })));
+        dedup.record(&key, written.clone()).await;
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('history_dedup') ORDER BY cid")
+                .fetch_all(&store.pool())
+                .await
+                .expect("read the table's columns");
+        assert_eq!(
+            columns,
+            vec![
+                "namespace",
+                "key",
+                "principal",
+                "payload_digest",
+                "outcome_json"
+            ],
+            "no timestamp column exists for a clock jump to age out"
+        );
+
+        // Nothing deletes: the record still replays after the file is reopened.
+        assert_eq!(recorded(dedup.lookup(&key).await, "before reopen"), written);
+        drop(dedup);
+        let (_store, reopened) = open(&dir).await;
+        assert_eq!(
+            recorded(reopened.lookup(&key).await, "after reopen"),
+            written
+        );
+    }
+
+    /// A key that is not the canonical four-member identity still claims and replays; it is simply
+    /// accounted to itself rather than to a named principal, so it cannot spend a real caller's
+    /// quota.
+    #[tokio::test]
+    async fn a_key_that_does_not_parse_is_its_own_principal() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        assert_eq!(
+            dedup.lookup("not-a-canonical-key").await,
+            HistoryDedupLookup::Unseen
+        );
+        let written = record("digest", SpokeResult::Ok(json!({ "deleted": 1 })));
+        dedup.record("not-a-canonical-key", written.clone()).await;
+        assert_eq!(
+            recorded(dedup.lookup("not-a-canonical-key").await, "unparsed"),
+            written
+        );
+        assert_eq!(
+            principal_row_count(&store, "collection-one", "not-a-canonical-key").await,
+            1,
+            "the whole key is its own accounting bucket"
+        );
+    }
+
+    /// The bound counts one `(namespace, principal)` pair exactly. Under the old prefix range a
+    /// collection whose name extended another's — `"a\0b"` beside `"a"` — had its rows swept into
+    /// the shorter name's count, so a full neighbour could refuse a namespace that held nothing.
     #[tokio::test]
     async fn the_capacity_count_holds_only_the_named_namespace() {
         let dir = TempDir::new().expect("temporary directory");
@@ -589,9 +716,9 @@ mod tests {
             .expect("open the store");
         let nested = SqliteHistoryDedupStore::new(store.pool(), "a\u{0}b");
 
-        // Fill the NUL-bearing namespace to its bound, and nothing else.
+        // Fill one principal's quota in the NUL-bearing namespace, and nothing else.
         for index in 0..HISTORY_DEDUP_CAPACITY {
-            let key = format!("key-{index}");
+            let key = key_for("prn_one", &format!("key-{index}"));
             assert_eq!(nested.lookup(&key).await, HistoryDedupLookup::Unseen);
             nested
                 .record(
@@ -601,100 +728,24 @@ mod tests {
                 .await;
         }
         assert_eq!(
-            row_count(&store, "a\u{0}b").await,
+            principal_row_count(&store, "a\u{0}b", "prn_one").await,
             HISTORY_DEDUP_CAPACITY,
-            "the nested namespace is full"
+            "the nested namespace's quota is full"
         );
         assert_eq!(row_count(&store, "a").await, 0);
 
-        // The shorter name is empty, so its own bound is untouched: a fresh key still claims.
+        // The shorter name is empty, so the same principal's quota there is untouched.
         let plain = SqliteHistoryDedupStore::new(store.pool(), "a");
         assert_eq!(
-            plain.lookup("key-fresh").await,
+            plain.lookup(&key_for("prn_one", "key-fresh")).await,
             HistoryDedupLookup::Unseen,
             "the full neighbour's rows are not this namespace's"
         );
         assert_eq!(row_count(&store, "a").await, 1);
         assert_eq!(
-            row_count(&store, "a\u{0}b").await,
+            principal_row_count(&store, "a\u{0}b", "prn_one").await,
             HISTORY_DEDUP_CAPACITY,
             "the neighbour's claim left the full namespace alone"
-        );
-    }
-
-    /// Move every row of a namespace out of the retention window without touching its key.
-    async fn age_every_row(store: &MindStore, namespace: &str) {
-        sqlx::query("UPDATE history_dedup SET recorded_at = ? WHERE namespace = ?")
-            .bind(now_seconds() - HISTORY_DEDUP_RETENTION_SECONDS - 1)
-            .bind(namespace)
-            .execute(&store.pool())
-            .await
-            .expect("age the namespace's rows");
-    }
-
-    /// A key past the window is reclaimed, so it is a fresh request again: the same key answers
-    /// `Unseen` and its row is written with the current stamp rather than the stale one.
-    #[tokio::test]
-    async fn a_key_past_the_window_is_reclaimed_and_claims_again() {
-        let dir = TempDir::new().expect("temporary directory");
-        let (store, dedup) = open(&dir).await;
-        dedup.lookup("key-one").await;
-        dedup
-            .record(
-                "key-one",
-                record("digest-old", SpokeResult::Ok(json!({ "deleted": 2 }))),
-            )
-            .await;
-        age_every_row(&store, "collection-one").await;
-        assert_eq!(row_count(&store, "collection-one").await, 1);
-
-        assert_eq!(
-            dedup.lookup("key-one").await,
-            HistoryDedupLookup::Unseen,
-            "the expired row was reclaimed, so this key is a new request"
-        );
-        assert_eq!(row_count(&store, "collection-one").await, 1);
-
-        // The re-claim carries the current stamp, so the fresh key replays from now on.
-        let fresh = record("digest-new", SpokeResult::Ok(json!({ "deleted": 5 })));
-        dedup.record("key-one", fresh.clone()).await;
-        assert_eq!(recorded(dedup.lookup("key-one").await, "re-claimed"), fresh);
-    }
-
-    /// A namespace full of expired rows reclaims them before the capacity gate, so the bound is a
-    /// working set rather than a permanent lockout of the whole collection.
-    #[tokio::test]
-    async fn reclamation_restores_capacity_at_the_bound() {
-        let dir = TempDir::new().expect("temporary directory");
-        let (store, dedup) = open(&dir).await;
-        for index in 0..HISTORY_DEDUP_CAPACITY {
-            let key = format!("key-{index}");
-            assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
-            dedup
-                .record(
-                    &key,
-                    record("digest", SpokeResult::Ok(json!({ "deleted": 0 }))),
-                )
-                .await;
-        }
-        assert_eq!(
-            dedup.lookup("key-overflow").await,
-            HistoryDedupLookup::Evicted,
-            "the bound refuses a fresh key while every row is inside the window"
-        );
-
-        age_every_row(&store, "collection-one").await;
-        // The lookup that finds the full namespace is the one that reclaims it: one fresh key
-        // claims after the reclamation, and the expired rows are gone.
-        assert_eq!(
-            dedup.lookup("key-overflow").await,
-            HistoryDedupLookup::Unseen,
-            "reclamation made room, so the prune runs"
-        );
-        assert_eq!(
-            row_count(&store, "collection-one").await,
-            1,
-            "every expired row was reclaimed, leaving the fresh claim"
         );
     }
 }
