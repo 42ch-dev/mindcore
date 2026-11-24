@@ -66,6 +66,8 @@ jobs:
       - name: SemVer policy check
         if: ${{ !contains(steps.version.outputs.version, '-') }}
         run: node tooling/semver/check.mjs --blocking
+        env:
+          SQLX_OFFLINE: "true"
 
       # The lock must already cover every migration in the tagged commit.
       # --write-lock is a no-op when it does; when a migration landed after the

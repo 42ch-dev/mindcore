@@ -59,6 +59,8 @@ jobs:
           tool: cargo-semver-checks
       - name: SemVer policy check
         run: node tooling/semver/check.mjs
+        env:
+          SQLX_OFFLINE: "true"
       - name: Migration compatibility check
         run: node tooling/migrations/check.mjs
       - name: Test the release checkers
