@@ -65,3 +65,12 @@ jobs:
         run: mstar-harness lint .agents/specs --type specs
       - name: Lint ADR corpus
         run: mstar-harness lint .agents/adr --type adr
+      # The release test renders a real tagged range; it skips without this binary.
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: git-cliff@2
+      - name: Test release tooling
+        env:
+          # Without the binary the git-cliff range test would skip; fail instead.
+          REQUIRE_GIT_CLIFF: "1"
+        run: node --test tooling/release/release.test.mjs

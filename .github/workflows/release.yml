@@ -1,0 +1,111 @@
+name: Release
+
+# Tags the merged release-bump PR and creates the GitHub Release.
+# No crate ships to a registry: the release is a tag plus a GitHub Release.
+#
+# Release notes are the `## [<version>]` section of the committed `CHANGELOG.md`,
+# i.e. the curated notes the release PR carried. Commits merged after the
+# dispatch are not reflected (tracked as I-000112).
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: release-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.18.1
+          package-manager-cache: false
+
+      # Before any tag exists: a missing section must fail the run untouched.
+      - name: Prepare release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="$(node tooling/release/next-version.mjs --current)"
+          TAG="v${VERSION}"
+          BODY_FILE="${RUNNER_TEMP}/release-body.md"
+          if ! node tooling/release/extract-changelog-notes.mjs "${VERSION}" > "$BODY_FILE"; then
+            echo "::error::No committed CHANGELOG.md section for ${VERSION}; nothing tagged."
+            exit 1
+          fi
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "body=${BODY_FILE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Tag the merge commit
+        env:
+          TAG: ${{ steps.notes.outputs.tag }}
+          BODY_FILE: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force origin
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            if [ "$(git cat-file -t "refs/tags/${TAG}")" != "tag" ]; then
+              echo "::error::Tag ${TAG} exists but is not an annotated tag."
+              exit 1
+            fi
+            # A rerun must tag the same commit; a stale tag means main moved on.
+            TAGGED="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+            if [ "$TAGGED" != "${{ github.event.pull_request.merge_commit_sha }}" ]; then
+              echo "::error::Tag ${TAG} points at ${TAGGED}, not the merged commit ${{ github.event.pull_request.merge_commit_sha }}."
+              exit 1
+            fi
+            echo "Tag ${TAG} already exists; continuing."
+          else
+            # Prepare release notes already failed on an empty body, so the
+            # annotation is that same body. `--cleanup=verbatim` keeps the
+            # Markdown headings the default cleanup would strip.
+            git tag -a "$TAG" --cleanup=verbatim -F "$BODY_FILE" "${{ github.event.pull_request.merge_commit_sha }}"
+            git push origin "refs/tags/${TAG}"
+            echo "Created and pushed ${TAG}"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.notes.outputs.version }}
+          TAG: ${{ steps.notes.outputs.tag }}
+          BODY_FILE: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "$BODY_FILE" ]; then
+            echo "::error::Release body for ${TAG} is empty."
+            exit 1
+          fi
+
+          # Any SemVer prerelease (`-...`) is a prerelease release.
+          PRERELEASE=()
+          case "$VERSION" in
+            *-*) PRERELEASE=(--prerelease) ;;
+          esac
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; continuing."
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$BODY_FILE" "${PRERELEASE[@]}"
+          fi
