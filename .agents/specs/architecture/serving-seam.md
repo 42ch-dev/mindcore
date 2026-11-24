@@ -132,14 +132,15 @@ collection the peer may reach.
 Adoption applies them to the destination entry it would return and to the copy it would write: an
 entry outside the admitted selection is neither served nor written, and answers the ordinary
 occupancy refusal — `REVISION_CONFLICT` with no details, byte-identical to a visible occupant's —
-so a hidden occupant, a visible one and a retired one are the same answer. The three reach that
-answer by different paths: the destination read reports a hidden live occupant and the selection
-filter refuses it before any write, while a retired occupant reads as an absent slot, so the
-create-only put runs and meets the superseded answer instead. The invariant is the observable
-answer — code, message shape and absent `details` — not a shared constructor, and no path reveals
-the occupant's content, revision or visibility. `NOT_AUTHORIZED` is reserved for a
-`destination_scope_id` that is not the admitted scope. The host's configured collection selects the
-destination; the admitted selection narrows what the call may touch inside it.
+so a hidden occupant, a visible one and a retired one are the same answer. The destination read
+answers it for all three: a live occupant it returns is refused by the selection filter before any
+write, and the store's live-only read reports a retired row as an absence, so the read then checks
+the row including superseded ones and answers the same occupancy instead of letting the caller
+reach a revision gate. The invariant is the observable answer — code, message shape and absent
+`details` — not a shared constructor, and no path reveals the occupant's content, revision or
+visibility. `NOT_AUTHORIZED` is reserved for a `destination_scope_id` that is not the admitted
+scope. The host's configured collection selects the destination; the admitted selection narrows
+what the call may touch inside it.
 
 **Slot occupancy is a permitted disclosure.** A create-only destination answers occupied for an
 occupied id and success for a free one, so the answer reports whether the `destination_entry_id`
