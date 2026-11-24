@@ -95,24 +95,36 @@ something wrong:
   build, not at the registry.
 - The workspace version in `Cargo.toml` is the version `release.yml` tagged: the script reads that
   version, so the tag and the registry have to agree.
-- The `CARGO_REGISTRY_TOKEN` secret exists (see below).
+- The maintainer's own crates.io token is available for the one local alpha publish (see below);
+  the repository stores no registry secret.
 
-## Token
+## First publish and Trusted Publishing
 
-`CARGO_REGISTRY_TOKEN` is a repository secret holding a crates.io API token. It must be configured
-before the first release: the workflow fails at the first `cargo publish` without it.
+The three crate names are claimed once by a local publish from the maintainer's machine:
 
-The token must belong to an owner of all three crate names, because the first publish claims each
-name permanently. Crate ownership on crates.io is per crate, so verify all three names appear under
-the same account before the first release.
+```bash
+cargo login                                   # the maintainer's own token; never committed
+node tooling/release/bump-version.mjs 0.1.0-alpha.1
+cargo publish -p mindcore-base --locked
+cargo publish -p mindcore-spi --locked
+cargo publish -p mindcore-sqlite --locked
+node tooling/release/bump-version.mjs 0.1.0
+```
 
-`publish-crates` has `contents: read`; the only credential the job uses is that token.
+The alpha version is chosen explicitly and never goes through `release.yml`: the workflow uploads
+stable versions only, and a prerelease is Git-only. Claiming the names with an alpha keeps the
+first stable version free for the normal release flow.
 
-The secret is needed because the crate names do not exist on crates.io yet, so Trusted Publishing
-cannot be configured in advance. Once the first release has claimed the three names, crates.io
-Trusted Publishing (OIDC, no long-lived secret) can replace `CARGO_REGISTRY_TOKEN`: register
-`42ch-dev/mindcore` and `.github/workflows/release.yml` as the trusted publisher for each crate,
-then swap the token for `rust-lang/crates-io-auth-action` in the `publish-crates` job.
+Then, for each crate on crates.io, add this repository and `.github/workflows/release.yml` as a
+trusted publisher. From that point `publish-crates` mints a short-lived OIDC token
+(`rust-lang/crates-io-auth-action`); the repository stores no registry secret and no secret has to
+be rotated.
+
+The verification build runs with `CARGO_REGISTRY_TOKEN` removed (`env -u`), and only the upload
+step receives the minted token, so a dependency's build script cannot read it.
+
+`publish-crates` has `contents: read` plus `id-token: write`; those are the only permissions the job
+needs.
 
 ## Verify
 
