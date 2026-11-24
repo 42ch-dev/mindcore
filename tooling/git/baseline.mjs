@@ -25,13 +25,16 @@ export function git(cwd, args) {
   }
 }
 
-// Newest stable v* tag from a `git tag --list` argument set: the first line
-// without a prerelease suffix (`-`), or null when every tag is a prerelease.
-// `args` carries the list pattern and any --merged filter.
+// Newest stable release tag from a `git tag --list` argument set: a full
+// `vX.Y.Z` with no prerelease suffix. Aliases such as `v2` are ignored even when
+// version sort ranks them first. `args` carries the list pattern and any
+// --merged filter.
+const RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
+
 function newestStable(cwd, args) {
   const tags = git(cwd, ['tag', '--list', ...args, '--sort=-v:refname']);
   if (tags === null) return null;
-  return tags.split('\n').find((tag) => tag && !tag.includes('-')) ?? null;
+  return tags.split('\n').find((tag) => RELEASE_TAG.test(tag)) ?? null;
 }
 
 export function baselineTag(cwd) {
