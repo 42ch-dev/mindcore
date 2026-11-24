@@ -41,6 +41,17 @@ jobs:
             git diff --stat -- .sqlx/
             exit 1
           fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.18.1
+          package-manager-cache: false
+      - name: Install cargo-semver-checks
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: cargo install cargo-semver-checks --locked
+      - name: SemVer policy check
+        run: node tooling/semver/check.mjs
+      - name: Migration compatibility check
+        run: node tooling/migrations/check.mjs
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         env:
           SQLX_OFFLINE: "true"

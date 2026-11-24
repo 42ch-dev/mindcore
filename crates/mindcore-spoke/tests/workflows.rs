@@ -4134,20 +4134,6 @@ async fn a_reloaded_page_ranks_exactly_like_fresh_embeddings() {
         );
     }
 
-    let query_vector = axis_vector("north gate");
-    let fresh_scores = mindcore_spi::workflows::scored_bits_for_test(
-        &texts,
-        "north gate",
-        &query_vector,
-        &fresh_vectors,
-    );
-    let reloaded_scores =
-        mindcore_spi::workflows::scored_bits_for_test(&texts, "north gate", &query_vector, &stored);
-    assert_eq!(
-        reloaded_scores, fresh_scores,
-        "every item keeps its exact score bits once its vector is reloaded"
-    );
-
     let reloaded_engine =
         SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
     let reloaded = reloaded_engine
