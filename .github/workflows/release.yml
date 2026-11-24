@@ -58,7 +58,8 @@ jobs:
             fi
             echo "Tag ${TAG} already exists; continuing."
           else
-            MESSAGE="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" || true)"
+            # The tag annotation may fall back; the Release body may not.
+            MESSAGE="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" 2>/dev/null)" || MESSAGE=""
             if [ -z "$MESSAGE" ]; then
               MESSAGE="Release ${TAG}"
             fi
@@ -74,12 +75,10 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          BODY="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}" || true)"
-          if [ -z "$BODY" ]; then
-            BODY="$(git tag -l --format='%(contents)' "$TAG" || true)"
-          fi
-          if [ -z "$BODY" ]; then
-            BODY="Release ${TAG}"
+          # No silent fallback: a missing or empty changelog section fails the job.
+          if ! BODY="$(node tooling/release/extract-changelog-notes.mjs "${VERSION}")"; then
+            echo "::error::No CHANGELOG.md section for ${VERSION}; the release body would be empty."
+            exit 1
           fi
 
           # Any SemVer prerelease (`-...`) is a prerelease release.

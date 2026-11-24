@@ -34,7 +34,6 @@ postprocessors = [
 conventional_commits = true
 filter_unconventional = true
 require_conventional = false
-ignore_merges = true
 tag_pattern = "v[0-9].*"
 sort_commits = "oldest"
 commit_preprocessors = [
@@ -63,6 +62,9 @@ commit_parsers = [
   { message = "^revert", group = "Changed" },
   { message = "^ci", group = "Internal" },
   { message = "^chore", group = "Internal" },
+  { message = "^build", group = "Internal" },
+  # Catch-all: nothing renders under an empty heading.
+  { message = ".*", group = "Internal" },
 ]
 filter_commits = false
 fail_on_unmatched_commit = false

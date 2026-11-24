@@ -111,6 +111,9 @@ export function compareVersions(a, b) {
 }
 
 /**
+ * The default next version: a prerelease promotes to its core version (the
+ * release it announces), while a stable version takes the next patch.
+ *
  * @param {string} current
  * @returns {string}
  */
@@ -118,6 +121,9 @@ export function patchBump(current) {
   const parsed = parseVersion(current);
   if (!parsed) {
     throw new Error(`Invalid current version: "${current}"`);
+  }
+  if (parsed.prerelease) {
+    return `${parsed.major}.${parsed.minor}.${parsed.patch}`;
   }
   return `${parsed.major}.${parsed.minor}.${parsed.patch + 1n}`;
 }

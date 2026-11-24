@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { mergeVersionSection, unreleasedBody } from "./render-changelog.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -111,6 +112,28 @@ describe("next-version", () => {
     assert.equal(result.stdout.trim(), "0.1.1");
   });
 
+  it("promotes a prerelease to its core version by default", () => {
+    const root = createFixture();
+    writeFileSync(
+      join(root, "Cargo.toml"),
+      CARGO_TOML.replace('version = "0.1.0"', 'version = "0.2.0-rc.1"'),
+    );
+    const result = run(root, "next-version.mjs", []);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "0.2.0");
+  });
+
+  it("takes the next patch from a stable version", () => {
+    const root = createFixture();
+    writeFileSync(
+      join(root, "Cargo.toml"),
+      CARGO_TOML.replace('version = "0.1.0"', 'version = "0.2.0"'),
+    );
+    const result = run(root, "next-version.mjs", []);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "0.2.1");
+  });
+
   it("accepts a strictly greater version", () => {
     const result = run(createFixture(), "next-version.mjs", ["0.2.0-rc.1"]);
     assert.equal(result.status, 0, result.stderr);
@@ -210,5 +233,71 @@ describe("extract-changelog-notes", () => {
     const missing = run(root, "extract-changelog-notes.mjs", ["9.9.9"]);
     assert.equal(missing.status, 1);
     assert.equal(missing.stdout, "");
+    assert.match(missing.stderr, /no "## \[9\.9\.9\]" section/);
+    assert.match(missing.stderr, /headings found: Unreleased, 0\.1\.1, 0\.1\.0/);
+  });
+
+  it("reports an invalid version distinctly", () => {
+    const result = run(createFixture(), "extract-changelog-notes.mjs", ["0.02.0"]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /invalid SemVer "0\.02\.0"/);
+  });
+
+  it("reports an empty section distinctly", () => {
+    const root = createFixture();
+    writeFileSync(
+      join(root, "CHANGELOG.md"),
+      "# Changelog\n\n## [0.2.0] - 2026-01-03\n\n## [0.1.0] - 2026-01-01\n\n- Initial.\n",
+    );
+    const result = run(root, "extract-changelog-notes.mjs", ["0.2.0"]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /"## \[0\.2\.0\]" section is empty/);
+  });
+});
+
+describe("render-changelog", () => {
+  it("keeps a present version section and injects the curated body under it", () => {
+    const generated = "# Changelog\n\n## [0.2.0] - 2026-01-03\n\n### Added\n\n- Thing.\n";
+    const merged = mergeVersionSection(generated, "0.2.0", {
+      body: "Migration: rename `a` to `b`.",
+      date: "2026-01-04",
+    });
+    assert.ok(
+      merged.startsWith(
+        "# Changelog\n\n## [0.2.0] - 2026-01-03\n\nMigration: rename `a` to `b`.\n\n### Added\n",
+      ),
+      merged,
+    );
+  });
+
+  it("leaves a section untouched without a curated body", () => {
+    const generated = "# Changelog\n\n## [0.2.0] - 2026-01-03\n\n### Added\n\n- Thing.\n";
+    assert.equal(
+      mergeVersionSection(generated, "0.2.0", { body: null, date: "2026-01-04" }),
+      generated,
+    );
+  });
+
+  it("inserts a placeholder section when git-cliff produced none", () => {
+    const generated = "# Changelog\n\n## [0.1.0] - 2026-01-01\n\n- Initial.\n";
+    const merged = mergeVersionSection(generated, "0.2.0", {
+      body: null,
+      date: "2026-01-04",
+    });
+    assert.equal(
+      merged,
+      "# Changelog\n\n## [0.2.0] - 2026-01-04\n\n_No user-visible changes._\n\n## [0.1.0] - 2026-01-01\n\n- Initial.\n",
+    );
+  });
+
+  it("captures the Unreleased body only when it has content", () => {
+    assert.equal(unreleasedBody("# Changelog\n\n## [Unreleased]\n\n## [0.1.0]\n\n- x\n"), null);
+    assert.equal(
+      unreleasedBody("# Changelog\n\n## [Unreleased]\n\nMigration notes.\n"),
+      "Migration notes.",
+    );
+    assert.equal(unreleasedBody("# Changelog\n\n## [0.1.0]\n"), null);
   });
 });

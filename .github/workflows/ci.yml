@@ -65,3 +65,5 @@ jobs:
         run: mstar-harness lint .agents/specs --type specs
       - name: Lint ADR corpus
         run: mstar-harness lint .agents/adr --type adr
+      - name: Test release tooling
+        run: node --test tooling/release/release.test.mjs
