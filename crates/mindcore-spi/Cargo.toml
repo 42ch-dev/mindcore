@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "MIND ladder contract crate: capability and workflow seams over the published SPOKE DTOs"
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE"]
 
 [dependencies]
 mindcore-base = { path = "../mindcore-base", version = "0.1.0" }

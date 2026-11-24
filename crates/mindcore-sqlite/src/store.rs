@@ -76,9 +76,9 @@ impl MindStore {
     ///
     /// The embedded migration set is append-only from the first published release: a published
     /// file is immutable and a schema change appends a new one, so a database recorded at any
-    /// published set reopens here and the appended files are the only pending work. The contract is
-    /// `docs/storage-compatibility.md`, and `tooling/migrations/check.mjs` enforces the lock it
-    /// reads.
+    /// published set reopens here and the appended files are the only pending work. The release
+    /// checks lock this set by content, so editing a published file fails the release rather than
+    /// silently diverging from it.
     ///
     /// `open` accepts an applied set that is a subset of the embedded one — the remaining files are
     /// then applied — and refuses a database that diverges from it: SQLx's `VersionMissing` when an

@@ -15,6 +15,7 @@ include = [
     # freshness check in one place still governs it.
     ".sqlx/*.json",
     "Cargo.toml",
+    "LICENSE",
 ]
 
 [dependencies]
