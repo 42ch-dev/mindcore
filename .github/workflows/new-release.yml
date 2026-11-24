@@ -9,9 +9,12 @@ on:
     inputs:
       version:
         description: >-
-          SemVer greater than the current workspace version. No build metadata
-          (`+...`). Empty = the default bump: next patch of a stable version, or
-          the core of a prerelease (0.2.0-rc.1 -> 0.2.0).
+          SemVer strictly greater than the current workspace version. No build
+          metadata (`+...`). The current version itself is refused, also before
+          the first `v*` tag exists, so a first dispatch either names a higher
+          version explicitly or takes the patch bump. Blank = the default bump:
+          next patch of a stable version (0.1.0 -> 0.1.1), or the core of a
+          prerelease (0.2.0-rc.1 -> 0.2.0).
         required: false
         type: string
         default: ""
@@ -106,12 +109,14 @@ jobs:
           git checkout -B "$BRANCH" origin/main
 
           node tooling/release/bump-version.mjs "$VERSION"
+          node tooling/release/render-changelog.mjs "$VERSION"
+
+          # After both steps: a first release whose version is already current
+          # changes no Cargo file but always writes the CHANGELOG section.
           if git diff --quiet; then
             echo "::error::Version bump produced no changes."
             exit 1
           fi
-
-          node tooling/release/render-changelog.mjs "$VERSION"
 
           git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "chore(release): bump version to ${VERSION}"
