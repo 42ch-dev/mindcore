@@ -19,7 +19,7 @@ include = [
 ]
 
 [dependencies]
-mindcore-base = { path = "../mindcore-base", version = "0.1.0-alpha.1" }
+mindcore-base = { path = "../mindcore-base", version = "0.1.0" }
 spoke-schemas.workspace = true
 spoke-operations.workspace = true
 serde_json.workspace = true
