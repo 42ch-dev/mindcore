@@ -20,6 +20,7 @@ Without a fixed default set, each delivery form answers who may operate a new Mi
 - **Why space-wide and unrestricted.** `memory.subjects.ensure` needs a grant that already covers a subject that does not exist yet (`crates/mindcore-spoke/src/control.rs`, `ensure_subject`). The `deliberate` write re-checks a `subject_all` read, which only an unrestricted grant passes (`crates/mindcore-spoke/src/workflows.rs`, `revalidate_subject`).
 - **Why `admin`.** The owner's reason: without it the creator cannot share a Mind through `memory.grants.grant`. Sharing goes only through that operation, it needs a space-wide `admin` grant on the granter, and an issuance cannot exceed what the granter holds (`crates/mindcore-spoke/src/admission.rs`, `authorize_issuance`).
 - **How `create` writes the row.** Inside `create`'s transaction, the one that records the Mind and leaves no row on a failure (`2026-11-25-mind-is-one-memory-space.md`). It cannot go through `memory.grants.grant`, which requires the granter to hold `admin` already.
+- **Two entry points, one create.** A SPOKE peer creates a Mind through `memory.spaces.create`; a library caller creates one through the facade's `create`. On a Mindcore host both run the same create and write this set. The owner's framing: one action, two interfaces, for two different products.
 
 **Pages this changes.** No existing record states a default grant set. `.agents/specs/architecture/mind-model.md` states the rule that memory reads authorize per operation under the caller's live grants, and it gains the `create` operation with this set; the facade contract spec carries the operation's shape and is written with the facade.
 
@@ -35,9 +36,10 @@ Without a fixed default set, each delivery form answers who may operate a new Mi
 - The row has no `subject_id`, no `context_ids` and no expiry, and has the shape `memory.grants.grant` writes.
 - With that row alone, the creator runs `recall_context`, `absorb` and `deliberate` on the new Mind, and `memory.grants.grant` accepts a grant it issues to another principal.
 - A `create` that fails leaves no grant row behind.
+- A Mind created through `memory.spaces.create` on a Mindcore host carries the same single grant row as one created through the library.
 
 ## Risks
 
 - **`admin` is wider than the six it sits beside.** The adapter delegates coverage to SPOKE's `grant_covers` (`crates/mindcore-spoke/src/admission.rs`), in which `admin` implies every capability within the grant's coverage. The creator therefore also holds what the six do not name, such as record promotion (`promote`), profile update (`profile_write`, `crates/mindcore-spoke/src/content.rs`) and reflections (`reflect`, `crates/mindcore-spoke/src/reflection.rs`), and the operations that require space-wide `admin` themselves: `memory.grants.revoke`, `memory.spaces.freeze` and `memory.spaces.unfreeze` (`crates/mindcore-spoke/src/control.rs`). A reader who counts seven names understates what the row grants.
 - **The row never expires.** Whoever holds the creating principal keeps `admin` of the Mind for as long as the row stands, and sharing the Mind does not dilute it.
-- **A SPOKE peer does not reach `create`.** The adapter's space operations are `list_spaces`, `freeze_space` and `unfreeze_space` (`crates/mindcore-spoke/src/control.rs`); no wire operation creates a Mind, so the set reaches a peer only for a Mind an embedding process created. Whether a peer may create a Mind is undecided.
+- **The peer's entry point does not exist yet.** `memory.spaces.create` is not in SPOKE, and the adapter's space operations are `list_spaces`, `freeze_space` and `unfreeze_space` (`crates/mindcore-spoke/src/control.rs`). Until SPOKE has the operation, a peer cannot create a Mind and only the library's `create` does.
