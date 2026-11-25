@@ -358,6 +358,15 @@ async fn a_taken_registry_row_leaves_no_row() {
     );
     let pool = store.pool();
     assert_eq!(count(&pool, "memory_spaces").await, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")
+            .bind("mind:wren")
+            .fetch_one(&pool)
+            .await
+            .expect("count the carrier entries"),
+        0,
+        "the carrier the refused create wrote is rolled back"
+    );
     assert_eq!(count(&pool, "memory_grants").await, 0);
     assert_eq!(
         count(&pool, "minds").await,
