@@ -10,8 +10,8 @@ use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{MindId, SpaceId};
 use mindcore_base::ir::{MemoryGrantRow, MemoryRepository, MemorySpaceRow};
 use mindcore_sqlite::minds::{
-    self, CreateMind, Mind, MindStatus, CARRIER_ENTRY_ID, DEFAULT_GRANT_CAPABILITIES,
-    MIND_ALREADY_EXISTS,
+    self, CreateMind, Mind, MindStatus, CARRIER_ENTRY_ID, MIND_ALREADY_EXISTS,
+    MIND_COLLECTION_OCCUPIED, MIND_ID_INVALID,
 };
 use mindcore_sqlite::{write_entry, MindStore, SqliteMemoryRepository};
 use serde_json::{Map, Number};
@@ -179,13 +179,22 @@ async fn create_with_a_named_id_writes_space_carrier_record_and_grant() {
     tx.commit().await.expect("commit");
     assert_eq!(grants.len(), 1, "exactly one grant for the owner");
     let grant = &grants[0];
-    assert_eq!(
-        grant.capabilities,
-        DEFAULT_GRANT_CAPABILITIES
-            .iter()
-            .map(|capability| (*capability).to_string())
-            .collect::<Vec<_>>()
-    );
+    // The set the create default grant contract fixes, asserted independently of the constant
+    // the producer writes from: a dropped or renamed capability fails here.
+    let specified: std::collections::BTreeSet<&str> = [
+        "recall",
+        "capture",
+        "review",
+        "records_write",
+        "knowledge_read",
+        "knowledge_write",
+        "admin",
+    ]
+    .into_iter()
+    .collect();
+    let actual: std::collections::BTreeSet<&str> =
+        grant.capabilities.iter().map(String::as_str).collect();
+    assert_eq!(actual, specified);
     assert!(grant.subject_id.is_none());
     assert!(grant.expires_at.is_none());
     assert!(grant.context_ids.is_empty());
@@ -376,7 +385,7 @@ async fn a_taken_registry_row_leaves_no_row() {
 }
 
 #[tokio::test]
-async fn a_taken_default_grant_id_leaves_no_row() {
+async fn a_grant_named_like_a_mind_in_another_space_does_not_block_it() {
     let temp = tempfile::tempdir().expect("private temporary root");
     let path = temp.path().join("mindcore.db");
     let store = open_store(&path).await;
@@ -388,47 +397,27 @@ async fn a_taken_default_grant_id_leaves_no_row() {
     )
     .await;
 
-    let refused = reject(
-        store
-            .create_mind(&request(Some("wren"), "caller_wren"))
-            .await,
-    );
-    assert_eq!(refused.code, SpokeRejectCode::InvalidInput);
-    assert_eq!(
-        refused
-            .details
-            .as_ref()
-            .and_then(|details| details.get("reason"))
-            .and_then(|reason| reason.as_str()),
-        Some(MIND_ALREADY_EXISTS)
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_spaces WHERE space_id = ?")
+    // The default grant id is minted independently: a grant in another space, even one named
+    // after this Mind, reserves nothing of the Mind's name.
+    let mind = ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+    assert_eq!(mind.id, MindId::new("wren"));
+    let grant_ids: Vec<String> =
+        sqlx::query_scalar("SELECT grant_id FROM memory_grants WHERE space_id = ?")
             .bind("wren")
-            .fetch_one(&pool)
+            .fetch_all(&pool)
             .await
-            .expect("count the wren space"),
-        0,
-        "no wren space row"
+            .expect("read the wren grants");
+    assert_eq!(grant_ids.len(), 1, "exactly one default grant row");
+    assert_ne!(
+        grant_ids[0], "grt_wren",
+        "the grant id does not derive from the Mind id"
     );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")
-            .bind("mind:wren")
-            .fetch_one(&pool)
-            .await
-            .expect("count the carrier entries"),
-        0,
-        "no entry in mind:wren"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM minds WHERE space_id = ?")
-            .bind("wren")
-            .fetch_one(&pool)
-            .await
-            .expect("count the minds row"),
-        0,
-        "no minds row for wren"
-    );
+    let seen = ok(store
+        .get_mind(&CallerId::new("caller_wren"), &MindId::new("wren"))
+        .await);
+    assert_eq!(mind, seen);
 }
 
 #[tokio::test]
@@ -634,6 +623,180 @@ async fn a_frozen_space_freezes_the_mind_and_unfreezing_reactivates_it() {
         1,
         "one registry row throughout"
     );
+}
+
+#[tokio::test]
+async fn a_populated_collection_is_refused_and_the_seed_survives() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let pool = store.pool();
+    // A host-populated `mind:wren` collection with no wren space and no registry row: the new
+    // Mind must never claim entries it did not create.
+    let mut tx = pool.begin().await.expect("begin");
+    match write_entry(&mut tx, "mind:wren", plain_carrier("ke_foreign"), None).await {
+        SpokeResult::Ok(_) => {}
+        SpokeResult::Reject(reject) => panic!("seed the foreign entry: {reject:?}"),
+    }
+    tx.commit().await.expect("commit");
+
+    let refused = reject(
+        store
+            .create_mind(&request(Some("wren"), "caller_wren"))
+            .await,
+    );
+    assert_eq!(refused.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        refused
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some(MIND_COLLECTION_OCCUPIED)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?"
+        )
+        .bind("mind:wren")
+        .bind("ke_foreign")
+        .fetch_one(&pool)
+        .await
+        .expect("count the seeded entry"),
+        1,
+        "the seeded entry is untouched"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")
+            .bind("mind:wren")
+            .fetch_one(&pool)
+            .await
+            .expect("count the collection"),
+        1,
+        "no carrier joined the populated collection"
+    );
+    for table in ["memory_spaces", "minds", "memory_grants"] {
+        assert_eq!(count(&pool, table).await, 0, "nothing written in {table}");
+    }
+}
+
+#[tokio::test]
+async fn an_id_the_schema_cannot_hold_is_invalid_input() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+
+    // SQLite's `length()` counts up to the first NUL, so a NUL-leading id fails the registry's
+    // `length(space_id) > 0` check. The schema's refusal is invalid input, never an internal
+    // error.
+    let refused = reject(
+        store
+            .create_mind(&request(Some("\0wren"), "caller_wren"))
+            .await,
+    );
+    assert_eq!(refused.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        refused
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some(MIND_ID_INVALID),
+        "the refusal names the invalid id, not internal storage"
+    );
+
+    // A very long id is one the schema can hold: neither the space key nor the registry check
+    // has a length cap, so creation succeeds.
+    let long_id = "x".repeat(4096);
+    let request = CreateMind {
+        mind_id: Some(MindId::new(long_id.clone())),
+        display_name: None,
+        owner: CallerId::new("caller_wren"),
+    };
+    let mind = ok(store.create_mind(&request).await);
+    assert_eq!(mind.id.as_str(), long_id);
+
+    let pool = store.pool();
+    for table in [
+        "memory_spaces",
+        "knowledge_entries",
+        "minds",
+        "memory_grants",
+    ] {
+        assert_eq!(
+            count(&pool, table).await,
+            1,
+            "exactly the successful create's row in {table}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_expiry_hides_the_mind() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let pool = store.pool();
+    ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+
+    insert_grant(
+        &pool,
+        &grant_row(
+            "grt_broken",
+            "wren",
+            "caller_broken",
+            Some("not-a-timestamp"),
+        ),
+    )
+    .await;
+    assert!(
+        ok(store.list_minds(&CallerId::new("caller_broken")).await).is_empty(),
+        "an expiry that does not parse is never live"
+    );
+    let unseen = reject(
+        store
+            .get_mind(&CallerId::new("caller_broken"), &MindId::new("wren"))
+            .await,
+    );
+    assert_eq!(unseen.code, SpokeRejectCode::NotFound);
+}
+
+#[tokio::test]
+async fn an_expired_grant_before_a_live_one_lists_the_mind_once() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let pool = store.pool();
+    ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+
+    // Two grants for one caller on one Mind: the earlier candidate in `grant_id` order is
+    // expired and a later one is live; the Mind is listed exactly once.
+    insert_grant(
+        &pool,
+        &grant_row(
+            "grt_aa_expired",
+            "wren",
+            "caller_pair",
+            Some("2020-01-01T00:00:00Z"),
+        ),
+    )
+    .await;
+    insert_grant(
+        &pool,
+        &grant_row("grt_bb_live", "wren", "caller_pair", None),
+    )
+    .await;
+    let listed = ok(store.list_minds(&CallerId::new("caller_pair")).await);
+    assert_eq!(listed.len(), 1, "the Mind appears exactly once");
+    assert_eq!(listed[0].id, MindId::new("wren"));
+    let seen = ok(store
+        .get_mind(&CallerId::new("caller_pair"), &MindId::new("wren"))
+        .await);
+    assert_eq!(seen.id, MindId::new("wren"));
 }
 
 #[tokio::test]

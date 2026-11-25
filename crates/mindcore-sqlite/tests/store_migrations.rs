@@ -163,22 +163,57 @@ async fn a_database_written_by_the_published_set_reopens_through_the_appended_fi
     };
     let pool = raw_pool(&path).await;
     published.run(&pool).await.expect("write a 0.1.0 database");
+    // One legacy space row written by the published set, exactly as a 0.1.0 host left it.
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+          created_at) \
+         VALUES ('spc_legacy', 'Legacy', 'host-1', 1, 'active', 1, '2026-11-20T09:20:01.123Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("write the legacy space");
     pool.close().await;
 
     let store = MindStore::open(&path)
         .await
         .expect("a 0.1.0 database reopens");
-    let versions: Vec<i64> =
-        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&store.pool())
-            .await
-            .expect("read the applied versions");
-    assert_eq!(versions, vec![1, 2], "the appended file applied on open");
+    // The legacy row survives the upgrade unchanged, and it is not a Mind: nothing could infer
+    // its collection or carrier, so no registry row appears for it and no caller lists it.
+    let legacy: (Option<String>, String, i64, String, i64, String) = sqlx::query_as(
+        "SELECT display_name, authority_host_id, authority_generation, status, revision, \
+         created_at FROM memory_spaces WHERE space_id = 'spc_legacy'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .expect("read the legacy space");
+    assert_eq!(
+        legacy,
+        (
+            Some("Legacy".to_string()),
+            "host-1".to_string(),
+            1,
+            "active".to_string(),
+            1,
+            "2026-11-20T09:20:01.123Z".to_string()
+        ),
+        "the legacy row is unchanged"
+    );
     let registry = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM minds")
         .fetch_one(&store.pool())
         .await
         .expect("count the registry");
-    assert_eq!(registry, 0);
+    assert_eq!(registry, 0, "a pre-registry space is not registered");
+    let listed = store.list_minds(&CallerId::new("caller_wren")).await;
+    match listed {
+        spoke_operations::SpokeResult::Ok(listed) => assert!(
+            listed.is_empty(),
+            "the legacy space is not listed as a Mind"
+        ),
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("list on a reopened database: {reject:?}")
+        }
+    }
 
     let created = store
         .create_mind(&CreateMind {

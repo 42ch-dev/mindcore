@@ -5,6 +5,8 @@
 //! the caller's live grants. No operation archives or deletes a Mind: deactivation is the
 //! space's frozen state.
 
+use std::future::poll_fn;
+
 use chrono::Utc;
 use serde_json::{Map, Number, Value};
 use sqlx::{Sqlite, Transaction};
@@ -67,6 +69,12 @@ pub const CARRIER_ENTRY_ID: &str = "ke_carrier";
 /// `details.reason` of the refusal a taken Mind id answers.
 pub const MIND_ALREADY_EXISTS: &str = "MIND_ALREADY_EXISTS";
 
+/// `details.reason` of the refusal a Mind id the schema cannot hold answers.
+pub const MIND_ID_INVALID: &str = "MIND_ID_INVALID";
+
+/// `details.reason` of the refusal a populated target collection answers.
+pub const MIND_COLLECTION_OCCUPIED: &str = "MIND_COLLECTION_OCCUPIED";
+
 /// The collection a Mind's entries and carrier live in: `mind:` and the Mind's id.
 pub fn knowledge_collection_of(id: &MindId) -> String {
     format!("mind:{id}")
@@ -92,16 +100,22 @@ fn invalid_input<T>(message: impl Into<String>) -> SpokeResult<T> {
     spoke_reject(SpokeRejectCode::InvalidInput, message, None)
 }
 
+fn invalid_input_with_reason<T>(message: impl Into<String>, reason: &str) -> SpokeResult<T> {
+    let mut details = Map::new();
+    details.insert("reason".to_string(), Value::from(reason));
+    spoke_reject(SpokeRejectCode::InvalidInput, message, Some(details))
+}
+
 /// The empty carrier `create` establishes: an ordinary entry of type `character` with no
 /// modules, so it holds no records until the first append.
-fn carrier_entry() -> KnowledgeEntry {
-    KnowledgeEntry {
+fn carrier_entry(
+) -> Result<KnowledgeEntry, spoke_schemas::data::knowledge_entry::error::ConversionError> {
+    Ok(KnowledgeEntry {
         adoption_anchor: None,
         body: KnowledgeEntryBody::default(),
         canonical_name: KnowledgeEntryCanonicalName::try_from(format!(
             "{CARRIER_ENTRY_ID} carrier"
-        ))
-        .expect("non-empty canonical name"),
+        ))?,
         created_at: None,
         disclosure: None,
         entry_id: CARRIER_ENTRY_ID.to_string(),
@@ -110,11 +124,12 @@ fn carrier_entry() -> KnowledgeEntry {
         modules: std::collections::HashMap::new(),
         owner: None,
         revision: Some(1),
-        schema_version: std::num::NonZeroU64::new(1).expect("non-zero wire baseline"),
+        // SAFETY: the wire baseline one is not zero.
+        schema_version: unsafe { std::num::NonZeroU64::new_unchecked(1) },
         source_anchor: None,
         status: "confirmed".to_string(),
         updated_at: None,
-    }
+    })
 }
 
 /// The operation both entry points call. It borrows `tx`: the caller begins, commits and rolls
@@ -149,11 +164,44 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
         pending_receipts: 0,
     };
     if let Err(error) = repository.insert_space(tx, &space_row).await {
-        return repo_error(error, &id);
+        return match error {
+            crate::repository::SqliteRepositoryError::Conflict(_) => already_exists(&id),
+            crate::repository::SqliteRepositoryError::Sql(sqlx::Error::Database(error))
+                if error.is_check_violation() =>
+            {
+                invalid_input_with_reason(format!("mind id {id} is not storable"), MIND_ID_INVALID)
+            }
+            _ => storage_unavailable(),
+        };
     }
 
+    // A Mind's collection is its own: a caller-named id must never claim entries the Mind did
+    // not create. A populated target collection is refused before the carrier is written; the
+    // refusal is not the taken-id one, because no Mind of this id need exist.
     let collection = knowledge_collection_of(&id);
-    match write_entry(tx, &collection, carrier_entry(), None).await {
+    let occupied = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id != ?",
+    )
+    .bind(&collection)
+    .bind(CARRIER_ENTRY_ID)
+    .fetch_one(&mut **tx)
+    .await;
+    match occupied {
+        Ok(0) => {}
+        Ok(_) => {
+            return invalid_input_with_reason(
+                format!("mind {id} collection is occupied"),
+                MIND_COLLECTION_OCCUPIED,
+            )
+        }
+        Err(_) => return storage_unavailable(),
+    }
+
+    let carrier = match carrier_entry() {
+        Ok(entry) => entry,
+        Err(error) => return internal(format!("the carrier entry could not be built: {error}")),
+    };
+    match write_entry(tx, &collection, carrier, None).await {
         SpokeResult::Ok(_) => {}
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     }
@@ -171,7 +219,7 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
     }
 
     let grant = MemoryGrantRow {
-        grant_id: format!("grt_{id}"),
+        grant_id: mint("grt"),
         space_id: space,
         subject_id: None,
         principal_id: request.owner.clone(),
@@ -187,8 +235,10 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
         created_at: created_at.clone(),
         extensions: Map::new(),
     };
-    if let Err(error) = repository.insert_grant(tx, &grant).await {
-        return repo_error(error, &id);
+    // A colliding grant id is not a taken Mind id: the id is minted independently, and its
+    // failure means nothing about the Mind the caller asked for.
+    if repository.insert_grant(tx, &grant).await.is_err() {
+        return storage_unavailable();
     }
 
     SpokeResult::Ok(Mind {
@@ -201,19 +251,14 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
     })
 }
 
-/// A repository refusal of `create`: a colliding key is the taken-id refusal, anything else is
-/// the fixed storage answer.
-fn repo_error<T>(error: crate::repository::SqliteRepositoryError, id: &MindId) -> SpokeResult<T> {
-    match error {
-        crate::repository::SqliteRepositoryError::Conflict(_) => already_exists(id),
-        _ => storage_unavailable(),
-    }
-}
-
-/// A driver failure of the registry write: a unique violation is the taken-id refusal.
+/// A driver failure of the registry write: a unique violation is the taken-id refusal, a
+/// violated length check on the id is invalid input, anything else is the fixed storage answer.
 fn driver_error<T>(error: sqlx::Error, id: &MindId) -> SpokeResult<T> {
     match error {
         sqlx::Error::Database(error) if error.is_unique_violation() => already_exists(id),
+        sqlx::Error::Database(error) if error.is_check_violation() => {
+            invalid_input_with_reason(format!("mind id {id} is not storable"), MIND_ID_INVALID)
+        }
         _ => storage_unavailable(),
     }
 }
@@ -230,75 +275,143 @@ type JoinRow = (
     Option<String>,
 );
 
-/// The read `list_minds` and `get_mind` share, driven from the principal's grant index. Rows
-/// arrive grouped by Mind; a Mind is visible when any of its unrevoked grant rows is live — no
-/// expiry, or an expiry that parses as an instant later than now. The expiry is compared as an
-/// instant and never as text, so a `+08:00` offset is honoured. `id` narrows the read to one
-/// Mind.
-async fn read_visible(
-    store: &MindStore,
-    caller: &CallerId,
-    id: Option<&MindId>,
-) -> SpokeResult<Vec<Mind>> {
-    let id = id.map(|id| id.as_str().to_string());
-    let rows: Result<Vec<JoinRow>, sqlx::Error> = sqlx::query_as(
+// The one projection and join both visibility reads share. A macro rather than a constant,
+// because `concat!` joins literals only, and sqlx's safety lint accepts literals alone.
+macro_rules! grant_columns {
+    () => {
         "SELECT m.space_id, m.knowledge_collection, m.carrier_entry_id, \
          s.display_name, s.status, s.created_at, g.expires_at \
          FROM memory_grants g \
          JOIN minds m ON m.space_id = g.space_id \
-         JOIN memory_spaces s ON s.space_id = g.space_id \
-         WHERE g.principal_id = ?1 AND g.revoked_at IS NULL AND (?2 IS NULL OR g.space_id = ?2) \
-         ORDER BY m.space_id, g.grant_id",
-    )
-    .bind(caller.as_str())
-    .bind(id)
-    .fetch_all(&store.pool)
-    .await;
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(_) => return storage_unavailable(),
+         JOIN memory_spaces s ON s.space_id = g.space_id"
     };
+}
+
+// The visibility rule of `expiry_passed` in `crates/mindcore-spoke/src/admission.rs`, restated
+// here because `mindcore-sqlite` cannot depend on the adapter: no expiry is live; an expiry
+// that does not parse as RFC 3339 is never live; the expiry is compared as an instant and never
+// as text, so an offset is honoured and an expiry equal to now is already passed.
+fn live(expires_at: &Option<String>, now: chrono::DateTime<Utc>) -> bool {
+    match expires_at {
+        None => true,
+        Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(at) => at.with_timezone(&Utc) > now,
+            Err(_) => false,
+        },
+    }
+}
+
+/// One joined row becomes a Mind; the strict status decode refuses a row the schema's CHECK
+/// forbids, and the fixed message names no stored value.
+fn mind_of(
+    space_id: String,
+    collection: String,
+    carrier: String,
+    display_name: Option<String>,
+    status: String,
+    created_at: String,
+) -> SpokeResult<Mind> {
+    let status = match status.as_str() {
+        "active" => MindStatus::Active,
+        "frozen" => MindStatus::Frozen,
+        _ => {
+            return internal(format!(
+                "the status of mind space {space_id} is not decodable"
+            ))
+        }
+    };
+    SpokeResult::Ok(Mind {
+        id: MindId::new(space_id),
+        display_name,
+        status,
+        knowledge: KnowledgeScope::new(collection),
+        carrier_entry_id: carrier,
+        created_at,
+    })
+}
+
+/// The read `list_minds` runs, driven from the principal's grant index. Rows stream one at a
+/// time — peak memory is the output plus the current row, never one copy per matching grant.
+/// Rows arrive grouped by Mind: the adjacent-group de-duplication keeps the first live row of
+/// each group and skips the rest, and an expired row only hides its Mind when no later row of
+/// the same group is live.
+async fn read_visible(store: &MindStore, caller: &CallerId) -> SpokeResult<Vec<Mind>> {
+    let mut rows = sqlx::query_as::<_, JoinRow>(concat!(
+        grant_columns!(),
+        " WHERE g.principal_id = ?1 AND g.revoked_at IS NULL ORDER BY m.space_id, g.grant_id"
+    ))
+    .bind(caller.as_str())
+    .fetch(&store.pool);
     let now = Utc::now();
     let mut minds = Vec::new();
-    // Rows arrive grouped by Mind: the adjacent-group de-duplication keeps the first live row
-    // of each group and skips the rest, and an expired row only hides its Mind when no later
-    // row of the same group is live.
     let mut emitted: Option<String> = None;
-    for (space_id, collection, carrier, display_name, status, created_at, expires_at) in rows {
+    while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+        let (space_id, collection, carrier, display_name, status, created_at, expires_at) =
+            match row {
+                Ok(row) => row,
+                Err(_) => return storage_unavailable(),
+            };
         if emitted.as_deref() == Some(space_id.as_str()) {
             continue;
         }
-        let live = match expires_at {
-            None => true,
-            Some(raw) => match chrono::DateTime::parse_from_rfc3339(&raw) {
-                Ok(at) => at.with_timezone(&Utc) > now,
-                Err(_) => false,
-            },
-        };
-        if !live {
+        if !live(&expires_at, now) {
             continue;
         }
-        let status = match status.as_str() {
-            "active" => MindStatus::Active,
-            "frozen" => MindStatus::Frozen,
-            // Anything else is a row the schema's CHECK forbids: the strict decode refuses it.
-            other => {
-                return internal(format!(
-                    "mind space {space_id} status {other} is not decodable"
-                ))
-            }
-        };
-        emitted = Some(space_id.clone());
-        minds.push(Mind {
-            id: MindId::new(space_id),
+        let mind = match mind_of(
+            space_id,
+            collection,
+            carrier,
             display_name,
             status,
-            knowledge: KnowledgeScope::new(collection),
-            carrier_entry_id: carrier,
             created_at,
-        });
+        ) {
+            SpokeResult::Ok(mind) => mind,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        emitted = Some(mind.id.as_str().to_string());
+        minds.push(mind);
     }
     SpokeResult::Ok(minds)
+}
+
+/// The read `get_mind` runs: the point constraint on `(principal_id, space_id)` lets the grant
+/// index seek directly, so a point read never scans unrelated grants. The visibility rule is the
+/// one `read_visible` applies.
+async fn read_one_visible(
+    store: &MindStore,
+    caller: &CallerId,
+    id: &MindId,
+) -> SpokeResult<Vec<Mind>> {
+    let mut rows = sqlx::query_as::<_, JoinRow>(concat!(
+        grant_columns!(),
+        " WHERE g.principal_id = ?1 AND g.space_id = ?2 AND g.revoked_at IS NULL ORDER BY g.grant_id"
+    ))
+    .bind(caller.as_str())
+    .bind(id.as_str())
+    .fetch(&store.pool);
+    let now = Utc::now();
+    while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+        let (space_id, collection, carrier, display_name, status, created_at, expires_at) =
+            match row {
+                Ok(row) => row,
+                Err(_) => return storage_unavailable(),
+            };
+        if !live(&expires_at, now) {
+            continue;
+        }
+        return match mind_of(
+            space_id,
+            collection,
+            carrier,
+            display_name,
+            status,
+            created_at,
+        ) {
+            SpokeResult::Ok(mind) => SpokeResult::Ok(vec![mind]),
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        };
+    }
+    SpokeResult::Ok(Vec::new())
 }
 
 impl MindStore {
@@ -321,12 +434,12 @@ impl MindStore {
 
     /// Every Mind whose space `caller` holds a live grant in, in `id` order.
     pub async fn list_minds(&self, caller: &CallerId) -> SpokeResult<Vec<Mind>> {
-        read_visible(self, caller, None).await
+        read_visible(self, caller).await
     }
 
     /// One Mind `caller` may see; `NotFound` for any other id.
     pub async fn get_mind(&self, caller: &CallerId, id: &MindId) -> SpokeResult<Mind> {
-        match read_visible(self, caller, Some(id)).await {
+        match read_one_visible(self, caller, id).await {
             SpokeResult::Ok(mut minds) => {
                 if let Some(mind) = minds.pop() {
                     SpokeResult::Ok(mind)
