@@ -11,7 +11,7 @@ use mindcore_base::ids::{MindId, SpaceId};
 use mindcore_base::ir::{MemoryGrantRow, MemoryRepository, MemorySpaceRow};
 use mindcore_sqlite::minds::{
     self, CreateMind, Mind, MindStatus, CARRIER_ENTRY_ID, MIND_ALREADY_EXISTS,
-    MIND_COLLECTION_OCCUPIED, MIND_ID_INVALID,
+    MIND_CARRIER_CANNOT_BE_SUPERSEDED, MIND_COLLECTION_OCCUPIED, MIND_ID_INVALID,
 };
 use mindcore_sqlite::{write_entry, MindStore, SqliteMemoryRepository};
 use serde_json::{Map, Number};
@@ -32,6 +32,10 @@ fn request(mind_id: Option<&str>, owner: &str) -> CreateMind {
         display_name: Some("Wren".to_string()),
         owner: CallerId::new(owner),
     }
+}
+
+async fn pool_begin(store: &MindStore) -> sqlx::Transaction<'static, sqlx::Sqlite> {
+    store.pool().begin().await.expect("begin a transaction")
 }
 
 fn reject<T>(result: SpokeResult<T>) -> SpokeReject {
@@ -323,7 +327,22 @@ async fn a_taken_carrier_slot_leaves_no_row() {
             .create_mind(&request(Some("wren"), "caller_wren"))
             .await,
     );
-    assert_eq!(refused.code, SpokeRejectCode::KnowledgeEntryAlreadyExists);
+    // The slot and every other entry in the collection answer one refusal — the occupied
+    // collection — and its message never names the internal carrier id.
+    assert_eq!(refused.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        refused
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some(MIND_COLLECTION_OCCUPIED)
+    );
+    assert!(
+        !refused.message.contains(CARRIER_ENTRY_ID),
+        "the refusal does not leak the internal carrier id: {}",
+        refused.message
+    );
     for table in ["memory_spaces", "minds", "memory_grants"] {
         assert_eq!(count(&pool, table).await, 0, "nothing written in {table}");
     }
@@ -881,6 +900,88 @@ async fn a_grant_expiring_during_the_connection_wait_is_not_live() {
     );
     let unseen = reject(store.get_mind(&caller, &MindId::new("wren")).await);
     assert_eq!(unseen.code, SpokeRejectCode::NotFound);
+}
+
+#[tokio::test]
+async fn a_registered_carrier_cannot_be_superseded() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let mind = ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+    let port = store.knowledge(mind.knowledge.clone());
+
+    // The successor exists in the same collection, exactly as the retirement sequence sets up.
+    let mut tx = pool_begin(&store).await;
+    match write_entry(&mut tx, "mind:wren", plain_carrier("ke_next"), None).await {
+        SpokeResult::Ok(_) => {}
+        SpokeResult::Reject(reject) => panic!("seed the successor: {reject:?}"),
+    }
+    tx.commit().await.expect("commit");
+
+    let refused = reject(port.supersede_entry(CARRIER_ENTRY_ID, 1, "ke_next").await);
+    assert_eq!(refused.code, SpokeRejectCode::InvalidInput);
+    assert_eq!(
+        refused
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some(MIND_CARRIER_CANNOT_BE_SUPERSEDED)
+    );
+
+    // The carrier stays readable and appendable: its revision advances through the ordinary
+    // knowledge write.
+    let carrier = ok(port.get_knowledge_entry(CARRIER_ENTRY_ID).await);
+    assert_eq!(carrier.revision, Some(1));
+    let updated = ok(port.put_knowledge_entry(carrier.clone(), Some(1)).await);
+    assert_eq!(updated.revision, Some(2), "the carrier still advances");
+}
+
+#[tokio::test]
+async fn an_unregistered_entry_in_a_minds_collection_still_supersedes() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let mind = ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+    let port = store.knowledge(mind.knowledge.clone());
+
+    for entry_id in ["ke_note", "ke_note_next"] {
+        let mut tx = pool_begin(&store).await;
+        match write_entry(&mut tx, "mind:wren", plain_carrier(entry_id), None).await {
+            SpokeResult::Ok(_) => {}
+            SpokeResult::Reject(reject) => panic!("seed {entry_id}: {reject:?}"),
+        }
+        tx.commit().await.expect("commit");
+    }
+    let marked = ok(port.supersede_entry("ke_note", 1, "ke_note_next").await);
+    assert_eq!(marked, 2, "an unregistered entry retires as before");
+}
+
+#[tokio::test]
+async fn an_entry_in_an_unregistered_collection_still_supersedes() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+    let port = store.knowledge(mindcore_base::knowledge::KnowledgeScope::new("unrelated"));
+
+    // The same entry id in a collection no Mind registers keeps the retirement behaviour.
+    for entry_id in [CARRIER_ENTRY_ID, "ke_next"] {
+        let mut tx = pool_begin(&store).await;
+        match write_entry(&mut tx, "unrelated", plain_carrier(entry_id), None).await {
+            SpokeResult::Ok(_) => {}
+            SpokeResult::Reject(reject) => panic!("seed {entry_id}: {reject:?}"),
+        }
+        tx.commit().await.expect("commit");
+    }
+    let marked = ok(port.supersede_entry(CARRIER_ENTRY_ID, 1, "ke_next").await);
+    assert_eq!(marked, 2, "the carrier's id in another collection retires");
 }
 
 #[tokio::test]

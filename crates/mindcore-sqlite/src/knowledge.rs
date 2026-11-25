@@ -179,6 +179,28 @@ impl ScopedKnowledgeStore {
             Ok(transaction) => transaction,
             Err(error) => return internal(format!("knowledge supersede could not begin: {error}")),
         };
+        // A Mind's registered carrier cannot be retired: the registry names it forever, and a
+        // superseded carrier can no longer be read or appended, so the Mind would be stranded
+        // with no path back. Keyed on both columns, so the same entry id in another collection
+        // and ordinary entries of a Mind's collection keep the retirement behaviour.
+        let registered = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM minds WHERE knowledge_collection = ? AND carrier_entry_id = ?",
+        )
+        .bind(&self.scope.collection)
+        .bind(entry_id)
+        .fetch_one(&mut *transaction)
+        .await;
+        match registered {
+            Ok(0) => {}
+            Ok(_) => {
+                return crate::minds::carrier_cannot_be_superseded(entry_id);
+            }
+            Err(error) => {
+                return internal(format!(
+                    "the carrier registration could not be read: {error}"
+                ))
+            }
+        }
         let source = match read_stored_row(
             &mut transaction,
             &self.scope.collection,

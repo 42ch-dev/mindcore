@@ -74,6 +74,8 @@ pub const MIND_ID_INVALID: &str = "MIND_ID_INVALID";
 
 /// `details.reason` of the refusal a populated target collection answers.
 pub const MIND_COLLECTION_OCCUPIED: &str = "MIND_COLLECTION_OCCUPIED";
+/// `details.reason` of the refusal a registered carrier's supersede answers.
+pub const MIND_CARRIER_CANNOT_BE_SUPERSEDED: &str = "MIND_CARRIER_CANNOT_BE_SUPERSEDED";
 
 /// The collection a Mind's entries and carrier live in: `mind:` and the Mind's id.
 pub fn knowledge_collection_of(id: &MindId) -> String {
@@ -104,6 +106,15 @@ fn invalid_input_with_reason<T>(message: impl Into<String>, reason: &str) -> Spo
     let mut details = Map::new();
     details.insert("reason".to_string(), Value::from(reason));
     spoke_reject(SpokeRejectCode::InvalidInput, message, Some(details))
+}
+
+/// The refusal superseding a registered carrier answers; shared with the knowledge port, which
+/// owns the supersede write.
+pub(crate) fn carrier_cannot_be_superseded<T>(entry_id: &str) -> SpokeResult<T> {
+    invalid_input_with_reason(
+        format!("mind carrier {entry_id} cannot be superseded"),
+        MIND_CARRIER_CANNOT_BE_SUPERSEDED,
+    )
 }
 
 /// The empty carrier `create` establishes: an ordinary entry of type `character` with no
@@ -164,13 +175,10 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
         pending_receipts: 0,
     };
     if let Err(error) = repository.insert_space(tx, &space_row).await {
+        // `memory_spaces` carries no CHECK a create input can violate: the only schema refusal
+        // the id can hit is the registry's length check, mapped in `driver_error`.
         return match error {
             crate::repository::SqliteRepositoryError::Conflict(_) => already_exists(&id),
-            crate::repository::SqliteRepositoryError::Sql(sqlx::Error::Database(error))
-                if error.is_check_violation() =>
-            {
-                invalid_input_with_reason(format!("mind id {id} is not storable"), MIND_ID_INVALID)
-            }
             _ => storage_unavailable(),
         };
     }
@@ -179,13 +187,11 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
     // not create. A populated target collection is refused before the carrier is written; the
     // refusal is not the taken-id one, because no Mind of this id need exist.
     let collection = knowledge_collection_of(&id);
-    let occupied = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id != ?",
-    )
-    .bind(&collection)
-    .bind(CARRIER_ENTRY_ID)
-    .fetch_one(&mut **tx)
-    .await;
+    let occupied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")
+            .bind(&collection)
+            .fetch_one(&mut **tx)
+            .await;
     match occupied {
         Ok(0) => {}
         Ok(_) => {
