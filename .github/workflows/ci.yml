@@ -13,10 +13,11 @@ jobs:
 # the `rust` job's result: that job checks Rust sources, manifests, migrations
 # and the tooling scripts, none of which read Markdown or the assets. This job
 # computes that so `rust` can skip. It runs on pull requests only: on `push`
-# the `rust` job runs anyway, and skipping this job does not skip `rust`
-# because its `if` starts with `!cancelled()`, which treats a skipped
-# prerequisite the same way as a failed one. `corpus` is never skipped because
-# linting the Markdown corpus is exactly its job.
+# the `rust` job runs anyway. If this job fails or is skipped, `rust` still
+# runs unless the run itself was cancelled, because its `if` starts with
+# `!cancelled()` — that is what keeps a failed judgement from skipping the
+# Rust job. `corpus` is never skipped because linting the Markdown corpus is
+# exactly its job.
   docs-only:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -34,12 +35,6 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Outside a pull request the SHAs are absent; failing to judge must
-          # never skip the Rust job, so answer "not docs-only" and exit 0.
-          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
-            echo "is-docs-only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
           docs_only=true
           count=0
@@ -57,7 +52,8 @@ jobs:
           echo "is-docs-only=$docs_only" >> "$GITHUB_OUTPUT"
   rust:
     needs: docs-only
-    # Needs-failure must run the Rust job too: only a cancelled run skips it.
+    # A prerequisite that fails or is skipped must still let the Rust job run;
+    # `!cancelled()` sees to that and gives way only to a cancelled run.
     if: "!cancelled() && (github.event_name == 'push' || needs.docs-only.outputs.is-docs-only != 'true')"
     runs-on: ubuntu-latest
     steps:
