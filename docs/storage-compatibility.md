@@ -49,10 +49,12 @@ are not migration mismatches.
    backfills a lower number.
 3. Appending is the only way a database reaches a new schema: the appended file runs on an existing
    database and must be written to apply on top of the published schema, not to recreate it.
-4. A new file becomes published when its entry is added to the lock. An ordinary change may add
-   that entry by hand in the same change, so publishing stays a reviewed act; otherwise the
-   release pull request's `--write-lock` adds every merged migration before its tag. A lock entry
-   is never rewritten afterwards.
+4. A lock entry is what a change adds; it makes the file's bytes part of that change's review. An
+   ordinary change may add the entry by hand in the same change, otherwise the release pull
+   request's `--write-lock` adds every merged migration before its tag. A file is published when a
+   release tag ships with its entry in the lock, and rule 1's immutability and the baseline
+   comparison start from that tag: before it, a change to the file and its hash is visible to
+   review, not to the script. A published file's lock entry is never rewritten afterwards.
 
 ## Enforcement
 
