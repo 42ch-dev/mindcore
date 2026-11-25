@@ -8,6 +8,8 @@ applies_when:
   - A served listing decides visibility from one principal's grants before it pages
   - A query filters rows by membership in a set the caller already holds in memory
   - A lookup is measured by statement count or by SQLite virtual-machine steps
+  - A streamed read feeds a decision that compares a stored timestamp with "now"
+last_updated: 2026-11-26
 tags:
   - sqlite
   - query-plan
@@ -56,6 +58,12 @@ every stored space.
    when its progress handler returns non-zero; sqlx's `set_progress_handler(n, closure)`
    continues while the closure returns `true`. A step counter therefore returns `true`, or
    the first measured statement is interrupted.
+6. **Read the clock when the row arrives, not before the query.** A streaming read that decides
+   liveness compares each row's expiry with the current instant at the moment the row is decoded.
+   Taking one instant before `fetch` makes the decision stale for every row that arrives after the
+   single-connection pool makes the query wait: a grant that expires during the wait is still
+   admitted. A scan's cost is not only memory; its duration is part of the correctness of any
+   decision it feeds.
 
 ## Why This Matters
 
