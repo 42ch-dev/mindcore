@@ -5,6 +5,7 @@ mod repository;
 mod store;
 
 pub mod cognition;
+pub mod minds;
 pub mod vectors;
 
 pub use knowledge::{
