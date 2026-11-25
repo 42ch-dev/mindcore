@@ -8,7 +8,53 @@ permissions:
   contents: read
 
 jobs:
+# A pull request whose changed files (against the merge base of its head and
+# its base) are all *.md, under docs/assets/, or exactly LICENSE cannot change
+# the `rust` job's result: that job checks Rust sources, manifests, migrations
+# and the tooling scripts, none of which read Markdown or the assets. This job
+# computes that so `rust` can skip. `corpus` is never skipped because linting
+# the Markdown corpus is exactly its job.
+  docs-only:
+    runs-on: ubuntu-latest
+    outputs:
+      is-docs-only: ${{ steps.check.outputs.is-docs-only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The merge base can sit arbitrarily far behind either end, so the
+          # clone needs full history, not a single commit.
+          fetch-depth: 0
+      - id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Outside a pull request the SHAs are absent; failing to judge must
+          # never skip the Rust job, so answer "not docs-only" and exit 0.
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            echo "is-docs-only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          docs_only=true
+          count=0
+          while IFS= read -r -d '' path; do
+            count=$((count + 1))
+            case "$path" in
+              *.md | docs/assets/* | LICENSE) ;;
+              *) docs_only=false ;;
+            esac
+          # --no-renames: a rename must surface as a deletion plus an addition,
+          # or moving a Rust source under docs/assets/ would look docs-only.
+          done < <(git diff --name-only --no-renames -z "$base" "$HEAD_SHA")
+          # An empty changed-file list must run the Rust job, not skip it.
+          [ "$count" -gt 0 ] || docs_only=false
+          echo "is-docs-only=$docs_only" >> "$GITHUB_OUTPUT"
   rust:
+    needs: docs-only
+    # Needs-failure must run the Rust job too: only a cancelled run skips it.
+    if: "!cancelled() && (github.event_name == 'push' || needs.docs-only.outputs.is-docs-only != 'true')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
