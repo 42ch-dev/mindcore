@@ -2,7 +2,7 @@
 
 ## Scope
 
-The SQLite schema a host gets from `MindStore::open`. The page states the schema the embedded migration set produces — the published files plus any file appended since the last release — and how a database written by an earlier set reaches it; which files are published is `tooling/migrations/migrations.lock.json`, and the upgrade rules are `docs/storage-compatibility.md`. It does not define protocol semantics (those live with the adapter and repository) or persistence for remote faces.
+The SQLite schema a host gets from `MindStore::open`. The page states the schema the embedded migration set produces — the published files plus any file appended since the last release — and how a database written by an earlier set reaches it; which files are published is `tooling/migrations/migrations.lock.json` at the latest release tag — the working tree's lock also carries files that are not yet published — and the upgrade rules are `docs/storage-compatibility.md`. It does not define protocol semantics (those live with the adapter and repository) or persistence for remote faces.
 
 ## Current state
 
@@ -22,7 +22,7 @@ There is one schema source. Tests open a temporary database through `MindStore::
 
 ## Migration policy
 
-The published set is `tooling/migrations/migrations.lock.json`; `0001_init.sql` shipped in `0.1.0` and is immutable. A schema change appends a file named `NNNN_<description>.sql` whose prefix follows every locked one, and `0002_minds.sql` is the first such file; an appended file may merge unlocked, and its lock entry is added by hand in the same change or by the release pull request's `--write-lock` before its tag, while the file is published only when a release tag ships with that entry — until then a change to the file and its hash is visible to review, not to the script. `MindStore::open` applies the appended files in order to a database recorded at an earlier set, so a database written by `0.1.0` reopens with its records. The accepted applied sets, and the rule that `open` never repairs, downgrades or converts a database, are `docs/storage-compatibility.md`.
+The published set is `tooling/migrations/migrations.lock.json` at the latest release tag, and the working tree's lock also carries files that are not yet published; `0001_init.sql` shipped in `0.1.0` and is immutable. A schema change appends a file named `NNNN_<description>.sql` whose prefix follows every locked one, and `0002_minds.sql` is the first such file; an appended file may merge unlocked, and its lock entry is added by hand in the same change or by the release pull request's `--write-lock` before its tag, while the file is published only when a release tag ships with that entry — until then a change to the file and its hash is visible to review, not to the script. `MindStore::open` applies the appended files in order to a database recorded at an earlier set, so a database written by `0.1.0` reopens with its records. The accepted applied sets, and the rule that `open` never repairs, downgrades or converts a database, are `docs/storage-compatibility.md`.
 
 `MindStore::open` refuses a database whose applied set no longer matches, with three distinct shapes:
 
