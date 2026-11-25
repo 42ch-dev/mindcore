@@ -49,8 +49,8 @@ are not migration mismatches.
    records a checksum of each applied file, so any edit makes every database that applied it
    unopenable.
 2. A schema change appends a new file named `NNNN_<description>.sql`, where `NNNN` is greater than
-   every locked prefix. It never edits, renames, splits or deletes a locked file, and never
-   backfills a lower number.
+   every locked prefix. It never edits, renames, splits or deletes a file a release tag shipped in
+   its lock, and never backfills a lower number.
 3. Appending is the only way a database reaches a new schema: the appended file runs on an existing
    database and must be written to apply on top of the published schema, not to recreate it.
 4. A lock entry is what a change adds; it makes the file's bytes part of that change's review. An
