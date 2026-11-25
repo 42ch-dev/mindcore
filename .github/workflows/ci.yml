@@ -8,7 +8,53 @@ permissions:
   contents: read
 
 jobs:
+# A pull request whose changed files (against the merge base of its head and
+# its base) are all *.md, under docs/assets/, or exactly LICENSE cannot change
+# the `rust` job's result: that job checks Rust sources, manifests, migrations
+# and the tooling scripts, none of which read Markdown or the assets. This job
+# computes that so `rust` can skip. It runs on pull requests only: on `push`
+# the `rust` job runs anyway. If this job fails or is skipped, `rust` still
+# runs unless the run itself was cancelled, because its `if` starts with
+# `!cancelled()` — that is what keeps a failed judgement from skipping the
+# Rust job. `corpus` has no `if` and no `needs`, so this filter does not
+# skip it: linting the Markdown corpus is exactly its job.
+  docs-only:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      is-docs-only: ${{ steps.check.outputs.is-docs-only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The merge base can sit arbitrarily far behind either end, so the
+          # clone needs full history, not a single commit.
+          fetch-depth: 0
+      - id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          docs_only=true
+          count=0
+          while IFS= read -r -d '' path; do
+            count=$((count + 1))
+            case "$path" in
+              *.md | docs/assets/* | LICENSE) ;;
+              *) docs_only=false ;;
+            esac
+          # --no-renames: a rename must surface as a deletion plus an addition,
+          # or moving a Rust source under docs/assets/ would look docs-only.
+          done < <(git diff --name-only --no-renames -z "$base" "$HEAD_SHA")
+          # An empty changed-file list must run the Rust job, not skip it.
+          [ "$count" -gt 0 ] || docs_only=false
+          echo "is-docs-only=$docs_only" >> "$GITHUB_OUTPUT"
   rust:
+    needs: docs-only
+    # A prerequisite that fails or is skipped must still let the Rust job run;
+    # `!cancelled()` sees to that and gives way only to a cancelled run.
+    if: "!cancelled() && (github.event_name == 'push' || needs.docs-only.outputs.is-docs-only != 'true')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
