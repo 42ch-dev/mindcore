@@ -16,8 +16,8 @@ jobs:
 # the `rust` job runs anyway. If this job fails or is skipped, `rust` still
 # runs unless the run itself was cancelled, because its `if` starts with
 # `!cancelled()` — that is what keeps a failed judgement from skipping the
-# Rust job. `corpus` is never skipped because linting the Markdown corpus is
-# exactly its job.
+# Rust job. `corpus` has no `if` and no `needs`, so this filter does not
+# skip it: linting the Markdown corpus is exactly its job.
   docs-only:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
