@@ -21,6 +21,8 @@ The first release serves three delivery forms.
 
 The three forms reach one kernel, so one authorization rule — live admission of the (principal, Mind) pair before any target is read — holds for each of them.
 
+**What the first release exposes.** Mind-level convenience operations only. The space-level capabilities beneath the facade are an advanced surface that may be exposed later.
+
 **An HTTP API is not a delivery form.** The first release ships no HTTP surface over the library: no HTTP listener, route or request type.
 
 **What the sidecar daemon becomes.** The daemon is one process that embeds the Rust library. It is not a fourth form, and no other form passes through it.
@@ -43,6 +45,7 @@ The three forms reach one kernel, so one authorization rule — live admission o
 ## Acceptance criteria
 
 - An in-process caller reaches memory, knowledge and cognition through a Mind handle without opening a transaction, building a `Principal`, supplying a wire-shaped request body or matching `MemoryStage`.
+- The facade's first release exposes Mind-level convenience operations only; the space-level capabilities beneath it are not exposed before that advanced surface is decided.
 - A TypeScript host creates a Mind, lists Minds and operates memory, knowledge and cognition through the native binding. A refusal on the facade surfaces through the binding with its code and details intact, and a Node integration check in the workspace runs the facade's quickstart path through the binding.
 - A SPOKE peer lists the Minds it is admitted to and operates one, as the acceptance criteria of `2026-11-25-one-surface-serves-many-minds.md` state.
 - A `mindcore-daemon` binary loads a config file, takes a single-instance lock, serves a `ConnectResponder` over its transport, and exits cleanly on `SIGTERM`; an integration test drives one hello and one invoke. Which knowledge operations its first release serves follows the daemon spec and the undecided composition choice recorded in `2026-11-25-one-surface-serves-many-minds.md`.
