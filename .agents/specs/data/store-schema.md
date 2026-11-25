@@ -2,7 +2,7 @@
 
 ## Scope
 
-The SQLite schema a host gets from `MindStore::open`. The page states the schema of the latest published set and the appended files that move a database to it; the upgrade rules are `docs/storage-compatibility.md`. It does not define protocol semantics (those live with the adapter and repository) or persistence for remote faces.
+The SQLite schema a host gets from `MindStore::open`. The page states the schema the embedded migration set produces — the published files plus any file appended since the last release — and how a database written by an earlier set reaches it; which files are published is `tooling/migrations/migrations.lock.json`, and the upgrade rules are `docs/storage-compatibility.md`. It does not define protocol semantics (those live with the adapter and repository) or persistence for remote faces.
 
 ## Current state
 
