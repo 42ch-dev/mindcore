@@ -1,0 +1,61 @@
+# ADR: A Mind is one memory space
+
+Status: implemented — the registry, `create`, `list` and `get` persist a Mind whose id is its space id, bind its space, knowledge collection and carrier, and deactivate it only by freezing its space
+Date: 2026-11-25
+Class: architecture
+Related: `2026-11-19-cognition-carrier.md`, `2026-11-25-create-default-grant-set.md`, `2026-11-25-one-surface-serves-many-minds.md`, `2026-11-25-three-delivery-forms.md`, `.agents/specs/architecture/mind-model.md`, `.agents/specs/data/store-schema.md`
+
+## Problem
+
+Without the registry a caller needed five values to mean one Mind, and nothing bound them. Memory is addressed by `space_id` and `subject_id`, with an optional `context_id`. Knowledge is addressed by the collection a port was built on. Cognition is addressed by a carrier `entry_id` and a `holder` the caller names on every call (`crates/mindcore-runtime/src/tools.rs`, `DeliberateArguments`). Workflow routing is a `principal_id` key into `ServeFaces.workflow_routes`, host configuration that is not persisted (`crates/mindcore-runtime/src/lib.rs`). Adoption writes the one collection of `ServeFaces.knowledge`.
+
+`memory.spaces.list` answers the spaces a principal holds a live grant in, not Minds (`crates/mindcore-spoke/src/control.rs`, `list_spaces`). `.agents/specs/architecture/mind-model.md` keeps a Mind a "stable logical actor identity" that is "not a caller, a database file, a collection or a wire type"; that rule stopped a Mind being confused with one coordinate and, until this decision, left nothing that held the coordinates together.
+
+The cost fell on a downstream's first call: a new Mind's first rows were a hand-written `INSERT INTO memory_spaces` and a repository-level `insert_grant`, and `docs/quickstart.md` still leaves them to the host: "production hosts use their own authorization model".
+
+Without a decision every delivery form invents its own Mind. An embedding process keeps its own table of coordinates beside the store, a TypeScript host keeps another, and a SPOKE peer has nothing to name. A registry built later then reconciles three vocabularies, and a Mind created through one form is not the Mind another form finds.
+
+## Decision
+
+A Mind is one memory space, and its id is that space's `space_id`. `MindId` is the entity's id and takes the same value as the `SpaceId` of the Mind's space. There is no second id namespace and no mapping between the two.
+
+The owner's reason: a Mind is what is a mind within one space, its application scenario, so it needs no second id.
+
+One persisted record binds the Mind's space, the knowledge collection its entries and carrier live in, and the carrier that holds its current judgment. The record is the `minds` table (`crates/mindcore-sqlite/migrations/0002_minds.sql`): one row per Mind, keyed by the space's id, holding the collection and the carrier entry id. `create` (`crates/mindcore-sqlite/src/minds.rs`) establishes the space, the carrier entry, the record and the creating principal's one default grant row in one transaction, and a failure leaves no row.
+
+- **The carrier.** Current judgment stays `modules.cognition` records on the carrier's `KnowledgeEntry` (`2026-11-19-cognition-carrier.md`). The Mind's row names the carrier through `minds.carrier_entry_id`; `create` writes that entry, `ke_carrier`, into the Mind's collection as an ordinary entry, so it holds no records until the first append. `tools.mindcore.deliberate` still names its carrier by `holder` (`crates/mindcore-runtime/src/tools.rs`); replacing that argument is the facade's change (`2026-11-25-three-delivery-forms.md`).
+- **No subject of its own.** A Mind owns no subject: `create` establishes none, nothing substitutes one, and a write names its own subject. The owner's reason: which subject a memory belongs to is the caller's organization of its memory, so no subject of a Mind is its default, and a Mind's space holds many subjects. A record's placement is its space, subject and context, and a grant's coverage is subject-scoped (`.agents/specs/architecture/mind-model.md`).
+- **Deactivation.** A Mind is deactivated by freezing its space and reactivated by unfreezing it. There is no archive and no delete. The freeze is SPOKE's and is not reinvented: a space is `active` or `frozen` (`crates/mindcore-sqlite/migrations/0001_init.sql`, `memory_spaces`); a frozen space answers `SpaceFrozen` to the operations that are freeze-gated and outside the maintenance allowlist, which SPOKE defines, and serves the operations that are not freeze-gated (`crates/mindcore-spoke/src/admission.rs`, `gate`); `memory.spaces.freeze` and `memory.spaces.unfreeze` need an `admin` grant (`crates/mindcore-spoke/src/control.rs`). A frozen Mind therefore answers by one rule: a caller with a grant in its space reads, and is refused with `SpaceFrozen` only for a freeze-gated operation outside the allowlist; a caller without one is refused as for any Mind it holds no grant in.
+- **The collection binding.** The binding is stored, not assembled from host configuration. `create` binds a Mind to one collection of its own, `mind:` followed by the Mind's id, so a caller-named id never selects a collection the caller prepared; the registry row records the collection and the carrier entry id. How a served call resolves a Mind to a collection is `2026-11-25-one-surface-serves-many-minds.md`.
+- **Storage.** The registry is one appended migration file, `0002_minds.sql`. `0001_init.sql` is published and does not change, and a database opened by `0.1.0` reopens through the appended file (`docs/storage-compatibility.md`).
+
+A Mind record is not a grant. It binds coordinates and confers no access: every operation still admits the caller under its own live grants in the Mind's space, as it does today.
+
+**The id the caller names, and the one it does not.** The caller may name the `space_id`. `create` refuses a named id whose space already exists — as a Mind, or as a space without a registry row — and writes nothing: returning the existing Mind would report a creation that did not happen, and claiming an existing space would hand the caller its `admin`. When the caller names none, the library assigns `spc_` and a minted identity (`mindcore_base::ids::mint`).
+
+**The entry points.** `create`, `list` and `get` are reached through `crates/mindcore-runtime` (`mindcore_runtime::minds`) and run in `crates/mindcore-sqlite`. The operation, `mindcore_sqlite::minds::create`, borrows the caller's transaction, so the protocol operation runs the same create inside the adapter's own transaction once SPOKE has it (`2026-11-25-create-default-grant-set.md`). `list` answers the Minds whose space the caller holds a live grant in, the rule `memory.spaces.list` applies to spaces (`crates/mindcore-spoke/src/control.rs`, `list_spaces_body`); `get` answers `NotFound` for every other Mind. A frozen Mind stays listed and readable.
+
+**The pages.** `.agents/specs/architecture/mind-model.md` states the Mind record, its id, subject and deactivation rules, the entry points and the registry table; `.agents/specs/data/store-schema.md` states that table and the appended migration that creates it.
+
+## Alternatives considered
+
+- **No persisted Mind (today's state).** Rejected: it is the state this decision replaces. A caller that keeps five coordinates can keep them inconsistent with each other, a new Mind needs hand-written SQL, and a SPOKE peer cannot name a Mind because no wire value stands for one.
+- **A separate Mind id namespace.** Rejected: a Mind that is one space would carry two ids for one thing. Every selector would need a translation between them, a listing would carry both, and a caller able to quote either could pair a Mind id with the wrong space id. One id that already rides `space_id` needs no new wire member.
+- **A default subject per Mind.** Rejected: the owner's reason is that which subject a memory belongs to is the caller's organization of its memory, so no subject of a Mind is its default, and a Mind's space holds many subjects.
+- **Archive.** Rejected: the owner ruled it out. A space is `active` or `frozen` (`crates/mindcore-sqlite/migrations/0001_init.sql`, `memory_spaces`), so an archived Mind would need a state the space does not have, where the frozen state already is the deactivation.
+- **Delete.** Rejected: the owner ruled it out. The repository stops serving what it withdraws by a state or a marker and keeps the row: a subject becomes `fenced` or `archived` (`crates/mindcore-sqlite/migrations/0001_init.sql`, `memory_subjects`), and a knowledge entry is superseded by a marker (`.agents/knowledge/architecture-patterns/retire-with-a-marker-not-a-delete.md`).
+
+## Consequences
+
+- `create` writes four rows in one transaction — the space, the carrier entry, the registry row and the creating principal's one grant row — and a failure in any of them leaves no row (`crates/mindcore-sqlite/tests/minds.rs`: the four `a_taken_*` tests and `the_borrowed_create_commits_only_with_the_callers_transaction`).
+- A Mind owns no subject: `create` establishes none (`create_with_a_named_id_writes_space_carrier_record_and_grant`).
+- Freezing a Mind's space deactivates the Mind and unfreezing it reactivates it; no operation archives or deletes a Mind (`a_frozen_space_freezes_the_mind_and_unfreezing_reactivates_it`; `crates/mindcore-sqlite/src/minds.rs` declares `create`, `list_minds` and `get_mind` alone). Freezing needs an `admin` grant (`crates/mindcore-spoke/src/control.rs`), which the default grant row gives the creator.
+- The Mind's id equals its space's `space_id`: `MindId` is the type of `Mind.id`. No second Mind id exists in storage, in the library or on the wire.
+- `list` answers the Minds the caller may see and no other, `get` answers `NotFound` for any other, and `get` answers the same identity after the store is reopened (`list_answers_the_minds_the_caller_holds_a_live_grant_in`, `get_answers_not_found_for_an_unseen_or_unknown_mind`, `get_returns_the_same_mind_after_reopen`).
+- `0001_init.sql` is unchanged, the registry is one appended migration, and a database written by `0.1.0` reopens through it (`crates/mindcore-sqlite/tests/store_migrations.rs`, `a_database_written_by_the_published_set_reopens_through_the_appended_file`). The appended file's shape is fixed once a release locks it; a wrong column is corrected by another appended file.
+- No test or example creates a Mind by inserting into `memory_spaces` by hand: the story and the bootstrap proof call `create`, and every other fixture obtains its space through `SqliteMemoryRepository::insert_space`.
+- `.agents/specs/architecture/mind-model.md` and `.agents/specs/data/store-schema.md` state the Mind record and the registry table.
+- **A Mind id is a space id, so Mind ids inherit the space's disclosure.** On the memory path an unknown `space_id` answers `NOT_FOUND` where an ungranted one answers `NOT_AUTHORIZED` (`crates/mindcore-spoke/src/admission.rs`, `space` and `refuse_coverage`), so a peer can tell which Mind ids exist. `2026-11-25-one-surface-serves-many-minds.md` closes that gap; this record does not.
+- **A space written before the registry is not a Mind.** Nothing can infer its collection or carrier, and there is no data-movement path: `list` does not show it, `create` refuses its id, and a host creates new Minds while the old spaces keep working as spaces.
+- **The collection name and the carrier id are stored per row.** `mind:` and the Mind's id, and `ke_carrier`, are what `create` writes (`mindcore_sqlite::minds::knowledge_collection_of`, `CARRIER_ENTRY_ID`); a later rule applies to new Minds only.
+- **`deliberate` takes `subject_id` for its own work.** It uses it for its snapshot recall, its grant re-check and its unsettled-intent check (`crates/mindcore-spoke/src/workflows.rs`). The owner settled on 2026-11-25 that the facade's `deliberate` takes no `subject_id` and that the grant re-check and the unsettled-intent check move to the space; the facade's change verifies both against the code (`2026-11-25-three-delivery-forms.md`).
