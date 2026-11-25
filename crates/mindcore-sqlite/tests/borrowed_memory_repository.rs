@@ -11,8 +11,8 @@ use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
 use mindcore_base::ir::{
     CandidateState, Classification, Consumption, MemoryCandidateIr, MemoryContent,
-    MemoryJournalRow, MemoryRecordIr, MemoryRepository, Placement, Provenance, ReceiptRead,
-    ReceiptState, RecordState, ReviewReceiptIr,
+    MemoryJournalRow, MemoryRecordIr, MemoryRepository, MemorySpaceRow, Placement, Provenance,
+    ReceiptRead, ReceiptState, RecordState, ReviewReceiptIr,
 };
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 
@@ -35,16 +35,24 @@ async fn open(path: &std::path::Path) -> SqlitePool {
 
 async fn prepared(path: &std::path::Path) -> SqlitePool {
     let pool = MindStore::open(path).await.expect("open store").pool();
-    sqlx::query!(
-        "INSERT INTO memory_spaces \
-         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-          created_at) \
-         VALUES ('spc_workshop', 'Workshop', 'host-1', 1, 'active', 1, ?)",
-        TIME,
+    let repo = SqliteMemoryRepository;
+    let mut tx = pool.begin().await.expect("begin space transaction");
+    repo.insert_space(
+        &mut tx,
+        &MemorySpaceRow {
+            space_id: SpaceId::new("spc_workshop"),
+            display_name: Some("Workshop".into()),
+            authority_host_id: "host-1".into(),
+            authority_generation: 1,
+            status: "active".into(),
+            revision: Number::from(1),
+            created_at: TIME.into(),
+            pending_receipts: 0,
+        },
     )
-    .execute(&pool)
     .await
     .expect("seed space");
+    tx.commit().await.expect("commit space transaction");
     sqlx::query!(
         "INSERT INTO memory_subjects \
          (space_id, subject_id, status, revision, created_at) \
@@ -794,13 +802,19 @@ async fn guarded_updates_do_not_cross_spaces() {
     let pool = prepared(&path).await;
 
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query!(
-        "INSERT INTO memory_spaces \
-         (space_id, authority_host_id, authority_generation, status, revision, created_at) \
-         VALUES ('spc_other', 'host-2', 1, 'active', 1, ?)",
-        TIME,
+    repo.insert_space(
+        &mut tx,
+        &MemorySpaceRow {
+            space_id: SpaceId::new("spc_other"),
+            display_name: None,
+            authority_host_id: "host-2".into(),
+            authority_generation: 1,
+            status: "active".into(),
+            revision: Number::from(1),
+            created_at: TIME.into(),
+            pending_receipts: 0,
+        },
     )
-    .execute(&mut *tx)
     .await
     .unwrap();
     sqlx::query!(

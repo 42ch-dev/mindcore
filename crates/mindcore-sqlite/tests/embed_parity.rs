@@ -18,15 +18,17 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{json, Number, Value};
 use spoke_operations::{jcs_sha256_hex, SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, SqlitePool, Transaction};
 use tempfile::TempDir;
 
+use mindcore_base::ids::SpaceId;
+use mindcore_base::ir::MemorySpaceRow;
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 
 const SPACE: &str = "spc_parity";
 const SUBJECT: &str = "sbj_mira";
@@ -89,15 +91,22 @@ impl Harness {
             db,
             pool,
         };
-        sqlx::query(
-            "INSERT INTO memory_spaces \
-             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-              created_at) \
-             VALUES ('spc_parity', 'parity', 'host_1', 1, 'active', 1, '2026-11-20T09:20:01.123Z')",
-        )
-        .execute(&harness.pool)
-        .await
-        .expect("seed space");
+        let mut tx = harness.pool.begin().await.expect("begin");
+        let space = MemorySpaceRow {
+            space_id: SpaceId::new("spc_parity"),
+            display_name: Some("parity".to_string()),
+            authority_host_id: "host_1".to_string(),
+            authority_generation: 1,
+            status: "active".to_string(),
+            revision: Number::from(1),
+            created_at: "2026-11-20T09:20:01.123Z".to_string(),
+            pending_receipts: 0,
+        };
+        SqliteMemoryRepository
+            .insert_space(&mut tx, &space)
+            .await
+            .expect("seed space");
+        tx.commit().await.expect("commit space");
         sqlx::query(
             "INSERT INTO memory_subjects \
              (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, \

@@ -2,6 +2,7 @@
 
 Status: implemented — one carrier keeps a single authoritative current judgment without a second store
 Date: 2026-11-19
+Related: `2026-11-25-mind-is-one-memory-space.md` — the registry row names the carrier
 
 ## Problem
 

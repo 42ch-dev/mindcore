@@ -13,11 +13,12 @@ use mindcore_base::boundary::CallerId;
 use mindcore_base::cognition::{
     append_cognition_record, derive_mind_state, mind_state_value, MindError,
 };
-use mindcore_base::ids::SpaceId;
-use mindcore_base::ir::{MemoryGrantRow, MemoryRepository};
+use mindcore_base::ids::{MindId, SpaceId};
+use mindcore_base::ir::MemoryRepository;
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
 use mindcore_sqlite::cognition::{read_carrier, write_carrier};
+use mindcore_sqlite::minds::{CreateMind, Mind, CARRIER_ENTRY_ID};
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use serde_json::{json, Map, Value};
 use spoke_operations::{validate_mind_state, KnowledgeEntryPort, SpokeRejectCode, SpokeResult};
@@ -126,7 +127,7 @@ fn belief_record(
     json!({
         "assessed_at": assessed_at,
         "assessment_context": {"context_id": "ctx_dusk_at_the_gate"},
-        "assessor": reference("knowledge_entry", "ke_wren_cognition"),
+        "assessor": reference("knowledge_entry", CARRIER_ENTRY_ID),
         "assessor_role": "holder_self_report",
         "basis": {
             "acquisition": acquisition,
@@ -135,7 +136,7 @@ fn belief_record(
         },
         "effective_at": "2026-11-19T18:00:00Z",
         "extensions": {},
-        "holder": reference("knowledge_entry", "ke_wren_cognition"),
+        "holder": reference("knowledge_entry", CARRIER_ENTRY_ID),
         "kind": "belief",
         "order": 1,
         "q": {
@@ -192,50 +193,26 @@ fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
     }
 }
 
-pub async fn provision_space(pool: &SqlitePool, space: &str, caller: &str) {
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let mut tx = pool.begin().await.expect("begin the provisioning");
-    sqlx::query(
-        "INSERT INTO memory_spaces \
-         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-          created_at) \
-         VALUES (?, ?, 'host_story', 1, 'active', 1, ?)",
+/// Creates one Mind through the library entry point: `create_mind` with the space's own id and
+/// display name and the caller as the grant owner.
+pub async fn create(store: &MindStore, space: &str, caller: &str) -> Mind {
+    expect_ok(
+        store
+            .create_mind(&CreateMind {
+                mind_id: Some(MindId::new(space)),
+                display_name: Some(space.to_string()),
+                owner: CallerId::new(caller),
+            })
+            .await,
+        "create the mind",
     )
-    .bind(space)
-    .bind(space)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .expect("provision the space");
-    SqliteMemoryRepository
-        .insert_grant(
-            &mut tx,
-            &MemoryGrantRow {
-                grant_id: format!("grt_{space}"),
-                space_id: SpaceId::new(space),
-                subject_id: None,
-                principal_id: CallerId::new(caller),
-                capabilities: [
-                    "capture",
-                    "review",
-                    "records_read",
-                    "records_write",
-                    "recall",
-                ]
-                .map(str::to_string)
-                .to_vec(),
-                context_ids: Vec::new(),
-                shared_access: false,
-                expires_at: None,
-                revoked_at: None,
-                revision: serde_json::Number::from(1),
-                created_at: now,
-                extensions: Map::new(),
-            },
-        )
-        .await
-        .expect("provision the grant");
-    tx.commit().await.expect("commit the provisioning");
+}
+
+fn entry_ids(entries: &[KnowledgeEntry]) -> Vec<&str> {
+    entries
+        .iter()
+        .map(|entry| entry.entry_id.as_str())
+        .collect()
 }
 
 /// One adapter subject registration: the story's Wren and the race tests' shared subject.
@@ -469,12 +446,12 @@ pub async fn run_story(label: &str) {
     let studio_caller = principal("caller_studio");
     let pool = store.pool();
     let adapter = MemoryAdapter::new(false);
-    provision_space(&pool, "wren", "caller_wren").await;
-    provision_space(&pool, "studio", "caller_studio").await;
+    let wren_mind = create(&store, "wren", "caller_wren").await;
+    let studio_mind = create(&store, "studio", "caller_studio").await;
     ensure_subject(&pool, &adapter, &wren_caller).await;
 
-    let wren = store.knowledge(KnowledgeScope::new("wren"));
-    let studio = store.knowledge(KnowledgeScope::new("studio"));
+    let wren = store.knowledge(wren_mind.knowledge.clone());
+    let studio = store.knowledge(studio_mind.knowledge.clone());
     let facts = store.knowledge(KnowledgeScope::new("village-facts"));
 
     let (shared_collection, shared_entries) = shared_fixture();
@@ -539,15 +516,21 @@ pub async fn run_story(label: &str) {
         "read the shared entry",
     );
     assert_eq!(json_of(&shared_read), json_of(&shared_seeded));
-    assert!(expect_ok(wren.list_entries().await, "list wren").is_empty());
-    assert!(expect_ok(studio.list_entries().await, "list studio").is_empty());
+    assert_eq!(
+        entry_ids(&expect_ok(wren.list_entries().await, "list wren")),
+        vec![CARRIER_ENTRY_ID]
+    );
+    assert_eq!(
+        entry_ids(&expect_ok(studio.list_entries().await, "list studio")),
+        vec![CARRIER_ENTRY_ID]
+    );
     assert!(
         matches!(derive_mind_state(&shared_read), Err(MindError::NoRecords)),
         "a catalog read must not derive cognition"
     );
     step(
         2,
-        "catalog read: shared entry revision 1 unchanged; wren has no entries; derived state NoRecords",
+        "catalog read: shared entry revision 1 unchanged; wren holds only its carrier; derived state NoRecords",
     );
 
     let mut adoption = entry(
@@ -664,17 +647,8 @@ pub async fn run_story(label: &str) {
         ),
     );
 
-    let carrier_entry = entry(
-        "ke_wren_cognition",
-        "character",
-        "Wren's current view of the north gate.",
-    );
-    expect_ok(
-        wren.put_knowledge_entry(carrier_entry, None).await,
-        "create the cognition carrier",
-    );
     let carrier = expect_ok(
-        read_carrier(&wren, "ke_wren_cognition").await,
+        read_carrier(&wren, CARRIER_ENTRY_ID).await,
         "read the empty carrier",
     );
     let doubt_assessed_at = "2026-11-19T18:05:00Z";
@@ -744,7 +718,7 @@ pub async fn run_story(label: &str) {
     assert_eq!(at_the_gate[0]["occurred_at"], json!(gate_observed_at));
 
     let carrier = expect_ok(
-        read_carrier(&wren, "ke_wren_cognition").await,
+        read_carrier(&wren, CARRIER_ENTRY_ID).await,
         "read the carrier before the second judgment",
     );
     let revision_before = carrier.revision.expect("the carrier holds a revision");
@@ -876,7 +850,7 @@ pub async fn run_story(label: &str) {
     );
     assert_eq!(json_of(&personal_after_shared), json_of(&adopted));
     let carrier_after_shared = expect_ok(
-        read_carrier(&wren, "ke_wren_cognition").await,
+        read_carrier(&wren, CARRIER_ENTRY_ID).await,
         "read the carrier after the shared change",
     );
     let view_after_shared =
@@ -907,10 +881,24 @@ pub async fn run_story(label: &str) {
     let store = MindStore::open(&path).await.expect("reopen the store");
     let pool = store.pool();
     let adapter = MemoryAdapter::new(false);
-    let wren = store.knowledge(KnowledgeScope::new("wren"));
-    let studio = store.knowledge(KnowledgeScope::new("studio"));
+    let wren_reopened = expect_ok(
+        store
+            .get_mind(&CallerId::new("caller_wren"), &MindId::new("wren"))
+            .await,
+        "read wren's mind after reopen",
+    );
+    let studio_reopened = expect_ok(
+        store
+            .get_mind(&CallerId::new("caller_studio"), &MindId::new("studio"))
+            .await,
+        "read studio's mind after reopen",
+    );
+    assert_eq!(wren_reopened, wren_mind);
+    assert_eq!(studio_reopened, studio_mind);
+    let wren = store.knowledge(wren_reopened.knowledge.clone());
+    let studio = store.knowledge(studio_reopened.knowledge.clone());
     let carrier_reopened = expect_ok(
-        read_carrier(&wren, "ke_wren_cognition").await,
+        read_carrier(&wren, &wren_mind.carrier_entry_id).await,
         "read the carrier after reopen",
     );
     let reopened_view = derive_mind_state(&carrier_reopened).expect("derive after reopen");
@@ -921,14 +909,20 @@ pub async fn run_story(label: &str) {
         mind_state_value(&reopened_view, "ms_wren_story").expect("render after reopen"),
         expected_value
     );
-    assert!(expect_ok(studio.list_entries().await, "list studio after reopen").is_empty());
+    assert_eq!(
+        entry_ids(&expect_ok(
+            studio.list_entries().await,
+            "list studio after reopen"
+        )),
+        vec![CARRIER_ENTRY_ID]
+    );
     let reopened_tavern =
         recalled(&pool, &adapter, &wren_caller, "wren", in_context("tavern")).await;
     assert_eq!(record_ids(&reopened_tavern), vec![hearsay.as_str()]);
     step(
         7,
         &format!(
-            "reopen: derived state equals the pre-close state (holder {}, revision 3, records cog_hearsay, cog_observed); {hearsay} still recallable; studio empty",
+            "reopen: derived state equals the pre-close state (holder {}, revision 3, records cog_hearsay, cog_observed); {hearsay} still recallable; studio holds only its carrier",
             reopened_view.holder_entry_id
         ),
     );
@@ -1014,11 +1008,13 @@ pub async fn run_story(label: &str) {
         ),
         SpokeRejectCode::KnowledgeEntryNotFound
     );
-    assert!(expect_ok(
-        studio.list_entries().await,
-        "list studio after the refusals"
-    )
-    .is_empty());
+    assert_eq!(
+        entry_ids(&expect_ok(
+            studio.list_entries().await,
+            "list studio after the refusals"
+        )),
+        vec![CARRIER_ENTRY_ID]
+    );
     step(
         8,
         "refusals: studio read KnowledgeEntryNotFound; Wren update revision 2; wrong-scope and stale writes StoredRevisionStale; both scopes unchanged",

@@ -15,13 +15,13 @@ Without a decision each downstream picks its own way in. The peer form has no pr
 
 The first release serves three delivery forms.
 
-1. **A process embedding the Rust library.** The host embeds the workspace as it does today and reaches memory, knowledge and cognition through an in-process facade over the existing adapter, ports and workflows, by way of a Mind handle. The facade adds no second write path, moves no validation point, and a Mind handle never widens a principal's grants. Its contract spec is written with the facade.
+1. **A process embedding the Rust library.** The host embeds the workspace as it does today and reaches memory, knowledge and cognition through an in-process facade over the existing adapter, ports and workflows, by way of a Mind handle. The facade is `crates/mindcore-runtime`: that crate is the library's entry crate and holds the in-process entry points beside the served surface; no crate is added and none is renamed (owner, 2026-11-25). Its entry points `create`, `list` and `get` are built (`mindcore_runtime::minds`); the Mind handle and the memory, knowledge and cognition operations behind it are the facade's remaining work. The facade adds no second write path, moves no validation point, and a Mind handle never widens a principal's grants. Its contract spec is written with the facade.
 2. **A TypeScript host through a native binding library.** A native binding wraps the in-process facade, so a TypeScript process links the library into its own process and is not a client of another process.
-3. **A SPOKE peer.** Any SPOKE Connect peer operates a Mind through standard SPOKE operations. A SPOKE interface change is proposed for SPOKE-side evaluation (`https://github.com/42ch-dev/spoke/issues/222`) and is not assumed; what a peer gets without it, and in which stages, is `2026-11-25-one-surface-serves-many-minds.md`.
+3. **A SPOKE peer.** Any SPOKE Connect peer operates a Mind through standard SPOKE operations. A SPOKE interface change was proposed for SPOKE-side evaluation (`https://github.com/42ch-dev/spoke/issues/222`); the owner stated on 2026-11-25 that SPOKE settled it and that SPOKE 0.19.0 will carry the three items; what a peer gets without it, and in which stages, is `2026-11-25-one-surface-serves-many-minds.md`.
 
 The three forms reach one kernel, so one authorization rule — live admission of the (principal, Mind) pair before any target is read — holds for each of them.
 
-**What the first release exposes.** Mind-level convenience operations only. The space-level capabilities beneath the facade are an advanced surface that may be exposed later.
+**What the first release exposes.** Mind-level convenience operations only. The space-level capabilities beneath the facade are an advanced surface that may be exposed later. It also composes none of the operations that are not Mind-routed: until each of `port.knowledge.*`, `history.*` and `knowledge.adopt` is served per Mind, the surface does not compose it, because every operation is to hang off the Mind entity (owner, 2026-11-25).
 
 **An HTTP API is not a delivery form.** The first release ships no HTTP surface over the library: no HTTP listener, route or request type.
 
@@ -48,7 +48,7 @@ The three forms reach one kernel, so one authorization rule — live admission o
 - The facade's first release exposes Mind-level convenience operations only; the space-level capabilities beneath it are not exposed before that advanced surface is decided.
 - A TypeScript host creates a Mind, lists Minds and operates memory, knowledge and cognition through the native binding. A refusal on the facade surfaces through the binding with its code and details intact, and a Node integration check in the workspace runs the facade's quickstart path through the binding.
 - A SPOKE peer lists the Minds it is admitted to and operates one, as the acceptance criteria of `2026-11-25-one-surface-serves-many-minds.md` state.
-- A `mindcore-daemon` binary loads a config file, takes a single-instance lock, serves a `ConnectResponder` over its transport, and exits cleanly on `SIGTERM`; an integration test drives one hello and one invoke. Which knowledge operations its first release serves follows the daemon spec and the undecided composition choice recorded in `2026-11-25-one-surface-serves-many-minds.md`.
+- A `mindcore-daemon` binary loads a config file, takes a single-instance lock, serves a `ConnectResponder` over its transport, and exits cleanly on `SIGTERM`; an integration test drives one hello and one invoke. Which knowledge operations its first release serves follows the daemon spec and the settled composition rule recorded in `2026-11-25-one-surface-serves-many-minds.md`: the surface composes none of the operations that are not Mind-routed until each is served per Mind.
 - `crates/mindcore-runtime` remains a library crate with no listener and no accept loop.
 - The repository contains no HTTP surface over the library: no HTTP listener, route or request type.
 - `README.md` and `docs/quickstart.md` lead with the Mind path, and the facade, the binding and the crates they need are consumable by a downstream.
@@ -56,8 +56,9 @@ The three forms reach one kernel, so one authorization rule — live admission o
 ## Risks
 
 - **None of the three forms exists in full.** At the decision the facade, the binding and the daemon binary are unbuilt. A first release that claims all three owes all three.
-- **The SPOKE-side items are outside this repository's control.** They are proposed, not accepted; until both exist a peer gets per-Mind memory and cognition only (`2026-11-25-one-surface-serves-many-minds.md`).
-- **Undecided: how a downstream consumes the facade and the binding.** `mindcore-spoke` and `mindcore-runtime` are `publish = false` (`crates/mindcore-spoke/Cargo.toml`, `crates/mindcore-runtime/Cargo.toml`; `2026-11-24-release-pipeline.md`), so an embedding downstream reaches them from this repository only. The owner has not fixed whether the facade's crate and the binding are published to a registry or documented as a dependency with the reason recorded.
+- **The SPOKE-side items wait for a cohort this repository does not yet pin.** SPOKE 0.19.0 will carry them (owner, 2026-11-25); until that cohort is pinned here, a peer gets per-Mind memory and cognition only (`2026-11-25-one-surface-serves-many-minds.md`).
+- **Settled for the two crates, open for the binding: how a downstream consumes the facade and the binding.** `mindcore-runtime` and `mindcore-spoke` are published to crates.io (owner, 2026-11-25); today both are `publish = false` (`crates/mindcore-spoke/Cargo.toml`, `crates/mindcore-runtime/Cargo.toml`; `2026-11-24-release-pipeline.md`), so until that lands an embedding downstream reaches them from this repository only. How the binding is packaged is decided with the binding.
 - **Undecided: which tool builds the binding,** and how it is packaged for a TypeScript host. The owner fixed a native binding library and nothing about its toolchain.
 - **The daemon's boundary is fixed here only in position and transport.** Its crate layout, config file format and admission model are not written down.
 - **The daemon is one more artifact to release and to operate,** and it takes in configuration what an embedding host writes for itself: identity, admission, a journal publisher and workflow providers.
+- **No release before SPOKE 0.19.0.** Changes merge to `main`; the first Mind-centric release follows SPOKE 0.19.0 and ships the served surface's two stages as one minor (owner, 2026-11-25).

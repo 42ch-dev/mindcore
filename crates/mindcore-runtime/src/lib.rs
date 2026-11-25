@@ -6,9 +6,13 @@
 //! `ConnectResponderOptions` from [`MindcoreSurface`]. Advertisements follow what is served:
 //! [`MindcoreServe::surface`] derives `capabilities` and `tools` from the composed faces and the
 //! registrations, never from a host-supplied capability string.
+//!
+//! The crate is also the library's entry crate: [`minds`] holds the in-process entry points
+//! `create`, `list` and `get` a host calls on its `MindStore`.
 
 mod adoption;
 mod history_dedup;
+pub mod minds;
 pub mod tools;
 
 use std::collections::BTreeMap;

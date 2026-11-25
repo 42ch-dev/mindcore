@@ -25,8 +25,7 @@ pub use serve::{ServedMemory, TransferService};
 pub use transfer::OPERATIONS as TRANSFER_OPERATIONS;
 pub use workflows::MemoryWorkflowBinding;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+pub(crate) use mindcore_base::ids::mint;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -253,18 +252,6 @@ pub(crate) fn recorded_failure(failure: &ReceiptFailure) -> Reject {
         }
     }
     reject
-}
-
-/// A fresh identity for one stored row. The counter keeps it unique within the
-/// process and the nanosecond stamp across processes.
-pub(crate) fn mint(prefix: &str) -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}_{nanos:x}{count:x}")
 }
 
 /// One stored row's revision bumped by one.

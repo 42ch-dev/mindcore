@@ -1313,6 +1313,32 @@ impl SqliteMemoryRepository {
         rows.into_iter().map(subject_columns_row).collect()
     }
 
+    /// Insert-only space row; the space's subjects and grants follow under its id.
+    /// `pending_receipts` is a read-side snapshot and never persisted.
+    pub async fn insert_space(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        row: &MemorySpaceRow,
+    ) -> RepoResult<()> {
+        sqlx::query(
+            "INSERT INTO memory_spaces \
+             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+              created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(row.space_id.as_str())
+        .bind(&row.display_name)
+        .bind(&row.authority_host_id)
+        .bind(row.authority_generation)
+        .bind(&row.status)
+        .bind(revision_i64(&row.revision)?)
+        .bind(&row.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| conflict(error, row.space_id.as_str()))?;
+        Ok(())
+    }
+
     /// The space's receipt rows projected content-free, in stable id order.
     pub async fn receipt_summaries(
         &self,

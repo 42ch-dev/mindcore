@@ -1,14 +1,14 @@
 //! The export builder against seeded storage and the §6.13 boundary cases.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map, Number, Value};
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
 use mindcore_base::ir::{
     CandidateState, Classification, Consumption, MemoryCandidateIr, MemoryContent, MemoryGrantRow,
     MemoryJournalRow, MemoryProfileRow, MemoryRecordIr, MemoryReflectionRow, MemoryRepository,
-    MemorySubjectRow, Placement, PlacementSelection, Provenance, ReceiptState, RecordState,
-    ReviewReceiptIr,
+    MemorySpaceRow, MemorySubjectRow, Placement, PlacementSelection, Provenance, ReceiptState,
+    RecordState, ReviewReceiptIr,
 };
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use sqlx::SqlitePool;
@@ -173,16 +173,20 @@ impl Fixture {
 
     async fn seed(&self) {
         let mut tx = self.pool.begin().await.expect("begin");
-        sqlx::query(
-            "INSERT INTO memory_spaces \
-             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-              created_at) VALUES (?, 'space', 'host_1', 3, 'active', 1, ?)",
-        )
-        .bind(SPACE)
-        .bind(NOW)
-        .execute(&mut *tx)
-        .await
-        .expect("seed space");
+        let space = MemorySpaceRow {
+            space_id: SpaceId::new(SPACE),
+            display_name: Some("space".to_string()),
+            authority_host_id: "host_1".to_string(),
+            authority_generation: 3,
+            status: "active".to_string(),
+            revision: Number::from(1),
+            created_at: NOW.to_string(),
+            pending_receipts: 0,
+        };
+        self.repository
+            .insert_space(&mut tx, &space)
+            .await
+            .expect("seed space");
         for row in [
             subject("s_1", "active", &["ctx_1", "ctx_2"]),
             subject("s_2", "archived", &[]),
@@ -2424,16 +2428,21 @@ const TARGET: &str = "spc_target";
 /// A second, empty space where `p_1` holds `transfer` and `admin`.
 async fn target_space(fixture: &Fixture) {
     let mut tx = fixture.begin().await;
-    sqlx::query(
-        "INSERT INTO memory_spaces \
-         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-          created_at) VALUES (?, 'target', 'host_1', 1, 'active', 1, ?)",
-    )
-    .bind(TARGET)
-    .bind(NOW)
-    .execute(&mut *tx)
-    .await
-    .expect("seed target space");
+    let space = MemorySpaceRow {
+        space_id: SpaceId::new(TARGET),
+        display_name: Some("target".to_string()),
+        authority_host_id: "host_1".to_string(),
+        authority_generation: 1,
+        status: "active".to_string(),
+        revision: Number::from(1),
+        created_at: NOW.to_string(),
+        pending_receipts: 0,
+    };
+    fixture
+        .repository
+        .insert_space(&mut tx, &space)
+        .await
+        .expect("seed target space");
     let mut row = grant("g_target", None, "p_1", &[], false, false);
     row.space_id = SpaceId::new(TARGET);
     row.capabilities = vec![

@@ -35,8 +35,8 @@ use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use sqlx::{Sqlite, Transaction};
 
 use embedded_story::{
-    attempt_retain, capture, ensure_subject, expect_ok, principal, provision_space, recalled,
-    record_ids, settle_receipt, stage_review, TempDb,
+    attempt_retain, capture, create, ensure_subject, expect_ok, principal, recalled, record_ids,
+    settle_receipt, stage_review, TempDb,
 };
 
 fn hearing(key: &str) -> serde_json::Value {
@@ -86,7 +86,7 @@ async fn competing_handles_retain_one_candidate() {
     let path = temp.database_path();
     let left = MindStore::open(&path).await.expect("open the left handle");
     let left_pool = left.pool();
-    provision_space(&left_pool, "wren", "caller_wren").await;
+    create(&left, "wren", "caller_wren").await;
     let right = MindStore::open(&path).await.expect("open the right handle");
     let right_pool = right.pool();
     let caller = principal("caller_wren");
@@ -168,7 +168,7 @@ async fn competing_settlements_keep_the_pending_pair_atomic() {
     let path = temp.database_path();
     let left = MindStore::open(&path).await.expect("open the left handle");
     let left_pool = left.pool();
-    provision_space(&left_pool, "wren", "caller_wren").await;
+    create(&left, "wren", "caller_wren").await;
     let right = MindStore::open(&path).await.expect("open the right handle");
     let right_pool = right.pool();
     let caller = principal("caller_wren");

@@ -138,3 +138,109 @@ async fn applied_set_missing_a_recorded_version_is_refused() {
         other => panic!("expected ExecuteMigration for version 1, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_database_written_by_the_published_set_reopens_through_the_appended_file() {
+    use mindcore_base::boundary::CallerId;
+    use mindcore_base::ids::MindId;
+    use mindcore_sqlite::minds::CreateMind;
+
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+
+    let embedded = sqlx::migrate!("./migrations");
+    // The set 0.1.0 shipped: the first file alone, with the checksum sqlx records for it.
+    let published = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            embedded
+                .migrations
+                .iter()
+                .filter(|m| m.version == 1)
+                .cloned()
+                .collect(),
+        ),
+        ..embedded
+    };
+    let pool = raw_pool(&path).await;
+    published.run(&pool).await.expect("write a 0.1.0 database");
+    // One legacy space row written by the published set, exactly as a 0.1.0 host left it.
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+          created_at) \
+         VALUES ('spc_legacy', 'Legacy', 'host-1', 1, 'active', 1, '2026-11-20T09:20:01.123Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("write the legacy space");
+    pool.close().await;
+
+    let store = MindStore::open(&path)
+        .await
+        .expect("a 0.1.0 database reopens");
+    // The legacy row survives the upgrade unchanged, and it is not a Mind: nothing could infer
+    // its collection or carrier, so no registry row appears for it and no caller lists it.
+    let legacy: (Option<String>, String, i64, String, i64, String) = sqlx::query_as(
+        "SELECT display_name, authority_host_id, authority_generation, status, revision, \
+         created_at FROM memory_spaces WHERE space_id = 'spc_legacy'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .expect("read the legacy space");
+    assert_eq!(
+        legacy,
+        (
+            Some("Legacy".to_string()),
+            "host-1".to_string(),
+            1,
+            "active".to_string(),
+            1,
+            "2026-11-20T09:20:01.123Z".to_string()
+        ),
+        "the legacy row is unchanged"
+    );
+    let registry = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM minds")
+        .fetch_one(&store.pool())
+        .await
+        .expect("count the registry");
+    assert_eq!(registry, 0, "a pre-registry space is not registered");
+    let listed = store.list_minds(&CallerId::new("caller_wren")).await;
+    match listed {
+        spoke_operations::SpokeResult::Ok(listed) => assert!(
+            listed.is_empty(),
+            "the legacy space is not listed as a Mind"
+        ),
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("list on a reopened database: {reject:?}")
+        }
+    }
+
+    let created = store
+        .create_mind(&CreateMind {
+            mind_id: Some(MindId::new("wren")),
+            display_name: None,
+            owner: CallerId::new("caller_wren"),
+        })
+        .await;
+    let mind = match created {
+        spoke_operations::SpokeResult::Ok(mind) => mind,
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("create on a reopened database: {reject:?}")
+        }
+    };
+    let seen = store
+        .get_mind(&CallerId::new("caller_wren"), &MindId::new("wren"))
+        .await;
+    match seen {
+        spoke_operations::SpokeResult::Ok(seen) => assert_eq!(mind, seen),
+        spoke_operations::SpokeResult::Reject(reject) => {
+            panic!("get on a reopened database: {reject:?}")
+        }
+    }
+    store.close().await;
+    MindStore::open(&path)
+        .await
+        .expect("the reopened database reopens again")
+        .close()
+        .await;
+}
