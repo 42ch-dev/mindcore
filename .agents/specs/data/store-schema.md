@@ -22,7 +22,7 @@ There is one schema source. Tests open a temporary database through `MindStore::
 
 ## Migration policy
 
-The published set is `tooling/migrations/migrations.lock.json`; `0001_init.sql` shipped in `0.1.0` and is immutable. A schema change appends a file named `NNNN_<description>.sql` whose prefix follows every locked one, and `0002_minds.sql` is the first such file; a file becomes published when the release that ships it adds its lock entry. `MindStore::open` applies the appended files in order to a database recorded at an earlier set, so a database written by `0.1.0` reopens with its records. The accepted applied sets, and the rule that `open` never repairs, downgrades or converts a database, are `docs/storage-compatibility.md`.
+The published set is `tooling/migrations/migrations.lock.json`; `0001_init.sql` shipped in `0.1.0` and is immutable. A schema change appends a file named `NNNN_<description>.sql` whose prefix follows every locked one, and `0002_minds.sql` is the first such file; an appended file may merge before its lock entry exists, and it becomes published when the release pull request adds that entry, before the release is tagged. `MindStore::open` applies the appended files in order to a database recorded at an earlier set, so a database written by `0.1.0` reopens with its records. The accepted applied sets, and the rule that `open` never repairs, downgrades or converts a database, are `docs/storage-compatibility.md`.
 
 `MindStore::open` refuses a database whose applied set no longer matches, with three distinct shapes:
 
@@ -55,7 +55,7 @@ All three mean recreate. A busy or locked database, an I/O error or a permission
 
 ## Change obligations
 
-A migration edit lands together with this page, the reader that decodes the changed table, and the tests that open the database through `MindStore::open` — a schema without its reader, or a reader without its schema, is not a deliverable. An appended migration lands together with this page, the reader that decodes its table and the open-path test that proves a database written by the previous published set reopens through it; its lock entry is written by the release that ships it; and changing the published set, or the three refusal shapes `open` reports, changes this page in the same commit.
+A migration edit lands together with this page, the reader that decodes the changed table, and the tests that open the database through `MindStore::open` — a schema without its reader, or a reader without its schema, is not a deliverable. An appended migration lands together with this page, the reader that decodes its table and the open-path test that proves a database written by the previous published set reopens through it; its lock entry is written by the release pull request that ships it, before its tag; and changing the published set, or the three refusal shapes `open` reports, changes this page in the same commit.
 
 ## Adoption anchor storage
 

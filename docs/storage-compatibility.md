@@ -49,8 +49,9 @@ are not migration mismatches.
    backfills a lower number.
 3. Appending is the only way a database reaches a new schema: the appended file runs on an existing
    database and must be written to apply on top of the published schema, not to recreate it.
-4. A new file becomes published when its entry is added to the lock. The lock entry is added in the
-   same change as the file; it is never rewritten afterwards.
+4. A new file becomes published when its entry is added to the lock. The lock entry is added by the
+   release pull request before its tag; an appended file may merge before that, unlocked, and a lock
+   entry is never rewritten afterwards.
 
 ## Enforcement
 
