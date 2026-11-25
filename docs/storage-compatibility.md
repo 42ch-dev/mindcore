@@ -9,9 +9,9 @@ accepts.
 
 The published set is `tooling/migrations/migrations.lock.json` as it stands at the latest release
 tag: an ordered array of `{ "file", "sha256" }` entries naming every migration file that has shipped
-in a release. The working tree's lock is the same file and also lists files that are not yet
-published. A file is published when a release tag ships with its entry in the lock, and published
-files are immutable.
+in a release. The working tree's lock is the same file and may also list files that no release
+tag has published. A file is published when a release tag ships with its entry in the lock,
+and published files are immutable.
 
 ## What `open` accepts
 
