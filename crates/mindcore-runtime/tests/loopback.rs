@@ -18,9 +18,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
-use serde_json::{json, Value};
+use serde_json::{json, Number, Value};
 use tempfile::TempDir;
 
+use mindcore_base::ids::SpaceId;
+use mindcore_base::ir::MemorySpaceRow;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
 use mindcore_runtime::{
@@ -31,7 +33,7 @@ use mindcore_spi::{
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
 use mindcore_spoke::{ServedMemory, TransferService};
-use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore, SqliteMemoryRepository};
 use spoke_connect::core::{derive_peer_id_from_ed25519_pubkey, CAPABILITY_SPOKE_JUDGMENT};
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
@@ -118,17 +120,22 @@ impl Fixture {
             .await
             .expect("open store");
         let pool = store.pool();
-        sqlx::query(
-            "INSERT INTO memory_spaces \
-             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-              created_at) \
-             VALUES (?, 'loopback space', 'host_1', 1, 'active', 1, ?)",
-        )
-        .bind(SPACE)
-        .bind(NOW)
-        .execute(&pool)
-        .await
-        .expect("seed space");
+        let mut tx = pool.begin().await.expect("begin");
+        let space = MemorySpaceRow {
+            space_id: SpaceId::new(SPACE),
+            display_name: Some("loopback space".to_string()),
+            authority_host_id: "host_1".to_string(),
+            authority_generation: 1,
+            status: "active".to_string(),
+            revision: Number::from(1),
+            created_at: NOW.to_string(),
+            pending_receipts: 0,
+        };
+        SqliteMemoryRepository
+            .insert_space(&mut tx, &space)
+            .await
+            .expect("seed space");
+        tx.commit().await.expect("commit space");
         sqlx::query(
             "INSERT INTO memory_subjects \
              (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, \

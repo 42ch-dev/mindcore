@@ -5,13 +5,15 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde_json::{json, Value};
+use serde_json::{json, Number, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, SqlitePool};
 use tempfile::TempDir;
 
+use mindcore_base::ids::SpaceId;
+use mindcore_base::ir::MemorySpaceRow;
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
-use mindcore_sqlite::MindStore;
+use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use spoke_operations::{SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 
@@ -82,18 +84,22 @@ struct Grant<'a> {
 }
 
 async fn seed_space_row(pool: &SqlitePool, space_id: &str) {
-    sqlx::query(
-        "INSERT INTO memory_spaces \
-         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-          created_at) \
-         VALUES (?, ?, 'host_1', 1, 'active', 1, ?)",
-    )
-    .bind(space_id)
-    .bind(space_id)
-    .bind(NOW)
-    .execute(pool)
-    .await
-    .expect("seed space");
+    let mut tx = pool.begin().await.expect("begin");
+    let space = MemorySpaceRow {
+        space_id: SpaceId::new(space_id),
+        display_name: Some(space_id.to_string()),
+        authority_host_id: "host_1".to_string(),
+        authority_generation: 1,
+        status: "active".to_string(),
+        revision: Number::from(1),
+        created_at: NOW.to_string(),
+        pending_receipts: 0,
+    };
+    SqliteMemoryRepository
+        .insert_space(&mut tx, &space)
+        .await
+        .expect("seed space");
+    tx.commit().await.expect("commit space");
 }
 
 async fn seed_grant(pool: &SqlitePool, grant: Grant<'_>) {
