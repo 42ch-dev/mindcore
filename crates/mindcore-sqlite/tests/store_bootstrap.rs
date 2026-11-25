@@ -1,14 +1,14 @@
 //! End-to-end proof of the production open path (`I-000068`): opening a fresh database through
-//! `MindStore::open` installs the protocol schema, so a host needs only its two control-plane
-//! provisioning rows and every protocol step can then run through `MemoryAdapter`.
+//! `MindStore::open` installs the protocol schema, so a host needs only one `create` call and
+//! every protocol step can then run through `MemoryAdapter`.
 
-use chrono::Utc;
 use mindcore_base::boundary::CallerId;
-use mindcore_base::ids::SpaceId;
-use mindcore_base::ir::{MemoryGrantRow, MemoryRepository};
+use mindcore_base::ids::{MindId, SpaceId};
+use mindcore_base::ir::MemoryRepository;
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
+use mindcore_sqlite::minds::CreateMind;
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use spoke_operations::SpokeResult;
 use spoke_schemas::Principal;
 use sqlx::SqlitePool;
@@ -29,56 +29,6 @@ fn ready(stage: SpokeResult<MemoryStage>, context: &str) -> Value {
         SpokeResult::Ok(other) => panic!("{context}: expected a ready stage, got {other:?}"),
         SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
     }
-}
-
-/// Host control-plane provisioning: the protocol has no create-space or first-grant operation, so
-/// the host writes exactly two rows — one active space and its first grant. Everything after this is
-/// a protocol operation through `MemoryAdapter`.
-async fn provision_space(pool: &SqlitePool, caller: &str) {
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let mut tx = pool.begin().await.expect("begin the provisioning");
-    sqlx::query(
-        "INSERT INTO memory_spaces \
-         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
-          created_at) \
-         VALUES (?, ?, 'host_bootstrap', 1, 'active', 1, ?)",
-    )
-    .bind(SPACE)
-    .bind(SPACE)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .expect("provision the space");
-
-    SqliteMemoryRepository
-        .insert_grant(
-            &mut tx,
-            &MemoryGrantRow {
-                grant_id: format!("grt_{SPACE}"),
-                space_id: SpaceId::new(SPACE),
-                subject_id: None,
-                principal_id: CallerId::new(caller),
-                capabilities: [
-                    "capture",
-                    "review",
-                    "records_read",
-                    "records_write",
-                    "recall",
-                ]
-                .map(str::to_string)
-                .to_vec(),
-                context_ids: Vec::new(),
-                shared_access: false,
-                expires_at: None,
-                revoked_at: None,
-                revision: serde_json::Number::from(1),
-                created_at: now,
-                extensions: Map::new(),
-            },
-        )
-        .await
-        .expect("provision the grant");
-    tx.commit().await.expect("commit the provisioning");
 }
 
 async fn recall(pool: &SqlitePool, adapter: &MemoryAdapter, caller: &Principal) -> Vec<Value> {
@@ -111,7 +61,17 @@ async fn production_open_serves_recall_after_bootstrap() {
     let caller = principal("caller_wren");
     let adapter = MemoryAdapter::new(false);
 
-    provision_space(&pool, "caller_wren").await;
+    match store
+        .create_mind(&CreateMind {
+            mind_id: Some(MindId::new(SPACE)),
+            display_name: Some(SPACE.to_string()),
+            owner: CallerId::new("caller_wren"),
+        })
+        .await
+    {
+        SpokeResult::Ok(_) => {}
+        SpokeResult::Reject(reject) => panic!("create unexpectedly rejected with {reject:?}"),
+    }
 
     let mut tx = pool.begin().await.expect("begin the subject");
     ready(
