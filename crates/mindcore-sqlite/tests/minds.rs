@@ -800,6 +800,90 @@ async fn an_expired_grant_before_a_live_one_lists_the_mind_once() {
 }
 
 #[tokio::test]
+async fn two_live_grants_for_one_caller_list_the_mind_once() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let pool = store.pool();
+    ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+
+    // Two live grants for the same caller on the same Mind: without the adjacent-group
+    // de-duplication the Mind would be listed once per grant.
+    insert_grant(
+        &pool,
+        &grant_row("grt_cc_recall", "wren", "caller_pair", None),
+    )
+    .await;
+    insert_grant(
+        &pool,
+        &grant_row("grt_dd_capture", "wren", "caller_pair", None),
+    )
+    .await;
+    let listed = ok(store.list_minds(&CallerId::new("caller_pair")).await);
+    assert_eq!(listed.len(), 1, "two live grants still list one Mind");
+    assert_eq!(listed[0].id, MindId::new("wren"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_expiring_during_the_connection_wait_is_not_live() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let pool = store.pool();
+    ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+
+    // A grant that expires a few tens of milliseconds from now. A liveness decision taken before
+    // the read begins would still see it live after the wait; one taken per row must not.
+    let expiry = (chrono::Utc::now() + chrono::Duration::milliseconds(40))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    insert_grant(
+        &pool,
+        &grant_row("grt_fleeting", "wren", "caller_wait", Some(&expiry)),
+    )
+    .await;
+
+    // The pool's one connection is held open by an unrelated borrower, so `list_minds` waits
+    // for its connection while the expiry passes; WAL readers are not lock-blocked, so the wait
+    // is purely the pool's.
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let blocker_pool = pool.clone();
+    let blocker = tokio::spawn(async move {
+        let connection = blocker_pool.acquire().await.expect("hold the connection");
+        started_tx.send(()).await.expect("signal the hold");
+        let _ = held.await;
+        drop(connection);
+    });
+    started_rx
+        .recv()
+        .await
+        .expect("the blocker holds the connection");
+
+    // `list_minds` starts now, before the expiry; the borrower lets go after the expiry has
+    // passed, so the read's rows arrive with the grant already dead.
+    let caller = CallerId::new("caller_wait");
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let _ = release.send(());
+    });
+    let listed = store.list_minds(&caller).await;
+    releaser.await.expect("join the releaser");
+    blocker.await.expect("join the blocker");
+    let listed = ok(listed);
+    assert!(
+        listed.is_empty(),
+        "a grant whose expiry passed during the wait is not live"
+    );
+    let unseen = reject(store.get_mind(&caller, &MindId::new("wren")).await);
+    assert_eq!(unseen.code, SpokeRejectCode::NotFound);
+}
+
+#[tokio::test]
 async fn get_returns_the_same_mind_after_reopen() {
     let temp = tempfile::tempdir().expect("private temporary root");
     let path = temp.path().join("mindcore.db");

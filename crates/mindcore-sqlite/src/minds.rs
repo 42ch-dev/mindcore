@@ -291,7 +291,10 @@ macro_rules! grant_columns {
 // here because `mindcore-sqlite` cannot depend on the adapter: no expiry is live; an expiry
 // that does not parse as RFC 3339 is never live; the expiry is compared as an instant and never
 // as text, so an offset is honoured and an expiry equal to now is already passed.
-fn live(expires_at: &Option<String>, now: chrono::DateTime<Utc>) -> bool {
+fn live(expires_at: &Option<String>) -> bool {
+    // The instant is read here, at the moment the row is examined and never earlier: a grant
+    // that expires while the single-connection pool makes the query wait is already passed.
+    let now = Utc::now();
     match expires_at {
         None => true,
         Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
@@ -342,7 +345,6 @@ async fn read_visible(store: &MindStore, caller: &CallerId) -> SpokeResult<Vec<M
     ))
     .bind(caller.as_str())
     .fetch(&store.pool);
-    let now = Utc::now();
     let mut minds = Vec::new();
     let mut emitted: Option<String> = None;
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
@@ -354,7 +356,7 @@ async fn read_visible(store: &MindStore, caller: &CallerId) -> SpokeResult<Vec<M
         if emitted.as_deref() == Some(space_id.as_str()) {
             continue;
         }
-        if !live(&expires_at, now) {
+        if !live(&expires_at) {
             continue;
         }
         let mind = match mind_of(
@@ -389,14 +391,13 @@ async fn read_one_visible(
     .bind(caller.as_str())
     .bind(id.as_str())
     .fetch(&store.pool);
-    let now = Utc::now();
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
         let (space_id, collection, carrier, display_name, status, created_at, expires_at) =
             match row {
                 Ok(row) => row,
                 Err(_) => return storage_unavailable(),
             };
-        if !live(&expires_at, now) {
+        if !live(&expires_at) {
             continue;
         }
         return match mind_of(
