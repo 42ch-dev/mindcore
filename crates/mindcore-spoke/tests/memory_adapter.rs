@@ -1138,8 +1138,7 @@ async fn revoked_grant_denies_subject_and_profile_reads() {
         )
         .await;
     let refusal = reject(&subject);
-    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
-    assert_eq!(retry_class(refusal), "terminal");
+    assert_admission_refusal(refusal, "a revoked grant is no admission");
 
     let profile = adapter
         .get_profile(
@@ -4485,11 +4484,6 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
     for space in ["sp_absent", "sp_ungranted", "sp_frozen"] {
         let mut tx = harness.begin().await;
         for (op, result) in guarded_reads(&adapter, &mut tx, space, SUBJECT, "cnd_any").await {
-            // The reflection reads are not Mind-admission paths: they answer
-            // through their own space lookup and are out of this envelope.
-            if op.starts_with("memory.reflections") {
-                continue;
-            }
             let refusal = reject(&result);
             assert_eq!(
                 refusal.code,
@@ -4505,8 +4499,8 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
                 serde_json::json!(refusal.message),
             ));
         }
-        // `memory.receipts.get` is the seventh read path `guarded_reads` does
-        // not carry.
+        // `memory.receipts.get` and the two control reads are paths
+        // `guarded_reads` does not carry.
         let receipts = adapter
             .get_receipt(
                 &mut tx,
@@ -4521,6 +4515,34 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
             "receipts in {space} carries no details: {refusal:?}"
         );
         envelopes.push((format!("receipts in {space}"), serde_json::json!(refusal.message)));
+        let subjects_get = adapter
+            .get_subject(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": space, "subject_id": SUBJECT }),
+            )
+            .await;
+        let refusal = reject(&subjects_get);
+        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "subjects.get in {space}");
+        assert!(
+            refusal.details.is_none(),
+            "subjects.get in {space} carries no details: {refusal:?}"
+        );
+        envelopes.push((format!("subjects.get in {space}"), serde_json::json!(refusal.message)));
+        let grants_list = adapter
+            .list_grants(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": space }),
+            )
+            .await;
+        let refusal = reject(&grants_list);
+        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "grants.list in {space}");
+        assert!(
+            refusal.details.is_none(),
+            "grants.list in {space} carries no details: {refusal:?}"
+        );
+        envelopes.push((format!("grants.list in {space}"), serde_json::json!(refusal.message)));
         // The mutation path enters admission through `authorize`.
         let mutation = adapter
             .capture(

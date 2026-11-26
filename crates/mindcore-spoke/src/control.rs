@@ -367,9 +367,9 @@ impl MemoryAdapter {
         let request: MemorySubjectsGetRequest = wire::decode(&raw, "memory.subjects.get request")?;
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
-        admission::space(&self.repository, tx, &space).await?;
         let subject_id = request.subject_id.as_str();
-        let rows = admission::grants(&self.repository, tx, &space).await?;
+        let (rows, _space_row) =
+            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         if !admission::any_grant_for_subject(
             &rows,
             principal_id,
@@ -511,9 +511,9 @@ impl MemoryAdapter {
         }
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
-        admission::space(&self.repository, tx, &space).await?;
         let now = Utc::now();
-        let rows = admission::grants(&self.repository, tx, &space).await?;
+        let (rows, _space_row) =
+            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let admin = admission::covered(
             &wire_grants,
@@ -529,14 +529,7 @@ impl MemoryAdapter {
         let applied = if admin {
             requested
         } else {
-            if !rows.iter().any(|row| {
-                row.principal_id.as_str() == principal_id && admission::live_grant(row, now)
-            }) {
-                return Err(Reject::not_authorized(format!(
-                    "principal {principal_id} holds no grant in space {}",
-                    space.as_str()
-                )));
-            }
+            // admit_mind already proved one live grant for this principal.
             Some(principal_id.to_string())
         };
         let subject_filter = request
