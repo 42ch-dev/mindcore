@@ -344,6 +344,15 @@ another Mind reads, and a source scope equal to a Mind's id would let that Mind 
 destination. Refusals four and five see only the Minds that exist at assembly, which is why the
 call re-makes the same two decisions against the whole registry inside its transaction.
 
+**A claimable source id disables shared adoption, by design.** Mind creation accepts any authenticated
+peer claiming a free id (owner decision, `I-000155`), so a peer can register a Mind whose id is the
+configured source's `scope_id`. From that moment the call-time registry check refuses every adoption
+into every Mind — the source is a registered Mind's id, which is exactly refusal five — and the
+failure is deliberate rather than a defect to narrow. Hosts that admit arbitrary peers must
+therefore treat a shared source's `scope_id` as reserved configuration: an id no peer can claim, and
+one they never hand out as a Mind id. `I-000155` owns the create semantics; this page owns only the
+consequence for a composed adoption face.
+
 **The call-time `NOT_FOUND` cases.** Three request or registry states answer the same generic
 `NOT_FOUND` with no `details`, so a peer cannot tell them apart:
 

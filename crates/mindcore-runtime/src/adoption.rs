@@ -37,8 +37,9 @@ use spoke_schemas::{
 const SCHEMA_VERSION_MAX: u64 = spoke_schemas::integers::SCHEMA_VERSION_MAX;
 
 /// The one grant an adoption needs, and needs on one row: it writes a knowledge entry into the
-/// Mind's collection and returns the copy, so it is a knowledge put and a get together.
-const ADOPTION_CAPABILITIES: [&str; 2] = ["knowledge_write", "knowledge_read"];
+/// Mind's collection and returns the copy, so it is a knowledge put and a get together. The
+/// admission and the port's transaction both require it, so the runtime shares this one list.
+pub(crate) const ADOPTION_CAPABILITIES: [&str; 2] = ["knowledge_write", "knowledge_read"];
 
 /// The source side of the surface: the one collection adoption reads for every admitted Mind,
 /// named on the wire by a host-owned id that lands in each copy's anchor.
@@ -223,31 +224,29 @@ async fn adopt_in(
         SpokeResult::Ok(terminal) => terminal,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
-    // A live source must sit at the revision asked for; a retired one is never compared, because
-    // the anchor records the terminal's own revision.
-    if terminal.source_entry_id == request.source_entry_id.as_str()
-        && terminal.source_revision != request.source_revision
-    {
-        return spoke_reject(
-            SpokeRejectCode::RevisionConflict,
-            format!(
-                "shared knowledge entry {} is not at revision {}",
-                request.source_entry_id.as_str(),
-                request.source_revision
-            ),
-            None,
-        );
-    }
+    // The revision to hand the copy helper. A retired source records the terminal's own revision,
+    // because the anchor names the terminal. A live source records the caller's requested
+    // revision, so the helper classifies an occupied slot before its create-only revision check:
+    // a repeat whose stored anchor records the requested revision answers `already_present` even
+    // when the source has advanced since, and a copy adopted at another revision stays the
+    // conflict the helper reports with `details.adopted_revision`. Pre-empting that here with the
+    // source's current revision would answer a repeat as a conflict.
+    let live_source = terminal.source_entry_id == request.source_entry_id.as_str();
+    let expected_revision = match live_source {
+        true => request.source_revision,
+        false => terminal.source_revision,
+    };
 
     let destination_id = request
         .destination_entry_id
         .as_deref()
         .map(String::as_str)
         .unwrap_or(terminal.source_entry_id.as_str());
-    // The anchor records the terminal's revision, so a value the served wire cannot carry would
+    // A new anchor records `expected_revision`, so a value the served wire cannot carry would
     // commit a copy whose response Connect must reject as a transport fault. Refuse before the
-    // write instead: the caller's request was in range, the stored source is not servable.
-    if terminal.source_revision > SERVED_REVISION_BOUND {
+    // write instead: the caller's request was in range, the stored source is not servable. An
+    // occupied slot's own above-range anchor is the helper's `store` fault, not this guard.
+    if expected_revision > SERVED_REVISION_BOUND {
         return spoke_reject(
             SpokeRejectCode::InternalError,
             format!(
@@ -272,7 +271,7 @@ async fn adopt_in(
         &terminal.source_scope_id,
         &terminal.source_entry_id,
         destination_id,
-        terminal.source_revision,
+        expected_revision,
     )
     .await
 }
@@ -379,15 +378,15 @@ fn admitted_destination(entry: &KnowledgeEntry, scope: &Scope) -> SpokeResult<bo
 
 /// A storage fault under adoption.
 ///
-/// The wire carries a fixed message and the failing stage: a raw sqlx or decoder diagnostic names
-/// local tables, columns and stored payloads, so it goes to the host's stderr and never into the
-/// signed refusal.
+/// The wire carries the fixed message and one fixed kind, `store`: the failing stage and a raw sqlx
+/// or decoder diagnostic name local tables, columns and stored payloads, so both stay host-side and
+/// never enter the signed refusal. `stage` therefore selects only the host's stderr line.
 fn adoption_fault(stage: &str, diagnostic: impl std::fmt::Display) -> SpokeReject {
     let _ = writeln!(
         std::io::stderr(),
         "mindcore adoption {stage} fault: {diagnostic}"
     );
-    fixed_fault(stage)
+    fixed_fault()
 }
 
 /// The contract's own refusals travel as they are; anything else a port reports is a storage or
@@ -860,6 +859,8 @@ mod tests {
         assert_eq!(repeat["outcome"], "already_present");
         assert_eq!(repeat["entry"]["revision"], created["entry"]["revision"]);
 
+        // The slot holds this source at revision 1, so asking for revision 2 is the contract's
+        // stale-copy conflict: `details.adopted_revision` names the revision the copy anchors.
         let stale = refused(
             service
                 .adopt_knowledge_entry(&owner, &admitted, &request("ke_source", 2))
@@ -867,7 +868,14 @@ mod tests {
             "a stale source revision",
         );
         assert_eq!(stale.code, SpokeRejectCode::RevisionConflict);
-        assert!(stale.details.is_none(), "{stale:?}");
+        assert_eq!(
+            stale
+                .details
+                .as_ref()
+                .and_then(|details| details.get("adopted_revision")),
+            Some(&json!(1)),
+            "the conflict names the revision the stored copy anchors: {stale:?}"
+        );
 
         let absent = refused(
             service

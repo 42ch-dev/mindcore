@@ -19,16 +19,22 @@ pub const SERVED_REVISION_BOUND: u64 = (1 << 53) - 1;
 /// host-side.
 pub const ADOPTION_FAULT: &str = "knowledge adoption could not complete";
 
-/// The fixed fault an adoption answers with, naming the failing stage. The SPI's occupancy
-/// classification and the runtime's refusal hygiene build it from one place, so the two cannot
-/// drift apart; the diagnostic that caused it stays host-side.
-pub fn adoption_fault(stage: &str) -> SpokeReject {
+/// The one `details.kind` every adoption fault carries. The failing stage, the SQL statement and
+/// the stored payload are host-side diagnostics: they name local tables and columns, so they never
+/// reach the signed refusal.
+pub const ADOPTION_FAULT_KIND: &str = "store";
+
+/// The fixed fault an adoption answers with: the fixed message, [`ADOPTION_FAULT_KIND`] as its one
+/// `details.kind`, and nothing else. The kind takes no argument, so no caller can put its own value
+/// on the wire: the SPI's occupancy classification and the runtime's refusal hygiene build the same
+/// refusal, and the diagnostic that caused it stays host-side.
+pub fn adoption_fault() -> SpokeReject {
     SpokeReject {
         code: SpokeRejectCode::InternalError,
         message: ADOPTION_FAULT.into(),
         details: Some(Map::from_iter([(
             "kind".to_string(),
-            Value::String(stage.to_string()),
+            Value::String(ADOPTION_FAULT_KIND.to_string()),
         )])),
     }
 }

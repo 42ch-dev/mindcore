@@ -33,7 +33,7 @@ use mindcore_spi::{
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
 use mindcore_spoke::{MemoryAdapter, MemoryStage, ServedMemory, TransferService};
-use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
+use mindcore_sqlite::{MindStore, ScopedKnowledgeStore, SqliteMemoryRepository};
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
@@ -7512,6 +7512,163 @@ async fn adoption_needs_the_write_and_read_grant() {
         "the creator's default grant covering both capabilities",
     );
     assert_eq!(wire(adopted)["outcome"], "adopted");
+}
+
+/// A shared source that advances between two adoption calls does not turn the repeat into a
+/// conflict: the destination copy's anchor records the revision the second call asks for, so the
+/// copy helper classifies the occupied slot before its create-only revision check and answers
+/// `already_present` with the stored copy, exactly as it would had the source never moved.
+///
+/// The runtime once pre-empted that with the source's current revision, which answered
+/// `REVISION_CONFLICT` for a copy the caller already held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_adoption_survives_a_source_edit_between_the_calls() {
+    let fixture = Fixture::open().await;
+    seed_shared(&fixture.store, &["ke_edited"]).await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    let first = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_edited", 1, SPACE, "k-edit-first"),
+        )
+        .await,
+        "the adoption at revision 1",
+    );
+    let first = wire(first);
+    assert_eq!(first["outcome"], "adopted", "{first}");
+    assert_eq!(first["entry"]["adoption_anchor"]["source_revision"], 1);
+    let copy_revision = first["entry"]["revision"].clone();
+
+    // Edit the live source: a normal put of the same entry advances it to revision 2.
+    let source =
+        ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(ADOPT_SOURCE_COLLECTION));
+    let edited = expect_ok(
+        source
+            .put_knowledge_entry(
+                served_entry("ke_edited", "the source after an edit"),
+                Some(1),
+            )
+            .await,
+        "edit the live source",
+    );
+    assert_eq!(edited.revision, Some(2), "the source advanced");
+
+    // The repeat still names revision 1 — the revision the copy anchors — and is served that copy.
+    let repeat = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_edited", 1, SPACE, "k-edit-second"),
+        )
+        .await,
+        "the repeat after the source moved to revision 2",
+    );
+    let repeat = wire(repeat);
+    assert_eq!(
+        repeat["outcome"], "already_present",
+        "a repeat answers the stored copy, never a conflict: {repeat}"
+    );
+    assert_eq!(
+        repeat["entry"]["revision"], copy_revision,
+        "the stored copy is served unchanged"
+    );
+    assert_eq!(repeat["entry"]["adoption_anchor"]["source_revision"], 1);
+
+    // A call naming the source's new revision is the stale-copy conflict, and names the revision
+    // the stored copy anchors rather than the source's current one.
+    let stale = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_edited", 2, SPACE, "k-edit-stale"),
+        )
+        .await,
+        "a call naming the edited source's revision",
+    );
+    assert_eq!(stale.code, SpokeRejectCode::RevisionConflict);
+    assert_eq!(
+        stale
+            .details
+            .as_ref()
+            .and_then(|details| details.get("adopted_revision")),
+        Some(&json!(1)),
+        "the conflict names the revision the stored copy anchors: {stale:?}"
+    );
+}
+
+/// A recorded adoption replay is answered after Mind admission alone, so a face that stops there
+/// would hand the recorded entry to a peer whose knowledge grant was revoked. The face's scoped
+/// admission therefore requires the operation's own grant through the same `authorize_knowledge`
+/// call the port makes, and the revoked peer is refused even though the outcome is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_knowledge_grant_refuses_a_recorded_adoption_replay() {
+    let fixture = Fixture::open().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+    let request = adopt_request("ke_shared_note", 1, SPACE, "k-replay");
+
+    let adopted = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &scope_of(SPACE), &request).await,
+        "the first adoption",
+    );
+    assert_eq!(wire(adopted)["outcome"], "adopted");
+    let settled = both_collections(&pool).await;
+
+    // The same retry identity replays the recorded outcome after admission alone; the copy is not
+    // written again.
+    let replay = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &scope_of(SPACE), &request).await,
+        "the recorded replay while the grant lives",
+    );
+    assert_eq!(
+        wire(replay)["outcome"],
+        "already_present",
+        "the recorded outcome, served from the dedup record"
+    );
+    assert_eq!(
+        both_collections(&pool).await,
+        settled,
+        "a replay writes nothing"
+    );
+
+    // Revoke the knowledge grant while the peer still holds its other live grant in the Mind:
+    // admission passes and the operation grant is what must answer.
+    sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = 'grt_knowledge'")
+        .bind(NOW)
+        .execute(&pool)
+        .await
+        .expect("revoke the knowledge grant");
+    let refused = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &scope_of(SPACE), &request).await,
+        "the recorded replay after the knowledge grant is revoked",
+    );
+    assert_eq!(
+        refused.code,
+        SpokeRejectCode::NotAuthorized,
+        "the revoked grant is the face's own refusal: {refused:?}"
+    );
+    assert!(
+        refused.details.is_none(),
+        "the refusal names no capability or Mind: {refused:?}"
+    );
+    assert_eq!(
+        both_collections(&pool).await,
+        settled,
+        "the refused replay writes nothing either"
+    );
 }
 
 /// A fault at any statement of the copy leaves both collections exactly as they were: the source

@@ -33,10 +33,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use mindcore_base::ids::SpaceId;
 use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
 use mindcore_spoke::{
-    admitted_mind, is_mind_admission_refusal, MemoryWorkflowBinding, MindHistoryPort,
-    MindKnowledgePort, ServedMemory, TRANSFER_OPERATIONS,
+    admitted_mind, authorize_knowledge, is_mind_admission_refusal, MemoryWorkflowBinding,
+    MindHistoryPort, MindKnowledgePort, ServedMemory, TRANSFER_OPERATIONS,
 };
 use mindcore_sqlite::{bind_caller, validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
@@ -352,6 +353,12 @@ impl MindcoreServe {
     /// is — the caller binding belongs to the face that binds it, and Connect's destination check
     /// compares the request's destination with this scope.
     ///
+    /// The admission runs Mind admission and then the operation's own grant, through the same
+    /// [`authorize_knowledge`] call the port makes: Connect answers a recorded adoption replay
+    /// after admission alone, so a peer whose knowledge grant was revoked would otherwise receive
+    /// the recorded entry while any other Mind grant still admits it. Requiring the grant here
+    /// refuses that peer on every path, replayed outcomes included.
+    ///
     /// The peer-only admission `AdoptionPortService::new` requires never answers:
     /// `with_scoped_admission` replaces it in place. The dedup default is Connect's bounded
     /// in-memory store, because an adoption's recorded outcome need not outlive the session.
@@ -370,6 +377,12 @@ impl MindcoreServe {
                     SpokeResult::Ok(admitted) => admitted,
                     SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
                 };
+            // Synchronous callback on Connect's blocking pool, like `admit_peer`: the grant read
+            // takes its own transaction and is rolled back, so admission never writes.
+            let granted = admit_adoption_grant(&admission_pool, &principal.principal_id, &scope_id);
+            if let SpokeResult::Reject(reject) = granted {
+                return SpokeResult::Reject(reject);
+            }
             SpokeResult::Ok((
                 principal,
                 Scope {
@@ -389,6 +402,42 @@ impl MindcoreServe {
         let peer_only: AdoptionAdmission = Arc::new(no_peer_only_admission);
         Arc::new(AdoptionPortService::new(port, peer_only).with_scoped_admission(admission))
     }
+}
+
+/// The operation grant the adoption face's admission requires: one live grant in the Mind's space
+/// covering both capabilities, decided by [`authorize_knowledge`] — the same call, on its own
+/// transaction, the port makes inside the copy's.
+///
+/// It is not one atomic step with any later write; the port re-checks on the transaction that
+/// writes. This read exists so no path reaches a recorded outcome without it.
+fn admit_adoption_grant(pool: &SqlitePool, principal: &str, scope_id: &str) -> SpokeResult<()> {
+    // Synchronous because Connect's admission is, like `admit_peer`: the responder runs the
+    // callback on its blocking pool, where `block_on` is legal on a multi-thread runtime.
+    Handle::current().block_on(async {
+        let mut transaction = match pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(_) => return admission_storage_unavailable(),
+        };
+        let decided = authorize_knowledge(
+            &mut transaction,
+            principal,
+            &SpaceId::new(scope_id),
+            &crate::adoption::ADOPTION_CAPABILITIES,
+        )
+        .await;
+        let _ = transaction.rollback().await;
+        decided
+    })
+}
+
+/// The admission's storage answer: the same fixed text the knowledge face gives, so a broken store
+/// is never reported as the admission refusal.
+fn admission_storage_unavailable<T>() -> SpokeResult<T> {
+    SpokeResult::Reject(SpokeReject {
+        code: SpokeRejectCode::InternalError,
+        message: "knowledge storage is unavailable".to_string(),
+        details: None,
+    })
 }
 
 /// Whether `value` occupies a registry row of `query`. `Ok` answers a free value; a taken one is

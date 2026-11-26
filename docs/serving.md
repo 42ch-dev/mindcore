@@ -71,11 +71,12 @@ already run: the port repeats both registry checks inside the adoption transacti
 check and before the source is read, and answers the generic `NOT_FOUND`. The invariant therefore
 holds without a reassembly, and the caller cannot tell the collision from a missing source.
 
-The destination is not configured: each call resolves the collection from the registry row of the
-Mind the caller was admitted to, inside the copy's one transaction
-(`crates/mindcore-runtime/src/adoption.rs`). Adoption reuses the knowledge face's admission, so a
-peer the knowledge face does not admit cannot adopt, every copy is readable through the same
-`knowledge.get`/`list`, and no wire value selects either side of the copy.
+`destination_scope_id` selects which Mind the call is admitted against — Connect hands it to the
+admission callback as the selector, and that Mind's registry row supplies the collection. No wire
+value selects a collection: neither side of a copy is chosen by a request member. Adoption reuses
+the knowledge face's admission, so a peer the knowledge face does not admit cannot adopt, every copy
+is readable through the same `knowledge.get`/`list`, and a peer holding no live grant covering both
+`knowledge_write` and `knowledge_read` in that Mind is refused on admission.
 
 ## Assemble, then register
 
