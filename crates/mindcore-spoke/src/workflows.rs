@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 use spoke_operations::{
-    knowledge_entry_visible_to_viewpoint, GrantRequirement, SpokeReject, SpokeRejectCode,
+    knowledge_entry_visible_to_viewpoint, SpokeReject, SpokeRejectCode,
     SpokeResult,
 };
 use spoke_schemas::data::cognition::{CognitionReference, CognitionReferenceKind};
@@ -347,39 +347,6 @@ impl MemoryWorkflowBinding {
         self.knowledge_routes.get(principal_id(principal))
     }
 
-    /// `principal`'s own live grant for every one of `capabilities` in `space_id`, on `tx`.
-    ///
-    /// Live grants are re-derived on every call, so a read after provider work runs the same
-    /// admission and a revoked grant refuses it. A memory grant never substitutes for this, and a
-    /// knowledge read never stands in for [`KNOWLEDGE_WRITE`].
-    async fn require_knowledge_grants(
-        &self,
-        tx: &mut Tx<'_>,
-        principal: &Principal,
-        space_id: &str,
-        capabilities: &[&str],
-    ) -> Result<(), SpiError> {
-        let caller = principal_id(principal);
-        let space = SpaceId::new(space_id.to_string());
-        let grants = self.space_grants(tx, space_id).await?;
-        for capability in capabilities {
-            let requirement = GrantRequirement {
-                capability,
-                subject_id: None,
-                context_ids: Vec::new(),
-                reads_shared: false,
-                subject_all: false,
-            };
-            if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
-                return Err(not_authorized(format!(
-                    "principal {caller} holds no live {capability} grant in space {}",
-                    space.as_str()
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// The collection the carrier write serves: `principal` must have a route and hold a live
     /// grant for every one of `capabilities` in `space_id`.
     ///
@@ -399,7 +366,8 @@ impl MemoryWorkflowBinding {
             .ok_or_else(|| {
                 not_authorized("principal has no workflow knowledge route".to_string())
             })?;
-        self.require_knowledge_grants(tx, principal, space_id, capabilities)
+        self.adapter
+            .require_space_grants(tx, principal, space_id, capabilities)
             .await?;
         Ok(collection)
     }
@@ -456,7 +424,8 @@ impl MemoryWorkflowBinding {
             return Ok(Vec::new());
         };
         match self
-            .require_knowledge_grants(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
+            .adapter
+            .require_space_grants(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
             .await
         {
             Ok(()) => {}

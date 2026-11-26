@@ -10,6 +10,12 @@
 //! durable so a refused publication leaves no record, then settle the receipt on a second
 //! transaction. No method takes a collection, an owner or a viewpoint, and none chooses a
 //! subject: the caller names it every time.
+//!
+//! The knowledge operations compose the scoped store the same way: each admits the caller under
+//! `MemoryAdapter::require_space_grants` on its own transaction — space-wide `knowledge_read` for
+//! the reads, `knowledge_write` for the put — then reads or writes through the store's
+//! borrowed-transaction entry points on that same transaction, against the collection the row
+//! resolved at open. Revisions and refusals are the store's own.
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -20,11 +26,15 @@ use mindcore_base::ir::MemoryRepository;
 use mindcore_spi::SpiError;
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
 use mindcore_sqlite::minds::Mind as MindRow;
-use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
+use mindcore_sqlite::{
+    list_entries_in, read_entry, read_entry_at_revision, write_entry, MindStore,
+    SqliteMemoryRepository,
+};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::memory_candidates_review_request::Decision;
 use spoke_schemas::{
-    MemoryCandidatesReviewResponse, MemoryCaptureResponse, MemoryRecallResponse, Principal,
+    KnowledgeEntry, MemoryCandidatesReviewResponse, MemoryCaptureResponse, MemoryRecallResponse,
+    Principal,
 };
 use sqlx::SqlitePool;
 
@@ -239,6 +249,135 @@ impl Mind {
             .await;
         drop(transaction);
         ready(stage)
+    }
+
+    /// Read one entry of this Mind's collection: `knowledge_read` admitted on one read
+    /// transaction, then the store's `read_entry` — or `read_entry_at_revision` when a
+    /// revision is named — on it, rolled back after the read.
+    pub async fn knowledge_get(
+        &self,
+        entry_id: &str,
+        revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        let mut transaction = match self.pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return retryable_internal(format!(
+                    "knowledge read transaction could not begin: {error}"
+                ))
+            }
+        };
+        if let Err(error) = self
+            .adapter
+            .require_space_grants(
+                &mut transaction,
+                &principal(&self.caller),
+                self.row.id.as_str(),
+                &["knowledge_read"],
+            )
+            .await
+        {
+            drop(transaction);
+            return match error {
+                SpiError::Settlement(reject) => SpokeResult::Reject(reject),
+                other => retryable_internal(format!("knowledge admission failed: {other}")),
+            };
+        }
+        let result = match revision {
+            Some(revision) => {
+                read_entry_at_revision(
+                    &mut transaction,
+                    &self.row.knowledge.collection,
+                    entry_id,
+                    revision,
+                )
+                .await
+            }
+            None => read_entry(&mut transaction, &self.row.knowledge.collection, entry_id).await,
+        };
+        drop(transaction);
+        result
+    }
+
+    /// Write one entry of this Mind's collection: `knowledge_write` admitted on one
+    /// immediate-write transaction, then the store's `write_entry` on it, committed. The
+    /// revision check and every refusal are the store's own.
+    pub async fn knowledge_put(
+        &self,
+        entry: KnowledgeEntry,
+        expected_base_revision: Option<u64>,
+    ) -> SpokeResult<KnowledgeEntry> {
+        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return retryable_internal(format!(
+                    "knowledge write transaction could not begin: {error}"
+                ))
+            }
+        };
+        if let Err(error) = self
+            .adapter
+            .require_space_grants(
+                &mut transaction,
+                &principal(&self.caller),
+                self.row.id.as_str(),
+                &["knowledge_write"],
+            )
+            .await
+        {
+            drop(transaction);
+            return match error {
+                SpiError::Settlement(reject) => SpokeResult::Reject(reject),
+                other => retryable_internal(format!("knowledge admission failed: {other}")),
+            };
+        }
+        let written = write_entry(
+            &mut transaction,
+            &self.row.knowledge.collection,
+            entry,
+            expected_base_revision,
+        )
+        .await;
+        if written.is_reject() {
+            drop(transaction);
+            return written;
+        }
+        if let Err(error) = transaction.commit().await {
+            return uncertain(format!("knowledge write committed an unknown outcome: {error}"));
+        }
+        written
+    }
+
+    /// Every entry of this Mind's collection: `knowledge_read` admitted on one read
+    /// transaction, then the store's `list_entries_in` on it, rolled back after the read.
+    pub async fn knowledge_list(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
+        let mut transaction = match self.pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return retryable_internal(format!(
+                    "knowledge list transaction could not begin: {error}"
+                ))
+            }
+        };
+        if let Err(error) = self
+            .adapter
+            .require_space_grants(
+                &mut transaction,
+                &principal(&self.caller),
+                self.row.id.as_str(),
+                &["knowledge_read"],
+            )
+            .await
+        {
+            drop(transaction);
+            return match error {
+                SpiError::Settlement(reject) => SpokeResult::Reject(reject),
+                other => retryable_internal(format!("knowledge admission failed: {other}")),
+            };
+        }
+        let entries = list_entries_in(&mut transaction, &self.row.knowledge.collection).await;
+        drop(transaction);
+        entries
     }
 
     /// Review one pending candidate and answer the settled receipt, not a `MemoryStage`.

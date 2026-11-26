@@ -3,14 +3,20 @@
 //! Mind opening because the handle acts on no status from the row.
 
 use mindcore_base::boundary::CallerId;
-use mindcore_base::ids::{MindId, SpaceId};
+use mindcore_base::ids::{mint, MindId, SpaceId};
+use mindcore_base::ir::MemoryGrantRow;
 use mindcore_base::ir::MemoryRepository;
 use mindcore_runtime::journal_dir;
 use mindcore_runtime::minds::{self, CreateMind};
 use mindcore_runtime::{Capture, Mind, Recall};
 use mindcore_spi::SpiError;
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
-use serde_json::{json, Number, Value};
+use chrono::Utc;
+use serde_json::{json, Map, Number, Value};
+use spoke_schemas::data::knowledge_entry::{
+    KnowledgeEntryBody, KnowledgeEntryCanonicalName,
+};
+use spoke_schemas::KnowledgeEntry;
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::memory_candidates_review_request::Decision;
 use std::sync::mpsc;
@@ -593,5 +599,168 @@ async fn the_public_publisher_handles_a_relative_root_that_does_not_exist_yet() 
         read_back.expect("the published target"),
         "relative root bytes",
         "the relative root holds the target at its own path"
+    );
+}
+
+// ---------- Task 3: knowledge operations on the handle ----------
+
+/// One plain entry the test writes; the store assigns and checks the revision.
+fn entry(entry_id: &str, name: &str) -> KnowledgeEntry {
+    KnowledgeEntry {
+        adoption_anchor: None,
+        body: KnowledgeEntryBody::default(),
+        canonical_name: KnowledgeEntryCanonicalName::try_from(name.to_string())
+            .expect("a valid canonical name"),
+        created_at: None,
+        disclosure: None,
+        entry_id: entry_id.to_string(),
+        entry_type: "character".to_string(),
+        extensions: std::collections::HashMap::new(),
+        modules: std::collections::HashMap::new(),
+        owner: None,
+        revision: Some(1),
+        // SAFETY: the wire baseline one is not zero.
+        schema_version: unsafe { std::num::NonZeroU64::new_unchecked(1) },
+        source_anchor: None,
+        status: "confirmed".to_string(),
+        updated_at: None,
+    }
+}
+
+/// One extra live grant row for `principal` in the Mind's space, carrying only
+/// `capabilities` — the limited callers of the refusal tests.
+async fn grant(store: &MindStore, space_id: &str, principal: &str, capabilities: &[&str]) {
+    let row = MemoryGrantRow {
+        grant_id: mint("grt"),
+        space_id: SpaceId::new(space_id),
+        subject_id: None,
+        principal_id: CallerId::new(principal),
+        capabilities: capabilities.iter().map(|capability| capability.to_string()).collect(),
+        context_ids: Vec::new(),
+        shared_access: false,
+        expires_at: None,
+        revoked_at: None,
+        revision: Number::from(1),
+        created_at: Utc::now().to_rfc3339(),
+        extensions: Map::new(),
+    };
+    let mut tx = store.pool().begin().await.expect("begin the grant write");
+    SqliteMemoryRepository
+        .insert_grant(&mut tx, &row)
+        .await
+        .expect("insert the grant");
+    tx.commit().await.expect("commit the grant");
+}
+
+#[tokio::test]
+async fn knowledge_write_then_read_by_revision_answers_the_stored_entry() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    let written = ok(handle
+        .knowledge_put(entry("ke_fact", "fact one"), None)
+        .await);
+    assert_eq!(written.revision, Some(1), "the create assigns revision 1");
+
+    let current = ok(handle.knowledge_get("ke_fact", None).await);
+    assert_eq!(current.entry_id, "ke_fact");
+    assert_eq!(current.revision, Some(1));
+
+    let at_revision = ok(handle.knowledge_get("ke_fact", Some(1)).await);
+    assert_eq!(
+        at_revision.entry_id, "ke_fact",
+        "the revision read answers the stored entry"
+    );
+    assert_eq!(at_revision.revision, Some(1));
+
+    let listed = ok(handle.knowledge_list().await);
+    assert!(
+        listed.iter().any(|entry| entry.entry_id == "ke_fact"),
+        "the list carries the written entry beside the carrier"
+    );
+    assert!(
+        listed.iter().any(|entry| entry.entry_id == created.carrier_entry_id),
+        "the list reads the Mind's own collection, carrier included"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_revision_refuses_stored_revision_stale() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    ok(handle.knowledge_put(entry("ke_fact", "fact one"), None).await);
+    ok(handle
+        .knowledge_put(entry("ke_fact", "fact two"), Some(1))
+        .await);
+
+    assert_eq!(
+        reject_code(handle.knowledge_put(entry("ke_fact", "fact three"), Some(1)).await),
+        SpokeRejectCode::StoredRevisionStale,
+        "a put against a moved revision refuses the store's own stale refusal"
+    );
+    let current = ok(handle.knowledge_get("ke_fact", None).await);
+    assert_eq!(current.revision, Some(2), "the refused write never landed");
+}
+
+#[tokio::test]
+async fn a_caller_without_knowledge_write_is_refused_and_the_row_is_untouched() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let owner_handle = ok(Mind::open(&store, &owner, &created.id).await);
+    ok(owner_handle
+        .knowledge_put(entry("ke_fact", "fact one"), None)
+        .await);
+
+    let reader = CallerId::new("caller_reader");
+    grant(&store, created.id.as_str(), "caller_reader", &["knowledge_read"]).await;
+    let reader_handle = ok(Mind::open(&store, &reader, &created.id).await);
+
+    let refuse = reject_of(reader_handle
+        .knowledge_put(entry("ke_fact", "defaced"), Some(1))
+        .await);
+    assert_eq!(
+        refuse.code,
+        SpokeRejectCode::NotAuthorized,
+        "a caller without knowledge_write is refused"
+    );
+
+    let after = ok(owner_handle.knowledge_get("ke_fact", None).await);
+    assert_eq!(after.revision, Some(1), "the row is untouched");
+    assert_eq!(
+        after.canonical_name.as_str(),
+        "fact one",
+        "the payload the refused caller targeted is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_without_knowledge_read_reads_nothing() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let owner_handle = ok(Mind::open(&store, &owner, &created.id).await);
+    ok(owner_handle
+        .knowledge_put(entry("ke_fact", "fact one"), None)
+        .await);
+
+    let writer = CallerId::new("caller_writer");
+    grant(&store, created.id.as_str(), "caller_writer", &["knowledge_write"]).await;
+    let writer_handle = ok(Mind::open(&store, &writer, &created.id).await);
+
+    assert_eq!(
+        reject_code(writer_handle.knowledge_get("ke_fact", None).await),
+        SpokeRejectCode::NotAuthorized,
+        "a caller without knowledge_read reads no entry"
+    );
+    assert_eq!(
+        reject_code(writer_handle.knowledge_list().await),
+        SpokeRejectCode::NotAuthorized,
+        "a caller without knowledge_read reads no list"
     );
 }

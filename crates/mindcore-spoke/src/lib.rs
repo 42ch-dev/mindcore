@@ -27,13 +27,15 @@ pub use workflows::MemoryWorkflowBinding;
 
 pub(crate) use mindcore_base::ids::mint;
 
+use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use spoke_operations::{SpokeRejectCode, SpokeResult};
+use spoke_operations::{GrantRequirement, SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 use sqlx::{Sqlite, Transaction};
 
 use mindcore_base::ids::{SpaceId, SubjectId};
+use mindcore_spi::SpiError;
 use mindcore_base::ir::{MemoryRepository, ReceiptFailure, ReceiptState, ReviewReceiptIr};
 use mindcore_sqlite::SqliteMemoryRepository;
 
@@ -217,6 +219,43 @@ impl MemoryAdapter {
         } else {
             Ok(())
         }
+    }
+
+    /// `principal`'s own live grant for every one of `capabilities` in `space_id`, on `tx`.
+    ///
+    /// Live grants are re-derived on every call, so a read after provider work runs the same
+    /// admission and a revoked grant refuses it. A memory grant never substitutes for a
+    /// knowledge capability: only a capability the caller names admits its principal.
+    pub async fn require_space_grants(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+        capabilities: &[&str],
+    ) -> Result<(), SpiError> {
+        let caller = principal_id(principal);
+        let space = SpaceId::new(space_id.to_string());
+        let rows = admission::grants(&self.repository, tx, &space)
+            .await
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        let grants = admission::wire_grants(&rows)
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        for capability in capabilities {
+            let requirement = GrantRequirement {
+                capability,
+                subject_id: None,
+                context_ids: Vec::new(),
+                reads_shared: false,
+                subject_all: false,
+            };
+            if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
+                return Err(SpiError::Settlement(Reject::not_authorized(format!(
+                    "principal {caller} holds no live {capability} grant in space {}",
+                    space.as_str()
+                )).into_spoke()));
+            }
+        }
+        Ok(())
     }
 }
 
