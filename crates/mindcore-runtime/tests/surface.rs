@@ -427,9 +427,10 @@ async fn tool_registrations_drive_advertisement_and_installation() {
 /// `spoke-knowledge` and `spoke-knowledge-scoped` together and answers `as_scoped_knowledge()`
 /// with the face; false advertises neither and answers nothing.
 ///
-/// `ke-ownership` is advertised in neither case. The admitted scope never carries a `viewpoint`,
-/// so a viewpoint request is refused after admission; claiming the flag would advertise a
-/// capability the face cannot honour.
+/// `ke-ownership` is advertised in neither case. Every admitted scope carries `viewpoint: None`,
+/// so the face cannot honour the flag; with it never offered, no session can negotiate it, and
+/// Connect's ownership conjunct refuses a viewpoint request with wire `op_unsupported` before
+/// admission. Claiming the flag would advertise a capability the face cannot honour.
 #[tokio::test]
 async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
     let serve = Fixture::open().await.serve();
