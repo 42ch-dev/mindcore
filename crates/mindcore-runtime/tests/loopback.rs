@@ -716,6 +716,19 @@ fn deliberate_arguments_in(space: &str) -> Value {
     })
 }
 
+/// One served capture inside `space`: the freeze-gated write the frozen-Mind case needs.
+fn absorb_arguments_in(space: &str) -> Value {
+    json!({
+        "request": {
+            "space_id": space,
+            "subject_id": SUBJECT,
+            "capture_scope": { "visibility": "shared" },
+            "content": { "text": "a capture into the Mind" },
+            "idempotency_key": "cap_loopback",
+        }
+    })
+}
+
 /// The cognition read's arguments: the Mind id alone, the same id its memory requests carry.
 fn cognition_arguments(space: &str) -> Value {
     json!({ "space_id": space })
@@ -1756,6 +1769,73 @@ async fn a_space_with_no_registry_row_reaches_no_carrier() {
         json!([]),
         "a space with no registry row reads its memory with an empty knowledge slot"
     );
+}
+
+/// A frozen Mind, through the composed surface: a granted caller is served every operation that
+/// is not freeze-gated — its recall and the cognition read — while a freeze-gated one outside
+/// SPOKE's maintenance allowlist answers `SpaceFrozen`, having passed admission and coverage, and
+/// stages nothing. The freeze check follows admission, so only a granted caller ever reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frozen_mind_serves_reads_and_refuses_a_freeze_gated_write() {
+    let fixture = Fixture::open().await;
+    fixture.grant("grt_capture", PRINCIPAL, &["capture"]).await;
+    let pool = fixture.store.pool();
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE)
+        .execute(&pool)
+        .await
+        .expect("freeze the Mind");
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(hello("runtime", &[]), None, MindProviders::default()),
+    );
+    let session = connect(&surface, &[RECALL_CONTEXT, ABSORB, READ_COGNITION]).await;
+
+    let mut recall = recall_arguments();
+    recall["max_tokens"] = json!(4_000);
+    let pack = expect_ok(
+        session.adapter.invoke_tool(RECALL_CONTEXT, recall).await,
+        "recall in a frozen Mind",
+    );
+    assert_eq!(
+        packed_record_ids(&pack),
+        ["rec_market", "rec_north_gate"],
+        "a frozen Mind still serves its granted caller's recall: {pack}"
+    );
+    assert_eq!(
+        packed_knowledge_ids(&pack),
+        [CARRIER],
+        "the frozen Mind's knowledge slot is served too: {pack}"
+    );
+
+    let read = expect_ok(
+        session
+            .adapter
+            .invoke_tool(READ_COGNITION, cognition_arguments(SPACE))
+            .await,
+        "the cognition read in a frozen Mind",
+    );
+    assert_eq!(read["carrier_revision"], 1);
+    assert_eq!(read["records"], json!([]));
+
+    let rejection = expect_reject(
+        session
+            .adapter
+            .invoke_tool(ABSORB, absorb_arguments_in(SPACE))
+            .await,
+        "a capture into a frozen Mind",
+    );
+    assert_eq!(
+        rejection.code,
+        SpokeRejectCode::SpaceFrozen,
+        "a freeze-gated operation outside the allowlist is the frozen refusal: {rejection:?}"
+    );
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_candidates")
+        .fetch_one(&pool)
+        .await
+        .expect("count the candidates");
+    assert_eq!(staged, 0, "a frozen Mind stages nothing");
 }
 
 /// Existence privacy: a peer admitted to nothing — no grant in either space — cannot tell an

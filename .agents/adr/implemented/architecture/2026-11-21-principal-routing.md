@@ -5,6 +5,8 @@ Date: 2026-11-21
 Class: architecture
 Related: `2026-11-21-spoke-017-serving-cohort.md`
 
+> **Superseded-by (2026-11-25, `2026-11-25-one-surface-serves-many-minds.md`):** the route map is gone. A served call names its Mind through the `space_id` it already carries, and the Mind's registry row resolves the collection and carrier; `ServeFaces.workflow_routes`, `MemoryWorkflowBinding::with_knowledge_routes` and `knowledge_route` were removed rather than kept beside the row. The rules this record states that outlive the map hold per Mind: the wire never names a collection, a refusal carries no target details, and a route never substitutes for a live grant.
+
 ## Problem
 
 A serving surface may serve more than one principal, and the two routed workflows each need exactly one knowledge collection per call: `deliberate` settles onto one carrier entry, and `recall_context` fills one knowledge slot. Binding the surface to a single caller principal made a multi-principal host assemble one surface per principal, and each surface would have to duplicate its responder, tool registration and accept-loop configuration.

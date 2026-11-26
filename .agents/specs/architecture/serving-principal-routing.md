@@ -1,161 +1,152 @@
-# Architecture: Serving per-principal routing
+# Architecture: Serving Mind routing
 
 ## Scope
 
-How one Mindcore serving surface selects the knowledge collection a served call reads and writes:
-the routed workflow calls and the shared-entry adoption face. It does not define memory semantics,
-the Connect handshake, or carrier record storage.
+How one Mindcore serving surface selects the knowledge collection and carrier a served call reads
+and writes: the request's Mind id is the only route input, and the Mind's registry row resolves it.
+It also states which served operations are not Mind-routed and are therefore not composed. It does
+not define memory semantics, the Connect handshake, refusal vocabulary or carrier record storage.
 
 ## Current state
 
-### The map
+### One route input: the Mind
 
-A serving surface may serve more than one principal. The host supplies a route map keyed by the
-principal id its `MemoryAdmission` returns for the authenticated peer. The route names the
-`KnowledgeScope` whose collection that principal's carrier entry lives in.
+A serving surface serves many Minds from one assembly, and neither the assembly nor the wire names a
+collection. Routing has two inputs, and only the second is caller-declared:
 
-Routing therefore has two independent inputs, and neither is caller-declared:
+1. **Admission** — authenticated peer → `Principal`, from the host's `MemoryAdmission`. Never a wire
+   value.
+2. **Route** — the request's Mind id → the registry row's collection and carrier entry. Never a
+   caller-named collection.
 
-1. **Admission** — peer → `Principal`, from the host's `MemoryAdmission`.
-2. **Route** — `Principal` id → `KnowledgeScope`, from the host's surface configuration.
+A Mind's id is its space id (`2026-11-25-mind-is-one-memory-space.md`), so the selectors SPOKE
+already carries express it: `space_id` on a memory request and on the served workflow tools'
+arguments, and `scope_id` on a knowledge `Scope` once that face returns. The `minds` row
+(`crates/mindcore-sqlite/migrations/0002_minds.sql`) is the map: it names the Mind's knowledge
+collection and its carrier entry, and no configuration carries that pair a second time.
 
-A caller-supplied principal, scope or collection is never used to select a route.
+### Resolution and admission
 
-`ServeFaces.workflow_routes: BTreeMap<String, KnowledgeScope>` carries the map
-(`crates/mindcore-runtime/src/lib.rs:297-304`). Keys are exact principal ids, not peer ids; values are
-workflow collection scopes. The standalone Knowledge face still uses its own `ServeFaces.scope_id`,
-`knowledge`, and `admission`. `MemoryWorkflowBinding::new(pool, reflections)` starts with an
-empty private `knowledge_routes`; `with_knowledge_routes` validates and takes ownership of the full
-map (`crates/mindcore-spoke/src/workflows.rs:295-326`). The one private lookup,
-`knowledge_route(&self, principal: &Principal) -> Option<&KnowledgeScope>`, borrows the scope by
-`principal_id(principal)` for both carrier admission and the recall knowledge slot
-(`crates/mindcore-spoke/src/workflows.rs:346-348`).
+Every Mind-level operation reaches the store through an adapter entry, and each begins by looking
+the Mind up. `admission::admit_mind` (`crates/mindcore-spoke/src/admission.rs`) is that lookup:
+the caller's own grant rows in the space first, then the space row. No live grant and no space row
+answer one `NOT_AUTHORIZED` with a fixed message and no `details`, so an unknown Mind, an
+unadmitted one and a frozen one the caller holds no grant in are one answer.
+
+Coverage is checked after admission (`refuse_coverage`), and the freeze gate after that
+(`gate`): a capability the caller's grant does not cover is a distinct refusal, and a frozen Mind
+answers `SpaceFrozen` only to an operation that is freeze-gated and outside SPOKE's maintenance
+allowlist, while serving every operation that is not freeze-gated. Only a caller that passed
+admission reaches either check.
+
+The carrier read paths resolve through the registry row on the caller's transaction, after the same
+order: `admitted_carrier` (`crates/mindcore-spoke/src/workflows.rs`) for the cognition read, and
+`admitted_carrier_entry` for the host-side `deliberate` handler, which requires a space-wide live
+`knowledge_read` grant before touching a carrier. A `space_id` with no registry row answers the
+admission refusal before any carrier is read.
 
 ### Deliberation
 
-`deliberate` settles onto a carrier entry, so it needs exactly one routed collection per call.
+`deliberate` settles onto exactly one carrier entry, so it needs exactly one collection per call.
 
-- The route is resolved from the admitted principal inside the binding; the carrier write reads and
-  CAS-writes only that collection.
-- The route fixes only the collection. Deliberation reads the carrier entry the request's `holder`
-  names inside it, so the existing holder/assessor identity rules decide whether a write is accepted;
-  a holder id that exists only in another collection is refused `knowledge_entry_not_found` and
-  writes nothing.
-- Each destination collection belongs to exactly one principal route: assembly refuses a collection
-  named by two routes. The request's `holder` names the entry inside that one collection, so a
-  cross-principal carrier write is unreachable.
-- A principal with no route is refused `NotAuthorized` with no target details. The refusal never
-  reveals whether another principal has a route.
-- A surface with no route does not advertise `tools.mindcore.deliberate` and installs no handler
-  for it. Memory-face availability is independent: it is served only when the host configures it.
+- The collection and carrier are the registry row's, resolved through
+  `MemoryWorkflowBinding::carrier_collection` (`crates/mindcore-spoke/src/workflows.rs`) on the
+  caller's transaction; a binding an in-process facade opened may pin its own Mind first. A space
+  with no row answers the admission refusal before any carrier access.
+- The request does not name the carrier: `holder` is not a member of the served argument object, so
+  a peer that still sends it meets the closed object's `InvalidInput`.
+- The route fixes only the collection. Existing holder/assessor identity rules still decide whether
+  a write is accepted, and a destination collection belongs to one Mind, so a cross-Mind carrier
+  write is unreachable.
 
 ### Recall
 
-`recall_context` is authorized by the caller's own live `RECALL` grant; the knowledge slot is
+`recall_context` is authorized by the caller's own live `recall` grant; its knowledge slot is
 additional, not a condition of the call.
 
-- The slot lists the collection routed to the admitted principal, under that principal's own live
-  `KNOWLEDGE_READ` grant in the request's space.
-- A principal with no route, or no live `KNOWLEDGE_READ` grant, receives memory records with an
-  empty knowledge slot. The call does not fail because a route or grant is absent.
+- The slot lists the collection the request's `space_id` row names, under that principal's own live
+  `knowledge_read` grant in the same space.
+- A space with no registry row, or no live `knowledge_read` grant, receives the memory records with
+  an empty knowledge slot. The call does not fail because a row or grant is absent.
 - Grant-store read and collection-list failures are not authorization and still fail the call.
 
-### Adoption
+`absorb` consults no registry row: it captures and reviews memory in the named space and writes no
+carrier.
 
-`knowledge.adopt` reads one host-configured shared collection and writes the collection the
-knowledge face itself serves. `ServeFaces.adoption: Option<AdoptionRoute>` names the source by its
-wire `scope_id` and its collection (`crates/mindcore-runtime/src/lib.rs:247-257,288-296`); the
-destination is `ServeFaces.knowledge`, the one collection `knowledge.get`/`list` read for the
-admitted peer. Adoption does not consult `workflow_routes`: that map selects a *workflow* collection
-per principal, and the knowledge face takes no per-principal collection, so a route-derived
-destination could land a copy where no knowledge-face read reaches it. Neither collection is
-selected by a request member: the two scope members are only compared against the configured source
-and the admitted scope.
+### Listing
 
-- Assembly refuses an empty source scope id, an empty source collection, a source scope id equal to
-  `ServeFaces.scope_id`, and a source collection equal to `ServeFaces.knowledge`'s collection or to
-  any route destination, including the route of a principal that is not currently connected
-  (`crates/mindcore-runtime/src/lib.rs:105-150`). Without the collection refusal an adopted copy
-  could become the shared entry another principal reads, or a copy of the destination itself; the
-  scope refusal keeps a principal from adopting out of its own destination scope.
-- Admission is the knowledge face's, composed as `(principals(peer)?, knowledge_admission(peer)?)`:
-  a peer outside either callback gets that callback's refusal, so a principal the knowledge
-  admission refuses answers `NOT_AUTHORIZED` instead of adopting. A principal with knowledge
-  admission but no workflow route adopts normally.
-- The destination collection is fixed by the host, so every admitted principal adopts into the one
-  collection its own knowledge-face reads serve; the admitted scope's entry selection narrows what
-  the call may serve or write inside it. Both come from host configuration, never from the payload.
-- The source is read-only to the call and only that destination is written, both on one
-  `BEGIN IMMEDIATE` transaction, so adoption adds no write outside the destination collection. The
-  source handle is a distinct type from the destination handle, and the one write its port must
-  expose refuses before any statement runs, so no caller can write the shared collection through
-  the source side.
-- The source resolves through its retirement chain before the copy is read, so the write lands a
-  copy whose anchor names the terminal, never a retired hop.
+`memory.spaces.list` takes the same admission: its set is the registry's join over the caller's live
+grants (`crates/mindcore-sqlite/src/minds.rs`, `visible_mind_ids`), in `id` order, so a peer lists
+exactly the Minds it may operate. A frozen Mind is listed with its `frozen` status; a space with no
+registry row is not listed even under a live grant. The wire shape, cursor and marker are unchanged.
 
-The scope mapping, the refusal vocabulary and its wire codes, the terminal-anchor rule, the served
-revision domain, the copy's inherited governance and the idempotency envelope are
-[`serving-seam.md`](serving-seam.md)'s alone; this page states only which collection the route
-selects and how admission reaches it.
+### The un-routed operations
+
+`port.knowledge.*`, `history.*` and `knowledge.adopt` cannot name a Mind: the retained
+`RoutedKnowledgeStore` (and its `HistoryPort`) binds one collection for its lifetime, and adoption's
+destination is the knowledge face's own collection. Stage 1 therefore composes none of them:
+
+- the manifest advertises no `spoke-knowledge`, `ke-ownership`, `spoke-history` or
+  `spoke-knowledge-adoption`, and the runtime's `MindPorts` answers `None` for every family but
+  memory;
+- a call to each answers `CAPABILITY_PORT_MISSING` on the responder's dispatch-deny branch.
+
+They return per Mind in Stage 2, once SPOKE carries request-scoped admission and an optional scope on
+knowledge get and put (`2026-11-25-one-surface-serves-many-minds.md`). Their contracts stay
+[`serving-seam.md`](serving-seam.md)'s.
 
 ### Construction
 
-- An empty principal key, an empty collection, or one collection named by two routes is refused
-  when the surface is assembled; the refusal does not wait for the first call
-  (`crates/mindcore-spoke/src/workflows.rs:295-326`). The adoption source is validated in the same
-  assembly step, before any port or registration exists.
-- The route map is host configuration: it is not persisted, not derived from arguments, and not
-  read from the wire.
+- There is no route map to validate: `ServeFaces` carries no `workflow_routes`, `scope_id`,
+  `knowledge` or knowledge admission, and every Mind names its own collection through its row.
+- The route is persisted state, not host configuration: it is written once by `create` and not
+  derived from arguments, and the wire carries only the Mind id.
 - The route never substitutes for a live grant: every carrier write and knowledge read still
-  re-derives the grants on its own transaction.
+  re-derives the caller's own grants on its own transaction.
 
 ## Invariants
 
-- A served workflow's knowledge access produces no write, disclosure, revision change, entry-count
-  change or knowledge-slot entry outside the collection routed to its own admitted principal.
-  Adoption is the one served call that touches a second collection: it reads only the
-  host-configured source and writes only the knowledge face's own collection, which every peer
-  admitted to that scope shares: it holds one slot per destination entry id, the first adoption of a
-  given id claims it, a repeat is served that stored copy only at the anchor revision the copy
-  records, and a peer whose own admitted selection admits it reads the copy through that face;
-  assembly refuses a source that is the destination collection or any route destination. Read-only
-  access beyond the routed collection is otherwise not observable through the served surface and is
-  therefore not asserted.
-- No refusal discloses another principal's route, collection or entry.
-- No wire value selects the authenticated principal, the source collection or the destination
-  collection: admission supplies the principal, `AdoptionRoute` the source, and `ServeFaces.knowledge`
-  the destination. Adoption's arguments name one source entry, its expected source
-  revision, an optional destination entry id, an idempotency key, and the required
-  `source_scope_id` and `destination_scope_id`: the two scope members are compared against the
-  host-configured source and the admitted scope and never select either, and its result carries that
-  copy, whose stored provenance selects nothing.
+- A served call reads and writes only the collection the admitted Mind's registry row names, and no
+  result mixes two Minds. The host's own memory family service dispatches its operations under the
+  host's admission; which of them it dispatches was always the host's.
+- One `NOT_AUTHORIZED` with no `details` answers an unknown Mind id and a Mind the caller holds no
+  live grant in, a frozen one included, because admission runs before any existence check.
+- No refusal discloses another Mind's collection, carrier or entry; the coverage refusal is
+  reachable only by a caller already admitted to that Mind.
+- The three un-routed operations are never advertised and never served; a restored face re-enters
+  composition only per Mind, with `serving-seam.md`'s contract.
 - The carrier record format is unchanged.
 
 ## Where it lives
 
-- `crates/mindcore-runtime/src/lib.rs` — `ServeFaces` (`:261-309`) with `workflow_routes`
-  (`:297-304`) and `adoption` (`:288-296`), `AdoptionRoute` (`:247-257`), the adoption admission
-  composition (`:195-208`), and the assembly-time refusals in `MindcoreServe::surface`
-  (`:105-150`), the adoption source checks among them (`:107-150`).
-- `crates/mindcore-spoke/src/workflows.rs` — `MemoryWorkflowBinding::new` (`:92-99`),
-  `with_knowledge_routes` (`:295-326`) and the one `knowledge_route` lookup (`:346-348`) both
-  routed workflow calls share.
-- `crates/mindcore-runtime/src/adoption.rs` — the adoption port: the destination handle over the
-  knowledge face's collection, the admitted-selection predicate, and the one `BEGIN IMMEDIATE`
-  transaction around the chain resolution and the copy.
+- `crates/mindcore-spoke/src/admission.rs` — `admit_mind` (grant rows, then the space row),
+  `refuse_coverage`, `refuse_space_coverage` and `gate` (the freeze and subject gates).
+- `crates/mindcore-spoke/src/workflows.rs` — `carrier_collection` (the one registry-row lookup both
+  readers share), `knowledge_slot`, and `admitted_carrier` / `admitted_carrier_entry` (the carrier
+  admissions).
+- `crates/mindcore-sqlite/src/minds.rs` — the `minds` row, its visibility join and `create`.
+- `crates/mindcore-runtime/src/tools.rs` — the served `deliberate` and `read_cognition` argument
+  objects and their handler entry.
+- `crates/mindcore-runtime/src/lib.rs` — `MindPorts`, the retired-id filter and `face_capabilities`.
 - `.agents/specs/architecture/serving-seam.md` — the served tool ABI and the advertisement rule.
-- `crates/mindcore-runtime/tests/{loopback,surface}.rs` — the signed-session assertions for each
-  route and each advertisement case, and the surface-level adoption-reads-back test.
+- `crates/mindcore-runtime/tests/loopback.rs` — the signed-session assertions: two Minds and two
+  peers, the unadmitted/absent refusal, the frozen cases and the advertised set.
+- `crates/mindcore-spoke/tests/memory_adapter.rs` — the admission-first assertions over every
+  Mind-level read path and the registry-derived `memory.spaces.list`.
 
 ## Known limit
 
-A route, and the knowledge face's own collection, are fixed for the lifetime of the surface.
-Changing either requires assembling a new surface; there is no hot reload of the route map. The
-workspace has no periodic reconfiguration requirement, so this is recorded rather than implemented.
+Stage 1 routes memory and cognition per Mind only. `port.knowledge.*`, `history.*` and
+`knowledge.adopt` stay un-routed until Stage 2, so a peer gets no knowledge, history or adoption
+operation. A Mind's registry row is written once: changing its collection is a new Mind, not a
+reconfiguration, and there is no hot reload.
 
 ## Change obligations
 
-Changing admission, the route map shape, route resolution, reachability or collection isolation
-updates this page, the served tool table in [`serving-seam.md`](serving-seam.md) and the loopback
-assertions in the same change, and keeps the invariants above true. A new routed call states here
-which collection it reads and which it writes, and how it refuses a principal with no route.
+Changing admission, route resolution, reachability or collection isolation updates this page, the
+served tool table in [`serving-seam.md`](serving-seam.md) and the loopback assertions in the same
+change, and keeps the invariants above true. A new served operation states here which collection it
+reads and which it writes, and how it refuses a caller with no admission to the named Mind. The
+knowledge page `.agents/knowledge/architecture-patterns/serving-principal-routing.md` still
+describes the retired principal route map; it is stale against this page and is rewritten with that
+corpus, not here.

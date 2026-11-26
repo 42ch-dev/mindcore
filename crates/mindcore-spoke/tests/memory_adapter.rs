@@ -4455,12 +4455,11 @@ async fn receipts_poll_serves_regardless_of_unsettled_intents() {
     tx.rollback().await.expect("rollback");
 }
 
-/// Mind admission (one served surface serves many Minds): an unknown Mind, an
-/// ungranted one and a frozen one the caller holds no grant in answer one
-/// byte-equal `NOT_AUTHORIZED` with no details — before any coverage check —
-/// on every read path whose first lookup was the space row. A granted caller
-/// in the frozen Mind is still served a read, because reads are not
-/// freeze-gated.
+/// Mind admission (one served surface serves many Minds): admission runs before any existence
+/// check, so an unknown Mind, an ungranted one and a frozen one the caller holds no grant in
+/// answer one byte-equal `NOT_AUTHORIZED` with no details — before any coverage check and before
+/// the code could report whether the Mind exists. A granted caller in the frozen Mind is still
+/// served a read, because reads are not freeze-gated.
 #[tokio::test]
 async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
     let harness = Harness::open().await;
