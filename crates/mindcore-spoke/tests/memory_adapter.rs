@@ -4902,3 +4902,47 @@ async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
     );
     tx.rollback().await.expect("rollback");
 }
+
+/// An undecodable grant row is invisible, not fatal: admission decodes row by row, so a good row
+/// sorted after a bad one still admits the caller and serves the read. `query_as`'s `try_map`
+/// would have ended the stream at the bad row.
+#[tokio::test]
+async fn a_good_grant_after_an_undecodable_row_still_admits() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    // A bad row that sorts first — `capabilities_json` holds bytes the driver cannot hand over as
+    // text — and a good row that sorts after it.
+    for (grant_id, capabilities) in [
+        ("grant_a_bad", "CAST(X'80' AS TEXT)"),
+        ("grant_z_good", "'[\"recall\"]'"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO memory_grants \
+             (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+              context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+             VALUES ('{grant_id}', '{SPACE}', NULL, '{PRINCIPAL}', {capabilities}, '[]', 0, \
+              NULL, NULL, 1, '{NOW}')"
+        )))
+        .execute(&harness.pool)
+        .await
+        .expect("insert grant");
+    }
+
+    let mut tx = harness.begin().await;
+    let pack = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" },
+                        "budget": { "max_items": 4 } }),
+            )
+            .await,
+    );
+    assert!(
+        pack["records"].is_array(),
+        "the good row after the bad one still admits the caller: {pack}"
+    );
+    tx.rollback().await.expect("rollback");
+}

@@ -9,7 +9,8 @@ use std::future::poll_fn;
 
 use chrono::Utc;
 use serde_json::{Map, Number, Value};
-use sqlx::{Sqlite, Transaction};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Row, Sqlite, Transaction};
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{mint, MindId, SpaceId};
@@ -302,6 +303,36 @@ fn row_decodes(capabilities_json: &str, context_ids_json: &str) -> bool {
     crate::repository::decode_grant_columns(capabilities_json, context_ids_json).is_ok()
 }
 
+/// One joined row from a raw driver row, or `None` when any column does not decode.
+///
+/// `query_as` maps the whole row through SQLx's `try_map`, whose error ends the stream, so a good
+/// row sorted after an undecodable one would never be seen. The registry reads take raw driver
+/// rows and decode each one here: an undecodable row is invisible rather than fatal.
+fn join_of(row: &SqliteRow) -> Option<JoinRow> {
+    Some((
+        row.try_get("space_id").ok()?,
+        row.try_get("knowledge_collection").ok()?,
+        row.try_get("carrier_entry_id").ok()?,
+        row.try_get("display_name").ok()?,
+        row.try_get("status").ok()?,
+        row.try_get("created_at").ok()?,
+        row.try_get("expires_at").ok()?,
+        row.try_get("capabilities_json").ok()?,
+        row.try_get("context_ids_json").ok()?,
+    ))
+}
+
+/// One `visible_mind_ids` row from a raw driver row, or `None` when any column does not decode:
+/// the id read omits an undecodable row and keeps serving the rest.
+fn visible_id_of(row: &SqliteRow) -> Option<(String, Option<String>, String, String)> {
+    Some((
+        row.try_get("space_id").ok()?,
+        row.try_get("expires_at").ok()?,
+        row.try_get("capabilities_json").ok()?,
+        row.try_get("context_ids_json").ok()?,
+    ))
+}
+
 // The visibility rule of `expiry_passed` in `crates/mindcore-spoke/src/admission.rs`, restated
 // here because `mindcore-sqlite` cannot depend on the adapter: no expiry is live; an expiry
 // that does not parse as RFC 3339 is never live; the expiry is compared as an instant and never
@@ -352,9 +383,10 @@ fn mind_of(
 /// time — peak memory is the output plus the current row, never one copy per matching grant.
 /// Rows arrive grouped by Mind: the adjacent-group de-duplication keeps the first live row of
 /// each group and skips the rest, and an expired row only hides its Mind when no later row of
-/// the same group is live.
+/// the same group is live. A row whose columns do not decode is invisible rather than fatal:
+/// it is skipped and the read keeps going, so a good row sorted after it still lists the Mind.
 async fn read_visible(store: &MindStore, caller: &CallerId) -> SpokeResult<Vec<Mind>> {
-    let mut rows = sqlx::query_as::<_, JoinRow>(concat!(
+    let mut rows = sqlx::query(concat!(
         grant_columns!(),
         " WHERE g.principal_id = ?1 AND g.revoked_at IS NULL ORDER BY m.space_id, g.grant_id"
     ))
@@ -363,7 +395,11 @@ async fn read_visible(store: &MindStore, caller: &CallerId) -> SpokeResult<Vec<M
     let mut minds = Vec::new();
     let mut emitted: Option<String> = None;
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
-        let (
+        let row = match row {
+            Ok(row) => row,
+            Err(_) => return storage_unavailable(),
+        };
+        let Some((
             space_id,
             collection,
             carrier,
@@ -373,9 +409,9 @@ async fn read_visible(store: &MindStore, caller: &CallerId) -> SpokeResult<Vec<M
             expires_at,
             capabilities_json,
             context_ids_json,
-        ) = match row {
-            Ok(row) => row,
-            Err(_) => return storage_unavailable(),
+        )) = join_of(&row)
+        else {
+            continue;
         };
         if emitted.as_deref() == Some(space_id.as_str()) {
             continue;
@@ -411,7 +447,7 @@ async fn read_one_visible(
     caller: &CallerId,
     id: &MindId,
 ) -> SpokeResult<Vec<Mind>> {
-    let mut rows = sqlx::query_as::<_, JoinRow>(concat!(
+    let mut rows = sqlx::query(concat!(
         grant_columns!(),
         " WHERE g.principal_id = ?1 AND g.space_id = ?2 AND g.revoked_at IS NULL ORDER BY g.grant_id"
     ))
@@ -419,7 +455,11 @@ async fn read_one_visible(
     .bind(id.as_str())
     .fetch(&store.pool);
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
-        let (
+        let row = match row {
+            Ok(row) => row,
+            Err(_) => return storage_unavailable(),
+        };
+        let Some((
             space_id,
             collection,
             carrier,
@@ -429,9 +469,9 @@ async fn read_one_visible(
             expires_at,
             capabilities_json,
             context_ids_json,
-        ) = match row {
-            Ok(row) => row,
-            Err(_) => return storage_unavailable(),
+        )) = join_of(&row)
+        else {
+            continue;
         };
         if !live(&expires_at) {
             continue;
@@ -465,7 +505,7 @@ pub async fn visible_mind_ids(
     tx: &mut Transaction<'_, Sqlite>,
     caller: &str,
 ) -> SpokeResult<Vec<String>> {
-    let mut rows = sqlx::query_as::<_, (String, Option<String>, String, String)>(
+    let mut rows = sqlx::query(
         "SELECT m.space_id, g.expires_at, g.capabilities_json, g.context_ids_json \
          FROM memory_grants g \
          JOIN minds m ON m.space_id = g.space_id \
@@ -477,9 +517,13 @@ pub async fn visible_mind_ids(
     let mut ids = Vec::new();
     let mut emitted: Option<String> = None;
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
-        let (space_id, expires_at, capabilities_json, context_ids_json) = match row {
+        let row = match row {
             Ok(row) => row,
             Err(_) => return storage_unavailable(),
+        };
+        let Some((space_id, expires_at, capabilities_json, context_ids_json)) = visible_id_of(&row)
+        else {
+            continue;
         };
         if emitted.as_deref() == Some(space_id.as_str()) {
             continue;
