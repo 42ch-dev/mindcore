@@ -567,3 +567,31 @@ async fn the_public_publisher_creates_and_publishes_a_nested_root() {
         "exact published bytes"
     );
 }
+
+/// A relative root is anchored at the current directory: a root that does not exist yet is
+/// created and published instead of refusing on the empty parent path. The scratch tree sits
+/// directly under the package root cargo runs tests from — no pre-existing intermediate can
+/// stand in for the current-directory anchor — and is removed before the assertions.
+#[tokio::test]
+async fn the_public_publisher_handles_a_relative_root_that_does_not_exist_yet() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_nanos();
+    let relative = format!("journal-relative-{}-{unique}", std::process::id());
+    let root = std::path::PathBuf::from(&relative);
+    assert!(!root.exists(), "the relative root starts absent");
+    let publisher = mindcore_runtime::journal_dir(&relative);
+    let published = publisher(&[json!({
+        "path": "records/rec_relative.md",
+        "content": "relative root bytes",
+    })]);
+    let read_back = std::fs::read_to_string(root.join("records").join("rec_relative.md"));
+    std::fs::remove_dir_all(&root).ok();
+    published.expect("a relative root publishes");
+    assert_eq!(
+        read_back.expect("the published target"),
+        "relative root bytes",
+        "the relative root holds the target at its own path"
+    );
+}
