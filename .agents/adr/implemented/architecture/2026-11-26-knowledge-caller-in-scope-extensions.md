@@ -1,6 +1,6 @@
 # ADR: The served knowledge face carries the caller in `Scope.extensions`
 
-Status: implemented — `MindKnowledgePort` reads the caller from an own `Scope.extensions` namespace the admission wrote and authorizes every served knowledge operation on that caller's own live grant, so `port.knowledge.put` no longer appends cognition records unguarded
+Status: implemented — layer 1 ships the port, the two binding helpers and the guard `MindKnowledgePort`; layer 2 composes the admission callback that writes the binding and the served face around it
 Date: 2026-11-26
 Class: architecture
 Related: `2026-11-20-storage-ir-layering.md`, `2026-11-25-one-surface-serves-many-minds.md`, `2026-11-25-mind-is-one-memory-space.md`, `.agents/specs/architecture/serving-seam.md`
@@ -15,7 +15,7 @@ A peer can put the same extensions namespace in its own request scope. Only Conn
 
 ## Decision
 
-The admission callback resolves the authenticated peer to a `Principal` and the request's selector to a Mind, and binds that principal into the `Scope` it returns, under this workspace's own extensions namespace: `mindcore_caller` / `principal`, a name the generated `ExtensionKey` pattern `^[a-z][a-z0-9_-]*$` admits. `mindcore_sqlite::bind_caller` is the shape's single writer and `bound_caller` its single reader; `validate_admission_scope` admits that one namespace and still refuses every other extension selection.
+The caller travels in the `Scope` the admission returns, under this workspace's own extensions namespace: `mindcore_caller` / `principal`, a name the generated `ExtensionKey` pattern `^[a-z][a-z0-9_-]*$` admits. `mindcore_sqlite::bind_caller` is the shape's single writer and `bound_caller` its single reader; `validate_admission_scope` admits that one namespace and still refuses every other extension selection.
 
 `mindcore_spoke::MindKnowledgePort` is the one `ScopedKnowledgePort` a served knowledge face installs. Each of its three methods runs one order — the scope's shape, then the caller's own live grant, then the wrapped store:
 
@@ -30,6 +30,12 @@ The port fails closed. A scope with no binding, a caller with no live grant in t
 
 The cognition append stays. It is guarded, not removed: a caller holding such a grant appends records through `port.knowledge.put` exactly as before.
 
+### What this layer implements, and what the next one composes
+
+This layer implements the port, the two binding helpers and the guard, and proves them directly: `crates/mindcore-spoke/tests/served_knowledge.rs` calls `MindKnowledgePort` with scopes the test binds and shows each refusal before any record is written, and `crates/mindcore-sqlite/src/knowledge.rs`'s tests pin the binding's round trip and `validate_admission_scope`'s narrowing. No knowledge face is composed on any surface yet, so nothing on the wire changes and no `Scope` arriving from a peer carries the binding.
+
+Layer 2 composes the face: the admission callback that resolves the authenticated peer and the request's selector and calls `bind_caller` on the scope it returns, the served knowledge face that installs `MindKnowledgePort`, and the adversarial loopback that proves a peer-supplied `mindcore_caller` namespace does not decide the caller. Until that callback exists the guard is reachable only from tests, and nothing on the wire changes. Layer 2 does not re-claim `I-000137`; it claims this per-operation authorization on the composed face.
+
 ## Alternatives considered
 
 - **Gate the whole knowledge face on `knowledge_write`.** Rejected: it refuses every read to a read-only peer, and the served face has three operations with two different requirements. A face-wide capability is not the operation's, and it would also make the read rule depend on a write capability.
@@ -40,9 +46,8 @@ The cognition append stays. It is guarded, not removed: a caller holding such a 
 
 ## Consequences
 
-- **The authorization rests on Connect's extension merge.** A peer that puts `mindcore_caller` in its own request scope is overridden by the admitted namespace only because admitted extensions win on conflict. That is an upstream rule, verified against `responder.rs`'s merge and not enforced here. Layer 2's adversarial loopback is the tripwire: a peer-supplied namespace must not decide the caller, and it runs on every cohort upgrade.
-- **`RoutedKnowledgeStore` stays a public `ScopedKnowledgePort` without a grant rule.** A host that assembles its own face with it skips the guard. `MindcoreServe` installs it only inside `MindKnowledgePort`, and the type's documentation says so; the gap is disclosed rather than closed by a compile-time barrier.
+- **The authorization will rest on Connect's extension merge.** Once layer 2 writes the binding in a composed face's admission, a peer that puts `mindcore_caller` in its own request scope is overridden by the admitted namespace only because admitted extensions win on conflict. That is an upstream rule, verified against `responder.rs`'s merge and not enforced here. Layer 2's adversarial loopback is the tripwire: a peer-supplied namespace must not decide the caller, and it runs on every cohort upgrade.
+- **`RoutedKnowledgeStore` stays a public `ScopedKnowledgePort` without a grant rule.** A host that assembles its own face with it skips the guard. The type's documentation says so; nothing in this workspace composes it today except through `MindKnowledgePort` in tests, and the gap is disclosed rather than closed by a compile-time barrier.
 - **Two transactions per served call.** The grant read takes the pool and never shares a snapshot with the store call, so an authorization decision and the write that follows it are not one atomic step. A grant revoked between them can let one read through; the next call is refused.
 - **A refusal is unattributable.** Because the answer is byte-identical to the admission refusal, a peer cannot tell a missing grant from a missing Mind. That is the intended disclosure rule, and it costs diagnosability: a host observes the cause in its own admission path, not in the wire answer.
 - **The binding is one namespace of this workspace's own.** `mindcore_caller` is product metadata, not a protocol member; a second served face that needs the caller reuses the same namespace and the same two helpers rather than inventing another.
-- **Layer 2 composes the face.** Until its admission callback writes the binding on a composed knowledge face, the guard is reachable only from tests, and nothing on the wire changes. Layer 2 does not re-claim `I-000137`; it claims this per-operation authorization on the composed face.

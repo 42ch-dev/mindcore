@@ -5075,13 +5075,14 @@ async fn create_of_a_new_id_writes_the_creators_one_default_grant() {
         1,
         "a create writes exactly one grant row"
     );
-    let (capabilities, subject, contexts, expires): (
+    let (capabilities, grantee, subject, contexts, expires): (
+        String,
         String,
         Option<String>,
         String,
         Option<String>,
     ) = sqlx::query_as(
-        "SELECT capabilities_json, subject_id, context_ids_json, expires_at \
+        "SELECT capabilities_json, principal_id, subject_id, context_ids_json, expires_at \
              FROM memory_grants WHERE space_id = 'sp_fresh'",
     )
     .fetch_one(&mut *tx)
@@ -5100,6 +5101,10 @@ async fn create_of_a_new_id_writes_the_creators_one_default_grant() {
             "admin"
         ]),
         "the default grant set, in the owner's order"
+    );
+    assert_eq!(
+        grantee, PRINCIPAL,
+        "the default grant is issued to the creating principal"
     );
     assert_eq!(subject, None, "the default grant is space-wide");
     assert_eq!(contexts, "[]", "the default grant restricts no context");
@@ -5224,6 +5229,11 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
     assert_eq!(first["result"]["created"], json!(false));
     assert_eq!(first["result"]["revision"], json!(1));
     assert_eq!(first["result"]["status"], json!("active"));
+    assert_eq!(
+        harness.count_pool("memory_receipts").await,
+        1,
+        "the first key recorded one receipt"
+    );
 
     let mut tx = harness.begin().await;
     let repeat = ready(

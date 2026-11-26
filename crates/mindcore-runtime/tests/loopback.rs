@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
-use serde_json::{json, Number, Value};
+use serde_json::{json, Map, Number, Value};
 use tempfile::TempDir;
 
 use mindcore_base::ids::SpaceId;
@@ -36,8 +36,9 @@ use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
-    ConnectResponderOptions, MemoryAdmission, RemoteAdapter, RemoteAdapterOptions,
-    RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
+    ConnectResponderOptions, LoopbackTransport, MemoryAdmission, RemoteAdapter,
+    RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
+    Transport, TransportError,
 };
 use spoke_operations::{
     spoke_ok, spoke_reject, validate_judgment, AdoptionPort, HistoryPort, KnowledgeEntryPort,
@@ -617,6 +618,8 @@ fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
 struct Session {
     adapter: Arc<RemoteAdapter>,
     responder: Arc<ConnectResponder>,
+    /// Every envelope the responder sent back on this session, verbatim.
+    wire: Arc<WireLog>,
 }
 
 impl Drop for Session {
@@ -640,6 +643,7 @@ async fn connect_as(
     dialer_capabilities: &[&str],
 ) -> Session {
     let pair = loopback_transport_pair();
+    let wire = Arc::new(WireLog::default());
     let dialer = peer_id(seed);
     let responder_pubkey = SigningKey::from_bytes(&RESPONDER_SEED)
         .verifying_key()
@@ -664,7 +668,10 @@ async fn connect_as(
     expect_ok(surface.register(&responder), "install the served handlers");
 
     let adapter = connect_remote_adapter(RemoteAdapterOptions {
-        transport: Arc::new(pair.client),
+        transport: Arc::new(RecordingTransport {
+            inner: pair.client,
+            log: Arc::clone(&wire),
+        }),
         local_identity: RemoteIdentity { seed: *seed },
         local_manifest: hello("loopback-dialer", dialer_capabilities),
         remote_pubkey: responder_pubkey,
@@ -685,7 +692,11 @@ async fn connect_as(
         Some(dialer.as_str()),
         "the responder serves the authenticated peer, not a claimed one"
     );
-    Session { adapter, responder }
+    Session {
+        adapter,
+        responder,
+        wire,
+    }
 }
 
 fn recall_arguments() -> Value {
@@ -3142,6 +3153,46 @@ struct CreateSpaceFace {
     admission: MemoryAdmission,
 }
 
+/// The create face's lost-acknowledgement answer: the commit was not confirmed, so the caller
+/// cannot know whether the Mind was written — only the receipt names which outcome to resolve.
+///
+/// The receipt id comes from the `Ready` body the adapter staged, which is the committed receipt
+/// the transaction wrote; the answer claims no commit outcome either way.
+fn create_commit_uncertain(body: &Value, error: impl std::fmt::Display) -> SpokeReject {
+    let mut details = Map::new();
+    details.insert("retry_class".to_string(), json!("uncertain"));
+    if let Some(receipt_id) = body.get("receipt_id").cloned() {
+        details.insert("receipt_id".to_string(), receipt_id);
+    }
+    SpokeReject {
+        code: SpokeRejectCode::OutcomeUncertain,
+        message: format!("memory.spaces.create commit was not confirmed: {error}"),
+        details: Some(details),
+    }
+}
+
+/// A lost commit acknowledgement names the receipt and claims no outcome: the caller resolves it
+/// through `memory.receipts.get` rather than reading the answer as a create or a refusal.
+#[test]
+fn a_lost_create_commit_names_the_receipt_and_claims_no_outcome() {
+    let body = json!({
+        "schema_version": 1,
+        "receipt_id": "rct_create",
+        "status": "committed",
+        "result": { "space_id": "spc_wire", "created": true, "status": "active", "revision": 1 },
+    });
+    let reject = create_commit_uncertain(&body, "the connection went away");
+    assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+    let details = reject.details.expect("the uncertain answer carries details");
+    assert_eq!(details["receipt_id"], json!("rct_create"));
+    assert_eq!(details["retry_class"], json!("uncertain"));
+    assert!(
+        !reject.message.contains("committed") && !reject.message.contains("not committed"),
+        "the answer claims no commit outcome: {}",
+        reject.message
+    );
+}
+
 #[async_trait]
 impl RemoteMemoryService for CreateSpaceFace {
     async fn invoke(&self, peer_id: &str, op: &str, payload: Value) -> SpokeResult<Value> {
@@ -3172,11 +3223,7 @@ impl RemoteMemoryService for CreateSpaceFace {
         match stage {
             SpokeResult::Ok(MemoryStage::Ready(body)) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(body),
-                Err(error) => spoke_reject(
-                    SpokeRejectCode::OutcomeUncertain,
-                    format!("memory.spaces.create commit was not confirmed: {error}"),
-                    None,
-                ),
+                Err(error) => SpokeResult::Reject(create_commit_uncertain(&body, error)),
             },
             SpokeResult::Ok(_) => spoke_reject(
                 SpokeRejectCode::InternalError,
@@ -3219,6 +3266,9 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         capabilities(&surface)
     );
     let session = connect(&surface, &["spoke-memory"]).await;
+    // The handshake's own envelopes are not this test's subject; every drain from here covers
+    // exactly one create call.
+    session.wire.drain();
 
     let grants = |pool: sqlx::SqlitePool, space: &'static str| async move {
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_grants WHERE space_id = ?")
@@ -3226,6 +3276,13 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
             .fetch_one(&pool)
             .await
             .expect("count the grants")
+    };
+    let receipts = |pool: sqlx::SqlitePool, space: &'static str| async move {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_receipts WHERE space_id = ?")
+            .bind(space)
+            .fetch_one(&pool)
+            .await
+            .expect("count the receipts")
     };
 
     let created = wire(expect_ok(
@@ -3237,6 +3294,7 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         .await,
         "memory.spaces.create",
     ));
+    assert_caller_absent(&session, "the create answer");
     assert_eq!(created["result"]["space_id"], json!("spc_wire"));
     assert_eq!(created["result"]["created"], json!(true));
     assert_eq!(created["result"]["status"], json!("active"));
@@ -3247,9 +3305,23 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         grants_after_create, 1,
         "a create writes one default grant row"
     );
+    assert_eq!(
+        receipts(pool.clone(), "spc_wire").await,
+        1,
+        "a create records one committed receipt"
+    );
 
-    let granted: String = sqlx::query_scalar(
-        "SELECT capabilities_json FROM memory_grants WHERE space_id = 'spc_wire'",
+    // The creator's own grant row: the seven capabilities, and the ownership that makes them
+    // reachable — space-wide, subject-free, context-free, never expiring.
+    let (granted, grantee, subject, contexts, expires): (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT capabilities_json, principal_id, subject_id, context_ids_json, expires_at \
+         FROM memory_grants WHERE space_id = 'spc_wire'",
     )
     .fetch_one(&pool)
     .await
@@ -3267,12 +3339,13 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         ]),
         "the served create writes the same default grant set as the library"
     );
-    // The binding the served knowledge port reads is an extensions namespace of the admitted
-    // scope, never a wire member: no answer here may carry it.
-    assert!(
-        !created.to_string().contains("mindcore_caller"),
-        "no wire answer carries the caller binding: {created}"
+    assert_eq!(
+        grantee, PRINCIPAL,
+        "the default grant is issued to the creating principal"
     );
+    assert_eq!(subject, None, "the default grant is space-wide");
+    assert_eq!(contexts, "[]", "the default grant restricts no context");
+    assert_eq!(expires, None, "the default grant never expires");
 
     let replay = wire(expect_ok(
         MemoryPort::create_space(
@@ -3283,6 +3356,7 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         .await,
         "the replay of a create",
     ));
+    assert_caller_absent(&session, "the replay answer");
     assert_eq!(replay["receipt_id"], first_receipt);
     assert_eq!(replay["result"], created["result"]);
     assert_eq!(
@@ -3290,12 +3364,11 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         1,
         "a replay writes nothing"
     );
-    let receipts: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM memory_receipts WHERE space_id = 'spc_wire'")
-            .fetch_one(&pool)
-            .await
-            .expect("count the receipts");
-    assert_eq!(receipts, 1, "a replay records no second receipt");
+    assert_eq!(
+        receipts(pool.clone(), "spc_wire").await,
+        1,
+        "a replay records no second receipt"
+    );
 
     let repeat = wire(expect_ok(
         MemoryPort::create_space(
@@ -3306,12 +3379,19 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         .await,
         "a repeat create under a fresh key",
     ));
+    assert_caller_absent(&session, "the fresh-key repeat answer");
     assert_ne!(repeat["receipt_id"], first_receipt);
     assert_eq!(repeat["result"]["created"], json!(false));
     assert_eq!(
         repeat["result"]["revision"],
         json!(1),
         "the revision did not move"
+    );
+    // The repeat is a second recorded outcome, not a replay: one more receipt row, nothing else.
+    assert_eq!(
+        receipts(pool.clone(), "spc_wire").await,
+        2,
+        "a fresh key records its own receipt"
     );
     assert_eq!(
         grants(pool.clone(), "spc_wire").await,
@@ -3352,6 +3432,7 @@ async fn a_signed_create_of_an_existing_mind_without_admin_learns_nothing() {
         ),
     );
     let session = connect(&surface, &["spoke-memory"]).await;
+    session.wire.drain();
 
     let refusal = expect_reject(
         MemoryPort::create_space(
@@ -3362,6 +3443,7 @@ async fn a_signed_create_of_an_existing_mind_without_admin_learns_nothing() {
         .await,
         "an existing-Mind create without admin",
     );
+    assert_caller_absent(&session, "the no-admin refusal");
     assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
     assert!(
         refusal.details.is_none(),
@@ -3410,6 +3492,7 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
         ),
     );
     let session = connect(&surface, &["spoke-memory"]).await;
+    session.wire.drain();
 
     let refusal = expect_reject(
         MemoryPort::create_space(
@@ -3420,6 +3503,7 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
         .await,
         "a create into a frozen Mind",
     );
+    assert_caller_absent(&session, "the frozen refusal");
     assert_eq!(
         refusal.code,
         SpokeRejectCode::SpaceFrozen,

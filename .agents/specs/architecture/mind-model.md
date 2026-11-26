@@ -39,7 +39,7 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - `ScopedKnowledgeStore` keeps the caller's timestamp values in the `KnowledgeEntry` payload without that memory round-trip refusal; the store encodes only its separate SQL bookkeeping columns. Raw timestamp spelling is not a guarantee of the typed knowledge port — wire fidelity belongs to the IR codec (`storage-ir-boundary.md`).
 - A Mind is written by one `BEGIN IMMEDIATE` transaction or not at all: a failure in any of its four writes leaves no space, carrier, registry or grant row.
 - A create's second interface writes nothing its first does not: `memory.spaces.create` reaches `minds::create` on one transaction and adds only its own committed receipt, so a Mind's rows and its default grant set have one writer.
-- A repeat create changes no space, grant or revision: under a fresh key it records its receipt and answers `created: false`; under a retained key it replays. Neither is a fresh effect, so neither is refused by a later freeze or a later grant change.
+- A repeat create changes no space, grant or revision: under a fresh key it records its receipt and answers `created: false`; under a retained key it replays. A fresh-key repeat reaches the admin and freeze gates, so a later freeze or a later grant change refuses it; only a retained-key replay answers without them, because the dedup probe answers before any grant or freeze check.
 - A registry row names an existing space and an existing carrier entry: `minds` carries a foreign key to each.
 - No operation removes a Mind or its registry row; deactivation is the space's `frozen` status.
 
