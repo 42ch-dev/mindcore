@@ -4,11 +4,12 @@
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{mint, MindId, SpaceId};
-use mindcore_base::ir::MemoryGrantRow;
+use mindcore_base::ir::{MemoryGrantRow, MemoryJournalRow};
 use mindcore_base::ir::MemoryRepository;
+use mindcore_base::ids::SubjectId;
 use mindcore_runtime::journal_dir;
 use mindcore_runtime::minds::{self, CreateMind};
-use mindcore_runtime::{Capture, Mind, Recall};
+use mindcore_runtime::{Capture, Deliberation, Mind, MindProviders, Recall};
 use mindcore_spi::SpiError;
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use chrono::Utc;
@@ -19,7 +20,7 @@ use spoke_schemas::data::knowledge_entry::{
 use spoke_schemas::KnowledgeEntry;
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::memory_candidates_review_request::Decision;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use tempfile::TempDir;
 
 const OWNER: &str = "caller_wren";
@@ -762,5 +763,326 @@ async fn a_caller_without_knowledge_read_reads_nothing() {
         reject_code(writer_handle.knowledge_list().await),
         SpokeRejectCode::NotAuthorized,
         "a caller without knowledge_read reads no list"
+    );
+}
+
+// ---------- Task 4: cognition read and the space-level deliberate ----------
+
+/// One promotion over the supplied evidence; `record_ids` names no memory record
+/// because a subjectless snapshot serves no memory page.
+struct SettlingReasoner;
+
+#[async_trait::async_trait]
+impl mindcore_spi::Reasoner for SettlingReasoner {
+    async fn reason_structured(
+        &self,
+        request: mindcore_spi::StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        assert_eq!(
+            request.task_kind,
+            mindcore_spi::CognitiveTaskKind::Deliberate
+        );
+        let payload: Value =
+            serde_json::from_str(request.user_payload).expect("the payload is JSON");
+        assert!(
+            payload["records"]
+                .as_array()
+                .is_some_and(|records| records.is_empty()),
+            "a subjectless snapshot serves no memory page: {}",
+            request.user_payload
+        );
+        Ok(json!({
+            "recommendation": { "kind": "promote", "target_kind": "belief" },
+            "rationale": "the supplied evidence carries the north gate state",
+            "evidence_ids": ["ev_gate"],
+            "record_ids": [],
+            "record": {
+                "kind": "belief",
+                "order": 1,
+                "q": {
+                    "value": 0.8,
+                    "assertion": "belief_attribution",
+                    "method": "two_witness_reports",
+                    "calibration": "uncalibrated"
+                },
+                "assessor_role": "holder_self_report",
+                "basis": { "kind": "evidence", "evidence": [] }
+            }
+        }))
+    }
+}
+
+/// A verdict citing a memory record the subjectless snapshot never admitted.
+struct CitingReasoner;
+
+#[async_trait::async_trait]
+impl mindcore_spi::Reasoner for CitingReasoner {
+    async fn reason_structured(
+        &self,
+        _request: mindcore_spi::StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        Ok(json!({
+            "recommendation": { "kind": "promote", "target_kind": "belief" },
+            "rationale": "rests on a record this snapshot never served",
+            "evidence_ids": ["ev_gate"],
+            "record_ids": ["rec_not_admitted"],
+            "record": {
+                "kind": "belief",
+                "order": 1,
+                "q": {
+                    "value": 0.8,
+                    "assertion": "belief_attribution",
+                    "method": "two_witness_reports",
+                    "calibration": "uncalibrated"
+                },
+                "assessor_role": "holder_self_report"
+            }
+        }))
+    }
+}
+
+struct AutoPolicy;
+
+#[async_trait::async_trait]
+impl mindcore_spi::PolicyHook for AutoPolicy {
+    async fn evaluate_settlement(
+        &self,
+        _draft: mindcore_spi::SettlementDraft<'_>,
+    ) -> Result<mindcore_spi::PolicyDecision, SpiError> {
+        Ok(mindcore_spi::PolicyDecision::AutoSettle)
+    }
+}
+
+/// The carrier as the Mind's target: the facade's holder is the row's carrier.
+fn cognition_target(carrier_entry_id: &str) -> spoke_schemas::data::cognition::CognitionTarget {
+    serde_json::from_value(json!({
+        "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": carrier_entry_id },
+        "target_id": "prop_north_gate",
+        "kind": "proposition",
+    }))
+    .expect("a valid cognition target")
+}
+
+/// One deliberation over the fixed evidence, with the providers the test injects:
+/// `with_providers` consumes the handle, so each call opens its own with them.
+async fn deliberate(
+    store: &MindStore,
+    caller: &CallerId,
+    mind_id: &MindId,
+    target: &spoke_schemas::data::cognition::CognitionTarget,
+    reasoner: Arc<dyn mindcore_spi::Reasoner>,
+) -> SpokeResult<mindcore_spi::DeliberateOutcome> {
+    let evidence = [mindcore_spi::Evidence {
+        id: "ev_gate",
+        text: "the north gate is closed at dusk",
+    }];
+    let providers = MindProviders {
+        reasoner: Some(reasoner),
+        policy_hook: Some(Arc::new(AutoPolicy)),
+        ..MindProviders::default()
+    };
+    let handle = ok(Mind::open(store, caller, mind_id).await).with_providers(providers);
+    handle
+        .deliberate(&Deliberation {
+            target,
+            evidence: &evidence,
+            timeout: std::time::Duration::from_secs(5),
+        })
+        .await
+}
+
+/// One unsettled durable intent for `subject_id` in the Mind's space, written
+/// directly: the served absorb can leave one, and the facade's check is the
+/// space-level one.
+async fn settle_never(store: &MindStore, space_id: &str, subject_id: &str) {
+    let row = MemoryJournalRow {
+        seq: 0,
+        receipt_id: mint("rct"),
+        space_id: SpaceId::new(space_id),
+        subject_id: SubjectId::new(subject_id),
+        requester: CallerId::new(OWNER),
+        operation: "memory.candidates.review".to_string(),
+        idempotency_key: Some("intent_unsettled".to_string()),
+        state: "pending".to_string(),
+        targets: Vec::new(),
+        result: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    let mut tx = store.pool().begin().await.expect("begin the intent write");
+    SqliteMemoryRepository
+        .insert_journal_intent(&mut tx, &row)
+        .await
+        .expect("insert the unsettled intent");
+    tx.commit().await.expect("commit the intent");
+}
+
+#[tokio::test]
+async fn cognition_read_answers_none_then_the_judgment_and_mind_state() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    assert!(
+        ok(handle.cognition_read().await).is_none(),
+        "a fresh carrier holds no judgment, which is a state and not a refusal"
+    );
+
+    // The plan's own consequence: a fresh Mind has no judgment to read, so the
+    // carrier is written through the one validation boundary — an explicit
+    // `knowledge_put` carrying one cognition record.
+    let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
+    let revision = carrier.revision.expect("a stored carrier has a revision");
+    let record = json!({
+        "kind": "belief",
+        "order": 1,
+        "record_id": "cog_one",
+        "holder": {
+            "kind": "knowledge_entry",
+            "namespace": "mindcore",
+            "id": created.carrier_entry_id,
+        },
+        "target": {
+            "carrier": {
+                "kind": "knowledge_entry",
+                "namespace": "mindcore",
+                "id": created.carrier_entry_id,
+            },
+            "target_id": "prop_north_gate",
+            "kind": "proposition",
+        },
+        "assessor": {
+            "kind": "principal",
+            "namespace": "mindcore",
+            "id": OWNER,
+        },
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [{ "kind": "memory_record", "namespace": "mindcore", "id": "rec_gate" }],
+        },
+        "assessment_context": { "context_id": created.id.as_str() },
+        "assessed_at": "2026-11-20T09:00:00Z",
+        "effective_at": "2026-11-20T09:00:00Z",
+        "view": "current",
+        "q": {
+            "value": 0.8,
+            "assertion": "belief_attribution",
+            "method": "two_witness_reports",
+            "calibration": "uncalibrated",
+        },
+        "extensions": {},
+    });
+    let next = mindcore_base::cognition::append_cognition_record(&carrier, record)
+        .expect("one valid record appends to the carrier");
+    let written = ok(handle.knowledge_put(next, Some(revision)).await);
+    assert_eq!(
+        written.revision,
+        Some(revision + 1),
+        "the carrier update is one explicit revision step"
+    );
+
+    let cognition = ok(handle.cognition_read().await).expect("one record is a judgment");
+    assert_eq!(cognition.records.len(), 1, "the one current-view record");
+    assert_eq!(
+        cognition.records[0]["record_id"],
+        json!("cog_one"),
+        "the judgment is the record the carrier holds"
+    );
+    assert_eq!(
+        cognition.mind_state["mind_state_id"],
+        json!(created.id.as_str()),
+        "the Mind's id names its derived state"
+    );
+    assert_eq!(
+        cognition.mind_state["holder_entry_id"],
+        json!(created.carrier_entry_id),
+        "the state descends from the Mind's carrier"
+    );
+    assert!(
+        cognition.carrier_revision >= 1,
+        "the read served an assigned carrier revision"
+    );
+}
+
+#[tokio::test]
+async fn deliberate_without_a_space_wide_recall_grant_is_refused_and_writes_nothing() {
+    let (_dir, store) = fixture().await;
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let owner = CallerId::new(OWNER);
+    let owner_handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    // The knowledge capabilities admit the carrier; no `recall` grant was ever
+    // written for this caller, so the space-level revalidation must refuse.
+    let knowledge_only = CallerId::new("caller_knowledge_only");
+    grant(
+        &store,
+        created.id.as_str(),
+        "caller_knowledge_only",
+        &["knowledge_read", "knowledge_write"],
+    )
+    .await;
+    let target = cognition_target(&created.carrier_entry_id);
+    let refuse = reject_of(deliberate(&store, &knowledge_only, &created.id, &target, Arc::new(SettlingReasoner)).await);
+    assert_eq!(
+        refuse.code,
+        SpokeRejectCode::NotAuthorized,
+        "a caller without the space-wide recall grant is refused"
+    );
+
+    assert!(
+        ok(owner_handle.cognition_read().await).is_none(),
+        "the refused deliberation wrote no record"
+    );
+}
+
+#[tokio::test]
+async fn an_unsettled_intent_in_another_subject_refuses_deliberate() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    settle_never(&store, created.id.as_str(), "subj_other").await;
+
+    let target = cognition_target(&created.carrier_entry_id);
+    let refuse = reject_of(deliberate(&store, &owner, &created.id, &target, Arc::new(SettlingReasoner)).await);
+    assert_eq!(refuse.code, SpokeRejectCode::InternalError);
+    let details = refuse.details.as_ref().expect("structured details");
+    assert_eq!(
+        details.get("reason").and_then(Value::as_str),
+        Some("UNRECONCILED"),
+        "the space-level withhold"
+    );
+    assert_eq!(
+        details.get("space_id").and_then(Value::as_str),
+        Some(created.id.as_str()),
+        "the refusal names the space and no subject"
+    );
+    assert!(details.get("subject_id").is_none());
+    assert!(
+        ok(handle.cognition_read().await).is_none(),
+        "the refused deliberation wrote no record"
+    );
+}
+
+#[tokio::test]
+async fn a_verdict_citing_a_memory_record_is_refused() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    let target = cognition_target(&created.carrier_entry_id);
+    let refuse = reject_of(deliberate(&store, &owner, &created.id, &target, Arc::new(CitingReasoner)).await);
+    assert_eq!(
+        refuse.code,
+        SpokeRejectCode::InternalError,
+        "a citation outside the subjectless snapshot is refused, never widened"
+    );
+    assert!(
+        ok(handle.cognition_read().await).is_none(),
+        "the refused verdict wrote no record"
     );
 }

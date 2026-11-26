@@ -23,20 +23,25 @@ use serde_json::{json, Map, Value};
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{MindId, SpaceId};
 use mindcore_base::ir::MemoryRepository;
-use mindcore_spi::SpiError;
-use mindcore_spoke::{MemoryAdapter, MemoryStage};
+use mindcore_spi::{
+    DeliberateOutcome, DeliberateRequest, MindWorkflows, SpiError, SpiMindWorkflows,
+};
+use mindcore_spoke::{Cognition, MemoryAdapter, MemoryStage, MemoryWorkflowBinding};
 use mindcore_sqlite::minds::Mind as MindRow;
 use mindcore_sqlite::{
     list_entries_in, read_entry, read_entry_at_revision, write_entry, MindStore,
     SqliteMemoryRepository,
 };
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::memory_candidates_review_request::Decision;
 use spoke_schemas::{
     KnowledgeEntry, MemoryCandidatesReviewResponse, MemoryCaptureResponse, MemoryRecallResponse,
     Principal,
 };
 use sqlx::SqlitePool;
+
+use crate::tools::workflow_reject;
 
 /// The host's journal publisher: the handle never invents one.
 type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
@@ -53,6 +58,7 @@ pub struct Mind {
     row: MindRow,
     adapter: MemoryAdapter,
     publisher: Option<Box<JournalPublisher>>,
+    providers: crate::MindProviders,
 }
 
 /// One memory capture in plain arguments; the handle renders the wire body with the Mind's
@@ -80,6 +86,18 @@ pub struct Recall<'a> {
     pub max_bytes: Option<u64>,
     pub query: Option<&'a str>,
     pub cursor: Option<&'a str>,
+}
+
+/// One deliberation in plain arguments: a target and the evidence the verdict
+/// may rest on. There is no subject: the facade's `deliberate` is space-level,
+/// and the request carries the Mind's id as its assessment context.
+pub struct Deliberation<'a> {
+    /// The cognition target being assessed.
+    pub target: &'a CognitionTarget,
+    /// Evidence admitted for this deliberation.
+    pub evidence: &'a [mindcore_spi::Evidence<'a>],
+    /// Elapsed-time budget for the whole call.
+    pub timeout: std::time::Duration,
 }
 
 fn reject<T>(code: SpokeRejectCode, message: impl Into<String>, class: &str) -> SpokeResult<T> {
@@ -142,6 +160,7 @@ impl Mind {
                 row,
                 adapter: MemoryAdapter::new(false),
                 publisher: None,
+                providers: crate::MindProviders::default(),
             }),
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
@@ -158,6 +177,15 @@ impl Mind {
         publish: impl Fn(&[Value]) -> Result<(), SpiError> + Send + Sync + 'static,
     ) -> Self {
         self.publisher = Some(Box::new(publish));
+        self
+    }
+
+    /// The providers `deliberate` reasons with: the host's own embedder, reasoner,
+    /// settlement policy and lens. The handle never invents them; `deliberate`
+    /// without a reasoner is refused with the workflow's own unavailability.
+    #[must_use]
+    pub fn with_providers(mut self, providers: crate::MindProviders) -> Self {
+        self.providers = providers;
         self
     }
 
@@ -577,6 +605,86 @@ impl Mind {
             Err(error) => uncertain(format!(
                 "the settled receipt {receipt_id} does not match its schema: {error}"
             )),
+        }
+    }
+
+    /// Read this Mind's judgment: `MemoryAdapter::read_cognition` over one read
+    /// transaction, rolled back after the read. A fresh carrier answers `None`;
+    /// after one record, the judgment's records and the derived `MindState`.
+    pub async fn cognition_read(&self) -> SpokeResult<Option<Cognition>> {
+        let mut transaction = match self.pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return retryable_internal(format!(
+                    "cognition read transaction could not begin: {error}"
+                ))
+            }
+        };
+        let read = self
+            .adapter
+            .read_cognition(
+                &mut transaction,
+                &principal(&self.caller),
+                self.row.id.as_str(),
+                &self.row.knowledge.collection,
+                &self.row.carrier_entry_id,
+                self.row.id.as_str(),
+            )
+            .await;
+        drop(transaction);
+        match read {
+            Ok(cognition) => SpokeResult::Ok(cognition),
+            Err(error) => SpokeResult::Reject(workflow_reject(error)),
+        }
+    }
+
+    /// Deliberate one target over the evidence: `SpiMindWorkflows::deliberate`
+    /// with the Mind's id as `space_id`, no subject, the carrier the row names
+    /// as holder and the Mind's id as the assessment context. The space-level
+    /// revalidation and unsettled-intent checks stand where the subject-level
+    /// pair would; no path chooses a subject.
+    pub async fn deliberate(
+        &self,
+        deliberation: &Deliberation<'_>,
+    ) -> SpokeResult<DeliberateOutcome> {
+        let holder: CognitionReference = match serde_json::from_value(json!({
+            "kind": "knowledge_entry",
+            "namespace": "mindcore",
+            "id": self.row.carrier_entry_id.as_str(),
+        })) {
+            Ok(holder) => holder,
+            Err(error) => {
+                return retryable_internal(format!("the carrier reference does not decode: {error}"))
+            }
+        };
+        let binding = MemoryWorkflowBinding::new(self.pool.clone(), false)
+            .with_carrier_collection(
+                self.row.id.as_str(),
+                &self.row.knowledge.collection,
+                &self.row.carrier_entry_id,
+            );
+        let workflows = SpiMindWorkflows::new(binding);
+        let request = DeliberateRequest {
+            space_id: self.row.id.as_str(),
+            subject_id: None,
+            assessment_context_id: Some(self.row.id.as_str()),
+            holder: &holder,
+            target: deliberation.target,
+            evidence: deliberation.evidence,
+            timeout: deliberation.timeout,
+        };
+        let caps = self.providers.capabilities();
+        let outcome = MindWorkflows::deliberate(
+            &workflows,
+            &principal(&self.caller),
+            request,
+            self.providers.lens.as_deref(),
+            &caps,
+        )
+        .await;
+        match outcome {
+            Ok(outcome) => SpokeResult::Ok(outcome),
+            Err(error) => SpokeResult::Reject(workflow_reject(error)),
         }
     }
 }

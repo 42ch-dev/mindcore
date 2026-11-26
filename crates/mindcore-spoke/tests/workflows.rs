@@ -2630,7 +2630,7 @@ async fn deliberate_as(
     }];
     let request = mindcore_spi::DeliberateRequest {
         space_id: SPACE,
-        subject_id: SUBJECT,
+        subject_id: Some(SUBJECT),
         assessment_context_id,
         holder: &holder,
         target: &target,
@@ -4239,7 +4239,7 @@ async fn a_settle_refuses_at_its_deadline_while_the_only_connection_is_held() {
         binding.commit_cognition(
             &principal(),
             SPACE,
-            SUBJECT,
+            Some(SUBJECT),
             &settle_holder(),
             1,
             settle_record("cog_refused"),
@@ -4299,7 +4299,7 @@ async fn a_settle_with_a_passed_deadline_opens_no_transaction_on_a_free_connecti
         binding.commit_cognition(
             &principal(),
             SPACE,
-            SUBJECT,
+            Some(SUBJECT),
             &settle_holder(),
             1,
             settle_record("cog_expired"),
@@ -4338,7 +4338,7 @@ async fn a_settle_commits_on_a_free_connection_within_its_deadline() {
         binding.commit_cognition(
             &principal(),
             SPACE,
-            SUBJECT,
+            Some(SUBJECT),
             &settle_holder(),
             1,
             settle_record("cog_settled"),
@@ -4386,7 +4386,7 @@ async fn a_settle_waits_out_a_short_hold_until_its_deadline() {
         binding.commit_cognition(
             &principal(),
             SPACE,
-            SUBJECT,
+            Some(SUBJECT),
             &settle_holder(),
             1,
             settle_record("cog_waited"),

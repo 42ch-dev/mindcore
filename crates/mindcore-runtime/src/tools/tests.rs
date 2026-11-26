@@ -102,7 +102,7 @@ impl MindWorkflows for Fake {
             "deliberate:{}:{}:{}:{}:{}",
             principal.principal_id.as_str(),
             request.space_id,
-            request.subject_id,
+            request.subject_id.unwrap_or(""),
             request.timeout.as_millis(),
             evidence.join(",")
         ));

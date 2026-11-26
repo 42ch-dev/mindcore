@@ -2690,6 +2690,23 @@ impl MemoryRepository for SqliteMemoryRepository {
         .is_some())
     }
 
+    async fn has_unsettled_intent_in_space(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+    ) -> RepoResult<bool> {
+        Ok(sqlx::query_scalar!(
+            "SELECT 1 FROM memory_journal \
+             WHERE space_id = ? AND state <> 'applied' \
+             LIMIT 1",
+            space.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(decode_row)?
+        .is_some())
+    }
+
     async fn insert_journal_intent(
         &self,
         tx: &mut Self::Tx<'_>,

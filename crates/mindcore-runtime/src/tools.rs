@@ -54,7 +54,7 @@ pub struct MindProviders {
 }
 
 impl MindProviders {
-    fn capabilities(&self) -> MindCapabilities<'_> {
+    pub(crate) fn capabilities(&self) -> MindCapabilities<'_> {
         MindCapabilities {
             embedder: self.embedder.as_deref(),
             reasoner: self.reasoner.as_deref(),
@@ -315,7 +315,7 @@ async fn deliberate(
         .collect();
     let request = DeliberateRequest {
         space_id: &arguments.space_id,
-        subject_id: &arguments.subject_id,
+        subject_id: Some(&arguments.subject_id),
         assessment_context_id: None,
         holder: &arguments.holder,
         target: &arguments.target,
@@ -382,7 +382,7 @@ fn deliberate_outcome(outcome: DeliberateOutcome) -> Value {
 }
 
 /// One workflow failure as the wire reject the seam documents.
-fn workflow_reject(error: SpiError) -> SpokeReject {
+pub(crate) fn workflow_reject(error: SpiError) -> SpokeReject {
     match error {
         SpiError::Settlement(reject) => reject,
         SpiError::InvalidInput(message) => SpokeReject {

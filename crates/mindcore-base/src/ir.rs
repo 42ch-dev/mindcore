@@ -715,6 +715,15 @@ pub trait MemoryRepository: Send + Sync {
         space: &SpaceId,
         subject: &SubjectId,
     ) -> Result<bool, Self::Error>;
+
+    /// Whether any non-`applied` durable intent exists anywhere in the space,
+    /// whichever subject it belongs to: the space-level withhold of a
+    /// subjectless deliberation. No payload column is selected or decoded.
+    async fn has_unsettled_intent_in_space(
+        &self,
+        tx: &mut Self::Tx<'_>,
+        space: &SpaceId,
+    ) -> Result<bool, Self::Error>;
     async fn insert_journal_intent(
         &self,
         tx: &mut Self::Tx<'_>,

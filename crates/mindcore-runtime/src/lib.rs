@@ -49,7 +49,8 @@ use sqlx::SqlitePool;
 use adoption::AdoptionService;
 use history_dedup::SqliteHistoryDedupStore;
 pub use journal::journal_dir;
-pub use mind::{Capture, Mind, Recall};
+pub use mind::{Capture, Deliberation, Mind, Recall};
+pub use mindcore_spoke::Cognition;
 pub use tools::MindProviders;
 use tools::WorkflowTools;
 

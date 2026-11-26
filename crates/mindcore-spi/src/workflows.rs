@@ -264,12 +264,15 @@ pub trait WorkflowBinding: Send + Sync {
     ///
     /// The holder must name the existing carrier entry of the caller's bound
     /// knowledge collection. A memory grant is not an admission to the
-    /// carrier; only the binding's knowledge admission is.
+    /// carrier; only the binding's knowledge admission is. With no subject
+    /// there is no page to read: the snapshot serves an empty memory page, and
+    /// the space-level revalidation and unsettled-intent checks run in place of
+    /// the subject-level pair.
     async fn deliberate_snapshot(
         &self,
         principal: &Principal,
         space_id: &str,
-        subject_id: &str,
+        subject_id: Option<&str>,
         holder: &CognitionReference,
         max_items: u64,
     ) -> Result<DeliberateSnapshot, SpiError>;
@@ -278,10 +281,11 @@ pub trait WorkflowBinding: Send + Sync {
     /// one caller-managed write transaction.
     ///
     /// Rechecks the caller's admission to *write* the carrier (a read grant is
-    /// not one), the subject's recall admission, its withholding and every
-    /// cited record revision against `cited`, and refuses a carrier that no
-    /// longer holds `expected_carrier_revision`. Returns the carrier revision
-    /// of the derived `MindState` after a confirmed commit.
+    /// not one), the recall admission and the unsettled-intent withhold — over
+    /// the subject when one is named, over the whole space when none is — and
+    /// every cited record revision against `cited`, and refuses a carrier that
+    /// no longer holds `expected_carrier_revision`. Returns the carrier
+    /// revision of the derived `MindState` after a confirmed commit.
     ///
     /// An implementation must observe `deadline` itself, because the caller
     /// cannot bound the wait for its storage: while acquiring whatever the
@@ -295,7 +299,7 @@ pub trait WorkflowBinding: Send + Sync {
         &self,
         principal: &Principal,
         space_id: &str,
-        subject_id: &str,
+        subject_id: Option<&str>,
         holder: &CognitionReference,
         expected_carrier_revision: u64,
         record: Value,
@@ -1564,6 +1568,15 @@ fn stamp_cognition_record(
         .as_object()
         .cloned()
         .ok_or_else(|| invalid_verdict("the proposed record is not an object"))?;
+    // The record's context is a trusted input, never the model's: a request
+    // naming neither an explicit context nor a subject to derive one from is
+    // the caller's invalid input, not a verdict defect.
+    let Some(context_id) = request.assessment_context_id.or(request.subject_id) else {
+        return Err(SpiError::InvalidInput(
+            "the request names neither an assessment context nor a subject to derive it from"
+                .to_string(),
+        ));
+    };
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
     let stamped = [
         ("record_id", Value::String(new_record_id(request)?)),
@@ -1580,7 +1593,7 @@ fn stamp_cognition_record(
         (
             "assessment_context",
             json!({
-                "context_id": request.assessment_context_id.unwrap_or(request.subject_id),
+                "context_id": context_id,
             }),
         ),
         ("assessed_at", Value::String(now.clone())),
@@ -1611,8 +1624,12 @@ fn stamp_cognition_record(
 }
 
 /// Whether the record validates with the assessment context derived from the
-/// subject, as a request that supplied none would have stamped it.
+/// subject, as a request that supplied none would have stamped it. A subjectless
+/// request derives nothing, so its supplied context never gets this fallback.
 fn validates_with_derived_context(record: &Value, request: &DeliberateRequest<'_>) -> bool {
+    let Some(subject_id) = request.subject_id else {
+        return false;
+    };
     let mut derived = record.clone();
     let Some(context) = derived
         .get_mut("assessment_context")
@@ -1622,7 +1639,7 @@ fn validates_with_derived_context(record: &Value, request: &DeliberateRequest<'_
     };
     context.insert(
         "context_id".to_string(),
-        Value::String(request.subject_id.to_string()),
+        Value::String(subject_id.to_string()),
     );
     !matches!(validate_cognition_record(&derived), SpokeResult::Reject(_))
 }
@@ -2552,7 +2569,7 @@ mod tests {
             &self,
             _principal: &Principal,
             _space_id: &str,
-            _subject_id: &str,
+            _subject_id: Option<&str>,
             _holder: &CognitionReference,
             _max_items: u64,
         ) -> Result<DeliberateSnapshot, SpiError> {
@@ -2563,7 +2580,7 @@ mod tests {
             &self,
             _principal: &Principal,
             _space_id: &str,
-            _subject_id: &str,
+            _subject_id: Option<&str>,
             _holder: &CognitionReference,
             _expected_carrier_revision: u64,
             _record: Value,
