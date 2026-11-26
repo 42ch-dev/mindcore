@@ -13,6 +13,7 @@
 
 mod adoption;
 mod history_dedup;
+pub mod journal;
 pub mod mind;
 pub mod minds;
 pub mod tools;
@@ -47,7 +48,7 @@ use sqlx::SqlitePool;
 
 use adoption::AdoptionService;
 use history_dedup::SqliteHistoryDedupStore;
-pub use mind::Mind;
+pub use mind::{Capture, Mind, Recall};
 pub use tools::MindProviders;
 use tools::WorkflowTools;
 
