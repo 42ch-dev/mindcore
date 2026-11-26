@@ -41,7 +41,9 @@ use mindcore_sqlite::{
 
 use crate::admission;
 use crate::reject::Reject;
-use crate::{principal_id, MemoryAdapter, MemoryStage, Tx, KNOWLEDGE_READ, KNOWLEDGE_WRITE, RECALL};
+use crate::{
+    principal_id, MemoryAdapter, MemoryStage, Tx, KNOWLEDGE_READ, KNOWLEDGE_WRITE, RECALL,
+};
 
 /// Publishes one intent's file targets and confirms them: `Ok(())` only when
 /// every target's exact bytes landed at its path.

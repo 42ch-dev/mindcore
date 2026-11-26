@@ -29,12 +29,15 @@ use serde_json::Value;
 /// parent chain.
 ///
 /// Durability: each target syncs its file, then every directory the publication created or
-/// wrote into beneath the root, deepest first, ending at the root itself — inclusive. The
-/// chain is a pure function of the target's path, never of which directories happen to exist,
-/// so a retry after a publication that failed between creating directories and syncing them
-/// syncs the same chain as the attempt that failed. The root's own creation entry is the
-/// host's and never the publisher's to sync: the host established it durable before the first
-/// publication, which is exactly why the publisher requires the root to exist.
+/// wrote into beneath the root, deepest first, ending at the canonical root itself —
+/// inclusive. The chain is computed from the target's *resolved* parent: a symlink inside the
+/// root can redirect the write, and only the resolved chain carries the real parent of every
+/// entry the publication dirtied. The chain is a pure function of the target's path and the
+/// tree's symlinks, never of which directories happen to exist, so a retry after a
+/// publication that failed between creating directories and syncing them syncs the same
+/// chain as the attempt that failed. The root's own creation entry is the host's and never
+/// the publisher's to sync: the host established it durable before the first publication,
+/// which is exactly why the publisher requires the root to exist.
 ///
 /// Permission requirement: syncing a directory opens it for reading, which POSIX refuses for
 /// a search-only directory, so the host must grant read on `root` and everything beneath it.
@@ -227,10 +230,16 @@ pub fn journal_dir(
             })?;
             // Durability, not visibility: the write must reach the medium before the caller
             // may settle the intent. The temporary's contents were synced before the rename;
-            // what remains is the directory entries: the rename itself, and every directory the
-            // publication created or wrote into beneath the root, deepest first, ending at the
-            // root.
-            let mut cursor = Some(parent.clone());
+            // what remains is the directory entries. The chain is computed from the *resolved*
+            // parent, not the lexical one: a symlink inside the root can redirect the target
+            // (`root/records` → `root/backing/nested`), and walking the lexical spelling's
+            // `parent()` would sync the resolved directory and the root but skip the real
+            // intermediate (`backing`) whose entry names `nested`. Parentage is a real-tree
+            // relation, so canonicalizing the parent and walking up to the canonical root
+            // syncs exactly the directories whose entries carry what the publication created
+            // or wrote into — a symlink never re-parents an entry, so the resolved chain is
+            // the complete one, whether or not any component was a symlink.
+            let mut cursor = Some(resolved.clone());
             while let Some(directory) = cursor {
                 std::fs::File::open(&directory)
                     .and_then(|directory| directory.sync_all())
@@ -240,7 +249,7 @@ pub fn journal_dir(
                             directory.display()
                         )))
                     })?;
-                if directory == root {
+                if directory == canonical_root {
                     break;
                 }
                 cursor = directory.parent().map(Path::to_path_buf);

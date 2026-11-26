@@ -2,24 +2,22 @@
 //! live grants, the registry's own `NotFound` for a Mind the caller cannot see, and a frozen
 //! Mind opening because the handle acts on no status from the row.
 
+use chrono::Utc;
 use mindcore_base::boundary::CallerId;
-use mindcore_base::ids::{mint, MindId, SpaceId};
-use mindcore_base::ir::{MemoryGrantRow, MemoryJournalRow};
-use mindcore_base::ir::MemoryRepository;
 use mindcore_base::ids::SubjectId;
+use mindcore_base::ids::{mint, MindId, SpaceId};
+use mindcore_base::ir::MemoryRepository;
+use mindcore_base::ir::{MemoryGrantRow, MemoryJournalRow};
 use mindcore_runtime::journal_dir;
 use mindcore_runtime::minds::{self, CreateMind};
 use mindcore_runtime::{Capture, Deliberation, Mind, MindProviders, Recall};
 use mindcore_spi::SpiError;
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
-use chrono::Utc;
 use serde_json::{json, Map, Number, Value};
-use spoke_schemas::data::knowledge_entry::{
-    KnowledgeEntryBody, KnowledgeEntryCanonicalName,
-};
-use spoke_schemas::KnowledgeEntry;
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_schemas::data::knowledge_entry::{KnowledgeEntryBody, KnowledgeEntryCanonicalName};
 use spoke_schemas::memory_candidates_review_request::Decision;
+use spoke_schemas::KnowledgeEntry;
 use std::sync::{mpsc, Arc};
 use tempfile::TempDir;
 
@@ -150,7 +148,7 @@ fn recall_all() -> (Recall<'static>, Value) {
         Recall {
             subject: SUBJECT,
             selection,
-            max_items: Some(10),
+            max_items: 10,
             max_bytes: None,
             query: None,
             cursor: None,
@@ -296,6 +294,42 @@ async fn capture_review_then_recall_returns_the_record_for_the_named_subject() {
     assert!(
         published.exists(),
         "the record projection was published under the journal root"
+    );
+}
+
+#[tokio::test]
+async fn a_recall_with_only_max_items_and_no_other_budget_fields_is_a_valid_wire_request() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(dir.path()));
+    capture_candidate(&handle, "cap-min-budget", "a plain note").await;
+
+    // The regression the wire contract pins: a recall carrying neither query, cursor nor
+    // max_bytes — the minimal budget shape — must decode as a valid wire request and answer
+    // a page, not a validation refusal. `max_items` is non-optional on the facade exactly
+    // because the wire requires the member.
+    let (minimal, _) = recall_all();
+    let page = value_of(&ok(handle.recall(&minimal).await));
+    assert!(
+        page["records"].is_array(),
+        "the minimal budget answers a records page: {page}"
+    );
+
+    // One item bounds the page to exactly one record even though more exist.
+    capture_candidate(&handle, "cap-min-budget-two", "a second note").await;
+    let bounded = Recall {
+        max_items: 1,
+        ..recall_all().0
+    };
+    let page = value_of(&ok(handle.recall(&bounded).await));
+    let records = page["records"].as_array().expect("a records page");
+    assert!(
+        records.len() <= 1,
+        "max_items bounds the page: {}",
+        records.len()
     );
 }
 
@@ -457,13 +491,15 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
                 // One poll with a no-op waker: the future must be pending because the staging
                 // transaction still holds the pool's one connection, and this first poll is
                 // what registers the task in the pool's FIFO queue.
-                let pending = std::future::poll_fn(|cx| {
+                std::future::poll_fn(|cx| {
                     let polled = std::future::Future::poll(acquire.as_mut(), cx);
-                    assert!(polled.is_pending(), "the one connection is still checked out");
+                    assert!(
+                        polled.is_pending(),
+                        "the one connection is still checked out"
+                    );
                     std::task::Poll::Ready(())
                 })
                 .await;
-                let _ = pending;
                 registered.send(()).expect("signal the registration");
                 let mut connection = acquire.await.expect("the one connection");
                 sqlx::query("UPDATE memory_journal SET state = 'deferred'")
@@ -499,7 +535,6 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
         "the staged record is durable"
     );
 }
-
 
 /// The `OUTCOME_UNCERTAIN` recovery contract: a failure after the staging commit answers the
 /// uncertain outcome once, and a same-key repeat continues through the fold — publish, then
@@ -537,7 +572,10 @@ async fn a_repeat_after_outcome_uncertain_continues_the_fold_and_settles() {
                 tokio::pin!(acquire);
                 std::future::poll_fn(|cx| {
                     let polled = std::future::Future::poll(acquire.as_mut(), cx);
-                    assert!(polled.is_pending(), "the one connection is still checked out");
+                    assert!(
+                        polled.is_pending(),
+                        "the one connection is still checked out"
+                    );
                     std::task::Poll::Ready(())
                 })
                 .await;
@@ -703,7 +741,10 @@ async fn the_public_publisher_publishes_a_nested_subtree_under_an_existing_root(
     .expect("publish beneath an existing root");
     assert_eq!(
         std::fs::read_to_string(
-            root.join("deeply").join("nested").join("records").join("rec_nested.md")
+            root.join("deeply")
+                .join("nested")
+                .join("records")
+                .join("rec_nested.md")
         )
         .expect("the published target"),
         "exact published bytes"
@@ -743,7 +784,10 @@ async fn grant(store: &MindStore, space_id: &str, principal: &str, capabilities:
         space_id: SpaceId::new(space_id),
         subject_id: None,
         principal_id: CallerId::new(principal),
-        capabilities: capabilities.iter().map(|capability| capability.to_string()).collect(),
+        capabilities: capabilities
+            .iter()
+            .map(|capability| capability.to_string())
+            .collect(),
         context_ids: Vec::new(),
         shared_access: false,
         expires_at: None,
@@ -789,7 +833,9 @@ async fn knowledge_write_then_read_by_revision_answers_the_stored_entry() {
         "the list carries the written entry beside the carrier"
     );
     assert!(
-        listed.iter().any(|entry| entry.entry_id == created.carrier_entry_id),
+        listed
+            .iter()
+            .any(|entry| entry.entry_id == created.carrier_entry_id),
         "the list reads the Mind's own collection, carrier included"
     );
 }
@@ -801,13 +847,19 @@ async fn a_stale_revision_refuses_stored_revision_stale() {
     let created = ok(minds::create(&store, &request(OWNER)).await);
     let handle = ok(Mind::open(&store, &owner, &created.id).await);
 
-    ok(handle.knowledge_put(entry("ke_fact", "fact one"), None).await);
+    ok(handle
+        .knowledge_put(entry("ke_fact", "fact one"), None)
+        .await);
     ok(handle
         .knowledge_put(entry("ke_fact", "fact two"), Some(1))
         .await);
 
     assert_eq!(
-        reject_code(handle.knowledge_put(entry("ke_fact", "fact three"), Some(1)).await),
+        reject_code(
+            handle
+                .knowledge_put(entry("ke_fact", "fact three"), Some(1))
+                .await
+        ),
         SpokeRejectCode::StoredRevisionStale,
         "a put against a moved revision refuses the store's own stale refusal"
     );
@@ -826,12 +878,20 @@ async fn a_caller_without_knowledge_write_is_refused_and_the_row_is_untouched() 
         .await);
 
     let reader = CallerId::new("caller_reader");
-    grant(&store, created.id.as_str(), "caller_reader", &["knowledge_read"]).await;
+    grant(
+        &store,
+        created.id.as_str(),
+        "caller_reader",
+        &["knowledge_read"],
+    )
+    .await;
     let reader_handle = ok(Mind::open(&store, &reader, &created.id).await);
 
-    let refuse = reject_of(reader_handle
-        .knowledge_put(entry("ke_fact", "defaced"), Some(1))
-        .await);
+    let refuse = reject_of(
+        reader_handle
+            .knowledge_put(entry("ke_fact", "defaced"), Some(1))
+            .await,
+    );
     assert_eq!(
         refuse.code,
         SpokeRejectCode::NotAuthorized,
@@ -858,7 +918,13 @@ async fn a_caller_without_knowledge_read_reads_nothing() {
         .await);
 
     let writer = CallerId::new("caller_writer");
-    grant(&store, created.id.as_str(), "caller_writer", &["knowledge_write"]).await;
+    grant(
+        &store,
+        created.id.as_str(),
+        "caller_writer",
+        &["knowledge_write"],
+    )
+    .await;
     let writer_handle = ok(Mind::open(&store, &writer, &created.id).await);
 
     assert_eq!(
@@ -1131,7 +1197,16 @@ async fn deliberate_without_a_space_wide_recall_grant_is_refused_and_writes_noth
     )
     .await;
     let target = cognition_target(&created.carrier_entry_id);
-    let refuse = reject_of(deliberate(&store, &knowledge_only, &created.id, &target, Arc::new(SettlingReasoner)).await);
+    let refuse = reject_of(
+        deliberate(
+            &store,
+            &knowledge_only,
+            &created.id,
+            &target,
+            Arc::new(SettlingReasoner),
+        )
+        .await,
+    );
     assert_eq!(
         refuse.code,
         SpokeRejectCode::NotAuthorized,
@@ -1154,7 +1229,16 @@ async fn an_unsettled_intent_in_another_subject_refuses_deliberate() {
     settle_never(&store, created.id.as_str(), "subj_other").await;
 
     let target = cognition_target(&created.carrier_entry_id);
-    let refuse = reject_of(deliberate(&store, &owner, &created.id, &target, Arc::new(SettlingReasoner)).await);
+    let refuse = reject_of(
+        deliberate(
+            &store,
+            &owner,
+            &created.id,
+            &target,
+            Arc::new(SettlingReasoner),
+        )
+        .await,
+    );
     assert_eq!(refuse.code, SpokeRejectCode::InternalError);
     let details = refuse.details.as_ref().expect("structured details");
     assert_eq!(
@@ -1182,7 +1266,16 @@ async fn a_verdict_citing_a_memory_record_is_refused() {
     let handle = ok(Mind::open(&store, &owner, &created.id).await);
 
     let target = cognition_target(&created.carrier_entry_id);
-    let refuse = reject_of(deliberate(&store, &owner, &created.id, &target, Arc::new(CitingReasoner)).await);
+    let refuse = reject_of(
+        deliberate(
+            &store,
+            &owner,
+            &created.id,
+            &target,
+            Arc::new(CitingReasoner),
+        )
+        .await,
+    );
     assert_eq!(
         refuse.code,
         SpokeRejectCode::InternalError,
@@ -1279,11 +1372,17 @@ async fn a_space_level_verdict_settles_with_the_mind_context_and_derives_its_sta
     let created = ok(minds::create(&store, &request(OWNER)).await);
     let target = cognition_target(&created.carrier_entry_id);
 
-    let outcome = ok(deliberate(&store, &owner, &created.id, &target, Arc::new(PriorBasisReasoner)).await);
+    let outcome = ok(deliberate(
+        &store,
+        &owner,
+        &created.id,
+        &target,
+        Arc::new(PriorBasisReasoner),
+    )
+    .await);
     let mind_state_version = match outcome {
         mindcore_spi::DeliberateOutcome::Settled {
-            mind_state_version,
-            ..
+            mind_state_version, ..
         } => mind_state_version,
         other => panic!("the auto-settled verdict must commit: {other:?}"),
     };
@@ -1368,7 +1467,11 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
     let settled = ok(handle
         .review(&candidate_id, &promote(), "rev-settled-replay")
         .await);
-    assert_eq!(value_of(&settled)["status"], "committed", "the first review settles");
+    assert_eq!(
+        value_of(&settled)["status"],
+        "committed",
+        "the first review settles"
+    );
 
     // An unsettled intent for the same subject, as a crashed served absorb would leave one.
     settle_never(&store, created.id.as_str(), SUBJECT).await;
@@ -1380,8 +1483,16 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
         value_of(&settled),
         "the settled key replays beside the same subject's unsettled intent"
     );
-    assert_eq!(count_records(&store.pool()).await, 1, "no second record is staged");
-    assert_eq!(count_intents(&store.pool()).await, 2, "no second replay intent");
+    assert_eq!(
+        count_records(&store.pool()).await,
+        1,
+        "no second record is staged"
+    );
+    assert_eq!(
+        count_intents(&store.pool()).await,
+        2,
+        "no second replay intent"
+    );
 
     // The same key also replays beside an intent of another subject in the same space.
     settle_never(&store, created.id.as_str(), "subj_elsewhere").await;
@@ -1393,7 +1504,11 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
         value_of(&settled),
         "the settled key replays beside another subject's unsettled intent"
     );
-    assert_eq!(count_records(&store.pool()).await, 1, "still no second record");
+    assert_eq!(
+        count_records(&store.pool()).await,
+        1,
+        "still no second record"
+    );
 }
 
 /// Only the replay bypasses the unsettled-intent withhold: a fresh review — a new key over a
@@ -1421,7 +1536,10 @@ async fn a_fresh_review_is_refused_while_the_subjects_intent_is_unsettled() {
         "the withhold travels as the adapter's own refusal"
     );
     assert_eq!(
-        reject.details.as_ref().and_then(|details| details.get("reason")),
+        reject
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason")),
         Some(&json!("UNRECONCILED")),
         "a fresh review is withheld while the subject's intent is unsettled: {reject:?}"
     );
@@ -1463,10 +1581,7 @@ async fn the_public_publisher_refuses_a_target_outside_its_root() {
         "content": "escape",
     })]);
     assert!(absolute.is_err(), "an absolute target is refused");
-    assert!(
-        !escaped.exists(),
-        "nothing was written outside the root"
-    );
+    assert!(!escaped.exists(), "nothing was written outside the root");
 
     let parent = publisher(&[json!({
         "path": "../escaped.md",
@@ -1546,16 +1661,12 @@ async fn the_public_publisher_never_writes_through_a_preplaced_temporary_symlink
     let file = root.join(target_path);
     let parent = file.parent().expect("the target parent").to_path_buf();
     std::fs::create_dir_all(&parent).expect("create the target parent");
-    let temporary = parent.join(format!(
-        ".journal-{}-{:016x}.tmp",
-        std::process::id(),
-        {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            file.hash(&mut hasher);
-            hasher.finish()
-        }
-    ));
+    let temporary = parent.join(format!(".journal-{}-{:016x}.tmp", std::process::id(), {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        file.hash(&mut hasher);
+        hasher.finish()
+    }));
     std::os::unix::fs::symlink(outside.join("victim.md"), &temporary)
         .expect("pre-place the temporary symlink");
 
@@ -1615,8 +1726,8 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
     let (release, is_released) = tokio::sync::oneshot::channel::<()>();
     let is_released = std::sync::Mutex::new(Some(is_released));
     let parked_root = journal_root.clone();
-    let parked = ok(Mind::open(&store, &owner, &created.id).await)
-        .with_journal_publisher(move |targets| {
+    let parked =
+        ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
             journal_dir(&parked_root)(targets)?;
             entered.send(()).expect("signal the publisher entered");
             let receiver = is_released
@@ -1629,15 +1740,16 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         });
 
     let review = tokio::spawn(async move {
-        parked.review(&candidate_id, &promote(), "rev-offworker").await
+        parked
+            .review(&candidate_id, &promote(), "rev-offworker")
+            .await
     });
 
     // Wait for the publisher's entry signal on a blocking thread — the receive itself is the
     // observed state: it completes exactly when the publisher is inside its flush, however the
     // scheduler gets there.
-    let entry = tokio::task::spawn_blocking(move || {
-        is_entered.recv().expect("the publisher entry signal")
-    });
+    let entry =
+        tokio::task::spawn_blocking(move || is_entered.recv().expect("the publisher entry signal"));
     entry.await.expect("the entry signal arrived");
 
     // The probe: spawned after the entry signal, a bare unit of executor work. Its completion
@@ -1694,7 +1806,9 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(30));
             if !disarm.load(std::sync::atomic::Ordering::SeqCst) {
-                eprintln!("TIMEOUT: the publication handshake never completed — a signal never arrived");
+                eprintln!(
+                    "TIMEOUT: the publication handshake never completed — a signal never arrived"
+                );
                 std::process::exit(2);
             }
         });
@@ -1715,8 +1829,8 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     let first_finished = Arc::new(std::sync::Mutex::new(false));
     let finished_pub = first_finished.clone();
     let parked_root = journal_root.clone();
-    let parked = ok(Mind::open(&store, &owner, &created.id).await)
-        .with_journal_publisher(move |targets| {
+    let parked =
+        ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
             journal_dir(&parked_root)(targets)?;
             entered.send(()).expect("signal the publisher entered");
             let receiver = is_released
@@ -1731,14 +1845,15 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
 
     let cancelled_id = candidate_id.clone();
     let review = tokio::spawn(async move {
-        parked.review(&cancelled_id, &promote(), "rev-cancelled").await
+        parked
+            .review(&cancelled_id, &promote(), "rev-cancelled")
+            .await
     });
 
     // Wait for the publisher's entry signal, then cancel. The receive itself is the observed
     // state: it completes exactly when the publisher is inside its flush.
-    let entry = tokio::task::spawn_blocking(move || {
-        is_entered.recv().expect("the publisher entry signal")
-    });
+    let entry =
+        tokio::task::spawn_blocking(move || is_entered.recv().expect("the publisher entry signal"));
     entry.await.expect("the entry signal arrived");
     review.abort();
 
@@ -1750,7 +1865,10 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     // holding it, never merely unscheduled.
     let witness_pool = store.pool();
     let witness = tokio::spawn(async move {
-        let connection = witness_pool.acquire().await.expect("the witness acquisition");
+        let connection = witness_pool
+            .acquire()
+            .await
+            .expect("the witness acquisition");
         drop(connection);
     });
     let sentinel = tokio::spawn(async {});
@@ -1896,7 +2014,9 @@ async fn cognition_read_reads_only_the_collection_of_the_admitted_mind() {
     });
     let appended = mindcore_base::cognition::append_cognition_record(&second_carrier, poisoned)
         .expect("the poisoned record validates in its own carrier");
-    let revision = second_carrier.revision.expect("a stored carrier has a revision");
+    let revision = second_carrier
+        .revision
+        .expect("a stored carrier has a revision");
     ok(second_handle.knowledge_put(appended, Some(revision)).await);
 
     // The first Mind's read is untouched by anything the second collection holds.
