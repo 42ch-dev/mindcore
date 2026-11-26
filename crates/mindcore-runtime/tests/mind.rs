@@ -1179,6 +1179,95 @@ async fn cognition_read_answers_none_then_the_judgment_and_mind_state() {
     );
 }
 
+/// The facade is convenience, not a sandbox: `cognition_read` applies no disclosure predicate, so
+/// an `owner`-private carrier's judgment stays readable by the caller the space-wide
+/// `knowledge_read` grant admits — the same caller `knowledge_get` hands the carrier to — while
+/// the served adapter read hides it. The disclosure duty lives on the served surface, where a
+/// peer's viewpoint exists; the spec records the split.
+#[tokio::test]
+async fn cognition_read_serves_an_owner_private_carrier_to_the_in_process_caller() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
+    let revision = carrier.revision.expect("a stored carrier has a revision");
+    let record = json!({
+        "kind": "belief",
+        "order": 1,
+        "record_id": "cog_hidden",
+        "holder": {
+            "kind": "knowledge_entry",
+            "namespace": "mindcore",
+            "id": created.carrier_entry_id,
+        },
+        "target": {
+            "carrier": {
+                "kind": "knowledge_entry",
+                "namespace": "mindcore",
+                "id": created.carrier_entry_id,
+            },
+            "target_id": "prop_north_gate",
+            "kind": "proposition",
+        },
+        "assessor": {
+            "kind": "principal",
+            "namespace": "mindcore",
+            "id": OWNER,
+        },
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [{ "kind": "memory_record", "namespace": "mindcore", "id": "rec_gate" }],
+        },
+        "assessment_context": { "context_id": created.id.as_str() },
+        "assessed_at": "2026-11-20T09:00:00Z",
+        "effective_at": "2026-11-20T09:00:00Z",
+        "view": "current",
+        "q": {
+            "value": 0.8,
+            "assertion": "belief_attribution",
+            "method": "two_witness_reports",
+            "calibration": "uncalibrated",
+        },
+        "extensions": {},
+    });
+    let judged = mindcore_base::cognition::append_cognition_record(&carrier, record)
+        .expect("one valid record appends to the carrier");
+
+    // Mark the judging carrier `owner`-private through the same knowledge write path.
+    let mut payload = serde_json::to_value(&judged).expect("the carrier serializes");
+    payload["disclosure"] = json!("owner-private");
+    payload["owner"] = json!(OWNER);
+    let private: KnowledgeEntry = serde_json::from_value(payload).expect("the carrier decodes");
+    ok(handle.knowledge_put(private, Some(revision)).await);
+
+    let cognition = ok(handle.cognition_read().await)
+        .expect("an owner-private carrier still answers the in-process caller");
+    assert_eq!(
+        cognition.records.len(),
+        1,
+        "the facade applies no disclosure predicate: the judgment serves"
+    );
+    assert_eq!(cognition.records[0]["record_id"], json!("cog_hidden"));
+    assert_eq!(
+        cognition.mind_state["holder_entry_id"],
+        json!(created.carrier_entry_id),
+        "the derived state descends from the Mind's carrier"
+    );
+    let sibling = serde_json::to_value(ok(handle
+        .knowledge_get(handle.carrier_entry_id(), None)
+        .await))
+    .expect("the carrier serializes");
+    assert_eq!(
+        sibling["disclosure"],
+        json!("owner-private"),
+        "the sibling read returns the same owner-private carrier in full, which is why the facade \
+         does not filter one read and not the other"
+    );
+}
+
 #[tokio::test]
 async fn deliberate_without_a_space_wide_recall_grant_is_refused_and_writes_nothing() {
     let (_dir, store) = fixture().await;

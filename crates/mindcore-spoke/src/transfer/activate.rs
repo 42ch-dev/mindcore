@@ -969,7 +969,7 @@ impl MemoryAdapter {
         };
         let staged = decode_staged(&payload, &op.space, principal_id)?;
         recheck(&self.repository, tx, &op.space, &staged).await?;
-        let caller_grants = admission::grants(&self.repository, tx, &op.space).await?;
+        let caller_grants = admission::grants(tx, &op.space).await?;
         not_subsumed(
             &staged.grants,
             &caller_grants,

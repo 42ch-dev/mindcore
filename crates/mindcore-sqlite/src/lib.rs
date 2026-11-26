@@ -15,7 +15,7 @@ pub use knowledge::{
     RoutedKnowledgeStore, ScopedKnowledgeStore, SERVED_KNOWLEDGE_LIST_LIMIT,
 };
 pub use repository::{
-    MemoryExportRow, MemoryImportRow, MemoryReceiptSummary, SqliteMemoryRepository,
-    SqliteRepositoryError,
+    decodable_grants, MemoryExportRow, MemoryImportRow, MemoryReceiptSummary,
+    SqliteMemoryRepository, SqliteRepositoryError,
 };
 pub use store::MindStore;

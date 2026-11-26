@@ -23,21 +23,24 @@ mod workflows;
 
 pub use serve::{ServedMemory, TransferService};
 pub use transfer::OPERATIONS as TRANSFER_OPERATIONS;
-pub use workflows::MemoryWorkflowBinding;
+pub use workflows::{admitted_carrier_entry, MemoryWorkflowBinding};
 
 pub(crate) use mindcore_base::ids::mint;
 
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use spoke_operations::{GrantRequirement, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    knowledge_entry_visible_to_viewpoint, GrantRequirement, SpokeReject, SpokeRejectCode,
+    SpokeResult,
+};
 use spoke_schemas::Principal;
 use sqlx::{Sqlite, Transaction};
 
 use mindcore_base::ids::{SpaceId, SubjectId};
 use mindcore_base::ir::{MemoryRepository, ReceiptFailure, ReceiptState, ReviewReceiptIr};
 use mindcore_spi::SpiError;
-use mindcore_sqlite::SqliteMemoryRepository;
+use mindcore_sqlite::{read_entry, SqliteMemoryRepository};
 
 use crate::admission::Op;
 use crate::reject::{AResult, Reject};
@@ -294,10 +297,11 @@ impl MemoryAdapter {
     ) -> Result<(), SpiError> {
         let caller = principal_id(principal);
         let space = SpaceId::new(space_id.to_string());
-        let rows = admission::grants(&self.repository, tx, &space)
+        let now = Utc::now();
+        let rows = admission::grants(tx, &space)
             .await
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
-        let grants = admission::wire_grants(&rows)
+        let grants = admission::live_wire_grants(&rows, now)
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
         for capability in capabilities {
             let requirement = GrantRequirement {
@@ -307,7 +311,7 @@ impl MemoryAdapter {
                 reads_shared: false,
                 subject_all: false,
             };
-            if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
+            if !admission::covered(&grants, caller, space.as_str(), now, &requirement) {
                 return Err(SpiError::Settlement(
                     Reject::not_authorized(format!(
                         "principal {caller} holds no live {capability} grant in space {}",
@@ -318,6 +322,92 @@ impl MemoryAdapter {
             }
         }
         Ok(())
+    }
+
+    /// Read one Mind's judgment over the caller's transaction: admission first, then the carrier
+    /// the registry row names, then the derived `MindState` — all inside `tx`, so a revocation
+    /// cannot land between admission and the read. Admission is [`workflows::admitted_carrier`]:
+    /// the caller's own grant rows and the registry row, read together, answering one fixed
+    /// refusal with no details whether the Mind is absent or the caller was never admitted.
+    /// A fresh carrier answers `records: []` and `mind_state: null`; a stored carrier that cannot
+    /// be derived is a terminal `InternalError`, matching the facade's `cognition_read`, because
+    /// the carrier passed validation at its write and repeating the read cannot change it. The
+    /// recall knowledge slot's disclosure predicate applies here too, viewpoint-free: an
+    /// `owner`-private carrier answers the same empty view a Mind that has judged nothing
+    /// answers, and the derived `MindState` sees the filtered set. The transaction is the
+    /// caller's to end.
+    pub async fn read_cognition(
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+    ) -> Result<Cognition, SpokeReject> {
+        let carrier = workflows::admitted_carrier(tx, principal_id(principal), space_id).await?;
+        let carrier_entry =
+            match read_entry(tx, &carrier.collection, &carrier.carrier_entry_id).await {
+                SpokeResult::Ok(entry) => entry,
+                SpokeResult::Reject(reject) => return Err(reject),
+            };
+        let revision = match carrier_entry.revision {
+            Some(revision) => revision,
+            None => {
+                return Err(Reject::terminal(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "carrier {} holds no assigned revision",
+                        carrier.carrier_entry_id
+                    ),
+                )
+                .into_spoke())
+            }
+        };
+        // The knowledge slot's disclosure predicate, viewpoint-free: admission and the
+        // `knowledge_read` coverage above stay first, but a carrier they hide — an
+        // `owner`-private one — answers the empty view, and no derivation runs on its records.
+        if !knowledge_entry_visible_to_viewpoint(&carrier_entry, None) {
+            return Ok(Cognition {
+                carrier_revision: revision,
+                records: Vec::new(),
+                mind_state: Value::Null,
+            });
+        }
+        let view = match mindcore_base::cognition::derive_mind_state(&carrier_entry) {
+            Ok(view) => view,
+            Err(mindcore_base::cognition::MindError::NoRecords) => {
+                return Ok(Cognition {
+                    carrier_revision: revision,
+                    records: Vec::new(),
+                    mind_state: Value::Null,
+                })
+            }
+            Err(error) => {
+                return Err(Reject::terminal(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "carrier {} cannot be derived: {error}",
+                        carrier.carrier_entry_id
+                    ),
+                )
+                .into_spoke())
+            }
+        };
+        let mind_state = match mindcore_base::cognition::mind_state_value(&view, space_id) {
+            Ok(mind_state) => mind_state,
+            Err(error) => {
+                return Err(Reject::terminal(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "the mind state of {} cannot be projected: {error}",
+                        carrier.carrier_entry_id
+                    ),
+                )
+                .into_spoke())
+            }
+        };
+        Ok(Cognition {
+            carrier_revision: revision,
+            records: view.records,
+            mind_state,
+        })
     }
 }
 

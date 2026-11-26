@@ -745,7 +745,10 @@ impl Mind {
     /// authorizes exactly the Mind that is read. A fresh carrier answers `None`; after one
     /// record, the judgment's records and the derived `MindState`. The record list is the one
     /// `derive_mind_state` already owns: the validated view is the single extraction, projected
-    /// once into the wire state and moved into the answer.
+    /// once into the wire state and moved into the answer. The facade is convenience, not a
+    /// sandbox: it applies no disclosure predicate, because `knowledge_get` on the same handle
+    /// returns the stored carrier verbatim and an in-process caller already holds the store.
+    /// Disclosure is the served surface's duty; [`MemoryAdapter::read_cognition`] applies it.
     pub async fn cognition_read(&self) -> SpokeResult<Option<Cognition>> {
         let mut transaction = match self.pool.begin().await {
             Ok(transaction) => transaction,

@@ -1,0 +1,65 @@
+# ADR: One served surface serves many Minds
+
+Status: implemented — Stage 1 serves many Minds from one surface, each call reached by its Mind id and admitted before any existence check; the three operations that cannot yet name a Mind stay un-routed until Stage 2
+Date: 2026-11-25
+Class: architecture
+Supersedes: `2026-11-21-principal-routing.md` — its principal-keyed route map is removed
+Related: `2026-11-21-spoke-017-serving-cohort.md`, `2026-11-25-mind-is-one-memory-space.md`, `.agents/specs/architecture/serving-principal-routing.md`, `.agents/specs/architecture/serving-seam.md`
+
+## Problem
+
+A served surface is assembled around one knowledge collection. `ServeFaces.scope_id` was "the one configured route", `ServeFaces.knowledge` was "the collection that route serves", and `ServeFaces.admission` mapped each peer to one scope. `port.knowledge.get`, `port.knowledge.put` and the list operation read and wrote that collection for every admitted peer, `history.*` served the same store, and `knowledge.adopt` wrote it. The two routed workflows reached a collection through `ServeFaces.workflow_routes`, a host-configured map from principal id to collection that was fixed for the surface's lifetime.
+
+So one process could not let a peer operate several Minds or list them: a host that wanted more than one Mind assembled one surface per Mind. A peer had no wire value that named a Mind; the workflow tools named memory coordinates, and every `deliberate` named its carrier by `holder`. And because reach was host configuration, a Mind created after assembly was unreachable until the surface was rebuilt.
+
+## Decision
+
+One served surface serves many Minds, reached by Mind id, in two stages with a recorded fallback. The owner settled the shape on 2026-11-25 and stated that SPOKE 0.19.0 will carry the three SPOKE-side items the second stage needs.
+
+The Mind id rides the selectors SPOKE requests already carry: `space_id` on a memory request and `scope_id` on a knowledge `Scope`. A Mind's id is its space id (`2026-11-25-mind-is-one-memory-space.md`), so no new wire member is needed.
+
+**Resolution and admission.** The wire never names a collection. For each call Mindcore resolves the Mind id in the registry row — one lookup to a collection and a carrier — admits the (principal, Mind) pair, and only then binds the collection to a port.
+
+- Memory: a live grant covering the operation, in that space.
+- Workflow tools, each where it reaches the adapter (`crates/mindcore-spoke/src/workflows.rs`): `recall_context` checks `recall`, and `knowledge_read` only to fill its knowledge slot. `absorb` checks `capture`, `review` to read the candidate and `recall` for its page, then `review` with `records_write` on one grant to review, `records_write` to update and `review` to dismiss. `deliberate` checks `recall` over a `subject_all` page, `knowledge_read` and `knowledge_write`.
+
+**Refuse, do not filter.** Kept (`docs/concepts.md`). Each call admits one Mind, and the handler binds a port to the resolved collection, so no result mixes two Minds. Mind admission precedes every existence check: an unknown Mind id and a Mind the peer holds no grant for answer one `NOT_AUTHORIZED`, with no `details`, before any subject, entry or carrier is read (`crates/mindcore-spoke/src/admission.rs`, `admit_mind`).
+
+**A frozen Mind.** A Mind that is not active is frozen (`2026-11-25-mind-is-one-memory-space.md`), and it answers by SPOKE's freeze semantics: a caller without a grant in its space is refused as an unknown Mind is, because the grant check comes before the freeze check. A caller with a grant reads. `gate` answers `SpaceFrozen` only to an operation that is freeze-gated and outside the maintenance allowlist, which SPOKE defines, and serves the operations that are not freeze-gated.
+
+**Stage 1, no SPOKE change.** Stage 1 exposes Mind-level convenience operations only and composes none of the operations that are not Mind-routed: until each of `port.knowledge.*`, `history.*` and `knowledge.adopt` is served per Mind, the surface does not compose it, because every operation is to hang off the Mind entity (owner, 2026-11-25).
+
+- `memory.spaces.list` lists Minds: the registry's join over the caller's live grants, not every space.
+- The memory family and the workflow tools name a Mind through the `space_id` they already carry; no member is added and none is renamed.
+- The workflow tools' one argument change is that `deliberate` loses `holder`, because the Mind's record names the carrier. The facade's `deliberate` takes no `subject_id` (owner, 2026-11-25); the served tool keeps its `subject_id`, its subject-level recall and its unsettled-intent check.
+- A new `tools.mindcore.read_cognition` takes `space_id`, as the memory operations do, and returns that Mind's current judgment and derived `MindState`.
+- One `NOT_AUTHORIZED` answers an unknown or unadmitted Mind before any existence check, a frozen Mind included.
+
+**Stage 2, three SPOKE-side items.** A1 is request-scoped admission: the admission callback receives the `scope_id` a request declares. It is additive and source-compatible. A2 is an optional `scope` on `port.knowledge.get` and `port.knowledge.put`, with a negotiable marker saying the responder honours it; it is a wire change, so a new SPOKE cohort. A3 is `memory.spaces.create`, the operation a SPOKE peer creates a Mind through. A1 and A2 turn on knowledge, history and adoption per Mind; A3 turns on a peer's creation of a Mind. SPOKE 0.19.0 will carry A1, A2 and A3, and the caller names the `space_id` (owner, 2026-11-25).
+
+**Creating a Mind.** A library caller creates a Mind through `create`, `list` and `get` in `crates/mindcore-runtime`, which need no SPOKE change and are built; the facade (`2026-11-25-three-delivery-forms.md`) builds on them. A SPOKE peer creates one through `memory.spaces.create`, which is A3 of Stage 2. On a Mindcore host both run the same create and write the default grant set (`2026-11-25-create-default-grant-set.md`). Until this repository pins that cohort, a peer operates only Minds created through the library.
+
+**The fallback.** Design T is the fallback: every Mind-scoped operation is a `tools.mindcore.*` tool whose argument object starts with `mind_id`, with no SPOKE change. SPOKE and Mindcore have the same owner, so whether the fallback is taken is the owner's direct decision, and it needs no trigger. `mind_id` is there a tool argument of Design T's own, not a renamed SPOKE member: every operation becomes a new tool, and the argument object is that tool's to define.
+
+**Records and pages this changes.** `ServeFaces.workflow_routes` is replaced by the registry's Mind-to-collection row, which retires the route `2026-11-21-principal-routing.md` records. Its rules that outlive the map hold per Mind: the wire never names a collection, a refusal carries no target details, and a route never substitutes for a live grant. `.agents/specs/architecture/serving-principal-routing.md` gains the request's Mind id as the route input and loses the map, and the knowledge page `.agents/knowledge/architecture-patterns/serving-principal-routing.md` describes that map and goes stale with it. `.agents/specs/architecture/serving-seam.md` changes the tool argument table — the `deliberate` row loses `holder`, the `read_cognition` row is added — and records the composition Stage 1 ships.
+
+**Evidence.** `.agents/specs/architecture/serving-{principal-routing,seam}.md` state the routing and the served ABI; `crates/mindcore-runtime/tests/loopback.rs` runs the signed two-Mind/two-peer loopback, the unadmitted-equals-absent refusal and the frozen cases; `crates/mindcore-spoke/tests/memory_adapter.rs` pins the admission-first refusal across every Mind-level read path and the registry-derived `memory.spaces.list`.
+
+## Alternatives considered
+
+- **Design T: every Mind-scoped operation a `tools.mindcore.*` tool, no SPOKE change.** Rejected as the primary route and kept as the fallback. It restates `port.knowledge.*`, `history.*` and `knowledge.adopt` as six product tools, which is a second operation surface inside the tool namespace and reverses the migration that replaced `tools.mindcore.adopt` with `knowledge.adopt` (`.agents/specs/architecture/serving-seam.md`). The surface would still carry the per-peer `port.knowledge.*` path beside those tools, and a tool's arguments pass outside SPOKE's scope and cognition gates. The chosen route rides selectors SPOKE already has and keeps the peer on standard operations.
+- **One responder per Mind, no SPOKE change.** Rejected: it is not one surface serving many Minds. Each Mind gets its own surface, manifest, handler set and one signed session per peer, a peer has no way to list Minds, and the hello manifest repeats for every (peer, Mind) pair. Whether an unadmitted Mind's address differs from an unknown one is left to the host's transport.
+- **One collection, with Minds separated per entry, no SPOKE change.** Rejected: SPOKE's scope predicate has no entry-ownership term and an admitted scope is fixed per peer, so two peers could not be held to different Minds. It also gives up the one-collection-per-Mind binding of `2026-11-25-mind-is-one-memory-space.md`.
+- **Ship no peer form until the SPOKE-side items exist.** Rejected: it ties a first release to a SPOKE release Mindcore does not control. Stage 1 needs no SPOKE change and gives a peer per-Mind memory and cognition; what it costs is that a peer gets no `port.knowledge.*`, `history.*` or `knowledge.adopt` until Stage 2, because a many-Mind surface composes none of them until each is served per Mind. The one collection per peer those operations answer from today is the state this decision replaces, not what Stage 1 ships. The third round's release timing makes a release without the peer capabilities impossible until SPOKE 0.19.0; that is a release decision and does not adopt this alternative.
+
+## Consequences
+
+- **Stage 1 ships per-Mind memory and cognition only.** `port.knowledge.*`, `history.*` and `knowledge.adopt` are composed only once each is served per Mind, which A1 and A2 turn on. Today they answer from a surface's one collection, which no Mind owns; that is the state Stage 2 replaces and is not carried into a many-Mind surface. No release ships Stage 1 alone: the first Mind-centric release follows SPOKE 0.19.0 and ships Stage 1 and Stage 2 as one minor (owner, 2026-11-25).
+- **The argument change breaks existing `deliberate` callers.** `holder` was a required member of the old arguments and the argument object is closed, so a peer built on the old `deliberate` fails after the change. `recall_context` and `absorb` arguments do not change. It is a Mindcore release change, not a SPOKE one.
+- **A2 without its marker misroutes silently.** A responder that ignores the new `scope` drops it, and the read lands in the peer's default collection. The marker is part of the ask and is not optional for Mindcore.
+- **Admission stays synchronous and bounded.** The registry lookup behind a Mind admission runs under the responder's serve budget and must fit inside it.
+- **Closing the existence gap changed answers tests pinned.** The memory path answered `NOT_FOUND` for an unknown space; every Mind-level read path now answers the one admission refusal, and the adapter and loopback assertions changed with it.
+- **Settled: a many-Mind surface composes none of the operations that are not Mind-routed.** Until each of `port.knowledge.*`, `history.*` and `knowledge.adopt` is served per Mind, the surface does not compose it, because every operation is to hang off the Mind entity (owner, 2026-11-25).
+- **Undecided: the grant rule for a knowledge put that carries cognition records.** `port.knowledge.put` appends `modules.cognition.records` on the admitted scope alone (`crates/mindcore-sqlite/src/knowledge.rs`), where `deliberate` requires `knowledge_write`. The asymmetry exists today, and routing knowledge per Mind would carry it to every admitted Mind. The rule is settled before knowledge is routed per Mind.
+- **A3 is not in the pinned SPOKE cohort yet.** `memory.spaces.create` does not exist in 0.18.1, and SPOKE 0.19.0 will carry it (owner, 2026-11-25). Until this repository pins that cohort, a peer can operate Minds and cannot create one. On a Mindcore host the operation runs the same create as the library, `mindcore_sqlite::minds::create`, which borrows the caller's transaction.
+- **Design T, if taken, costs more than Stage 2**: eight new tools, six of which restate standard operations, and a second knowledge path on the surface.

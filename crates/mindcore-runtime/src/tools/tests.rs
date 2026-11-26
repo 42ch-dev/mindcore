@@ -130,8 +130,237 @@ fn admission() -> MemoryAdmission {
     })
 }
 
-fn tools(fake: Arc<Fake>) -> WorkflowTools {
-    WorkflowTools::new(fake, admission(), MindProviders::default())
+/// A store pool with the `minds` table the carrier resolution reads: the handler looks the
+/// carrier entry id up in the registry row of the request's space, so the probe seeds the one
+/// row the tests name.
+async fn registry_pool() -> SqlitePool {
+    // One connection only: every pooled connection opens its own in-memory database, so the
+    // registry row must live on the single connection the probe serves.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite");
+    sqlx::query(
+        "CREATE TABLE minds (space_id TEXT PRIMARY KEY, knowledge_collection TEXT NOT NULL, carrier_entry_id TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create minds");
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES ('spc_1', 'wren', 'ke_wren')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed mind row");
+    // The admission probe reads live grants in the request's space; the probe principal holds a
+    // space-wide `knowledge_read` grant here.
+    sqlx::query(
+        "CREATE TABLE memory_grants (\
+            grant_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, subject_id TEXT, \
+            principal_id TEXT NOT NULL, capabilities_json TEXT NOT NULL, \
+            context_ids_json TEXT NOT NULL, shared_access INTEGER NOT NULL, \
+            expires_at TEXT, revoked_at TEXT, revision INTEGER NOT NULL, created_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create memory_grants");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_probe', 'spc_1', NULL, 'prn_driver', '[\"knowledge_read\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed probe grant");
+    // The carrier entry the registry row names, holding no judgment yet: the cognition read
+    // resolves `(collection, carrier_entry_id)` from the row and reads this entry through it.
+    sqlx::query(
+        "CREATE TABLE knowledge_entries (collection TEXT NOT NULL, entry_id TEXT NOT NULL, \
+         revision INTEGER NOT NULL, payload TEXT NOT NULL, superseded_by TEXT, \
+         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (collection, entry_id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("create knowledge_entries");
+    sqlx::query(
+        "INSERT INTO knowledge_entries (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_wren', 1, ?, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(
+        serde_json::json!({
+            "schema_version": 1,
+            "entry_id": "ke_wren",
+            "entry_type": "note",
+            "canonical_name": "wren's carrier",
+            "status": "confirmed",
+            "revision": 1,
+            "body": { "summary": "what this holder currently holds" },
+            "modules": { "cognition": { "records": [], "world_facts": [], "extensions": {} } },
+            "extensions": {},
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the carrier entry");
+    // One committed judgment on the first Mind's carrier, and a second Mind whose carrier holds
+    // none: the cognition read is exercised on both sides of `mind_state: null`.
+    sqlx::query(
+        "CREATE TABLE cognition_records (collection TEXT NOT NULL, entry_id TEXT NOT NULL, \
+         append_seq INTEGER NOT NULL, record_id TEXT NOT NULL, payload TEXT NOT NULL, \
+         append_prior_shape INTEGER, PRIMARY KEY (collection, entry_id, append_seq))",
+    )
+    .execute(&pool)
+    .await
+    .expect("create cognition_records");
+    sqlx::query(
+        "INSERT INTO cognition_records (collection, entry_id, append_seq, record_id, payload, \
+         append_prior_shape) VALUES ('wren', 'ke_wren', 1, 'cog_1', ?, NULL)",
+    )
+    .bind(
+        serde_json::to_value(cognition())
+            .expect("the cognition fixture serializes")
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the committed judgment");
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
+         VALUES ('spc_2', 'mora', 'ke_mora')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the fresh mind row");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_fresh', 'spc_2', NULL, 'prn_driver', '[\"knowledge_read\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the fresh grant");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, superseded_by, created_at, updated_at) \
+         VALUES ('mora', 'ke_mora', 1, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(
+        serde_json::json!({
+            "schema_version": 1,
+            "entry_id": "ke_mora",
+            "entry_type": "note",
+            "canonical_name": "mora's carrier",
+            "status": "confirmed",
+            "revision": 1,
+            "body": { "summary": "a holder that has not judged anything yet" },
+            "modules": { "cognition": { "records": [], "world_facts": [], "extensions": {} } },
+            "extensions": {},
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the fresh carrier entry");
+    // A Mind the probe's principal holds no grant in: the admission refusal is the same answer
+    // as a space that does not exist, so the read cannot disclose which one was named.
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
+         VALUES ('spc_3', 'ghost', 'ke_ghost')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the ghost mind row");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_ghost', 'spc_3', NULL, 'prn_other', '[\"knowledge_read\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the ghost grant");
+    // A Mind this principal is admitted to — it holds a live grant — but not to a
+    // `knowledge_read`: admission passes and the coverage check is the refusal that answers.
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
+         VALUES ('spc_4', 'ash', 'ke_ash')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the underprivileged mind row");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_recall_only', 'spc_4', NULL, 'prn_driver', '[\"recall\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the underprivileged grant");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, superseded_by, created_at, updated_at) \
+         VALUES ('ash', 'ke_ash', 1, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(
+        serde_json::json!({
+            "schema_version": 1,
+            "entry_id": "ke_ash",
+            "entry_type": "note",
+            "canonical_name": "ash's carrier",
+            "status": "confirmed",
+            "revision": 1,
+            "body": { "summary": "a holder this caller may not read" },
+            "modules": { "cognition": { "records": [], "world_facts": [], "extensions": {} } },
+            "extensions": {},
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the underprivileged carrier entry");
+    // The space rows admission reads: a live grant only ever belongs to a Mind whose space row
+    // and registry row were written with it.
+    sqlx::query(
+        "CREATE TABLE memory_spaces (space_id TEXT PRIMARY KEY, display_name TEXT, \
+         authority_host_id TEXT NOT NULL, authority_generation INTEGER NOT NULL, \
+         status TEXT NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create memory_spaces");
+    sqlx::query(
+        "CREATE TABLE memory_receipts (receipt_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, \
+         status TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create memory_receipts");
+    for space in ["spc_1", "spc_2", "spc_3", "spc_4"] {
+        sqlx::query(
+            "INSERT INTO memory_spaces \
+             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+              created_at) \
+             VALUES (?, NULL, 'host_1', 1, 'active', 1, '2026-11-21T00:00:00Z')",
+        )
+        .bind(space)
+        .execute(&pool)
+        .await
+        .expect("seed the space row");
+    }
+    pool
+}
+
+async fn tools(fake: Arc<Fake>) -> WorkflowTools {
+    tools_over(fake, registry_pool().await).await
+}
+
+async fn tools_over(fake: Arc<Fake>, pool: SqlitePool) -> WorkflowTools {
+    WorkflowTools::new(fake, admission(), MindProviders::default(), pool)
 }
 
 fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
@@ -139,6 +368,17 @@ fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
         SpokeResult::Ok(value) => value,
         SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
     }
+}
+
+/// One refusal rendered the way a peer decodes it from the wire: the code string, the message and
+/// the details, and nothing else.
+fn wire_refusal(reject: &SpokeReject) -> String {
+    json!({
+        "code": reject.code.as_str(),
+        "message": reject.message,
+        "details": reject.details,
+    })
+    .to_string()
 }
 
 fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
@@ -274,7 +514,6 @@ fn deliberate_arguments() -> Value {
     json!({
         "space_id": "spc_1",
         "subject_id": "subj_1",
-        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_wren" },
         "target": {
             "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_gate" },
             "target_id": "prop_gate_closed",
@@ -283,6 +522,11 @@ fn deliberate_arguments() -> Value {
         "evidence": [{ "id": "ev_1", "text": "the north gate closed at dusk" }],
         "timeout_ms": 5000
     })
+}
+
+/// The cognition read names one Mind and nothing else.
+fn cognition_read_arguments(space: &str) -> Value {
+    json!({ "space_id": space })
 }
 
 #[tokio::test]
@@ -296,6 +540,7 @@ async fn recall_context_round_trips_the_pack() {
 
     let value = expect_ok(
         tools(Arc::clone(&fake))
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "recall context",
@@ -327,7 +572,7 @@ async fn absorb_round_trips_every_candidate_status() {
         },
     ]));
 
-    let tool = tools(Arc::clone(&fake));
+    let tool = tools(Arc::clone(&fake)).await;
     let value = expect_ok(
         tool.call(ABSORB, "peer-driver", absorb_arguments()).await,
         "absorb",
@@ -374,7 +619,7 @@ async fn absorb_round_trips_every_candidate_status() {
 #[tokio::test]
 async fn deliberate_round_trips_every_outcome_branch() {
     let fake = Arc::new(Fake::default());
-    let tool = tools(Arc::clone(&fake));
+    let tool = tools(Arc::clone(&fake)).await;
 
     fake.reply_deliberate(Ok(DeliberateOutcome::NoChange {
         verdict: json!({ "recommendation": { "kind": "none" } }),
@@ -467,14 +712,28 @@ async fn deliberate_round_trips_every_outcome_branch() {
         "a no_change outcome carries no draft"
     );
 
+    let seen = fake.seen();
     assert_eq!(
-        fake.seen(),
-        [
-            "deliberate:prn_driver:spc_1:subj_1:5000:ev_1",
-            "deliberate:prn_driver:spc_1:subj_1:5000:ev_1",
-            "deliberate:prn_driver:spc_1:subj_1:5000:ev_1",
-        ]
+        seen.len(),
+        3,
+        "each branch runs the workflow once: {seen:?}"
     );
+    for entry in &seen {
+        let fields: Vec<&str> = entry.split(':').collect();
+        assert_eq!(
+            &fields[..4],
+            ["deliberate", "prn_driver", "spc_1", "subj_1"],
+            "{entry}"
+        );
+        assert_eq!(fields[5], "ev_1", "{entry}");
+        let timeout: u64 = fields[4]
+            .parse()
+            .expect("the recorded call ends with its remaining budget in milliseconds");
+        assert!(
+            (1..=5_000).contains(&timeout),
+            "the pre-check is charged against the request's budget: {entry}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -506,7 +765,6 @@ async fn malformed_arguments_are_invalid_input() {
             json!({
                 "space_id": "spc_1",
                 "subject_id": "subj_1",
-                "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_wren" },
                 "target": {
                     "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_gate" },
                     "target_id": "prop_gate_closed",
@@ -522,7 +780,6 @@ async fn malformed_arguments_are_invalid_input() {
             json!({
                 "space_id": "spc_1",
                 "subject_id": "subj_1",
-                "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_wren" },
                 "target": {
                     "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_gate" },
                     "target_id": "prop_gate_closed",
@@ -538,6 +795,7 @@ async fn malformed_arguments_are_invalid_input() {
         let fake = Arc::new(Fake::default());
         let reject = expect_reject(
             tools(fake)
+                .await
                 .call(capability_id, "peer-driver", arguments)
                 .await,
             case,
@@ -551,6 +809,7 @@ async fn unadmitted_peers_are_not_authorized() {
     let fake = Arc::new(Fake::default());
     let reject = expect_reject(
         tools(Arc::clone(&fake))
+            .await
             .call(RECALL_CONTEXT, "peer-stranger", recall_arguments())
             .await,
         "stranger",
@@ -560,6 +819,196 @@ async fn unadmitted_peers_are_not_authorized() {
     assert!(
         fake.seen().is_empty(),
         "no workflow runs for a peer the host does not admit"
+    );
+}
+
+/// The cognition read over one store: a Mind holding a committed judgment answers its records and
+/// the derived `MindState`; a Mind that has judged nothing answers `records: []` and a null
+/// `mind_state`; and a Mind the caller holds no grant in answers the same target-free refusal as
+/// a space that does not exist.
+#[tokio::test]
+async fn read_cognition_serves_a_judgment_or_a_null_state() {
+    let tool = tools(Arc::new(Fake::default())).await;
+
+    let committed = expect_ok(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_1"),
+        )
+        .await,
+        "a Mind with a committed judgment",
+    );
+    assert_eq!(committed["carrier_revision"], 1);
+    assert_eq!(
+        committed["records"],
+        json!([serde_json::to_value(cognition()).expect("the fixture serializes")]),
+        "the committed record is served in carrier order"
+    );
+    assert!(
+        committed["mind_state"].is_object(),
+        "the derived MindState is served beside the judgment: {committed}"
+    );
+
+    let fresh = expect_ok(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_2"),
+        )
+        .await,
+        "a Mind with no judgment yet",
+    );
+    assert_eq!(fresh["records"], json!([]));
+    assert_eq!(
+        fresh["mind_state"],
+        Value::Null,
+        "a Mind with no judgment answers a null state"
+    );
+
+    let unadmitted = expect_reject(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_3"),
+        )
+        .await,
+        "a Mind the caller is not admitted to",
+    );
+    let absent = expect_reject(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_absent"),
+        )
+        .await,
+        "a space that does not exist",
+    );
+    assert_eq!(unadmitted.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        unadmitted.details, None,
+        "an admission refusal discloses no details"
+    );
+    assert_eq!(
+        unadmitted, absent,
+        "an unadmitted Mind and an absent one are one answer"
+    );
+    assert_eq!(
+        wire_refusal(&unadmitted),
+        wire_refusal(&absent),
+        "the refusal is byte-equal across an unadmitted and an absent Mind"
+    );
+
+    // Admitted (a live `recall` grant), but not to `knowledge_read`: the coverage refusal
+    // answers, and it must not be the target-free admission refusal.
+    let uncovered = expect_reject(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_4"),
+        )
+        .await,
+        "an admitted caller without knowledge_read",
+    );
+    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        uncovered.message.contains("knowledge_read"),
+        "the coverage refusal names the capability the caller lacks: {uncovered:?}"
+    );
+    assert!(
+        uncovered.message.contains("spc_4"),
+        "the caller is admitted, so the refusal may name the Mind: {uncovered:?}"
+    );
+    assert_eq!(
+        uncovered
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str),
+        Some("terminal"),
+        "a coverage gap cannot be retried away: {uncovered:?}"
+    );
+    assert_ne!(
+        uncovered, unadmitted,
+        "an admitted caller short of one capability is not an unadmitted caller"
+    );
+}
+
+/// The served `deliberate` admits before the workflow and leaves the operation's own coverage to
+/// it: a caller the Mind admits reaches the workflow even without `knowledge_read` (the subject
+/// page and its revalidation answer first there), while an unadmitted Mind and an absent one
+/// answer one byte-equal, detail-free admission refusal before any workflow runs.
+#[tokio::test]
+async fn deliberate_admits_before_the_workflow_and_its_coverage() {
+    let fake = Arc::new(Fake::default());
+    fake.reply_deliberate(Ok(DeliberateOutcome::NoChange {
+        verdict: json!({}),
+        judgment: judgment(),
+    }));
+    let tool = tools(Arc::clone(&fake)).await;
+
+    let mut admitted_arguments = deliberate_arguments();
+    admitted_arguments["space_id"] = json!("spc_4");
+    let served = expect_ok(
+        tool.call(DELIBERATE, "peer-driver", admitted_arguments)
+            .await,
+        "an admitted caller without knowledge_read reaches the workflow",
+    );
+    assert_eq!(served["status"], "no_change");
+    assert_eq!(
+        fake.seen().len(),
+        1,
+        "the workflow's own coverage is what answers a capability gap: {:?}",
+        fake.seen()
+    );
+
+    let mut unadmitted_arguments = deliberate_arguments();
+    unadmitted_arguments["space_id"] = json!("spc_3");
+    let unadmitted = expect_reject(
+        tool.call(DELIBERATE, "peer-driver", unadmitted_arguments)
+            .await,
+        "a Mind the caller is not admitted to",
+    );
+    let mut absent_arguments = deliberate_arguments();
+    absent_arguments["space_id"] = json!("spc_absent");
+    let absent = expect_reject(
+        tool.call(DELIBERATE, "peer-driver", absent_arguments).await,
+        "a space that does not exist",
+    );
+    assert_eq!(unadmitted.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        unadmitted.details, None,
+        "an admission refusal discloses no details"
+    );
+    assert_eq!(
+        unadmitted, absent,
+        "an unadmitted Mind and an absent one are one answer"
+    );
+    assert_eq!(
+        fake.seen().len(),
+        1,
+        "neither refusal above reaches the workflow"
+    );
+}
+
+/// The pre-check is charged against the request's budget: the workflow gets the remainder, and a
+/// budget the pre-check already spent starts nothing.
+#[test]
+fn the_deliberation_budget_covers_its_pre_check() {
+    let budget = Duration::from_millis(5_000);
+    assert_eq!(
+        remaining_budget(budget, Duration::from_millis(1_500)),
+        Some(Duration::from_millis(3_500))
+    );
+    assert_eq!(
+        remaining_budget(budget, budget),
+        None,
+        "a spent budget has no remainder"
+    );
+    assert_eq!(
+        remaining_budget(budget, Duration::from_millis(6_000)),
+        None,
+        "an overrun leaves nothing to start"
     );
 }
 
@@ -575,6 +1024,7 @@ async fn settlement_refusals_keep_their_code_and_details() {
 
     let reject = expect_reject(
         tools(fake)
+            .await
             .call(ABSORB, "peer-driver", absorb_arguments())
             .await,
         "settlement refusal",
@@ -589,6 +1039,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
     fake.reply_recall(Err(SpiError::DeadlineExceeded));
     let reject = expect_reject(
         tools(fake)
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "deadline",
@@ -634,6 +1085,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
         fake.reply_recall(Err(error));
         let reject = expect_reject(
             tools(fake)
+                .await
                 .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
                 .await,
             kind,
@@ -659,6 +1111,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
     )));
     let reject = expect_reject(
         tools(fake)
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "policy",
@@ -687,6 +1140,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
     )));
     let reject = expect_reject(
         tools(fake)
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "invalid input",
@@ -700,7 +1154,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
 #[tokio::test]
 async fn advertised_input_schemas_match_the_decoded_arguments() {
     let fake = Arc::new(Fake::default());
-    let tool = tools(Arc::clone(&fake));
+    let tool = tools(Arc::clone(&fake)).await;
 
     for descriptor in tool.descriptors() {
         let capability_id = descriptor.capability_id.as_str();
@@ -718,10 +1172,23 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
                 verdict: json!({}),
                 judgment: judgment(),
             })),
+            READ_COGNITION => {}
             other => panic!("unadvertised tool {other}"),
         }
 
-        let arguments = minimal(&input, &input);
+        let mut arguments = minimal(&input, &input);
+        // `deliberate` and `read_cognition` both resolve a Mind from the request's `space_id`, so
+        // the manifest-shaped probe names the one Mind this harness seeds. `spc_1` satisfies the
+        // schema's `minLength` either way, so the shape check is unchanged.
+        if matches!(capability_id, DELIBERATE | READ_COGNITION) {
+            arguments["space_id"] = json!("spc_1");
+        }
+        // The pre-check is charged against the request's budget, so this probe names a budget
+        // that a process-scheduled pre-check cannot spend: the probe measures the ABI, not the
+        // clock.
+        if capability_id == DELIBERATE {
+            arguments["timeout_ms"] = json!(30_000);
+        }
         expect_ok(
             tool.call(capability_id, "peer-driver", arguments.clone())
                 .await,
