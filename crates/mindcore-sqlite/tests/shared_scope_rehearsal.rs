@@ -135,6 +135,30 @@ fn owner_private(entry_id: &str, summary: &str, owner: &str) -> KnowledgeEntry {
     entry
 }
 
+/// The Mind registry row the served face resolves its route from: the space row names the shared
+/// collection and a live entry of it.
+async fn register_mind(pool: &SqlitePool, space_id: &str, collection: &str, carrier: &str) {
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+          created_at) \
+         VALUES (?, NULL, 'host_1', 1, 'active', 1, '2026-11-26T09:00:00.000Z')",
+    )
+    .bind(space_id)
+    .execute(pool)
+    .await
+    .expect("seed the mind's space row");
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
+    )
+    .bind(space_id)
+    .bind(collection)
+    .bind(carrier)
+    .execute(pool)
+    .await
+    .expect("seed the mind registry row");
+}
+
 fn viewpoint_scope(viewpoint: &str) -> Scope {
     serde_json::from_value(json!({ "scope_id": ROUTE, "viewpoint": viewpoint }))
         .expect("scope JSON matches the schema")
@@ -279,7 +303,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     let pool = store.pool();
     let shared = store.knowledge(KnowledgeScope::new(SHARED));
     let personal = store.knowledge(KnowledgeScope::new(PERSONAL));
-    let served = store.served_knowledge(ROUTE, KnowledgeScope::new(SHARED));
+    let served = store.served_knowledge();
 
     expect_ok(
         shared
@@ -345,6 +369,11 @@ async fn shared_scope_holds_the_seven_named_facts() {
             "item 2: seed the retirement successor",
         );
     }
+
+    // The served route is the Mind registry row: `ROUTE` names the space whose registered
+    // collection is the shared one, and the carrier it names is a live entry of that collection
+    // that the rehearsal never retires.
+    register_mind(&pool, ROUTE, SHARED, "ke_gate_tower").await;
     assert_eq!(
         expect_ok(
             shared.supersede_entry("ke_gate", 2, "ke_gate_rail").await,
@@ -604,7 +633,7 @@ async fn shared_scope_holds_the_seven_named_facts() {
     let pool = restored.pool();
     let shared = restored.knowledge(KnowledgeScope::new(SHARED));
     let personal = restored.knowledge(KnowledgeScope::new(PERSONAL));
-    let served = restored.served_knowledge(ROUTE, KnowledgeScope::new(SHARED));
+    let served = restored.served_knowledge();
 
     assert_eq!(
         expect_ok(

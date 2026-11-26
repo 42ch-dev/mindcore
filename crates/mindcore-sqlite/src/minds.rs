@@ -10,7 +10,7 @@ use std::future::poll_fn;
 use chrono::Utc;
 use serde_json::{Map, Number, Value};
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Executor, Row, Sqlite, Transaction};
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{mint, MindId, SpaceId};
@@ -539,6 +539,28 @@ pub async fn visible_mind_ids(
         ids.push(space_id);
     }
     SpokeResult::Ok(ids)
+}
+
+/// The collection the Mind registered for `space_id`, or `None` when no registry row names one.
+///
+/// The one registry read: it takes an executor, so a served op resolves its route on the
+/// transaction its statement runs on and a caller holding a bare connection reads the same row.
+pub async fn registered_collection<'e, E>(
+    executor: E,
+    space_id: &str,
+) -> SpokeResult<Option<String>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let collection: Result<Option<String>, sqlx::Error> =
+        sqlx::query_scalar("SELECT knowledge_collection FROM minds WHERE space_id = ?")
+            .bind(space_id)
+            .fetch_optional(executor)
+            .await;
+    match collection {
+        Ok(collection) => SpokeResult::Ok(collection),
+        Err(_) => storage_unavailable(),
+    }
 }
 
 impl MindStore {
