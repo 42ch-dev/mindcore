@@ -454,10 +454,16 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
             tokio::spawn(async move {
                 let acquire = interference_pool.acquire();
                 tokio::pin!(acquire);
-                assert!(
-                    futures::poll!(acquire.as_mut()).is_pending(),
-                    "the staging transaction still holds the one connection"
-                );
+                // One poll with a no-op waker: the future must be pending because the staging
+                // transaction still holds the pool's one connection, and this first poll is
+                // what registers the task in the pool's FIFO queue.
+                let pending = std::future::poll_fn(|cx| {
+                    let polled = std::future::Future::poll(acquire.as_mut(), cx);
+                    assert!(polled.is_pending(), "the one connection is still checked out");
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                let _ = pending;
                 registered.send(()).expect("signal the registration");
                 let mut connection = acquire.await.expect("the one connection");
                 sqlx::query("UPDATE memory_journal SET state = 'deferred'")
@@ -491,6 +497,98 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
         count_records(&pool).await,
         1,
         "the staged record is durable"
+    );
+}
+
+
+/// The `OUTCOME_UNCERTAIN` recovery contract: repeating the review with the same key while the
+/// receipt is still pending answers the same uncertain outcome again — the recorded refusal,
+/// never a staged duplicate and never silence. The repeat is byte-identical, so it reaches the
+/// adapter's receipt probe directly, and the probe reports the still-pending receipt exactly as
+/// the fold left it: no second record, no second intent, the candidate still consumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_after_outcome_uncertain_replays_the_pending_receipt_as_uncertain() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let pool = store.pool();
+    let journal_root = dir.path().to_path_buf();
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(&journal_root));
+    let candidate_id = capture_candidate(
+        &handle,
+        "cap-uncertain-replay",
+        "a note whose settlement outcome is unknown",
+    )
+    .await;
+
+    // The same interference handshake as `a_refused_settle_answers_outcome_uncertain`: the
+    // staging commit releases the one connection, and the registered task moves the intent out
+    // of pending before the settlement transaction can acquire it, so the settle is refused.
+    let interference_pool = pool.clone();
+    let blocking =
+        ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
+            journal_dir(&journal_root)(targets)?;
+            let interference_pool = interference_pool.clone();
+            let (registered, is_registered) = mpsc::channel::<()>();
+            tokio::spawn(async move {
+                let acquire = interference_pool.acquire();
+                tokio::pin!(acquire);
+                std::future::poll_fn(|cx| {
+                    let polled = std::future::Future::poll(acquire.as_mut(), cx);
+                    assert!(polled.is_pending(), "the one connection is still checked out");
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                registered.send(()).expect("signal the registration");
+                let mut connection = acquire.await.expect("the one connection");
+                sqlx::query("UPDATE memory_journal SET state = 'deferred'")
+                    .execute(&mut *connection)
+                    .await
+                    .expect("move the intent out of pending");
+            });
+            is_registered
+                .recv()
+                .expect("the interference task registered its acquisition");
+            Ok(())
+        });
+
+    let first = reject_of(
+        blocking
+            .review(&candidate_id, &promote(), "rev-uncertain-replay")
+            .await,
+    );
+    assert_eq!(
+        first.code,
+        SpokeRejectCode::OutcomeUncertain,
+        "the refused settle answers OUTCOME_UNCERTAIN"
+    );
+
+    // The repeat: same candidate, decision and key, through a working publisher. The receipt
+    // is still pending, so the probe answers the uncertain outcome again without re-staging.
+    let working = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(dir.path()));
+    let repeat = reject_of(
+        working
+            .review(&candidate_id, &promote(), "rev-uncertain-replay")
+            .await,
+    );
+    assert_eq!(
+        repeat.code,
+        SpokeRejectCode::OutcomeUncertain,
+        "a same-key repeat while the receipt is pending answers OUTCOME_UNCERTAIN: {repeat:?}"
+    );
+    assert_eq!(retry_class(&repeat), "uncertain");
+    assert_eq!(
+        count_records(&pool).await,
+        1,
+        "the repeat stages no second record"
+    );
+    assert_eq!(
+        count_intents(&pool).await,
+        1,
+        "the repeat stages no second intent"
     );
 }
 
@@ -1239,5 +1337,248 @@ async fn an_intent_that_arrives_after_the_snapshot_refuses_the_commit() {
         carrier.revision,
         Some(1),
         "the refused commit moved no carrier revision"
+    );
+}
+
+// ---------- QC fix wave: settled-key replay, publisher confinement and executor offload ----------
+
+/// A settled key's replay reaches the receipt probe no matter what else the space holds
+/// unsettled: another of the same subject's intents, or an intent of another subject in the
+/// same space. The replay is metadata-identical to its first review, so the probe answers the
+/// committed receipt — never the content withhold, which guards subject content and says
+/// nothing about receipts.
+#[tokio::test]
+async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(dir.path()));
+    let candidate_id = capture_candidate(&handle, "cap-settled-replay", "a settled note").await;
+    let settled = ok(handle
+        .review(&candidate_id, &promote(), "rev-settled-replay")
+        .await);
+    assert_eq!(value_of(&settled)["status"], "committed", "the first review settles");
+
+    // An unsettled intent for the same subject, as a crashed served absorb would leave one.
+    settle_never(&store, created.id.as_str(), SUBJECT).await;
+    let replayed = ok(handle
+        .review(&candidate_id, &promote(), "rev-settled-replay")
+        .await);
+    assert_eq!(
+        value_of(&replayed),
+        value_of(&settled),
+        "the settled key replays beside the same subject's unsettled intent"
+    );
+    assert_eq!(count_records(&store.pool()).await, 1, "no second record is staged");
+    assert_eq!(count_intents(&store.pool()).await, 2, "no second replay intent");
+
+    // The same key also replays beside an intent of another subject in the same space.
+    settle_never(&store, created.id.as_str(), "subj_elsewhere").await;
+    let replayed = ok(handle
+        .review(&candidate_id, &promote(), "rev-settled-replay")
+        .await);
+    assert_eq!(
+        value_of(&replayed),
+        value_of(&settled),
+        "the settled key replays beside another subject's unsettled intent"
+    );
+    assert_eq!(count_records(&store.pool()).await, 1, "still no second record");
+}
+
+/// The publisher confines every target to its root: an absolute target path or one carrying
+/// `..` is refused with nothing written outside the root.
+#[tokio::test]
+async fn the_public_publisher_refuses_a_target_outside_its_root() {
+    let dir = TempDir::new().expect("temporary directory");
+    let root = dir.path().join("journal");
+    std::fs::create_dir_all(&root).expect("create the root");
+    let publisher = mindcore_runtime::journal_dir(&root);
+
+    let escaped = dir.path().join("escaped.md");
+    let absolute = publisher(&[json!({
+        "path": escaped.to_str().expect("utf-8 scratch path"),
+        "content": "escape",
+    })]);
+    assert!(absolute.is_err(), "an absolute target is refused");
+    assert!(
+        !escaped.exists(),
+        "nothing was written outside the root"
+    );
+
+    let parent = publisher(&[json!({
+        "path": "../escaped.md",
+        "content": "escape",
+    })]);
+    assert!(parent.is_err(), "a parent traversal target is refused");
+    assert!(
+        !dir.path().join("escaped.md").exists(),
+        "no traversal write landed"
+    );
+
+    // Confined targets still publish exactly as before.
+    publisher(&[json!({ "path": "records/rec_confined.md", "content": "confined bytes" })])
+        .expect("a confined target publishes");
+    assert_eq!(
+        std::fs::read_to_string(root.join("records").join("rec_confined.md"))
+            .expect("the confined target"),
+        "confined bytes"
+    );
+}
+
+/// The review's publication runs off the async worker: while the publisher is parked inside
+/// its flush, unrelated executor work keeps progressing, and nothing commits before the
+/// publication confirms — the records count is still zero until the review finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let journal_root = dir.path().to_path_buf();
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(&journal_root));
+    let candidate_id = capture_candidate(&handle, "cap-offworker", "a parked publication").await;
+
+    // A publisher parked inside its flush: it enters, signals, and waits for the test to
+    // release it. A probe task signals progress while the review is parked; if the publication
+    // ran on the executor, the probe could never be polled and the probe signal would starve.
+    let (entered, is_entered) = mpsc::channel::<()>();
+    let (release, is_released) = tokio::sync::oneshot::channel::<()>();
+    let is_released = std::sync::Mutex::new(Some(is_released));
+    let parked_root = journal_root.clone();
+    let parked = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(move |targets| {
+            journal_dir(&parked_root)(targets)?;
+            entered.send(()).expect("signal the publisher entered");
+            let receiver = is_released
+                .lock()
+                .expect("the release lock")
+                .take()
+                .expect("the publisher is entered once");
+            receiver.blocking_recv().expect("wait for the test release");
+            Ok(())
+        });
+
+    let review = tokio::spawn(async move {
+        parked.review(&candidate_id, &promote(), "rev-offworker").await
+    });
+
+    // The probe task: progress measurable only on a free executor.
+    let (progressed, is_progressed) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = progressed.send(());
+    });
+
+    is_entered.recv().expect("the publisher is parked inside its flush");
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(5), is_progressed).await;
+    assert!(
+        progress.is_ok(),
+        "executor progress continued while the publisher was parked"
+    );
+    // Nothing commits before the publication confirms: a second pool on the same file reads
+    // the committed state — the staging transaction still holds the first pool's connection,
+    // and its uncommitted rows are invisible here.
+    let observer = MindStore::open(&dir.path().join("minds.db"))
+        .await
+        .expect("open the observer store");
+    assert_eq!(
+        count_records(&observer.pool()).await,
+        0,
+        "nothing commits before the publication confirms"
+    );
+
+    release.send(()).expect("release the publisher");
+    let reviewed = review.await.expect("the review task joins");
+    assert_eq!(
+        value_of(&ok(reviewed))["status"],
+        "committed",
+        "the review settles after the publication confirms"
+    );
+}
+
+/// `cognition_read` reads only the collection its admitted Mind resolved at open: a colliding
+/// entry in another Mind's collection — same carrier entry id, poisoned content — never leaks
+/// into the read, because the collection is the row's own, never a caller-supplied input.
+#[tokio::test]
+async fn cognition_read_reads_only_the_collection_of_the_admitted_mind() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let first = ok(minds::create(&store, &request(OWNER)).await);
+    let second = ok(minds::create(&store, &request(OWNER)).await);
+    assert_ne!(
+        first.knowledge.collection, second.knowledge.collection,
+        "each Mind owns its own collection"
+    );
+
+    // A poisoned record for the first Mind's carrier entry id, written into the second Mind's
+    // collection. The record validates: its holder is the second carrier it actually lives
+    // with, so the write passes the one validation boundary.
+    let second_handle = ok(Mind::open(&store, &owner, &second.id).await);
+    let second_carrier = ok(second_handle
+        .knowledge_get(second_handle.carrier_entry_id(), None)
+        .await);
+    let poisoned = json!({
+        "kind": "belief",
+        "order": 1,
+        "record_id": "cog_poisoned",
+        "holder": {
+            "kind": "knowledge_entry",
+            "namespace": "mindcore",
+            "id": second.carrier_entry_id,
+        },
+        "target": {
+            "carrier": {
+                "kind": "knowledge_entry",
+                "namespace": "mindcore",
+                "id": second.carrier_entry_id,
+            },
+            "target_id": "prop_collision",
+            "kind": "proposition",
+        },
+        "assessor": {
+            "kind": "principal",
+            "namespace": "mindcore",
+            "id": OWNER,
+        },
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [{ "kind": "memory_record", "namespace": "mindcore", "id": "rec_collision" }],
+        },
+        "assessment_context": { "context_id": second.id.as_str() },
+        "assessed_at": "2026-11-20T09:00:00Z",
+        "effective_at": "2026-11-20T09:00:00Z",
+        "view": "current",
+        "q": {
+            "value": 0.9,
+            "assertion": "belief_attribution",
+            "method": "two_witness_reports",
+            "calibration": "uncalibrated",
+        },
+        "extensions": {},
+    });
+    let appended = mindcore_base::cognition::append_cognition_record(&second_carrier, poisoned)
+        .expect("the poisoned record validates in its own carrier");
+    let revision = second_carrier.revision.expect("a stored carrier has a revision");
+    ok(second_handle.knowledge_put(appended, Some(revision)).await);
+
+    // The first Mind's read is untouched by anything the second collection holds.
+    let first_handle = ok(Mind::open(&store, &owner, &first.id).await);
+    assert!(
+        ok(first_handle.cognition_read().await).is_none(),
+        "the first Mind still answers the fresh-Mind None"
+    );
+    let cognition = ok(second_handle.cognition_read().await).expect("one judgment");
+    assert_eq!(
+        cognition.records.len(),
+        1,
+        "the second Mind reads its own collection's record"
+    );
+    assert_eq!(
+        cognition.records[0]["record_id"],
+        json!("cog_poisoned"),
+        "the read is the admitted Mind's own carrier"
     );
 }

@@ -30,12 +30,12 @@ with the binding's and the workflow's own refusals.
 | Operation | Composes | Transaction | Grants re-checked |
 |---|---|---|---|
 | `capture(&Capture)` | the memory adapter's `capture` with the Mind's id as `space_id` | one `BEGIN IMMEDIATE`, committed | the adapter's own, over the caller-named subject and placement |
-| `review(candidate_id, decision, key)` | `get_candidate`, then `review_candidate` staged in one `BEGIN IMMEDIATE`; the staged intent read on it; publication before the staging commits; `settle_journal` on a second transaction | the fold below | the adapter's own: `review` and `records_write` over the candidate |
+| `review(candidate_id, decision, key)` | the candidate's revision and status read as metadata; `review_candidate` staged in one `BEGIN IMMEDIATE`; the staged intent read on it; publication off the async worker before the staging commits; `settle_journal` on a second transaction | the fold below | the adapter's own: `review` and `records_write` over the candidate |
 | `recall(&Recall)` | the memory adapter's `recall` | one read transaction, rolled back | the adapter's own, over the caller-named selection |
 | `knowledge_get(entry_id, revision)` | `read_entry`, or `read_entry_at_revision` when a revision is named, on the row's collection | one read transaction, rolled back | space-wide `knowledge_read` |
 | `knowledge_put(entry, expected)` | `write_entry` — the one cognition validation boundary — on the row's collection | one `BEGIN IMMEDIATE`, committed | space-wide `knowledge_write` |
 | `knowledge_list()` | `list_entries_in` on the row's collection | one read transaction, rolled back | space-wide `knowledge_read` |
-| `cognition_read()` | `MemoryAdapter::read_cognition`: the carrier read and the derivation, nothing persisted | one read transaction, rolled back | space-wide `knowledge_read` |
+| `cognition_read()` | the carrier `read_entry` on the row's collection, derived in the facade; nothing persisted | one read transaction, rolled back | space-wide `knowledge_read` |
 | `deliberate(&Deliberation)` | `SpiMindWorkflows::deliberate` with no subject, the row's carrier as holder and the Mind's id as assessment context | the workflow's own | space-wide `recall`, with the space-level withhold |
 
 No operation accepts a collection, an `owner` or a `viewpoint` from the caller. `Capture.subject`
@@ -46,17 +46,44 @@ the adapter's own code, and a revision below an entry's floor answers the store'
 
 ### The `review` fold
 
-`review` answers the settled receipt, not a stage. Inside one `BEGIN IMMEDIATE` it stages the whole
-decision through `review_candidate`, reads the staged intent on the same transaction and publishes
-the owed targets **before the staging is durable**: a refused publication rolls everything back —
-no record row, no intent, a pending candidate — and the same idempotency key can be repeated, with
-the publisher's own `SpiError::Settlement` refusal traveling unchanged. Only after a successful
-publication does the staging commit; settlement then runs on a second transaction, and any failure
-from there answers `OUTCOME_UNCERTAIN` because durable work may be outstanding. A receipt already
-settled is replayed as it is. The ordering differs from the served surface deliberately: the served
-caller holds the receipt protocol that resolves `OUTCOME_UNCERTAIN` over a staged record; the
-facade's caller does not, so a failed publication leaves no record to resolve. The cost is an
-orphan published file when the process dies between publication and the staging commit.
+`review` answers the settled receipt, not a stage. Inside one `BEGIN IMMEDIATE` it reads the
+candidate's revision and status as metadata and stages the whole decision through
+`review_candidate`. The metadata read is deliberately not a content read: the adapter's
+`get_candidate` withholds subject content while any of the subject's intents is unsettled,
+which is correct for content but unrelated to a receipt — a settled key's replay must reach
+the adapter's probe no matter what else in the space is unsettled, whether another of the
+same subject's intents or another subject's in the same space. Admission does not move:
+`review_candidate` authorizes the write, probes the receipt first and applies every fresh-work
+gate on its own, and a replay is digest-identical, so the metadata read only rebuilds the
+original `expected_revision`.
+
+The fold reads the staged intent on the same transaction and publishes the owed targets off
+the async worker — the publisher writes and fsyncs synchronously, so it runs on the blocking
+pool while nothing commits and unrelated executor work stays schedulable — **before the
+staging is durable**: a refused publication rolls everything back — no record row, no intent,
+a pending candidate — and the same idempotency key can be repeated, with the publisher's own
+`SpiError::Settlement` refusal traveling unchanged. Only after a successful publication does
+the staging commit; settlement then runs on a second transaction, and any failure from there
+answers `OUTCOME_UNCERTAIN` because durable work may be outstanding. A receipt already settled
+is replayed as it is.
+
+The `OUTCOME_UNCERTAIN` recovery contract: the caller repeats the review with the same
+candidate, decision and idempotency key. While the receipt is still pending, the repeat
+answers `OUTCOME_UNCERTAIN` again — the probe reports the pending receipt exactly as the fold
+left it, with no second record and no second intent. When the receipt has committed, the same
+repeat answers the settled receipt as any replay does. The ordering differs from the served
+surface deliberately: the served caller holds the receipt protocol that resolves
+`OUTCOME_UNCERTAIN` over a staged record; the facade's caller does not, so a failed publication
+leaves no record to resolve. The cost is an orphan published file when the process dies
+between publication and the staging commit.
+
+`journal_dir(root)` confines every target to its root: a target path that is absolute or
+carries `..` is refused before its first byte. Durability is anchored at `root`, which the
+host establishes as durable; publication syncs the file and every directory of the publisher's
+tree down to the target, never ancestors outside the root. Syncing a directory opens it for
+reading, so the host must grant read on `root` and every directory below it — a write-only
+journal root cannot be published, because the sync that must precede settlement would be
+refused for a reason the write itself never hit.
 
 ### `deliberate` without a subject
 
@@ -75,10 +102,14 @@ boundary, and the cognition module keeps its single persistence validation insid
 
 ### `cognition_read`
 
-The carrier is read on the handle's collection and derived; nothing is persisted. A carrier that
-holds no current-view record yet — every Mind until its first judgment — answers `None`, not a
-refusal: a Mind without a judgment is a state, not an error. After one record, the read answers
-the carrier's current-view records and the derived `MindState` named by the Mind's id.
+The carrier is read on the collection the row resolved at open — the read is bound to the
+admitted Mind, and nothing the caller says can point it at another collection — and derived in
+the facade; nothing is persisted. The derivation runs once: the validated record vector
+`derive_mind_state` owns is projected into the wire `MindState` and moved into the answer, so
+no second extraction pass copies the carrier's history. A carrier that holds no current-view
+record yet — every Mind until its first judgment — answers `None`, not a refusal: a Mind
+without a judgment is a state, not an error. After one record, the read answers the carrier's
+current-view records and the derived `MindState` named by the Mind's id.
 
 ## Non-goals
 
@@ -90,6 +121,22 @@ the carrier's current-view records and the derived `MindState` named by the Mind
 - A second write path, a moved validation point, or any grant widening.
 - Subject defaulting: no facade operation chooses a subject for the caller.
 - Host provisioning: subject registration, grant administration beyond the `create` row, the
+  journal publisher and the model providers are the embedding host's, as on the served surface.
+
+### Admission decisions the spec records
+
+**The facade is convenience, not a sandbox.** An in-process caller already holds the store and
+can read any row through it, so the facade deliberately does not reproduce the served path's
+per-principal routing and disclosure predicates: a space-wide `knowledge_read` /
+`knowledge_write` grant reaches the whole Mind collection, whatever `owner` an entry carries.
+The boundary the facade composes is the store's own — `read_entry`, `write_entry` and
+`list_entries_in`, the validation and revision checks inside them — not the adoption port
+`put_knowledge_entry`, which is a different surface.
+
+**Reflections are off.** Every handle builds its adapter and workflow binding with
+`reflections: false` and offers no switch: the reflection surface (§7.25–§7.27 of the SPOKE
+spec) is a provider-level capability the facade's convenience contract does not expose, and a
+host that needs it embeds the adapter or the served surface directly.
   journal publisher and the model providers are the embedding host's, as on the served surface.
 
 ## Invariants

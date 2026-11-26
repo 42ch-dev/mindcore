@@ -40,6 +40,7 @@ use spoke_schemas::{
     Principal,
 };
 use sqlx::SqlitePool;
+use std::sync::Arc;
 
 use crate::tools::workflow_reject;
 
@@ -57,7 +58,7 @@ pub struct Mind {
     caller: CallerId,
     row: MindRow,
     adapter: MemoryAdapter,
-    publisher: Option<Box<JournalPublisher>>,
+    publisher: Option<Arc<JournalPublisher>>,
     providers: crate::MindProviders,
 }
 
@@ -176,7 +177,7 @@ impl Mind {
         mut self,
         publish: impl Fn(&[Value]) -> Result<(), SpiError> + Send + Sync + 'static,
     ) -> Self {
-        self.publisher = Some(Box::new(publish));
+        self.publisher = Some(Arc::new(publish));
         self
     }
 
@@ -422,7 +423,7 @@ impl Mind {
         decision: &Decision,
         idempotency_key: &str,
     ) -> SpokeResult<MemoryCandidatesReviewResponse> {
-        let publisher = match self.publisher.as_deref() {
+        let publisher = match self.publisher.as_ref() {
             Some(publisher) => publisher,
             None => {
                 return reject(
@@ -443,40 +444,35 @@ impl Mind {
             }
         };
 
-        // 1. Read the candidate as the plan requires: the revision this staging transaction
-        //    must assert, and whether an earlier review already consumed it. A refusal is the
-        //    adapter's own and rolls the transaction back.
-        let observed = self
-            .adapter
-            .get_candidate(
-                &mut transaction,
-                &caller,
-                json!({ "space_id": space.as_str(), "candidate_id": candidate_id }),
-            )
-            .await;
+        // 1. Read the candidate's revision and consumption status as metadata. A content-read
+        //    path like `get_candidate` is deliberately not used here: its withhold on the
+        //    subject's unsettled intents is correct for subject content but unrelated to a
+        //    receipt, and it would keep a settled key's replay from ever reaching the adapter's
+        //    probe while any other intent of the subject is unsettled. Admission itself does
+        //    not move: `review_candidate` authorizes the write, probes the receipt first and
+        //    applies every fresh-work gate on its own. A same-key replay is digest-identical,
+        //    so this row only rebuilds the original `expected_revision` — a wrong value can
+        //    never reach a receipt.
+        let observed: Option<(i64, String)> = match sqlx::query_as(
+            "SELECT revision, status FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
+        )
+        .bind(space.as_str())
+        .bind(candidate_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                drop(transaction);
+                return retryable_internal(format!("the candidate row could not be read: {error}"));
+            }
+        };
         let (revision, consumed) = match observed {
-            SpokeResult::Ok(MemoryStage::Ready(body)) => {
-                let Some(candidate) = body.get("candidate") else {
-                    drop(transaction);
-                    return retryable_internal("the candidate body carries no candidate");
-                };
-                let Some(revision) = candidate.get("revision").and_then(Value::as_u64) else {
-                    drop(transaction);
-                    return retryable_internal("the candidate body carries no integer revision");
-                };
-                let consumed = candidate.get("status").and_then(Value::as_str) == Some("consumed");
-                (revision, consumed)
-            }
-            SpokeResult::Ok(stage) => {
-                drop(transaction);
-                return retryable_internal(format!(
-                    "candidate read answered an unexpected stage: {stage:?}"
-                ));
-            }
-            SpokeResult::Reject(reject) => {
-                drop(transaction);
-                return SpokeResult::Reject(reject);
-            }
+            Some((revision, status)) => (u64::try_from(revision).unwrap_or(0), status == "consumed"),
+            // No row: stage at revision 1, the candidate's fresh-work value. `review_candidate`
+            // answers its own `NotFound` for a candidate that never existed; a replayed key of
+            // a consumed or pruned candidate is digest-guarded before this value can matter.
+            None => (1, false),
         };
         // 2. Stage on the same transaction. The adapter's dedup probe keys on
         //    (space, requester, operation, idempotency_key) and digests the whole payload, so
@@ -554,10 +550,27 @@ impl Mind {
             }
         };
 
-        // 4. Publish before the staging is durable. A refusal rolls the transaction back:
-        // no record row, no intent and a pending candidate are left, and the publisher's own
-        // `SpiError::Settlement` refusal travels unchanged.
-        if let Err(error) = publisher(&intent.targets) {
+        // 4. Publish before the staging is durable, off the async worker: the publisher writes
+        //    and fsyncs synchronously, so it runs on the blocking pool while the handle's task
+        //    awaits it — unrelated executor work stays schedulable for the whole flush. The
+        //    ordering is unchanged: nothing commits before the publisher has confirmed, and a
+        //    refusal rolls the transaction back — no record row, no intent and a pending
+        //    candidate are left, with the publisher's own `SpiError::Settlement` refusal
+        //    traveling unchanged. The task is awaited to completion, so it always retains
+        //    ownership of the publication, caller cancellation included.
+        let publish_targets = intent.targets.clone();
+        let publish = {
+            let publisher = Arc::clone(publisher);
+            tokio::task::spawn_blocking(move || publisher(&publish_targets))
+        };
+        let published = match publish.await {
+            Ok(result) => result,
+            Err(error) => {
+                drop(transaction);
+                return retryable_internal(format!("the publication task failed to join: {error}"));
+            }
+        };
+        if let Err(error) = published {
             drop(transaction);
             return match error {
                 SpiError::Settlement(reject) => SpokeResult::Reject(reject),
@@ -608,9 +621,13 @@ impl Mind {
         }
     }
 
-    /// Read this Mind's judgment: `MemoryAdapter::read_cognition` over one read
-    /// transaction, rolled back after the read. A fresh carrier answers `None`;
-    /// after one record, the judgment's records and the derived `MindState`.
+    /// Read this Mind's judgment over one read transaction, rolled back after the read. The
+    /// collection and carrier entry the transaction reads are the row's own — resolved from the
+    /// admitted Mind at `open`, never from the caller — so a space-wide `knowledge_read` grant
+    /// authorizes exactly the Mind that is read. A fresh carrier answers `None`; after one
+    /// record, the judgment's records and the derived `MindState`. The record list is the one
+    /// `derive_mind_state` already owns: the validated view is the single extraction, projected
+    /// once into the wire state and moved into the answer.
     pub async fn cognition_read(&self) -> SpokeResult<Option<Cognition>> {
         let mut transaction = match self.pool.begin().await {
             Ok(transaction) => transaction,
@@ -620,22 +637,79 @@ impl Mind {
                 ))
             }
         };
-        let read = self
+        let admission = self
             .adapter
-            .read_cognition(
+            .require_space_grants(
                 &mut transaction,
                 &principal(&self.caller),
                 self.row.id.as_str(),
-                &self.row.knowledge.collection,
-                &self.row.carrier_entry_id,
-                self.row.id.as_str(),
+                &["knowledge_read"],
             )
             .await;
-        drop(transaction);
-        match read {
-            Ok(cognition) => SpokeResult::Ok(cognition),
-            Err(error) => SpokeResult::Reject(workflow_reject(error)),
+        if let Err(error) = admission {
+            drop(transaction);
+            return SpokeResult::Reject(workflow_reject(error));
         }
+        let carrier = match read_entry(
+            &mut transaction,
+            &self.row.knowledge.collection,
+            &self.row.carrier_entry_id,
+        )
+        .await
+        {
+            SpokeResult::Ok(carrier) => carrier,
+            SpokeResult::Reject(reject) => {
+                drop(transaction);
+                return SpokeResult::Reject(reject);
+            }
+        };
+        drop(transaction);
+        let revision = match carrier.revision {
+            Some(revision) => revision,
+            None => {
+                return reject(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "carrier {} holds no assigned revision",
+                        self.row.carrier_entry_id
+                    ),
+                    "terminal",
+                )
+            }
+        };
+        let view = match mindcore_base::cognition::derive_mind_state(&carrier) {
+            Ok(view) => view,
+            Err(mindcore_base::cognition::MindError::NoRecords) => return SpokeResult::Ok(None),
+            Err(error) => {
+                return reject(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "carrier {} cannot be derived: {error}",
+                        self.row.carrier_entry_id
+                    ),
+                    "terminal",
+                )
+            }
+        };
+        let mind_state = match mindcore_base::cognition::mind_state_value(&view, self.row.id.as_str())
+        {
+            Ok(mind_state) => mind_state,
+            Err(error) => {
+                return reject(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "the mind state of {} cannot be projected: {error}",
+                        self.row.carrier_entry_id
+                    ),
+                    "terminal",
+                )
+            }
+        };
+        SpokeResult::Ok(Some(Cognition {
+            carrier_revision: revision,
+            records: view.records,
+            mind_state,
+        }))
     }
 
     /// Deliberate one target over the evidence: `SpiMindWorkflows::deliberate`

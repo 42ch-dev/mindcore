@@ -1,7 +1,7 @@
 //! The one journal publisher the crate offers: `journal_dir(root)` writes every journaled
 //! file target under `root` at the target's own path.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use mindcore_spi::SpiError;
 use serde_json::Value;
@@ -10,16 +10,26 @@ use serde_json::Value;
 /// target's `path`, parent directories are created, and `Ok(())` is returned only when every
 /// target's exact bytes are durable.
 ///
-/// Durability covers the whole required ancestry of each target, deepest first, through a
-/// bounded anchor: the filesystem root for an absolute path, the current directory for a
-/// relative one. The ancestry is a function of the target's path alone — never of which
-/// directories happen to exist — so a retry after a publication that failed between creating
-/// directories and syncing them is never weaker than the attempt that failed: it syncs the
-/// same chain, including the entries the failed attempt left behind.
+/// Confinement: a target path that is absolute or carries any `..` — a `ParentDir`, `RootDir`
+/// or `Prefix` component — is refused before its first byte, so no target can ever write
+/// outside `root` whatever a journaled row holds.
+///
+/// The sync anchor is `root` itself. Publication creates no directory at or above it: the host
+/// establishes `root` (or the path it will be created at) as already durable, so every entry
+/// publication depends on lies within the publisher's own tree. Each target syncs its file,
+/// then every directory of that tree its entry depends on, deepest first, ending at `root`.
+/// The chain is a function of the target's path alone — never of which directories happen to
+/// exist — so a retry after a publication that failed between creating directories and
+/// syncing them syncs the same chain as the attempt that failed.
+///
+/// Permission requirement: syncing a directory opens it for reading, which POSIX refuses for
+/// a search-only directory, so the host must grant read on `root` and every directory below
+/// it. A write-only journal root cannot be published: the write itself would succeed, but the
+/// durability sync that must precede settlement would be refused for a reason the write never
+/// hit.
 ///
 /// Target paths are the adapter's own (`records/<id>.md`, `candidates/<id>.md`,
-/// `profiles/<digest>.md`): they carry no separators that could escape `root`, and they are
-/// published as given rather than re-derived here.
+/// `profiles/<digest>.md`): they are confined to `root` as given rather than re-derived here.
 pub fn journal_dir(
     root: impl Into<PathBuf>,
 ) -> impl Fn(&[Value]) -> Result<(), SpiError> + Send + Sync + 'static {
@@ -35,14 +45,28 @@ pub fn journal_dir(
                 .ok_or_else(|| {
                     SpiError::InvalidInput(format!("journal target {path} carries no content"))
                 })?;
+            // Confinement is refused before the first byte of this target: an absolute path
+            // or one carrying `..` would escape `root` under `join`, whatever it names.
+            let confined = !Path::new(path).is_absolute()
+                && Path::new(path).components().all(|component| {
+                    matches!(
+                        component,
+                        Component::Normal(_) | Component::CurDir
+                    )
+                });
+            if !confined {
+                return Err(SpiError::InvalidInput(format!(
+                    "journal target {path} is not confined to the journal root"
+                )));
+            }
             let file = root.join(path);
-            // A target at the publisher root has the empty path as its parent; the current
-            // directory is what that names, and it is this publication's anchor.
             let parent = match file.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => parent,
-                _ => Path::new("."),
+                // A target at the publisher root has the root itself as its parent: the
+                // confinement check above has already erased any `.` components, so the
+                // empty parent is reached only when the target names one plain file.
+                _ => root.as_path(),
             };
-            let chain = durable_chain(parent);
             std::fs::create_dir_all(parent).map_err(|error| {
                 SpiError::Settlement(spoke_reject(format!(
                     "the directory for {path} could not be created: {error}"
@@ -54,8 +78,9 @@ pub fn journal_dir(
                 )))
             })?;
             // Durability, not visibility: the write must reach the medium before the caller
-            // may settle the intent. Sync the file's contents, then the whole ancestry the
-            // target's entry depends on, deepest first.
+            // may settle the intent. Sync the file's contents, then every directory of the
+            // publisher's own tree its entry depends on, deepest first, ending at `root` —
+            // the anchor the host established as durable.
             std::fs::File::open(&file)
                 .and_then(|file| file.sync_all())
                 .map_err(|error| {
@@ -63,8 +88,9 @@ pub fn journal_dir(
                         "journal target {path} could not be synced: {error}"
                     )))
                 })?;
-            for directory in &chain {
-                std::fs::File::open(directory)
+            let mut cursor = Some(parent.to_path_buf());
+            while let Some(directory) = cursor {
+                std::fs::File::open(&directory)
                     .and_then(|directory| directory.sync_all())
                     .map_err(|error| {
                         SpiError::Settlement(spoke_reject(format!(
@@ -72,6 +98,14 @@ pub fn journal_dir(
                             directory.display()
                         )))
                     })?;
+                if directory == root {
+                    break;
+                }
+                cursor = directory
+                    .components()
+                    .as_path()
+                    .parent()
+                    .map(Path::to_path_buf);
             }
             let landed = std::fs::read_to_string(&file).map_err(|error| {
                 SpiError::Settlement(spoke_reject(format!(
@@ -88,35 +122,6 @@ pub fn journal_dir(
     }
 }
 
-/// The directories whose entries one target depends on, deepest first, through the bounded
-/// anchor of its path: every ancestor named by the path, and then `/` for an absolute path or
-/// `.` for a relative one.
-///
-/// Existence is deliberately not consulted: the chain is the same for a first attempt and for
-/// a retry after a failed attempt left some of those directories behind, so a retry can never
-/// skip a directory entry the failed attempt created.
-fn durable_chain(parent: &Path) -> Vec<PathBuf> {
-    let mut chain = Vec::new();
-    let mut cursor = parent.to_path_buf();
-    loop {
-        if cursor.as_os_str().is_empty() {
-            chain.push(PathBuf::from("."));
-            break;
-        }
-        let at_anchor = cursor == Path::new(".");
-        chain.push(cursor.clone());
-        if at_anchor {
-            break;
-        }
-        match cursor.parent() {
-            Some(ancestor) => cursor = ancestor.to_path_buf(),
-            // An absolute path's anchor `/` has no parent and was already pushed.
-            None => break,
-        }
-    }
-    chain
-}
-
 /// The publisher's refusal: a retryable `INTERNAL_ERROR` — nothing the settlement leg staged
 /// is durable yet, so the same review can be repeated once the medium is writable.
 fn spoke_reject(message: String) -> spoke_operations::SpokeReject {
@@ -129,115 +134,5 @@ fn spoke_reject(message: String) -> spoke_operations::SpokeReject {
         code: spoke_operations::SpokeRejectCode::InternalError,
         message,
         details: Some(details),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{durable_chain, journal_dir};
-    use serde_json::json;
-    use std::path::{Path, PathBuf};
-
-    fn paths(chain: &[PathBuf]) -> Vec<&str> {
-        chain
-            .iter()
-            .map(|path| path.to_str().expect("utf-8"))
-            .collect()
-    }
-
-    /// An absolute ancestry runs deepest first through `/`, even when nothing exists yet.
-    #[test]
-    fn an_absolute_chain_ends_at_the_filesystem_root() {
-        let chain = durable_chain(Path::new("/scratch/one/two/records"));
-        assert_eq!(
-            paths(&chain),
-            vec![
-                "/scratch/one/two/records",
-                "/scratch/one/two",
-                "/scratch/one",
-                "/scratch",
-                "/"
-            ],
-            "every named ancestor, then the anchor"
-        );
-    }
-
-    /// A relative ancestry anchors at the current directory: the empty parent path never
-    /// reaches `File::open`, and no path in the chain is empty.
-    #[test]
-    fn a_relative_chain_anchors_at_the_current_directory() {
-        let chain = durable_chain(Path::new("journal/records"));
-        assert_eq!(paths(&chain), vec!["journal/records", "journal", "."]);
-        assert!(
-            chain.iter().all(|path| !path.as_os_str().is_empty()),
-            "an empty path can never be opened"
-        );
-    }
-
-    /// `journal_dir("journal")` builds `journal/records/…` style parents, so the relative
-    /// anchor is exercised exactly as the first publication of such a root would.
-    #[test]
-    fn a_relative_parent_under_the_current_directory_stops_at_it() {
-        assert_eq!(
-            paths(&durable_chain(Path::new("./records"))),
-            vec!["./records", "."]
-        );
-        assert_eq!(paths(&durable_chain(Path::new("."))), vec!["."]);
-    }
-
-    /// The chain depends on the path, never on which directories already exist: this is what
-    /// keeps a retry from being weaker than a failed first attempt.
-    #[test]
-    fn the_chain_is_identical_before_and_after_the_directories_exist() {
-        let directory = tempfile::TempDir::new().expect("temporary directory");
-        let parent = directory.path().join("one/two/records");
-        let before = durable_chain(&parent);
-        std::fs::create_dir_all(&parent).expect("create the tree");
-        let after = durable_chain(&parent);
-        assert_eq!(
-            paths(&before),
-            paths(&after),
-            "a retry sees the same chain as the attempt that created the tree"
-        );
-    }
-
-    /// The failure/retry boundary: a refusal after an earlier target already created a tree
-    /// leaves directories behind; the retry syncs the same chain and lands both targets.
-    #[test]
-    fn a_retry_after_a_refused_publication_syncs_the_same_chain() {
-        let directory = tempfile::TempDir::new().expect("temporary directory");
-        let root = directory.path().to_path_buf();
-        let parent = root.join("nested").join("records");
-        let before = durable_chain(&parent);
-
-        let publish = journal_dir(&root);
-        let refused = publish(&[
-            json!({ "path": "nested/records/one.md", "content": "one" }),
-            // The second target has no content: the first has already landed and created the
-            // tree when this one is refused.
-            json!({ "path": "nested/records/two.md" }),
-        ]);
-        assert!(
-            refused.is_err(),
-            "the malformed target refuses the publication"
-        );
-        assert!(parent.is_dir(), "the failed attempt created the tree");
-
-        let after = durable_chain(&parent);
-        assert_eq!(
-            paths(&before),
-            paths(&after),
-            "the retry syncs the same ancestry, including what the failed attempt created"
-        );
-
-        publish(&[
-            json!({ "path": "nested/records/one.md", "content": "one" }),
-            json!({ "path": "nested/records/two.md", "content": "two" }),
-        ])
-        .expect("the retry publishes");
-        assert_eq!(
-            std::fs::read_to_string(parent.join("two.md")).expect("the retried target"),
-            "two"
-        );
     }
 }
