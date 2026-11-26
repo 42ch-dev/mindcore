@@ -4,8 +4,9 @@
 
 How one Mindcore serving surface selects the knowledge collection and carrier a served call reads
 and writes: the request's Mind id is the only route input, and the Mind's registry row resolves it.
-It also states which served operations are not Mind-routed and are therefore not composed. It does
+It also states which served operations are not composed. It does
 not define memory semantics, the Connect handshake, refusal vocabulary or carrier record storage.
+The knowledge face serves `port.knowledge.*` per Mind; history and adoption stay uncomposed.
 
 ## Current state
 
@@ -21,9 +22,10 @@ collection. Routing has two inputs, and only the second is caller-declared:
 
 A Mind's id is its space id (`2026-11-25-mind-is-one-memory-space.md`), so the selectors SPOKE
 already carries express it: `space_id` on a memory request and on the served workflow tools'
-arguments, and `scope_id` on a knowledge `Scope` once that face returns. The `minds` row
-(`crates/mindcore-sqlite/migrations/0002_minds.sql`) is the map: it names the Mind's knowledge
-collection and its carrier entry, and no configuration carries that pair a second time.
+arguments, and `scope_id` on a knowledge `Scope`, which the knowledge face's admission takes from
+the request. The `minds` row (`crates/mindcore-sqlite/migrations/0002_minds.sql`) is the map: it
+names the Mind's knowledge collection and its carrier entry, and no configuration carries that pair
+a second time.
 
 ### Resolution and admission
 
@@ -113,30 +115,58 @@ registry row is not listed even under a live grant. The wire shape, cursor and m
   the signal needs its own create admission or a server-assigned id. The decision is tracked in
   `I-000155`; the served contract states the signal in [`serving-seam.md`](serving-seam.md).
 
-### The un-routed operations
+### The knowledge face
 
-`port.knowledge.*`, `history.*` and `knowledge.adopt` cannot name a Mind: the retained
-`RoutedKnowledgeStore` (and its `HistoryPort`) binds one collection for its lifetime, and adoption's
-destination is the knowledge face's own collection. Stage 1 therefore composes none of them:
+`port.knowledge.get`, `port.knowledge.put` and `port.scope.list_knowledge_entries` are Mind-routed
+and served when `ServeFaces.knowledge` is true:
 
-- the manifest advertises no `spoke-knowledge`, `ke-ownership`, `spoke-history` or
-  `spoke-knowledge-adoption`, and the runtime's `MindPorts` answers `None` for every family but
-  memory;
-- a call to each is refused on the responder's dispatch-deny branch — raw wire `op_unsupported` for
-  the knowledge family, `capability_missing` for history and adoption, each surfaced by the Rust
-  dialer as `CapabilityPortMissing` with `details.wire_code`.
+- The route input is the request's Mind id: the `scope_id` of the scope a `get` or `put` declares,
+  and the required scope of the list op. No selector names a collection, and a request that names
+  no scope names no Mind.
+- The admission resolves it. The face's callback maps the peer through the host's `principals`
+  admission, then calls `admitted_mind` (`crates/mindcore-spoke/src/workflows.rs`) — the caller's
+  own live grant rows, then the space row, then the registry row — and refuses an unknown Mind, an
+  unadmitted one and one the caller holds no live grant in with the same target-free
+  `NOT_AUTHORIZED`. It then binds the caller into the `Scope` it returns
+  (`mindcore_sqlite::bind_caller`) and validates it (`validate_admission_scope`); every successful
+  return is bound.
+- The registry row resolves on every call, not once per surface. `RoutedKnowledgeStore::admit`
+  reads `crates/mindcore-sqlite/src/minds.rs`'s `registered_collection` on the transaction the
+  op's statement runs on, so the collection is the admitted Mind's registered one and a `scope_id`
+  with no registry row is the same target-free refusal. Two requests for two Minds therefore reach
+  two collections through one composed face.
+- The route never substitutes for a grant: `MindKnowledgePort` authorizes each operation on the
+  caller's own live grant in the admitted Mind's space before the store is reached, per
+  [`serving-seam.md`](serving-seam.md) § Knowledge.
 
-They return per Mind in Stage 2: the pinned `0.19` cohort carries request-scoped admission (A1), the
-optional scope on knowledge get and put (A2) and `memory.spaces.create` (A3)
-(`2026-11-25-one-surface-serves-many-minds.md`), and the served port that authorizes each of them on
-the caller the admitted scope carries already exists
-(`2026-11-26-knowledge-caller-in-scope-extensions.md`). What Stage 2 still owes is the composition
-itself. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
+`history.*` and `knowledge.adopt` stay uncomposed: see below.
+
+### The uncomposed operations
+
+`history.*` and `knowledge.adopt` are Mind-routed in principle — both would resolve their route from
+the request's Mind id like the knowledge face, and the retained `HistoryPort` already resolves the
+registered collection per call through `admit_history` on its operation's transaction. This layer
+composes neither because the runtime pieces around them are gone, not because the route is
+missing: the durable prune dedup store and the one-transaction adoption service were removed with
+Stage 1's face, so the runtime serves neither family:
+
+- the manifest advertises no `spoke-history` or `spoke-knowledge-adoption`, and the runtime's
+  `MindPorts` answers `None` for both families;
+- a call to each is refused on the responder's dispatch-deny branch — raw wire
+  `capability_missing`, surfaced by the Rust dialer as `CapabilityPortMissing` with
+  `details.wire_code`.
+
+They return per Mind in later layers, once those runtime pieces are re-implemented; the pinned
+`0.19` cohort already carries request-scoped admission (A1) and the optional scope on knowledge get
+and put (A2) (`2026-11-25-one-surface-serves-many-minds.md`), and this layer composed the knowledge
+face that both use. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
 
 ### Construction
 
-- There is no route map to validate: `ServeFaces` carries no `workflow_routes`, `scope_id`,
-  `knowledge` or knowledge admission, and every Mind names its own collection through its row.
+- There is no route map to validate: `ServeFaces` carries no `workflow_routes`, `scope_id` or
+  knowledge collection, and every Mind names its own collection through its row. `ServeFaces.knowledge`
+  is a switch, not a route: it decides whether the face is composed, never which collection it
+  serves.
 - The route is persisted state, not host configuration: it is written once by `create` and not
   derived from arguments, and the wire carries only the Mind id.
 - The route never substitutes for a live grant: every carrier write and knowledge read still
@@ -156,7 +186,10 @@ itself. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
   names neither the caller, the Mind nor the missing capability.
 - A create writes the Mind's route and its default grant on one transaction, and a repeat create
   writes only its own receipt: the route a later call resolves is the one the first create wrote.
-- The three un-routed operations are never advertised and never served; a restored face re-enters
+- The composed knowledge face resolves its route per call: each served op reads the admitted
+  Mind's registry row on its own statement's transaction, so one face serves many Minds and no
+  collection is captured at assembly.
+- The two uncomposed operations are never advertised and never served; a restored face re-enters
   composition only per Mind, with `serving-seam.md`'s contract.
 - The carrier record format is unchanged.
 
@@ -164,28 +197,37 @@ itself. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
 
 - `crates/mindcore-spoke/src/admission.rs` — `admit_mind` (grant rows, then the space row),
   `refuse_coverage`, `refuse_space_coverage` and `gate` (the freeze and subject gates).
-- `crates/mindcore-spoke/src/workflows.rs` — `carrier_collection` (the one registry-row lookup both
-  readers share), `knowledge_slot`, and `admitted_carrier` / `admitted_carrier_entry` (the carrier
-  admissions).
-- `crates/mindcore-sqlite/src/minds.rs` — the `minds` row, its visibility join and `create`.
+- `crates/mindcore-spoke/src/workflows.rs` — `admitted_mind` (the admission the composed
+  knowledge face uses today, and the one the history and adoption faces must reuse when they are
+  composed: grant rows, then the space row, then the registry row),
+  `carrier_collection` (the one registry-row lookup both readers share), `knowledge_slot`, and
+  `admitted_carrier` / `admitted_carrier_entry` (the carrier admissions).
+- `crates/mindcore-sqlite/src/minds.rs` — the `minds` row, its visibility join, `create` and
+  `registered_collection` (the registry read every served knowledge op resolves its route with).
+- `crates/mindcore-sqlite/src/knowledge.rs` — `RoutedKnowledgeStore` and its per-call `admit`, which
+  resolves the admitted Mind's collection on the op's own transaction.
 - `crates/mindcore-spoke/src/control.rs` — `MemoryAdapter::create_space`, the served create that
   resolves no existing route and writes one; `crates/mindcore-runtime/tests/loopback.rs` drives it
   on a signed session.
 - `crates/mindcore-runtime/src/tools.rs` — the served `deliberate` and `read_cognition` argument
   objects and their handler entry.
-- `crates/mindcore-runtime/src/lib.rs` — `MindPorts`, the retired-id filter and `face_capabilities`.
-- `.agents/specs/architecture/serving-seam.md` — the served tool ABI and the advertisement rule.
+- `crates/mindcore-runtime/src/lib.rs` — `ServeFaces.knowledge`, `MindcoreServe::scoped_knowledge`
+  (the composed face and its admission callback), `MindPorts`, the retired-id filter and
+  `face_capabilities`.
+- `.agents/specs/architecture/serving-seam.md` — the served tool ABI, the per-operation grant rule
+  and the advertisement rule.
 - `crates/mindcore-runtime/tests/loopback.rs` — the signed-session assertions: two Minds and two
-  peers, the unadmitted/absent refusal, the frozen cases and the advertised set.
+  peers, the unadmitted/absent refusal, the frozen cases, the served knowledge ops and their two
+  adversarial loopbacks, and the advertised set.
 - `crates/mindcore-spoke/tests/memory_adapter.rs` — the admission-first assertions over every
   Mind-level read path and the registry-derived `memory.spaces.list`.
 
 ## Known limit
 
-Stage 1 routes memory and cognition per Mind only. `port.knowledge.*`, `history.*` and
-`knowledge.adopt` stay un-routed until Stage 2, so a peer gets no knowledge, history or adoption
-operation. A Mind's registry row is written once: changing its collection is a new Mind, not a
-reconfiguration, and there is no hot reload.
+Memory, the four Mind tools and `port.knowledge.*` route per Mind. `history.*` and
+`knowledge.adopt` stay uncomposed until their layers re-implement the runtime pieces they need, so a
+peer gets no history or adoption operation. A Mind's registry row is written once: changing its
+collection is a new Mind, not a reconfiguration, and there is no hot reload.
 
 ## Change obligations
 

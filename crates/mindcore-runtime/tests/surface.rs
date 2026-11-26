@@ -127,6 +127,7 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
     ServeFaces {
         manifest,
         memory: None,
+        knowledge: false,
         principals: principals(),
         providers: MindProviders::default(),
         tools: Vec::new(),
@@ -207,7 +208,11 @@ async fn manifest_follows_the_composed_faces() {
     );
     assert!(
         surface.ports.as_knowledge().is_none(),
-        "no knowledge face is composed: the responder answers its ops as a missing port"
+        "no peer-only knowledge face is composed"
+    );
+    assert!(
+        surface.ports.as_scoped_knowledge().is_none(),
+        "no scoped knowledge face is composed: the responder answers its ops as a missing port"
     );
     assert!(
         surface.ports.as_history().is_none(),
@@ -416,4 +421,54 @@ async fn tool_registrations_drive_advertisement_and_installation() {
     .await;
     expect_ok(surface.register(&responder), "install handlers");
     responder.close();
+}
+
+/// The knowledge face is one composition decision: `ServeFaces.knowledge` true advertises
+/// `spoke-knowledge`, `ke-ownership` and `spoke-knowledge-scoped` together and answers
+/// `as_scoped_knowledge()` with the face; false advertises none of them and answers nothing.
+#[tokio::test]
+async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
+    let serve = Fixture::open().await.serve();
+    let composed = expect_ok(
+        serve.surface(ServeFaces {
+            knowledge: true,
+            ..faces(metadata("runtime"))
+        }),
+        "assemble a knowledge-serving surface",
+    );
+    for capability in ["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"] {
+        assert!(
+            capabilities(&composed).contains(&capability),
+            "the composed face advertises {capability}: {:?}",
+            capabilities(&composed)
+        );
+    }
+    assert!(
+        composed.ports.as_scoped_knowledge().is_some(),
+        "the composed face answers the scoped probe"
+    );
+    assert!(
+        composed.ports.as_knowledge().is_none(),
+        "the request-scoped face is the one composed, never the peer-only fallback beside it"
+    );
+    expect_ok(
+        validate_manifest_tools(&composed.manifest),
+        "the derived manifest is self-consistent",
+    );
+
+    let absent = expect_ok(
+        serve.surface(faces(metadata("runtime"))),
+        "assemble a surface without the knowledge face",
+    );
+    for capability in ["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"] {
+        assert!(
+            !capabilities(&absent).contains(&capability),
+            "the absent face advertises nothing: {capability} in {:?}",
+            capabilities(&absent)
+        );
+    }
+    assert!(
+        absent.ports.as_scoped_knowledge().is_none(),
+        "the absent face answers no scoped probe"
+    );
 }

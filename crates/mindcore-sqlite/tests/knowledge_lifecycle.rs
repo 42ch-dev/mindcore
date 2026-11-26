@@ -44,6 +44,30 @@ fn database_path(label: &str) -> PathBuf {
     ))
 }
 
+/// The Mind registry row the served face resolves its route from: the space row, then the
+/// registry row naming the collection and a live entry of it.
+async fn register_mind(pool: &SqlitePool, space_id: &str, collection: &str, carrier: &str) {
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+          created_at) \
+         VALUES (?, NULL, 'host_1', 1, 'active', 1, '2026-11-26T09:00:00.000Z')",
+    )
+    .bind(space_id)
+    .execute(pool)
+    .await
+    .expect("seed the mind's space row");
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
+    )
+    .bind(space_id)
+    .bind(collection)
+    .bind(carrier)
+    .execute(pool)
+    .await
+    .expect("seed the mind registry row");
+}
+
 fn remove_database(path: &Path) {
     let _ = std::fs::remove_file(path);
     for suffix in ["-wal", "-shm"] {
@@ -1287,7 +1311,7 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
     remove_database(&path);
     let store = MindStore::open(&path).await.expect("open store");
     let shared = store.knowledge(KnowledgeScope::new("shared"));
-    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let port = store.served_knowledge();
     let peer = principal("peer-a");
     let admitted = scope_of("spc_shared");
 
@@ -1304,6 +1328,8 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
             "seed entry-l",
         );
     }
+    // The served route is the Mind registry: the row names the collection and a live entry of it.
+    register_mind(&store.pool(), "spc_shared", "shared", "entry-l").await;
     expect_ok(
         shared
             .put_knowledge_entry(private_entry("entry-private", "mira's private notes"), None)
@@ -1545,7 +1571,7 @@ async fn a_history_replay_outside_the_admitted_scope_answers_the_generic_absence
     remove_database(&path);
     let store = MindStore::open(&path).await.expect("open store");
     let shared = store.knowledge(KnowledgeScope::new("shared"));
-    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let port = store.served_knowledge();
     let peer = principal("peer-a");
     let admitted = scope_of("spc_shared");
 
@@ -1563,6 +1589,7 @@ async fn a_history_replay_outside_the_admitted_scope_answers_the_generic_absence
             .await,
         "publish entry-v",
     );
+    register_mind(&store.pool(), "spc_shared", "shared", "entry-v").await;
 
     let details = expect_history_reject(
         port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-v", 1)
@@ -1590,7 +1617,7 @@ async fn the_history_port_redacts_a_stored_decode_fault() {
     remove_database(&path);
     let store = MindStore::open(&path).await.expect("open store");
     let shared = store.knowledge(KnowledgeScope::new("shared"));
-    let port = store.served_knowledge("spc_shared", KnowledgeScope::new("shared"));
+    let port = store.served_knowledge();
     let peer = principal("peer-a");
     let admitted = scope_of("spc_shared");
 
@@ -1600,6 +1627,7 @@ async fn the_history_port_redacts_a_stored_decode_fault() {
             .await,
         "seed entry-f",
     );
+    register_mind(&store.pool(), "spc_shared", "shared", "entry-f").await;
 
     // The public prune helper keeps the input rule at its own boundary.
     let mut transaction = store

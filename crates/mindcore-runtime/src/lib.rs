@@ -1,11 +1,17 @@
-//! The Mindcore serving surface: the workflow engine and the host's memory face assembled into the
-//! pieces a Connect responder is built from.
+//! The Mindcore serving surface: the workflow engine, the host's memory face and the per-Mind
+//! knowledge face assembled into the pieces a Connect responder is built from.
 //!
 //! The crate opens nothing: no listener, accept loop, identity or transport. The host supplies
 //! those plus its admission, publisher and memory service, then builds
 //! `ConnectResponderOptions` from [`MindcoreSurface`]. Advertisements follow what is served:
 //! [`MindcoreServe::surface`] derives `capabilities` and `tools` from the composed faces and the
 //! registrations, never from a host-supplied capability string.
+//!
+//! The knowledge face is one composition decision ([`ServeFaces::knowledge`]): the request's scope
+//! selector names a Mind, admission resolves it exactly as the memory path does, and only then is
+//! the caller bound into the returned scope. The face therefore serves several Minds from one
+//! responder, and the admission callback blocks — see [`ServeFaces::knowledge`] for the runtime
+//! requirement that follows.
 //!
 //! The crate is also the library's entry crate: [`minds`] holds the in-process entry points
 //! `create`, `list` and `get` a host calls on its `MindStore`, and [`mind`] holds the `Mind`
@@ -21,18 +27,24 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
-use mindcore_spoke::{MemoryWorkflowBinding, ServedMemory, TRANSFER_OPERATIONS};
-use mindcore_sqlite::{vectors, MindStore};
+use mindcore_spoke::{
+    admitted_mind, is_mind_admission_refusal, MemoryWorkflowBinding, MindKnowledgePort,
+    ServedMemory, TRANSFER_OPERATIONS,
+};
+use mindcore_sqlite::{bind_caller, validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
-    CAPABILITY_SPOKE_JUDGMENT, CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
+    CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_JUDGMENT, CAPABILITY_SPOKE_KNOWLEDGE,
+    CAPABILITY_SPOKE_KNOWLEDGE_SCOPED, CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
-    ConnectResponder, MemoryAdmission, RemoteMemoryService, RemoteServePorts, ToolHandler,
+    ConnectResponder, MemoryAdmission, RemoteMemoryService, RemoteScopedKnowledgeFace,
+    RemoteServePorts, ScopedKnowledgeAdmission, ToolHandler,
 };
-use spoke_operations::{validate_manifest_tools, SpokeResult};
+use spoke_operations::{validate_manifest_tools, ScopedKnowledgePort, SpokeReject, SpokeResult};
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
-use spoke_schemas::HostCapabilityManifest;
+use spoke_schemas::{HostCapabilityManifest, Scope};
 use sqlx::SqlitePool;
+use tokio::runtime::Handle;
 
 pub use journal::journal_dir;
 pub use mind::{Capture, Deliberation, Mind, Recall};
@@ -127,13 +139,22 @@ impl MindcoreServe {
                 .into_iter()
                 .filter(|tool| !reserved.contains(&tool.descriptor.capability_id.as_str())),
         );
-        let manifest = match derive_manifest(faces.manifest, faces.memory.as_deref(), &tools) {
+        let knowledge = faces
+            .knowledge
+            .then(|| self.scoped_knowledge(Arc::clone(&principals)));
+        let manifest = match derive_manifest(
+            faces.manifest,
+            faces.memory.as_deref(),
+            knowledge.is_some(),
+            &tools,
+        ) {
             SpokeResult::Ok(manifest) => manifest,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         SpokeResult::Ok(MindcoreSurface {
             ports: Arc::new(MindPorts {
                 memory: faces.memory,
+                knowledge,
             }),
             manifest,
             tools,
@@ -141,16 +162,79 @@ impl MindcoreServe {
             pool: self.store.pool(),
         })
     }
+
+    /// The per-Mind scoped knowledge face: one store and one admission for every Mind.
+    ///
+    /// The store is layer 1's served port over the per-call routed store, so every call resolves
+    /// the collection from the admitted `scope_id`. The admission is the callback Connect runs on
+    /// its blocking pool: the host's own peer-to-principal mapping, then the Mind the request's
+    /// selector names through [`admitted_mind`], then the caller binding
+    /// ([`mindcore_sqlite::bind_caller`]) — the last step runs on every successful return, so no
+    /// scope leaves this face unbound.
+    fn scoped_knowledge(&self, principals: MemoryAdmission) -> Arc<RemoteScopedKnowledgeFace> {
+        let pool = self.store.pool();
+        let store: Arc<dyn ScopedKnowledgePort + Send + Sync> = Arc::new(MindKnowledgePort::new(
+            pool.clone(),
+            Arc::new(self.store.served_knowledge()),
+        ));
+        let admission: ScopedKnowledgeAdmission = Arc::new(move |peer_id, selector| {
+            // Step one passes the host's own rejection through as it is — the admission rule the
+            // plan states for this callback. The host callback is the host's to classify; only the
+            // Mind admission below can tell a refusal from a storage fault on grounds this face
+            // owns.
+            let principal = match principals(peer_id) {
+                SpokeResult::Ok(principal) => principal,
+                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+            };
+            // A selector is what the request asked for, never a grant. No selector names no Mind,
+            // and the empty id no Mind carries makes admission refuse it through the one
+            // `admitted_mind` rule rather than a second spelling of it.
+            let scope_id = selector.unwrap_or_default();
+            // Synchronous because Connect's admission is; the responder runs it on the blocking
+            // pool, where `block_on` is legal on a multi-thread runtime.
+            let admitted =
+                Handle::current().block_on(admitted_mind(&pool, &principal.principal_id, scope_id));
+            // Every refusal step — no live grant, an unadmitted or unknown Mind, no space row, no
+            // registry row — answers the one target-free value. Anything else here is a storage
+            // fault and must not be answered as that refusal.
+            if let Err(reject) = admitted {
+                return match is_mind_admission_refusal(&reject) {
+                    true => SpokeResult::Reject(reject),
+                    false => fault_out_of_admission(&reject),
+                };
+            }
+            let mut scope = Scope {
+                cognition: None,
+                entry_ids: None,
+                entry_types: None,
+                extensions: None,
+                fork_id: None,
+                scope_id: scope_id.to_string(),
+                source_id: None,
+                timeline_event_ids: None,
+                timeline_scale: None,
+                viewpoint: None,
+            };
+            bind_caller(&mut scope, &principal.principal_id);
+            match validate_admission_scope(&scope) {
+                SpokeResult::Ok(()) => SpokeResult::Ok(scope),
+                SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+            }
+        });
+        Arc::new(RemoteScopedKnowledgeFace { store, admission })
+    }
 }
 
-/// The runtime's own ports: the one face this surface carries is the host's memory service.
+/// The runtime's own ports: the host's memory service and, when `ServeFaces.knowledge` asks for
+/// it, the per-Mind scoped knowledge face.
 ///
-/// The other families stay absent — a call to each is refused on the responder's dispatch-deny
-/// branch, raw wire `op_unsupported` for knowledge and `capability_missing` for history and
-/// adoption, which the Rust dialer surfaces as `CapabilityPortMissing` — because none of them can
-/// name a Mind yet; each is composed per Mind once SPOKE carries that contract.
+/// History and adoption stay absent — a call to each is refused on the responder's dispatch-deny
+/// branch, wire `capability_missing`, which the Rust dialer surfaces as `CapabilityPortMissing` —
+/// because neither can name a Mind yet; each is composed per Mind once SPOKE carries that
+/// contract.
 struct MindPorts {
     memory: Option<Arc<dyn ServedMemory>>,
+    knowledge: Option<Arc<RemoteScopedKnowledgeFace>>,
 }
 
 /// The responder takes the family's bare service; `ServedMemory` only adds the operation report.
@@ -161,6 +245,10 @@ fn remote_memory(memory: Arc<dyn ServedMemory>) -> Arc<dyn RemoteMemoryService> 
 impl RemoteServePorts for MindPorts {
     fn as_memory(&self) -> Option<Arc<dyn RemoteMemoryService>> {
         self.memory.clone().map(remote_memory)
+    }
+
+    fn as_scoped_knowledge(&self) -> Option<Arc<RemoteScopedKnowledgeFace>> {
+        self.knowledge.clone()
     }
 }
 
@@ -178,6 +266,18 @@ pub struct ServeFaces {
     /// cannot show it dispatches. A bare `RemoteMemoryService` takes the trait's default and
     /// reports none.
     pub memory: Option<Arc<dyn ServedMemory>>,
+    /// Whether the per-Mind knowledge face is composed.
+    ///
+    /// `true` composes the scoped knowledge face — [`MindKnowledgePort`] over the store's
+    /// per-call routed store, with one admission for every Mind — and advertises
+    /// `spoke-knowledge`, `ke-ownership` and `spoke-knowledge-scoped` together. `false` composes
+    /// and advertises none, and the knowledge ops keep the dispatch-deny answer.
+    ///
+    /// The admission callback is synchronous and Connect runs it on its blocking pool, so it
+    /// drives the admission through [`Handle::block_on`]: the host must run the responder on a
+    /// **multi-thread** runtime. A single-thread runtime cannot run the callback's store read,
+    /// and the callback would panic (contained by Connect as `INTERNAL_ERROR`).
+    pub knowledge: bool,
     /// Maps the authenticated peer to the `Principal` the workflows admit. The same host mapping
     /// the memory face uses; never read from the wire.
     pub principals: MemoryAdmission,
@@ -277,10 +377,34 @@ impl MindcoreSurface {
     }
 }
 
+/// Answer a storage fault inside the scoped knowledge admission through Connect's per-request
+/// internal-error channel, never through the fixed admission refusal.
+///
+/// **Why a panic, deliberately.** Connect answers every admission `Reject` with one fixed
+/// `NOT_AUTHORIZED` (`deny_knowledge_scope`), so a database fault returned as a `Reject` would be
+/// byte-identical to an unadmitted caller and the caller could not tell a broken store from a
+/// refusal. Connect does have one fault channel: it runs this callback under
+/// `spawn_blocking`, catches a panic as that task's join error, and answers *that request* with
+/// `INTERNAL_ERROR("knowledge admission failed")` — the panic payload stays host-side and never
+/// reaches the wire, and nothing was sent to the store. Panicking here is therefore the
+/// supported way to say "not a refusal"; the `panic!` below is intentional, not incidental.
+///
+/// The message is the store's own diagnostic: it is kept host-side by Connect and is what a host
+/// logging the panic carries. It names local tables and columns, so it must not reach a peer —
+/// and it does not.
+fn fault_out_of_admission<T>(fault: &SpokeReject) -> T {
+    panic!(
+        "knowledge admission hit a storage fault, answered as this request's internal error: {} ({})",
+        fault.message,
+        fault.code.as_str()
+    )
+}
+
 /// The advertised capabilities follow the composed faces: the memory family flag when a memory
 /// service is attached and the transfer family flag when that service reports every one of
-/// [`TRANSFER_OPERATIONS`]. No other family is composed, so none is advertised.
-fn face_capabilities(memory: Option<&dyn ServedMemory>) -> Vec<String> {
+/// [`TRANSFER_OPERATIONS`]; the three knowledge flags together when the scoped face is composed.
+/// No other family is composed, so none is advertised.
+fn face_capabilities(memory: Option<&dyn ServedMemory>, knowledge: bool) -> Vec<String> {
     let mut capabilities = Vec::new();
     if let Some(memory) = memory {
         capabilities.push(CAPABILITY_SPOKE_MEMORY.to_string());
@@ -292,6 +416,13 @@ fn face_capabilities(memory: Option<&dyn ServedMemory>) -> Vec<String> {
             capabilities.push(CAPABILITY_SPOKE_MEMORY_TRANSFER.to_string());
         }
     }
+    if knowledge {
+        // Without the marker a per-Mind face could not serve a scoped `get` or `put` at all, and
+        // without `ke-ownership` Connect refuses any request that names a viewpoint.
+        capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE.to_string());
+        capabilities.push(CAPABILITY_KE_OWNERSHIP.to_string());
+        capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE_SCOPED.to_string());
+    }
     capabilities
 }
 
@@ -300,9 +431,10 @@ fn face_capabilities(memory: Option<&dyn ServedMemory>) -> Vec<String> {
 fn derive_manifest(
     mut manifest: HostCapabilityManifest,
     memory: Option<&dyn ServedMemory>,
+    knowledge: bool,
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
-    manifest.capabilities = face_capabilities(memory);
+    manifest.capabilities = face_capabilities(memory, knowledge);
     if tools
         .iter()
         .any(|tool| tool.descriptor.capability_id.as_str() == tools::DELIBERATE)
