@@ -4883,5 +4883,22 @@ async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
         SpokeRejectCode::NotAuthorized,
         "the skipped Mind answers the admission refusal"
     );
+
+    // The mixed set agrees with the list: the Mind with one broken and one live decodable row is
+    // listed above and served here, because admission skips the row it cannot decode exactly as
+    // the visibility read does.
+    let mixed = adapter
+        .recall(
+            &mut tx,
+            &principal(owner),
+            json!({ "space_id": "mind_extra", "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "budget": { "max_items": 4 } }),
+        )
+        .await;
+    assert!(
+        matches!(mixed, SpokeResult::Ok(_)),
+        "a live decodable row admits beside a broken one: {mixed:?}"
+    );
     tx.rollback().await.expect("rollback");
 }

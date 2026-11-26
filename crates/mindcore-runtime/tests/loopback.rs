@@ -1950,10 +1950,15 @@ async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
         .await
         .expect("corrupt the expiry");
     let (_dir, serve) = fixture.serve();
+    // A reasoner is configured so the workflow reaches its snapshot: the refusal must come from
+    // admission/coverage, never from the engine's missing capability.
     let mut faces = faces(
         hello("runtime", &[]),
         None,
-        MindProviders::default(),
+        MindProviders {
+            reasoner: Some(Arc::new(NoChangeReasoner)),
+            ..MindProviders::default()
+        },
     );
     faces.principals = principal_admission();
     let surface = surface(&serve, faces);
@@ -2009,10 +2014,15 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
+    // A reasoner is configured so the workflow reaches its snapshot: the refusal must come from
+    // admission/coverage, never from the engine's missing capability.
     let mut faces = faces(
         hello("runtime", &[]),
         None,
-        MindProviders::default(),
+        MindProviders {
+            reasoner: Some(Arc::new(NoChangeReasoner)),
+            ..MindProviders::default()
+        },
     );
     faces.principals = principal_admission();
     let surface = surface(&serve, faces);
@@ -2031,10 +2041,10 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
             .await,
         "deliberate after the knowledge grant is revoked",
     );
-    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
-    assert!(
-        uncovered.message.contains("knowledge_read"),
-        "a revoked row covers nothing, so the coverage refusal answers: {uncovered:?}"
+    assert_eq!(
+        uncovered.code,
+        SpokeRejectCode::NotAuthorized,
+        "the revoked knowledge grant is the coverage answer: {uncovered:?}"
     );
 
     sqlx::query(
@@ -2054,6 +2064,106 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
     assert!(
         reject.details.is_none(),
         "a revoked grant is the plain admission refusal: {reject:?}"
+    );
+}
+
+/// The plan's refusal order on the served `deliberate`: admission, then the workflow's subject
+/// page and its revalidation, and only then the `knowledge_read` coverage. A caller whose recall
+/// grant does not cover the named subject answers that refusal even though it also lacks
+/// `knowledge_read`; once the subject is covered, the capability gap answers. No reasoner is
+/// configured, so any path that reached the engine would answer differently again, and nothing is
+/// written either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliberate_refuses_the_subject_before_the_knowledge_coverage() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    // The caller keeps one recall grant, scoped to a subject it is not asking about, and no
+    // knowledge grant at all: both refusals apply, and the subject's must answer first.
+    fixture.revoke("grt_recall").await;
+    fixture.revoke("grt_knowledge").await;
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_recall_elsewhere', ?, 'subj_elsewhere', ?, '[\"recall\"]', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(SPACE)
+    .bind(PRINCIPAL)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed the elsewhere recall grant");
+    let (_dir, serve) = fixture.serve();
+    // A reasoner is configured so the workflow reaches its snapshot: both refusals below are
+    // decided there, before any provider work.
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &[]),
+            None,
+            MindProviders {
+                reasoner: Some(Arc::new(NoChangeReasoner)),
+                ..MindProviders::default()
+            },
+        ),
+    );
+    let session = connect(&surface, &[DELIBERATE]).await;
+
+    let subject_first = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate whose recall grant covers another subject",
+    );
+    assert_eq!(
+        subject_first.code,
+        SpokeRejectCode::NotAuthorized,
+        "the subject refusal answers: {subject_first:?}"
+    );
+    assert!(
+        subject_first.message.contains("recall"),
+        "the subject page's own refusal answers first: {subject_first:?}"
+    );
+    assert!(
+        !subject_first.message.contains("knowledge_read"),
+        "the capability gap must not pre-empt the subject refusal: {subject_first:?}"
+    );
+
+    // Covering the subject leaves only the capability gap; it answers now, from the workflow.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_recall_subject', ?, ?, ?, '[\"recall\"]', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(SPACE)
+    .bind(SUBJECT)
+    .bind(PRINCIPAL)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed the subject recall grant");
+    let coverage = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate whose subject is covered but whose knowledge_read is missing",
+    );
+    assert_eq!(coverage.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        coverage.message.contains("knowledge_read"),
+        "the coverage refusal answers once the subject is admitted: {coverage:?}"
+    );
+    assert_ne!(
+        coverage, subject_first,
+        "the two refusals are different answers in the plan's order"
+    );
+    assert_eq!(
+        carrier_revision(&pool, COLLECTION, CARRIER).await,
+        1,
+        "neither refusal writes a judgment"
     );
 }
 

@@ -368,7 +368,7 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let subject_id = request.subject_id.as_str();
-        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(tx, principal_id, &space).await?;
         if !admission::any_grant_for_subject(
             &rows,
             principal_id,
@@ -511,8 +511,8 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let now = Utc::now();
-        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
-        let wire_grants = admission::wire_grants(&rows)?;
+        let rows = admission::admit_mind(tx, principal_id, &space).await?;
+        let wire_grants = admission::live_wire_grants(&rows, now)?;
         let admin = admission::covered(
             &wire_grants,
             principal_id,
@@ -534,8 +534,18 @@ impl MemoryAdapter {
             .subject_id
             .as_ref()
             .map(|subject| subject.as_str().to_string());
+        // Admission stays caller-only, but the answer does not: an admin is served the whole
+        // space's grant set, and the cursor marker is computed over the same set, so another
+        // principal's grant change moves the marker an admin's page is checked against. Everyone
+        // else is served exactly the rows admission read for them.
+        let served: Vec<MemoryGrantRow> = if admin {
+            admission::grants(tx, &space).await?
+        } else {
+            rows
+        };
         let marker = policy::snapshot_marker(
-            rows.iter()
+            served
+                .iter()
                 .map(|row| (row.grant_id.clone(), row.revision.as_i64().unwrap_or(0)))
                 .collect(),
             &[],
@@ -552,7 +562,7 @@ impl MemoryAdapter {
             .as_ref()
             .map(|cursor| cursor.as_str().to_string());
         let (offset, claimed) = policy::cursor_page(cursor.as_deref(), principal_id, &scope)?;
-        let page: Vec<&MemoryGrantRow> = rows
+        let page: Vec<&MemoryGrantRow> = served
             .iter()
             .filter(|row| {
                 applied

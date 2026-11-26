@@ -36,7 +36,7 @@ use mindcore_spi::{
 };
 use mindcore_sqlite::{
     append_cognition, list_entries_in, read_carrier_header, read_entry, vectors,
-    SqliteMemoryRepository, SqliteRepositoryError,
+    SqliteMemoryRepository,
 };
 
 use crate::admission;
@@ -62,15 +62,48 @@ pub(crate) struct AdmittedCarrier {
     pub(crate) carrier_entry_id: String,
 }
 
-/// Mind admission for the host-side `deliberate` handler, in the order the plan fixes: the
-/// caller's live grant, then the space row, then the registry row, and only then the space-wide
-/// `knowledge_read` coverage — the same split [`admitted_carrier`] applies to the cognition read.
+/// The plan's carrier admission, shared by both entries below and in its fixed order: a live grant
+/// of the caller's in the space — any capability admits, and an unknown, an unadmitted and a
+/// frozen-ungranted Mind answer the one target-free refusal — then the space row, then the
+/// registry row the carrier comes from.
+async fn admit_carrier_location(
+    tx: &mut Tx<'_>,
+    principal_id: &str,
+    space: &SpaceId,
+    space_id: &str,
+) -> Result<(Vec<MemoryGrantRow>, AdmittedCarrier), SpokeReject> {
+    let rows = caller_grants(tx, principal_id, space).await?;
+    let now = Utc::now();
+    if !rows.iter().any(|row| admission::live_grant(row, now)) {
+        return Err(Reject::admission_refusal().into_spoke());
+    }
+    // The space row is the plan's second step, and it is what `admit_mind` itself checks: a grant
+    // outlives its space only if the space row is deleted underneath it, which the store never
+    // does — a Mind's space row, registry row and carrier entry are written in one transaction.
+    // Keeping the read makes this path refuse exactly the Minds `admit_mind` refuses.
+    let space_row = SqliteMemoryRepository
+        .space(tx, space)
+        .await
+        .map_err(|error| {
+            Reject::internal(format!("the mind admission could not be read: {error}")).into_spoke()
+        })?;
+    if space_row.is_none() {
+        return Err(Reject::admission_refusal().into_spoke());
+    }
+    let carrier = registry_carrier(tx, space_id)
+        .await?
+        .ok_or_else(|| Reject::admission_refusal().into_spoke())?;
+    Ok((rows, carrier))
+}
+
+/// Admission for the host-side `deliberate` handler: the steps above and nothing more.
 ///
-/// An unknown Mind, an unadmitted one and a frozen one the caller holds no grant in answer the
-/// one target-free refusal. A caller the named Mind admits but whose grants do not cover
-/// `knowledge_read` answers the coverage refusal instead, which is reachable only by a caller
-/// already known to hold a live grant here; the two answers are deliberately different, so a
-/// capability gap never reads as a lost admission.
+/// The operation's own coverage is deliberately not checked here. `deliberate` reaches the
+/// carrier through the workflow, which reads its subject page and revalidates it before it checks
+/// `knowledge_read` and `knowledge_write`, so a caller the Mind admits but whose grants do not
+/// cover a capability still sees the refusal its request earns first — the plan's order, and the
+/// one the refused operations answered before the Mind routing. The host pre-check exists only to
+/// resolve the carrier a caller the Mind admits at all may write.
 pub async fn admitted_carrier_entry(
     pool: &SqlitePool,
     principal_id: &str,
@@ -84,15 +117,15 @@ pub async fn admitted_carrier_entry(
         .begin()
         .await
         .map_err(|e| Reject::internal(format!("the mind admission could not begin: {e}")).into_spoke())?;
-    let carrier = admitted_carrier(&mut tx, principal_id, space_id).await;
+    let space = SpaceId::new(space_id.to_string());
+    let located = admit_carrier_location(&mut tx, principal_id, &space, space_id).await;
     let _ = tx.rollback().await;
-    carrier.map(|carrier| carrier.carrier_entry_id)
+    located.map(|(_, carrier)| carrier.carrier_entry_id)
 }
 
-/// Admission of one Mind-level read, in the order the plan fixes: a live grant of the caller's in
-/// the named space — any capability admits, and an unknown, an unadmitted and a frozen-ungranted
-/// Mind answer the one target-free refusal — then the space row, then the registry row the carrier
-/// comes from, and only then the space-wide `knowledge_read` coverage.
+/// Admission of one Mind-level read: the steps above, then the space-wide `knowledge_read`
+/// coverage. A read has no subject page ahead of the carrier, so the coverage refusal is its
+/// first capability answer.
 ///
 /// The two refusals are deliberately different answers. Admission answers the fixed refusal with
 /// no details, because it must not say whether the named Mind exists. Coverage answers
@@ -101,36 +134,16 @@ pub async fn admitted_carrier_entry(
 /// a Mind the caller was never admitted to.
 ///
 /// Every read is confined to the caller's own grant rows. Another principal's malformed row never
-/// reaches a decision, and a decode failure on the caller's own row answers the same target-free
-/// refusal as a Mind that does not exist.
+/// reaches a decision, and a row of the caller's own that cannot decode is skipped exactly as the
+/// registry's visibility read skips it.
 pub(crate) async fn admitted_carrier(
     tx: &mut Tx<'_>,
     principal_id: &str,
     space_id: &str,
 ) -> Result<AdmittedCarrier, SpokeReject> {
-    let repository = SqliteMemoryRepository;
     let space = SpaceId::new(space_id.to_string());
-    let rows = caller_grants(tx, principal_id, &space).await?;
+    let (rows, carrier) = admit_carrier_location(tx, principal_id, &space, space_id).await?;
     let now = Utc::now();
-    if !rows
-        .iter()
-        .any(|row| row.principal_id.as_str() == principal_id && admission::live_grant(row, now))
-    {
-        return Err(Reject::admission_refusal().into_spoke());
-    }
-    // The space row is the plan's second step, and it is what `admit_mind` itself checks: a grant
-    // outlives its space only if the space row is deleted underneath it, which the store never
-    // does — a Mind's space row, registry row and carrier entry are written in one transaction.
-    // Keeping the read makes this path refuse exactly the Minds `admit_mind` refuses.
-    let space_row = repository.space(tx, &space).await.map_err(|error| {
-        Reject::internal(format!("the mind admission could not be read: {error}")).into_spoke()
-    })?;
-    if space_row.is_none() {
-        return Err(Reject::admission_refusal().into_spoke());
-    }
-    let carrier = registry_carrier(tx, space_id)
-        .await?
-        .ok_or_else(|| Reject::admission_refusal().into_spoke())?;
     // Coverage over the same caller-only rows: another principal's grants are neither needed for
     // a space-wide requirement nor allowed to reach this decision, and a dead row of the
     // caller's own covers nothing — projecting one would turn a refusal into a storage error.
@@ -161,13 +174,10 @@ async fn caller_grants(
     principal_id: &str,
     space: &SpaceId,
 ) -> Result<Vec<MemoryGrantRow>, SpokeReject> {
-    SqliteMemoryRepository
-        .list_grants(tx, space, Some(principal_id))
+    mindcore_sqlite::decodable_grants(tx, space, Some(principal_id))
         .await
-        .map_err(|error| match error {
-            SqliteRepositoryError::InvalidRow(_) => Reject::admission_refusal().into_spoke(),
-            other => Reject::internal(format!("the mind admission could not be read: {other}"))
-                .into_spoke(),
+        .map_err(|error| {
+            Reject::internal(format!("the mind admission could not be read: {error}")).into_spoke()
         })
 }
 
@@ -409,10 +419,11 @@ impl MemoryWorkflowBinding {
         space_id: &str,
     ) -> Result<Vec<MemoryGrant>, SpiError> {
         let space = SpaceId::new(space_id.to_string());
-        let rows = admission::grants(&SqliteMemoryRepository, tx, &space)
+        let rows = admission::grants(tx, &space)
             .await
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
-        admission::wire_grants(&rows).map_err(|reject| SpiError::Settlement(reject.into_spoke()))
+        admission::live_wire_grants(&rows, Utc::now())
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))
     }
 
     /// Bind the carrier its row states, for the facade handle that resolved the

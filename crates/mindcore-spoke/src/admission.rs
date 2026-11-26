@@ -14,7 +14,7 @@ use mindcore_base::ir::{
     MemoryRepository, MemorySpaceRow, MemorySubjectRow, Placement, ReceiptKey, ReceiptRead,
     ReviewReceiptIr,
 };
-use mindcore_sqlite::{SqliteMemoryRepository, SqliteRepositoryError};
+use mindcore_sqlite::SqliteMemoryRepository;
 use spoke_operations::SpokeResult;
 use spoke_operations::{
     grant_covers, is_freeze_allowlisted, validate_grant_issuance, GrantRequirement, IssuedGrant,
@@ -217,29 +217,28 @@ pub(crate) fn candidate_requirement<'a>(
 /// space to `memory.*`; the registry gates only `memory.spaces.list` and the
 /// Mind-level reads.
 ///
-/// The read is filtered to the caller's own rows at the query. Another
-/// principal's malformed row is therefore never decoded and can neither turn
-/// this refusal into a storage error nor tell the caller the space exists; a
-/// row of the caller's own that cannot decode admits nothing and answers the
-/// same target-free refusal.
+/// The read is filtered to the caller's own rows at the query and decodes one
+/// row at a time, skipping a row that cannot decode — the rule the registry's
+/// visibility read applies. Another principal's malformed row is therefore
+/// never decoded and can neither turn this refusal into a storage error nor
+/// tell the caller the space exists; a live decodable row of the caller's
+/// admits, and only a set with none refuses, so a Mind the list names is one
+/// admission serves.
 pub(crate) async fn admit_mind(
-    repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
     principal: &str,
     space: &SpaceId,
 ) -> AResult<Vec<MemoryGrantRow>> {
-    let rows = repository
-        .list_grants(tx, space, Some(principal))
+    let rows = mindcore_sqlite::decodable_grants(tx, space, Some(principal))
         .await
-        .map_err(|error| match error {
-            SqliteRepositoryError::InvalidRow(_) => Reject::admission_refusal(),
-            other => Reject::internal(format!("the mind admission could not be read: {other}")),
+        .map_err(|error| {
+            Reject::internal(format!("the mind admission could not be read: {error}"))
         })?;
     let now = Utc::now();
     if !rows.iter().any(|row| live_grant(row, now)) {
         return Err(Reject::admission_refusal());
     }
-    match repository.space(tx, space).await? {
+    match SqliteMemoryRepository.space(tx, space).await? {
         Some(_) => Ok(rows),
         None => Err(Reject::admission_refusal()),
     }
@@ -305,12 +304,10 @@ pub(crate) async fn record(
     Ok(repository.record(tx, space, record_id).await?)
 }
 
-pub(crate) async fn grants(
-    repository: &SqliteMemoryRepository,
-    tx: &mut Tx<'_>,
-    space: &SpaceId,
-) -> AResult<Vec<MemoryGrantRow>> {
-    Ok(repository.list_grants(tx, space, None).await?)
+pub(crate) async fn grants(tx: &mut Tx<'_>, space: &SpaceId) -> AResult<Vec<MemoryGrantRow>> {
+    mindcore_sqlite::decodable_grants(tx, space, None)
+        .await
+        .map_err(|error| Reject::internal(format!("the grant read failed: {error}")))
 }
 
 /// The protocol's own coverage evaluator takes the wire grant union; the stored
@@ -493,7 +490,7 @@ pub(crate) async fn authorize(
     admission: &Admission<'_>,
     now: DateTime<Utc>,
 ) -> AResult<Vec<MemoryGrantRow>> {
-    let rows = admit_mind(repository, tx, admission.principal, admission.space).await?;
+    let rows = admit_mind(tx, admission.principal, admission.space).await?;
     let wire = live_wire_grants(&rows, now)?;
     let space_id = admission.space.as_str();
     match &admission.coverage {
@@ -553,7 +550,7 @@ pub(crate) fn authorize_issuance(
     let Some(issued) = admission.issuance.as_ref() else {
         return Ok(());
     };
-    let wire = wire_grants(rows)?;
+    let wire = live_wire_grants(rows, now)?;
     match validate_grant_issuance(
         &wire,
         admission.principal,

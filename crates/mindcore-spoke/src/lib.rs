@@ -294,10 +294,11 @@ impl MemoryAdapter {
     ) -> Result<(), SpiError> {
         let caller = principal_id(principal);
         let space = SpaceId::new(space_id.to_string());
-        let rows = admission::grants(&self.repository, tx, &space)
+        let now = Utc::now();
+        let rows = admission::grants(tx, &space)
             .await
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
-        let grants = admission::wire_grants(&rows)
+        let grants = admission::live_wire_grants(&rows, now)
             .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
         for capability in capabilities {
             let requirement = GrantRequirement {
@@ -307,7 +308,7 @@ impl MemoryAdapter {
                 reads_shared: false,
                 subject_all: false,
             };
-            if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
+            if !admission::covered(&grants, caller, space.as_str(), now, &requirement) {
                 return Err(SpiError::Settlement(
                     Reject::not_authorized(format!(
                         "principal {caller} holds no live {capability} grant in space {}",

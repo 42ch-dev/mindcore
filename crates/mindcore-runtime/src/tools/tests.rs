@@ -929,12 +929,12 @@ async fn read_cognition_serves_a_judgment_or_a_null_state() {
     );
 }
 
-/// The served `deliberate` keeps the plan's refusal split: a caller the Mind admits without a
-/// space-wide `knowledge_read` grant answers the coverage refusal, while an unadmitted Mind and
-/// an absent one answer one byte-equal, detail-free admission refusal. Neither refusal reaches
-/// the workflow.
+/// The served `deliberate` admits before the workflow and leaves the operation's own coverage to
+/// it: a caller the Mind admits reaches the workflow even without `knowledge_read` (the subject
+/// page and its revalidation answer first there), while an unadmitted Mind and an absent one
+/// answer one byte-equal, detail-free admission refusal before any workflow runs.
 #[tokio::test]
-async fn deliberate_refuses_coverage_after_admission() {
+async fn deliberate_admits_before_the_workflow_and_its_coverage() {
     let fake = Arc::new(Fake::default());
     fake.reply_deliberate(Ok(DeliberateOutcome::NoChange {
         verdict: json!({}),
@@ -942,21 +942,19 @@ async fn deliberate_refuses_coverage_after_admission() {
     }));
     let tool = tools(Arc::clone(&fake)).await;
 
-    let mut uncovered_arguments = deliberate_arguments();
-    uncovered_arguments["space_id"] = json!("spc_4");
-    let uncovered = expect_reject(
-        tool.call(DELIBERATE, "peer-driver", uncovered_arguments)
+    let mut admitted_arguments = deliberate_arguments();
+    admitted_arguments["space_id"] = json!("spc_4");
+    let served = expect_ok(
+        tool.call(DELIBERATE, "peer-driver", admitted_arguments)
             .await,
-        "an admitted caller without knowledge_read",
+        "an admitted caller without knowledge_read reaches the workflow",
     );
-    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
-    assert!(
-        uncovered.message.contains("knowledge_read"),
-        "the coverage refusal names the capability the caller lacks: {uncovered:?}"
-    );
-    assert_ne!(
-        uncovered.details, None,
-        "a coverage gap cannot be retried away: {uncovered:?}"
+    assert_eq!(served["status"], "no_change");
+    assert_eq!(
+        fake.seen().len(),
+        1,
+        "the workflow's own coverage is what answers a capability gap: {:?}",
+        fake.seen()
     );
 
     let mut unadmitted_arguments = deliberate_arguments();
@@ -981,13 +979,10 @@ async fn deliberate_refuses_coverage_after_admission() {
         unadmitted, absent,
         "an unadmitted Mind and an absent one are one answer"
     );
-    assert_ne!(
-        uncovered, unadmitted,
-        "an admitted caller short of one capability is not an unadmitted caller"
-    );
-    assert!(
-        fake.seen().is_empty(),
-        "no refusal above reaches the workflow"
+    assert_eq!(
+        fake.seen().len(),
+        1,
+        "neither refusal above reaches the workflow"
     );
 }
 

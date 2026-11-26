@@ -951,6 +951,46 @@ struct GrantRow {
     created_at: String,
 }
 
+/// `space`'s grant rows, decoded one row at a time: a row the driver cannot hand over and a row
+/// that does not decode are both skipped rather than failing the read.
+///
+/// Admission and the registry's visibility read share this rule, so a Mind with one live decodable
+/// row is both listed and admitted, and only a set with no decodable row refuses. `principal_filter`
+/// narrows the read to one caller's rows; `None` reads the whole space for an admin listing.
+pub async fn decodable_grants(
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    principal_filter: Option<&str>,
+) -> Result<Vec<MemoryGrantRow>, SqliteRepositoryError> {
+    let mut rows = sqlx::query_as!(
+        GrantRow,
+        "SELECT grant_id, space_id, subject_id, principal_id, \
+         capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+         revision, created_at FROM memory_grants \
+         WHERE space_id = ? AND (? IS NULL OR principal_id = ?) ORDER BY grant_id",
+        space.as_str(),
+        principal_filter,
+        principal_filter,
+    )
+    .fetch(&mut **tx);
+    let mut grants = Vec::new();
+    while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+        let row = match row {
+            Ok(row) => row,
+            Err(error) => match decode_row(error) {
+                SqliteRepositoryError::InvalidRow(_) => continue,
+                other => return Err(other),
+            },
+        };
+        match grant_row(row) {
+            Ok(grant) => grants.push(grant),
+            Err(SqliteRepositoryError::InvalidRow(_)) => continue,
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(grants)
+}
+
 /// A `memory_profiles` row; `list_profiles` decodes through the macro's
 /// unchecked UTF-8 contract like every other compile-checked path.
 struct ProfileRow {

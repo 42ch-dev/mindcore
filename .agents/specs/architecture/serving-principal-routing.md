@@ -39,11 +39,17 @@ answers `SpaceFrozen` only to an operation that is freeze-gated and outside SPOK
 allowlist, while serving every operation that is not freeze-gated. Only a caller that passed
 admission reaches either check.
 
-The carrier read paths resolve through the registry row on the caller's transaction, after the same
-order: `admitted_carrier` (`crates/mindcore-spoke/src/workflows.rs`) for the cognition read, and
-`admitted_carrier_entry` for the host-side `deliberate` handler, which requires a space-wide live
-`knowledge_read` grant before touching a carrier. A `space_id` with no registry row answers the
-admission refusal before any carrier is read.
+The carrier paths resolve through the registry row on the caller's transaction, after the same
+order — `admit_carrier_location` (`crates/mindcore-spoke/src/workflows.rs`) is the shared first
+step: a live grant of the caller's (any capability), then the space row, then the registry row. A
+`space_id` with no registry row answers the admission refusal before any carrier is read.
+
+The two carriers then differ by what their operation earns first. The cognition read
+(`admitted_carrier`) adds the space-wide `knowledge_read` coverage after those steps, because it has
+no subject page ahead of the carrier. The host-side `deliberate` handler (`admitted_carrier_entry`)
+adds no coverage at all: the workflow reads and revalidates the named subject's page and only then
+checks `knowledge_read`/`knowledge_write` on the carrier, so the refusal a request earns first — the
+subject's, or the capability's — is the one a caller sees.
 
 ### Deliberation
 

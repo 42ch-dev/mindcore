@@ -123,8 +123,8 @@ impl MemoryAdapter {
         let subject_id = request.subject_id.to_string();
         let (selection, filter) = read_selection(object)?;
         let now = Utc::now();
-        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
-        let wire_grants = admission::wire_grants(&rows)?;
+        let rows = admission::admit_mind(tx, principal_id, &space).await?;
+        let wire_grants = admission::live_wire_grants(&rows, now)?;
         let base = admission::selection_requirement("reflect", subject_id.as_str(), &selection);
         if !admission::covered(&wire_grants, principal_id, space.as_str(), now, &base) {
             return Err(Reject::not_authorized(format!(
@@ -211,8 +211,8 @@ impl MemoryAdapter {
         };
         let filter = wire::PlacementSelectionWire::filter(object, "filter")?;
         let now = Utc::now();
-        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
-        let wire_grants = admission::wire_grants(&rows)?;
+        let rows = admission::admit_mind(tx, principal_id, &space).await?;
+        let wire_grants = admission::live_wire_grants(&rows, now)?;
         let base = admission::selection_requirement("reflect", subject_id.as_str(), &requested);
         if !admission::covered(&wire_grants, principal_id, space.as_str(), now, &base) {
             return Err(Reject::not_authorized(format!(

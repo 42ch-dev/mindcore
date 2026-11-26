@@ -332,8 +332,9 @@ async fn deliberate(
         Ok(arguments) => arguments,
         Err(reject) => return SpokeResult::Reject(reject),
     };
-    // The request's budget covers the whole call, and this pre-check is part of it: the DB read
-    // cannot be preempted, so its wall time is charged against the workflow's deadline instead.
+    // The request's budget covers the whole call, and this pre-check is part of it: a query or
+    // connection wait is bounded by the timer, so expiry stops the pre-check rather than being
+    // answered after it returns. A timer that fires starts no reasoner work and no carrier write.
     let budget = Duration::from_millis(arguments.timeout_ms.get() as u64);
     let started = Instant::now();
     // Admission before existence, in one transaction: the grant rows and the registry row are
@@ -341,19 +342,21 @@ async fn deliberate(
     // adapter's own (`live_grant` — unrevoked, unexpired, an unparseable expiry fails closed).
     // A missing grant, a revoked or expired one and a space with no registry row are the same
     // target-free refusal, so a caller can never tell an existing Mind from an absent one by
-    // varying `space_id`; a caller the Mind admits without `knowledge_read` answers the coverage
-    // refusal instead.
-    let carrier_entry_id = match mindcore_spoke::admitted_carrier_entry(
-        pool,
-        &principal.principal_id,
-        &arguments.space_id,
+    // varying `space_id`. The operation's own coverage is not checked here: the workflow reads
+    // and revalidates the subject page first and only then checks `knowledge_read`, so the
+    // request's own refusal is the one a caller sees.
+    let carrier_entry_id = match tokio::time::timeout(
+        budget,
+        mindcore_spoke::admitted_carrier_entry(pool, &principal.principal_id, &arguments.space_id),
     )
     .await
     {
-        Ok(carrier_entry_id) => carrier_entry_id,
-        Err(reject) => return SpokeResult::Reject(reject),
+        Ok(Ok(carrier_entry_id)) => carrier_entry_id,
+        Ok(Err(reject)) => return SpokeResult::Reject(reject),
+        Err(_elapsed) => return SpokeResult::Reject(workflow_retryable("deadline_exceeded")),
     };
-    // A budget the pre-check already spent starts nothing: no reasoner, no carrier write.
+    // The pre-check kept its time: the workflow gets only what is left, and an exhausted budget
+    // starts nothing either.
     let Some(timeout) = remaining_budget(budget, started.elapsed()) else {
         return SpokeResult::Reject(workflow_retryable("deadline_exceeded"));
     };
