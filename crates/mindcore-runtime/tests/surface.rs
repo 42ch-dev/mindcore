@@ -424,8 +424,12 @@ async fn tool_registrations_drive_advertisement_and_installation() {
 }
 
 /// The knowledge face is one composition decision: `ServeFaces.knowledge` true advertises
-/// `spoke-knowledge`, `ke-ownership` and `spoke-knowledge-scoped` together and answers
-/// `as_scoped_knowledge()` with the face; false advertises none of them and answers nothing.
+/// `spoke-knowledge` and `spoke-knowledge-scoped` together and answers `as_scoped_knowledge()`
+/// with the face; false advertises neither and answers nothing.
+///
+/// `ke-ownership` is advertised in neither case. The admitted scope never carries a `viewpoint`,
+/// so a viewpoint request is refused after admission; claiming the flag would advertise a
+/// capability the face cannot honour.
 #[tokio::test]
 async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
     let serve = Fixture::open().await.serve();
@@ -436,13 +440,18 @@ async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
         }),
         "assemble a knowledge-serving surface",
     );
-    for capability in ["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"] {
+    for capability in ["spoke-knowledge", "spoke-knowledge-scoped"] {
         assert!(
             capabilities(&composed).contains(&capability),
             "the composed face advertises {capability}: {:?}",
             capabilities(&composed)
         );
     }
+    assert!(
+        !capabilities(&composed).contains(&"ke-ownership"),
+        "the composed face does not advertise a flag it cannot honour: {:?}",
+        capabilities(&composed)
+    );
     assert!(
         composed.ports.as_scoped_knowledge().is_some(),
         "the composed face answers the scoped probe"
@@ -460,7 +469,7 @@ async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
         serve.surface(faces(metadata("runtime"))),
         "assemble a surface without the knowledge face",
     );
-    for capability in ["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"] {
+    for capability in ["spoke-knowledge", "spoke-knowledge-scoped", "ke-ownership"] {
         assert!(
             !capabilities(&absent).contains(&capability),
             "the absent face advertises nothing: {capability} in {:?}",

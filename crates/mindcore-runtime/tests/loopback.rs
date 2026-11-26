@@ -75,10 +75,11 @@ const NOW: &str = "2026-11-21T00:00:00.500Z";
 const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
 /// A host-owned tool the runtime serves beside its own three.
 const HOST_TOOL: &str = "tools.mindcore.host_tool";
-/// The knowledge face's three flags: a session that serves scoped knowledge negotiates them
-/// together, exactly as the composed manifest advertises them.
-const KNOWLEDGE_CAPABILITIES: [&str; 3] =
-    ["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"];
+/// The knowledge face's two flags: a session that serves scoped knowledge negotiates them
+/// together, exactly as the composed manifest advertises them. `ke-ownership` is deliberately
+/// absent — the face advertises no such flag, because the admitted scope never carries a
+/// `viewpoint`, so a request naming one is refused rather than served.
+const KNOWLEDGE_CAPABILITIES: [&str; 2] = ["spoke-knowledge", "spoke-knowledge-scoped"];
 
 const DIALER_SEED: [u8; 32] = [0x42u8; 32];
 const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
@@ -4311,14 +4312,29 @@ async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
     );
 }
 
-/// A request that declares a viewpoint is refused: the admitted scope carries none, so the
-/// viewpoint cannot equal it, and the refusal lands before any store call.
+/// A request that declares a viewpoint is refused, never silently served.
+///
+/// The face advertises no `ke-ownership`, so no session negotiates it, and Connect's ownership
+/// conjunct answers a viewpoint request with wire `op_unsupported` before admission. This is the
+/// honest answer for a face whose admitted scope always carries `viewpoint: None`: it cannot
+/// honour the flag, so it does not offer it, and it refuses the request instead of dropping the
+/// member. Viewpoint support is not implemented in this layer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_requested_viewpoint_is_not_the_admitted_scope() {
+async fn a_requested_viewpoint_is_refused_rather_than_silently_served() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, principal_admission());
-    let session = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    assert!(
+        !capabilities(&surface).contains(&"ke-ownership"),
+        "the face advertises no flag it cannot honour: {:?}",
+        capabilities(&surface)
+    );
+    // A dialer that asks for the flag anyway cannot negotiate it: the intersection is empty of it.
+    let session = connect(
+        &surface,
+        &["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"],
+    )
+    .await;
     let dialer = &*session.adapter;
 
     let viewpoint: Scope = serde_json::from_value(json!({
@@ -4326,15 +4342,45 @@ async fn a_requested_viewpoint_is_not_the_admitted_scope() {
         "viewpoint": "kb_someone_else",
     }))
     .expect("scope JSON matches the schema");
-    assert_scope_refusal(
+    let refused = expect_reject(
         KnowledgeQueryPort::list_knowledge_entries(dialer, &viewpoint).await,
         "a list naming a viewpoint",
     );
-    assert_scope_refusal(
+    assert_eq!(
+        refused.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "the ownership conjunct answers the wire deny: {refused:?}"
+    );
+    assert_eq!(
+        refused
+            .details
+            .as_ref()
+            .and_then(|details| details.get("wire_code"))
+            .and_then(Value::as_str),
+        Some("op_unsupported"),
+        "the pinned raw reject code: {refused:?}"
+    );
+    assert!(
+        refused.message.contains("ke-ownership"),
+        "the refusal names the capability the face does not offer: {}",
+        refused.message
+    );
+
+    let scoped = expect_reject(
         dialer
             .get_knowledge_entry_in_scope("ke_absent", Some(&viewpoint))
             .await,
         "a get naming a viewpoint",
+    );
+    assert_eq!(
+        scoped.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "a scoped get naming a viewpoint is refused too: {scoped:?}"
+    );
+    assert!(
+        scoped.message.contains("ke-ownership"),
+        "the same conjunct answers: {}",
+        scoped.message
     );
 }
 

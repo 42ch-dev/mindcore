@@ -33,8 +33,8 @@ use mindcore_spoke::{
 };
 use mindcore_sqlite::{bind_caller, validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
-    CAPABILITY_KE_OWNERSHIP, CAPABILITY_SPOKE_JUDGMENT, CAPABILITY_SPOKE_KNOWLEDGE,
-    CAPABILITY_SPOKE_KNOWLEDGE_SCOPED, CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
+    CAPABILITY_SPOKE_JUDGMENT, CAPABILITY_SPOKE_KNOWLEDGE, CAPABILITY_SPOKE_KNOWLEDGE_SCOPED,
+    CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
     ConnectResponder, MemoryAdmission, RemoteMemoryService, RemoteScopedKnowledgeFace,
@@ -228,10 +228,15 @@ impl MindcoreServe {
 /// The runtime's own ports: the host's memory service and, when `ServeFaces.knowledge` asks for
 /// it, the per-Mind scoped knowledge face.
 ///
-/// History and adoption stay absent — a call to each is refused on the responder's dispatch-deny
-/// branch, wire `capability_missing`, which the Rust dialer surfaces as `CapabilityPortMissing` —
-/// because neither can name a Mind yet; each is composed per Mind once SPOKE carries that
-/// contract.
+/// History and adoption stay absent. Both are Mind-routed in principle — each names the Mind its
+/// request declares, exactly as knowledge does — but neither face is composed: their runtime
+/// pieces were removed with the Stage 1 face, and nothing re-installs them yet. A call to either
+/// is refused on the responder's dispatch-deny branch, wire `capability_missing`, which the Rust
+/// dialer surfaces as `CapabilityPortMissing`. The storage below them is already registry-routed:
+/// `RoutedKnowledgeStore` resolves the Mind's collection per call on the transaction each op
+/// opens, so a later composition re-uses that route rather than rebuilding it. What a composed
+/// history face still owes is its durable dedup record, and a composed adoption face its
+/// single-transaction copy — `serving-seam.md` states both handoffs.
 struct MindPorts {
     memory: Option<Arc<dyn ServedMemory>>,
     knowledge: Option<Arc<RemoteScopedKnowledgeFace>>,
@@ -270,8 +275,11 @@ pub struct ServeFaces {
     ///
     /// `true` composes the scoped knowledge face — [`MindKnowledgePort`] over the store's
     /// per-call routed store, with one admission for every Mind — and advertises
-    /// `spoke-knowledge`, `ke-ownership` and `spoke-knowledge-scoped` together. `false` composes
-    /// and advertises none, and the knowledge ops keep the dispatch-deny answer.
+    /// `spoke-knowledge` and `spoke-knowledge-scoped` together. `false` composes and advertises
+    /// none, and the knowledge ops keep the dispatch-deny answer. `ke-ownership` is not
+    /// advertised in either case: the admitted scope carries no `viewpoint`, so the face cannot
+    /// honour the flag and a request naming a `viewpoint` is refused — wire `op_unsupported` on
+    /// the ownership conjunct — rather than silently served with the member dropped.
     ///
     /// The admission callback is synchronous and Connect runs it on its blocking pool, so it
     /// drives the admission through [`Handle::block_on`]: the host must run the responder on a
@@ -402,7 +410,7 @@ fn fault_out_of_admission<T>(fault: &SpokeReject) -> T {
 
 /// The advertised capabilities follow the composed faces: the memory family flag when a memory
 /// service is attached and the transfer family flag when that service reports every one of
-/// [`TRANSFER_OPERATIONS`]; the three knowledge flags together when the scoped face is composed.
+/// [`TRANSFER_OPERATIONS`]; the two knowledge flags the face can honour when it is composed.
 /// No other family is composed, so none is advertised.
 fn face_capabilities(memory: Option<&dyn ServedMemory>, knowledge: bool) -> Vec<String> {
     let mut capabilities = Vec::new();
@@ -417,10 +425,11 @@ fn face_capabilities(memory: Option<&dyn ServedMemory>, knowledge: bool) -> Vec<
         }
     }
     if knowledge {
-        // Without the marker a per-Mind face could not serve a scoped `get` or `put` at all, and
-        // without `ke-ownership` Connect refuses any request that names a viewpoint.
+        // Without the marker a per-Mind face could not serve a scoped `get` or `put` at all.
+        // `ke-ownership` is deliberately not advertised: the admitted scope never carries a
+        // `viewpoint`, so a request naming one can never match it and would be refused after
+        // admission. Advertising the flag would claim a capability this face cannot honour.
         capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE.to_string());
-        capabilities.push(CAPABILITY_KE_OWNERSHIP.to_string());
         capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE_SCOPED.to_string());
     }
     capabilities
