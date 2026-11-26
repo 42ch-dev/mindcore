@@ -455,7 +455,7 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
                 // One poll with a no-op waker: the future must be pending because the staging
                 // transaction still holds the pool's one connection, and this first poll is
                 // what registers the task in the pool's FIFO queue.
-                let pending = std::future::poll_fn(|cx| {
+                std::future::poll_fn(|cx| {
                     let polled = std::future::Future::poll(acquire.as_mut(), cx);
                     assert!(
                         polled.is_pending(),
@@ -464,7 +464,6 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
                     std::task::Poll::Ready(())
                 })
                 .await;
-                let _ = pending;
                 registered.send(()).expect("signal the registration");
                 let mut connection = acquire.await.expect("the one connection");
                 sqlx::query("UPDATE memory_journal SET state = 'deferred'")

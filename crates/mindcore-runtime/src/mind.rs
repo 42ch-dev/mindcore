@@ -518,12 +518,9 @@ impl Mind {
                 }
             }
         };
-        let revision = match observed_revision {
-            Some(revision) => revision,
-            // No row at all: stage at revision 1, the candidate's fresh-work value —
-            // `review_candidate` answers its own `NotFound` for a candidate that never existed.
-            None => 1,
-        };
+        // No row at all: revision 1, the candidate's fresh-work value —
+        // `review_candidate` answers its own `NotFound` for a candidate that never existed.
+        let revision = observed_revision.unwrap_or(1);
         // 2. Stage on the same transaction. The adapter's dedup probe keys on
         //    (space, requester, operation, idempotency_key) and digests the whole payload, so
         //    a same-key replay must rebuild a byte-identical request to reach the recorded
