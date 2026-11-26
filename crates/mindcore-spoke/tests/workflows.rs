@@ -4408,3 +4408,131 @@ async fn a_settle_waits_out_a_short_hold_until_its_deadline() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["record_id"], "cog_waited");
 }
+
+/// A bound binding serves exactly the carrier its row names: a holder naming
+/// any other entry of the same collection is refused at both boundaries, so a
+/// caller cannot read or append cognition beside the Mind's own carrier.
+#[tokio::test]
+async fn a_bound_carrier_refuses_a_holder_that_names_another_entry() {
+    let harness = deliberate_harness().await;
+    let binding = settle_binding(&harness.pool).with_carrier_collection(SPACE, "wren", CARRIER);
+    let other: spoke_schemas::data::cognition::CognitionReference =
+        serde_json::from_value(cognition_reference("ke_not_the_carrier")).expect("other holder");
+
+    let refused = binding
+        .deliberate_snapshot(&principal(), SPACE, Some(SUBJECT), &other, 32)
+        .await
+        .expect_err("a foreign holder is refused before any carrier read");
+    assert!(
+        matches!(refused, SpiError::InvalidInput(_)),
+        "the binding's identity is enforced, got {refused:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let refused = binding
+        .commit_cognition(
+            &principal(),
+            SPACE,
+            Some(SUBJECT),
+            &other,
+            1,
+            settle_record("cog_foreign"),
+            &[],
+            deadline,
+        )
+        .await
+        .expect_err("a foreign holder is refused before any write");
+    assert!(
+        matches!(refused, SpiError::InvalidInput(_)),
+        "the commit refuses the foreign holder too, got {refused:?}"
+    );
+    assert_eq!(
+        harness.count_from("cognition_records").await,
+        0,
+        "the refused commit appended nothing"
+    );
+
+    // The control: the bound carrier itself is served.
+    let snapshot = binding
+        .deliberate_snapshot(&principal(), SPACE, Some(SUBJECT), &settle_holder(), 32)
+        .await
+        .expect("the bound carrier is the one this binding serves");
+    assert_eq!(snapshot.carrier_revision, 1);
+}
+
+/// A request naming neither a subject nor an assessment context is the caller's
+/// invalid input: the check runs before the snapshot and the reasoner, so even a
+/// verdict that would write nothing cannot make it succeed.
+#[tokio::test]
+async fn a_request_naming_neither_subject_nor_context_is_refused_before_the_verdict() {
+    struct NoRecordReasoner(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Reasoner for NoRecordReasoner {
+        async fn reason_structured(
+            &self,
+            _request: StructuredReasonRequest<'_>,
+        ) -> Result<Value, SpiError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "recommendation": { "kind": "none" },
+                "rationale": "nothing worth recording",
+                "evidence_ids": [],
+                "record_ids": [],
+            }))
+        }
+    }
+
+    let harness = deliberate_harness().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reasoner = NoRecordReasoner(Arc::clone(&calls));
+    let caps = MindCapabilities {
+        reasoner: Some(&reasoner),
+        ..MindCapabilities::default()
+    };
+    let workflows = SpiMindWorkflows::new(
+        MemoryWorkflowBinding::new(harness.pool.clone(), true)
+            .with_knowledge_routes(routes(&[PRINCIPAL]))
+            .expect("the fixture route map is valid"),
+    );
+    let holder: spoke_schemas::data::cognition::CognitionReference =
+        serde_json::from_value(cognition_reference(CARRIER)).expect("holder");
+    let target: spoke_schemas::data::cognition::CognitionTarget = serde_json::from_value(json!({
+        "carrier": cognition_reference(CARRIER),
+        "target_id": "prop_gate_closed",
+        "kind": "proposition",
+    }))
+    .expect("target");
+    let evidence = [mindcore_spi::Evidence {
+        id: "ev_gate",
+        text: "the gate test passed on this commit",
+    }];
+    let request = mindcore_spi::DeliberateRequest {
+        space_id: SPACE,
+        subject_id: None,
+        assessment_context_id: None,
+        holder: &holder,
+        target: &target,
+        evidence: &evidence,
+        timeout: Duration::from_secs(5),
+    };
+
+    let refused = workflows
+        .deliberate(&principal(), request, None, &caps)
+        .await
+        .expect_err("a request with neither subject nor context is refused");
+    assert!(
+        matches!(refused, SpiError::InvalidInput(_)),
+        "the refusal is the caller's invalid input, got {refused:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no reasoner work ran before the request was refused"
+    );
+    assert_eq!(
+        harness.count_from("cognition_records").await,
+        0,
+        "the refused request wrote nothing"
+    );
+}

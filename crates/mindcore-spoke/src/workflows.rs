@@ -368,6 +368,25 @@ impl MemoryWorkflowBinding {
             .map(|route| route.collection.as_str())
     }
 
+    /// A bound carrier is the only carrier this binding serves in its space: a
+    /// holder naming any other entry is refused before any carrier read or
+    /// append, so the binding's identity is enforced and not merely resolved.
+    fn require_bound_carrier(
+        &self,
+        space_id: &str,
+        holder: &CognitionReference,
+    ) -> Result<(), SpiError> {
+        if let Some((bound_space, _, carrier_entry_id)) = &self.carrier_binding {
+            if bound_space == space_id && carrier_entry_id != holder.id.as_str() {
+                return Err(SpiError::InvalidInput(format!(
+                    "holder {} does not name the carrier this binding serves",
+                    holder.id.as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The collection the carrier write serves: `principal` must have a route —
     /// or the binding a bound carrier — and hold a live grant for every one of
     /// `capabilities` in `space_id`.
@@ -1095,6 +1114,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         holder: &CognitionReference,
         max_items: u64,
     ) -> Result<DeliberateSnapshot, SpiError> {
+        self.require_bound_carrier(space_id, holder)?;
         let mut transaction = self.pool.begin().await.map_err(|error| {
             internal(format!(
                 "deliberation read transaction could not begin: {error}"
@@ -1172,6 +1192,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         cited: &[CitedRecord],
         deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
+        self.require_bound_carrier(space_id, holder)?;
         // The pool holds one connection in production, so an acquire can wait
         // for another statement indefinitely: the request deadline bounds that
         // wait, and a connection in hand is re-checked before the begin. Both

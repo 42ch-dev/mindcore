@@ -1086,3 +1086,158 @@ async fn a_verdict_citing_a_memory_record_is_refused() {
         "the refused verdict wrote no record"
     );
 }
+
+/// The subjectless promotion: a `prior` basis needs no memory record, which is
+/// the only basis a space-level snapshot can admit — it carries no page to cite.
+fn prior_basis_verdict() -> Value {
+    json!({
+        "recommendation": { "kind": "promote", "target_kind": "belief" },
+        "rationale": "the gate has been closed at dusk all season",
+        "evidence_ids": ["ev_gate"],
+        "record_ids": [],
+        "record": {
+            "kind": "belief",
+            "order": 1,
+            "q": {
+                "value": 0.8,
+                "assertion": "belief_attribution",
+                "method": "two_witness_reports",
+                "calibration": "uncalibrated"
+            },
+            "assessor_role": "holder_self_report",
+            "basis": {
+                "kind": "prior",
+                "description": "every dusk patrol reported the gate closed"
+            }
+        }
+    })
+}
+
+struct PriorBasisReasoner;
+
+#[async_trait::async_trait]
+impl mindcore_spi::Reasoner for PriorBasisReasoner {
+    async fn reason_structured(
+        &self,
+        _request: mindcore_spi::StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        Ok(prior_basis_verdict())
+    }
+}
+
+/// Settles nothing itself: it leaves an unsettled intent in the Mind's space for
+/// another subject while the snapshot is already past, so the refusal must come
+/// from the commit's space-level withhold.
+struct RecordingIntentReasoner {
+    pool: sqlx::SqlitePool,
+    space_id: String,
+}
+
+#[async_trait::async_trait]
+impl mindcore_spi::Reasoner for RecordingIntentReasoner {
+    async fn reason_structured(
+        &self,
+        _request: mindcore_spi::StructuredReasonRequest<'_>,
+    ) -> Result<Value, SpiError> {
+        let row = MemoryJournalRow {
+            seq: 0,
+            receipt_id: mint("rct"),
+            space_id: SpaceId::new(self.space_id.as_str()),
+            subject_id: SubjectId::new("subj_other"),
+            requester: CallerId::new(OWNER),
+            operation: "memory.candidates.review".to_string(),
+            idempotency_key: Some("intent_after_snapshot".to_string()),
+            state: "pending".to_string(),
+            targets: Vec::new(),
+            result: None,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let mut tx = self.pool.begin().await.expect("begin the late intent");
+        SqliteMemoryRepository
+            .insert_journal_intent(&mut tx, &row)
+            .await
+            .map_err(|error| SpiError::InvalidInput(format!("late intent: {error}")))?;
+        tx.commit()
+            .await
+            .map_err(|error| SpiError::InvalidInput(format!("late intent commit: {error}")))?;
+        Ok(prior_basis_verdict())
+    }
+}
+
+#[tokio::test]
+async fn a_space_level_verdict_settles_with_the_mind_context_and_derives_its_state() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let target = cognition_target(&created.carrier_entry_id);
+
+    let outcome = ok(deliberate(&store, &owner, &created.id, &target, Arc::new(PriorBasisReasoner)).await);
+    let mind_state_version = match outcome {
+        mindcore_spi::DeliberateOutcome::Settled {
+            mind_state_version,
+            ..
+        } => mind_state_version,
+        other => panic!("the auto-settled verdict must commit: {other:?}"),
+    };
+    assert_eq!(
+        mind_state_version, 2,
+        "the carrier advances one revision past its creation"
+    );
+
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+    let cognition = ok(handle.cognition_read().await).expect("the settled judgment derives");
+    assert_eq!(cognition.records.len(), 1, "the one committed record");
+    assert_eq!(
+        cognition.records[0]["assessment_context"]["context_id"],
+        json!(created.id.as_str()),
+        "the stored record carries the Mind's id as its context"
+    );
+    assert_eq!(
+        cognition.records[0]["holder"]["id"],
+        json!(created.carrier_entry_id),
+        "the record is held by the Mind's carrier"
+    );
+    assert_eq!(
+        cognition.mind_state["holder_entry_id"],
+        json!(created.carrier_entry_id),
+        "the derived state descends from that carrier"
+    );
+}
+
+#[tokio::test]
+async fn an_intent_that_arrives_after_the_snapshot_refuses_the_commit() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+    let target = cognition_target(&created.carrier_entry_id);
+
+    let reasoner = Arc::new(RecordingIntentReasoner {
+        pool: store.pool().clone(),
+        space_id: created.id.as_str().to_string(),
+    });
+    let refuse = reject_of(deliberate(&store, &owner, &created.id, &target, reasoner).await);
+    assert_eq!(refuse.code, SpokeRejectCode::InternalError);
+    let details = refuse.details.as_ref().expect("structured details");
+    assert_eq!(
+        details.get("reason").and_then(Value::as_str),
+        Some("UNRECONCILED"),
+        "the space-level withhold refused the commit"
+    );
+    assert_eq!(
+        details.get("space_id").and_then(Value::as_str),
+        Some(created.id.as_str())
+    );
+
+    assert!(
+        ok(handle.cognition_read().await).is_none(),
+        "the refused commit wrote no record"
+    );
+    let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
+    assert_eq!(
+        carrier.revision,
+        Some(1),
+        "the refused commit moved no carrier revision"
+    );
+}
