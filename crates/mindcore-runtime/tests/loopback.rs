@@ -6683,27 +6683,47 @@ async fn seed_shared(store: &MindStore, entry_ids: &[&str]) {
     }
 }
 
-/// One collection's rows: its live entries and every stored revision preimage, in a stable order.
-type TableRows = (Vec<(String, i64, String)>, Vec<(String, i64, String)>);
+/// One collection's persisted rows, projected whole: every column of every live entry and every
+/// stored revision preimage, in a deterministic order.
+///
+/// `json_object` names each column explicitly instead of `SELECT *`, because the comparison is only
+/// meaningful if a column the copy might touch cannot appear silently: a change to `superseded_by`,
+/// `history_floor_revision`, a timestamp or the cognition head is a difference here.
+type TableRows = (Vec<Value>, Vec<Value>);
 
 async fn table_rows(pool: &sqlx::SqlitePool, collection: &str) -> TableRows {
-    let entries: Vec<(String, i64, String)> = sqlx::query_as(
-        "SELECT entry_id, revision, payload FROM knowledge_entries \
-         WHERE collection = ? ORDER BY entry_id",
+    let entries: Vec<String> = sqlx::query_scalar(
+        "SELECT json_object('collection', collection, 'entry_id', entry_id, \
+         'revision', revision, 'history_floor_revision', history_floor_revision, \
+         'payload', payload, 'cognition_head_seq', cognition_head_seq, \
+         'superseded_by', superseded_by, 'created_at', created_at, 'updated_at', updated_at) \
+         FROM knowledge_entries WHERE collection = ? ORDER BY entry_id",
     )
     .bind(collection)
     .fetch_all(pool)
     .await
     .expect("read the collection's live entries");
-    let revisions: Vec<(String, i64, String)> = sqlx::query_as(
-        "SELECT entry_id, revision, payload FROM knowledge_entry_revisions \
-         WHERE collection = ? ORDER BY entry_id, revision",
+    let revisions: Vec<String> = sqlx::query_scalar(
+        "SELECT json_object('collection', collection, 'entry_id', entry_id, \
+         'revision', revision, 'payload', payload, 'cognition_head_seq', cognition_head_seq, \
+         'recorded_at', recorded_at) \
+         FROM knowledge_entry_revisions WHERE collection = ? ORDER BY entry_id, revision",
     )
     .bind(collection)
     .fetch_all(pool)
     .await
     .expect("read the collection's revision preimages");
-    (entries, revisions)
+    let row = |json: &str| serde_json::from_str::<Value>(json).expect("the row's json");
+    (
+        entries.iter().map(|json| row(json)).collect(),
+        revisions.iter().map(|json| row(json)).collect(),
+    )
+}
+
+/// Whether one collection's live rows hold `entry_id`.
+fn holds(rows: &[Value], entry_id: &str) -> bool {
+    rows.iter()
+        .any(|row| row.get("entry_id").and_then(Value::as_str) == Some(entry_id))
 }
 
 /// The shared source and the admitted Mind's collection together: the pair a failed copy must
@@ -6793,18 +6813,12 @@ async fn adoption_lands_in_the_admitted_mind_and_reads_back_through_its_knowledg
     // The destination is the admitted Mind's registered collection, resolved in the call.
     let destination = table_rows(&pool, COLLECTION).await;
     assert!(
-        destination
-            .0
-            .iter()
-            .any(|(entry_id, _, _)| entry_id == "ke_shared_note"),
+        holds(&destination.0, "ke_shared_note"),
         "the copy lands in the Mind's own collection: {destination:?}"
     );
     let elsewhere = table_rows(&pool, COLLECTION_TWO).await;
     assert!(
-        !elsewhere
-            .0
-            .iter()
-            .any(|(entry_id, _, _)| entry_id == "ke_shared_note"),
+        !holds(&elsewhere.0, "ke_shared_note"),
         "no other Mind's collection holds the copy: {elsewhere:?}"
     );
 
@@ -6832,9 +6846,8 @@ async fn adoption_lands_in_the_admitted_mind_and_reads_back_through_its_knowledg
 
 /// Admission precedes existence, and a request member selects nothing: a destination in another
 /// Mind answers the target-free `NOT_AUTHORIZED`, and so do a Mind that is no Mind and a frozen
-/// Mind the caller holds no grant in — byte for byte, with nothing written. The same answer is
-/// distinct from the generic absence a source the host never configured draws, so a caller can
-/// tell no more from one refusal than from the other.
+/// Mind the caller holds no grant in — byte for byte, with nothing written. A second authenticated
+/// peer admitted to nothing draws the same bytes, so the refusal is the face's, not this caller's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
     let fixture = Fixture::open().await;
@@ -6845,7 +6858,7 @@ async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
         .await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = adoption_surface(&serve, two_principal_admission()).await;
+    let surface = adoption_surface(&serve, three_principal_admission()).await;
     let session = connect_as(&surface, &PEER_TWO_SEED, &ADOPTION_CAPABILITIES).await;
     let dialer = &*session.adapter;
     let peer = principal_for(PEER_TWO_PRINCIPAL);
@@ -6889,10 +6902,7 @@ async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
         "a destination in a frozen Mind without a grant",
     );
 
-    for (label, reject) in [
-        ("unknown Mind", &unknown),
-        ("frozen Mind", &frozen),
-    ] {
+    for (label, reject) in [("unknown Mind", &unknown), ("frozen Mind", &frozen)] {
         assert_eq!(
             reject, &cross,
             "{label}: every admission refusal is the same bytes"
@@ -6903,6 +6913,24 @@ async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
         cross.details.is_none(),
         "the target-free refusal carries no details: {cross:?}"
     );
+
+    // A second authenticated peer, admitted to nothing at all, naming the same Mind answers the
+    // same bytes: the refusal belongs to the face rather than to the caller that drew it.
+    let stranger = connect_as(&surface, &PEER_THREE_SEED, &ADOPTION_CAPABILITIES).await;
+    let from_another_caller = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*stranger.adapter,
+            &principal_for(PEER_THREE_PRINCIPAL),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-stranger"),
+        )
+        .await,
+        "a second caller naming the same Mind",
+    );
+    assert_eq!(
+        from_another_caller, cross,
+        "two different callers draw the same target-free refusal"
+    );
     assert_eq!(
         both_collections(&pool).await,
         before,
@@ -6910,10 +6938,14 @@ async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
     );
 }
 
-/// A destination that is another Mind is the target-free `NOT_AUTHORIZED`: the caller is admitted
-/// to its own Mind and names a different one, so the answer names no target and writes no copy.
+/// The wire scenario, stated as the code produces it: `RemoteAdapter::adopt_knowledge_entry`
+/// ignores its `principal` and `scope` arguments and serializes only the request, and the responder
+/// selects admission from `request.destination_scope_id`. So a request whose destination member
+/// names another Mind is an admission attempt on *that* Mind, and this caller holds no grant in it.
+/// The answer is the target-free `NOT_AUTHORIZED`: no target in the code, no details, no id in the
+/// message, and no copy anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adoption_destination_in_another_mind_is_the_target_free_refusal() {
+async fn adoption_destination_member_naming_another_mind_is_the_target_free_refusal() {
     let fixture = Fixture::open().await;
     fixture.seed_second_mind().await;
     seed_shared(&fixture.store, &["ke_shared_note"]).await;
@@ -6938,6 +6970,22 @@ async fn adoption_destination_in_another_mind_is_the_target_free_refusal() {
         refused.details.is_none(),
         "the target-free refusal carries no details: {refused:?}"
     );
+    // Target-free means the message names neither the Mind the caller is admitted to, nor the one
+    // the request named, nor the source entry or collection.
+    for target in [
+        SPACE,
+        SPACE_TWO,
+        COLLECTION,
+        COLLECTION_TWO,
+        ADOPT_SOURCE_SCOPE,
+        ADOPT_SOURCE_COLLECTION,
+        "ke_shared_note",
+    ] {
+        assert!(
+            !refused.message.contains(target),
+            "the refusal must not name {target}: {refused:?}"
+        );
+    }
     assert_eq!(
         both_collections(&pool).await,
         before,
@@ -6945,10 +6993,7 @@ async fn adoption_destination_in_another_mind_is_the_target_free_refusal() {
     );
     let elsewhere = table_rows(&pool, COLLECTION_TWO).await;
     assert!(
-        !elsewhere
-            .0
-            .iter()
-            .any(|(entry_id, _, _)| entry_id == "ke_shared_note"),
+        !holds(&elsewhere.0, "ke_shared_note"),
         "the other Mind's collection is untouched: {elsewhere:?}"
     );
 }
@@ -7054,13 +7099,12 @@ async fn adoption_repeat_answers_already_present_through_both_keys() {
         settled,
         "a repeat adds no row to either collection"
     );
-    let copies = table_rows(&pool, COLLECTION)
-        .await
-        .0
-        .into_iter()
-        .filter(|(entry_id, _, _)| entry_id == "ke_shared_note")
+    let rows = table_rows(&pool, COLLECTION).await.0;
+    let copies = rows
+        .iter()
+        .filter(|row| row.get("entry_id").and_then(Value::as_str) == Some("ke_shared_note"))
         .count();
-    assert_eq!(copies, 1, "the slot holds exactly one copy");
+    assert_eq!(copies, 1, "the slot holds exactly one copy: {rows:?}");
 }
 
 /// A retired source resolves to its live terminal: the copy takes the terminal's id, and its
@@ -7161,7 +7205,11 @@ async fn adoption_needs_the_write_and_read_grant() {
     let fixture = Fixture::open().await;
     seed_shared(&fixture.store, &["ke_shared_note"]).await;
     fixture
-        .grant("grt_reader_peer_two", PEER_TWO_PRINCIPAL, &["knowledge_read"])
+        .grant(
+            "grt_reader_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["knowledge_read"],
+        )
         .await;
     fixture
         .grant(
@@ -7175,7 +7223,21 @@ async fn adoption_needs_the_write_and_read_grant() {
     let surface = adoption_surface(&serve, three_principal_admission()).await;
     let before = both_collections(&pool).await;
 
+    // Each half of the grant is compared against the same principal's own knowledge put, not only
+    // against the other half: the adoption must answer the knowledge face's refusal byte for byte,
+    // so a change to both adoption refusals alone still fails.
     let reader = connect_as(&surface, &PEER_TWO_SEED, &ADOPTION_CAPABILITIES).await;
+    let reader_put = expect_reject(
+        reader
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_reader_note", "x"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a knowledge put by a principal holding only knowledge_read",
+    );
     let reader_refusal = expect_reject(
         AdoptionPort::adopt_knowledge_entry(
             &*reader.adapter,
@@ -7184,9 +7246,25 @@ async fn adoption_needs_the_write_and_read_grant() {
             &adopt_request("ke_shared_note", 1, SPACE, "k-reader"),
         )
         .await,
-        "a principal holding only knowledge_read",
+        "an adoption by a principal holding only knowledge_read",
     );
+    assert_eq!(
+        reader_refusal, reader_put,
+        "the read-only grant's adoption answers its own knowledge put"
+    );
+
     let writer = connect_as(&surface, &PEER_THREE_SEED, &ADOPTION_CAPABILITIES).await;
+    let writer_put = expect_reject(
+        writer
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_writer_note", "x"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a knowledge put by a principal holding only knowledge_write",
+    );
     let writer_refusal = expect_reject(
         AdoptionPort::adopt_knowledge_entry(
             &*writer.adapter,
@@ -7195,7 +7273,11 @@ async fn adoption_needs_the_write_and_read_grant() {
             &adopt_request("ke_shared_note", 1, SPACE, "k-writer"),
         )
         .await,
-        "a principal holding only knowledge_write",
+        "an adoption by a principal holding only knowledge_write",
+    );
+    assert_eq!(
+        writer_refusal, writer_put,
+        "the write-only grant's adoption answers its own knowledge put"
     );
 
     assert_eq!(reader_refusal.code, SpokeRejectCode::NotAuthorized);
@@ -7233,7 +7315,11 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     seed_shared(
         &fixture.store,
         &[
-            "ke_source", "ke_free", "ke_cycle_a", "ke_cycle_b", "ke_fault",
+            "ke_source",
+            "ke_free",
+            "ke_cycle_a",
+            "ke_cycle_b",
+            "ke_fault",
         ],
     )
     .await;
