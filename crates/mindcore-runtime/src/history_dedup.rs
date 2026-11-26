@@ -53,6 +53,17 @@
 //! channel, which the responder answers `OUTCOME_UNCERTAIN`: the outcome is unknown, the caller
 //! replays the key, and no acknowledged receipt exists that was never written
 //! ([`outcome_not_settled`]).
+//!
+//! Not everything the port answers is a settled outcome, either. A **storage fault** — a busy
+//! begin, a failed grant statement, a store read that could not run — is a transient condition of
+//! the database, not this key's answer about the Mind's history, so recording it would make one
+//! failure permanent: every later same-key retry would replay `INTERNAL_ERROR` long after the fault
+//! cleared. `record` therefore settles only a genuine execution result — success, and the refusals
+//! that are decisions: `NOT_AUTHORIZED`, `NOT_FOUND`, `HISTORY_TRUNCATED`,
+//! `HISTORY_ENTITY_UNSUPPORTED`, `INVALID_INPUT`. [`is_storage_fault`] is that rule, it reads the
+//! reject code rather than the message text, and it is the one place to change when the served
+//! path gains a code; the caller of a fault is answered through [`outcome_not_settled`] and the
+//! claim is left as a claim, so a retry once the fault clears executes.
 
 use std::io::Write;
 
@@ -121,7 +132,33 @@ async fn namespace_of(pool: &SqlitePool, key: &str) -> Result<Option<String>, Sp
     }
 }
 
-/// The failure a settled prune reaches the caller through when its outcome did not persist.
+/// The codes that mean the prune did not reach a decision about the Mind's history.
+///
+/// **`INTERNAL_ERROR` is the whole list, and it is the list because of how the path is built.**
+/// Every fault on the way to a prune answer is reported as `InternalError` and nothing else:
+/// `mindcore_sqlite`'s `internal`, which every failed statement on the store, the route and the
+/// checkpoint reads maps to; `MindHistoryPort`'s `storage_unavailable`, which is the grant read's
+/// one failure answer; and Connect's own transport decode fault. A code is a fault only when it
+/// says the work could not be carried out — never a decision the work reached. The decisions are
+/// the rest: `NOT_AUTHORIZED` (the grant check refused), `NOT_FOUND` (the row is absent, retired or
+/// hidden), `HISTORY_TRUNCATED` and `HISTORY_ENTITY_UNSUPPORTED` (the request is out of range or out
+/// of coverage), `INVALID_INPUT` (`keep == 0` and the decoder's own shape checks).
+///
+/// The distinction is a property of the code, not of the message text: a diagnostic's words change
+/// with the driver, and matching on them would silently reclassify a refusal as a fault — or a
+/// fault as a refusal, which is the worse direction, because a fault recorded as a settled answer
+/// is permanent. A new code reaches this function as "not a fault" only by being added to this
+/// list, so the default is the safe one for a refusal that keeps the caller's answer honest.
+///
+/// A fault is **not** settled: the row keeps its claim, so a retry after the fault clears executes
+/// instead of replaying a transient storage error for the key's lifetime, and the caller's answer
+/// is the uncertain outcome [`outcome_not_settled`] describes rather than a recorded fault.
+fn is_storage_fault(code: SpokeRejectCode) -> bool {
+    matches!(code, SpokeRejectCode::InternalError)
+}
+
+/// The answer a prune gives when its outcome is not settled: a failed write, a registry fault, or
+/// a fault the port answered.
 ///
 /// **Why a panic, deliberately.** `HistoryDedupStore::record` answers `()`
 /// (`serve_ports.rs:464-465`): it carries no error channel, and `HistoryPortService` returns the
@@ -136,8 +173,8 @@ async fn namespace_of(pool: &SqlitePool, key: &str) -> Result<Option<String>, Sp
 /// of asserting a receipt it does not hold, and the host-side diagnostic names no wire bytes.
 fn outcome_not_settled(diagnostic: impl std::fmt::Display) -> ! {
     panic!(
-        "history dedup outcome settlement failed after the prune committed; answered as this \
-         request's uncertain outcome: {diagnostic}"
+        "history dedup outcome could not be settled; answered as this request's uncertain \
+         outcome: {diagnostic}"
     )
 }
 
@@ -237,6 +274,19 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             // registry fault is not "nothing to settle", so it takes the fault path.
             Err(reject) => outcome_not_settled(reject.message),
         };
+        // A fault is not the key's settled answer: it says the work could not be carried out, so
+        // recording it would make one transient failure permanent for this retry identity. The
+        // claim stays, and the caller is answered the uncertain outcome instead. See
+        // [`is_storage_fault`] for the rule and why it reads the code rather than the text.
+        if let SpokeResult::Reject(reject) = &record.outcome {
+            if is_storage_fault(reject.code) {
+                outcome_not_settled(format!(
+                    "the port answered {}: {}",
+                    reject.code.as_str(),
+                    reject.message
+                ));
+            }
+        }
         let outcome_json = encode_outcome(&record.outcome);
         let principal = principal_of(key);
         // Only fill a claim `lookup` already inserted: the `EXISTS` gate is the whole condition.
@@ -855,7 +905,7 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| "<non-string panic payload>".to_string());
         assert!(
-            message.contains("outcome settlement failed"),
+            message.contains("could not be settled"),
             "the fault names its stage for the host's log: {message}"
         );
 
@@ -871,6 +921,120 @@ mod tests {
             HistoryDedupLookup::Evicted,
             "a retry sees an unsettled claim, never a success the first call never held"
         );
+    }
+
+    /// The discrimination rule itself: `INTERNAL_ERROR` is a storage fault, and every decision the
+    /// work can reach is not. A code added to the first list is a deliberate act, which is why the
+    /// rule is a list and not a text match.
+    #[test]
+    fn only_a_storage_fault_is_refused_settlement() {
+        assert!(
+            is_storage_fault(SpokeRejectCode::InternalError),
+            "the served path's one fault code"
+        );
+        for decision in [
+            SpokeRejectCode::NotAuthorized,
+            SpokeRejectCode::NotFound,
+            SpokeRejectCode::KnowledgeEntryNotFound,
+            SpokeRejectCode::HistoryTruncated,
+            SpokeRejectCode::HistoryNotRetained,
+            SpokeRejectCode::HistoryEntityUnsupported,
+            SpokeRejectCode::InvalidInput,
+            SpokeRejectCode::IdempotencyConflict,
+            SpokeRejectCode::OutcomeUncertain,
+        ] {
+            assert!(
+                !is_storage_fault(decision),
+                "{} settles as the key's answer",
+                decision.as_str()
+            );
+        }
+    }
+
+    /// A storage fault the port answers is never the key's settled outcome: the claim stays a
+    /// claim, so a retry after the fault clears executes instead of replaying the fault for the
+    /// key's lifetime, and the caller who hit the fault is answered as unsettled.
+    #[tokio::test]
+    async fn a_port_fault_is_not_settled_as_the_keys_outcome() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let dedup = Arc::new(dedup);
+        let key = key_for("prn_one", "key-one");
+        assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
+
+        // What `record` receives when the grant read, the route or a store statement failed: the
+        // store's own `internal` answer, which is the whole fault vocabulary of this path.
+        let faulted = record(
+            "digest",
+            SpokeResult::Reject(SpokeReject {
+                code: SpokeRejectCode::InternalError,
+                message: "knowledge storage is unavailable".to_string(),
+                details: None,
+            }),
+        );
+        let settle = {
+            let dedup = Arc::clone(&dedup);
+            let key = key.clone();
+            let faulted = faulted.clone();
+            tokio::spawn(async move { dedup.record(&key, faulted).await })
+        };
+        let join = match settle.await {
+            Ok(()) => panic!("a fault was settled and returned as the caller's answer"),
+            Err(join) => join,
+        };
+        assert!(
+            join.is_panic(),
+            "the fault left through the unsettled channel"
+        );
+
+        assert_eq!(
+            dedup_row(&store, &key).await,
+            (None, None),
+            "the fault was not written as the key's outcome"
+        );
+
+        // The fault clears. The same key must execute, not replay `INTERNAL_ERROR` from the row.
+        assert_eq!(
+            dedup.lookup(&key).await,
+            HistoryDedupLookup::Evicted,
+            "the claim is still a claim, so the key is not a recorded fault"
+        );
+    }
+
+    /// The other side of the rule: a refusal that is a decision settles and replays, because it
+    /// is the answer about this request, not a condition of the database.
+    #[tokio::test]
+    async fn a_decision_refusal_settles_and_replays() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (_store, dedup) = open(&dir).await;
+        for (index, code) in [
+            SpokeRejectCode::NotAuthorized,
+            SpokeRejectCode::NotFound,
+            SpokeRejectCode::HistoryTruncated,
+            SpokeRejectCode::HistoryEntityUnsupported,
+            SpokeRejectCode::InvalidInput,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = key_for("prn_one", &format!("key-{index}"));
+            let written = record(
+                "digest",
+                SpokeResult::Reject(SpokeReject {
+                    code,
+                    message: format!("{} is this key's answer", code.as_str()),
+                    details: None,
+                }),
+            );
+            dedup.lookup(&key).await;
+            dedup.record(&key, written.clone()).await;
+            assert_eq!(
+                recorded(dedup.lookup(&key).await, code.as_str()),
+                written,
+                "{} settles and replays",
+                code.as_str()
+            );
+        }
     }
 
     /// A registry fault during settlement is not "nothing to settle". The claim landed, so the

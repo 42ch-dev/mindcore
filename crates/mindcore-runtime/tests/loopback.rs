@@ -5466,6 +5466,24 @@ async fn checkpoint_revisions(
     .expect("read the entry's checkpoints")
 }
 
+/// [`checkpoint_revisions`] against the table a fault test moved aside as
+/// `knowledge_entry_revisions_intact`, for the interval when the real name is a faulting view.
+async fn intact_checkpoint_revisions(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    entry_id: &str,
+) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions_intact \
+         WHERE collection = ? AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("read the entry's checkpoints through the intact table")
+}
+
 /// Connect's prune dedup key for one retry identity: the RFC 8785 serialization of
 /// `[op, effective_scope, principal_id, idempotency_key]`. The admitted scope the history face
 /// returns carries the Mind's `scope_id` and nothing else, so a test can name the exact row the
@@ -6590,4 +6608,137 @@ async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_resu
         [2],
         "the retry did not execute the prune a second time"
     );
+}
+
+/// A storage fault the port answers is not the key's settled outcome. The grant read fails before
+/// the prune runs, so the caller is told the outcome is unknown; once the fault clears, the same
+/// key executes instead of replaying `INTERNAL_ERROR` for its lifetime.
+///
+/// The fault is installed on the port's own path: `MindHistoryPort` authorizes on a transaction of
+/// its own, and a trigger refusing a read turns that statement into the store's `InternalError` —
+/// the one fault code the served prune path answers. The claim is Connect's, taken before the port,
+/// so it lands and is what makes the retry's behaviour observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_port_storage_fault_is_not_settled_as_the_keys_outcome() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, principal_admission());
+    let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let key = dedup_key(SPACE, PRINCIPAL, "key-faulted");
+
+    // SQLite has no read trigger, so the fault is installed on the statement the prune itself
+    // runs: `prune_entry_history` reads the entry's checkpoints from
+    // `knowledge_entry_revisions`, and a view over that table calling a missing function fails the
+    // statement at prepare time — the store's `InternalError`, answered after admission and after
+    // the claim, so the fault is the port's and not the Mind admission's.
+    sqlx::query("ALTER TABLE knowledge_entry_revisions RENAME TO knowledge_entry_revisions_intact")
+        .execute(&pool)
+        .await
+        .expect("move the checkpoints aside");
+    sqlx::query(
+        "CREATE VIEW knowledge_entry_revisions AS \
+         SELECT collection, entry_id, revision, payload, cognition_head_seq, recorded_at \
+         FROM knowledge_entry_revisions_intact WHERE no_such_function()",
+    )
+    .execute(&pool)
+    .await
+    .expect("install a checkpoint read that faults");
+
+    let faulted = expect_reject(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "a prune whose checkpoint read faulted",
+    );
+    assert_eq!(
+        faulted.code,
+        SpokeRejectCode::OutcomeUncertain,
+        "a fault is answered as an unsettled settlement, not stored: {faulted:?}"
+    );
+    let (digest, outcome) = dedup_row(&pool, COLLECTION, &key).await;
+    assert_eq!(
+        (digest, outcome),
+        (None, None),
+        "the port's fault was not recorded as the key's outcome"
+    );
+    assert_eq!(
+        intact_checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "the faulted prune never reached the store"
+    );
+
+    // The fault clears.
+    sqlx::query("DROP VIEW knowledge_entry_revisions")
+        .execute(&pool)
+        .await
+        .expect("drop the faulting view");
+    sqlx::query("ALTER TABLE knowledge_entry_revisions_intact RENAME TO knowledge_entry_revisions")
+        .execute(&pool)
+        .await
+        .expect("remove the fault");
+
+    // The same key now executes rather than replaying the fault it hit. The claim is left as a
+    // claim, so this answers RECEIPT_EXPIRED — never a recorded INTERNAL_ERROR — and the floor the
+    // retry leaves is what the caller acts on.
+    let retried = expect_reject(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "the same key once the fault cleared",
+    );
+    assert_eq!(
+        retried.code,
+        SpokeRejectCode::ReceiptExpired,
+        "the retry sees a claim, never the recorded fault: {retried:?}"
+    );
+    // The decisive assertion: the retry's answer is not the fault the first call hit. `RECEIPT_EXPIRED`
+    // names no stored outcome at all, which is exactly why the key stays usable once the fault clears.
+    let details = serde_json::to_string(&retried.details).unwrap_or_default();
+    assert!(
+        !details.contains("INTERNAL_ERROR") && !retried.message.contains("unavailable"),
+        "no transient fault was persisted as this key's answer: {retried:?}"
+    );
+
+    // A fresh key under the cleared fault executes, proving the store is healthy again and the
+    // refusal above was the claim rather than a still-broken path.
+    let fresh = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted-fresh"),
+            )
+            .await,
+        "a fresh key executes once the fault cleared",
+    );
+    assert_eq!((fresh.deleted, fresh.floor_revision), (1, Some(2)));
 }
