@@ -6691,7 +6691,7 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, principal_admission());
+    let surface = history_surface(&serve, principal_admission()).await;
     let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
     let key = dedup_key(SPACE, PRINCIPAL, "key-faulted");
 
