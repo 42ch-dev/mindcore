@@ -197,8 +197,12 @@ history faces that use them. Its contract stays [`serving-seam.md`](serving-seam
   which collection those faces serve.
 - The route is persisted state, not host configuration: it is written once by `create` and not
   derived from arguments, and the wire carries only the Mind id.
-- The route never substitutes for a live grant: every carrier write, knowledge read and history
-  op still re-derives the caller's own grants on its own transaction.
+- The route never substitutes for a live grant, and the grant check is per execution, not per
+  call: Mind admission (the peer mapping and the registry row) runs on every call, while the
+  caller's own operation-level grant is re-derived only when the operation actually executes.
+  A prune whose retry key already holds a recorded outcome — an earlier success or an earlier
+  refusal — returns that outcome after admission without invoking the history port, so its grant
+  check does not run again; a fresh key runs the port and its check on its own transaction.
 
 ## Invariants
 

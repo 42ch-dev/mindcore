@@ -8,9 +8,13 @@
 //! `knowledge_write` and `knowledge_read`, the equivalent of a knowledge put whose anchor read
 //! passes through `get`.
 //!
-//! Every refusal is the knowledge face's own fixed `NOT_AUTHORIZED` with no `details`, byte for
-//! byte, so a refusal for want of a capability is indistinguishable from one for want of
-//! admission and names no caller, capability or space.
+//! An **authorization** refusal is the knowledge face's own fixed `NOT_AUTHORIZED` with no
+//! `details`, byte for byte: a refusal for want of a capability is the same answer the equivalent
+//! knowledge get or put gives, and it names no caller, capability or space. An **admission**
+//! refusal is not identical across the two faces: Connect's knowledge branch replaces every
+//! admission `Reject` with its own constant, while its history branch returns this callback's
+//! `Reject` verbatim — the Mind admission's own message. Both carry `NOT_AUTHORIZED`, neither
+//! carries `details`, and neither reaches a port.
 
 use std::sync::Arc;
 
