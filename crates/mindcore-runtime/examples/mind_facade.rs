@@ -75,6 +75,11 @@ async fn main() {
     //    the publisher never does: the entry that names it is the host's to make durable.
     let journal_root = dir.path().join("journal");
     std::fs::create_dir_all(&journal_root).expect("the host creates the journal root");
+    // The host, not the publisher, owns the root's creation entry: creating the root writes an
+    // entry in its parent, and that entry is durable only once the parent is synced.
+    std::fs::File::open(journal_root.parent().expect("the journal root has a parent"))
+        .and_then(|parent| parent.sync_all())
+        .expect("sync the journal root's creation entry");
     let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
         .with_journal_publisher(journal_dir(journal_root));
 

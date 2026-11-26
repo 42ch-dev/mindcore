@@ -131,34 +131,56 @@ pub fn journal_dir(
                     "journal target {path} resolves outside the journal root"
                 )));
             }
-            // The target file itself must not redirect the write: a symlink — or any other
-            // pre-existing entry that is not a regular file — at the target name is refused
-            // before the first byte. A regular file is the retry of this same target's own
-            // earlier write and is replaced with the identical bytes.
+            // The write itself can never follow a symlink at the target: the bytes land in a
+            // temporary file inside the target's own directory, are synced there, and the
+            // `rename` then replaces the target entry atomically — rename swaps the directory
+            // entry, it never follows what the entry points to, so a symlink swapped in at any
+            // moment before it is replaced itself rather than written through. An existing
+            // regular file is the retry of this target's earlier write and is replaced with
+            // the identical bytes; any other pre-existing non-file entry is refused first, so
+            // a directory or device node can never be clobbered by the rename.
             if let Ok(metadata) = std::fs::symlink_metadata(&file) {
-                if !metadata.file_type().is_file() {
+                if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
                     return Err(SpiError::InvalidInput(format!(
                         "journal target {path} already exists as a non-file entry"
                     )));
                 }
             }
-            std::fs::write(&file, content).map_err(|error| {
+            let temporary = parent.join(format!(
+                ".journal-{}-{pathhash:016x}.tmp",
+                std::process::id(),
+                pathhash = {
+                    // A stable hash of the target path: retries of the same target reuse one
+                    // temporary name, so a crashed earlier attempt's leftover is overwritten
+                    // rather than accumulated.
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    file.hash(&mut hasher);
+                    hasher.finish()
+                }
+            ));
+            std::fs::write(&temporary, content).map_err(|error| {
                 SpiError::Settlement(spoke_reject(format!(
                     "journal target {path} could not be written: {error}"
                 )))
             })?;
-            // Durability, not visibility: the write must reach the medium before the caller
-            // may settle the intent. Sync the file's contents, then every directory entry the
-            // target depends on, deepest first, ending at the deepest pre-existing ancestor —
-            // inclusive, because the entry that names what this publication created below it
-            // (the fresh journal root included) lives in that directory.
-            std::fs::File::open(&file)
-                .and_then(|file| file.sync_all())
+            std::fs::File::open(&temporary)
+                .and_then(|temporary| temporary.sync_all())
                 .map_err(|error| {
                     SpiError::Settlement(spoke_reject(format!(
                         "journal target {path} could not be synced: {error}"
                     )))
                 })?;
+            std::fs::rename(&temporary, &file).map_err(|error| {
+                SpiError::Settlement(spoke_reject(format!(
+                    "journal target {path} could not be renamed into place: {error}"
+                )))
+            })?;
+            // Durability, not visibility: the write must reach the medium before the caller
+            // may settle the intent. The temporary's contents were synced before the rename;
+            // what remains is the directory entries: the rename itself, and every directory the
+            // publication created or wrote into beneath the root, deepest first, ending at the
+            // root.
             let mut cursor = Some(parent.clone());
             while let Some(directory) = cursor {
                 std::fs::File::open(&directory)

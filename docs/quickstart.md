@@ -70,7 +70,8 @@ let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
 
 `open` is one registry read; a Mind the caller cannot see answers the registry's own `NotFound`.
 The journal publisher is the host's input — the facade never invents one — and `journal_dir` is
-the one publisher the crate offers. Before memory writes, the host provisions the subject rows it
+the one publisher the crate offers. The journal root is the host's to create and make durable
+before the first publish: create it, then sync its parent, exactly as the example does. Before memory writes, the host provisions the subject rows it
 means to write under, exactly as on the served surface; the example shows the minimal seed.
 
 2. Captures a memory and reviews it, in plain arguments:

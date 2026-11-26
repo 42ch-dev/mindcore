@@ -86,7 +86,9 @@ between publication and the staging commit.
 
 `journal_dir(root)` confines every target to its canonical root, and the root is the host's:
 it must exist — durable — before the first publication, because the entry that names it lives
-in its parent and only the host can establish that durability. A missing root is refused with
+in its parent and only the host can establish that durability. Creating the root writes an
+entry in its parent, so the host makes it durable by syncing the parent, exactly as the
+example does. A missing root is refused with
 the requirement named, and the publisher never creates it. Everything the publisher creates
 is beneath the root. A target path that is absolute or carries `..` is refused before its
 first byte; what remains is canonicalized — a parent resolving outside the canonical root
@@ -97,7 +99,12 @@ of the target's path, so a retry can never be weaker than the attempt that faile
 directory opens it for reading, so the host must grant read on the root and everything beneath
 it; ancestors above it need only traversal — a write-only journal root cannot be published,
 because the sync that must precede settlement would be refused for a reason the write itself
-never hit.
+never hit. A residual
+window is documented rather than hidden: a hostile writer that replaces a directory beneath
+the root with a symlink *after* the canonicalization check but during the write can redirect
+that write, because canonicalization is resolution-before-write, not a filesystem lock. The
+publisher trusts the host's tree for the duration of one publication; a host that cannot trust
+its own journal tree has no filesystem-level defense the publisher could add.
 
 ### `deliberate` without a subject
 
