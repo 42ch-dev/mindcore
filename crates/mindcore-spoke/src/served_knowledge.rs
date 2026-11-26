@@ -38,9 +38,9 @@ fn refuse<T>() -> SpokeResult<T> {
     )
 }
 
-/// The knowledge face's fixed storage text: a driver message names local tables and columns and
+/// The served faces' fixed storage text: a driver message names local tables and columns and
 /// never reaches a peer.
-fn storage_unavailable<T>() -> SpokeResult<T> {
+pub(crate) fn storage_unavailable<T>() -> SpokeResult<T> {
     spoke_reject(
         SpokeRejectCode::InternalError,
         "knowledge storage is unavailable",
