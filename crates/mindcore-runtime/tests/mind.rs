@@ -501,13 +501,13 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
 }
 
 
-/// The `OUTCOME_UNCERTAIN` recovery contract: repeating the review with the same key while the
-/// receipt is still pending answers the same uncertain outcome again — the recorded refusal,
-/// never a staged duplicate and never silence. The repeat is byte-identical, so it reaches the
-/// adapter's receipt probe directly, and the probe reports the still-pending receipt exactly as
-/// the fold left it: no second record, no second intent, the candidate still consumed.
+/// The `OUTCOME_UNCERTAIN` recovery contract: a failure after the staging commit answers the
+/// uncertain outcome once, and a same-key repeat continues through the fold — publish, then
+/// settle — instead of answering the uncertain outcome again. The repeat settles the intent,
+/// the record stays exactly the one the first attempt staged, and the receipt answers
+/// committed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repeat_after_outcome_uncertain_replays_the_pending_receipt_as_uncertain() {
+async fn a_repeat_after_outcome_uncertain_continues_the_fold_and_settles() {
     let (dir, store) = fixture().await;
     let owner = CallerId::new(OWNER);
     let created = ok(minds::create(&store, &request(OWNER)).await);
@@ -518,14 +518,14 @@ async fn a_repeat_after_outcome_uncertain_replays_the_pending_receipt_as_uncerta
         .with_journal_publisher(journal_dir(&journal_root));
     let candidate_id = capture_candidate(
         &handle,
-        "cap-uncertain-replay",
-        "a note whose settlement outcome is unknown",
+        "cap-uncertain-recovery",
+        "a note whose first settlement fails",
     )
     .await;
 
-    // The same interference handshake as `a_refused_settle_answers_outcome_uncertain`: the
-    // staging commit releases the one connection, and the registered task moves the intent out
-    // of pending before the settlement transaction can acquire it, so the settle is refused.
+    // The interference handshake: a task registered on the one-connection pool moves the
+    // intent out of pending the moment the staging commit releases the connection, so the
+    // first settle is refused — the `OUTCOME_UNCERTAIN` path.
     let interference_pool = pool.clone();
     let blocking =
         ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
@@ -556,7 +556,7 @@ async fn a_repeat_after_outcome_uncertain_replays_the_pending_receipt_as_uncerta
 
     let first = reject_of(
         blocking
-            .review(&candidate_id, &promote(), "rev-uncertain-replay")
+            .review(&candidate_id, &promote(), "rev-uncertain-recovery")
             .await,
     );
     assert_eq!(
@@ -565,30 +565,41 @@ async fn a_repeat_after_outcome_uncertain_replays_the_pending_receipt_as_uncerta
         "the refused settle answers OUTCOME_UNCERTAIN"
     );
 
-    // The repeat: same candidate, decision and key, through a working publisher. The receipt
-    // is still pending, so the probe answers the uncertain outcome again without re-staging.
+    // Restore the intent to pending — the crash window the contract covers is exactly this
+    // state: staging durable, intent unsettled — and repeat the review with the same key.
+    sqlx::query("UPDATE memory_journal SET state = 'pending'")
+        .execute(&store.pool())
+        .await
+        .expect("restore the intent to pending");
     let working = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(journal_dir(dir.path()));
-    let repeat = reject_of(
-        working
-            .review(&candidate_id, &promote(), "rev-uncertain-replay")
-            .await,
-    );
+    let recovered = ok(working
+        .review(&candidate_id, &promote(), "rev-uncertain-recovery")
+        .await);
     assert_eq!(
-        repeat.code,
-        SpokeRejectCode::OutcomeUncertain,
-        "a same-key repeat while the receipt is pending answers OUTCOME_UNCERTAIN: {repeat:?}"
+        value_of(&recovered)["status"],
+        "committed",
+        "the same-key repeat continues the fold and settles"
     );
-    assert_eq!(retry_class(&repeat), "uncertain");
     assert_eq!(
         count_records(&pool).await,
         1,
-        "the repeat stages no second record"
+        "the record is exactly the one the first attempt staged"
     );
     assert_eq!(
-        count_intents(&pool).await,
-        1,
-        "the repeat stages no second intent"
+        intent_states(&pool).await,
+        vec!["applied".to_string()],
+        "the intent is settled, never re-staged"
+    );
+
+    // A further repeat is the ordinary replay of a settled receipt.
+    let replayed = ok(working
+        .review(&candidate_id, &promote(), "rev-uncertain-recovery")
+        .await);
+    assert_eq!(
+        value_of(&replayed),
+        value_of(&recovered),
+        "a settled key replays the committed receipt"
     );
 }
 

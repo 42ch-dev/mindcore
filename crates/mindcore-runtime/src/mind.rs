@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{MindId, SpaceId};
-use mindcore_base::ir::MemoryRepository;
+use mindcore_base::ir::{MemoryRepository, ReceiptKey, ReceiptRead};
 use mindcore_spi::{
     DeliberateOutcome, DeliberateRequest, MindWorkflows, SpiError, SpiMindWorkflows,
 };
@@ -557,8 +557,19 @@ impl Mind {
                 }),
             )
             .await;
-        let receipt_id = match stage {
-            SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => receipt_id,
+        enum Staging {
+            // The fold staged a fresh decision on this transaction: it owns the staging and
+            // must commit it after publication.
+            Fresh { receipt_id: String },
+            // A repeat met its own still-pending receipt: the staging is already durable, the
+            // transaction is read-only for what follows, and the fold continues to publication
+            // and settlement rather than answering the uncertain outcome again.
+            PendingRetry { receipt_id: String },
+        }
+        let staging = match stage {
+            SpokeResult::Ok(MemoryStage::JournalPending { receipt_id, .. }) => {
+                Staging::Fresh { receipt_id }
+            }
             SpokeResult::Ok(MemoryStage::Ready(body)) => {
                 drop(transaction);
                 return match serde_json::from_value(body) {
@@ -574,10 +585,39 @@ impl Mind {
                     "review answered an unexpected stage: {stage:?}"
                 ));
             }
+            SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::OutcomeUncertain => {
+                // The only uncertain answer `review_candidate` can give is its own replay
+                // probe finding this key's receipt still pending. That is the recovery path:
+                // resolve the key to the receipt and continue the fold — publish, then
+                // settle — instead of answering the uncertain outcome forever.
+                let key = ReceiptKey {
+                    space: space.clone(),
+                    requester: mindcore_base::boundary::CallerId::new(self.caller.as_str()),
+                    operation: "memory.candidates.review".to_string(),
+                    idempotency_key: idempotency_key.to_string(),
+                };
+                let receipt = match SqliteMemoryRepository
+                    .review_receipt(&mut transaction, &key)
+                    .await
+                {
+                    Ok(Some(ReceiptRead::Retained(receipt))) => receipt,
+                    _other => {
+                        drop(transaction);
+                        return SpokeResult::Reject(reject);
+                    }
+                };
+                Staging::PendingRetry {
+                    receipt_id: receipt.receipt_id.clone(),
+                }
+            }
             SpokeResult::Reject(reject) => {
                 drop(transaction);
                 return SpokeResult::Reject(reject);
             }
+        };
+        let (receipt_id, fresh) = match staging {
+            Staging::Fresh { receipt_id } => (receipt_id, true),
+            Staging::PendingRetry { receipt_id } => (receipt_id, false),
         };
 
         // 3. Read the staged intent on the same transaction for the targets it owes.
@@ -630,13 +670,19 @@ impl Mind {
             };
         }
 
-        // 5. Commit the staging, then settle the receipt on a second immediate-write
-        // transaction. A failure from here leaves a pending intent and answers
-        // `OUTCOME_UNCERTAIN`, as the served surface does.
-        if let Err(error) = transaction.commit().await {
-            return uncertain(format!(
-                "review staging for receipt {receipt_id} committed an unknown outcome: {error}"
-            ));
+        // 5. Commit the staging — a fresh fold's own; a pending retry's is already durable, so
+        // its transaction is only dropped — then settle the receipt on a second
+        // immediate-write transaction. A failure from here leaves a pending intent and answers
+        // `OUTCOME_UNCERTAIN`, as the served surface does, and a same-key repeat resumes at
+        // this settlement leg rather than re-staging.
+        if fresh {
+            if let Err(error) = transaction.commit().await {
+                return uncertain(format!(
+                    "review staging for receipt {receipt_id} committed an unknown outcome: {error}"
+                ));
+            }
+        } else {
+            drop(transaction);
         }
         let mut settlement = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,

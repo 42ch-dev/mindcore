@@ -74,10 +74,11 @@ answers `OUTCOME_UNCERTAIN` because durable work may be outstanding. A receipt a
 is replayed as it is.
 
 The `OUTCOME_UNCERTAIN` recovery contract: the caller repeats the review with the same
-candidate, decision and idempotency key. While the receipt is still pending, the repeat
-answers `OUTCOME_UNCERTAIN` again — the probe reports the pending receipt exactly as the fold
-left it, with no second record and no second intent. When the receipt has committed, the same
-repeat answers the settled receipt as any replay does. The ordering differs from the served
+candidate, decision and idempotency key. When the probe meets the key's receipt still
+pending, the repeat does not stop at the uncertain answer — it continues the fold: publishes
+the intent's targets and runs the settlement leg, so a repeat actually settles the receipt
+and answers it committed. `OUTCOME_UNCERTAIN` remains the answer for a settlement that fails
+again, and a receipt already committed replays as the settled answer. The ordering differs from the served
 surface deliberately: the served caller holds the receipt protocol that resolves
 `OUTCOME_UNCERTAIN` over a staged record; the facade's caller does not, so a failed publication
 leaves no record to resolve. The cost is an orphan published file when the process dies
@@ -148,7 +149,6 @@ The boundary the facade composes is the store's own — `read_entry`, `write_ent
 `reflections: false` and offers no switch: the reflection surface (§7.25–§7.27 of the SPOKE
 spec) is a provider-level capability the facade's convenience contract does not expose, and a
 host that needs it embeds the adapter or the served surface directly.
-  journal publisher and the model providers are the embedding host's, as on the served surface.
 
 ## Invariants
 
