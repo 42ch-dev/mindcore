@@ -148,7 +148,7 @@ fn recall_all() -> (Recall<'static>, Value) {
         Recall {
             subject: SUBJECT,
             selection,
-            max_items: Some(10),
+            max_items: 10,
             max_bytes: None,
             query: None,
             cursor: None,
@@ -294,6 +294,42 @@ async fn capture_review_then_recall_returns_the_record_for_the_named_subject() {
     assert!(
         published.exists(),
         "the record projection was published under the journal root"
+    );
+}
+
+#[tokio::test]
+async fn a_recall_with_only_max_items_and_no_other_budget_fields_is_a_valid_wire_request() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(dir.path()));
+    capture_candidate(&handle, "cap-min-budget", "a plain note").await;
+
+    // The regression the wire contract pins: a recall carrying neither query, cursor nor
+    // max_bytes — the minimal budget shape — must decode as a valid wire request and answer
+    // a page, not a validation refusal. `max_items` is non-optional on the facade exactly
+    // because the wire requires the member.
+    let (minimal, _) = recall_all();
+    let page = value_of(&ok(handle.recall(&minimal).await));
+    assert!(
+        page["records"].is_array(),
+        "the minimal budget answers a records page: {page}"
+    );
+
+    // One item bounds the page to exactly one record even though more exist.
+    capture_candidate(&handle, "cap-min-budget-two", "a second note").await;
+    let bounded = Recall {
+        max_items: 1,
+        ..recall_all().0
+    };
+    let page = value_of(&ok(handle.recall(&bounded).await));
+    let records = page["records"].as_array().expect("a records page");
+    assert!(
+        records.len() <= 1,
+        "max_items bounds the page: {}",
+        records.len()
     );
 }
 

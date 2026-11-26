@@ -83,7 +83,9 @@ pub struct Recall<'a> {
     pub subject: &'a str,
     /// The §6.12 read selection member (`{"mode": ...}`), exactly as the wire carries it.
     pub selection: &'a Value,
-    pub max_items: Option<u64>,
+    /// At least one, at most one page: the wire's `budget` requires the member, so the
+    /// facade carries it non-optional — every recall the facade sends is a valid wire request.
+    pub max_items: u64,
     pub max_bytes: Option<u64>,
     pub query: Option<&'a str>,
     pub cursor: Option<&'a str>,
@@ -232,23 +234,38 @@ impl Mind {
             .adapter
             .capture(&mut transaction, &principal(&self.caller), request)
             .await;
-        if stage.is_reject() {
-            drop(transaction);
-            return ready(stage);
-        }
+        let body = match stage {
+            // Capture never journals: a non-Ready stage is a composition defect, answered
+            // before any state changes — nothing has committed, so the retry class holds.
+            SpokeResult::Ok(MemoryStage::Ready(body)) => body,
+            SpokeResult::Ok(unexpected) => {
+                drop(transaction);
+                return retryable_internal(format!(
+                    "the adapter answered an unexpected stage: {unexpected:?}"
+                ));
+            }
+            SpokeResult::Reject(reject) => {
+                drop(transaction);
+                return SpokeResult::Reject(reject);
+            }
+        };
         if let Err(error) = transaction.commit().await {
             return uncertain(format!("capture committed an unknown outcome: {error}"));
         }
-        ready(stage)
+        // Past the commit a malformed body is no longer retryable: rows may be durable.
+        match serde_json::from_value(body) {
+            Ok(response) => SpokeResult::Ok(response),
+            Err(error) => uncertain(format!(
+                "the adapter's committed response does not match its schema: {error}"
+            )),
+        }
     }
 
     /// Recall this Mind's live records: the adapter's `recall` over one read transaction,
     /// rolled back after the read.
     pub async fn recall(&self, recall: &Recall<'_>) -> SpokeResult<MemoryRecallResponse> {
         let mut budget = Map::new();
-        if let Some(max_items) = recall.max_items {
-            budget.insert("max_items".to_string(), json!(max_items));
-        }
+        budget.insert("max_items".to_string(), json!(recall.max_items));
         if let Some(max_bytes) = recall.max_bytes {
             budget.insert("max_bytes".to_string(), json!(max_bytes));
         }
@@ -379,8 +396,12 @@ impl Mind {
         written
     }
 
-    /// Every entry of this Mind's collection: `knowledge_read` admitted on one read
-    /// transaction, then the store's `list_entries_in` on it, rolled back after the read.
+    /// Every entry of this Mind's collection, bounded: `knowledge_read` admitted on one read
+    /// transaction, then the store's `list_entries_in` on it, rolled back after the read. The
+    /// list shares the served face's 512-entry bound — a Mind holding more live entries
+    /// answers the store's `COLLECTION_OVER_CAPACITY` refusal. The facade is the convenience
+    /// surface of exactly that bounded list and offers no pagination: a host whose Mind
+    /// outgrows the bound embeds the store layer directly.
     pub async fn knowledge_list(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
         let mut transaction = match self.pool.begin().await {
             Ok(transaction) => transaction,

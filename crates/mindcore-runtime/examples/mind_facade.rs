@@ -133,7 +133,7 @@ async fn main() {
     let recall = Recall {
         subject: SUBJECT,
         selection: &selection,
-        max_items: Some(10),
+        max_items: 10,
         max_bytes: None,
         query: None,
         cursor: None,

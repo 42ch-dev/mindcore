@@ -34,7 +34,7 @@ with the binding's and the workflow's own refusals.
 | `recall(&Recall)` | the memory adapter's `recall` | one read transaction, rolled back | the adapter's own, over the caller-named selection |
 | `knowledge_get(entry_id, revision)` | `read_entry`, or `read_entry_at_revision` when a revision is named, on the row's collection | one read transaction, rolled back | space-wide `knowledge_read` |
 | `knowledge_put(entry, expected)` | `write_entry` — the one cognition validation boundary — on the row's collection | one `BEGIN IMMEDIATE`, committed | space-wide `knowledge_write` |
-| `knowledge_list()` | `list_entries_in` on the row's collection | one read transaction, rolled back | space-wide `knowledge_read` |
+| `knowledge_list()` | `list_entries_in` on the row's collection — bounded: over 512 live entries the store's `COLLECTION_OVER_CAPACITY` answers, and the facade offers no pagination | one read transaction, rolled back | space-wide `knowledge_read` |
 | `cognition_read()` | the carrier `read_entry` on the row's collection, derived in the facade; nothing persisted | one read transaction, rolled back | space-wide `knowledge_read` |
 | `deliberate(&Deliberation)` | `SpiMindWorkflows::deliberate` with no subject, the row's carrier as holder and the Mind's id as assessment context | the workflow's own | space-wide `recall`, with the space-level withhold |
 
@@ -97,8 +97,11 @@ file itself no symlink can redirect the write: the bytes are written to a tempor
 created exclusively in the same directory and renamed over the target atomically, so a symlink
 at the target is replaced rather than followed — refusal applies instead to a symlink at the
 temporary name. Durability syncs the target's file, then every directory beneath the root the
-publication created or wrote into, deepest first, ending at the root itself — a pure function
-of the target's path, so a retry can never be weaker than the attempt that failed. Syncing a
+publication created or wrote into, deepest first, ending at the canonical root itself — the
+chain is computed from the target's resolved parent, because a symlink inside the root can
+redirect the write and only the resolved chain carries the real parent of every dirtied entry;
+a pure function of the target's path and the tree's symlinks, so a retry can never be weaker
+than the attempt that failed. Syncing a
 directory opens it for reading, so the host must grant read on the root and everything beneath
 it; ancestors above it need only traversal — a write-only journal root cannot be published,
 because the sync that must precede settlement would be refused for a reason the write itself
