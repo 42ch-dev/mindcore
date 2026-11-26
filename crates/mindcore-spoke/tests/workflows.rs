@@ -1855,7 +1855,10 @@ async fn a_citation_that_loses_its_admission_refuses_the_settlement() {
     let SpiError::Settlement(reject) = error else {
         panic!("expected a settlement refusal, got {error:?}");
     };
-    assert_eq!(reject.code, SpokeRejectCode::NotFound);
+    // A revoked grant is no admission: the settlement answers the one
+    // admission refusal, before any record existence check.
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(reject.details.is_none(), "{reject:?}");
     assert_eq!(harness.count_from("memory_records").await, 1);
     assert_eq!(harness.count_from("memory_journal").await, 0);
     assert_eq!(

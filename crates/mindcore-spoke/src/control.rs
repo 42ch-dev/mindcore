@@ -86,15 +86,16 @@ impl MemoryAdapter {
             }
         }
         let principal_id = principal_id(principal);
-        let now = Utc::now();
-        let mut visible_space_ids: HashSet<String> = HashSet::new();
-        self.repository
-            .scan_principal_grants(tx, principal_id, |grant| {
-                if admission::live_grant(&grant, now) {
-                    visible_space_ids.insert(grant.space_id.as_str().to_string());
-                }
-            })
-            .await?;
+        // The visible set is the Minds the principal holds a live grant in,
+        // read through the registry's join on this transaction: a space with
+        // no registry row is not listed, and a frozen Mind still is.
+        let ids = match mindcore_sqlite::minds::visible_mind_ids(tx, principal_id).await {
+            spoke_operations::SpokeResult::Ok(ids) => ids,
+            spoke_operations::SpokeResult::Reject(_) => {
+                return Err(Reject::internal("mind visibility read failed"));
+            }
+        };
+        let visible_space_ids: HashSet<String> = ids.into_iter().collect();
         let visible_spaces: Vec<&str> = visible_space_ids.iter().map(String::as_str).collect();
         let grant_revisions = self
             .repository

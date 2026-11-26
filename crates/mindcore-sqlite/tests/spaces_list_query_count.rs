@@ -1,7 +1,7 @@
-//! I-000060 / I-000066: `spaces.list` streams the principal's grants and
-//! projects the visible revisions, so it costs exactly three SELECTs — the
-//! scan, the revision projection and the spaces — whatever the space count,
-//! and it never fails on a grant whose space row is gone.
+//! I-000060 / I-000066: `spaces.list` reads the registry's visibility join
+//! and projects the visible revisions, so it costs exactly three SELECTs —
+//! the join, the revision projection and the spaces — whatever the space
+//! count, and it never fails on a grant whose space row is gone.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -99,6 +99,16 @@ async fn seed_space_row(pool: &SqlitePool, space_id: &str) {
         .insert_space(&mut tx, &space)
         .await
         .expect("seed space");
+    // The registry row makes the space a Mind `spaces.list` may list. The
+    // test pool disables foreign keys, so the collection and carrier need
+    // no entry row.
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id)          VALUES (?, 'mind:test', 'ke_test')",
+    )
+    .bind(space_id)
+    .execute(&mut *tx)
+    .await
+    .expect("seed registry row");
     tx.commit().await.expect("commit space");
 }
 
@@ -247,7 +257,7 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
     assert_eq!(
         listing(&pool).await,
         (3, five.clone()),
-        "an orphan grant is skipped instead of decoded",
+        "an orphan grant names no Mind, so the join never lists it",
     );
 
     seed_space_row(&pool, "spc_hidden").await;
@@ -362,9 +372,9 @@ async fn list_spaces_streams_grants_and_costs_three_selects() {
         },
     )
     .await;
-    let (_, stage) = list_call(&pool, json!({})).await;
-    assert!(
-        matches!(&stage, SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::InternalError),
-        "a malformed grant payload in a visible space must fail the listing: {stage:?}",
+    assert_eq!(
+        listing(&pool).await,
+        (3, five.clone()),
+        "the listing reads grant liveness, never the payload, so a malformed          capabilities payload changes nothing visible",
     );
 }

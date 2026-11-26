@@ -421,6 +421,45 @@ async fn read_one_visible(
     SpokeResult::Ok(Vec::new())
 }
 
+/// The Mind ids `caller` holds a live grant in, read through the caller's own
+/// transaction so `memory.spaces.list` sees exactly the rows its effect
+/// commits against. This is the registry's own join `read_visible` runs,
+/// reduced to the id: one joined row per live grant, de-duplicated in `id`
+/// order by the same adjacent-group rule. A frozen Mind's id is answered — the
+/// space row carries its status — and a space with no registry row never
+/// joins, so it is never in the answer.
+pub async fn visible_mind_ids(
+    tx: &mut Transaction<'_, Sqlite>,
+    caller: &str,
+) -> SpokeResult<Vec<String>> {
+    let mut rows = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT m.space_id, g.expires_at \
+         FROM memory_grants g \
+         JOIN minds m ON m.space_id = g.space_id \
+         WHERE g.principal_id = ?1 AND g.revoked_at IS NULL \
+         ORDER BY m.space_id, g.grant_id",
+    )
+    .bind(caller)
+    .fetch(&mut **tx);
+    let mut ids = Vec::new();
+    let mut emitted: Option<String> = None;
+    while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+        let (space_id, expires_at) = match row {
+            Ok(row) => row,
+            Err(_) => return storage_unavailable(),
+        };
+        if emitted.as_deref() == Some(space_id.as_str()) {
+            continue;
+        }
+        if !live(&expires_at) {
+            continue;
+        }
+        emitted = Some(space_id.clone());
+        ids.push(space_id);
+    }
+    SpokeResult::Ok(ids)
+}
+
 impl MindStore {
     /// `create` in one immediate-write transaction.
     pub async fn create_mind(&self, request: &CreateMind) -> SpokeResult<Mind> {

@@ -208,6 +208,35 @@ pub(crate) fn candidate_requirement<'a>(
     }
 }
 
+/// Mind admission, run before every existence check: the caller's grant rows
+/// first, then the space row. No live grant for this principal and no space
+/// row answer the same fixed `NOT_AUTHORIZED` with no details, so an unknown
+/// Mind, a frozen one the caller holds no grant in and an unadmitted one are
+/// one answer, and nothing the refusal carries says which case the caller hit.
+/// The registry is not consulted here: a space written before it is still a
+/// space to `memory.*`; the registry gates only `memory.spaces.list` and the
+/// Mind-level reads.
+pub(crate) async fn admit_mind(
+    repository: &SqliteMemoryRepository,
+    tx: &mut Tx<'_>,
+    principal: &str,
+    space: &SpaceId,
+) -> AResult<(Vec<MemoryGrantRow>, MemorySpaceRow)> {
+    let rows = grants(repository, tx, space).await?;
+    let now = Utc::now();
+    let admitted = rows
+        .iter()
+        .any(|row| row.principal_id.as_str() == principal && live_grant(row, now));
+    if !admitted {
+        return Err(Reject::admission_refusal());
+    }
+    let row = match repository.space(tx, space).await? {
+        Some(row) => row,
+        None => return Err(Reject::admission_refusal()),
+    };
+    Ok((rows, row))
+}
+
 pub(crate) async fn space(
     repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
@@ -435,8 +464,8 @@ pub(crate) async fn authorize(
     admission: &Admission<'_>,
     now: DateTime<Utc>,
 ) -> AResult<Vec<MemoryGrantRow>> {
-    space(repository, tx, admission.space).await?;
-    let rows = grants(repository, tx, admission.space).await?;
+    let (rows, _space) =
+        admit_mind(repository, tx, admission.principal, admission.space).await?;
     let wire = wire_grants(&rows)?;
     let space_id = admission.space.as_str();
     match &admission.coverage {
