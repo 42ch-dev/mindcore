@@ -322,9 +322,10 @@ impl MemoryAdapter {
     /// cannot land between admission and the read. Admission is [`workflows::admitted_carrier`]:
     /// the caller's own grant rows and the registry row, read together, answering one fixed
     /// refusal with no details whether the Mind is absent or the caller was never admitted.
-    /// A fresh carrier answers `records: []` and `mind_state: null`; the derivation failures a
-    /// stored carrier could raise are internal errors, because the carrier passed validation at
-    /// its write. The transaction is the caller's to end.
+    /// A fresh carrier answers `records: []` and `mind_state: null`; a stored carrier that cannot
+    /// be derived is a terminal `InternalError`, matching the facade's `cognition_read`, because
+    /// the carrier passed validation at its write and repeating the read cannot change it. The
+    /// transaction is the caller's to end.
     pub async fn read_cognition(
         tx: &mut Tx<'_>,
         principal: &Principal,
@@ -339,10 +340,13 @@ impl MemoryAdapter {
         let revision = match carrier_entry.revision {
             Some(revision) => revision,
             None => {
-                return Err(Reject::internal(format!(
-                    "carrier {} holds no assigned revision",
-                    carrier.carrier_entry_id
-                ))
+                return Err(Reject::terminal(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "carrier {} holds no assigned revision",
+                        carrier.carrier_entry_id
+                    ),
+                )
                 .into_spoke())
             }
         };
@@ -356,20 +360,26 @@ impl MemoryAdapter {
                 })
             }
             Err(error) => {
-                return Err(Reject::internal(format!(
-                    "carrier {} cannot be derived: {error}",
-                    carrier.carrier_entry_id
-                ))
+                return Err(Reject::terminal(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "carrier {} cannot be derived: {error}",
+                        carrier.carrier_entry_id
+                    ),
+                )
                 .into_spoke())
             }
         };
         let mind_state = match mindcore_base::cognition::mind_state_value(&view, space_id) {
             Ok(mind_state) => mind_state,
             Err(error) => {
-                return Err(Reject::internal(format!(
-                    "the mind state of {} cannot be projected: {error}",
-                    carrier.carrier_entry_id
-                ))
+                return Err(Reject::terminal(
+                    SpokeRejectCode::InternalError,
+                    format!(
+                        "the mind state of {} cannot be projected: {error}",
+                        carrier.carrier_entry_id
+                    ),
+                )
                 .into_spoke())
             }
         };
