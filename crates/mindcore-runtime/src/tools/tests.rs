@@ -153,6 +153,27 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed mind row");
+    // The admission probe reads live grants in the request's space; the probe principal holds a
+    // space-wide `knowledge_read` grant here.
+    sqlx::query(
+        "CREATE TABLE memory_grants (\
+            grant_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, subject_id TEXT, \
+            principal_id TEXT NOT NULL, capabilities_json TEXT NOT NULL, \
+            context_ids_json TEXT NOT NULL, shared_access INTEGER NOT NULL, \
+            expires_at TEXT, revoked_at TEXT, revision INTEGER NOT NULL, created_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create memory_grants");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_probe', 'spc_1', NULL, 'prn_driver', '[\"knowledge_read\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed probe grant");
     pool
 }
 

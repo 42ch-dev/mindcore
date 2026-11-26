@@ -646,13 +646,11 @@ impl PolicyHook for HoldingPolicy {
     }
 }
 
-/// The host's side of the surface. `routes` is the retired per-principal route map the binding no
-/// longer reads: the registry row decides every collection, so callers pass it and it is ignored.
+/// The host's side of the surface.
 fn faces(
     manifest: HostCapabilityManifest,
     memory: Option<Arc<dyn ServedMemory>>,
     providers: MindProviders,
-    _routes: BTreeMap<String, KnowledgeScope>,
 ) -> ServeFaces {
     ServeFaces {
         manifest,
@@ -668,14 +666,6 @@ fn faces(
     }
 }
 
-/// A retired route map shell: the registry row replaced routing, so this only keeps the call
-/// sites shaped as they were.
-fn routes(principals: &[&str]) -> BTreeMap<String, KnowledgeScope> {
-    principals
-        .iter()
-        .map(|principal| ((*principal).to_string(), KnowledgeScope::new(COLLECTION)))
-        .collect()
-}
 
 fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
     expect_ok(serve.surface(faces), "assemble the served surface")
@@ -964,7 +954,6 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
             hello("runtime", &["spoke-baseline"]),
             None,
             MindProviders::default(),
-            routes(&[]),
         ),
     );
 
@@ -1028,7 +1017,6 @@ async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
         hello("runtime", &[]),
         None,
         MindProviders::default(),
-        routes(&[PRINCIPAL]),
     );
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
@@ -1054,6 +1042,11 @@ async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
         result["knowledge"][0]["canonical_name"], "the second mind's carrier",
         "the slot carries the second Mind's own content: {result}"
     );
+    assert_eq!(
+        result["knowledge"][0]["body"]["summary"],
+        "the knowledge of the second mind, not the first",
+        "the slot carries the second Mind's own summary: {result}"
+    );
 }
 
 /// A configured route never narrows recall's authorization: the route's caller keeps the memory
@@ -1070,7 +1063,6 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
             hello("runtime", &[]),
             None,
             MindProviders::default(),
-            routes(&[PRINCIPAL]),
         ),
     );
     assert!(
@@ -1114,7 +1106,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
     };
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
+        faces(hello("runtime", &[]), None, providers),
     );
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
@@ -1177,7 +1169,6 @@ async fn deliberation_session(
                 policy_hook: Some(policy),
                 ..MindProviders::default()
             },
-            routes(&[PRINCIPAL]),
         ),
     );
     let session = connect(&surface, &[DELIBERATE]).await;
@@ -1277,7 +1268,7 @@ async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
     };
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
+        faces(hello("runtime", &[]), None, providers),
     );
 
     let session = connect(&surface, &[DELIBERATE]).await;
@@ -1325,7 +1316,7 @@ async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
     };
     let surface = surface(
         &serve,
-        faces(hello("runtime", &[]), None, providers, routes(&[PRINCIPAL])),
+        faces(hello("runtime", &[]), None, providers),
     );
 
     let session = connect(&surface, &[DELIBERATE]).await;
@@ -1425,7 +1416,6 @@ async fn two_minds_settle_onto_their_own_carriers() {
         .await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let workflow_routes = routes(&[PRINCIPAL]);
     let mut faces = faces(
         hello("runtime", &[]),
         None,
@@ -1434,7 +1424,6 @@ async fn two_minds_settle_onto_their_own_carriers() {
             policy_hook: Some(Arc::new(AutoPolicy)),
             ..MindProviders::default()
         },
-        workflow_routes,
     );
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
@@ -1636,7 +1625,6 @@ async fn a_space_with_no_registry_row_reaches_no_carrier() {
             reasoner: Some(Arc::new(NoChangeReasoner)),
             ..MindProviders::default()
         },
-        routes(&[PRINCIPAL]),
     );
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
@@ -1689,6 +1677,121 @@ async fn a_space_with_no_registry_row_reaches_no_carrier() {
     );
 }
 
+/// Existence privacy: a peer admitted to nothing — no grant in either space — cannot tell an
+/// existing Mind from an absent one. Both `space_id` variations are answered with the same
+/// refusal, byte-equal, and neither call reaches the reasoner: the reasoner is absent entirely
+/// here, so a call that escaped the admission gate would surface `ReasonerUnavailable` instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliberate_cannot_distinguish_an_absent_mind_from_an_ungranted_one() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    let (_dir, serve) = fixture.serve();
+    // No reasoner: any path that reaches the engine before admission is a different answer.
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+    );
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
+
+    let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let existing = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_in(SPACE_TWO))
+            .await,
+        "deliberate into an existing Mind the peer holds no grant in",
+    );
+    let absent = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_in("spc_no_such_mind"))
+            .await,
+        "deliberate into a space that is no Mind at all",
+    );
+    assert_eq!(existing.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        existing, absent,
+        "an ungranted Mind and an absent Mind must be the byte-same refusal"
+    );
+    assert!(
+        existing.details.is_none(),
+        "the refusal carries no details either way: {existing:?}"
+    );
+}
+
+/// One principal admitted to both Minds: each recall names its own `space_id` and answers that
+/// Mind's content — entry id, canonical name and body summary — never the other's. Two different
+/// principals would not pin this: a route keyed to the principal would pass either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_principal_recalls_each_mind_by_its_own_space_id() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    fixture
+        .grant_in_second(
+            "grt_shared_peer",
+            PRINCIPAL,
+            &["recall", "knowledge_read"],
+        )
+        .await;
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+    );
+    faces.principals = principal_admission();
+    let surface = surface(&serve, faces);
+
+    let session = connect(&surface, &[RECALL_CONTEXT]).await;
+    for (space, carrier, name, summary) in [
+        (SPACE, CARRIER, "ke_carrier's carrier", "what this holder currently holds"),
+        (
+            SPACE_TWO,
+            CARRIER_TWO,
+            "the second mind's carrier",
+            "the knowledge of the second mind, not the first",
+        ),
+    ] {
+        let mut arguments = recall_arguments_in(space);
+        arguments["max_tokens"] = json!(4_000);
+        let pack = expect_ok(
+            session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
+            &format!("recall {space} by the shared principal"),
+        );
+        assert_eq!(
+            packed_knowledge_ids(&pack),
+            [carrier],
+            "{space}: the slot names this Mind's carrier"
+        );
+        assert_eq!(
+            pack["knowledge"][0]["canonical_name"], name,
+            "{space}: the slot is this Mind's canonical name"
+        );
+        assert_eq!(
+            pack["knowledge"][0]["body"]["summary"], summary,
+            "{space}: the slot is this Mind's content"
+        );
+    }
+    let first_pack = {
+        let mut arguments = recall_arguments_in(SPACE);
+        arguments["max_tokens"] = json!(4_000);
+        expect_ok(
+            session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
+            "recall the first Mind",
+        )
+    };
+    assert!(
+        !first_pack["knowledge"]
+            .as_array()
+            .expect("first knowledge")
+            .iter()
+            .any(|entry| entry["entry_id"] == CARRIER_TWO),
+        "the first Mind's recall never carries the second Mind's entry: {first_pack}"
+    );
+}
+
 /// Advertisement honesty for the optional face: the dialer claims `spoke-memory` in both
 /// sessions, yet the op is denied while the host attaches no memory service and served verbatim
 /// once it does.
@@ -1702,7 +1805,6 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             hello("runtime", &["spoke-memory"]),
             None,
             MindProviders::default(),
-            routes(&[]),
         ),
     );
     assert!(
@@ -1725,7 +1827,6 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             hello("runtime", &["spoke-memory"]),
             Some(Arc::new(MemoryFace)),
             MindProviders::default(),
-            routes(&[]),
         ),
     );
     assert!(
@@ -1772,7 +1873,6 @@ async fn transfer_is_advertised_and_served_when_the_service_reports_all_five() {
             hello("runtime", &["spoke-memory", "spoke-memory-transfer"]),
             Some(service),
             MindProviders::default(),
-            routes(&[]),
         ),
     );
     assert!(
@@ -1904,7 +2004,6 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
             hello("runtime", &["spoke-memory", "spoke-memory-transfer"]),
             Some(service),
             MindProviders::default(),
-            routes(&[]),
         ),
     );
     let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
@@ -1957,7 +2056,6 @@ async fn the_baseline_face_is_never_composed_or_advertised() {
             hello("runtime", &["spoke-baseline"]),
             None,
             MindProviders::default(),
-            routes(&[]),
         ),
     );
     assert!(
@@ -1986,7 +2084,6 @@ async fn an_unserved_tool_answers_op_unsupported() {
             hello("runtime", &[]),
             None,
             MindProviders::default(),
-            routes(&[]),
         ),
     );
     assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
@@ -2027,7 +2124,7 @@ fn adopt_request(source_entry_id: &str, source_revision: u64, key: &str) -> Know
 }
 
 /// The fixture's faces with the one shared adoption source attached.
-fn adopting_faces(workflow_routes: BTreeMap<String, KnowledgeScope>) -> ServeFaces {
+fn adopting_faces() -> ServeFaces {
     ServeFaces {
         adoption: Some(AdoptionRoute {
             scope_id: SHARED_SCOPE.to_string(),
@@ -2037,7 +2134,6 @@ fn adopting_faces(workflow_routes: BTreeMap<String, KnowledgeScope>) -> ServeFac
             hello("runtime", &[]),
             None,
             MindProviders::default(),
-            workflow_routes,
         )
     }
 }
@@ -2197,7 +2293,6 @@ async fn adoption_is_advertised_and_served_only_with_the_face() {
             hello("runtime", &[]),
             None,
             MindProviders::default(),
-            routes(&[PRINCIPAL]),
         ),
     );
     assert!(
@@ -2228,7 +2323,7 @@ async fn adoption_is_advertised_and_served_only_with_the_face() {
     );
     drop(session);
 
-    let attached = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let attached = surface(&serve, adopting_faces());
     assert!(
         capabilities(&attached).contains(&ADOPTION),
         "a composed adoption face is advertised: {:?}",
@@ -2262,7 +2357,7 @@ async fn knowledge_adopt_anchors_the_terminal_and_repeats_idempotently() {
     let pool = fixture.store.pool();
     seed_shared_source(&pool).await;
     let (_dir, serve) = fixture.serve();
-    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let surface = surface(&serve, adopting_faces());
     let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
     let dialer = &*session.adapter;
     let destination = scope_of(SCOPE_ID);
@@ -2440,7 +2535,7 @@ async fn knowledge_adopt_refuses_with_the_contract_codes() {
     seed_shared_source(&pool).await;
     seed_cycle(&pool).await;
     let (_dir, serve) = fixture.serve();
-    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let surface = surface(&serve, adopting_faces());
     let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
     let dialer = &*session.adapter;
     let destination = scope_of(SCOPE_ID);
@@ -2583,7 +2678,7 @@ async fn an_occupied_destination_answers_occupancy_whatever_the_selection_shows(
     );
     let (_dir, serve) = fixture.serve();
     let surface_of = |admission: KnowledgeAdmission| {
-        let mut admitted = adopting_faces(routes(&[PRINCIPAL]));
+        let mut admitted = adopting_faces();
         admitted.admission = admission;
         surface(&serve, admitted)
     };
@@ -2746,7 +2841,7 @@ async fn a_retired_destination_occupant_answers_occupancy_over_the_signed_sessio
     seed_retired_destination(&pool).await;
     let before = destination_slot(&pool, RETIRED_SLOT).await;
     let (_dir, serve) = fixture.serve();
-    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let surface = surface(&serve, adopting_faces());
     let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
 
     let mut claim = adopt_request(SHARED_ENTRY, 1, "retired-destination");
@@ -2793,7 +2888,7 @@ async fn adoption_refuses_a_terminal_revision_outside_the_served_range() {
     let pool = fixture.store.pool();
     seed_shared_source(&pool).await;
     let (_dir, serve) = fixture.serve();
-    let surface = surface(&serve, adopting_faces(routes(&[PRINCIPAL])));
+    let surface = surface(&serve, adopting_faces());
     let session = connect(&surface, &[ADOPTION, "spoke-knowledge"]).await;
     let dialer = &*session.adapter;
 
@@ -2843,7 +2938,6 @@ async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
         hello("runtime", &[]),
         None,
         MindProviders::default(),
-        routes(&[]),
     );
     faces.tools = vec![ToolRegistration::new(
         host_tool_descriptor(),
@@ -2983,7 +3077,6 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
                 embedder: Some(embedder.clone()),
                 ..MindProviders::default()
             },
-            routes(&[]),
         ),
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
@@ -3089,7 +3182,6 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
                 embedder: Some(embedder.clone()),
                 ..MindProviders::default()
             },
-            routes(&[]),
         ),
     );
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
@@ -3218,7 +3310,6 @@ async fn history_is_advertised_and_served_only_with_the_face() {
             hello("runtime", &["spoke-history"]),
             None,
             MindProviders::default(),
-            routes(&[]),
         ),
     );
     assert!(
@@ -3260,7 +3351,6 @@ async fn history_is_advertised_and_served_only_with_the_face() {
         hello("runtime", &["spoke-history"]),
         None,
         MindProviders::default(),
-        routes(&[]),
     );
     attached.history = true;
     let attached = surface(&serve, attached);
@@ -3311,7 +3401,6 @@ async fn history_replays_prunes_and_refuses_over_a_signed_session() {
         hello("runtime", &["spoke-history", "spoke-knowledge"]),
         None,
         MindProviders::default(),
-        routes(&[]),
     );
     attached.history = true;
     let surface = surface(&serve, attached);
@@ -3514,7 +3603,6 @@ async fn a_prune_does_not_replay_across_collections_on_one_database() {
         hello("runtime", &["spoke-history"]),
         None,
         MindProviders::default(),
-        routes(&[]),
     );
     first.history = true;
     let first_surface = surface(&serve, first);
@@ -3534,7 +3622,6 @@ async fn a_prune_does_not_replay_across_collections_on_one_database() {
         hello("runtime", &["spoke-history"]),
         None,
         MindProviders::default(),
-        routes(&[]),
     );
     second.history = true;
     second.knowledge = KnowledgeScope::new(COLLECTION_TWO);
@@ -3607,7 +3694,6 @@ async fn a_prune_replays_its_recorded_outcome_for_the_same_key() {
         hello("runtime", &["spoke-history"]),
         None,
         MindProviders::default(),
-        routes(&[]),
     );
     attached.history = true;
     let surface = surface(&serve, attached);
@@ -3745,7 +3831,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
             hello("runtime", &["spoke-history"]),
             None,
             MindProviders::default(),
-            routes(&[]),
         );
         attached.history = true;
         let surface = surface(&serve, attached);
@@ -3786,7 +3871,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
         hello("runtime", &["spoke-history"]),
         None,
         MindProviders::default(),
-        routes(&[]),
     );
     attached.history = true;
     let surface = surface(&serve, attached);
