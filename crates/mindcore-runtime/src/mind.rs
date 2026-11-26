@@ -276,39 +276,13 @@ impl Mind {
             }
         };
 
-        // 1–2. Read the candidate's revision, then stage the review on the same transaction.
-        // A replay of a receipt already settled answers `Ready` and is returned as it is.
-        let candidate = self
-            .adapter
-            .get_candidate(
-                &mut transaction,
-                &caller,
-                json!({ "space_id": space.as_str(), "candidate_id": candidate_id }),
-            )
-            .await;
-        let revision = match candidate {
-            SpokeResult::Ok(MemoryStage::Ready(body)) => {
-                match body.pointer("/candidate/revision").and_then(Value::as_u64) {
-                    Some(revision) => revision,
-                    None => {
-                        drop(transaction);
-                        return retryable_internal(
-                            "the candidate body carries no integer revision",
-                        );
-                    }
-                }
-            }
-            SpokeResult::Ok(stage) => {
-                drop(transaction);
-                return retryable_internal(format!(
-                    "candidate read answered an unexpected stage: {stage:?}"
-                ));
-            }
-            SpokeResult::Reject(reject) => {
-                drop(transaction);
-                return SpokeResult::Reject(reject);
-            }
-        };
+        // 1–2. Stage the review on one transaction. A replay of a receipt already settled
+        // answers `Ready` and is returned as it is. The request must be byte-identical across
+        // replays of one key — the adapter's dedup probe digests the whole payload — so
+        // `expected_revision` is the constant a pending candidate always carries (capture
+        // writes revision 1 and nothing mutates a pending candidate), never a fresh read of
+        // the row: reading it would send 2 after the consumption bumped it and the replay
+        // would answer `IdempotencyConflict` instead of the recorded receipt.
         let decision = match serde_json::to_value(decision) {
             Ok(decision) => decision,
             Err(error) => {
@@ -325,7 +299,7 @@ impl Mind {
                     "space_id": space.as_str(),
                     "candidate_id": candidate_id,
                     "decision": decision,
-                    "expected_revision": revision,
+                    "expected_revision": 1,
                     "idempotency_key": idempotency_key,
                 }),
             )

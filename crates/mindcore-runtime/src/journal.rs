@@ -1,15 +1,16 @@
 //! The one journal publisher the crate offers: `journal_dir(root)` writes every journaled
 //! file target under `root` at the target's own path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mindcore_spi::SpiError;
 use serde_json::Value;
 
 /// A file publisher over `root`: each target's `content` bytes land at `root` joined with the
-/// target's `path`, parent directories are created, and the written file is read back before
-/// the target counts as published. `Ok(())` is returned only when every target's exact bytes
-/// are durable.
+/// target's `path`, parent directories are created, and `Ok(())` is returned only when every
+/// target's exact bytes are durable — the file contents are synced to disk and the directory
+/// entries that name it are synced too, so a power loss cannot quietly lose a target the
+/// settlement was told had landed.
 ///
 /// Target paths are the adapter's own (`records/<id>.md`, `candidates/<id>.md`,
 /// `profiles/<digest>.md`): they carry no separators that could escape `root`, and they are
@@ -42,6 +43,29 @@ pub fn journal_dir(
                     "journal target {path} could not be written: {error}"
                 )))
             })?;
+            // Durability, not visibility: the write must reach the medium before the caller
+            // may settle the intent. Sync the file's contents, then the directory entries of
+            // every directory `create_dir_all` may have created up to the publisher root.
+            std::fs::File::open(&file)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    SpiError::Settlement(spoke_reject(format!(
+                        "journal target {path} could not be synced: {error}"
+                    )))
+                })?;
+            let mut directory = file.parent().map(Path::to_path_buf);
+            while let Some(dir) = directory {
+                std::fs::File::open(&dir)
+                    .and_then(|dir_file| dir_file.sync_all())
+                    .map_err(|error| {
+                        SpiError::Settlement(spoke_reject(format!(
+                            "the directory for {path} could not be synced: {error}"
+                        )))
+                    })?;
+                directory = (dir != root)
+                    .then(|| dir.parent().map(Path::to_path_buf))
+                    .flatten();
+            }
             let landed = std::fs::read_to_string(&file).map_err(|error| {
                 SpiError::Settlement(spoke_reject(format!(
                     "journal target {path} could not be confirmed: {error}"

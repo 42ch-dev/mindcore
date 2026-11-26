@@ -5,13 +5,15 @@
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{MindId, SpaceId};
 use mindcore_base::ir::MemoryRepository;
-use mindcore_runtime::journal::journal_dir;
+use mindcore_runtime::journal_dir;
 use mindcore_runtime::minds::{self, CreateMind};
 use mindcore_runtime::{Capture, Mind, Recall};
 use mindcore_spi::SpiError;
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use serde_json::{json, Number, Value};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_schemas::memory_candidates_review_request::Decision;
+use std::sync::mpsc;
 use tempfile::TempDir;
 
 const OWNER: &str = "caller_wren";
@@ -360,9 +362,57 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
         "the same key settles after the refused publication"
     );
     assert_eq!(count_records(&store.pool()).await, 1, "one record row");
+
+    // Critical 1: the same key replays. Consuming the candidate bumped its revision to 2 —
+    // asserted here so the next assertion cannot silently pass on an unchanged row — so a
+    // facade that re-read the row would send a different `expected_revision`, change the
+    // payload digest and be answered `IdempotencyConflict`. The settled receipt replays
+    // instead, byte-identically.
+    let candidate_revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM memory_candidates WHERE candidate_id = ?")
+            .bind(&candidate_id)
+            .fetch_one(&store.pool())
+            .await
+            .expect("the consumed candidate row");
+    assert_eq!(
+        candidate_revision, 2,
+        "consumption moved the stored revision"
+    );
+    let replayed = ok(working
+        .review(&candidate_id, &promote(), "rev-refused-publish")
+        .await);
+    assert_eq!(
+        value_of(&replayed),
+        value_of(&reviewed),
+        "an identical review replays the recorded receipt"
+    );
+    assert_eq!(
+        count_records(&store.pool()).await,
+        1,
+        "a replay writes no second record"
+    );
+    assert_eq!(
+        count_intents(&store.pool()).await,
+        1,
+        "a replay stages no second intent"
+    );
+
+    // A different decision under the same key stays a conflict — the digest still guards it.
+    let different =
+        serde_json::from_value::<Decision>(json!({ "action": "drop" })).expect("drop decision");
+    let conflict = reject_of(
+        working
+            .review(&candidate_id, &different, "rev-refused-publish")
+            .await,
+    );
+    assert_eq!(
+        conflict.code,
+        SpokeRejectCode::IdempotencyConflict,
+        "a different payload under one key is refused"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pending() {
     let (dir, store) = fixture().await;
     let owner = CallerId::new(OWNER);
@@ -380,26 +430,37 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
     .await;
 
     // The publisher queues an interference task on the store's one-connection pool: the
-    // staging transaction still holds that connection, so the task cannot start until the
-    // staging commit releases it. The pool's queue is fair, so the task — queued while the
-    // publisher runs, before the facade's settlement transaction even asks — takes the next
-    // checkout, moves the intent out of `pending`, and only then hands the connection to the
-    // settlement. The settle therefore always reads a moved intent: deterministic, no timing.
+    // staging transaction still holds that connection, so the task cannot acquire until the
+    // staging commit releases it. sqlx's pool issues connections FIFO-fair in registration
+    // order, and the task proves it registered before the publisher returns: the spawned task
+    // polls its acquire future once (registration happens on the first poll, while the one
+    // connection is still checked out) and signals that through the handshake channel. The
+    // settlement transaction asks only after the commit, so it is always behind the
+    // interference task in the queue, and the settle always reads a moved intent — the order
+    // is the semaphore's, never the scheduler's.
     let interference_pool = pool.clone();
     let handle =
         ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
             journal_dir(&journal_root)(targets)?;
             let interference_pool = interference_pool.clone();
+            let (registered, is_registered) = mpsc::channel::<()>();
             tokio::spawn(async move {
-                let mut connection = interference_pool
-                    .acquire()
-                    .await
-                    .expect("the one connection");
+                let acquire = interference_pool.acquire();
+                tokio::pin!(acquire);
+                assert!(
+                    futures::poll!(acquire.as_mut()).is_pending(),
+                    "the staging transaction still holds the one connection"
+                );
+                registered.send(()).expect("signal the registration");
+                let mut connection = acquire.await.expect("the one connection");
                 sqlx::query("UPDATE memory_journal SET state = 'deferred'")
                     .execute(&mut *connection)
                     .await
                     .expect("move the intent out of pending");
             });
+            is_registered
+                .recv()
+                .expect("the interference task registered its acquisition");
             Ok(())
         });
 

@@ -48,6 +48,7 @@ use sqlx::SqlitePool;
 
 use adoption::AdoptionService;
 use history_dedup::SqliteHistoryDedupStore;
+pub use journal::journal_dir;
 pub use mind::{Capture, Mind, Recall};
 pub use tools::MindProviders;
 use tools::WorkflowTools;
