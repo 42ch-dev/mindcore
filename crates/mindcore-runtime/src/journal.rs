@@ -21,7 +21,12 @@ use serde_json::Value;
 /// and a parent whose resolution leaves the canonical root — a symlink below the root
 /// pointing outside it, at the destination or anywhere in between — is refused before
 /// anything is created or written. The root the publisher serves is the canonical root: a
-/// host that passes a symlinked `root` publishes inside what it resolves to.
+/// host that passes a symlinked `root` publishes inside what it resolves to. At the target
+/// file itself no symlink can redirect the write: the bytes are written to a temporary file
+/// created exclusively in the same directory and renamed over the target atomically — rename
+/// replaces the directory entry, so a symlink at the target is replaced rather than followed.
+/// Refusal applies instead to a symlink at the temporary name and, as above, to an escaping
+/// parent chain.
 ///
 /// Durability: each target syncs its file, then every directory the publication created or
 /// wrote into beneath the root, deepest first, ending at the root itself — inclusive. The

@@ -64,6 +64,13 @@ let created = ok(
     "create",
 );
 
+// The journal root is the host's: create it and make its creation entry durable before the
+// first publish — the publisher refuses a missing root.
+std::fs::create_dir_all("journal").expect("create the journal root");
+std::fs::File::open(".")
+    .and_then(|parent| parent.sync_all())
+    .expect("sync the journal root's creation entry");
+
 let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
     .with_journal_publisher(journal_dir("journal"));
 ```

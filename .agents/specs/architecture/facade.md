@@ -92,8 +92,11 @@ example does. A missing root is refused with
 the requirement named, and the publisher never creates it. Everything the publisher creates
 is beneath the root. A target path that is absolute or carries `..` is refused before its
 first byte; what remains is canonicalized — a parent resolving outside the canonical root
-through a symlink below it, or a symlink at the target file itself, is refused before anything
-is written. Durability syncs the target's file, then every directory beneath the root the
+through a symlink below it is refused before anything is created or written. At the target
+file itself no symlink can redirect the write: the bytes are written to a temporary file
+created exclusively in the same directory and renamed over the target atomically, so a symlink
+at the target is replaced rather than followed — refusal applies instead to a symlink at the
+temporary name. Durability syncs the target's file, then every directory beneath the root the
 publication created or wrote into, deepest first, ending at the root itself — a pure function
 of the target's path, so a retry can never be weaker than the attempt that failed. Syncing a
 directory opens it for reading, so the host must grant read on the root and everything beneath
