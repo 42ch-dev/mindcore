@@ -23,6 +23,7 @@ use tempfile::TempDir;
 
 use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::MemorySpaceRow;
+use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, READ_COGNITION, RECALL_CONTEXT};
 use mindcore_runtime::{
     MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
@@ -320,6 +321,11 @@ impl Fixture {
             .execute(&self.store.pool())
             .await
             .expect("drop the grant");
+    }
+
+    /// The database file this fixture opened: a test may reopen the same path.
+    fn db_path(&self) -> std::path::PathBuf {
+        self.dir.path().join(DB_FILE)
     }
 
     /// The store and its directory part company: the engine takes the store, the caller keeps the
@@ -642,6 +648,7 @@ fn faces(
         manifest,
         memory,
         knowledge: false,
+        history: false,
         principals: principal_admission(),
         providers,
         tools: Vec::new(),
@@ -3062,17 +3069,17 @@ async fn an_unserved_tool_answers_op_unsupported() {
     );
 }
 
-/// The un-routed families leave composition and advertisement together: the manifest names none of
-/// them, no face is composed, and a dialer that claims them is served a missing port.
+/// The un-routed family leaves composition and advertisement together: the manifest names none of
+/// it, no face is composed, and a dialer that claims it is served a missing port.
 ///
-/// The knowledge half of the Stage 1 assertion moved to the composed-face tests below: the face is
-/// now served when `ServeFaces.knowledge` asks for it, and absent — unadvertised and unserved —
-/// when it does not.
+/// The knowledge and history halves of the Stage 1 assertion moved to the composed-face tests: each
+/// face is served when its `ServeFaces` flag asks for it, and absent — unadvertised and unserved —
+/// when it does not. Adoption is still un-routed, because it cannot name a Mind yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_un_routed_face_answers_a_missing_port() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let claimed = ["spoke-history", "spoke-knowledge-adoption"];
+    let claimed = ["spoke-knowledge-adoption"];
     let surface = surface(
         &serve,
         faces(hello("runtime", &claimed), None, MindProviders::default()),
@@ -3091,19 +3098,6 @@ async fn an_un_routed_face_answers_a_missing_port() {
 
     let session = connect(&surface, &claimed).await;
     let dialer = &*session.adapter;
-    assert_wire_deny(
-        HistoryPort::get_history_snapshot(
-            dialer,
-            &principal(),
-            &scope_of(SCOPE_ID),
-            "knowledge_entry",
-            "ke_absent",
-            1,
-        )
-        .await,
-        "history.revisions.get",
-        "capability_missing",
-    );
     let adopt: KnowledgeAdoptRequest = serde_json::from_value(json!({
         "source_scope_id": SCOPE_ID,
         "source_entry_id": "ke_absent",
@@ -5410,4 +5404,1398 @@ async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_min
             "{scope_id}: no details, and no hint that the store is healthy: {refused:?}"
         );
     }
+}
+
+// ---------- The composed history face ----------
+
+/// A session that serves history negotiates the knowledge face's three flags with it: both
+/// history ops admit through that face's callbacks.
+const HISTORY_CAPABILITIES: [&str; 4] = [
+    "spoke-knowledge",
+    "ke-ownership",
+    "spoke-knowledge-scoped",
+    "spoke-history",
+];
+
+/// A surface whose history face is composed over the knowledge face, for `principals`.
+fn history_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
+    let mut faces = faces(
+        hello("runtime", &HISTORY_CAPABILITIES),
+        None,
+        MindProviders::default(),
+    );
+    faces.knowledge = true;
+    faces.history = true;
+    faces.principals = principals;
+    surface(serve, faces)
+}
+
+/// `summaries.len()` revisions of `entry_id` in `collection`, written through the store the way a
+/// creator's puts write them.
+///
+/// Seeded through the store rather than the wire: the entry's history is the fixture, and the
+/// tests below are about what the served face answers for it.
+async fn seed_history(store: &MindStore, collection: &str, entry_id: &str, summaries: &[&str]) {
+    let scoped = store.knowledge(KnowledgeScope::new(collection));
+    let mut base = None;
+    for summary in summaries {
+        base = expect_ok(
+            scoped
+                .put_knowledge_entry(served_entry(entry_id, summary), base)
+                .await,
+            "seed the entry's history",
+        )
+        .revision;
+    }
+}
+
+/// The stored checkpoint revisions of one entry, ascending: the preimages a prune cuts.
+async fn checkpoint_revisions(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    entry_id: &str,
+) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions \
+         WHERE collection = ? AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("read the entry's checkpoints")
+}
+
+/// [`checkpoint_revisions`] against the table a fault test moved aside as
+/// `knowledge_entry_revisions_intact`, for the interval when the real name is a faulting view.
+async fn intact_checkpoint_revisions(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    entry_id: &str,
+) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions_intact \
+         WHERE collection = ? AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("read the entry's checkpoints through the intact table")
+}
+
+/// Connect's prune dedup key for one retry identity: the RFC 8785 serialization of
+/// `[op, effective_scope, principal_id, idempotency_key]`. The admitted scope the history face
+/// returns carries the Mind's `scope_id` and nothing else, so a test can name the exact row the
+/// served face touches.
+fn dedup_key(scope_id: &str, principal_id: &str, idempotency_key: &str) -> String {
+    serde_jcs::to_string(&json!([
+        "history.revisions.prune",
+        { "scope_id": scope_id },
+        principal_id,
+        idempotency_key
+    ]))
+    .expect("the retry identity JCS-canonicalizes")
+}
+
+/// One dedup row's `(payload_digest, outcome_json)`: `None`/`None` for a claim still in flight.
+async fn dedup_row(
+    pool: &sqlx::SqlitePool,
+    namespace: &str,
+    key: &str,
+) -> (Option<String>, Option<String>) {
+    sqlx::query_as(
+        "SELECT payload_digest, outcome_json FROM history_dedup WHERE namespace = ? AND key = ?",
+    )
+    .bind(namespace)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .expect("read the namespace's dedup row")
+}
+
+/// How many dedup rows one namespace holds.
+async fn dedup_row_count(pool: &sqlx::SqlitePool, namespace: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM history_dedup WHERE namespace = ?")
+        .bind(namespace)
+        .fetch_one(pool)
+        .await
+        .expect("count the namespace's dedup rows")
+}
+
+/// The refusal a history op answers when the Mind admission rejects: the runtime's own
+/// admission refusal (`the caller is not admitted to the named mind`), NotAuthorized, and no
+/// `details` at all.
+///
+/// Connect's history service returns the admission callback's `Reject` verbatim, while its
+/// knowledge service maps every admission `Reject` onto its own fixed
+/// `knowledge scope not authorized` constant. The two therefore differ in message text and agree
+/// on everything that could disclose anything: code, absence of `details`, and the fact that no
+/// port was reached. The callers of [`assert_history_admission_refusal`] pin that agreement and
+/// name the difference rather than assert it away.
+fn assert_history_admission_refusal<T: std::fmt::Debug>(
+    result: SpokeResult<T>,
+    context: &str,
+) -> SpokeReject {
+    let reject = expect_reject(result, context);
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::NotAuthorized,
+        "{context}: the fixed admission refusal: {reject:?}"
+    );
+    assert_eq!(
+        reject.message, "the caller is not admitted to the named mind",
+        "{context}: the runtime's own admission refusal"
+    );
+    assert!(
+        reject.details.is_none(),
+        "{context}: the refusal carries no details: {reject:?}"
+    );
+    reject
+}
+
+/// Replay one revision of `entry_id` in the Mind named by `scope`.
+async fn replay(
+    adapter: &RemoteAdapter,
+    scope: &Scope,
+    entry_id: &str,
+    revision: u64,
+) -> SpokeResult<spoke_schemas::RevisionSnapshot> {
+    HistoryPort::get_history_snapshot(
+        adapter,
+        &principal(),
+        scope,
+        "knowledge_entry",
+        entry_id,
+        revision,
+    )
+    .await
+}
+
+/// The summary a replayed snapshot holds, as the wire carried it.
+fn replayed_summary(snapshot: &spoke_schemas::RevisionSnapshot) -> Option<String> {
+    serde_json::to_value(&snapshot.snapshot)
+        .expect("the snapshot serializes")
+        .pointer("/body/summary")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Replay and prune are served per Mind: one session reaches each Mind the caller holds a grant
+/// in, each Mind answers its own entry's history, and a prune in one leaves the other's
+/// checkpoints alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_serves_each_mind_its_own_entry_history() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    fixture
+        .grant_in_second(
+            "grt_two_creator",
+            PRINCIPAL,
+            &["knowledge_read", "knowledge_write"],
+        )
+        .await;
+    let pool = fixture.store.pool();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    seed_history(
+        &fixture.store,
+        COLLECTION_TWO,
+        "ke_history_two",
+        &["the mill opens at dawn", "the mill closes at dusk"],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, principal_admission());
+    assert!(
+        capabilities(&surface).contains(&"spoke-history"),
+        "the composed face is advertised: {:?}",
+        capabilities(&surface)
+    );
+    let session = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    let first = expect_ok(
+        replay(dialer, &scope_of(SPACE), "ke_history", 2).await,
+        "replay the first Mind's older checkpoint",
+    );
+    assert_eq!(first.entity_id.as_str(), "ke_history");
+    assert_eq!(first.entity_kind.as_str(), "knowledge_entry");
+    assert_eq!(first.revision, 2);
+    assert_eq!(
+        replayed_summary(&first).as_deref(),
+        Some("the gate closes at dusk")
+    );
+
+    let second = expect_ok(
+        replay(dialer, &scope_of(SPACE_TWO), "ke_history_two", 2).await,
+        "replay the second Mind's older checkpoint",
+    );
+    assert_eq!(second.entity_id.as_str(), "ke_history_two");
+    assert_eq!(
+        replayed_summary(&second).as_deref(),
+        Some("the mill closes at dusk")
+    );
+
+    // One Mind's entry id inside the other Mind's scope is not a cross-Mind read: the other Mind's
+    // collection holds no such row, so the answer is the absence of a history entity.
+    let absent = expect_reject(
+        replay(dialer, &scope_of(SPACE_TWO), "ke_history", 2).await,
+        "a replay of the first Mind's entry inside the second Mind",
+    );
+    assert_eq!(absent.code, SpokeRejectCode::NotFound);
+    assert!(absent.details.is_none(), "{absent:?}");
+
+    // The prune runs per Mind: the first Mind's prune cuts its own checkpoint, and the second
+    // Mind's history survives it.
+    let pruned = expect_ok(
+        dialer
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-a"),
+            )
+            .await,
+        "prune the first Mind's entry",
+    );
+    assert_eq!((pruned.deleted, pruned.floor_revision), (1, Some(2)));
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION_TWO, "ke_history_two").await,
+        [1],
+        "the other Mind's checkpoints are untouched by this Mind's prune"
+    );
+    expect_ok(
+        replay(dialer, &scope_of(SPACE_TWO), "ke_history_two", 2).await,
+        "the other Mind still replays the checkpoint its own prune never cut",
+    );
+    assert_caller_absent(&session, "the served history answers", ExpectsReceipt::No);
+}
+
+/// History grants no access the knowledge face does not. A principal holding only `recall` in the
+/// Mind is refused on the knowledge face's get, list and put, and on replay and prune with the
+/// same bytes; its prune deletes nothing, and the checkpoint it aimed at still replays for the
+/// creator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_grants_no_access_the_knowledge_face_does_not() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    let pool = fixture.store.pool();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, two_principal_admission());
+    let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
+    let dialer = &*peer.adapter;
+
+    let knowledge_get = assert_scope_refusal(
+        dialer
+            .get_knowledge_entry_in_scope("ke_history", Some(&request_scope(SPACE, None)))
+            .await,
+        "a knowledge get by a recall-only caller",
+    );
+    let knowledge_list = assert_scope_refusal(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "a knowledge list by a recall-only caller",
+    );
+    let knowledge_put = assert_scope_refusal(
+        dialer
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_recall_write", "must not be written"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a knowledge put by a recall-only caller",
+    );
+    let history_get = assert_scope_refusal(
+        replay(dialer, &scope_of(SPACE), "ke_history", 2).await,
+        "a history replay by a recall-only caller",
+    );
+    let history_prune = assert_scope_refusal(
+        dialer
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-recall-only"),
+            )
+            .await,
+        "a history prune by a recall-only caller",
+    );
+
+    for (label, reject) in [
+        ("knowledge list", knowledge_list),
+        ("knowledge put", knowledge_put),
+        ("history replay", history_get),
+        ("history prune", history_prune),
+    ] {
+        assert_eq!(
+            reject, knowledge_get,
+            "{label}: the history refusal is the knowledge face's own, byte for byte"
+        );
+    }
+
+    // The refused prune cut nothing: both checkpoints are still stored, and the creator replays
+    // the one the peer aimed at.
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "a refused prune deletes nothing"
+    );
+    let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let replayed = expect_ok(
+        replay(&creator.adapter, &scope_of(SPACE), "ke_history", 2).await,
+        "the creator replays the checkpoint the refused prune aimed at",
+    );
+    assert_eq!(
+        replayed_summary(&replayed).as_deref(),
+        Some("the gate closes at dusk")
+    );
+    assert_caller_absent_for(
+        &peer,
+        &[PRINCIPAL, PEER_TWO_PRINCIPAL],
+        "the recall-only caller's refusals",
+        ExpectsReceipt::No,
+    );
+}
+
+/// Replay needs `knowledge_read`: the recall-only caller is refused, and a principal holding
+/// `knowledge_read` alone replays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_replay_needs_knowledge_read() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    fixture
+        .grant(
+            "grt_reader_peer_three",
+            PEER_THREE_PRINCIPAL,
+            &["knowledge_read"],
+        )
+        .await;
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &["the gate opens at dawn", "the gate closes at dusk"],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, three_principal_admission());
+
+    let recall_only = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
+    assert_scope_refusal(
+        replay(&recall_only.adapter, &scope_of(SPACE), "ke_history", 2).await,
+        "a replay by a recall-only caller",
+    );
+
+    let reader = connect_as(&surface, &PEER_THREE_SEED, &HISTORY_CAPABILITIES).await;
+    let replayed = expect_ok(
+        replay(&reader.adapter, &scope_of(SPACE), "ke_history", 2).await,
+        "a replay by a caller holding knowledge_read only",
+    );
+    assert_eq!(
+        replayed_summary(&replayed).as_deref(),
+        Some("the gate closes at dusk")
+    );
+    assert_caller_absent_for(
+        &reader,
+        &[PRINCIPAL, PEER_THREE_PRINCIPAL],
+        "the read-only caller's replay",
+        ExpectsReceipt::No,
+    );
+}
+
+/// A prune needs one grant covering both `knowledge_write` and `knowledge_read`: the read-only
+/// caller is refused, the write-only caller is refused, one caller holding the two capabilities on
+/// two separate live grants is refused as well, and the creator's default grant prunes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_prune_needs_the_write_and_read_grant() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant(
+            "grt_reader_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["knowledge_read"],
+        )
+        .await;
+    fixture
+        .grant(
+            "grt_writer_peer_three",
+            PEER_THREE_PRINCIPAL,
+            &["knowledge_write"],
+        )
+        .await;
+    // The split-grant case below: the same caller's `knowledge_read` grant plus this separate
+    // `knowledge_write`, so it holds both capabilities on two live grants in one Mind.
+    fixture
+        .grant("grt_split_write", PEER_TWO_PRINCIPAL, &["knowledge_write"])
+        .await;
+    let pool = fixture.store.pool();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, three_principal_admission());
+
+    // The read-only caller's prune is the knowledge face's put refusal, byte for byte, and it
+    // leaves every checkpoint in place.
+    let reader = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
+    let refused_read_only = assert_scope_refusal(
+        reader
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-read-only"),
+            )
+            .await,
+        "a prune by a caller holding knowledge_read only",
+    );
+    let put_refusal = assert_scope_refusal(
+        reader
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_reader_write", "must not be written"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "the same caller's knowledge put",
+    );
+    assert_eq!(
+        refused_read_only, put_refusal,
+        "the prune refusal is the knowledge put refusal, byte for byte"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "a refused prune deletes nothing"
+    );
+
+    let writer = connect_as(&surface, &PEER_THREE_SEED, &HISTORY_CAPABILITIES).await;
+    let refused_write_only = assert_scope_refusal(
+        writer
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-write-only"),
+            )
+            .await,
+        "a prune by a caller holding knowledge_write only",
+    );
+    assert_eq!(
+        refused_write_only, put_refusal,
+        "a grant split across the two capabilities covers no prune, and answers the same bytes"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "the write-only refusal deletes nothing"
+    );
+
+    // The invariant itself: ONE caller holding the two capabilities on TWO live grants in the same
+    // Mind — the `knowledge_read` grant it already holds above, plus the separate `knowledge_write`
+    // seeded with the fixture. Requirements never union, so the prune is refused with the same
+    // fixed bytes and the checkpoints survive. Two different principals each missing one
+    // capability — the cases above — would still pass if the check were two independent
+    // single-capability reads.
+    let split = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
+    let refused_split = assert_scope_refusal(
+        split
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-split-grant"),
+            )
+            .await,
+        "a prune by one caller holding read and write on separate grants",
+    );
+    assert_eq!(
+        refused_split, put_refusal,
+        "the split grant answers the covering-grant refusal byte for byte"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "the split-grant refusal deletes nothing"
+    );
+    // The same caller's read-only operation still works, so the refusal above is the prune's
+    // requirement and not a blanket refusal of the caller.
+    assert_eq!(
+        replayed_summary(&expect_ok(
+            replay(&split.adapter, &scope_of(SPACE), "ke_history", 2).await,
+            "the split-grant caller replays under its read grant"
+        ))
+        .as_deref(),
+        Some("the gate closes at dusk")
+    );
+
+    let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let pruned = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-creator"),
+            )
+            .await,
+        "the creator's covering grant prunes",
+    );
+    assert_eq!((pruned.deleted, pruned.floor_revision), (1, Some(2)));
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2],
+        "the authorized prune cut the older checkpoint"
+    );
+    let truncated = expect_reject(
+        replay(&creator.adapter, &scope_of(SPACE), "ke_history", 1).await,
+        "replay the checkpoint the authorized prune cut",
+    );
+    assert_eq!(truncated.code, SpokeRejectCode::HistoryTruncated);
+    assert_eq!(
+        truncated
+            .details
+            .clone()
+            .unwrap_or_default()
+            .get("floor_revision"),
+        Some(&json!(2))
+    );
+}
+
+/// Admission precedes existence on both history ops: a Mind the caller is not admitted to, a Mind
+/// that is no Mind at all, and a frozen Mind without a grant answer byte for byte, with no
+/// details — and none of them reaches the dedup claim, so no prune row is written for a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_history_face_refuses_every_mind_it_does_not_admit_alike() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    let pool = fixture.store.pool();
+    // The second Mind's entry, written before the freeze: its history is the control's subject.
+    seed_history(
+        &fixture.store,
+        COLLECTION_TWO,
+        "ke_two",
+        &[
+            "the mill opens at dawn",
+            "the mill closes at dusk",
+            "the mill opens again at dawn",
+        ],
+    )
+    .await;
+    // The second Mind is frozen for its probe; the peer holds no grant in it yet.
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE_TWO)
+        .execute(&pool)
+        .await
+        .expect("freeze the second Mind");
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, two_principal_admission());
+    let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
+    let dialer = &*peer.adapter;
+
+    let mut refusals = Vec::new();
+    for (label, scope_id) in [
+        (
+            "a Mind that exists and admits this caller to nothing",
+            SPACE,
+        ),
+        ("a Mind that is no Mind at all", "spc_no_such_mind"),
+        ("a frozen Mind without a grant", SPACE_TWO),
+    ] {
+        refusals.push(assert_history_admission_refusal(
+            replay(dialer, &scope_of(scope_id), "ke_absent", 1).await,
+            label,
+        ));
+        refusals.push(assert_history_admission_refusal(
+            dialer
+                .prune_history(&scope_of(scope_id), "knowledge_entry", "ke_absent", 1, None)
+                .await,
+            label,
+        ));
+    }
+    let unadmitted = refusals.remove(0);
+    for (index, reject) in refusals.into_iter().enumerate() {
+        assert_eq!(
+            reject,
+            unadmitted,
+            "refusal {} is the same bytes as the unadmitted Mind's",
+            index + 1
+        );
+    }
+    assert_eq!(
+        dedup_row_count(&pool, COLLECTION).await + dedup_row_count(&pool, COLLECTION_TWO).await,
+        0,
+        "a refused prune never reaches the dedup claim"
+    );
+
+    // The control: admitted to its own Mind, the same peer replays and prunes, so the refusals
+    // above were admission and not a missing face.
+    sqlx::query("UPDATE memory_spaces SET status = 'active' WHERE space_id = ?")
+        .bind(SPACE_TWO)
+        .execute(&pool)
+        .await
+        .expect("unfreeze the second Mind");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind("grt_two_peer")
+    .bind(SPACE_TWO)
+    .bind(PEER_TWO_PRINCIPAL)
+    .bind(json!(["knowledge_read", "knowledge_write"]).to_string())
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("grant the peer its own Mind");
+    let served = expect_ok(
+        replay(dialer, &scope_of(SPACE_TWO), "ke_two", 2).await,
+        "a replay in the peer's own Mind",
+    );
+    assert_eq!(served.entity_id.as_str(), "ke_two");
+    let pruned = expect_ok(
+        dialer
+            .prune_history(&scope_of(SPACE_TWO), "knowledge_entry", "ke_two", 1, None)
+            .await,
+        "a prune in the peer's own Mind",
+    );
+    assert_eq!((pruned.deleted, pruned.floor_revision), (1, Some(2)));
+}
+
+/// One more revision of `entry_id` in `collection`: the live revision is read back and the next
+/// one written, so the append lands where a creator's put would.
+async fn append_revision(store: &MindStore, collection: &str, entry_id: &str, summary: &str) {
+    let pool = store.pool();
+    let live: i64 = sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the live revision");
+    expect_ok(
+        store
+            .knowledge(KnowledgeScope::new(collection))
+            .put_knowledge_entry(served_entry(entry_id, summary), Some(live as u64))
+            .await,
+        "append one revision",
+    );
+}
+
+/// The record lives in the database file, not in the process: after the session, the surface and
+/// the serve are gone, a reopened file answers the prune's recorded outcome instead of executing
+/// again against checkpoints the original call never saw.
+///
+/// Before the reopen: the entry holds revisions 1 to 3, a prune under `key-one` answers
+/// `{ deleted: 1, floor_revision: 2 }`, revision 1 answers `HISTORY_TRUNCATED`, and the Mind's
+/// namespace holds one settled row — a digest and an outcome.
+///
+/// Between: the whole serving stack is dropped and the same file is reopened through
+/// `MindStore::open`, a new surface and a new signed session are assembled, and one more revision
+/// is written — checkpoint 3, which the first prune never saw.
+///
+/// After: the same key and payload answer the recorded `{ deleted: 1, floor_revision: 2 }` rather
+/// than a new count, and checkpoints 2 and 3 still replay, where a second execution would have cut
+/// checkpoint 2. The same key with another payload answers `IDEMPOTENCY_CONFLICT`; the same
+/// principal and idempotency key against the other Mind finds no row in its own namespace, so that
+/// prune executes there and this Mind's row and outcome are untouched; a claim with no outcome
+/// answers `RECEIPT_EXPIRED` without reaching the port; and a fresh key executes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    fixture
+        .grant_in_second(
+            "grt_two_creator",
+            PRINCIPAL,
+            &["knowledge_read", "knowledge_write"],
+        )
+        .await;
+    let path = fixture.db_path();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    // The other Mind's entry has a longer history, so its own prune deletes a different count: a
+    // cross-Mind replay would be visible in the answer.
+    seed_history(
+        &fixture.store,
+        COLLECTION_TWO,
+        "ke_history_two",
+        &[
+            "the mill opens at dawn",
+            "the mill turns",
+            "the mill slows",
+            "the mill stops",
+            "the mill opens again",
+        ],
+    )
+    .await;
+    let scope = scope_of(SPACE);
+    // The pool the fixture opened: the same database file the reopen below reads again.
+    let pool = fixture.store.pool();
+
+    let (dir, serve) = fixture.serve();
+
+    // Before: one prune, its recorded outcome, and the checkpoint it cut.
+    let first = {
+        let surface = history_surface(&serve, principal_admission());
+        let session = connect(&surface, &HISTORY_CAPABILITIES).await;
+        let dialer = &*session.adapter;
+        let first = expect_ok(
+            dialer
+                .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+                .await,
+            "the first prune",
+        );
+        assert_eq!((first.deleted, first.floor_revision), (1, Some(2)));
+        let truncated = expect_reject(
+            replay(dialer, &scope, "ke_history", 1).await,
+            "replay the checkpoint the first prune cut",
+        );
+        assert_eq!(truncated.code, SpokeRejectCode::HistoryTruncated);
+        first
+    };
+    let key_one = dedup_key(SPACE, PRINCIPAL, "key-one");
+    assert_eq!(dedup_row_count(&pool, COLLECTION).await, 1, "one row");
+    let first_row = dedup_row(&pool, COLLECTION, &key_one).await;
+    assert!(
+        first_row.0.is_some() && first_row.1.is_some(),
+        "the row is a settled outcome, not a claim: {first_row:?}"
+    );
+
+    drop(serve);
+    // Nothing reachable from the old surface holds dedup state: the file is the only place the
+    // record can live for the reopen below to find it.
+    drop(pool);
+
+    // Between: the same file, a fresh store, a fresh surface, a fresh signed session, and one more
+    // revision the first prune never saw.
+    let reopened = MindStore::open(&path)
+        .await
+        .expect("reopen the same database file");
+    append_revision(
+        &reopened,
+        COLLECTION,
+        "ke_history",
+        "the gate is bolted at midnight",
+    )
+    .await;
+    let pool = reopened.pool();
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2, 3],
+        "the append wrote checkpoint 3 above the first prune's floor"
+    );
+    let serve = MindcoreServe::new(reopened, false, |_targets| Ok(()));
+    let surface = history_surface(&serve, principal_admission());
+    let session = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    // After: the recorded outcome, not a new count.
+    let replayed = expect_ok(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "the same key and payload after a reopen",
+    );
+    assert_eq!(
+        (replayed.deleted, replayed.floor_revision),
+        (first.deleted, first.floor_revision),
+        "the recorded outcome replays instead of executing against the newer checkpoint"
+    );
+    for revision in [2u64, 3] {
+        expect_ok(
+            replay(dialer, &scope, "ke_history", revision).await,
+            "the replayed prune cut nothing, so both checkpoints above the floor still replay",
+        );
+    }
+    assert_eq!(
+        dedup_row(&pool, COLLECTION, &key_one).await,
+        first_row,
+        "a replay leaves the recorded row exactly as it was"
+    );
+
+    // The same key with another payload is the conflict, and it changes nothing.
+    let conflict = expect_reject(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 2, Some("key-one"))
+            .await,
+        "the same key with another keep",
+    );
+    assert_eq!(conflict.code, SpokeRejectCode::IdempotencyConflict);
+
+    // Across Minds: the same principal and idempotency key against the other Mind finds no row in
+    // its own namespace, so that prune executes — with the other Mind's own count — and this
+    // Mind's recorded row and outcome are what they were.
+    let other = expect_ok(
+        dialer
+            .prune_history(
+                &scope_of(SPACE_TWO),
+                "knowledge_entry",
+                "ke_history_two",
+                1,
+                Some("key-one"),
+            )
+            .await,
+        "the other Mind's prune under the same principal and key",
+    );
+    assert_eq!(
+        (other.deleted, other.floor_revision),
+        (3, Some(4)),
+        "the other Mind executed its own prune rather than replaying this Mind's outcome"
+    );
+    assert_eq!(
+        dedup_row(&pool, COLLECTION, &key_one).await,
+        first_row,
+        "this Mind's recorded outcome is untouched by the other Mind's prune"
+    );
+    let other_key = dedup_key(SPACE_TWO, PRINCIPAL, "key-one");
+    let other_row = dedup_row(&pool, COLLECTION_TWO, &other_key).await;
+    assert!(
+        other_row.0.is_some() && other_row.1.is_some(),
+        "the other Mind's outcome lives in its own namespace: {other_row:?}"
+    );
+    assert_eq!(dedup_row_count(&pool, COLLECTION_TWO).await, 1);
+    assert_eq!(dedup_row_count(&pool, COLLECTION).await, 1);
+    let replayed = expect_ok(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
+            .await,
+        "this Mind's same-key replay after the other Mind's prune",
+    );
+    assert_eq!(
+        (replayed.deleted, replayed.floor_revision),
+        (first.deleted, first.floor_revision),
+        "this Mind's recorded outcome is still the one it answered"
+    );
+
+    // A claim with no outcome: the key was claimed and never settled, so the retry answers
+    // `RECEIPT_EXPIRED` and the port is not called.
+    let claimed_key = dedup_key(SPACE, PRINCIPAL, "key-claimed");
+    sqlx::query("INSERT INTO history_dedup (namespace, key, principal) VALUES (?, ?, ?)")
+        .bind(COLLECTION)
+        .bind(&claimed_key)
+        .bind(PRINCIPAL)
+        .execute(&pool)
+        .await
+        .expect("insert an unsettled claim");
+    let unsettled = expect_reject(
+        dialer
+            .prune_history(
+                &scope,
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-claimed"),
+            )
+            .await,
+        "a prune whose key holds a claim with no outcome",
+    );
+    assert_eq!(unsettled.code, SpokeRejectCode::ReceiptExpired);
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2, 3],
+        "an unsettled claim never reaches the port"
+    );
+
+    // A fresh key executes against the current state.
+    let fresh = expect_ok(
+        dialer
+            .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-two"))
+            .await,
+        "a new key runs the prune again",
+    );
+    assert_eq!(
+        (fresh.deleted, fresh.floor_revision),
+        (1, Some(3)),
+        "the fresh key really pruned: the floor moved onto the newer checkpoint"
+    );
+    let truncated = expect_reject(
+        replay(dialer, &scope, "ke_history", 2).await,
+        "replay the checkpoint the fresh key cut",
+    );
+    assert_eq!(truncated.code, SpokeRejectCode::HistoryTruncated);
+    assert_eq!(
+        truncated
+            .details
+            .clone()
+            .unwrap_or_default()
+            .get("floor_revision"),
+        Some(&json!(3))
+    );
+
+    drop(dir);
+}
+
+/// The single-connection pool sequence, end to end: the admission callback, the dedup claim, the
+/// port call and the record all complete on a pool that holds exactly one connection.
+///
+/// A prune refused by the port is the sharpest witness of the order. The service claims the key
+/// first, the port then refuses it (the caller holds only `recall`), and the service records the
+/// refusal — so a later call under the same principal and key replays that refusal even after the
+/// caller has been granted the covering capabilities. Nothing is deleted, and the recorded outcome
+/// is the port's own refusal. A sequence that skipped the claim would execute once the grant
+/// arrives; one that recorded before claiming would write no row.
+///
+/// The pool is the production `MindStore::open` pool, whose single connection is asserted here:
+/// the claim releases its connection before the port is awaited, the port's own transactions take
+/// and release theirs, and the record takes one again. Two held at once would deadlock this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_settles_its_claim_and_its_record_on_the_single_connection_pool() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    let pool = fixture.store.pool();
+    assert_eq!(
+        pool.options().get_max_connections(),
+        1,
+        "the production open path serves one connection, so the order is a real constraint"
+    );
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, two_principal_admission());
+    let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
+    let key = dedup_key(SPACE, PEER_TWO_PRINCIPAL, "key-order");
+
+    let refused = assert_scope_refusal(
+        peer.adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-order"),
+            )
+            .await,
+        "a prune the port refuses",
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "the refused prune deleted nothing"
+    );
+    let (digest, outcome) = dedup_row(&pool, COLLECTION, &key).await;
+    assert!(
+        digest.is_some(),
+        "the claim and the record both ran: {digest:?}"
+    );
+    let outcome = outcome.expect("the refused prune settled its outcome");
+    assert!(
+        outcome.contains("knowledge scope not authorized"),
+        "the recorded outcome is the port's own refusal: {outcome}"
+    );
+
+    // The same principal and key now holds the covering grant. A sequence that had not claimed
+    // before the port would execute here; the recorded refusal answers instead.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind("grt_covering_peer_two")
+    .bind(SPACE)
+    .bind(PEER_TWO_PRINCIPAL)
+    .bind(json!(["knowledge_read", "knowledge_write"]).to_string())
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("grant the covering capabilities");
+    let replayed = expect_reject(
+        peer.adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-order"),
+            )
+            .await,
+        "the same key after the grant arrives",
+    );
+    assert_eq!(
+        replayed, refused,
+        "the recorded refusal replays verbatim instead of executing"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "the replay did not execute the now-authorized prune"
+    );
+
+    // A fresh key under the new grant executes, so the replay above was the record and not a
+    // second refusal.
+    let fresh = expect_ok(
+        peer.adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-order-fresh"),
+            )
+            .await,
+        "a fresh key executes under the covering grant",
+    );
+    assert_eq!((fresh.deleted, fresh.floor_revision), (1, Some(2)));
+}
+
+/// A settlement failure is never answered as success. The prune commits, the outcome row cannot
+/// be written, and the caller is told its outcome is unknown — never given the prune result it
+/// could not recover later. A same-key retry then reads the claim, not a phantom success.
+///
+/// The fault is a trigger refusing the settled write, which is what a full disk or a locked page
+/// looks like to that statement. The claim is a plain insert and still lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_result() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, principal_admission());
+    let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let key = dedup_key(SPACE, PRINCIPAL, "key-unsettled");
+
+    sqlx::query(
+        "CREATE TRIGGER refuse_settlement BEFORE UPDATE ON history_dedup \
+         WHEN NEW.payload_digest IS NOT NULL \
+         BEGIN SELECT RAISE(ABORT, 'settlement refused'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install the settlement fault");
+
+    let unsettled = expect_reject(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-unsettled"),
+            )
+            .await,
+        "a prune whose outcome could not be settled",
+    );
+    assert_eq!(
+        unsettled.code,
+        SpokeRejectCode::OutcomeUncertain,
+        "the caller is told the outcome is unknown: {unsettled:?}"
+    );
+    assert_eq!(
+        unsettled
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str),
+        Some("uncertain"),
+        "Connect's own uncertain class, so the caller knows to replay the key"
+    );
+    assert!(
+        unsettled.message.contains("outcome is unknown"),
+        "the answer says the outcome is unknown rather than claiming a receipt: {}",
+        unsettled.message
+    );
+
+    // The prune itself did commit; only its receipt is missing. That is exactly why the caller
+    // must not be told it succeeded.
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2],
+        "the prune ran"
+    );
+    // The failed write released the claim rather than leaving it behind, so the key is not spent.
+    assert_eq!(
+        dedup_row_count(&pool, COLLECTION).await,
+        0,
+        "the unsettled settlement left no claim, so the key stays claimable"
+    );
+
+    // The fault clears and the same key executes. The prune it runs now sees the state the first
+    // one left, so it deletes nothing and records that: a real result, not the answer the caller
+    // was denied and not `RECEIPT_EXPIRED`.
+    sqlx::query("DROP TRIGGER refuse_settlement")
+        .execute(&pool)
+        .await
+        .expect("remove the settlement fault");
+    let recovered = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-unsettled"),
+            )
+            .await,
+        "the same key executes once the settlement fault cleared",
+    );
+    assert_eq!(
+        (recovered.deleted, recovered.floor_revision),
+        (0, None),
+        "the recovered prune ran against the state the first one left"
+    );
+    let (digest, outcome) = dedup_row(&pool, COLLECTION, &key).await;
+    assert!(
+        digest.is_some() && outcome.is_some(),
+        "the recovered prune settled its outcome: {digest:?} / {outcome:?}"
+    );
+
+    // The key is settled once: the same request now replays instead of pruning again.
+    let replayed = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-unsettled"),
+            )
+            .await,
+        "the same key replays its recorded outcome",
+    );
+    assert_eq!(
+        (replayed.deleted, replayed.floor_revision),
+        (recovered.deleted, recovered.floor_revision),
+        "the replay answers the recorded result"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2],
+        "no second prune ran"
+    );
+}
+
+/// A storage fault the port answers is not the key's settled outcome, and it does not consume the
+/// key either. The prune's checkpoint read fails before the cut, so the caller is told the outcome
+/// is unknown; the claim the lookup took is released, so once the fault clears the same
+/// `idempotency_key` executes and records its outcome instead of answering `RECEIPT_EXPIRED` for
+/// the database's lifetime.
+///
+/// The fault is installed on the statement the prune itself runs: a view over
+/// `knowledge_entry_revisions` calling a missing function fails at prepare time, after admission and
+/// after the claim, so the fault is the port's — the store's `InternalError`, the one fault code the
+/// served prune path answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, principal_admission());
+    let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let key = dedup_key(SPACE, PRINCIPAL, "key-faulted");
+
+    // SQLite has no read trigger, so the fault is installed on the statement the prune itself
+    // runs: `prune_entry_history` reads the entry's checkpoints from
+    // `knowledge_entry_revisions`, and a view over that table calling a missing function fails the
+    // statement at prepare time — the store's `InternalError`, answered after admission and after
+    // the claim, so the fault is the port's and not the Mind admission's.
+    sqlx::query("ALTER TABLE knowledge_entry_revisions RENAME TO knowledge_entry_revisions_intact")
+        .execute(&pool)
+        .await
+        .expect("move the checkpoints aside");
+    sqlx::query(
+        "CREATE VIEW knowledge_entry_revisions AS \
+         SELECT collection, entry_id, revision, payload, cognition_head_seq, recorded_at \
+         FROM knowledge_entry_revisions_intact WHERE no_such_function()",
+    )
+    .execute(&pool)
+    .await
+    .expect("install a checkpoint read that faults");
+
+    let faulted = expect_reject(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "a prune whose checkpoint read faulted",
+    );
+    assert_eq!(
+        faulted.code,
+        SpokeRejectCode::OutcomeUncertain,
+        "a fault is answered as an unsettled settlement, not stored: {faulted:?}"
+    );
+    assert_eq!(
+        dedup_row_count(&pool, COLLECTION).await,
+        0,
+        "the fault was neither recorded as the key's outcome nor left as a claim"
+    );
+    assert_eq!(
+        intact_checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "the faulted prune never reached the store"
+    );
+
+    // The fault clears.
+    sqlx::query("DROP VIEW knowledge_entry_revisions")
+        .execute(&pool)
+        .await
+        .expect("drop the faulting view");
+    sqlx::query("ALTER TABLE knowledge_entry_revisions_intact RENAME TO knowledge_entry_revisions")
+        .execute(&pool)
+        .await
+        .expect("remove the fault");
+
+    // The claim was released, not retained: no row stands between this key and a retry.
+    assert_eq!(
+        dedup_row_count(&pool, COLLECTION).await,
+        0,
+        "the faulted key left no claim behind"
+    );
+
+    // The same key now executes. Released, the key is claimable again, so the retry runs the prune
+    // against the current state and records its outcome — it does not answer RECEIPT_EXPIRED.
+    let recovered = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "the same key executes once the fault cleared",
+    );
+    assert_eq!(
+        (recovered.deleted, recovered.floor_revision),
+        (1, Some(2)),
+        "the retry executed the prune it could not start under the fault"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2],
+        "the executed prune cut the older checkpoint"
+    );
+    let (digest, outcome) = dedup_row(&pool, COLLECTION, &key).await;
+    assert!(
+        digest.is_some() && outcome.is_some(),
+        "the recovery settled the key's outcome: {digest:?} / {outcome:?}"
+    );
+    let outcome = outcome.expect("the recovery recorded an outcome");
+    assert!(
+        outcome.contains("\"deleted\""),
+        "the recorded outcome is the executed prune result: {outcome}"
+    );
+
+    // And the recorded outcome now replays: the key settled exactly once.
+    let replayed = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "the same key replays its recorded outcome",
+    );
+    assert_eq!(
+        (replayed.deleted, replayed.floor_revision),
+        (recovered.deleted, recovered.floor_revision),
+        "the replay answers the recorded result"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2],
+        "the replay did not execute a second prune"
+    );
 }

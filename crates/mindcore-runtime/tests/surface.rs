@@ -128,6 +128,7 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         manifest,
         memory: None,
         knowledge: false,
+        history: false,
         principals: principals(),
         providers: MindProviders::default(),
         tools: Vec::new(),
@@ -481,4 +482,64 @@ async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
         absent.ports.as_scoped_knowledge().is_none(),
         "the absent face answers no scoped probe"
     );
+}
+
+/// The history face rides on the knowledge face's admission: `ServeFaces.history` true advertises
+/// `spoke-history` and answers `as_history()` with the face, false advertises neither, and
+/// `history` without `knowledge` is refused at assembly, before any port is built.
+#[tokio::test]
+async fn the_history_face_is_advertised_exactly_when_it_is_composed() {
+    let serve = Fixture::open().await.serve();
+    let composed = expect_ok(
+        serve.surface(ServeFaces {
+            knowledge: true,
+            history: true,
+            ..faces(metadata("runtime"))
+        }),
+        "assemble a history-serving surface",
+    );
+    assert!(
+        capabilities(&composed).contains(&"spoke-history"),
+        "the composed face advertises the family: {:?}",
+        capabilities(&composed)
+    );
+    assert!(
+        composed.ports.as_history().is_some(),
+        "the composed face answers the history probe"
+    );
+    expect_ok(
+        validate_manifest_tools(&composed.manifest),
+        "the derived manifest is self-consistent",
+    );
+
+    let absent = expect_ok(
+        serve.surface(ServeFaces {
+            knowledge: true,
+            history: false,
+            ..faces(metadata("runtime"))
+        }),
+        "assemble a knowledge-only surface",
+    );
+    assert!(
+        !capabilities(&absent).contains(&"spoke-history"),
+        "the absent face advertises nothing: {:?}",
+        capabilities(&absent)
+    );
+    assert!(
+        absent.ports.as_history().is_none(),
+        "the absent face answers no history probe"
+    );
+
+    let refused = serve.surface(ServeFaces {
+        history: true,
+        ..faces(metadata("runtime"))
+    });
+    match refused {
+        SpokeResult::Reject(reject) => assert_eq!(
+            reject.code,
+            SpokeRejectCode::InvalidInput,
+            "history without knowledge is an assembly refusal"
+        ),
+        SpokeResult::Ok(_) => panic!("history without the knowledge face must not assemble"),
+    }
 }
