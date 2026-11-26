@@ -44,6 +44,15 @@
 //! Claim capacity belongs to `lookup`: it inserts the claim and refuses an unseen key at the bound.
 //! `record` only fills a claim that already exists, so a caller that records without claiming
 //! writes nothing and can never produce an outcome for a prune that did not run.
+//!
+//! A settlement that fails is never answered as success. `record` carries no error channel
+//! (`serve_ports.rs:464-465`) and `HistoryPortService` answers the port's result whatever `record`
+//! did, so returning normally after a failed write would hand the caller a prune result it could
+//! not recover on a retry — the second call reads the claim back as `RECEIPT_EXPIRED`. The failure
+//! therefore leaves through Connect's own fault channel, the detached serve task's dropped result
+//! channel, which the responder answers `OUTCOME_UNCERTAIN`: the outcome is unknown, the caller
+//! replays the key, and no acknowledged receipt exists that was never written
+//! ([`outcome_not_settled`]).
 
 use std::io::Write;
 
@@ -99,13 +108,37 @@ fn scope_of(key: &str) -> Option<String> {
 
 /// The namespace a dedup key's row lives in: the collection the Mind it names registered.
 ///
-/// A Mind with no registry row answers `None`, and so does a failed read, so neither claims a row.
-async fn namespace_of(pool: &SqlitePool, key: &str) -> Option<String> {
-    let scope_id = scope_of(key)?;
+/// `Ok(None)` for a key that names no Mind and for a Mind with no registry row — neither may claim
+/// a row or settle one. `Err` is a registry read that failed, which is not the same answer: on the
+/// settlement path it must not read as "nothing to settle", because the prune may have committed.
+async fn namespace_of(pool: &SqlitePool, key: &str) -> Result<Option<String>, SpokeReject> {
+    let Some(scope_id) = scope_of(key) else {
+        return Ok(None);
+    };
     match mindcore_sqlite::minds::registered_collection(pool, &scope_id).await {
-        SpokeResult::Ok(collection) => collection,
-        SpokeResult::Reject(_) => None,
+        SpokeResult::Ok(collection) => Ok(collection),
+        SpokeResult::Reject(reject) => Err(reject),
     }
+}
+
+/// The failure a settled prune reaches the caller through when its outcome did not persist.
+///
+/// **Why a panic, deliberately.** `HistoryDedupStore::record` answers `()`
+/// (`serve_ports.rs:464-465`): it carries no error channel, and `HistoryPortService` returns the
+/// port's result regardless of how `record` fared. Returning normally here would therefore tell
+/// the caller its prune settled while a same-key retry reads the claim back as
+/// `RECEIPT_EXPIRED` — an acknowledged outcome that does not exist. Connect's own fault channel
+/// is the same one the runtime's admission uses: the whole served invoke runs in a detached
+/// `tokio::spawn` and the responder receives its result over a oneshot
+/// (`responder.rs:2286-2300`), so a panic here drops that channel, and the responder answers the
+/// prune `OUTCOME_UNCERTAIN` with `details.retry_class = "uncertain"` rather than any success
+/// (`responder.rs:1006-1016`). The prune may well have committed; the transport says so instead
+/// of asserting a receipt it does not hold, and the host-side diagnostic names no wire bytes.
+fn outcome_not_settled(diagnostic: impl std::fmt::Display) -> ! {
+    panic!(
+        "history dedup outcome settlement failed after the prune committed; answered as this \
+         request's uncertain outcome: {diagnostic}"
+    )
 }
 
 /// One dedup record per retry identity, in the database file the knowledge store already serves
@@ -126,8 +159,12 @@ impl SqliteHistoryDedupStore {
 #[async_trait]
 impl HistoryDedupStore for SqliteHistoryDedupStore {
     async fn lookup(&self, key: &str) -> HistoryDedupLookup {
-        let Some(namespace) = namespace_of(&self.pool, key).await else {
-            return HistoryDedupLookup::Evicted;
+        // A key that names no Mind, a Mind with no registry row, and a registry fault all keep
+        // the prune out of the port: `Evicted` is Connect's `RECEIPT_EXPIRED`.
+        let namespace = match namespace_of(&self.pool, key).await {
+            Ok(Some(namespace)) => namespace,
+            Ok(None) => return HistoryDedupLookup::Evicted,
+            Err(reject) => return fault("namespace", reject.message),
         };
         let mut conn = match self.pool.acquire().await {
             Ok(conn) => conn,
@@ -191,9 +228,14 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
     }
 
     async fn record(&self, key: &str, record: HistoryDedupRecord) {
-        // A key that names no registered Mind has no row to fill; `lookup` refused it already.
-        let Some(namespace) = namespace_of(&self.pool, key).await else {
-            return;
+        // `lookup` answered `Evicted` for these keys, so no prune ran and no outcome exists to
+        // settle: nothing to write, and nothing to tell the caller.
+        let namespace = match namespace_of(&self.pool, key).await {
+            Ok(Some(namespace)) => namespace,
+            Ok(None) => return,
+            // The prune may have committed and this read is what would have settled it. A
+            // registry fault is not "nothing to settle", so it takes the fault path.
+            Err(reject) => outcome_not_settled(reject.message),
         };
         let outcome_json = encode_outcome(&record.outcome);
         let principal = principal_of(key);
@@ -220,12 +262,10 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         .execute(&self.pool)
         .await;
         if let Err(error) = written {
-            // The claim stays in place, so the key answers `RECEIPT_EXPIRED` rather than
-            // re-executing. The diagnostic names local columns and stays host-side.
-            let _ = writeln!(
-                std::io::stderr(),
-                "mindcore history dedup record fault: {error}"
-            );
+            // The statement never settled the outcome, so the caller must not be told its prune
+            // succeeded: see [`outcome_not_settled`] for the channel and the reason. The claim
+            // row stays in place, so the key answers `RECEIPT_EXPIRED` rather than re-executing.
+            outcome_not_settled(error);
         }
     }
 }
@@ -294,6 +334,8 @@ fn decode_outcome(stored: &str) -> Option<SpokeResult<Value>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::{json, Map};
     use tempfile::TempDir;
 
@@ -400,6 +442,19 @@ mod tests {
             .fetch_one(&store.pool())
             .await
             .expect("count the namespace's rows")
+    }
+
+    /// One row's `(payload_digest, outcome_json)`: `None`/`None` for a claim still in flight.
+    async fn dedup_row(store: &MindStore, key: &str) -> (Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT payload_digest, outcome_json FROM history_dedup \
+             WHERE namespace = ? AND key = ?",
+        )
+        .bind(COLLECTION)
+        .bind(key)
+        .fetch_one(&store.pool())
+        .await
+        .expect("read the namespace's dedup row")
     }
 
     async fn principal_row_count(store: &MindStore, namespace: &str, principal: &str) -> i64 {
@@ -746,6 +801,135 @@ mod tests {
             recorded(reopened.lookup(&key).await, "after reopen"),
             written
         );
+    }
+
+    /// A settlement failure is never answered as success, and never leaves a phantom success
+    /// behind: the claim stays a claim, so a same-key retry reads `Evicted` instead of the outcome
+    /// the caller was told it had.
+    ///
+    /// The fault is installed as a database-level trigger refusing the `record` upsert, which is
+    /// what a full disk, a locked page or a corrupt file looks like to this statement. The claim
+    /// `lookup` makes is a plain insert and still lands, so the failure is the settlement alone.
+    #[tokio::test]
+    async fn a_settlement_fault_is_not_answered_as_success_and_leaves_no_phantom() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let dedup = Arc::new(dedup);
+        let key = key_for("prn_one", "key-one");
+        assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
+
+        // Refuse only the settled write: a row carrying an outcome never lands.
+        sqlx::query(
+            "CREATE TRIGGER refuse_settlement BEFORE UPDATE ON history_dedup \
+             WHEN NEW.payload_digest IS NOT NULL \
+             BEGIN SELECT RAISE(ABORT, 'settlement refused'); END",
+        )
+        .execute(&store.pool())
+        .await
+        .expect("install the settlement fault");
+
+        let settle = {
+            let dedup = Arc::clone(&dedup);
+            let key = key.clone();
+            tokio::spawn(async move {
+                dedup
+                    .record(
+                        &key,
+                        record("digest", SpokeResult::Ok(json!({ "deleted": 2 }))),
+                    )
+                    .await
+            })
+        };
+        // Connect's own channel: the served invoke runs in a detached task, so a panic drops the
+        // result oneshot and the responder answers `OUTCOME_UNCERTAIN` (`responder.rs:2286-2300`).
+        let joined = settle.await;
+        let join = match joined {
+            Ok(()) => panic!("a failed settlement returned normally, which reads as success"),
+            Err(join) => join,
+        };
+        assert!(join.is_panic(), "the settlement fault aborted the invoke");
+        // The panic text is the host-side diagnostic; it never becomes wire bytes.
+        let message = join
+            .into_panic()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        assert!(
+            message.contains("outcome settlement failed"),
+            "the fault names its stage for the host's log: {message}"
+        );
+
+        // No phantom success: the row is still the claim `lookup` made, so a same-key retry is
+        // refused rather than answered with an outcome that never persisted.
+        assert_eq!(
+            dedup_row(&store, &key).await,
+            (None, None),
+            "the failed settlement wrote no outcome"
+        );
+        assert_eq!(
+            dedup.lookup(&key).await,
+            HistoryDedupLookup::Evicted,
+            "a retry sees an unsettled claim, never a success the first call never held"
+        );
+    }
+
+    /// A registry fault during settlement is not "nothing to settle". The claim landed, so the
+    /// prune may have committed; the failure takes the same fault path as a failed write rather
+    /// than returning as success.
+    #[tokio::test]
+    async fn a_registry_fault_during_settlement_is_not_answered_as_success() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let dedup = Arc::new(dedup);
+        let key = key_for("prn_one", "key-one");
+        assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
+        // The claim landed; now the registry read `record` makes cannot run.
+        sqlx::query("DROP TABLE minds")
+            .execute(&store.pool())
+            .await
+            .expect("drop the registry");
+
+        let settle = {
+            let dedup = Arc::clone(&dedup);
+            let key = key.clone();
+            tokio::spawn(async move {
+                dedup
+                    .record(
+                        &key,
+                        record("digest", SpokeResult::Ok(json!({ "deleted": 2 }))),
+                    )
+                    .await
+            })
+        };
+        let join = match settle.await {
+            Ok(()) => panic!("a settlement it could not resolve returned as success"),
+            Err(join) => join,
+        };
+        assert!(join.is_panic(), "the settlement fault aborted the invoke");
+        // `lookup` on the same broken registry keeps the prune out of the port rather than
+        // reporting a namespace it could not read.
+        assert_eq!(
+            dedup.lookup(&key).await,
+            HistoryDedupLookup::Evicted,
+            "an unresolvable namespace never answers Unseen or a recorded outcome"
+        );
+    }
+
+    /// The `record` path a caller reaches with a key that names no Mind writes nothing and does
+    /// not fault: `lookup` answered `Evicted`, so no prune ran and no outcome needs settling.
+    #[tokio::test]
+    async fn a_settlement_for_an_unresolvable_namespace_is_silent() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let unregistered = key_in("spc_nobody", "prn_one", "key-one");
+        dedup
+            .record(
+                &unregistered,
+                record("digest", SpokeResult::Ok(json!({ "deleted": 1 }))),
+            )
+            .await;
+        assert_eq!(row_count(&store, COLLECTION).await, 0);
+        assert_eq!(row_count(&store, "mind:spc_nobody").await, 0);
     }
 
     /// Unparsable keys share one bucket, so a caller cannot mint a fresh quota per odd key. They

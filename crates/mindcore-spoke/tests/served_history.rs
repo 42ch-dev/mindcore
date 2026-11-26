@@ -26,6 +26,8 @@ const OWNER: &str = "p_wren";
 const RECALL_ONLY: &str = "p_recall";
 const READER: &str = "p_reader";
 const WRITER: &str = "p_writer";
+/// One caller that holds `knowledge_read` and `knowledge_write` on two separate live grants.
+const SPLIT: &str = "p_split";
 const NOW: &str = "2026-11-26T09:00:00.000Z";
 
 /// The wrapped port's own answer, distinct from any refusal the guard gives, so reaching it is
@@ -79,13 +81,18 @@ impl Harness {
     }
 
     async fn seed_grant(&self, principal: &str, capabilities: &[&str]) {
+        self.seed_grant_with_id(&format!("grt_{principal}"), principal, capabilities)
+            .await;
+    }
+
+    async fn seed_grant_with_id(&self, grant_id: &str, principal: &str, capabilities: &[&str]) {
         sqlx::query(
             "INSERT INTO memory_grants \
              (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
               shared_access, expires_at, revoked_at, revision, created_at) \
              VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
         )
-        .bind(format!("grt_{principal}"))
+        .bind(grant_id)
         .bind(MIND)
         .bind(principal)
         .bind(serde_json::to_string(capabilities).expect("capabilities"))
@@ -93,6 +100,19 @@ impl Harness {
         .execute(&self.pool)
         .await
         .expect("seed grant");
+    }
+
+    /// How many live grant rows `principal` holds in the Mind.
+    async fn grants_of(&self, principal: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_grants \
+             WHERE space_id = ? AND principal_id = ? AND revoked_at IS NULL",
+        )
+        .bind(MIND)
+        .bind(principal)
+        .fetch_one(&self.pool)
+        .await
+        .expect("count the principal's grants")
     }
 
     fn calls(&self) -> Vec<&'static str> {
@@ -267,6 +287,41 @@ async fn prune_needs_one_grant_covering_write_and_read() {
         harness.calls().is_empty(),
         "the wrapped port was not reached"
     );
+}
+
+/// Requirements never union: ONE caller holding `knowledge_read` and `knowledge_write` on two
+/// separate live grants in the same Mind is refused, because the prune's one grant must cover both.
+///
+/// This is the invariant the two-principal case above cannot establish: two callers each missing a
+/// capability would still pass if the guard made two independent single-capability reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_is_refused_when_one_caller_holds_read_and_write_on_separate_grants() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant_with_id("grt_split_read", SPLIT, &["knowledge_read"])
+        .await;
+    harness
+        .seed_grant_with_id("grt_split_write", SPLIT, &["knowledge_write"])
+        .await;
+
+    assert_eq!(
+        harness.grants_of(SPLIT).await,
+        2,
+        "the caller holds two live grants, one capability each"
+    );
+    assert_fixed_refusal(
+        &expect_refused(harness.prune(SPLIT).await, "a split-grant prune"),
+        "a split-grant prune",
+    );
+    assert!(
+        harness.calls().is_empty(),
+        "the wrapped port was not reached"
+    );
+
+    // The read grant still serves the read-only operation, so the refusal above is the prune's
+    // one-grant requirement and not a blanket refusal of this caller.
+    assert_reached(harness.replay(SPLIT).await, "the split-grant replay");
+    assert_eq!(harness.calls(), vec!["replay"], "only the replay ran");
 }
 
 /// The creator's default grant covers both operations, so both reach the wrapped port.
