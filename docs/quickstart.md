@@ -40,15 +40,31 @@ It prints the recalled record and the derived `MindState`. In order, the example
 use mindcore_base::boundary::CallerId;
 use mindcore_runtime::minds::{self, CreateMind};
 use mindcore_runtime::{journal_dir, Mind};
+use spoke_operations::SpokeResult;
+
+// Every facade call answers a `SpokeResult`: unwrap yours the way your host handles refusals.
+fn ok<T>(result: SpokeResult<T>, step: &str) -> T {
+    match result {
+        SpokeResult::Ok(value) => value,
+        SpokeResult::Reject(reject) => panic!("{step} refused: {}: {}", reject.code, reject.message),
+    }
+}
 
 let owner = CallerId::new("caller_wren");
-let created = minds::create(&store, &CreateMind {
-    mind_id: None,
-    display_name: Some("Wren".to_string()),
-    owner: owner.clone(),
-}).await;
+let created = ok(
+    minds::create(
+        &store,
+        &CreateMind {
+            mind_id: None,
+            display_name: Some("Wren".to_string()),
+            owner: owner.clone(),
+        },
+    )
+    .await,
+    "create",
+);
 
-let mind = Mind::open(&store, &owner, &created.id).await
+let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
     .with_journal_publisher(journal_dir("journal"));
 ```
 
@@ -63,14 +79,20 @@ means to write under, exactly as on the served surface; the example shows the mi
 use mindcore_runtime::{Capture, Recall};
 
 let content = serde_json::json!({ "text": "the north gate is shut after dusk" });
-let captured = mind.capture(&Capture {
+let capture = Capture {
     subject: "subj_wren",
     context: None,
     content: &content,
     occurred_at: None,
     kind_hint: None,
     idempotency_key: "cap-north-gate",
-}).await;
+};
+let captured = ok(mind.capture(&capture).await, "capture");
+let candidate_id = serde_json::to_value(&captured).expect("the response serializes")
+    ["result"]["candidate_ids"][0]
+    .as_str()
+    .expect("the capture stages one candidate")
+    .to_string();
 ```
 
 `capture` takes the caller-named subject — never a default — and `review` answers the settled
