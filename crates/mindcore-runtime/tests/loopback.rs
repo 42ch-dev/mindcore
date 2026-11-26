@@ -42,11 +42,15 @@ use spoke_connect::remote::{
 };
 use spoke_operations::{
     spoke_ok, spoke_reject, validate_judgment, AdoptionPort, HistoryPort, KnowledgeEntryPort,
-    MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
+    KnowledgeQueryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
+use spoke_schemas::knowledge_entry::{
+    KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryModulesKey,
+    KnowledgeEntryModulesValue,
+};
 use spoke_schemas::{
-    HostCapabilityManifest, KnowledgeAdoptRequest, MemoryGrantsListRequest,
+    HostCapabilityManifest, KnowledgeAdoptRequest, KnowledgeEntry, MemoryGrantsListRequest,
     MemoryGrantsListResponse, MemoryRecallRequest, Principal, Scope,
 };
 
@@ -71,12 +75,20 @@ const NOW: &str = "2026-11-21T00:00:00.500Z";
 const UNSERVED_TOOL: &str = "tools.mindcore.unserved";
 /// A host-owned tool the runtime serves beside its own three.
 const HOST_TOOL: &str = "tools.mindcore.host_tool";
+/// The knowledge face's two flags: a session that serves scoped knowledge negotiates them
+/// together, exactly as the composed manifest advertises them. `ke-ownership` is deliberately
+/// absent — the face advertises no such flag, because the admitted scope never carries a
+/// `viewpoint`, so a request naming one is refused rather than served.
+const KNOWLEDGE_CAPABILITIES: [&str; 2] = ["spoke-knowledge", "spoke-knowledge-scoped"];
 
 const DIALER_SEED: [u8; 32] = [0x42u8; 32];
 const RESPONDER_SEED: [u8; 32] = [0xA7u8; 32];
 /// A second peer the host admits to its own principal, never the carrier route's caller.
 const PEER_TWO_SEED: [u8; 32] = [0x5Cu8; 32];
 const PEER_TWO_PRINCIPAL: &str = "prn_peer_two";
+/// A third peer, for the grants that do not cover a whole operation.
+const PEER_THREE_SEED: [u8; 32] = [0x6Du8; 32];
+const PEER_THREE_PRINCIPAL: &str = "prn_peer_three";
 
 /// The database file the fixture opens; a test may reopen the same path.
 const DB_FILE: &str = "loopback.db";
@@ -427,6 +439,30 @@ fn two_principal_admission() -> MemoryAdmission {
     })
 }
 
+/// The two-peer mapping plus a third authenticated peer holding only `knowledge_write`: the grant
+/// split the per-operation matrix needs.
+fn three_principal_admission() -> MemoryAdmission {
+    let dialer = dialer_peer_id();
+    let second = peer_id(&PEER_TWO_SEED);
+    let third = peer_id(&PEER_THREE_SEED);
+    Arc::new(move |peer: &str| {
+        let principal_id = if peer == dialer {
+            PRINCIPAL
+        } else if peer == second {
+            PEER_TWO_PRINCIPAL
+        } else if peer == third {
+            PEER_THREE_PRINCIPAL
+        } else {
+            return spoke_reject(
+                SpokeRejectCode::NotAuthorized,
+                format!("peer {peer} holds no workflow admission"),
+                None,
+            );
+        };
+        spoke_ok(principal_for(principal_id))
+    })
+}
+
 /// Both host admissions admit the dialer's authenticated peer id and nothing else, so a served
 /// call proves the responder took the peer from its session rather than from the arguments.
 fn principal_admission() -> MemoryAdmission {
@@ -605,6 +641,7 @@ fn faces(
     ServeFaces {
         manifest,
         memory,
+        knowledge: false,
         principals: principal_admission(),
         providers,
         tools: Vec::new(),
@@ -629,18 +666,26 @@ impl Drop for Session {
     }
 }
 
-/// The raw inbound envelopes of one session, in arrival order.
+/// The raw envelopes of one session, in order: what the responder sent back, and what the dialer
+/// put on the wire.
 ///
 /// A typed response is not the wire: `invoke_mapped` decodes into the op's DTO, so a member the
-/// DTO does not declare is gone before a test can see it. These are the bytes.
+/// DTO does not declare is gone before a test can see it. These are the bytes. The sent side is
+/// here for the one thing only the request carries: a value the dialer built and transmitted.
 #[derive(Default)]
 struct WireLog {
     frames: Mutex<Vec<String>>,
+    sent: Mutex<Vec<String>>,
 }
 
 impl WireLog {
     fn drain(&self) -> Vec<String> {
         std::mem::take(&mut *self.frames.lock().expect("wire log lock"))
+    }
+
+    /// Every envelope the dialer sent since the last call.
+    fn drain_sent(&self) -> Vec<String> {
+        std::mem::take(&mut *self.sent.lock().expect("wire log lock"))
     }
 }
 
@@ -653,6 +698,11 @@ struct RecordingTransport {
 #[async_trait]
 impl Transport for RecordingTransport {
     async fn send(&self, envelope: &[u8]) -> Result<(), TransportError> {
+        self.log
+            .sent
+            .lock()
+            .expect("wire log lock")
+            .push(String::from_utf8_lossy(envelope).into_owned());
         self.inner.send(envelope).await
     }
 
@@ -724,8 +774,12 @@ enum ExpectsReceipt {
     No,
 }
 
-/// Every occurrence of the caller in one decoded wire frame that must not be there, as
+/// Every occurrence of a caller in one decoded wire frame that must not be there, as
 /// `path: needle`; empty when the frame carries it only in a receipt's own attribution.
+///
+/// `principals` are the principal ids the session must not disclose — every caller the answer
+/// could name, not only this session's own, because a response that echoed a request value would
+/// carry the other peer's id.
 ///
 /// This walks the raw frame rather than the typed response, because `invoke_mapped` decodes into
 /// the op's DTO and drops every member the DTO does not declare: a leak under an unmodelled key
@@ -733,6 +787,7 @@ enum ExpectsReceipt {
 /// a key discloses it as surely as a value does.
 fn caller_leaks<'a>(
     value: &'a Value,
+    principals: &[&str],
     expects: ExpectsReceipt,
     path: &mut Vec<Step<'a>>,
 ) -> Vec<String> {
@@ -741,7 +796,9 @@ fn caller_leaks<'a>(
         Value::Object(members) => {
             for (key, member) in members {
                 path.push(Step::Key(key.as_str()));
-                if key.contains("mindcore_caller") || key.contains(PRINCIPAL) {
+                if key.contains("mindcore_caller")
+                    || principals.iter().any(|principal| key.contains(principal))
+                {
                     leaks.push(format!("{}: the caller as a key", rendered(path)));
                     path.pop();
                     continue;
@@ -765,7 +822,9 @@ fn caller_leaks<'a>(
                     let attributed = expects == ExpectsReceipt::Yes
                         && is_receipt_path(&path[..path.len() - 1])
                         && members.contains_key("receipt_id")
-                        && member.as_str() == Some(PRINCIPAL);
+                        && member
+                            .as_str()
+                            .is_some_and(|value| principals.contains(&value));
                     if !attributed {
                         leaks.push(format!(
                             "{}: the caller outside a receipt's attribution",
@@ -775,19 +834,19 @@ fn caller_leaks<'a>(
                     path.pop();
                     continue;
                 }
-                leaks.extend(caller_leaks(member, expects, path));
+                leaks.extend(caller_leaks(member, principals, expects, path));
                 path.pop();
             }
         }
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
                 path.push(Step::Index(index));
-                leaks.extend(caller_leaks(item, expects, path));
+                leaks.extend(caller_leaks(item, principals, expects, path));
                 path.pop();
             }
         }
         Value::String(text) => {
-            for needle in ["mindcore_caller", PRINCIPAL] {
+            for needle in std::iter::once(&"mindcore_caller").chain(principals) {
                 if text.contains(needle) {
                     leaks.push(format!("{}: {needle}", rendered(path)));
                 }
@@ -803,17 +862,82 @@ fn caller_leaks<'a>(
 /// receipt; a refusal passes [`ExpectsReceipt::No`], so the attribution exception cannot excuse
 /// one. A frame that is not JSON fails: nothing this suite's own faces send is anything else.
 fn assert_caller_absent(session: &Session, context: &str, expects: ExpectsReceipt) {
+    assert_caller_absent_for(session, &[PRINCIPAL], context, expects);
+}
+
+/// [`assert_caller_absent`] over a caller set the session must not name: the knowledge loopbacks
+/// serve two principals and assert every answer against both.
+fn assert_caller_absent_for(
+    session: &Session,
+    principals: &[&str],
+    context: &str,
+    expects: ExpectsReceipt,
+) {
     let frames = session.wire.drain();
     assert!(!frames.is_empty(), "{context}: the call was answered");
     for frame in &frames {
         let parsed: Value = serde_json::from_str(frame)
             .unwrap_or_else(|error| panic!("{context}: the wire frame is JSON ({error}): {frame}"));
-        let leaks = caller_leaks(&parsed, expects, &mut Vec::new());
+        let leaks = caller_leaks(&parsed, principals, expects, &mut Vec::new());
         assert!(
             leaks.is_empty(),
             "{context}: the answer carries the caller: {leaks:?}"
         );
     }
+}
+
+/// Assert that exactly one request envelope the dialer sent carries `scope` at the op's payload
+/// path, that its `extensions.mindcore_caller.principal` is `principal`, and return the frames so
+/// the caller can keep them for a later failure message.
+///
+/// Read from the request bytes rather than from the typed call: a dialer that stopped copying
+/// `scope.extensions` onto its payload would send a scope without the forged namespace, and the
+/// store-side refusal would then prove nothing about Connect's merge.
+fn assert_sent_forgery(frames: &[String], op: &str, entry: &str, principal: &str) {
+    let request = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<Value>(frame).ok())
+        .find(|frame| frame.get("op").and_then(Value::as_str) == Some(op))
+        .unwrap_or_else(|| panic!("{op} reached the wire: {frames:?}"));
+    if !entry.is_empty() {
+        assert_eq!(
+            request
+                .pointer("/payload/entry_id")
+                .or_else(|| request.pointer("/payload/entry/entry_id"))
+                .and_then(Value::as_str),
+            Some(entry),
+            "{op} carried the entry: {request}"
+        );
+    }
+    assert_eq!(
+        request
+            .pointer("/payload/scope/extensions/mindcore_caller/principal")
+            .and_then(Value::as_str),
+        Some(principal),
+        "{op} carried the forged caller at the scope path: {request}"
+    );
+    assert_eq!(
+        request
+            .pointer("/payload/scope/scope_id")
+            .and_then(Value::as_str),
+        Some(SPACE),
+        "{op} named the admitted Mind, not the forged caller: {request}"
+    );
+}
+
+/// The host admission for the raw-wire sessions: `raw_wire`'s own dialer key, mapped to the
+/// fixture's principal. The admission decides the peer, so a raw handshake with any other key is
+/// refused before the gates this suite asserts.
+fn raw_wire_admission() -> MemoryAdmission {
+    let peer_id = raw_wire::dialer_peer_id();
+    Arc::new(move |peer: &str| match peer == peer_id {
+        true => spoke_ok(principal()),
+        false => spoke_reject(
+            SpokeRejectCode::NotAuthorized,
+            format!("peer {peer} holds no workflow admission"),
+            None,
+        ),
+    })
 }
 
 /// Establish a real signed loopback session over `surface`, the dialer claiming exactly
@@ -2938,18 +3062,17 @@ async fn an_unserved_tool_answers_op_unsupported() {
     );
 }
 
-/// The three un-routed families leave composition and advertisement together: the manifest names
-/// none of them, no face is composed, and a dialer that claims them is served a missing port.
+/// The un-routed families leave composition and advertisement together: the manifest names none of
+/// them, no face is composed, and a dialer that claims them is served a missing port.
+///
+/// The knowledge half of the Stage 1 assertion moved to the composed-face tests below: the face is
+/// now served when `ServeFaces.knowledge` asks for it, and absent — unadvertised and unserved —
+/// when it does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_un_routed_face_answers_a_missing_port() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let claimed = [
-        "spoke-knowledge",
-        "ke-ownership",
-        "spoke-history",
-        "spoke-knowledge-adoption",
-    ];
+    let claimed = ["spoke-history", "spoke-knowledge-adoption"];
     let surface = surface(
         &serve,
         faces(hello("runtime", &claimed), None, MindProviders::default()),
@@ -2962,16 +3085,12 @@ async fn an_un_routed_face_answers_a_missing_port() {
         );
     }
     assert!(surface.ports.as_knowledge().is_none());
+    assert!(surface.ports.as_scoped_knowledge().is_none());
     assert!(surface.ports.as_history().is_none());
     assert!(surface.ports.as_adoption().is_none());
 
     let session = connect(&surface, &claimed).await;
     let dialer = &*session.adapter;
-    assert_wire_deny(
-        KnowledgeEntryPort::get_knowledge_entry(dialer, "ke_absent").await,
-        "port.knowledge.get",
-        "op_unsupported",
-    );
     assert_wire_deny(
         HistoryPort::get_history_snapshot(
             dialer,
@@ -3819,7 +3938,7 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
     let frame =
         |body: &str| -> Value { serde_json::from_str(body).expect("the fixture frame is JSON") };
     let leaks = |body: &str, expects| -> Vec<String> {
-        caller_leaks(&frame(body), expects, &mut Vec::new())
+        caller_leaks(&frame(body), &[PRINCIPAL], expects, &mut Vec::new())
     };
     // The two receipt paths, and only those, carry the attribution.
     for clean in [
@@ -3870,6 +3989,1425 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
             2,
             "a refusal carrying receipt attribution is two leaks — the receipt and the caller: \
              {refusal}"
+        );
+    }
+}
+
+// ---------- The composed knowledge face ----------
+
+/// One plain entry a served put creates: no cognition module, so the store validates only its
+/// own write bookkeeping.
+fn served_entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
+    KnowledgeEntry {
+        adoption_anchor: None,
+        body: KnowledgeEntryBody {
+            summary: Some(summary.to_string()),
+            ..KnowledgeEntryBody::default()
+        },
+        canonical_name: KnowledgeEntryCanonicalName::try_from(format!("{entry_id} name"))
+            .expect("non-empty canonical name"),
+        created_at: None,
+        disclosure: None,
+        entry_id: entry_id.to_string(),
+        entry_type: "note".to_string(),
+        extensions: HashMap::new(),
+        modules: HashMap::new(),
+        owner: None,
+        revision: None,
+        schema_version: std::num::NonZeroU64::new(1).expect("non-zero wire baseline"),
+        source_anchor: None,
+        status: "confirmed".to_string(),
+        updated_at: None,
+    }
+}
+
+/// One entry carrying a current-view cognition record whose holder is the entry itself: the
+/// shape a served put appends through, so the cognition append is a served write and not removed.
+fn served_entry_with_cognition(entry_id: &str, record_id: &str) -> KnowledgeEntry {
+    let mut entry = served_entry(entry_id, "a carrier with one belief");
+    let mut modules = HashMap::new();
+    modules.insert(
+        KnowledgeEntryModulesKey::try_from("cognition").expect("valid module key"),
+        KnowledgeEntryModulesValue::from(
+            json!({
+                "records": [{
+                    "kind": "belief",
+                    "order": 1,
+                    "record_id": record_id,
+                    "holder": {
+                        "kind": "knowledge_entry",
+                        "id": entry_id,
+                        "namespace": "mindcore",
+                    },
+                    "target": {
+                        "carrier": {
+                            "kind": "knowledge_entry",
+                            "id": CARRIER,
+                            "namespace": "mindcore",
+                        },
+                        "target_id": "prop_north_gate_closed",
+                        "kind": "proposition",
+                    },
+                    "assessor": {
+                        "kind": "knowledge_entry",
+                        "id": entry_id,
+                        "namespace": "mindcore",
+                    },
+                    "assessor_role": "holder_self_report",
+                    "basis": {
+                        "kind": "evidence",
+                        "evidence": [{
+                            "kind": "memory_record",
+                            "id": "rec_north_gate",
+                            "namespace": "mindcore",
+                        }],
+                    },
+                    "assessment_context": {"context_id": "ctx_dusk_at_the_gate"},
+                    "effective_at": "2026-11-19T18:00:00Z",
+                    "assessed_at": "2026-11-19T18:05:00Z",
+                    "view": "current",
+                    "q": {
+                        "value": 0.4,
+                        "assertion": "belief_attribution",
+                        "method": "single_self_report",
+                        "calibration": "uncalibrated",
+                    },
+                    "extensions": {},
+                }],
+                "world_facts": [],
+                "extensions": {},
+            })
+            .as_object()
+            .expect("cognition module is an object")
+            .clone(),
+        ),
+    );
+    entry.modules = modules;
+    entry
+}
+
+/// The scope a request declares: an admitted Mind, and any extension namespace the caller sends.
+fn request_scope(scope_id: &str, extensions: Option<Value>) -> Scope {
+    let mut scope = json!({ "scope_id": scope_id });
+    if let Some(extensions) = extensions {
+        scope["extensions"] = extensions;
+    }
+    serde_json::from_value(scope).expect("scope JSON matches the schema")
+}
+
+/// Every served operation answers the one knowledge-scope refusal: no existence detail, no
+/// admission detail, and nothing about the caller.
+fn assert_scope_refusal<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
+    let reject = expect_reject(result, context);
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::NotAuthorized,
+        "{context}: the fixed knowledge-scope refusal: {reject:?}"
+    );
+    assert_eq!(
+        reject.message, "knowledge scope not authorized",
+        "{context}: Connect's own admission-deny words"
+    );
+    assert!(
+        reject.details.is_none(),
+        "{context}: the refusal carries no details: {reject:?}"
+    );
+    reject
+}
+
+/// A surface whose knowledge face is composed, over the fixture's Mind.
+fn knowledge_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
+    let mut faces = faces(
+        hello("runtime", &KNOWLEDGE_CAPABILITIES),
+        None,
+        MindProviders::default(),
+    );
+    faces.knowledge = true;
+    faces.principals = principals;
+    surface(serve, faces)
+}
+
+/// The composed knowledge face serves the admitted Mind's own collection: a put creates an entry
+/// with its cognition record, a get and a list read it back, and no other Mind's entry appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_composed_knowledge_face_serves_the_admitted_minds_own_entries() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, principal_admission());
+    assert!(
+        capabilities(&surface).contains(&"spoke-knowledge"),
+        "the composed face is advertised: {:?}",
+        capabilities(&surface)
+    );
+
+    let session = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    let written = expect_ok(
+        dialer
+            .put_knowledge_entry_in_scope(
+                served_entry_with_cognition("ke_gate_note", "cog_gate_note"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a put by the Mind's creator",
+    );
+    assert_eq!(written.entry_id, "ke_gate_note");
+    assert_eq!(written.revision, Some(1), "the store assigned the revision");
+    let record_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cognition_records WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_gate_note")
+    .fetch_one(&pool)
+    .await
+    .expect("count the appended records");
+    assert_eq!(
+        record_rows, 1,
+        "the covering grant's put appends its cognition record"
+    );
+
+    let read = expect_ok(
+        dialer
+            .get_knowledge_entry_in_scope("ke_gate_note", Some(&request_scope(SPACE, None)))
+            .await,
+        "a get in the admitted Mind",
+    );
+    assert_eq!(
+        read.body.summary.as_deref(),
+        Some("a carrier with one belief")
+    );
+
+    let listed = expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "a list in the admitted Mind",
+    );
+    let ids: Vec<&str> = listed.iter().map(|entry| entry.entry_id.as_str()).collect();
+    assert!(
+        ids.contains(&"ke_gate_note") && ids.contains(&CARRIER),
+        "the admitted Mind's own entries are listed: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&CARRIER_TWO),
+        "the second Mind's carrier never reaches this list: {ids:?}"
+    );
+
+    // The second Mind's entry is not reachable by name either: the admitted Mind's own collection
+    // holds no such row, so the answer is the absence of a live entry, with no details.
+    let absent = expect_reject(
+        dialer
+            .get_knowledge_entry_in_scope(CARRIER_TWO, Some(&request_scope(SPACE, None)))
+            .await,
+        "a get of the other Mind's entry",
+    );
+    assert_eq!(
+        absent.code,
+        SpokeRejectCode::KnowledgeEntryNotFound,
+        "another Mind's entry is an absent entry, not a refused one: {absent:?}"
+    );
+    assert!(
+        absent.details.is_none(),
+        "the absence names no collection and no caller: {absent:?}"
+    );
+}
+
+/// Admission precedes existence, and the refusal is one answer: a Mind the caller is not admitted
+/// to, a Mind that is no Mind at all, a frozen Mind without a grant, a request that names no Mind
+/// at all, and a request whose scope is not the admitted one answer byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    let pool = fixture.store.pool();
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE_TWO)
+        .execute(&pool)
+        .await
+        .expect("freeze the second Mind");
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, two_principal_admission());
+
+    // The peer that holds no grant in the second Mind, and none in the first either.
+    let session = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    let unadmitted = assert_scope_refusal(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "a list in a Mind the caller holds no grant in",
+    );
+    let unknown = assert_scope_refusal(
+        KnowledgeQueryPort::list_knowledge_entries(
+            dialer,
+            &request_scope("spc_no_such_mind", None),
+        )
+        .await,
+        "a list in a Mind that is no Mind",
+    );
+    let frozen = assert_scope_refusal(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE_TWO, None)).await,
+        "a list in a frozen Mind the caller holds no grant in",
+    );
+    let unscoped_get = assert_scope_refusal(
+        KnowledgeEntryPort::get_knowledge_entry(dialer, "ke_absent").await,
+        "a get that names no scope at all",
+    );
+    let unscoped_put = assert_scope_refusal(
+        KnowledgeEntryPort::put_knowledge_entry(dialer, served_entry("ke_absent", "x"), None).await,
+        "a put that names no scope at all",
+    );
+
+    for (label, reject) in [
+        ("unknown", unknown),
+        ("frozen", frozen),
+        ("no scope, get", unscoped_get),
+        ("no scope, put", unscoped_put),
+    ] {
+        assert_eq!(
+            reject, unadmitted,
+            "{label}: every refusal for want of admission is the same bytes"
+        );
+    }
+
+    // The same peer, admitted to its own Mind, cannot name the other Mind's scope either: the
+    // declared scope must equal the admitted one before any store call.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind("grt_reader_peer_two")
+    .bind(SPACE_TWO)
+    .bind(PEER_TWO_PRINCIPAL)
+    .bind(json!(["knowledge_read"]).to_string())
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("grant the peer its own Mind");
+    sqlx::query("UPDATE memory_spaces SET status = 'active' WHERE space_id = ?")
+        .bind(SPACE_TWO)
+        .execute(&pool)
+        .await
+        .expect("unfreeze the second Mind");
+    let widened = assert_scope_refusal(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "a list naming a Mind the peer is not admitted to",
+    );
+    assert_eq!(
+        widened, unadmitted,
+        "a scope that is not the admitted one is the same refusal"
+    );
+
+    let served = expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE_TWO, None)).await,
+        "a list in the peer's own Mind",
+    );
+    let ids: Vec<&str> = served.iter().map(|entry| entry.entry_id.as_str()).collect();
+    assert!(
+        ids.contains(&CARRIER_TWO) && !ids.contains(&CARRIER),
+        "the admitted Mind's own entries, and only those: {ids:?}"
+    );
+}
+
+/// A request that declares a viewpoint is refused, never silently served.
+///
+/// The face advertises no `ke-ownership`, so no session negotiates it, and Connect's ownership
+/// conjunct answers a viewpoint request with wire `op_unsupported` before admission. This is the
+/// honest answer for a face whose admitted scope always carries `viewpoint: None`: it cannot
+/// honour the flag, so it does not offer it, and it refuses the request instead of dropping the
+/// member. Viewpoint support is not implemented in this layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requested_viewpoint_is_refused_rather_than_silently_served() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, principal_admission());
+    assert!(
+        !capabilities(&surface).contains(&"ke-ownership"),
+        "the face advertises no flag it cannot honour: {:?}",
+        capabilities(&surface)
+    );
+    // A dialer that asks for the flag anyway cannot negotiate it: the intersection is empty of it.
+    let session = connect(
+        &surface,
+        &["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"],
+    )
+    .await;
+    let dialer = &*session.adapter;
+
+    let viewpoint: Scope = serde_json::from_value(json!({
+        "scope_id": SPACE,
+        "viewpoint": "kb_someone_else",
+    }))
+    .expect("scope JSON matches the schema");
+    let refused = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &viewpoint).await,
+        "a list naming a viewpoint",
+    );
+    assert_eq!(
+        refused.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "the ownership conjunct answers the wire deny: {refused:?}"
+    );
+    assert_eq!(
+        refused
+            .details
+            .as_ref()
+            .and_then(|details| details.get("wire_code"))
+            .and_then(Value::as_str),
+        Some("op_unsupported"),
+        "the pinned raw reject code: {refused:?}"
+    );
+    assert!(
+        refused.message.contains("ke-ownership"),
+        "the refusal names the capability the face does not offer: {}",
+        refused.message
+    );
+
+    let scoped = expect_reject(
+        dialer
+            .get_knowledge_entry_in_scope("ke_absent", Some(&viewpoint))
+            .await,
+        "a get naming a viewpoint",
+    );
+    assert_eq!(
+        scoped.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "a scoped get naming a viewpoint is refused too: {scoped:?}"
+    );
+    assert!(
+        scoped.message.contains("ke-ownership"),
+        "the same conjunct answers: {}",
+        scoped.message
+    );
+}
+
+/// The gate order on the wire: a scoped `get` or `put` on a session that did not negotiate
+/// `spoke-knowledge-scoped` is the dispatch deny — never a scope the peer would silently drop —
+/// and a declared viewpoint without `ke-ownership` is the ownership conjunct, on the list op
+/// that carries a required scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_op_without_its_capability_is_the_dispatch_deny() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, principal_admission());
+    // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
+    // `ke-ownership`, so the negotiated set is exactly this hello's claim.
+    let session = connect(&surface, &["spoke-knowledge"]).await;
+    let dialer = &*session.adapter;
+
+    // `get`/`put` with a declared scope need the marker. The dialer refuses before sending, with
+    // the class the responder would answer, so no scope is ever dropped on the way out.
+    session.wire.drain_sent();
+    let scoped = expect_reject(
+        dialer
+            .get_knowledge_entry_in_scope("ke_absent", Some(&request_scope(SPACE, None)))
+            .await,
+        "a scoped get on a session without the marker",
+    );
+    assert_eq!(
+        scoped.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "an unnegotiated marker is the dispatch deny: {scoped:?}"
+    );
+    assert_eq!(
+        scoped
+            .details
+            .as_ref()
+            .and_then(|details| details.get("wire_code"))
+            .and_then(Value::as_str),
+        Some("op_unsupported"),
+        "the pinned raw reject code: {scoped:?}"
+    );
+    assert!(
+        scoped.message.contains("spoke-knowledge-scoped"),
+        "the refusal names the marker: {}",
+        scoped.message
+    );
+    assert!(
+        session.wire.drain_sent().is_empty(),
+        "an unnegotiated marker sends no scope"
+    );
+
+    // The list op carries a required scope, so the marker is not its conjunct; a declared
+    // viewpoint is, and without `ke-ownership` it is the wire `op_unsupported` deny.
+    let viewpoint: Scope = serde_json::from_value(json!({
+        "scope_id": SPACE,
+        "viewpoint": "kb_someone_else",
+    }))
+    .expect("scope JSON matches the schema");
+    let denied = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &viewpoint).await,
+        "a viewpoint list without the ownership flag",
+    );
+    assert_eq!(
+        denied.code,
+        SpokeRejectCode::CapabilityPortMissing,
+        "the ownership conjunct answers the wire deny: {denied:?}"
+    );
+    assert!(
+        denied.message.contains("ke-ownership"),
+        "the refusal names the missing capability: {}",
+        denied.message
+    );
+}
+
+/// Per-operation authorization: `knowledge_read` serves list and get, a put needs one grant
+/// covering both capabilities, and a caller holding the read grant only is refused on put without
+/// writing anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_knowledge_face_authorizes_each_operation_on_the_callers_own_grant() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant(
+            "grt_reader_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["knowledge_read"],
+        )
+        .await;
+    fixture
+        .grant(
+            "grt_writer_peer_three",
+            PEER_THREE_PRINCIPAL,
+            &["knowledge_write"],
+        )
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, three_principal_admission());
+
+    // The creator's default grant covers both: list, get and put all serve.
+    let creator = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    expect_ok(
+        creator
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_creator", "the creator's entry"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "the creator's put",
+    );
+    expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(&*creator.adapter, &request_scope(SPACE, None))
+            .await,
+        "the creator's list",
+    );
+    assert_caller_absent_for(
+        &creator,
+        &[PRINCIPAL, PEER_TWO_PRINCIPAL, PEER_THREE_PRINCIPAL],
+        "the creator's served answers",
+        ExpectsReceipt::No,
+    );
+
+    // A read-only grant lists and gets, and its put is the fixed refusal with no write.
+    let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    let listed = expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(&*reader.adapter, &request_scope(SPACE, None))
+            .await,
+        "a read-only grant's list",
+    );
+    assert!(
+        listed.iter().any(|entry| entry.entry_id == "ke_creator"),
+        "the read grant sees the Mind's entries"
+    );
+    expect_ok(
+        reader
+            .adapter
+            .get_knowledge_entry_in_scope("ke_creator", Some(&request_scope(SPACE, None)))
+            .await,
+        "a read-only grant's get",
+    );
+    let refused = assert_scope_refusal(
+        reader
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_reader_write", "must not be written"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a put by a caller without knowledge_write",
+    );
+    assert_eq!(refused.code, SpokeRejectCode::NotAuthorized);
+    assert!(refused.details.is_none());
+    assert_caller_absent_for(
+        &reader,
+        &[PRINCIPAL, PEER_TWO_PRINCIPAL, PEER_THREE_PRINCIPAL],
+        "the refused put",
+        ExpectsReceipt::No,
+    );
+    let written: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_reader_write")
+    .fetch_one(&pool)
+    .await
+    .expect("count the refused entry");
+    assert_eq!(written, 0, "a refused put writes nothing");
+
+    // `knowledge_write` alone is refused on all three: Connect reads the entry through `get`
+    // before it writes, so a put needs one grant covering both.
+    let writer = connect_as(&surface, &PEER_THREE_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    assert_scope_refusal(
+        KnowledgeQueryPort::list_knowledge_entries(&*writer.adapter, &request_scope(SPACE, None))
+            .await,
+        "a write-only grant's list",
+    );
+    assert_scope_refusal(
+        writer
+            .adapter
+            .get_knowledge_entry_in_scope("ke_creator", Some(&request_scope(SPACE, None)))
+            .await,
+        "a write-only grant's get",
+    );
+    assert_scope_refusal(
+        writer
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_writer_write", "must not be written"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a write-only grant's put",
+    );
+    let written: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_writer_write")
+    .fetch_one(&pool)
+    .await
+    .expect("count the refused entry");
+    assert_eq!(written, 0, "a write-only grant's put writes nothing");
+}
+
+/// A caller whose grant covers neither knowledge capability is refused on all three operations,
+/// exactly as one admitted to no Mind is: the same bytes, no details.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_covering_neither_knowledge_capability_serves_nothing() {
+    let fixture = Fixture::open().await;
+    fixture
+        .grant("grt_recall_only", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, two_principal_admission());
+    let session = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    let listed = assert_scope_refusal(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "a list by a caller with no knowledge capability",
+    );
+    let read = assert_scope_refusal(
+        dialer
+            .get_knowledge_entry_in_scope(CARRIER, Some(&request_scope(SPACE, None)))
+            .await,
+        "a get by a caller with no knowledge capability",
+    );
+    let written = assert_scope_refusal(
+        dialer
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_ungranted", "must not be written"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a put by a caller with no knowledge capability",
+    );
+    for (label, reject) in [("list", listed), ("get", read), ("put", written)] {
+        assert_eq!(
+            reject.code,
+            SpokeRejectCode::NotAuthorized,
+            "{label}: one fixed refusal"
+        );
+    }
+}
+
+/// The binding obligation's adversarial half: a peer that supplies the `mindcore_caller`
+/// namespace in its own request scope does not become the caller it names.
+///
+/// The admitted scope is bound on every successful return, so Connect's `effective_scope` merges
+/// the request's extensions with the admitted ones and the admitted namespace wins.
+///
+/// The test walks W's grant through three states so every operation discriminates on its own
+/// authorization decision:
+///
+/// 1. **W write-only, R read-only.** The forgery names W. List and get are served on R's
+///    `knowledge_read` and would be refused under W's write-only grant; put is refused for R and
+///    would also be refused for W, so put does not discriminate yet.
+/// 2. **W covering (both capabilities), R read-only.** The same forged put is refused while W's
+///    own covering grant would write it — the side-effect assertions below prove nothing was
+///    written, which is the put contrast.
+/// 3. **W covering, W's own positive write.** The same entry is then created by W, showing the
+///    refusals were R's grant and not the entry.
+///
+/// The no-scope put is the same test without the forgery. It is not decided by the binding:
+/// Connect passes no selector, and admission refuses a request that names no Mind before any
+/// scope is built or bound, so nothing unbound can reach the port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller() {
+    let fixture = Fixture::open().await;
+    // The forgery names W (the dialer's principal), who holds the covering default grant. R reads
+    // through its own grant and never through W's.
+    //
+    // The contrast is the forged principal himself: W's grant covers `knowledge_read`, so as long
+    // as W holds it neither read discriminates — honouring the forgery and reading on R's grant
+    // both succeed. So the test first drops W's read coverage with a write-only grant. Then each
+    // operation's answer depends on WHICH principal authorized it: under R's grant (which covers
+    // read and not write) list and get are served and put is refused; under W's grant (write and
+    // not read) all three are refused. A regression that authorized any one operation with the
+    // request's caller flips that operation's answer, not only put's.
+    fixture.revoke("grt_knowledge").await;
+    fixture
+        .grant("grt_writer_forged", PRINCIPAL, &["knowledge_write"])
+        .await;
+    fixture
+        .grant(
+            "grt_reader_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["knowledge_read"],
+        )
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, two_principal_admission());
+    let forgery = Some(json!({ "mindcore_caller": { "principal": PRINCIPAL } }));
+
+    let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    let forger = &*reader.adapter;
+
+    // Each operation is proven on four sides: the request bytes carry the forgery at the scope
+    // path, the answer is decided by R's own grant (and would differ under W's write-only one),
+    // and a dialer that stripped `scope.extensions` on any one of the three paths would fail its
+    // own assertion here. The wire read is per operation, not once for the suite.
+    reader.wire.drain_sent();
+    let listed = expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(forger, &request_scope(SPACE, forgery.clone()))
+            .await,
+        "a list carrying a forged caller namespace",
+    );
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.scope.list_knowledge_entries",
+        "",
+        PRINCIPAL,
+    );
+    assert!(
+        listed.iter().any(|entry| entry.entry_id == CARRIER),
+        "the list is served on R's own knowledge_read: the forged write-only grant would refuse it"
+    );
+
+    reader.wire.drain_sent();
+    expect_ok(
+        forger
+            .get_knowledge_entry_in_scope(CARRIER, Some(&request_scope(SPACE, forgery.clone())))
+            .await,
+        "a get carrying a forged caller namespace",
+    );
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.knowledge.get",
+        CARRIER,
+        PRINCIPAL,
+    );
+
+    // The put is refused by R's own grant: the forged namespace bought no capability. Under the
+    // forged principal's own write-only grant it would be refused as well, for the opposite
+    // reason; R's refusal is the one the answer must be, and the row proves nothing was written.
+    reader.wire.drain_sent();
+    assert_scope_refusal(
+        forger
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_forged", "written as somebody else"),
+                None,
+                Some(&request_scope(SPACE, forgery.clone())),
+            )
+            .await,
+        "a put carrying a forged caller namespace",
+    );
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.knowledge.put",
+        "ke_forged",
+        PRINCIPAL,
+    );
+    let forged_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_forged")
+    .fetch_one(&pool)
+    .await
+    .expect("count the forged entry");
+    assert_eq!(forged_rows, 0, "the forged put wrote nothing");
+
+    // The same put carrying no scope at all: the admission refuses a request that names no Mind,
+    // so the no-scope path is never answered with an unbound scope either.
+    assert_scope_refusal(
+        forger
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_forged", "written as somebody else"),
+                None,
+                None,
+            )
+            .await,
+        "a put carrying no request scope",
+    );
+    let unscoped_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_forged")
+    .fetch_one(&pool)
+    .await
+    .expect("count the unscoped entry");
+    assert_eq!(unscoped_rows, 0, "the unscoped put wrote nothing");
+
+    // The contrast made concrete on W's own session: with the write-only grant the same list and
+    // get the forging peer just had served are refused for W. That is the answer a regression
+    // honouring the forgery would produce for R, so the three reads above discriminate.
+    let write_only = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let w_list = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*write_only.adapter,
+            &request_scope(SPACE, None),
+        )
+        .await,
+        "the forged principal's own write-only list",
+    );
+    assert_eq!(w_list.code, SpokeRejectCode::NotAuthorized);
+    assert!(w_list.details.is_none());
+
+    // The entry is R's grant, not the entry: W's own peer creates it once a grant covering both
+    // capabilities is restored, which also shows the read contrast above is the grant W held.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind("grt_covering_forged")
+    .bind(SPACE)
+    .bind(PRINCIPAL)
+    .bind(json!(["knowledge_read", "knowledge_write"]).to_string())
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("restore the covering grant");
+
+    // The put contrast, now that the forged principal covers both capabilities again: the same
+    // request that is refused on R's `knowledge_read` would be WRITTEN if authorization took the
+    // caller from the request. The forgery reaches the wire, the answer is the fixed refusal, and
+    // neither the entry nor its cognition record exists — the two side effects W's own covering
+    // grant produces immediately below.
+    reader.wire.drain_sent();
+    assert_scope_refusal(
+        forger
+            .put_knowledge_entry_in_scope(
+                served_entry_with_cognition("ke_forged_contrast", "cog_forged_contrast"),
+                None,
+                Some(&request_scope(SPACE, forgery.clone())),
+            )
+            .await,
+        "a forged put while the forged principal covers both capabilities",
+    );
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.knowledge.put",
+        "ke_forged_contrast",
+        PRINCIPAL,
+    );
+    let contrast_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_forged_contrast")
+    .fetch_one(&pool)
+    .await
+    .expect("count the contrast entry");
+    assert_eq!(
+        contrast_entries, 0,
+        "the forged put wrote no entry: honouring the forgery would have written one"
+    );
+    let contrast_records: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cognition_records WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_forged_contrast")
+    .fetch_one(&pool)
+    .await
+    .expect("count the contrast cognition record");
+    assert_eq!(
+        contrast_records, 0,
+        "the forged put wrote no cognition record either"
+    );
+
+    let owner = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let written = expect_ok(
+        owner
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_forged", "the owner's own entry"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "the same entry created by the covering grant",
+    );
+    assert_eq!(written.entry_id, "ke_forged");
+    assert_eq!(written.revision, Some(1));
+
+    assert_caller_absent_for(
+        &reader,
+        &[PRINCIPAL, PEER_TWO_PRINCIPAL],
+        "every answer to the forging peer",
+        ExpectsReceipt::No,
+    );
+    assert_caller_absent_for(
+        &owner,
+        &[PRINCIPAL, PEER_TWO_PRINCIPAL],
+        "every answer to the owner",
+        ExpectsReceipt::No,
+    );
+}
+
+/// No wire response carries the caller: every answer to both peers — list, get, put, the
+/// refusals, an absent entry, a widening scope and an unadmitted or unknown Mind — is serialized
+/// whole and asserted to name neither principal id nor the `mindcore_caller` namespace.
+///
+/// The walk is layer 1's raw-envelope one, including its response-context rule: a refusal stages
+/// no receipt, so neither a receipt nor a receipt's own attribution may appear on one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_wire_response_carries_the_caller() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    fixture
+        .grant(
+            "grt_reader_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["knowledge_read"],
+        )
+        .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, two_principal_admission());
+    let principals = [PRINCIPAL, PEER_TWO_PRINCIPAL];
+
+    let owner = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*owner.adapter;
+    expect_ok(
+        dialer
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_disclosed", "an entry the owner wrote"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "the owner's put",
+    );
+    assert_caller_absent_for(
+        &owner,
+        &principals,
+        "the owner's put answer",
+        ExpectsReceipt::No,
+    );
+
+    expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "the owner's list",
+    );
+    assert_caller_absent_for(
+        &owner,
+        &principals,
+        "the owner's list answer",
+        ExpectsReceipt::No,
+    );
+
+    expect_ok(
+        dialer
+            .get_knowledge_entry_in_scope("ke_disclosed", Some(&request_scope(SPACE, None)))
+            .await,
+        "the owner's get",
+    );
+    assert_caller_absent_for(
+        &owner,
+        &principals,
+        "the owner's get answer",
+        ExpectsReceipt::No,
+    );
+
+    // An absent entry, an unadmitted Mind and a Mind that is no Mind: all refusals, none naming
+    // the caller.
+    expect_reject(
+        dialer
+            .get_knowledge_entry_in_scope("ke_absent", Some(&request_scope(SPACE, None)))
+            .await,
+        "the owner's get of an absent entry",
+    );
+    assert_caller_absent_for(
+        &owner,
+        &principals,
+        "the absent-entry answer",
+        ExpectsReceipt::No,
+    );
+
+    expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE_TWO, None)).await,
+        "the owner's list in another Mind",
+    );
+    assert_caller_absent_for(
+        &owner,
+        &principals,
+        "the unadmitted-Mind answer",
+        ExpectsReceipt::No,
+    );
+
+    expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(
+            dialer,
+            &request_scope("spc_no_such_mind", None),
+        )
+        .await,
+        "the owner's list in a Mind that is no Mind",
+    );
+    assert_caller_absent_for(
+        &owner,
+        &principals,
+        "the unknown-Mind answer",
+        ExpectsReceipt::No,
+    );
+
+    // The reader's answers, including a refused put and a request that widens the admitted scope.
+    let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(&*reader.adapter, &request_scope(SPACE, None))
+            .await,
+        "the reader's list",
+    );
+    assert_caller_absent_for(
+        &reader,
+        &principals,
+        "the reader's list answer",
+        ExpectsReceipt::No,
+    );
+
+    expect_reject(
+        reader
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_reader_refused", "must not be written"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "the reader's refused put",
+    );
+    assert_caller_absent_for(
+        &reader,
+        &principals,
+        "the reader's refused-put answer",
+        ExpectsReceipt::No,
+    );
+
+    expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*reader.adapter,
+            &request_scope(SPACE_TWO, None),
+        )
+        .await,
+        "the reader's list in another Mind",
+    );
+    assert_caller_absent_for(
+        &reader,
+        &principals,
+        "the reader's unadmitted-Mind answer",
+        ExpectsReceipt::No,
+    );
+}
+
+// ---------- The pinned gate order, on the wire ----------
+
+/// The gate order lives in the responder, not in the typed dialer: `RemoteAdapter` refuses a
+/// scoped `get`/`put` locally when the session did not negotiate the marker, so it can never
+/// reach the responder's `op_unsupported` branch or its shape-first `INVALID_INPUT`. These helpers
+/// drive the wire directly — a signed hello, the session snapshot, then hand-built invoke
+/// envelopes — so the ordering is proven where it actually runs.
+mod raw_wire {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{json, Value};
+
+    use mindcore_runtime::MindcoreSurface;
+    use spoke_connect::core::{derive_peer_id_from_ed25519_pubkey, sign_hello_ed25519};
+    use spoke_connect::remote::{
+        connect_responder, loopback_transport_pair, ConnectResponderOptions, LoopbackTransport,
+        RemoteIdentity, Transport,
+    };
+    use spoke_schemas::connect_hello::HostCapabilityManifest as HelloManifest;
+    use spoke_schemas::{ConnectHello, ConnectSession, HostCapabilityManifest};
+
+    /// The dialer's key: this module's own, so the session it opens is one the fixture's host
+    /// admission is told to admit.
+    pub(super) const DIALER_SEED: [u8; 32] = [0x11u8; 32];
+    const RESPONDER_SEED: [u8; 32] = [0x77u8; 32];
+
+    pub(super) fn dialer_peer_id() -> String {
+        derive_peer_id_from_ed25519_pubkey(
+            &SigningKey::from_bytes(&DIALER_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+
+    /// Start a responder over `surface` WITHOUT dialing, and open a raw session against it: a
+    /// signed initiator hello, the responder hello, the signed session snapshot. Returns the
+    /// client end and the session id every invoke envelope must name.
+    pub(super) async fn open_raw_session(
+        surface: &MindcoreSurface,
+        dialer_capabilities: &[&str],
+    ) -> (Arc<LoopbackTransport>, String) {
+        let pair = loopback_transport_pair();
+        let dialer = dialer_peer_id();
+        let responder_pubkey = SigningKey::from_bytes(&RESPONDER_SEED)
+            .verifying_key()
+            .to_bytes();
+        let responder = connect_responder(ConnectResponderOptions {
+            transport: Arc::new(pair.server),
+            identity: RemoteIdentity {
+                seed: RESPONDER_SEED,
+            },
+            manifest: surface.manifest.clone(),
+            allowlist: vec![dialer.clone()],
+            peer_keys: HashMap::from([(
+                dialer,
+                SigningKey::from_bytes(&DIALER_SEED)
+                    .verifying_key()
+                    .to_bytes(),
+            )]),
+            ports: Some(Arc::clone(&surface.ports)),
+            invoke_timeout_ms: Some(10_000),
+        })
+        .await;
+        assert!(
+            matches!(
+                surface.register(&responder),
+                spoke_operations::SpokeResult::Ok(())
+            ),
+            "install the served handlers"
+        );
+
+        let manifest: HostCapabilityManifest = serde_json::from_value(json!({
+            "schema_version": 1,
+            "host_id": "raw-dialer",
+            "roles": ["data-store"],
+            "capabilities": dialer_capabilities,
+            "namespaces": ["toy_world"],
+            "extensions": {},
+        }))
+        .expect("the dialer manifest matches the schema");
+        let hello_manifest: HelloManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).expect("manifest serializes"))
+                .expect("the hello manifest is field-identical");
+        let hello = sign_hello_ed25519(&DIALER_SEED, "raw-gate-nonce-0000", &hello_manifest, None)
+            .expect("sign the initiator hello");
+        pair.client
+            .send(&serde_json::to_vec(&hello).expect("hello bytes"))
+            .await
+            .expect("send the hello");
+        let _responder_hello: ConnectHello =
+            serde_json::from_slice(&pair.client.recv().await.expect("responder hello"))
+                .expect("decode the responder hello");
+        let session: ConnectSession =
+            serde_json::from_slice(&pair.client.recv().await.expect("session snapshot"))
+                .expect("decode the session snapshot");
+        assert_eq!(
+            session.initiator_peer_id.as_ref() as &str,
+            dialer_peer_id().as_str(),
+            "the responder bound the session to the dialer"
+        );
+        let _ = responder_pubkey;
+        (Arc::new(pair.client), session.session_id.to_string())
+    }
+
+    /// One signed invoke envelope, built the way the contract's 5-field signed object says: the
+    /// JCS bytes of `session_id`/`sequence`/`request_id`/`op`/`payload`, never `extensions`.
+    pub(super) async fn invoke(
+        client: &LoopbackTransport,
+        session_id: &str,
+        sequence: i64,
+        op: &str,
+        payload: Value,
+    ) -> Value {
+        let signed = json!({
+            "session_id": session_id,
+            "sequence": sequence,
+            "request_id": format!("raw-{op}-{sequence}"),
+            "op": op,
+            "payload": payload,
+        });
+        let jcs = serde_jcs::to_vec(&signed).expect("the signed object JCS-canonicalizes");
+        let signature = SigningKey::from_bytes(&DIALER_SEED).sign(&jcs);
+        let mut wire = signed.as_object().expect("signed object").clone();
+        wire.insert("extensions".into(), json!({}));
+        wire.insert(
+            "signature".into(),
+            json!(URL_SAFE_NO_PAD.encode(signature.to_bytes())),
+        );
+        client
+            .send(&serde_json::to_vec(&Value::Object(wire)).expect("invoke bytes"))
+            .await
+            .expect("send the invoke");
+        serde_json::from_slice(&client.recv().await.expect("invoke answer")).expect("decode")
+    }
+}
+
+/// The responder's own gate order, driven on the wire. A scoped `get` and a scoped `put` on a
+/// session that never negotiated `spoke-knowledge-scoped` answer the wire `op_unsupported` deny
+/// before the face is probed, and a malformed `scope` answers `INVALID_INPUT` before that marker
+/// conjunct — the shape first, then the marker, then the face.
+///
+/// The typed dialer cannot reach any of these: it refuses a declared scope locally, and it cannot
+/// serialize a `Scope` that is malformed. Only raw envelopes exercise the responder's branches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    fixture
+        .grant("grt_reader_raw", PRINCIPAL, &["knowledge_read"])
+        .await;
+    let (_dir, serve) = fixture.serve();
+    // The face is composed, so a request that passes the gates would be served: the denials below
+    // are the gates and not a missing face.
+    let surface = knowledge_surface(&serve, raw_wire_admission());
+    assert!(
+        surface.ports.as_scoped_knowledge().is_some(),
+        "the face is composed for this ordering test"
+    );
+    // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
+    // `ke-ownership`, so the negotiated set is exactly this hello's claim, and the marker is
+    // absent from it.
+    let (client, session_id) = raw_wire::open_raw_session(&surface, &["spoke-knowledge"]).await;
+
+    // 1. A scoped `get` without the negotiated marker: the marker conjunct, not the face.
+    let denied_get = raw_wire::invoke(
+        &client,
+        &session_id,
+        0,
+        "port.knowledge.get",
+        json!({
+            "entry_id": "ke_absent",
+            "scope": { "scope_id": SPACE },
+        }),
+    )
+    .await;
+    let code = denied_get
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .expect("the answer is an error envelope");
+    assert_eq!(
+        code, "op_unsupported",
+        "a declared scope without the marker is the wire deny, before any face call: {denied_get}"
+    );
+    let message = denied_get
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .expect("the deny carries a message");
+    assert!(
+        message.contains("spoke-knowledge-scoped"),
+        "the marker conjunct answered: {message}"
+    );
+
+    // 2. A scoped `put` on the same session: the same conjunct, so a peer cannot smuggle a write
+    //    scope past a peer that would silently drop it.
+    let denied_put = raw_wire::invoke(
+        &client,
+        &session_id,
+        1,
+        "port.knowledge.put",
+        json!({
+            "entry": served_entry("ke_raw_refused", "must not be written"),
+            "expected_base_revision": null,
+            "scope": { "scope_id": SPACE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        denied_put.pointer("/error/code").and_then(Value::as_str),
+        Some("op_unsupported"),
+        "a scoped put without the marker is the wire deny: {denied_put}"
+    );
+
+    // 3. A malformed `scope` (a present JSON `null` cognition subtree is shape, not selection)
+    //    answers `INVALID_INPUT` — before the marker conjunct would have answered.
+    let malformed = raw_wire::invoke(
+        &client,
+        &session_id,
+        2,
+        "port.knowledge.get",
+        json!({
+            "entry_id": "ke_absent",
+            "scope": { "scope_id": SPACE, "cognition": Value::Null },
+        }),
+    )
+    .await;
+    assert_eq!(
+        malformed.pointer("/error/code").and_then(Value::as_str),
+        Some("INVALID_INPUT"),
+        "the shape gate answers before the marker conjunct: {malformed}"
+    );
+
+    // 4. Nothing above reached the store: the forged-entry ids were never written.
+    for entry_id in ["ke_raw_refused"] {
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(COLLECTION)
+        .bind(entry_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count the refused entry");
+        assert_eq!(rows, 0, "{entry_id} was never written by a refused op");
+    }
+}
+
+/// A scoped op WITH the marker negotiated reaches the face, so the denials above are the gates:
+/// the same request that answered `op_unsupported` at step 1 is served once the session negotiates
+/// `spoke-knowledge-scoped`. This is the negative control that keeps the ordering test honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, raw_wire_admission());
+    let (client, session_id) = raw_wire::open_raw_session(&surface, &KNOWLEDGE_CAPABILITIES).await;
+
+    let served = raw_wire::invoke(
+        &client,
+        &session_id,
+        0,
+        "port.knowledge.get",
+        json!({
+            "entry_id": CARRIER,
+            "scope": { "scope_id": SPACE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        served.pointer("/payload/entry_id").and_then(Value::as_str),
+        Some(CARRIER),
+        "with the marker the same request is served: {served}"
+    );
+}
+
+// ---------- A storage fault during admission is not a refusal ----------
+
+/// A storage fault while the scoped admission resolves the caller's grants is answered as this
+/// request's internal error, not as the fixed `NOT_AUTHORIZED` an unadmitted caller receives.
+///
+/// Connect maps every admission `Reject` to one `deny_knowledge_scope`, so a fault returned as a
+/// `Reject` would be byte-identical to a refusal. The admission therefore raises the fault through
+/// the one channel Connect distinguishes — a panic on its blocking pool, which it catches as that
+/// request's join error and answers `INTERNAL_ERROR`. This drives both halves through the same
+/// signed session, on the same Mind, with only the store's health differing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_fault_during_admission_is_an_internal_error_not_a_refusal() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, principal_admission());
+    // The marker is advertised, so the scoped op is decodable and reaches the face; the caller
+    // holds the Mind's covering grant, so nothing but the store's health decides the answer.
+    let session = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    // Half one: an intact store serves the admitted caller.
+    expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "the admitted caller's list over a healthy store",
+    );
+
+    // Half two: the same caller, the same request, a store whose grant rows cannot be read. The
+    // table is dropped rather than emptied, so the admission's grant read fails rather than
+    // returning no rows — the difference between a fault and an admitted-nothing caller.
+    sqlx::query("DROP TABLE memory_grants")
+        .execute(&pool)
+        .await
+        .expect("remove the grants table to induce a storage fault");
+
+    let faulty = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "a list while the admission's grant read fails",
+    );
+    assert_eq!(
+        faulty.code,
+        SpokeRejectCode::InternalError,
+        "a storage fault is an internal error, never the admission refusal: {faulty:?}"
+    );
+    assert_eq!(
+        faulty.message, "knowledge admission failed",
+        "Connect's own per-request admission-failure text: {faulty:?}"
+    );
+    assert_ne!(
+        faulty.code,
+        SpokeRejectCode::NotAuthorized,
+        "the fault is distinguishable from an unadmitted caller: {faulty:?}"
+    );
+    assert!(
+        !faulty.message.contains("memory_grants") && !faulty.message.contains(COLLECTION),
+        "the driver text stays host-side: {faulty:?}"
+    );
+    assert!(
+        faulty.details.is_none(),
+        "the internal answer carries no details: {faulty:?}"
+    );
+
+    assert_caller_absent_for(
+        &session,
+        &[PRINCIPAL, PEER_TWO_PRINCIPAL],
+        "the internal-error answer",
+        ExpectsReceipt::No,
+    );
+}
+
+/// The distinction in one place: with the store healthy, an unadmitted caller and an unknown Mind
+/// answer the same fixed refusal; with the store's grant read broken, the fault is an internal
+/// error. Together with the test above this pins that the fault path is additive — it changes the
+/// answer only for a broken store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_mind() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, two_principal_admission());
+    // The second peer holds no grant anywhere: it is the unadmitted case.
+    let stranger = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*stranger.adapter;
+
+    for scope_id in [SPACE, "spc_no_such_mind"] {
+        let refused = expect_reject(
+            KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(scope_id, None))
+                .await,
+            "a list by a caller admitted to nothing",
+        );
+        assert_eq!(
+            refused.code,
+            SpokeRejectCode::NotAuthorized,
+            "{scope_id}: the fixed admission refusal: {refused:?}"
+        );
+        assert_eq!(
+            refused.message, "knowledge scope not authorized",
+            "{scope_id}: Connect's own admission-deny words"
+        );
+        assert!(
+            refused.details.is_none(),
+            "{scope_id}: no details, and no hint that the store is healthy: {refused:?}"
         );
     }
 }

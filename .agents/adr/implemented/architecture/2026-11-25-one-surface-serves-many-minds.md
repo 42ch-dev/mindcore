@@ -1,6 +1,6 @@
 # ADR: One served surface serves many Minds
 
-Status: implemented — Stage 1 serves many Minds from one surface, each call reached by its Mind id and admitted before any existence check; the three operations that cannot yet name a Mind stay un-routed until Stage 2
+Status: implemented — a surface serves many Minds, each call reached by its Mind id and admitted before any existence check. Stage 1 delivered per-Mind memory and cognition; Stage 2 delivered the per-Mind knowledge face, so `port.knowledge.get`, `port.knowledge.put` and the list operation are served per Mind when `ServeFaces.knowledge` composes it. `history.*` and `knowledge.adopt` still compose no face: their storage is registry-routed but the surface carries no switch for either until the later composition stages (`serving-seam.md` states the contract a restored face must satisfy)
 Date: 2026-11-25
 Class: architecture
 Supersedes: `2026-11-21-principal-routing.md` — its principal-keyed route map is removed

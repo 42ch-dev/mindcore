@@ -104,8 +104,10 @@ session is established.
 
 The manifest follows the composed faces:
 
-- `spoke-knowledge` and `ke-ownership` always (the knowledge face applies SPOKE's owner-private
-  disclosure, so a viewpoint-scoped list is truthful).
+- `spoke-knowledge` and `spoke-knowledge-scoped` always (the knowledge face applies SPOKE's
+  owner-private disclosure and honours the per-request scope selector). `ke-ownership` is never
+  advertised: every admitted scope carries no `viewpoint`, so the face cannot honour the flag and
+  a request naming a viewpoint is refused rather than served.
 - `spoke-judgment` when the deliberation tool is served.
 - `spoke-memory` when a memory service is attached; `spoke-memory-transfer` only when that service
   reports every one of `TRANSFER_OPERATIONS`. A bare `RemoteMemoryService` reports none.

@@ -62,8 +62,8 @@ const OTHER_COLLECTION: &str = "studio";
 const OWNER_VIEWPOINT: &str = "kb_mira";
 const FOREIGN_VIEWPOINT: &str = "kb_rival";
 
-/// One store with the served collection plus a second collection the route
-/// never reaches, and an owner-private entry only its own viewpoint sees.
+/// One store with the served collection plus a second collection no registry row names, and an
+/// owner-private entry only its own viewpoint sees.
 struct Fixture {
     _dir: TempDir,
     store: MindStore,
@@ -95,15 +95,48 @@ impl Fixture {
                 .await,
             "seed other-collection entry",
         );
+        register_mind(&store, SCOPE_ID, COLLECTION, "ke_alpha").await;
         Self { _dir: dir, store }
     }
 }
 
-/// A second connection on the fixture's file, so a test can corrupt a stored payload directly.
+/// The Mind registry row the served face resolves its route from: the space row first, then the
+/// registry row naming a live entry of the collection. `ke_alpha` carries it, so the fixture adds
+/// no row to the served collection's listing.
+async fn register_mind(store: &MindStore, space_id: &str, collection: &str, carrier: &str) {
+    let pool = store.pool();
+    sqlx::query(
+        "INSERT INTO memory_spaces \
+         (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+          created_at) \
+         VALUES (?, NULL, 'host_1', 1, 'active', 1, '2026-11-26T09:00:00.000Z')",
+    )
+    .bind(space_id)
+    .execute(&pool)
+    .await
+    .expect("seed the mind's space row");
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
+    )
+    .bind(space_id)
+    .bind(collection)
+    .bind(carrier)
+    .execute(&pool)
+    .await
+    .expect("seed the mind registry row");
+}
+
+/// A second connection on the fixture's file, so a test can corrupt a stored payload directly or
+/// drop a table. Foreign keys are off here: the table a test drops is also a foreign target of the
+/// fixture's registry row.
 async fn raw_connection(path: &Path) -> SqlitePool {
     SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(SqliteConnectOptions::new().filename(path))
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .foreign_keys(false),
+        )
         .await
         .expect("open raw connection")
 }
@@ -232,11 +265,7 @@ async fn connect_knowledge_session(
     let responder_peer_id = derive_peer_id_from_ed25519_pubkey(&responder_pubkey);
 
     let face = Arc::new(RemoteKnowledgeFace {
-        store: Arc::new(
-            fixture
-                .store
-                .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION)),
-        ),
+        store: Arc::new(fixture.store.served_knowledge()),
         admission,
     });
     let ports: Arc<dyn RemoteServePorts + Send + Sync> =
@@ -787,9 +816,7 @@ async fn entry_in_another_collection_is_indistinguishable_from_missing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_private_entry_stays_hidden_from_a_foreign_viewpoint() {
     let fixture = Fixture::open().await;
-    let served = fixture
-        .store
-        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let served = fixture.store.served_knowledge();
     let owner = viewpoint_scope(SCOPE_ID, OWNER_VIEWPOINT);
     let foreign = viewpoint_scope(SCOPE_ID, FOREIGN_VIEWPOINT);
 
@@ -860,9 +887,7 @@ async fn a_superseded_entry_is_served_like_a_missing_one() {
         "mark the served entry superseded",
     );
     assert_eq!(superseded, 2);
-    let served = fixture
-        .store
-        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let served = fixture.store.served_knowledge();
     let foreign = viewpoint_scope(SCOPE_ID, FOREIGN_VIEWPOINT);
 
     let marked = expect_reject(
@@ -957,9 +982,7 @@ async fn a_marked_row_with_unreadable_payload_is_served_like_a_missing_one() {
     .await
     .expect("corrupt the marked payload");
 
-    let served = fixture
-        .store
-        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let served = fixture.store.served_knowledge();
     let scope = scope_of(SCOPE_ID);
     let marked = expect_reject(
         served.get_scoped_knowledge_entry(&scope, "ke_beta").await,
@@ -1378,9 +1401,7 @@ async fn negotiated_viewpoint_cannot_bypass_admission_or_disclosure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_scope_selections_are_refused_by_the_served_store() {
     let fixture = Fixture::open().await;
-    let served = fixture
-        .store
-        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let served = fixture.store.served_knowledge();
     let selections = [
         (
             "cognition",
@@ -1514,9 +1535,9 @@ async fn admission_with_an_unsupported_selection_returns_no_entries() {
 async fn served_list_refuses_a_collection_over_the_bound() {
     let fixture = Fixture::open().await;
     let bounded = KnowledgeScope::new("bounded");
-    let served = fixture.store.served_knowledge(SCOPE_ID, bounded.clone());
+    let served = fixture.store.served_knowledge();
     let writer = fixture.store.knowledge(bounded);
-    let scope = scope_of(SCOPE_ID);
+    let scope = scope_of(OTHER_SCOPE_ID);
     for index in 0..SERVED_KNOWLEDGE_LIST_LIMIT {
         expect_ok(
             writer
@@ -1525,6 +1546,8 @@ async fn served_list_refuses_a_collection_over_the_bound() {
             "seed a bounded-collection entry",
         );
     }
+    // The registry row's carrier is one of the collection's own rows, so it follows the seeding.
+    register_mind(&fixture.store, OTHER_SCOPE_ID, "bounded", "ke_0000").await;
 
     let listed = expect_ok(
         served.list_scoped_knowledge_entries(&scope).await,
@@ -1630,9 +1653,7 @@ async fn served_list_refuses_a_collection_over_the_bound() {
 async fn the_served_put_is_the_anchor_gate_backstop() {
     let fixture = Fixture::open().await;
     let scope = scope_of(SCOPE_ID);
-    let served = fixture
-        .store
-        .served_knowledge(SCOPE_ID, KnowledgeScope::new(COLLECTION));
+    let served = fixture.store.served_knowledge();
     let local = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
 
     let mut adopted = entry("ke_adopted", "an adopted copy");
@@ -1703,5 +1724,69 @@ async fn the_served_put_is_the_anchor_gate_backstop() {
     assert_eq!(
         updated.body.summary.as_deref(),
         Some("the same anchor, edited")
+    );
+}
+
+/// The route is the Mind registry, not a host-configured pair: a `scope_id` no registry row names
+/// answers the one target-free `NOT_AUTHORIZED` on every served op, before any entry statement,
+/// and the same id answers identically whether the collection it might name holds entries or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scope_id_with_no_registry_row_is_not_authorized() {
+    let fixture = Fixture::open().await;
+    let served = fixture.store.served_knowledge();
+    let unregistered = viewpoint_scope(OTHER_SCOPE_ID, OWNER_VIEWPOINT);
+
+    let refusals = [
+        expect_reject(
+            served.list_scoped_knowledge_entries(&unregistered).await,
+            "list on a scope id with no registry row",
+        ),
+        expect_reject(
+            served
+                .get_scoped_knowledge_entry(&unregistered, "ke_alpha")
+                .await,
+            "get on a scope id with no registry row",
+        ),
+        expect_reject(
+            served
+                .put_scoped_knowledge_entry(&unregistered, entry("ke_orphan", "never stored"), None)
+                .await,
+            "put on a scope id with no registry row",
+        ),
+    ];
+    for reject in &refusals {
+        assert_eq!(
+            reject.code,
+            SpokeRejectCode::NotAuthorized,
+            "a scope id no registry row names is refused, not served from any collection"
+        );
+        assert_eq!(reject.message, "knowledge scope not authorized");
+        assert!(
+            reject.details.is_none(),
+            "the refusal names no target: {reject:?}"
+        );
+    }
+
+    // The registry row is what makes the collection reachable: once the same space id is
+    // registered the identical scope serves it, so the refusal was the missing row and not the
+    // scope's shape.
+    register_mind(
+        &fixture.store,
+        OTHER_SCOPE_ID,
+        OTHER_COLLECTION,
+        "ke_elsewhere",
+    )
+    .await;
+    assert_eq!(
+        expect_ok(
+            served
+                .get_scoped_knowledge_entry(&unregistered, "ke_elsewhere")
+                .await,
+            "the registry row is the route",
+        )
+        .body
+        .summary
+        .as_deref(),
+        Some("studio only")
     );
 }

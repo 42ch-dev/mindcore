@@ -59,6 +59,25 @@ silently admits empty maps and extra members, which is an input-surface regressi
 - Show the guard can fail: a test that only exercises the guarded path cannot distinguish a working
   guard from a fixture that never reaches the write.
 
+## Distinguish faults from refusals inside admission
+
+A scoped admission callback answers through two different channels, and confusing them makes a
+database outage look like an authorization problem. Connect maps every returned `Reject` to its
+fixed scope denial, so a storage error returned that way reaches the caller as "not authorized".
+
+The same responder contains a panicking callback per request: it runs admission under
+`spawn_blocking`, catches the join error and answers that one request `INTERNAL_ERROR`, keeping the
+panic text host-side and sending nothing to the store. So a fault has somewhere to go.
+
+The workable split is exact-value discrimination. Keep the refusal's constructor and its predicate
+side by side, compare code, message and absent details together, return a match unchanged, and route
+everything else through the fault channel with a comment naming the containment. Anything looser
+risks turning a real refusal into a 500, or a real fault into a denial.
+
+Prove both halves, and prove the test can fail: drop a table the admission reads so the failure is a
+driver error rather than an empty result, and revert the split to watch the misleading refusal come
+back.
+
 ## Costs and limits
 
 - Authorization and the store operation may end up in separate transactions, leaving a window in

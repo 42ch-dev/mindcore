@@ -173,6 +173,19 @@ impl From<WireError> for Reject {
     }
 }
 
+/// Whether `reject` is the one Mind-admission refusal [`Reject::admission_refusal`] answers.
+///
+/// The knowledge admission callback has to tell that refusal from a storage fault: Connect maps
+/// every admission `Reject` to the same fixed deny, so a fault answered as a `Reject` would be
+/// indistinguishable from an unadmitted caller. This is the predicate that separates them, held
+/// beside the constructor so the two cannot drift apart — it compares the whole value, including
+/// the absent details the refusal's indistinguishability depends on.
+#[must_use]
+pub fn is_mind_admission_refusal(reject: &SpokeReject) -> bool {
+    let refusal = Reject::admission_refusal().into_spoke();
+    reject == &refusal
+}
+
 /// Project one operation result onto the wire channel.
 pub(crate) fn settle<T>(result: AResult<T>) -> SpokeResult<T> {
     match result {
