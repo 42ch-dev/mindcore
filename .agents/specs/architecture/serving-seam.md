@@ -25,7 +25,9 @@ The peer's route grants read/write knowledge access within its scope, not uncons
 
 ### History
 
-The `spoke-history` family publishes two operations over the same signed session: `history.revisions.get` returns a `RevisionSnapshot`, `history.revisions.prune` returns `HistoryPruneResult { deleted, floor_revision }` where `floor_revision` is the local report's floor. The host enables both with `ServeFaces.history`: `false` composes no history service and advertises no `spoke-history`, the composed surface adds it to `RemoteServePortsComposite::knowledge_only(face).with_history(service)`, and `face_capabilities` advertises the family from that one flag.
+The `spoke-history` family publishes two operations over the same signed session: `history.revisions.get` returns a `RevisionSnapshot`, `history.revisions.prune` returns `HistoryPruneResult { deleted, floor_revision }` where `floor_revision` is the local report's floor.
+
+Stage 1 composes no history face: `ServeFaces` carries no history switch, `face_capabilities` advertises no `spoke-history`, and both operations answer `CAPABILITY_PORT_MISSING` on the responder's dispatch-deny branch. The paragraphs below state the contract a restored face must satisfy, and the Stage 2 handoff at the end of this section names what it must re-implement rather than re-bind.
 
 One store fills two port roles: `RoutedKnowledgeStore` implements `spoke_operations::HistoryPort` beside `ScopedKnowledgePort`, so no second store module exists and the runtime owns no second history implementation — only the dedup record beside it. Admission is the knowledge face's, composed as `HistoryAdmission = (principals(peer)?, knowledge_admission(peer)?)`: a peer outside either callback gets that callback's refusal, and can therefore replay and prune exactly the scope it reads and writes through `port.knowledge.*`. Connect compares a present request `scope` with the admitted scope before calling the port — `NOT_FOUND` on get, `NOT_AUTHORIZED` on prune — and the port re-applies `RoutedKnowledgeStore::admit` as its own guard.
 
@@ -76,6 +78,8 @@ So the answer is not a case distinction a caller can act on, and a caller must n
 
 Adoption keeps the released in-memory default and its own restart exposure. Adoption has no equivalent permanent-loss replay path, but it is not a guaranteed no-write repeat either. While the source still resolves to the terminal the first call copied and the destination already holds the copy, the create-only CAS and the anchor rules make the retry answer `already_present` or `REVISION_CONFLICT` and write nothing. After a reassembly dropped the record, a source since retired to a different terminal resolves the same request to that new terminal; with `destination_entry_id` omitted the copy is then addressed by the new terminal's id, so the retry writes a second copy. The original copy stays intact and nothing is lost — the repeat is simply not guaranteed to write nothing once the terminal changed and no destination id was supplied.
 
+**Stage 2 handoff: the durable dedup is not in the retained port.** `crates/mindcore-sqlite`'s `RoutedKnowledgeStore` still implements `spoke_operations::HistoryPort` — replay and prune over the routed collection — but that port carries no retry record. The claim-before-prune and recorded-outcome store lived in `crates/mindcore-runtime/src/history_dedup.rs` (`SqliteHistoryDedupStore`, composed through `spoke-connect`'s `HistoryPortService::with_dedup_store` over the store's own pool) and was removed with the face. Stage 2 must re-implement that durable dedup namespace — one row per `(namespace, key)`, `key` being Connect's canonical `[op, effective_scope, principal_id, idempotency_key]` retry identity and the namespace the collection the surface routes to, with the principal stored beside the key for the quota, claimed before the port runs and settled with the request digest and the outcome after it, each `(namespace, principal)` holding at most 4096 rows and nothing ever deleted — before it serves prune again. Re-enabling prune over the retained port with Connect's in-memory default instead would let a same-key retry after a restart re-run a destructive prune the first request may already have performed. Records already persisted by the removed store must stay readable: its composite key is `(namespace, key)` with the collection name as the namespace, not a framed string, so a Stage 2 store must keep that column pair rather than re-derive the namespace.
+
 ### Workflow tools
 
 `MindcoreServe` derives served capability ids and tool descriptors from installed faces and handlers; the host supplies identity, transport, allowed peers and non-capability manifest metadata. Compose Memory and Knowledge with `RemoteServePortsComposite::knowledge_only(face).with_memory(service)`, and the history family with `.with_history(service)` on that same composite. The Memory service consumes a trusted peer-to-principal mapping and implements the advertised family contract; the runtime does not create fake baseline, reflection or transfer providers. For each accepted transport, register handlers before releasing inbound traffic; `connect_responder` starts its own SPOKE receive task and does not install handlers from the manifest.
@@ -121,16 +125,15 @@ rather than kept as a second authority: assembly drops its reserved `tools.mindc
 host registration in both adoption configurations (`crates/mindcore-runtime/src/lib.rs:165`), so no
 manifest carries it and no handler answers it even when a host registers the id.
 
-The host enables the face with `ServeFaces.adoption: Option<AdoptionRoute>`, whose `scope_id` names
-the configured source on the wire and whose `source` names the `KnowledgeScope` the store reads
-(`crates/mindcore-runtime/src/lib.rs:247-257,288-296`). There is no destination setting: the
-destination is `ServeFaces.knowledge`, the one collection `knowledge.get`/`list` serve for the
+Stage 1 composes no adoption face: `ServeFaces` has no adoption setting, `face_capabilities` names
+neither `spoke-knowledge-adoption` nor its `spoke-knowledge` co-capability, and a `knowledge.adopt`
+call answers `CAPABILITY_PORT_MISSING`. The paragraphs below state the contract a restored face must
+satisfy. A restored face takes the one host-configured source as an `AdoptionRoute` — a `scope_id`
+naming it on the wire and the `KnowledgeScope` the store reads — and no destination setting: the
+destination is the knowledge face's own collection, the one `knowledge.get`/`list` serve for the
 admitted peer, so a copy is readable back through that face whenever the peer's admitted selection
-admits it. `workflow_routes` selects workflow collections only and plays no part in adoption. With
-`adoption: None` `face_capabilities` adds no capability and no service is composed; with `Some` it
-adds `spoke-knowledge-adoption` and `RemoteServePortsComposite::with_adoption` composes
-`spoke-connect`'s `AdoptionPortService` over the runtime's `AdoptionService`
-(`crates/mindcore-runtime/src/lib.rs:191-214,406-434`).
+admits it. `workflow_routes` selects workflow collections only and plays no part in adoption. The
+Stage 2 handoff at the end of this section names what it must re-implement rather than re-bind.
 
 **Admission is the knowledge face's**, composed as `(principals(peer)?, knowledge_admission(peer)?)`
 like the history family's: a peer the knowledge face does not admit cannot adopt, and a routed
@@ -250,6 +253,19 @@ before hello using its own trusted routing, verifies the selected peer against t
 session, and re-evaluates actual admission at call time. The runtime serves one manifest and one
 handler set per surface and exposes no per-principal manifest or handler set.
 
+**Stage 2 handoff: the single transaction is not in the retained ports.** `crates/mindcore-sqlite`
+implements `ScopedKnowledgePort` and `HistoryPort` but no `spoke_operations::AdoptionPort`, and the
+operation's body — the scope checks, the retirement-chain resolution, the destination read, the
+create-only write, the anchor and inherited-governance rules and the typed response — lived in the
+removed `crates/mindcore-runtime/src/adoption.rs` (`AdoptionService`). Its one `BEGIN IMMEDIATE`
+transaction covered all of that and committed only for `adopted`, rolling back for `already_present`
+and for every refusal, so no caller could observe a source read without its destination write and a
+refused response left no copy. Stage 2 must re-implement that single transaction before composing
+any per-Mind adoption face: a body assembled from separate port calls cannot carry it, because the
+destination read and the create-only write would no longer share the source read's snapshot or its
+rollback. Connect's `AdoptionPortService` dedup envelope is unchanged by this — it never carried the
+transactional guarantee.
+
 ### Store shape
 
 The runtime serves a **protocol-shaped** store: the memory tables the workflows read are the Nexus protocol shape, not the pre-release legacy shape. `MindStore::open` applies the one embedded migration, so a freshly opened store already carries that shape and serves `recall_context` and `deliberate`; the loopback fixture opens that same production path and only seeds the rows the faces read, so it is no longer the only protocol-shaped store. Nexus host-only objects — the writer guards, outbox/immutability triggers, `nexus_writer_*` UDFs and the `core_*` tables — stay absent, so `open` needs no writer runtime. This plan's acceptance is therefore runtime reachability of the served tools against a store the production open path produced.
@@ -262,14 +278,14 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 - Adoption's answer reports `destination_entry_id` slot occupancy — occupied or free — and nothing about the occupant: a concealed occupant is byte-identical to a visible one. That disclosure is permitted and no wider than the knowledge face it lands on, whose create-only `put_knowledge_entry` already distinguishes occupied from free while hiding the entry; entry content, revision and visibility stay undisclosed.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.
-- History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes. The `spoke-history` capability is advertised only when `ServeFaces.history` composes the service.
+- History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes. Stage 1 composes no history face, so `face_capabilities` names no `spoke-history` and both ops answer `CAPABILITY_PORT_MISSING`.
 - Every served `deliberate` response carries the judgment its own attempt produced, and every judgment it carries passed the released validator before the call returned; the identity rule [`mind-model.md`](mind-model.md) states holds on the wire, and `spoke-judgment` is advertised exactly with the tool.
 
 ## Where it lives
 
 - SQLite scoped store beside `crates/mindcore-sqlite/src/knowledge.rs` and its borrowed-transaction helpers; used both by the Knowledge loopback and by `crates/mindcore-runtime`. The same file implements `HistoryPort` for `RoutedKnowledgeStore` and projects the replay onto `RevisionSnapshot`.
 - `crates/mindcore-spoke/src/workflows.rs` owns workflow storage admission and the settlement transaction; `crates/mindcore-spi` owns the workflow contracts and their orchestration.
-- `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces` (including `history` and `adoption`), `AdoptionRoute`, the `HistoryAdmission` and `AdoptionAdmission` compositions, the retired-id filter and `face_capabilities`, and it composes both services: `HistoryPortService::with_dedup_store` over `history_dedup.rs`'s `SqliteHistoryDedupStore`, and `AdoptionPortService::new`, which keeps the in-memory dedup default; `spoke-connect`'s `HistoryPortService` and `AdoptionPortService` own the wire decode, the effective-scope check and their dedup seams; `crates/mindcore-runtime/src/history_dedup.rs` owns the served history's durable store over the store's own pool; `crates/mindcore-runtime/src/adoption.rs` owns the adoption port, `AdoptionService`. `crates/mindcore-runtime/src/tools.rs` owns the served workflow tool registrations and their advertised ABI. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session, including both history ops, the prune replay across a reopened file and `knowledge.adopt`.
+- `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces` (manifest metadata, the memory service, the peer-to-principal admission, providers and host tools), the runtime's `MindPorts`, the retired-id filter and `face_capabilities`; Stage 1 composes no knowledge, history or adoption face, so the former `crates/mindcore-runtime/src/history_dedup.rs` (`SqliteHistoryDedupStore`) and `crates/mindcore-runtime/src/adoption.rs` (`AdoptionService`) are removed and a restored face must re-implement them (the two Stage 2 handoff paragraphs above). `spoke-connect`'s `HistoryPortService` and `AdoptionPortService` keep their wire decode, effective-scope check and dedup seams, unused until a face is composed again; `crates/mindcore-runtime/src/tools.rs` owns the served workflow tool registrations and their advertised ABI. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session, including the three removed families' `CAPABILITY_PORT_MISSING` denial; `crates/mindcore-runtime/tests/surface.rs` asserts their absence from the composed ports and the manifest.
 
 ## Change obligations
 
