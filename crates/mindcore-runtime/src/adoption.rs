@@ -602,21 +602,37 @@ mod tests {
         }
     }
 
-    /// One space-wide grant in the admitted Mind's space, as a host issues one to a peer it admits.
-    async fn grant(store: &MindStore, principal_id: &str, capabilities: &[&str]) {
+    /// One space-wide grant, as a host issues one to a peer it admits into `space`.
+    async fn grant(store: &MindStore, space: &str, principal_id: &str, capabilities: &[&str]) {
         sqlx::query(
             "INSERT INTO memory_grants \
              (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
               shared_access, expires_at, revoked_at, revision, created_at) \
              VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, '2026-11-27T00:00:00.000Z')",
         )
-        .bind(format!("grt_{principal_id}"))
-        .bind(DESTINATION_MIND)
+        .bind(format!("grt_{principal_id}_{space}"))
+        .bind(space)
         .bind(principal_id)
         .bind(json!(capabilities).to_string())
         .execute(&store.pool())
         .await
         .expect("seed grant");
+    }
+
+    /// One memory space with no `minds` row: a space a host created and admits a peer to, without
+    /// registering it as a Mind. Only the grant check stands between such a caller and the
+    /// registry read.
+    async fn unregistered_space(store: &MindStore, space: &str) {
+        sqlx::query(
+            "INSERT INTO memory_spaces \
+             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+              created_at) \
+             VALUES (?, NULL, 'host_1', 1, 'active', 1, '2026-11-27T00:00:00.000Z')",
+        )
+        .bind(space)
+        .execute(&store.pool())
+        .await
+        .expect("seed space");
     }
 
     /// Every row of `collection`, so a refused call can be shown to have written nothing.
@@ -771,7 +787,13 @@ mod tests {
 
         // The destination is the admitted Mind's registered collection, and a peer the host
         // grants there writes into it, which is where `knowledge.get` reads the copy back.
-        grant(&store, "prn_second", &["knowledge_write", "knowledge_read"]).await;
+        grant(
+            &store,
+            DESTINATION_MIND,
+            "prn_second",
+            &["knowledge_write", "knowledge_read"],
+        )
+        .await;
         let second = ok(
             service
                 .adopt_knowledge_entry(
@@ -806,25 +828,49 @@ mod tests {
 
     /// A Mind the registry does not name is the target-free refusal: the call learns nothing about
     /// whether that scope exists, and it is the same answer a missing grant gets.
+    ///
+    /// The caller here holds a live grant covering both capabilities in a space with no `minds`
+    /// row, so the grant check passes and the call reaches `registered_collection`'s `None`. The
+    /// assertion therefore fails if that branch is broken or removed: a fallback collection would
+    /// adopt the source and answer `adopted`, and a drop of the branch would panic.
     #[tokio::test]
     async fn a_mind_with_no_registry_row_answers_the_target_free_refusal() {
         let (_dir, store, service) = service().await;
+        const UNREGISTERED: &str = "spc_unregistered";
+        unregistered_space(&store, UNREGISTERED).await;
+        grant(
+            &store,
+            UNREGISTERED,
+            "prn_homeless",
+            &["knowledge_write", "knowledge_read"],
+        )
+        .await;
         let mut unregistered = request("ke_source", 1);
-        unregistered.destination_scope_id = "spc_unregistered".parse().expect("scope id");
+        unregistered.destination_scope_id = UNREGISTERED.parse().expect("scope id");
 
-        let before = collection_rows(&store, DESTINATION_COLLECTION).await;
+        let source_before = collection_rows(&store, SOURCE_COLLECTION).await;
+        let destination_before = collection_rows(&store, DESTINATION_COLLECTION).await;
         let refused_answer = refused(
             service
-                .adopt_knowledge_entry(&principal(OWNER), &scope("spc_unregistered"), &unregistered)
+                .adopt_knowledge_entry(
+                    &principal("prn_homeless"),
+                    &scope(UNREGISTERED),
+                    &unregistered,
+                )
                 .await,
-            "a Mind with no registry row",
+            "a granted caller in a space with no registry row",
         );
         assert_eq!(refused_answer.code, SpokeRejectCode::NotAuthorized);
         assert!(refused_answer.details.is_none(), "{refused_answer:?}");
         assert_eq!(
+            collection_rows(&store, SOURCE_COLLECTION).await,
+            source_before,
+            "an unregistered Mind writes nothing into the source"
+        );
+        assert_eq!(
             collection_rows(&store, DESTINATION_COLLECTION).await,
-            before,
-            "an unregistered Mind is written nowhere"
+            destination_before,
+            "an unregistered Mind writes into no registered collection either"
         );
 
         // One answer for both cases of the widened rule: the granted owner naming a scope that is
@@ -909,6 +955,81 @@ mod tests {
         );
         assert_eq!(refused_answer.code, SpokeRejectCode::NotFound);
         assert!(refused_answer.details.is_none(), "{refused_answer:?}");
+    }
+
+    /// The grant check also stands ahead of the registry lookup, which the source-side test above
+    /// cannot show: a registry read that ran first would answer a valid row and leave the refusal
+    /// unchanged.
+    ///
+    /// The control makes the registry read's answer visible in the outcome. This service's source
+    /// is the registered Mind's own collection, so the row that resolves at
+    /// `registered_collection` is exactly the collision the port answers as a missing source. An
+    /// unauthorized caller is refused on its grant — `NOT_AUTHORIZED` — and would instead be
+    /// answered the generic `NOT_FOUND` if the lookup moved ahead of the check. The authorized
+    /// creator reaching that same `NOT_FOUND` proves the discriminating answer is live, so the
+    /// unauthorized assertion cannot pass by being unreachable.
+    #[tokio::test]
+    async fn the_grant_check_precedes_the_registry_lookup_whose_row_names_the_source() {
+        let (_dir, store, _service) = service().await;
+        let resolved = ok(
+            mindcore_sqlite::minds::registered_collection(&store.pool(), DESTINATION_MIND).await,
+            "read the registry row the wrong order would reach",
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some(DESTINATION_COLLECTION),
+            "the row is there to be read, so the control is not vacuous"
+        );
+        let colliding = AdoptionService::new(
+            store.pool(),
+            AdoptionRoute {
+                scope_id: SHARED_SCOPE.to_string(),
+                source: KnowledgeScope::new(DESTINATION_COLLECTION),
+            },
+        );
+        let destination_before = collection_rows(&store, DESTINATION_COLLECTION).await;
+
+        let unauthorized = refused(
+            colliding
+                .adopt_knowledge_entry(
+                    &principal("prn_stranger"),
+                    &scope(DESTINATION_MIND),
+                    &request("ke_source", 1),
+                )
+                .await,
+            "an unauthorized caller into a Mind whose collection is the source",
+        );
+        assert_eq!(
+            unauthorized.code,
+            SpokeRejectCode::NotAuthorized,
+            "the grant is decided before the registry row is read: {unauthorized:?}"
+        );
+        assert!(unauthorized.details.is_none(), "{unauthorized:?}");
+        assert_eq!(
+            collection_rows(&store, DESTINATION_COLLECTION).await,
+            destination_before,
+            "a refused adoption writes nothing"
+        );
+
+        let authorized = refused(
+            colliding
+                .adopt_knowledge_entry(
+                    &principal(OWNER),
+                    &scope(DESTINATION_MIND),
+                    &request("ke_source", 1),
+                )
+                .await,
+            "the granted creator meeting the same collision",
+        );
+        assert_eq!(
+            authorized.code,
+            SpokeRejectCode::NotFound,
+            "what a registry-first order would have answered: {authorized:?}"
+        );
+        assert_ne!(
+            unauthorized, authorized,
+            "the two orders are distinguishable, so the unauthorized answer pins the order"
+        );
     }
 
     /// The grant check stands ahead of every read: the source holds an undecodable payload, so a
