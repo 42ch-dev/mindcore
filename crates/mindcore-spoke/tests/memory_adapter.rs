@@ -4985,3 +4985,62 @@ async fn a_good_grant_after_an_undecodable_row_still_admits() {
     );
     tx.rollback().await.expect("rollback");
 }
+
+/// A create against an existing space needs space-wide `admin`, and its refusal is the fixed
+/// admission answer: an admitted caller whose live grant does not cover `admin` learns nothing
+/// about the principal, the space or the capability it lacks — the same envelope an unadmitted
+/// call receives. Coverage refusals of every other operation keep naming their cause.
+#[tokio::test]
+async fn create_of_an_existing_space_without_admin_answers_the_admission_refusal() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let refused = adapter
+        .create_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "idempotency_key": "create-no-admin" }),
+        )
+        .await;
+    let create_reject = reject(&refused);
+    assert_admission_refusal(
+        create_reject,
+        "an existing-space create without space-wide admin",
+    );
+    for needle in [PRINCIPAL, SPACE, "admin"] {
+        assert!(
+            !create_reject.message.contains(needle),
+            "the create refusal names neither the caller, the space nor the capability \
+             ({needle}): {create_reject:?}"
+        );
+    }
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        0,
+        "a refused create stages no receipt"
+    );
+
+    // Contrast: the same caller's freeze reaches the shared coverage refusal, which still
+    // names the principal and the space it lacks `admin` in.
+    let frozen = adapter
+        .freeze_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "expected_revision": 1,
+                "idempotency_key": "freeze-no-admin"
+            }),
+        )
+        .await;
+    let freeze_reject = reject(&frozen);
+    assert_eq!(freeze_reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(freeze_reject), "terminal");
+    assert!(
+        freeze_reject.message.contains(PRINCIPAL) && freeze_reject.message.contains(SPACE),
+        "the shared coverage refusal is unchanged: {freeze_reject:?}"
+    );
+    tx.rollback().await.expect("rollback");
+}

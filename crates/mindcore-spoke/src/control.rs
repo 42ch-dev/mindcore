@@ -257,7 +257,16 @@ impl MemoryAdapter {
                     placement_gate: None,
                     freeze_gated: true,
                 };
-                admission::authorize(&self.repository, tx, &admission, op.now).await?;
+                // Create answers every existing-space caller without space-wide `admin`
+                // exactly as it answers an unadmitted Mind: the shared coverage refusal
+                // names the principal, the space and the missing capability, and this
+                // operation must disclose none of them.
+                admission::authorize(&self.repository, tx, &admission, op.now)
+                    .await
+                    .map_err(|reject| match reject.code {
+                        SpokeRejectCode::NotAuthorized => Reject::admission_refusal(),
+                        _ => reject,
+                    })?;
                 admission::gate(&self.repository, tx, &admission).await?;
                 (false, current)
             }
