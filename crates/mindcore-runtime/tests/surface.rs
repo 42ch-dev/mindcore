@@ -9,8 +9,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+use mindcore_base::boundary::CallerId;
+use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_runtime::minds::{self, CreateMind};
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, READ_COGNITION, RECALL_CONTEXT};
-use mindcore_runtime::{MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
+use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::MindStore;
 use spoke_connect::core::CAPABILITY_SPOKE_JUDGMENT;
@@ -129,6 +132,7 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         memory: None,
         knowledge: false,
         history: false,
+        adoption: None,
         principals: principals(),
         providers: MindProviders::default(),
         tools: Vec::new(),
@@ -169,7 +173,7 @@ fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
 async fn manifest_follows_the_composed_faces() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
-        serve.surface(faces(metadata("runtime"))),
+        serve.surface(faces(metadata("runtime"))).await,
         "assemble surface",
     );
 
@@ -236,16 +240,18 @@ async fn manifest_follows_the_composed_faces() {
 async fn a_host_registration_cannot_shadow_a_runtime_tool() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
-        serve.surface(ServeFaces {
-            tools: vec![
-                shadowing(RECALL_CONTEXT),
-                shadowing(ABSORB),
-                shadowing(DELIBERATE),
-                shadowing(READ_COGNITION),
-                shadowing(RETIRED_ADOPT),
-            ],
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                tools: vec![
+                    shadowing(RECALL_CONTEXT),
+                    shadowing(ABSORB),
+                    shadowing(DELIBERATE),
+                    shadowing(READ_COGNITION),
+                    shadowing(RETIRED_ADOPT),
+                ],
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble a surface a host tries to shadow",
     );
 
@@ -292,10 +298,12 @@ fn shadowing(capability_id: &str) -> ToolRegistration {
 async fn attached_memory_service_is_advertised_and_served() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
-        serve.surface(ServeFaces {
-            memory: Some(Arc::new(RecordingMemory)),
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                memory: Some(Arc::new(RecordingMemory)),
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble mixed surface",
     );
 
@@ -324,10 +332,12 @@ async fn attached_memory_service_is_advertised_and_served() {
 async fn a_bare_memory_service_advertises_only_the_memory_family() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
-        serve.surface(ServeFaces {
-            memory: Some(Arc::new(RecordingMemory)),
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                memory: Some(Arc::new(RecordingMemory)),
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble a memory-serving surface",
     );
     assert!(capabilities(&surface).contains(&"spoke-memory"));
@@ -344,10 +354,12 @@ async fn a_bare_memory_service_advertises_only_the_memory_family() {
 async fn a_service_reporting_four_of_five_advertises_no_transfer_family() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
-        serve.surface(ServeFaces {
-            memory: Some(Arc::new(FourOfFive)),
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                memory: Some(Arc::new(FourOfFive)),
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble a partially transfer-serving surface",
     );
     assert!(capabilities(&surface).contains(&"spoke-memory"));
@@ -376,10 +388,12 @@ async fn tool_registrations_drive_advertisement_and_installation() {
         handler
     });
     let surface = expect_ok(
-        serve.surface(ServeFaces {
-            tools: vec![registration],
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                tools: vec![registration],
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble tool-serving surface",
     );
 
@@ -436,10 +450,12 @@ async fn tool_registrations_drive_advertisement_and_installation() {
 async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
     let serve = Fixture::open().await.serve();
     let composed = expect_ok(
-        serve.surface(ServeFaces {
-            knowledge: true,
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                knowledge: true,
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble a knowledge-serving surface",
     );
     for capability in ["spoke-knowledge", "spoke-knowledge-scoped"] {
@@ -468,7 +484,7 @@ async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
     );
 
     let absent = expect_ok(
-        serve.surface(faces(metadata("runtime"))),
+        serve.surface(faces(metadata("runtime"))).await,
         "assemble a surface without the knowledge face",
     );
     for capability in ["spoke-knowledge", "spoke-knowledge-scoped", "ke-ownership"] {
@@ -491,11 +507,13 @@ async fn the_knowledge_face_is_advertised_exactly_when_it_is_composed() {
 async fn the_history_face_is_advertised_exactly_when_it_is_composed() {
     let serve = Fixture::open().await.serve();
     let composed = expect_ok(
-        serve.surface(ServeFaces {
-            knowledge: true,
-            history: true,
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                knowledge: true,
+                history: true,
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble a history-serving surface",
     );
     assert!(
@@ -513,11 +531,13 @@ async fn the_history_face_is_advertised_exactly_when_it_is_composed() {
     );
 
     let absent = expect_ok(
-        serve.surface(ServeFaces {
-            knowledge: true,
-            history: false,
-            ..faces(metadata("runtime"))
-        }),
+        serve
+            .surface(ServeFaces {
+                knowledge: true,
+                history: false,
+                ..faces(metadata("runtime"))
+            })
+            .await,
         "assemble a knowledge-only surface",
     );
     assert!(
@@ -530,10 +550,12 @@ async fn the_history_face_is_advertised_exactly_when_it_is_composed() {
         "the absent face answers no history probe"
     );
 
-    let refused = serve.surface(ServeFaces {
-        history: true,
-        ..faces(metadata("runtime"))
-    });
+    let refused = serve
+        .surface(ServeFaces {
+            history: true,
+            ..faces(metadata("runtime"))
+        })
+        .await;
     match refused {
         SpokeResult::Reject(reject) => assert_eq!(
             reject.code,
@@ -542,4 +564,125 @@ async fn the_history_face_is_advertised_exactly_when_it_is_composed() {
         ),
         SpokeResult::Ok(_) => panic!("history without the knowledge face must not assemble"),
     }
+}
+
+/// A source route for the assembly tests.
+fn route(scope_id: &str, collection: &str) -> AdoptionRoute {
+    AdoptionRoute {
+        scope_id: scope_id.to_string(),
+        source: KnowledgeScope::new(collection),
+    }
+}
+
+/// The adoption source is the host's wiring, so assembly refuses a source the surface cannot
+/// serve before any port or registration exists: an empty scope id, an empty collection, a
+/// collection or id a registered Mind already holds, and a route without the knowledge face that
+/// admits it. The last case is the face's co-capability rule, not a second admission.
+#[tokio::test]
+async fn the_adoption_source_is_refused_at_assembly_when_it_cannot_be_served() {
+    let fixture = Fixture::open().await;
+    let mind = expect_ok(
+        minds::create(
+            &fixture.store,
+            &CreateMind {
+                mind_id: None,
+                display_name: Some("Wren".to_string()),
+                owner: CallerId::new("prn_owner"),
+            },
+        )
+        .await,
+        "create the Mind every destination resolves to",
+    );
+    let serve = fixture.serve();
+
+    let cases: [(&str, AdoptionRoute, bool); 5] = [
+        ("an empty source scope id", route("", "shared-source"), true),
+        (
+            "an empty source collection",
+            route("spoke-source", ""),
+            true,
+        ),
+        (
+            "a source collection a registered Mind holds",
+            route("spoke-source", &mind.knowledge.collection),
+            true,
+        ),
+        (
+            "a source scope id a registered Mind holds",
+            route(mind.id.as_str(), "shared-source"),
+            true,
+        ),
+        (
+            "a route without the knowledge face",
+            route("spoke-source", "shared-source"),
+            false,
+        ),
+    ];
+    for (case, route, knowledge) in cases {
+        let refused = serve
+            .surface(ServeFaces {
+                knowledge,
+                adoption: Some(route),
+                ..faces(metadata("runtime"))
+            })
+            .await;
+        match refused {
+            SpokeResult::Reject(reject) => assert_eq!(
+                reject.code,
+                SpokeRejectCode::InvalidInput,
+                "{case} is an assembly refusal"
+            ),
+            SpokeResult::Ok(_) => panic!("{case} must not assemble"),
+        }
+    }
+}
+
+/// A route whose source is free assembles with the knowledge face and answers the adoption probe;
+/// without the route the same surface answers none and advertises neither `spoke-knowledge-adoption`
+/// nor anything else, because `None` composes no face.
+#[tokio::test]
+async fn the_adoption_face_is_advertised_exactly_when_a_source_is_configured() {
+    let serve = Fixture::open().await.serve();
+    let composed = expect_ok(
+        serve
+            .surface(ServeFaces {
+                knowledge: true,
+                adoption: Some(route("spoke-source", "shared-source")),
+                ..faces(metadata("runtime"))
+            })
+            .await,
+        "assemble an adoption-serving surface",
+    );
+    assert!(
+        capabilities(&composed).contains(&"spoke-knowledge-adoption"),
+        "the configured face advertises the family: {:?}",
+        capabilities(&composed)
+    );
+    assert!(
+        composed.ports.as_adoption().is_some(),
+        "the configured face answers the adoption probe"
+    );
+    expect_ok(
+        validate_manifest_tools(&composed.manifest),
+        "the derived manifest is self-consistent",
+    );
+
+    let absent = expect_ok(
+        serve
+            .surface(ServeFaces {
+                knowledge: true,
+                ..faces(metadata("runtime"))
+            })
+            .await,
+        "assemble a surface without an adoption source",
+    );
+    assert!(
+        !capabilities(&absent).contains(&"spoke-knowledge-adoption"),
+        "the absent face advertises nothing: {:?}",
+        capabilities(&absent)
+    );
+    assert!(
+        absent.ports.as_adoption().is_none(),
+        "the absent face answers no adoption probe"
+    );
 }

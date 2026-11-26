@@ -23,10 +23,10 @@ use tempfile::TempDir;
 
 use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::MemorySpaceRow;
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::knowledge::{KnowledgeScope, ADOPTION_FAULT, SERVED_REVISION_BOUND};
 use mindcore_runtime::tools::{ABSORB, DELIBERATE, READ_COGNITION, RECALL_CONTEXT};
 use mindcore_runtime::{
-    MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
+    AdoptionRoute, MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
 };
 use mindcore_spi::{
     CognitiveTaskKind, Embedder, EmbeddingIdentity, PolicyDecision, PolicyHook, Reasoner,
@@ -46,9 +46,10 @@ use spoke_operations::{
     KnowledgeQueryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
+use spoke_schemas::integers::SCHEMA_VERSION_MAX;
 use spoke_schemas::knowledge_entry::{
-    KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryModulesKey,
-    KnowledgeEntryModulesValue,
+    KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
+    KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner,
 };
 use spoke_schemas::{
     HostCapabilityManifest, KnowledgeAdoptRequest, KnowledgeEntry, MemoryGrantsListRequest,
@@ -649,14 +650,15 @@ fn faces(
         memory,
         knowledge: false,
         history: false,
+        adoption: None,
         principals: principal_admission(),
         providers,
         tools: Vec::new(),
     }
 }
 
-fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
-    expect_ok(serve.surface(faces), "assemble the served surface")
+async fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
+    expect_ok(serve.surface(faces).await, "assemble the served surface")
 }
 
 struct Session {
@@ -1245,7 +1247,8 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
             None,
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
 
     assert_eq!(
         capabilities(&surface),
@@ -1311,7 +1314,7 @@ async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
     let (_dir, serve) = fixture.serve();
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[RECALL_CONTEXT]).await;
     let mut arguments = recall_arguments_in(SPACE_TWO);
@@ -1352,7 +1355,8 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &[]), None, MindProviders::default()),
-    );
+    )
+    .await;
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
         "the carrier route is wired: {:?}",
@@ -1392,7 +1396,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
         reasoner: Some(Arc::new(NoChangeReasoner)),
         ..MindProviders::default()
     };
-    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers)).await;
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
         "a wired deliberation route is advertised: {:?}",
@@ -1455,7 +1459,8 @@ async fn deliberation_session(
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[DELIBERATE]).await;
     (dir, serve, session)
 }
@@ -1551,7 +1556,7 @@ async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
         policy_hook: Some(Arc::new(HoldingPolicy)),
         ..MindProviders::default()
     };
-    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers)).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let result = expect_ok(
@@ -1596,7 +1601,7 @@ async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
         policy_hook: Some(Arc::new(AutoPolicy)),
         ..MindProviders::default()
     };
-    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers)).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let result = expect_ok(
@@ -1651,7 +1656,7 @@ async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
     // Two principals: the dialer reaches the first Mind, the second peer reaches only what it is
     // granted in the second.
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[DELIBERATE, READ_COGNITION]).await;
 
@@ -1850,7 +1855,7 @@ async fn two_minds_settle_onto_their_own_carriers() {
         },
     );
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let first = connect(&surface, &[DELIBERATE, RECALL_CONTEXT]).await;
     let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
@@ -2050,7 +2055,7 @@ async fn a_space_with_no_registry_row_reaches_no_carrier() {
         },
     );
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE, RECALL_CONTEXT]).await;
     let reject = expect_reject(
@@ -2120,7 +2125,8 @@ async fn a_frozen_mind_serves_reads_and_refuses_a_freeze_gated_write() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &[]), None, MindProviders::default()),
-    );
+    )
+    .await;
     let session = connect(&surface, &[RECALL_CONTEXT, ABSORB, READ_COGNITION]).await;
 
     let mut recall = recall_arguments();
@@ -2181,7 +2187,7 @@ async fn deliberate_cannot_distinguish_an_absent_mind_from_an_ungranted_one() {
     // No reasoner: any path that reaches the engine before admission is a different answer.
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
     let existing = expect_reject(
@@ -2232,7 +2238,7 @@ async fn a_strangers_malformed_grant_row_cannot_leak_the_minds_existence() {
     // No reasoner: a path that reaches the engine would answer differently again.
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
     let poisoned = expect_reject(
@@ -2286,7 +2292,7 @@ async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
         },
     );
     faces.principals = principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let uncovered = expect_reject(
@@ -2350,7 +2356,7 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
         },
     );
     faces.principals = principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     sqlx::query(
@@ -2431,7 +2437,8 @@ async fn deliberate_refuses_the_subject_before_the_knowledge_coverage() {
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[DELIBERATE]).await;
 
     let subject_first = expect_reject(
@@ -2505,7 +2512,7 @@ async fn one_principal_recalls_each_mind_by_its_own_space_id() {
     let (_dir, serve) = fixture.serve();
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
     for (space, carrier, name, summary) in [
@@ -2574,7 +2581,8 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             None,
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         !capabilities(&absent).contains(&"spoke-memory"),
         "an unattached memory face is never advertised: {:?}",
@@ -2596,7 +2604,8 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             Some(Arc::new(MemoryFace)),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         capabilities(&attached).contains(&"spoke-memory"),
         "an attached memory face is advertised: {:?}",
@@ -2706,7 +2715,7 @@ async fn the_admin_grant_view_reads_the_space_and_moves_its_marker() {
         MindProviders::default(),
     );
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let request = |payload: Value| -> MemoryGrantsListRequest {
         serde_json::from_value(payload).expect("the grants list request JSON matches the schema")
@@ -2842,7 +2851,8 @@ async fn transfer_is_advertised_and_served_when_the_service_reports_all_five() {
             Some(service),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         capabilities(&surface).contains(&"spoke-memory-transfer"),
         "a service that reports the whole family earns it: {:?}",
@@ -2973,7 +2983,8 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
             Some(service),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
     session.wire.drain();
 
@@ -3034,7 +3045,8 @@ async fn the_baseline_face_is_never_composed_or_advertised() {
             None,
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         !capabilities(&surface).contains(&"spoke-baseline"),
         "no baseline provider is composed: {:?}",
@@ -3058,7 +3070,8 @@ async fn an_unserved_tool_answers_op_unsupported() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &[]), None, MindProviders::default()),
-    );
+    )
+    .await;
     assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
 
     let session = connect(&surface, &[UNSERVED_TOOL]).await;
@@ -3069,12 +3082,14 @@ async fn an_unserved_tool_answers_op_unsupported() {
     );
 }
 
-/// The un-routed family leaves composition and advertisement together: the manifest names none of
-/// it, no face is composed, and a dialer that claims it is served a missing port.
+/// A family the host did not attach leaves composition and advertisement together: the manifest
+/// names none of it, no face is composed, and a dialer that claims it is served a missing port.
 ///
 /// The knowledge and history halves of the Stage 1 assertion moved to the composed-face tests: each
 /// face is served when its `ServeFaces` flag asks for it, and absent — unadvertised and unserved —
-/// when it does not. Adoption is still un-routed, because it cannot name a Mind yet.
+/// when it does not. The adoption half moved there too once the face became per-Mind: what this
+/// test still proves is the negative case, a surface that configured no source, whose adoption
+/// answer is Connect's `capability_missing` rather than any Mind's refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_un_routed_face_answers_a_missing_port() {
     let fixture = Fixture::open().await;
@@ -3083,7 +3098,8 @@ async fn an_un_routed_face_answers_a_missing_port() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &claimed), None, MindProviders::default()),
-    );
+    )
+    .await;
     for capability in claimed {
         assert!(
             !capabilities(&surface).contains(&capability),
@@ -3130,7 +3146,7 @@ async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
             handler
         },
     )];
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
     assert!(
         capabilities(&surface).contains(&HOST_TOOL),
         "the host registration is advertised: {:?}",
@@ -3258,7 +3274,8 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
 
     expect_ok(
@@ -3363,7 +3380,8 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
 
     expect_ok(
@@ -3570,7 +3588,8 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
             })),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         capabilities(&surface).contains(&"spoke-memory"),
         "the attached create face advertises the memory family: {:?}",
@@ -3834,7 +3853,8 @@ async fn a_signed_create_of_an_existing_mind_without_admin_learns_nothing() {
             })),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &["spoke-memory"]).await;
     session.wire.drain();
 
@@ -3894,7 +3914,8 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
             })),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &["spoke-memory"]).await;
     session.wire.drain();
 
@@ -4110,7 +4131,7 @@ fn assert_scope_refusal<T: std::fmt::Debug>(result: SpokeResult<T>, context: &st
 }
 
 /// A surface whose knowledge face is composed, over the fixture's Mind.
-fn knowledge_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
+async fn knowledge_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
     let mut faces = faces(
         hello("runtime", &KNOWLEDGE_CAPABILITIES),
         None,
@@ -4118,7 +4139,7 @@ fn knowledge_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> Mind
     );
     faces.knowledge = true;
     faces.principals = principals;
-    surface(serve, faces)
+    surface(serve, faces).await
 }
 
 /// The composed knowledge face serves the admitted Mind's own collection: a put creates an entry
@@ -4129,7 +4150,7 @@ async fn the_composed_knowledge_face_serves_the_admitted_minds_own_entries() {
     fixture.seed_second_mind().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     assert!(
         capabilities(&surface).contains(&"spoke-knowledge"),
         "the composed face is advertised: {:?}",
@@ -4222,7 +4243,7 @@ async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
         .await
         .expect("freeze the second Mind");
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
 
     // The peer that holds no grant in the second Mind, and none in the first either.
     let session = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
@@ -4317,7 +4338,7 @@ async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
 async fn a_requested_viewpoint_is_refused_rather_than_silently_served() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     assert!(
         !capabilities(&surface).contains(&"ke-ownership"),
         "the face advertises no flag it cannot honour: {:?}",
@@ -4386,7 +4407,7 @@ async fn a_requested_viewpoint_is_refused_rather_than_silently_served() {
 async fn a_scoped_op_without_its_capability_is_the_dispatch_deny() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
     // `ke-ownership`, so the negotiated set is exactly this hello's claim.
     let session = connect(&surface, &["spoke-knowledge"]).await;
@@ -4470,7 +4491,7 @@ async fn the_knowledge_face_authorizes_each_operation_on_the_callers_own_grant()
         .await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, three_principal_admission());
+    let surface = knowledge_surface(&serve, three_principal_admission()).await;
 
     // The creator's default grant covers both: list, get and put all serve.
     let creator = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
@@ -4590,7 +4611,7 @@ async fn a_grant_covering_neither_knowledge_capability_serves_nothing() {
         .grant("grt_recall_only", PEER_TWO_PRINCIPAL, &["recall"])
         .await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     let session = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let dialer = &*session.adapter;
 
@@ -4670,7 +4691,7 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
         .await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     let forgery = Some(json!({ "mindcore_caller": { "principal": PRINCIPAL } }));
 
     let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
@@ -4889,7 +4910,7 @@ async fn no_wire_response_carries_the_caller() {
         )
         .await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     let principals = [PRINCIPAL, PEER_TWO_PRINCIPAL];
 
     let owner = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
@@ -5181,7 +5202,7 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
     let (_dir, serve) = fixture.serve();
     // The face is composed, so a request that passes the gates would be served: the denials below
     // are the gates and not a missing face.
-    let surface = knowledge_surface(&serve, raw_wire_admission());
+    let surface = knowledge_surface(&serve, raw_wire_admission()).await;
     assert!(
         surface.ports.as_scoped_knowledge().is_some(),
         "the face is composed for this ordering test"
@@ -5280,7 +5301,7 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
 async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, raw_wire_admission());
+    let surface = knowledge_surface(&serve, raw_wire_admission()).await;
     let (client, session_id) = raw_wire::open_raw_session(&surface, &KNOWLEDGE_CAPABILITIES).await;
 
     let served = raw_wire::invoke(
@@ -5316,7 +5337,7 @@ async fn a_storage_fault_during_admission_is_an_internal_error_not_a_refusal() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     // The marker is advertised, so the scoped op is decodable and reaches the face; the caller
     // holds the Mind's covering grant, so nothing but the store's health decides the answer.
     let session = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
@@ -5379,7 +5400,7 @@ async fn a_storage_fault_during_admission_is_an_internal_error_not_a_refusal() {
 async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_mind() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     // The second peer holds no grant anywhere: it is the unadmitted case.
     let stranger = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let dialer = &*stranger.adapter;
@@ -5418,7 +5439,7 @@ const HISTORY_CAPABILITIES: [&str; 4] = [
 ];
 
 /// A surface whose history face is composed over the knowledge face, for `principals`.
-fn history_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
+async fn history_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
     let mut faces = faces(
         hello("runtime", &HISTORY_CAPABILITIES),
         None,
@@ -5427,7 +5448,7 @@ fn history_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> Mindco
     faces.knowledge = true;
     faces.history = true;
     faces.principals = principals;
-    surface(serve, faces)
+    surface(serve, faces).await
 }
 
 /// `summaries.len()` revisions of `entry_id` in `collection`, written through the store the way a
@@ -5615,7 +5636,7 @@ async fn history_serves_each_mind_its_own_entry_history() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, principal_admission());
+    let surface = history_surface(&serve, principal_admission()).await;
     assert!(
         capabilities(&surface).contains(&"spoke-history"),
         "the composed face is advertised: {:?}",
@@ -5705,7 +5726,7 @@ async fn history_grants_no_access_the_knowledge_face_does_not() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, two_principal_admission());
+    let surface = history_surface(&serve, two_principal_admission()).await;
     let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let dialer = &*peer.adapter;
 
@@ -5805,7 +5826,7 @@ async fn history_replay_needs_knowledge_read() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, three_principal_admission());
+    let surface = history_surface(&serve, three_principal_admission()).await;
 
     let recall_only = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     assert_scope_refusal(
@@ -5868,7 +5889,7 @@ async fn history_prune_needs_the_write_and_read_grant() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, three_principal_admission());
+    let surface = history_surface(&serve, three_principal_admission()).await;
 
     // The read-only caller's prune is the knowledge face's put refusal, byte for byte, and it
     // leaves every checkpoint in place.
@@ -6033,7 +6054,7 @@ async fn the_history_face_refuses_every_mind_it_does_not_admit_alike() {
         .await
         .expect("freeze the second Mind");
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, two_principal_admission());
+    let surface = history_surface(&serve, two_principal_admission()).await;
     let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let dialer = &*peer.adapter;
 
@@ -6192,7 +6213,7 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
 
     // Before: one prune, its recorded outcome, and the checkpoint it cut.
     let first = {
-        let surface = history_surface(&serve, principal_admission());
+        let surface = history_surface(&serve, principal_admission()).await;
         let session = connect(&surface, &HISTORY_CAPABILITIES).await;
         let dialer = &*session.adapter;
         let first = expect_ok(
@@ -6241,7 +6262,7 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
         "the append wrote checkpoint 3 above the first prune's floor"
     );
     let serve = MindcoreServe::new(reopened, false, |_targets| Ok(()));
-    let surface = history_surface(&serve, principal_admission());
+    let surface = history_surface(&serve, principal_admission()).await;
     let session = connect(&surface, &HISTORY_CAPABILITIES).await;
     let dialer = &*session.adapter;
 
@@ -6418,7 +6439,7 @@ async fn a_prune_settles_its_claim_and_its_record_on_the_single_connection_pool(
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, two_principal_admission());
+    let surface = history_surface(&serve, two_principal_admission()).await;
     let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let key = dedup_key(SPACE, PEER_TWO_PRINCIPAL, "key-order");
 
@@ -6527,7 +6548,7 @@ async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_resu
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, principal_admission());
+    let surface = history_surface(&serve, principal_admission()).await;
     let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
     let key = dedup_key(SPACE, PRINCIPAL, "key-unsettled");
 
@@ -6798,4 +6819,922 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
         [2],
         "the replay did not execute a second prune"
     );
+}
+
+// ---------- The composed adoption face ----------
+
+/// A session that serves adoption negotiates the family with the knowledge face that admits it:
+/// Connect's compound gate requires both.
+const ADOPTION_CAPABILITIES: [&str; 3] = [
+    "spoke-knowledge",
+    "spoke-knowledge-scoped",
+    "spoke-knowledge-adoption",
+];
+
+/// The host's one configured source: a scope id it owns on the wire, and the one shared
+/// collection every admitted Mind copies from.
+const ADOPT_SOURCE_SCOPE: &str = "spc_shared_source";
+const ADOPT_SOURCE_COLLECTION: &str = "shared-source";
+
+fn adoption_route() -> AdoptionRoute {
+    AdoptionRoute {
+        scope_id: ADOPT_SOURCE_SCOPE.to_string(),
+        source: KnowledgeScope::new(ADOPT_SOURCE_COLLECTION),
+    }
+}
+
+/// A surface whose adoption face is composed over the knowledge face, for `principals`.
+async fn adoption_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
+    let mut faces = faces(
+        hello("runtime", &ADOPTION_CAPABILITIES),
+        None,
+        MindProviders::default(),
+    );
+    faces.knowledge = true;
+    faces.adoption = Some(adoption_route());
+    faces.principals = principals;
+    surface(serve, faces).await
+}
+
+/// A request into the configured source, naming the Mind the caller is admitted to.
+fn adopt_request(
+    source_entry_id: &str,
+    source_revision: u64,
+    destination: &str,
+    key: &str,
+) -> KnowledgeAdoptRequest {
+    typed(json!({
+        "source_scope_id": ADOPT_SOURCE_SCOPE,
+        "source_entry_id": source_entry_id,
+        "source_revision": source_revision,
+        "destination_scope_id": destination,
+        "idempotency_key": key,
+    }))
+}
+
+/// The same request claiming one named destination slot, so an occupant can be placed there.
+fn adopt_into_slot(source_entry_id: &str, slot: &str, key: &str) -> KnowledgeAdoptRequest {
+    let mut request = adopt_request(source_entry_id, 1, SPACE, key);
+    request.destination_entry_id = Some(slot.parse().expect("non-empty destination id"));
+    request
+}
+
+/// The shared source's entries, written the way a host's own puts write them.
+async fn seed_shared(store: &MindStore, entry_ids: &[&str]) {
+    let source = store.knowledge(KnowledgeScope::new(ADOPT_SOURCE_COLLECTION));
+    for entry_id in entry_ids {
+        expect_ok(
+            source
+                .put_knowledge_entry(served_entry(entry_id, "shared knowledge"), None)
+                .await,
+            "seed the shared source",
+        );
+    }
+}
+
+/// One collection's persisted rows, projected whole: every column of every live entry and every
+/// stored revision preimage, in a deterministic order.
+///
+/// `json_object` names each column explicitly instead of `SELECT *`, because the comparison is only
+/// meaningful if a column the copy might touch cannot appear silently: a change to `superseded_by`,
+/// `history_floor_revision`, a timestamp or the cognition head is a difference here.
+type TableRows = (Vec<Value>, Vec<Value>);
+
+async fn table_rows(pool: &sqlx::SqlitePool, collection: &str) -> TableRows {
+    let entries: Vec<String> = sqlx::query_scalar(
+        "SELECT json_object('collection', collection, 'entry_id', entry_id, \
+         'revision', revision, 'history_floor_revision', history_floor_revision, \
+         'payload', payload, 'cognition_head_seq', cognition_head_seq, \
+         'superseded_by', superseded_by, 'created_at', created_at, 'updated_at', updated_at) \
+         FROM knowledge_entries WHERE collection = ? ORDER BY entry_id",
+    )
+    .bind(collection)
+    .fetch_all(pool)
+    .await
+    .expect("read the collection's live entries");
+    let revisions: Vec<String> = sqlx::query_scalar(
+        "SELECT json_object('collection', collection, 'entry_id', entry_id, \
+         'revision', revision, 'payload', payload, 'cognition_head_seq', cognition_head_seq, \
+         'recorded_at', recorded_at) \
+         FROM knowledge_entry_revisions WHERE collection = ? ORDER BY entry_id, revision",
+    )
+    .bind(collection)
+    .fetch_all(pool)
+    .await
+    .expect("read the collection's revision preimages");
+    let row = |json: &str| serde_json::from_str::<Value>(json).expect("the row's json");
+    (
+        entries.iter().map(|json| row(json)).collect(),
+        revisions.iter().map(|json| row(json)).collect(),
+    )
+}
+
+/// Whether one collection's live rows hold `entry_id`.
+fn holds(rows: &[Value], entry_id: &str) -> bool {
+    rows.iter()
+        .any(|row| row.get("entry_id").and_then(Value::as_str) == Some(entry_id))
+}
+
+/// The shared source and the admitted Mind's collection together: the pair a failed copy must
+/// leave exactly as it found it.
+async fn both_collections(pool: &sqlx::SqlitePool) -> (TableRows, TableRows) {
+    (
+        table_rows(pool, ADOPT_SOURCE_COLLECTION).await,
+        table_rows(pool, COLLECTION).await,
+    )
+}
+
+/// One fault-injection row: the call refuses with `expected`, and neither collection moves.
+async fn assert_adoption_writes_nothing(
+    session: &Session,
+    pool: &sqlx::SqlitePool,
+    request: &KnowledgeAdoptRequest,
+    expected: SpokeRejectCode,
+    case: &str,
+) {
+    let before = both_collections(pool).await;
+    let rejected = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            request,
+        )
+        .await,
+        case,
+    );
+    assert_eq!(rejected.code, expected, "{case}: {rejected:?}");
+    if expected == SpokeRejectCode::InternalError {
+        assert_eq!(
+            rejected.message, ADOPTION_FAULT,
+            "{case}: the diagnostic stays host-side: {rejected:?}"
+        );
+    }
+    assert_eq!(
+        both_collections(pool).await,
+        before,
+        "{case}: the two collections are unchanged"
+    );
+}
+
+/// A peer holding the creator's default grant adopts from the host's configured source into the
+/// Mind it is admitted to, and reads the copy back through that Mind's own knowledge face.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_lands_in_the_admitted_mind_and_reads_back_through_its_knowledge_face() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    assert!(
+        capabilities(&surface).contains(&"spoke-knowledge-adoption"),
+        "the composed face advertises the family: {:?}",
+        capabilities(&surface)
+    );
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+    let source_before = table_rows(&pool, ADOPT_SOURCE_COLLECTION).await;
+
+    let adopted = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-adopt-1"),
+        )
+        .await,
+        "an adoption into the admitted Mind",
+    );
+    let adopted = wire(adopted);
+    assert_eq!(adopted["outcome"], "adopted", "{adopted}");
+    assert_eq!(adopted["entry"]["entry_id"], "ke_shared_note");
+    let anchor = &adopted["entry"]["adoption_anchor"];
+    assert_eq!(anchor["source_scope_id"], ADOPT_SOURCE_SCOPE);
+    assert_eq!(anchor["source_entry_id"], "ke_shared_note");
+    assert_eq!(anchor["source_revision"], 1);
+    assert_eq!(
+        table_rows(&pool, ADOPT_SOURCE_COLLECTION).await,
+        source_before,
+        "the shared source is only ever read"
+    );
+
+    // The destination is the admitted Mind's registered collection, resolved in the call.
+    let destination = table_rows(&pool, COLLECTION).await;
+    assert!(
+        holds(&destination.0, "ke_shared_note"),
+        "the copy lands in the Mind's own collection: {destination:?}"
+    );
+    let elsewhere = table_rows(&pool, COLLECTION_TWO).await;
+    assert!(
+        !holds(&elsewhere.0, "ke_shared_note"),
+        "no other Mind's collection holds the copy: {elsewhere:?}"
+    );
+
+    // Read back through the very face the Mind serves its own knowledge through.
+    let read = expect_ok(
+        dialer
+            .get_knowledge_entry_in_scope("ke_shared_note", Some(&request_scope(SPACE, None)))
+            .await,
+        "the copy read back through the knowledge face",
+    );
+    assert_eq!(read.entry_id, "ke_shared_note");
+    assert_eq!(
+        read.adoption_anchor
+            .as_ref()
+            .map(|anchor| (anchor.source_scope_id.as_str(), anchor.source_revision)),
+        Some((ADOPT_SOURCE_SCOPE, 1)),
+        "the copy keeps the provenance the adoption wrote"
+    );
+    assert_eq!(
+        read.body.summary.as_deref(),
+        Some("shared knowledge"),
+        "the copy carries the source's content"
+    );
+}
+
+/// Admission precedes existence, and a request member selects nothing: a destination in another
+/// Mind answers the target-free `NOT_AUTHORIZED`, and so do a Mind that is no Mind and a frozen
+/// Mind the caller holds no grant in — byte for byte, with nothing written. A second authenticated
+/// peer admitted to nothing draws the same bytes, so the refusal is the face's, not this caller's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    fixture
+        .grant_in_second("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, three_principal_admission()).await;
+    let session = connect_as(&surface, &PEER_TWO_SEED, &ADOPTION_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+    let peer = principal_for(PEER_TWO_PRINCIPAL);
+    let before = both_collections(&pool).await;
+
+    // The peer is admitted to the second Mind only, so naming the first is naming another Mind.
+    let cross = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &peer,
+            &scope_of(SPACE_TWO),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-cross"),
+        )
+        .await,
+        "a destination in another Mind",
+    );
+    let unknown = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &peer,
+            &scope_of(SPACE_TWO),
+            &adopt_request("ke_shared_note", 1, "spc_no_such_mind", "k-unknown"),
+        )
+        .await,
+        "a destination in a Mind that is no Mind",
+    );
+    // The frozen Mind is the first one, where this peer holds no grant at all.
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE)
+        .execute(&pool)
+        .await
+        .expect("freeze the first Mind");
+    let frozen = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &peer,
+            &scope_of(SPACE_TWO),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-frozen"),
+        )
+        .await,
+        "a destination in a frozen Mind without a grant",
+    );
+
+    for (label, reject) in [("unknown Mind", &unknown), ("frozen Mind", &frozen)] {
+        assert_eq!(
+            reject, &cross,
+            "{label}: every admission refusal is the same bytes"
+        );
+    }
+    assert_eq!(cross.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        cross.details.is_none(),
+        "the target-free refusal carries no details: {cross:?}"
+    );
+
+    // A second authenticated peer, admitted to nothing at all, naming the same Mind answers the
+    // same bytes: the refusal belongs to the face rather than to the caller that drew it.
+    let stranger = connect_as(&surface, &PEER_THREE_SEED, &ADOPTION_CAPABILITIES).await;
+    let from_another_caller = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*stranger.adapter,
+            &principal_for(PEER_THREE_PRINCIPAL),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-stranger"),
+        )
+        .await,
+        "a second caller naming the same Mind",
+    );
+    assert_eq!(
+        from_another_caller, cross,
+        "two different callers draw the same target-free refusal"
+    );
+    assert_eq!(
+        both_collections(&pool).await,
+        before,
+        "a refused admission writes no copy"
+    );
+}
+
+/// The wire scenario, stated as the code produces it: `RemoteAdapter::adopt_knowledge_entry`
+/// ignores its `principal` and `scope` arguments and serializes only the request, and the responder
+/// selects admission from `request.destination_scope_id`. So a request whose destination member
+/// names another Mind is an admission attempt on *that* Mind, and this caller holds no grant in it.
+/// The answer is the target-free `NOT_AUTHORIZED`: no target in the code, no details, no id in the
+/// message, and no copy anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_destination_member_naming_another_mind_is_the_target_free_refusal() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+    let before = both_collections(&pool).await;
+
+    let refused = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE_TWO, "k-other-destination"),
+        )
+        .await,
+        "a destination naming another Mind",
+    );
+    assert_eq!(refused.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        refused.details.is_none(),
+        "the target-free refusal carries no details: {refused:?}"
+    );
+    // Target-free means the message names neither the Mind the caller is admitted to, nor the one
+    // the request named, nor the source entry or collection.
+    for target in [
+        SPACE,
+        SPACE_TWO,
+        COLLECTION,
+        COLLECTION_TWO,
+        ADOPT_SOURCE_SCOPE,
+        ADOPT_SOURCE_COLLECTION,
+        "ke_shared_note",
+    ] {
+        assert!(
+            !refused.message.contains(target),
+            "the refusal must not name {target}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        both_collections(&pool).await,
+        before,
+        "a refused destination writes no copy"
+    );
+    let elsewhere = table_rows(&pool, COLLECTION_TWO).await;
+    assert!(
+        !holds(&elsewhere.0, "ke_shared_note"),
+        "the other Mind's collection is untouched: {elsewhere:?}"
+    );
+}
+
+/// No request member selects the source: a source scope the host did not configure is the same
+/// generic absence as a source entry the collection does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_unconfigured_source_scope_answers_the_generic_not_found() {
+    let fixture = Fixture::open().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+    let before = both_collections(&pool).await;
+
+    let mut foreign = adopt_request("ke_shared_note", 1, SPACE, "k-foreign-source");
+    foreign.source_scope_id = "spc_other_source".parse().expect("non-empty scope id");
+    let unconfigured = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &scope_of(SPACE), &foreign).await,
+        "a source scope the host did not configure",
+    );
+    let absent = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_missing", 1, SPACE, "k-absent-source"),
+        )
+        .await,
+        "a source entry the shared collection does not hold",
+    );
+
+    assert_eq!(unconfigured.code, SpokeRejectCode::NotFound);
+    assert_eq!(
+        unconfigured, absent,
+        "the caller learns nothing about which scope is configured"
+    );
+    assert_eq!(
+        both_collections(&pool).await,
+        before,
+        "neither refusal writes a copy"
+    );
+}
+
+/// A repeat is no write: the same retry key replays the recorded outcome, and a fresh key finds
+/// this adoption's own anchor in the slot. Both answer `already_present` over one stored copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_repeat_answers_already_present_through_both_keys() {
+    let fixture = Fixture::open().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    let first = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-repeat"),
+        )
+        .await,
+        "the first adoption",
+    );
+    let first = wire(first);
+    assert_eq!(first["outcome"], "adopted");
+    let settled = both_collections(&pool).await;
+
+    let replay = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-repeat"),
+        )
+        .await,
+        "the same retry key",
+    );
+    let replay = wire(replay);
+    assert_eq!(replay["outcome"], "already_present", "{replay}");
+    assert_eq!(replay["entry"]["revision"], first["entry"]["revision"]);
+
+    let fresh_key = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-repeat-fresh"),
+        )
+        .await,
+        "a fresh key over the same source",
+    );
+    let fresh_key = wire(fresh_key);
+    assert_eq!(fresh_key["outcome"], "already_present", "{fresh_key}");
+    assert_eq!(fresh_key["entry"]["revision"], first["entry"]["revision"]);
+
+    assert_eq!(
+        both_collections(&pool).await,
+        settled,
+        "a repeat adds no row to either collection"
+    );
+    let rows = table_rows(&pool, COLLECTION).await.0;
+    let copies = rows
+        .iter()
+        .filter(|row| row.get("entry_id").and_then(Value::as_str) == Some("ke_shared_note"))
+        .count();
+    assert_eq!(copies, 1, "the slot holds exactly one copy: {rows:?}");
+}
+
+/// A retired source resolves to its live terminal: the copy takes the terminal's id, and its
+/// anchor records the terminal's own revision whatever the request named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_retired_source_anchors_its_terminal() {
+    let fixture = Fixture::open().await;
+    seed_shared(&fixture.store, &["ke_retired", "ke_terminal"]).await;
+    let source = fixture
+        .store
+        .knowledge(KnowledgeScope::new(ADOPT_SOURCE_COLLECTION));
+    expect_ok(
+        source.supersede_entry("ke_retired", 1, "ke_terminal").await,
+        "retire the source into its terminal",
+    );
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+
+    let adopted = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_retired", 1, SPACE, "k-retired"),
+        )
+        .await,
+        "an adoption from a retired source",
+    );
+    let adopted = wire(adopted);
+    assert_eq!(adopted["outcome"], "adopted", "{adopted}");
+    assert_eq!(
+        adopted["entry"]["entry_id"], "ke_terminal",
+        "the copy takes the terminal's id: {adopted}"
+    );
+    let anchor = &adopted["entry"]["adoption_anchor"];
+    assert_eq!(anchor["source_entry_id"], "ke_terminal");
+    assert_eq!(anchor["source_scope_id"], ADOPT_SOURCE_SCOPE);
+    assert_eq!(anchor["source_revision"], 1);
+}
+
+/// A principal holding only `recall` is refused the knowledge put; its adoption answers the same
+/// bytes, and the Mind's collection holds no copy. The adoption is not reachable ahead of the
+/// knowledge face that admits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_is_not_reachable_ahead_of_the_knowledge_face() {
+    let fixture = Fixture::open().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    fixture
+        .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, two_principal_admission()).await;
+    let session = connect_as(&surface, &PEER_TWO_SEED, &ADOPTION_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+    let peer = principal_for(PEER_TWO_PRINCIPAL);
+    let before = both_collections(&pool).await;
+
+    let put = expect_reject(
+        dialer
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_peer_note", "x"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a put by a principal holding only recall",
+    );
+    let adopted = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            dialer,
+            &peer,
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-recall-only"),
+        )
+        .await,
+        "an adoption by the same principal",
+    );
+
+    assert_eq!(put.code, SpokeRejectCode::NotAuthorized, "{put:?}");
+    assert_eq!(
+        adopted, put,
+        "the adoption answers the knowledge face's own refusal, byte for byte"
+    );
+    assert_eq!(
+        both_collections(&pool).await,
+        before,
+        "the refused adoption writes no copy"
+    );
+}
+
+/// One grant must cover both capabilities on one row: a principal holding `knowledge_read` only
+/// and one holding `knowledge_write` without it are each refused and write nothing, while the
+/// creator's default grant adopts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_needs_the_write_and_read_grant() {
+    let fixture = Fixture::open().await;
+    seed_shared(&fixture.store, &["ke_shared_note"]).await;
+    fixture
+        .grant(
+            "grt_reader_peer_two",
+            PEER_TWO_PRINCIPAL,
+            &["knowledge_read"],
+        )
+        .await;
+    fixture
+        .grant(
+            "grt_writer_peer_three",
+            PEER_THREE_PRINCIPAL,
+            &["knowledge_write"],
+        )
+        .await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, three_principal_admission()).await;
+    let before = both_collections(&pool).await;
+
+    // Each half of the grant is compared against the same principal's own knowledge put, not only
+    // against the other half: the adoption must answer the knowledge face's refusal byte for byte,
+    // so a change to both adoption refusals alone still fails.
+    let reader = connect_as(&surface, &PEER_TWO_SEED, &ADOPTION_CAPABILITIES).await;
+    let reader_put = expect_reject(
+        reader
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_reader_note", "x"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a knowledge put by a principal holding only knowledge_read",
+    );
+    let reader_refusal = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*reader.adapter,
+            &principal_for(PEER_TWO_PRINCIPAL),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-reader"),
+        )
+        .await,
+        "an adoption by a principal holding only knowledge_read",
+    );
+    assert_eq!(
+        reader_refusal, reader_put,
+        "the read-only grant's adoption answers its own knowledge put"
+    );
+
+    let writer = connect_as(&surface, &PEER_THREE_SEED, &ADOPTION_CAPABILITIES).await;
+    let writer_put = expect_reject(
+        writer
+            .adapter
+            .put_knowledge_entry_in_scope(
+                served_entry("ke_writer_note", "x"),
+                None,
+                Some(&request_scope(SPACE, None)),
+            )
+            .await,
+        "a knowledge put by a principal holding only knowledge_write",
+    );
+    let writer_refusal = expect_reject(
+        AdoptionPort::adopt_knowledge_entry(
+            &*writer.adapter,
+            &principal_for(PEER_THREE_PRINCIPAL),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-writer"),
+        )
+        .await,
+        "an adoption by a principal holding only knowledge_write",
+    );
+    assert_eq!(
+        writer_refusal, writer_put,
+        "the write-only grant's adoption answers its own knowledge put"
+    );
+
+    assert_eq!(reader_refusal.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        reader_refusal, writer_refusal,
+        "the split grant answers one refusal, never naming which half is missing"
+    );
+    assert_eq!(
+        both_collections(&pool).await,
+        before,
+        "neither refused adoption writes a copy"
+    );
+
+    let creator = connect(&surface, &ADOPTION_CAPABILITIES).await;
+    let adopted = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*creator.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_shared_note", 1, SPACE, "k-creator"),
+        )
+        .await,
+        "the creator's default grant covering both capabilities",
+    );
+    assert_eq!(wire(adopted)["outcome"], "adopted");
+}
+
+/// A fault at any statement of the copy leaves both collections exactly as they were: the source
+/// absent, an unresolvable chain, a live source at another revision, an occupant in the slot
+/// (visible, retired, and one the admitted selection hides), a repeat, a terminal above the served
+/// range, and a write the store itself refuses through a `BEFORE INSERT` trigger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
+    let fixture = Fixture::open().await;
+    seed_shared(
+        &fixture.store,
+        &[
+            "ke_source",
+            "ke_free",
+            "ke_cycle_a",
+            "ke_cycle_b",
+            "ke_fault",
+        ],
+    )
+    .await;
+    let pool = fixture.store.pool();
+    // A retirement chain that closes on itself: every hop loads, and the resolver refuses the
+    // repeated id.
+    for (entry_id, successor) in [("ke_cycle_a", "ke_cycle_b"), ("ke_cycle_b", "ke_cycle_a")] {
+        sqlx::query(
+            "UPDATE knowledge_entries SET superseded_by = ?
+             WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(successor)
+        .bind(ADOPT_SOURCE_COLLECTION)
+        .bind(entry_id)
+        .execute(&pool)
+        .await
+        .expect("close the retirement cycle");
+    }
+    // A live source whose row sits above the served revision range. Its payload is the ordinary
+    // written shape; the revision column is what the resolver reports.
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(ADOPT_SOURCE_COLLECTION)
+    .bind("ke_high")
+    .bind(SERVED_REVISION_BOUND as i64 + 1)
+    .bind(
+        serde_json::to_string(&served_entry("ke_high", "a source above the served range"))
+            .expect("the entry serializes"),
+    )
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed a source above the served range");
+    // A source the served wire cannot carry: its `schema_version` sits above the SchemaVersion
+    // ceiling. Two layers already stop this shape before a copy exists — the served put refuses it
+    // on the way in, and the store's own payload decode refuses to hand it back — so this case pins
+    // the end-to-end outcome (the fixed fault, both collections unchanged) rather than the seam
+    // guard, which `an_unserveable_copy_never_becomes_a_response` covers directly. It is written
+    // raw because a store written by another version can hold the row.
+    let mut unserveable = served_entry("ke_unserveable", "a source the wire cannot carry");
+    unserveable.schema_version = std::num::NonZeroU64::new(SCHEMA_VERSION_MAX + 1)
+        .expect("a non-zero version above the ceiling");
+    let raw = serde_json::to_string(&unserveable).expect("the entry serializes");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES (?, ?, 1, ?, ?, ?)",
+    )
+    .bind(ADOPT_SOURCE_COLLECTION)
+    .bind("ke_unserveable")
+    .bind(&raw)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed a source the served wire cannot carry");
+    // Three occupants of three destination slots: one visible, one retired, and one an owner's
+    // private entry the admitted selection carries no viewpoint for.
+    let destination = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
+    for entry_id in ["ke_taken", "ke_old", "ke_new"] {
+        expect_ok(
+            destination
+                .put_knowledge_entry(served_entry(entry_id, "an occupant"), None)
+                .await,
+            "seed a destination occupant",
+        );
+    }
+    expect_ok(
+        destination.supersede_entry("ke_old", 1, "ke_new").await,
+        "retire the destination occupant",
+    );
+    let mut concealed = served_entry("ke_private", "an occupant the selection hides");
+    concealed.disclosure =
+        Some(KnowledgeEntryDisclosure::try_from("owner-private").expect("non-empty disclosure"));
+    concealed.owner =
+        Some(KnowledgeEntryOwner::try_from("prn_somebody_else").expect("non-empty owner"));
+    expect_ok(
+        destination.put_knowledge_entry(concealed, None).await,
+        "seed a destination occupant the admitted selection hides",
+    );
+
+    let (_dir, serve) = fixture.serve();
+    let surface = adoption_surface(&serve, principal_admission()).await;
+    let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+
+    let cases: [(&str, KnowledgeAdoptRequest, SpokeRejectCode); 8] = [
+        (
+            "a source the shared collection does not hold",
+            adopt_request("ke_missing", 1, SPACE, "f-absent"),
+            SpokeRejectCode::NotFound,
+        ),
+        (
+            "an unresolvable retirement chain",
+            adopt_request("ke_cycle_a", 1, SPACE, "f-cycle"),
+            SpokeRejectCode::SourceRetired,
+        ),
+        (
+            "a live source at another revision",
+            adopt_request("ke_source", 2, SPACE, "f-stale"),
+            SpokeRejectCode::RevisionConflict,
+        ),
+        (
+            "a visible occupant of the slot",
+            adopt_into_slot("ke_free", "ke_taken", "f-visible"),
+            SpokeRejectCode::RevisionConflict,
+        ),
+        (
+            "a retired occupant of the slot",
+            adopt_into_slot("ke_free", "ke_old", "f-retired"),
+            SpokeRejectCode::RevisionConflict,
+        ),
+        (
+            "an occupant the admitted selection hides",
+            adopt_into_slot("ke_free", "ke_private", "f-hidden"),
+            SpokeRejectCode::RevisionConflict,
+        ),
+        (
+            "a terminal above the served range",
+            adopt_request("ke_high", SERVED_REVISION_BOUND + 1, SPACE, "f-high"),
+            SpokeRejectCode::InternalError,
+        ),
+        (
+            "a source whose schema_version the wire cannot carry",
+            adopt_request("ke_unserveable", 1, SPACE, "f-unserveable"),
+            SpokeRejectCode::InternalError,
+        ),
+    ];
+    for (case, request, expected) in cases {
+        assert_adoption_writes_nothing(&session, &pool, &request, expected, case).await;
+    }
+
+    // A repeat is a read of the existing copy, so the committed tables stay as the first call left
+    // them.
+    let first = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_free", 1, SPACE, "f-repeat-first"),
+        )
+        .await,
+        "the first copy of the repeat pair",
+    );
+    assert_eq!(wire(first)["outcome"], "adopted");
+    let settled = both_collections(&pool).await;
+    let repeat = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_free", 1, SPACE, "f-repeat-second"),
+        )
+        .await,
+        "the repeat",
+    );
+    assert_eq!(wire(repeat)["outcome"], "already_present");
+    assert_eq!(
+        both_collections(&pool).await,
+        settled,
+        "the repeat adds no row"
+    );
+
+    // The write itself fails after every read succeeded: a trigger on the destination refuses the
+    // one INSERT, so the call answers the fixed store fault and the copy is not there.
+    let trigger = format!(
+        "CREATE TRIGGER inject_adoption_write_fault \
+         BEFORE INSERT ON knowledge_entries \
+         WHEN NEW.collection = '{COLLECTION}' \
+         BEGIN SELECT RAISE(ABORT, 'injected adoption write fault'); END"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger))
+        .execute(&pool)
+        .await
+        .expect("install the write fault");
+    assert_adoption_writes_nothing(
+        &session,
+        &pool,
+        &adopt_request("ke_fault", 1, SPACE, "f-write"),
+        SpokeRejectCode::InternalError,
+        "a write the destination refuses",
+    )
+    .await;
+    sqlx::query("DROP TRIGGER inject_adoption_write_fault")
+        .execute(&pool)
+        .await
+        .expect("remove the write fault");
+
+    // The fault was the only thing in the way: the same call now commits the copy.
+    let adopted = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_fault", 1, SPACE, "f-write-retry"),
+        )
+        .await,
+        "the same call once the fault is removed",
+    );
+    assert_eq!(wire(adopted)["outcome"], "adopted");
+    let stored = expect_ok(
+        destination.get_knowledge_entry("ke_fault").await,
+        "the copy the retried call wrote",
+    );
+    assert_eq!(stored.entry_id, "ke_fault");
 }
