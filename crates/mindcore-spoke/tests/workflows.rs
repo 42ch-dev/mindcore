@@ -219,13 +219,15 @@ impl Harness {
         .execute(&pool)
         .await
         .expect("seed the carrier entry");
-        sqlx::query("INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)")
-            .bind(SPACE)
-            .bind("wren")
-            .bind("ke_wren")
-            .execute(&pool)
-            .await
-            .expect("seed the mind registry row");
+        sqlx::query(
+            "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
+        )
+        .bind(SPACE)
+        .bind("wren")
+        .bind("ke_wren")
+        .execute(&pool)
+        .await
+        .expect("seed the mind registry row");
         Self {
             _dir: dir,
             root,
@@ -374,7 +376,8 @@ impl Harness {
     /// dedicated append stores it: a `cognition_records` row the read hydrates
     /// into the payload's `records` member.
     async fn judgment(&self, record_id: &str) {
-        let reference = |kind: &str, id: &str| json!({ "kind": kind, "id": id, "namespace": "mindcore" });
+        let reference =
+            |kind: &str, id: &str| json!({ "kind": kind, "id": id, "namespace": "mindcore" });
         let record = json!({
             "assessed_at": NOW,
             "assessment_context": { "context_id": "ctx_gate" },
@@ -1050,9 +1053,16 @@ async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_pee
         .expect("the space-visible carrier read");
     assert_eq!(visible.carrier_revision, 1);
     let records = &visible.records;
-    assert_eq!(records.len(), 1, "the judgment serves once visible: {visible:?}");
+    assert_eq!(
+        records.len(),
+        1,
+        "the judgment serves once visible: {visible:?}"
+    );
     assert_eq!(records[0]["record_id"], "rec_judgment");
-    assert!(visible.mind_state.is_object(), "the derived state serves beside the record");
+    assert!(
+        visible.mind_state.is_object(),
+        "the derived state serves beside the record"
+    );
     assert_eq!(visible.mind_state["mind_state_id"], SPACE);
     assert_eq!(visible.mind_state["holder_entry_id"], "ke_wren");
 }
@@ -2769,9 +2779,7 @@ async fn deliberate_as(
     timeout: std::time::Duration,
     assessment_context_id: Option<&str>,
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
-    let workflows = SpiMindWorkflows::new(
-        MemoryWorkflowBinding::new(harness.pool.clone(), true),
-    );
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
     let holder_value = cognition_reference(CARRIER);
     let holder: spoke_schemas::data::cognition::CognitionReference =
         serde_json::from_value(holder_value).expect("holder");
@@ -2794,10 +2802,9 @@ async fn deliberate_as(
         evidence: &evidence,
         timeout,
     };
-    let caller_principal: Principal = serde_json::from_value(
-        json!({ "principal_id": caller, "extensions": {} }),
-    )
-    .expect("caller principal");
+    let caller_principal: Principal =
+        serde_json::from_value(json!({ "principal_id": caller, "extensions": {} }))
+            .expect("caller principal");
     workflows
         .deliberate(&caller_principal, request, None, caps)
         .await
@@ -4649,9 +4656,7 @@ async fn a_request_naming_neither_subject_nor_context_is_refused_before_the_verd
         reasoner: Some(&reasoner),
         ..MindCapabilities::default()
     };
-    let workflows = SpiMindWorkflows::new(
-        MemoryWorkflowBinding::new(harness.pool.clone(), true),
-    );
+    let workflows = SpiMindWorkflows::new(MemoryWorkflowBinding::new(harness.pool.clone(), true));
     let holder: spoke_schemas::data::cognition::CognitionReference =
         serde_json::from_value(cognition_reference(CARRIER)).expect("holder");
     let target: spoke_schemas::data::cognition::CognitionTarget = serde_json::from_value(json!({

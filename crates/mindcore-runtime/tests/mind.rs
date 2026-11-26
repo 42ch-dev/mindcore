@@ -1251,7 +1251,10 @@ async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_pee
     let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
     let revision = carrier.revision.expect("a stored carrier has a revision");
     let mut payload = serde_json::to_value(&carrier).expect("the carrier serializes");
-    payload.as_object_mut().expect("an object").remove("disclosure");
+    payload
+        .as_object_mut()
+        .expect("an object")
+        .remove("disclosure");
     payload.as_object_mut().expect("an object").remove("owner");
     let visible: KnowledgeEntry = serde_json::from_value(payload).expect("the carrier decodes");
     ok(handle.knowledge_put(visible, Some(revision)).await);
