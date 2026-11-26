@@ -31,7 +31,7 @@ use mindcore_spi::{
     CognitiveTaskKind, Embedder, EmbeddingIdentity, PolicyDecision, PolicyHook, Reasoner,
     SettlementDraft, SpiError, StructuredReasonRequest,
 };
-use mindcore_spoke::{ServedMemory, TransferService};
+use mindcore_spoke::{MemoryAdapter, MemoryStage, ServedMemory, TransferService};
 use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
@@ -45,7 +45,8 @@ use spoke_operations::{
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{
-    HostCapabilityManifest, KnowledgeAdoptRequest, MemoryRecallRequest, Principal, Scope,
+    HostCapabilityManifest, KnowledgeAdoptRequest, MemoryGrantsListRequest,
+    MemoryGrantsListResponse, MemoryRecallRequest, Principal, Scope,
 };
 
 const SCOPE_ID: &str = "spoke-scope-001";
@@ -2296,6 +2297,206 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
         "the host's memory service answered the authenticated peer"
     );
     assert_eq!(body["total_authorized"], 7);
+}
+
+/// A host memory service that serves `memory.grants.list` through the adapter over one pool, so
+/// the admin view of the listing can be driven on a signed session.
+struct GrantsListFace {
+    pool: sqlx::SqlitePool,
+    admission: MemoryAdmission,
+}
+
+#[async_trait]
+impl RemoteMemoryService for GrantsListFace {
+    async fn invoke(&self, peer_id: &str, op: &str, payload: Value) -> SpokeResult<Value> {
+        if op != "memory.grants.list" {
+            return spoke_reject(
+                SpokeRejectCode::CapabilityPortMissing,
+                format!("the fixture grants face does not serve {op}"),
+                None,
+            );
+        }
+        let principal = match (self.admission)(peer_id) {
+            SpokeResult::Ok(principal) => principal,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return spoke_reject(
+                    SpokeRejectCode::InternalError,
+                    format!("the fixture grants face could not begin: {error}"),
+                    None,
+                )
+            }
+        };
+        let stage = MemoryAdapter::new(true)
+            .list_grants(&mut tx, &principal, payload)
+            .await;
+        let _ = tx.rollback().await;
+        match stage {
+            SpokeResult::Ok(MemoryStage::Ready(body)) => SpokeResult::Ok(body),
+            SpokeResult::Ok(_) => spoke_reject(
+                SpokeRejectCode::InternalError,
+                "grants.list staged an outcome the fixture face cannot finish",
+                None,
+            ),
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        }
+    }
+}
+
+impl ServedMemory for GrantsListFace {}
+
+/// The admin view of `memory.grants.list` over a signed session: an admin naming another principal
+/// receives that principal's grant rows (not an empty page), the same admin naming none receives
+/// the whole space's decodable set, a non-admin naming another principal still receives only its
+/// own rows, and another principal's grant change moves the cursor marker an admin's page is
+/// checked against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_admin_grant_view_reads_the_space_and_moves_its_marker() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    fixture.grant("grt_admin_view", PRINCIPAL, &["admin"]).await;
+    fixture
+        .grant("grt_peer_two_recall", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
+    fixture
+        .grant("grt_peer_two_capture", PEER_TWO_PRINCIPAL, &["capture"])
+        .await;
+    // A stranger's undecodable row is invisible to the view, never fatal.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grant_a_bad', '{SPACE}', NULL, 'prn_stranger', CAST(X'80' AS TEXT), '[]', 0, \
+          NULL, NULL, 1, '{NOW}')"
+    )))
+    .execute(&pool)
+    .await
+    .expect("seed the undecodable row");
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        Some(Arc::new(GrantsListFace {
+            pool: pool.clone(),
+            admission: two_principal_admission(),
+        })),
+        MindProviders::default(),
+    );
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
+
+    let request = |payload: Value| -> MemoryGrantsListRequest {
+        serde_json::from_value(payload).expect("the grants list request JSON matches the schema")
+    };
+    let granted = |result: SpokeResult<MemoryGrantsListResponse>| -> (Vec<String>, Value) {
+        let response = expect_ok(result, "grants.list");
+        let value = serde_json::to_value(response).expect("the grants list response serializes");
+        let ids = value["grants"]
+            .as_array()
+            .expect("a grants array")
+            .iter()
+            .map(|grant| {
+                grant["grant_id"]
+                    .as_str()
+                    .expect("every served grant names its id")
+                    .to_string()
+            })
+            .collect();
+        (ids, value["next_cursor"].clone())
+    };
+
+    let admin_session = connect(&surface, &["spoke-memory"]).await;
+    let (named, _) = granted(
+        MemoryPort::list_grants(
+            &*admin_session.adapter,
+            &principal(),
+            request(json!({ "space_id": SPACE, "principal_id": PEER_TWO_PRINCIPAL })),
+        )
+        .await,
+    );
+    assert_eq!(
+        named,
+        ["grt_peer_two_capture", "grt_peer_two_recall"],
+        "an admin naming another principal receives that principal's rows, not an empty page"
+    );
+
+    let (all, _) = granted(
+        MemoryPort::list_grants(
+            &*admin_session.adapter,
+            &principal(),
+            request(json!({ "space_id": SPACE })),
+        )
+        .await,
+    );
+    assert_eq!(
+        all,
+        [
+            "grt_admin_view",
+            "grt_knowledge",
+            "grt_peer_two_capture",
+            "grt_peer_two_recall",
+            "grt_recall",
+        ],
+        "an admin naming no principal receives the whole space's decodable set: {all:?}"
+    );
+    assert!(
+        !all.contains(&"grant_a_bad".to_string()),
+        "the undecodable row is invisible to the admin page: {all:?}"
+    );
+
+    let peer_session = connect_as(&surface, &PEER_TWO_SEED, &["spoke-memory"]).await;
+    let (own, _) = granted(
+        MemoryPort::list_grants(
+            &*peer_session.adapter,
+            &principal_for(PEER_TWO_PRINCIPAL),
+            request(json!({ "space_id": SPACE, "principal_id": PRINCIPAL })),
+        )
+        .await,
+    );
+    assert_eq!(
+        own,
+        ["grt_peer_two_capture", "grt_peer_two_recall"],
+        "a non-admin naming another principal still receives only its own rows"
+    );
+
+    // The cursor marker covers the set the admin page was built from, so another principal's
+    // grant change invalidates a cursor the admin already holds.
+    let (page, cursor) = granted(
+        MemoryPort::list_grants(
+            &*admin_session.adapter,
+            &principal(),
+            request(json!({ "space_id": SPACE, "limit": 1 })),
+        )
+        .await,
+    );
+    assert_eq!(page.len(), 1);
+    let cursor = cursor
+        .as_str()
+        .unwrap_or_else(|| panic!("a bounded page advances: {cursor}"))
+        .to_string();
+    sqlx::query(
+        "UPDATE memory_grants SET revision = 2, capabilities_json = '[\"recall\",\"capture\"]' \
+         WHERE grant_id = 'grt_peer_two_recall'",
+    )
+    .execute(&pool)
+    .await
+    .expect("change another principal's grant");
+    let stale = expect_reject(
+        MemoryPort::list_grants(
+            &*admin_session.adapter,
+            &principal(),
+            request(json!({ "space_id": SPACE, "cursor": cursor })),
+        )
+        .await,
+        "an admin cursor issued before another principal's grant changed",
+    );
+    assert_eq!(
+        stale.code,
+        SpokeRejectCode::CursorInvalid,
+        "another principal's grant change moves the admin's marker: {stale:?}"
+    );
 }
 
 /// The five §7.29–§7.33 operations over the real store. A service that reports all five earns

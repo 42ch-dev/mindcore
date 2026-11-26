@@ -129,12 +129,11 @@ Two of the three workflow tools reach knowledge at all, and only they: `delibera
 Settlement returns its original `SpokeReject` (code, message and details); malformed arguments and `SpiError::InvalidInput` return `InvalidInput`. A `PolicyRejected` policy veto is also `InvalidInput`, with `details.kind = "policy_rejected"` and the host's reason as the message — never `NotAuthorized`, which stays the lost-admission code. A deadline returns `InternalError` with `details.kind = "deadline_exceeded"` and `details.retry_class = "retryable"`: nothing committed, so the caller may repeat the call. That no-write guarantee now also covers an expiry during the store-connection wait inside `commit_cognition`, and an expiry on a connection already in hand before the begin; it stops at `BEGIN IMMEDIATE`, whose wait for SQLite's write lock is outside the request deadline, and a write that has begun keeps its actual or uncertain outcome. [`mind-model.md`](mind-model.md) owns that boundary. The other provider errors return `InternalError` with `details.kind` set to `embeddings_unavailable`, `embedding_failed`, `reasoner_unavailable`, `reasoner_failed`, or `invalid_reasoner_output` as appropriate and carry no retry class; do not reflect provider internals into the wire message. Errors use the signed error envelope, never a success DTO. The client must negotiate each tool id it intends to invoke; descriptor `capability_id` and `op` match, and the responder owns the `mindcore` namespace.
 
 **The deliberation budget's stated limit.** `deliberate`'s host-side pre-check runs inside the
-request's budget, and the timer around it drops the pool wait and starts no workflow when it fires.
-A query already inside SQLite's own step cannot be interrupted by that timer — SQLite offers no
-cancellation — so its connection stays busy until the step ends, and the time a timed-out call spent
-inside the step is not reclaimed. The remaining budget is also sampled after the pre-check and
-before the holder and evidence are built, so those builds are charged to the workflow's own deadline
-rather than to the sample. No cancellation mechanism beyond the timer is attempted.
+request's budget: this implementation relies on the timer plus dropping the pool wait, so an expiry
+starts no workflow, and it does not use SQLite's own interrupt handle — a query already inside
+SQLite's step runs to that step's end and holds its connection until then. The remaining budget is
+sampled after the pre-check, and the holder and evidence are built between that sample and the
+workflow's SPI deadline, so their construction is counted in neither segment.
 
 ### Adoption face
 
