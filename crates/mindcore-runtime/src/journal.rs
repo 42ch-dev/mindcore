@@ -10,6 +10,11 @@ use serde_json::Value;
 /// target's `path`, parent directories are created, and `Ok(())` is returned only when every
 /// target's exact bytes are durable.
 ///
+/// The root is the host's, not the publisher's: it must exist — durable — before the first
+/// publication, because the entry that names it lives in its parent and only the host can
+/// establish that durability. A missing root is refused with the requirement named, and the
+/// publisher never creates it. Everything the publisher creates is beneath the root.
+///
 /// Confinement is filesystem resolution, not spelling. A target path that is absolute or
 /// carries any `..` — a `ParentDir`, `RootDir` or `Prefix` component — is refused before its
 /// first byte. What remains is resolved: the root and every target parent are canonicalized,
@@ -18,18 +23,17 @@ use serde_json::Value;
 /// anything is created or written. The root the publisher serves is the canonical root: a
 /// host that passes a symlinked `root` publishes inside what it resolves to.
 ///
-/// Durability: each target syncs its file, then every directory entry the target depends on,
-/// deepest first, ending at the deepest pre-existing ancestor of its parent — inclusive. That
-/// directory already exists, so its own creation entry is the host's; everything below it was
-/// created by this publication (on this attempt or an earlier failed one) and is synced on
-/// every attempt. When `root` itself is absent, `create_dir_all` creates it, and the chain
-/// ends at its existing parent: the entry that names the freshly created root is persisted
-/// before `Ok(())`, so a settled record can never outlive the projection tree that proves it.
+/// Durability: each target syncs its file, then every directory the publication created or
+/// wrote into beneath the root, deepest first, ending at the root itself — inclusive. The
+/// chain is a pure function of the target's path, never of which directories happen to exist,
+/// so a retry after a publication that failed between creating directories and syncing them
+/// syncs the same chain as the attempt that failed. The root's own creation entry is the
+/// host's and never the publisher's to sync: the host established it durable before the first
+/// publication, which is exactly why the publisher requires the root to exist.
 ///
 /// Permission requirement: syncing a directory opens it for reading, which POSIX refuses for
-/// a search-only directory, so the host must grant read on the deepest pre-existing ancestor
-/// and everything the publication creates below it. Ancestors above that anchor need only
-/// traversal: the publisher never opens them.
+/// a search-only directory, so the host must grant read on `root` and everything beneath it.
+/// Ancestors above the root need only traversal: the publisher never opens them.
 ///
 /// Target paths are the adapter's own (`records/<id>.md`, `candidates/<id>.md`,
 /// `profiles/<digest>.md`): they are confined to `root` as given rather than re-derived here.
@@ -67,15 +71,21 @@ pub fn journal_dir(
                 // parent is reached only when the target names one plain file.
                 _ => root.clone(),
             };
-            // The deepest pre-existing ancestor of the parent — the sync anchor. Existence
-            // is `symlink_metadata`: a dangling symlink is an existing entry, so it is never
-            // silently replaced by a created directory.
-            let anchor = deepest_existing_ancestor(&parent);
+            // The root is the host's: it must already exist — durable — before the first
+            // publication. The publisher never creates it, because the entry that names it
+            // lives in its parent and only the host can establish that durability.
+            if std::fs::symlink_metadata(&root).is_err() {
+                return Err(SpiError::InvalidInput(format!(
+                    "journal root {} does not exist: the host must create it — durable — before publication",
+                    root.display()
+                )));
+            }
             // Symlink escape, refused before anything is created — but only where a symlink
-            // can exist: inside the root. An anchor strictly within the root means the root
-            // itself exists, so both canonicalize; an anchor at or above the root means the
-            // root itself is missing, and a root that does not exist yet holds no symlinks to
-            // escape through — its containment is the post-creation check's job.
+            // can exist: inside the root. The deepest pre-existing component strictly within
+            // the root is canonicalized and must resolve inside the canonical root; a target
+            // whose parent sits in a freshly creatable subtree has no symlink to escape
+            // through yet, and its containment is the post-creation check's job.
+            let anchor = deepest_existing_ancestor(&parent);
             if anchor != root && anchor.starts_with(&root) {
                 let canonical_root = root.canonicalize().map_err(|error| {
                     SpiError::Settlement(spoke_reject(format!(
@@ -121,6 +131,17 @@ pub fn journal_dir(
                     "journal target {path} resolves outside the journal root"
                 )));
             }
+            // The target file itself must not redirect the write: a symlink — or any other
+            // pre-existing entry that is not a regular file — at the target name is refused
+            // before the first byte. A regular file is the retry of this same target's own
+            // earlier write and is replaced with the identical bytes.
+            if let Ok(metadata) = std::fs::symlink_metadata(&file) {
+                if !metadata.file_type().is_file() {
+                    return Err(SpiError::InvalidInput(format!(
+                        "journal target {path} already exists as a non-file entry"
+                    )));
+                }
+            }
             std::fs::write(&file, content).map_err(|error| {
                 SpiError::Settlement(spoke_reject(format!(
                     "journal target {path} could not be written: {error}"
@@ -148,7 +169,7 @@ pub fn journal_dir(
                             directory.display()
                         )))
                     })?;
-                if directory == anchor {
+                if directory == root {
                     break;
                 }
                 cursor = directory.parent().map(Path::to_path_buf);

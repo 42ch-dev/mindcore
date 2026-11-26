@@ -71,8 +71,10 @@ async fn main() {
     .expect("provision the subject");
 
     // 2. Open the handle. The crate's one journal publisher writes the review's file effects
-    //    under the scratch root at their own paths.
+    //    under the scratch root at their own paths — the host creates the root first, because
+    //    the publisher never does: the entry that names it is the host's to make durable.
     let journal_root = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_root).expect("the host creates the journal root");
     let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
         .with_journal_publisher(journal_dir(journal_root));
 

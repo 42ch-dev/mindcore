@@ -84,16 +84,18 @@ surface deliberately: the served caller holds the receipt protocol that resolves
 leaves no record to resolve. The cost is an orphan published file when the process dies
 between publication and the staging commit.
 
-`journal_dir(root)` confines every target to its canonical root: a target path that is
-absolute or carries `..` is refused before its first byte, and what remains is canonicalized —
-a parent whose resolution leaves the canonical root through a symlink below it is refused
-before anything is created or written. Durability ends at the deepest pre-existing ancestor
-of the target's parent, inclusive: everything below it was created by this publication and is
-synced on every attempt, and when `root` itself is absent the entry that names the freshly
-created root — in its existing parent — is persisted before `Ok(())`, so a settled record can
-never outlive the projection tree that proves it. Syncing a directory opens it for reading,
-so the host must grant read on the deepest pre-existing ancestor and everything below it;
-ancestors above it need only traversal — a write-only journal root cannot be published,
+`journal_dir(root)` confines every target to its canonical root, and the root is the host's:
+it must exist — durable — before the first publication, because the entry that names it lives
+in its parent and only the host can establish that durability. A missing root is refused with
+the requirement named, and the publisher never creates it. Everything the publisher creates
+is beneath the root. A target path that is absolute or carries `..` is refused before its
+first byte; what remains is canonicalized — a parent resolving outside the canonical root
+through a symlink below it, or a symlink at the target file itself, is refused before anything
+is written. Durability syncs the target's file, then every directory beneath the root the
+publication created or wrote into, deepest first, ending at the root itself — a pure function
+of the target's path, so a retry can never be weaker than the attempt that failed. Syncing a
+directory opens it for reading, so the host must grant read on the root and everything beneath
+it; ancestors above it need only traversal — a write-only journal root cannot be published,
 because the sync that must precede settlement would be refused for a reason the write itself
 never hit.
 

@@ -663,52 +663,50 @@ async fn a_pending_candidate_at_a_non_one_revision_reviews_and_replays() {
     );
 }
 
-/// The public publisher creates a root that does not exist yet and leaves the target's exact
-/// bytes at the target's own path; the durable directory chain it syncs is unit-tested in
-/// `journal.rs` (deepest created directory first, ending at the nearest existing ancestor).
+/// The root is the host's: the publisher never creates it. A missing root is refused with the
+/// requirement named, and nothing is created anywhere.
 #[tokio::test]
-async fn the_public_publisher_creates_and_publishes_a_nested_root() {
+async fn the_public_publisher_refuses_a_root_that_does_not_exist() {
     let dir = TempDir::new().expect("temporary directory");
     let root = dir.path().join("nested/publish/root");
     assert!(!root.exists(), "the root starts absent");
     let publisher = mindcore_runtime::journal_dir(&root);
-    publisher(&[json!({
+    let published = publisher(&[json!({
         "path": "records/rec_nested.md",
         "content": "exact published bytes",
-    })])
-    .expect("publish into a root that does not exist yet");
-    assert_eq!(
-        std::fs::read_to_string(root.join("records").join("rec_nested.md"))
-            .expect("the published target"),
-        "exact published bytes"
+    })]);
+    let error = published.expect_err("a missing root is refused");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("does not exist"),
+        "the refusal names the missing root requirement: {message}"
+    );
+    assert!(
+        !dir.path().join("nested").exists(),
+        "the publisher created nothing"
     );
 }
 
-/// A relative root is anchored at the current directory: a root that does not exist yet is
-/// created and published instead of refusing on the empty parent path. The scratch tree sits
-/// directly under the package root cargo runs tests from — no pre-existing intermediate can
-/// stand in for the current-directory anchor — and is removed before the assertions.
+/// A root the host created receives a nested subtree beneath it: the publisher creates the
+/// directories between the root and the target and lands the exact bytes at the target's own
+/// path.
 #[tokio::test]
-async fn the_public_publisher_handles_a_relative_root_that_does_not_exist_yet() {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after the epoch")
-        .as_nanos();
-    let relative = format!("journal-relative-{}-{unique}", std::process::id());
-    let root = std::path::PathBuf::from(&relative);
-    assert!(!root.exists(), "the relative root starts absent");
-    let publisher = mindcore_runtime::journal_dir(&relative);
-    let published = publisher(&[json!({
-        "path": "records/rec_relative.md",
-        "content": "relative root bytes",
-    })]);
-    let read_back = std::fs::read_to_string(root.join("records").join("rec_relative.md"));
-    std::fs::remove_dir_all(&root).ok();
-    published.expect("a relative root publishes");
+async fn the_public_publisher_publishes_a_nested_subtree_under_an_existing_root() {
+    let dir = TempDir::new().expect("temporary directory");
+    let root = dir.path().join("journal");
+    std::fs::create_dir_all(&root).expect("the host creates the root");
+    let publisher = mindcore_runtime::journal_dir(&root);
+    publisher(&[json!({
+        "path": "deeply/nested/records/rec_nested.md",
+        "content": "exact published bytes",
+    })])
+    .expect("publish beneath an existing root");
     assert_eq!(
-        read_back.expect("the published target"),
-        "relative root bytes",
-        "the relative root holds the target at its own path"
+        std::fs::read_to_string(
+            root.join("deeply").join("nested").join("records").join("rec_nested.md")
+        )
+        .expect("the published target"),
+        "exact published bytes"
     );
 }
 
@@ -1541,17 +1539,25 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         parked.review(&candidate_id, &promote(), "rev-offworker").await
     });
 
-    // Wait for entry asynchronously — the probe starts only after the publisher is parked.
+    // Wait for entry asynchronously, with a hard bound: if the publisher never enters — the
+    // regression this test guards — the timeout fails the test instead of parking it forever.
     let entered_wait = entered.clone();
-    tokio::task::spawn_blocking(move || {
-        let (lock, cvar) = &*entered_wait;
-        let mut flag = lock.lock().expect("the entry lock");
-        while !*flag {
-            flag = cvar.wait(flag).expect("wait for publisher entry");
-        }
-    })
-    .await
-    .expect("the publisher is parked inside its flush");
+    let entry = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let (lock, cvar) = &*entered_wait;
+            let mut flag = lock.lock().expect("the entry lock");
+            while !*flag {
+                flag = cvar.wait(flag).expect("wait for publisher entry");
+            }
+        }),
+    )
+    .await;
+    assert!(
+        entry.is_ok(),
+        "the publisher never entered its flush — the publication never started"
+    );
+    entry.expect("the entry wait did not panic").expect("the entry task joins");
 
     // The probe: progress measurable only on a free single worker.
     let (progressed, is_progressed) = tokio::sync::oneshot::channel::<()>();
@@ -1636,9 +1642,20 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     // The retry handle is opened before the review starts: the store's pool has one
     // connection, and once the staging transaction holds it nothing — not even a registry read
     // — can acquire another until the transaction ends. That is the serialization the test
-    // relies on, and pre-opening is what keeps the test itself out of that queue.
-    let working = ok(Mind::open(&store, &owner, &created.id).await)
-        .with_journal_publisher(journal_dir(&journal_root));
+    // relies on, and pre-opening is what keeps the test itself out of that queue. The retry's
+    // publisher signals when it is entered, which can only happen after the retry's own
+    // staging transaction acquired the pool.
+    let retry_entered = Arc::new(std::sync::Mutex::new(false));
+    let retry_flag = retry_entered.clone();
+    let retry_root_handle = journal_root.clone();
+    let working = {
+        let retry_entered = retry_entered.clone();
+        ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
+            journal_dir(&retry_root_handle)(targets)?;
+            *retry_entered.lock().expect("the retry entry lock") = true;
+            Ok(())
+        })
+    };
     let cancelled_id = candidate_id.clone();
     let review = tokio::spawn(async move {
         parked.review(&cancelled_id, &promote(), "rev-cancelled").await
@@ -1657,21 +1674,39 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     .expect("the publisher is parked inside its flush");
     review.abort();
 
-    // A same-key retry now: its staging transaction cannot acquire until the cancelled
-    // attempt's transaction rolls back — and that rollback cannot happen before the parked
-    // publication ends. Release the parked publisher, then the retry settles the key. The
-    // ownership invariant is what makes this wait exist at all: if the cancelled attempt
-    // released its transaction while parked, the retry's staging and publication would race
-    // the first publish instead of queueing behind its rollback.
+    // A same-key retry while the first publication is still parked. The retry instrumented
+    // here proves the ordering directly: its own publisher signals when it is entered, and
+    // that entry can only happen after the retry's staging transaction acquired the pool —
+    // which the cancelled attempt's rollback gates. If the cancelled attempt released its
+    // transaction while its publication was still parked, the retry would publish before the
+    // first attempt's flush ended, and the final assertions would catch the race.
+    let retrying = working;
+    let retry = tokio::spawn({
+        let candidate_id = candidate_id.clone();
+        async move {
+            retrying.review(&candidate_id, &promote(), "rev-cancelled").await
+        }
+    });
+
+    // Give the retry a real chance to race: yield until it has had every opportunity to enter
+    // its publication while the first one is still parked.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !*retry_flag.lock().expect("the retry entry lock"),
+        "the retry must not publish while the cancelled attempt's publication is still live"
+    );
+
+    // Release the parked publisher: the cancelled attempt's publication ends, its transaction
+    // rolls back, and only then can the retry's staging acquire.
     {
         let (lock, cvar) = &*released;
         let mut flag = lock.lock().expect("the release lock");
         *flag = true;
         cvar.notify_all();
     }
-    let reviewed = ok(working
-        .review(&candidate_id, &promote(), "rev-cancelled")
-        .await);
+    let reviewed = ok(retry.await.expect("the retry task joins"));
     assert_eq!(
         value_of(&reviewed)["status"],
         "committed",
@@ -1800,8 +1835,28 @@ async fn the_public_publisher_refuses_a_target_that_resolves_outside_its_root() 
         "nothing was written at the external destination"
     );
 
-    // A symlink at the destination itself — the file the write would follow — is refused the
-    // same way: the parent chain stays inside the root, and the confined target lands.
+    // A symlink at the target file itself is refused too: bytes must never follow it outside
+    // the root.
+    std::fs::create_dir_all(root.join("candidates")).expect("create the target parent");
+    std::os::unix::fs::symlink(
+        outside.join("planted.md"),
+        root.join("candidates").join("rec_target.md"),
+    )
+    .expect("plant the target symlink");
+    let at_target = publisher(&[json!({
+        "path": "candidates/rec_target.md",
+        "content": "escape through the target file",
+    })]);
+    assert!(
+        at_target.is_err(),
+        "a symlink at the target file is refused"
+    );
+    assert!(
+        !outside.join("planted.md").exists(),
+        "nothing was written through the target symlink"
+    );
+
+    // The parent chain stays inside the root, and the confined target lands.
     publisher(&[json!({
         "path": "profiles/rec_confined.md",
         "content": "confined bytes",
