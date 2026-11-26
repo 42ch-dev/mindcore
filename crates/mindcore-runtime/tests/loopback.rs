@@ -671,9 +671,39 @@ impl Transport for RecordingTransport {
     }
 }
 
-/// The paths this suite's answers put a receipt body at: the response `payload` itself, and
-/// `payload.receipt` for `memory.receipts.get`. Those two objects, and no others, are receipts.
-const RECEIPT_PATHS: [&str; 2] = ["$.payload", "$.payload.receipt"];
+/// One step into a decoded frame: an object member by its literal key, or an array element by its
+/// index. A key that happens to contain a dot stays one step, so it can never be read as two
+/// nesting levels.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// Render a path for a failure message. Every key is quoted, so a key that contains a dot reads as
+/// the one member it is rather than as a path.
+fn rendered(path: &[Step<'_>]) -> String {
+    let mut out = String::from("$");
+    for step in path {
+        match step {
+            Step::Key(key) => out.push_str(&format!("[\"{key}\"]")),
+            Step::Index(index) => out.push_str(&format!("[{index}]")),
+        }
+    }
+    out
+}
+
+/// Whether `path` is an object this suite's answers put a receipt body at: the response `payload`
+/// itself, and `payload.receipt` for `memory.receipts.get`.
+///
+/// The comparison is segment by segment, so a member whose literal key is `payload.receipt` is one
+/// key at one level and is not this path.
+fn is_receipt_path(path: &[Step<'_>]) -> bool {
+    matches!(
+        path,
+        [Step::Key("payload")] | [Step::Key("payload"), Step::Key("receipt")]
+    )
+}
 
 /// Every occurrence of the caller in one decoded wire frame that must not be there, as
 /// `path: needle`; empty when the frame carries it only in a receipt's own attribution.
@@ -682,14 +712,15 @@ const RECEIPT_PATHS: [&str; 2] = ["$.payload", "$.payload.receipt"];
 /// the op's DTO and drops every member the DTO does not declare: a leak under an unmodelled key
 /// is invisible after decoding but present here. Object keys are walked too: a principal used as
 /// a key discloses it as surely as a value does.
-fn caller_leaks(value: &Value, path: &str) -> Vec<String> {
+fn caller_leaks<'a>(value: &'a Value, path: &mut Vec<Step<'a>>) -> Vec<String> {
     let mut leaks = Vec::new();
     match value {
         Value::Object(members) => {
             for (key, member) in members {
-                let here = format!("{path}.{key}");
+                path.push(Step::Key(key.as_str()));
                 if key.contains("mindcore_caller") || key.contains(PRINCIPAL) {
-                    leaks.push(format!("{here}: the caller as a key"));
+                    leaks.push(format!("{}: the caller as a key", rendered(path)));
+                    path.pop();
                     continue;
                 }
                 // A receipt's own `requester_principal_id` is the caller's attribution of the
@@ -698,28 +729,35 @@ fn caller_leaks(value: &Value, path: &str) -> Vec<String> {
                 // the receipt's own path, holding the expected scalar. Any other position,
                 // nesting or value leaks.
                 if key == "requester_principal_id" {
-                    let attributed = RECEIPT_PATHS.contains(&path)
+                    // `path` ends with this member; the exemption is a property of the object
+                    // holding it.
+                    let attributed = is_receipt_path(&path[..path.len() - 1])
                         && members.contains_key("receipt_id")
                         && member.as_str() == Some(PRINCIPAL);
                     if !attributed {
                         leaks.push(format!(
-                            "{here}: the caller outside a receipt's attribution"
+                            "{}: the caller outside a receipt's attribution",
+                            rendered(path)
                         ));
                     }
+                    path.pop();
                     continue;
                 }
-                leaks.extend(caller_leaks(member, &here));
+                leaks.extend(caller_leaks(member, path));
+                path.pop();
             }
         }
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
-                leaks.extend(caller_leaks(item, &format!("{path}[{index}]")));
+                path.push(Step::Index(index));
+                leaks.extend(caller_leaks(item, path));
+                path.pop();
             }
         }
         Value::String(text) => {
             for needle in ["mindcore_caller", PRINCIPAL] {
                 if text.contains(needle) {
-                    leaks.push(format!("{path}: {needle}"));
+                    leaks.push(format!("{}: {needle}", rendered(path)));
                 }
             }
         }
@@ -737,7 +775,7 @@ fn assert_caller_absent(session: &Session, context: &str) {
     for frame in &frames {
         let parsed: Value = serde_json::from_str(frame)
             .unwrap_or_else(|error| panic!("{context}: the wire frame is JSON ({error}): {frame}"));
-        let leaks = caller_leaks(&parsed, "$");
+        let leaks = caller_leaks(&parsed, &mut Vec::new());
         assert!(
             leaks.is_empty(),
             "{context}: the answer carries the caller: {leaks:?}"
@@ -3411,8 +3449,8 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
             .await
             .expect("count the receipts")
     };
-    // The persisted Mind row by row — space, registry, carrier — projected whole, so a write to
-    // any column of any of the three shows up as a difference.
+    // The persisted Mind row by row — space, registry, carrier, grants — projected whole, so a
+    // write to any column of any of them shows up as a difference; an in-place grant edit too.
     let mind_rows = |pool: sqlx::SqlitePool, space: &'static str| async move {
         let space_row = sqlx::query_scalar::<_, String>(
             "SELECT json_object('space_id', space_id, 'display_name', display_name, \
@@ -3445,8 +3483,28 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         .fetch_one(&pool)
         .await
         .expect("the carrier entry");
+        let grants: Vec<String> = sqlx::query_scalar(
+            "SELECT json_object('grant_id', grant_id, 'principal_id', principal_id, \
+             'subject_id', subject_id, 'capabilities_json', capabilities_json, \
+             'context_ids_json', context_ids_json, 'shared_access', shared_access, \
+             'expires_at', expires_at, 'revoked_at', revoked_at, 'revision', revision, \
+             'created_at', created_at) \
+             FROM memory_grants WHERE space_id = ? ORDER BY grant_id",
+        )
+        .bind(space)
+        .fetch_all(&pool)
+        .await
+        .expect("the grant rows");
         let row = |json: String| serde_json::from_str::<Value>(&json).expect("the row's json");
-        (row(space_row), row(registry), row(carrier))
+        (
+            row(space_row),
+            row(registry),
+            row(carrier),
+            grants
+                .iter()
+                .map(|grant| row(grant.clone()))
+                .collect::<Vec<Value>>(),
+        )
     };
 
     let created = wire(expect_ok(
@@ -3511,7 +3569,8 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
     assert_eq!(contexts, "[]", "the default grant restricts no context");
     assert_eq!(expires, None, "the default grant never expires");
 
-    // The Mind as the create left it: the space row, the registry row and the carrier entry.
+    // The Mind as the create left it: the space row, the registry row, the carrier entry and the
+    // creator's one grant row.
     let mind_before = mind_rows(pool.clone(), "spc_wire").await;
     assert_eq!(
         mind_before.1,
@@ -3521,6 +3580,21 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
             "carrier_entry_id": CARRIER,
         }),
         "the create's registry row names the Mind's own collection and carrier"
+    );
+    assert_eq!(
+        mind_before.3.len(),
+        1,
+        "the served create wrote exactly one grant: {:?}",
+        mind_before.3
+    );
+    assert_eq!(mind_before.3[0]["principal_id"], json!(PRINCIPAL));
+    assert_eq!(mind_before.3[0]["subject_id"], Value::Null);
+    assert_eq!(mind_before.3[0]["context_ids_json"], json!("[]"));
+    assert_eq!(mind_before.3[0]["expires_at"], Value::Null);
+    assert_eq!(
+        mind_before.3[0]["capabilities_json"],
+        json!(granted),
+        "the snapshot holds the same default capability set the query above pins"
     );
 
     let replay = wire(expect_ok(
@@ -3574,8 +3648,9 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         1,
         "a repeat writes no second grant row"
     );
-    // The repeat's only difference: its receipt. The space row, the registry row and the carrier
-    // entry are exactly what the create wrote.
+    // The repeat's only difference: its receipt. The space row, the registry row, the carrier
+    // entry and the creator's grant row are exactly what the create wrote — a widened capability
+    // set or a moved expiry on that grant would differ here.
     assert_eq!(
         mind_rows(pool.clone(), "spc_wire").await,
         mind_before,
@@ -3704,18 +3779,19 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
 /// The absence walk is not vacuous, and its one permitted occurrence is narrow: a receipt's own
 /// `requester_principal_id`, at a receipt's own path, holding the expected scalar. Everything
 /// else — another key, another path, a nested value, a different principal, a principal used as
-/// an object key — is a leak.
+/// an object key, a key that merely spells a receipt path — is a leak.
 #[test]
 fn the_caller_absence_walk_catches_a_leak_under_any_key() {
     let frame =
         |body: &str| -> Value { serde_json::from_str(body).expect("the fixture frame is JSON") };
+    let leaks = |body: &str| -> Vec<String> { caller_leaks(&frame(body), &mut Vec::new()) };
     // The two receipt paths, and only those, carry the attribution.
     for clean in [
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
         r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
     ] {
         assert_eq!(
-            caller_leaks(&frame(clean), "$"),
+            leaks(clean),
             Vec::<String>::new(),
             "the walk accepts the receipt's own attribution: {clean}"
         );
@@ -3733,11 +3809,11 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
         // The same member at a receipt path but holding something other than the expected scalar.
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
         r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":["prn_loopback"]}}}"#,
+        // A single member whose literal key spells a receipt path is one key at one level, not a
+        // receipt nesting: the wrong value inside it must not be read as the permitted one.
+        r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
+        r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
     ] {
-        assert_eq!(
-            caller_leaks(&frame(leak), "$").len(),
-            1,
-            "the walk names the leak in: {leak}"
-        );
+        assert_eq!(leaks(leak).len(), 1, "the walk names the leak in: {leak}");
     }
 }

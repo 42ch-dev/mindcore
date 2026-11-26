@@ -102,14 +102,14 @@ impl Harness {
             .expect("count")
     }
 
-    /// The persisted Mind, row by row: the space row, the registry row and the carrier entry the
-    /// registry names. Each row is projected whole, so a write to any column shows up; `None`
-    /// means the row is gone.
+    /// The persisted Mind, row by row: the space row, the registry row, the carrier entry the
+    /// registry names, and the creator's default grant. Each row is projected whole, so a write to
+    /// any column shows up — an in-place grant edit included — and `None` means the row is gone.
     async fn mind_rows(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         space: &str,
-    ) -> (Option<String>, Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
         let space_row = sqlx::query_scalar(
             "SELECT json_object('space_id', space_id, 'display_name', display_name, \
              'authority_host_id', authority_host_id, 'authority_generation', \
@@ -141,7 +141,21 @@ impl Harness {
         .fetch_optional(&mut **tx)
         .await
         .expect("the carrier entry");
-        (space_row, registry, carrier)
+        // Every grant row in the Mind, ordered by id, so a grant edited in place — a widened
+        // `capabilities_json`, a moved expiry, a revoked row — differs from the snapshot.
+        let grants: Vec<String> = sqlx::query_scalar(
+            "SELECT json_object('grant_id', grant_id, 'principal_id', principal_id, \
+             'subject_id', subject_id, 'capabilities_json', capabilities_json, \
+             'context_ids_json', context_ids_json, 'shared_access', shared_access, \
+             'expires_at', expires_at, 'revoked_at', revoked_at, 'revision', revision, \
+             'created_at', created_at) \
+             FROM memory_grants WHERE space_id = ? ORDER BY grant_id",
+        )
+        .bind(space)
+        .fetch_all(&mut **tx)
+        .await
+        .expect("the grant rows");
+        (space_row, registry, carrier, grants)
     }
 
     /// Count after the caller's transaction ended, when the only connection is
@@ -5305,11 +5319,11 @@ async fn create_of_a_frozen_space_under_admin_answers_space_frozen() {
 }
 
 /// A repeat create by an admin under a fresh key changes no space, grant or revision, and leaves
-/// the registry row and the carrier entry exactly as the create wrote them; its own receipt is the
-/// only row it adds.
+/// the registry row, the carrier entry and the creator's grant exactly as the create wrote them;
+/// its own receipt is the only row it adds.
 ///
 /// The Mind is created here rather than seeded, because a seeded space has no registry row for a
-/// repeat to leave alone: the snapshot below only proves something when all three rows exist.
+/// repeat to leave alone: the snapshot below only proves something when all four rows exist.
 #[tokio::test]
 async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else() {
     let harness = Harness::open().await;
@@ -5346,6 +5360,39 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
         before.0.is_some() && before.1.is_some() && before.2.is_some(),
         "the create wrote the space, the registry row and the carrier: {before:?}"
     );
+    // The creator's own row, pinned whole: a repeat that widened its capabilities or moved its
+    // expiry has to show up below. The seeded admin row lives in another space and is not part of
+    // this Mind's snapshot.
+    let grant_rows: Vec<Value> = before
+        .3
+        .iter()
+        .map(|row| serde_json::from_str(row).expect("grant row json"))
+        .collect();
+    assert_eq!(
+        grant_rows.len(),
+        1,
+        "the create writes one grant in the new Mind: {grant_rows:?}"
+    );
+    let creator = &grant_rows[0];
+    assert_eq!(
+        creator["principal_id"],
+        json!(PRINCIPAL),
+        "the default grant is issued to the creating principal"
+    );
+    assert_eq!(
+        creator["capabilities_json"],
+        json!(
+            r#"["recall","capture","review","records_write","knowledge_read","knowledge_write","admin"]"#
+        ),
+        "the snapshot holds the creator's full default capability set"
+    );
+    assert_eq!(creator["subject_id"], Value::Null, "space-wide");
+    assert_eq!(
+        creator["context_ids_json"],
+        json!("[]"),
+        "no context restriction"
+    );
+    assert_eq!(creator["expires_at"], Value::Null, "never expiring");
     tx.rollback().await.expect("rollback");
 
     let mut tx = harness.begin().await;
@@ -5374,7 +5421,7 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
     );
     assert_eq!(repeat["result"]["status"], json!("active"));
 
-    // The registry row and the carrier entry byte-identical, and the space row with them: the
+    // The registry row, the carrier entry, the space row and both grant rows byte-identical: the
     // receipt is the only difference the repeat is allowed to leave.
     assert_eq!(
         harness.mind_rows(&mut tx, "sp_repeat").await,
