@@ -5212,6 +5212,61 @@ async fn a_retained_create_receipt_answers_before_the_grant_and_freeze_checks() 
     tx.rollback().await.expect("rollback");
 }
 
+/// §7.0.5 on the create path: the same key with a different payload is `IDEMPOTENCY_CONFLICT` and
+/// leaves the receipt count unchanged. The second request differs only in `display_name`, the one
+/// member that reaches the space row, so this fails if the create's digest stops binding it.
+#[tokio::test]
+async fn a_create_key_reused_with_a_different_display_name_rejects_as_idempotency_conflict() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": "sp_conflict",
+                    "display_name": "the name the key was first used for",
+                    "idempotency_key": "create-conflict"
+                }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit");
+
+    let mut tx = harness.begin().await;
+    let before = harness.count(&mut tx, "memory_receipts").await;
+    let refused = adapter
+        .create_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": "sp_conflict",
+                "display_name": "a different name under the same key",
+                "idempotency_key": "create-conflict"
+            }),
+        )
+        .await;
+    let reject = reject(&refused);
+    assert_eq!(reject.code, SpokeRejectCode::IdempotencyConflict);
+    assert_eq!(retry_class(reject), "terminal");
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        before,
+        "a conflicting key writes no second receipt"
+    );
+    assert_eq!(
+        harness
+            .count(&mut tx, "memory_spaces WHERE space_id = 'sp_conflict'")
+            .await,
+        1,
+        "a conflicting key writes no second space"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
 /// A frozen space under a caller holding space-wide `admin` answers `SPACE_FROZEN`, and stages no
 /// receipt: the freeze gate is a lifecycle gate on the fresh effect, not a dedup answer.
 #[tokio::test]
