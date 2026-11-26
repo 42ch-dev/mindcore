@@ -102,6 +102,48 @@ impl Harness {
             .expect("count")
     }
 
+    /// The persisted Mind, row by row: the space row, the registry row and the carrier entry the
+    /// registry names. Each row is projected whole, so a write to any column shows up; `None`
+    /// means the row is gone.
+    async fn mind_rows(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        space: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let space_row = sqlx::query_scalar(
+            "SELECT json_object('space_id', space_id, 'display_name', display_name, \
+             'authority_host_id', authority_host_id, 'authority_generation', \
+             authority_generation, 'status', status, 'revision', revision, \
+             'created_at', created_at) FROM memory_spaces WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_optional(&mut **tx)
+        .await
+        .expect("the space row");
+        let registry = sqlx::query_scalar(
+            "SELECT json_object('space_id', space_id, 'knowledge_collection', \
+             knowledge_collection, 'carrier_entry_id', carrier_entry_id) \
+             FROM minds WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_optional(&mut **tx)
+        .await
+        .expect("the registry row");
+        let carrier = sqlx::query_scalar(
+            "SELECT json_object('entry_id', entry_id, 'revision', revision, 'payload', payload, \
+             'history_floor_revision', history_floor_revision, \
+             'cognition_head_seq', cognition_head_seq, 'superseded_by', superseded_by, \
+             'created_at', created_at, 'updated_at', updated_at) \
+             FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(format!("mind:{space}"))
+        .bind(mindcore_sqlite::minds::CARRIER_ENTRY_ID)
+        .fetch_optional(&mut **tx)
+        .await
+        .expect("the carrier entry");
+        (space_row, registry, carrier)
+    }
+
     /// Count after the caller's transaction ended, when the only connection is
     /// free again.
     async fn count_pool(&self, table: &str) -> i64 {
@@ -5207,8 +5249,12 @@ async fn create_of_a_frozen_space_under_admin_answers_space_frozen() {
     tx.rollback().await.expect("rollback");
 }
 
-/// A repeat create by an admin under a fresh key changes no space, grant or revision and answers
-/// `created: false` with the space's current state; its own receipt is the only row it adds.
+/// A repeat create by an admin under a fresh key changes no space, grant or revision, and leaves
+/// the registry row and the carrier entry exactly as the create wrote them; its own receipt is the
+/// only row it adds.
+///
+/// The Mind is created here rather than seeded, because a seeded space has no registry row for a
+/// repeat to leave alone: the snapshot below only proves something when all three rows exist.
 #[tokio::test]
 async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else() {
     let harness = Harness::open().await;
@@ -5221,12 +5267,16 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
             .create_space(
                 &mut tx,
                 &principal(PRINCIPAL),
-                json!({ "space_id": SPACE, "idempotency_key": "create-repeat-1" }),
+                json!({
+                    "space_id": "sp_repeat",
+                    "display_name": "space",
+                    "idempotency_key": "create-repeat-1"
+                }),
             )
             .await,
     );
     tx.commit().await.expect("commit");
-    assert_eq!(first["result"]["created"], json!(false));
+    assert_eq!(first["result"]["created"], json!(true));
     assert_eq!(first["result"]["revision"], json!(1));
     assert_eq!(first["result"]["status"], json!("active"));
     assert_eq!(
@@ -5236,13 +5286,21 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
     );
 
     let mut tx = harness.begin().await;
+    let before = harness.mind_rows(&mut tx, "sp_repeat").await;
+    assert!(
+        before.0.is_some() && before.1.is_some() && before.2.is_some(),
+        "the create wrote the space, the registry row and the carrier: {before:?}"
+    );
+    tx.rollback().await.expect("rollback");
+
+    let mut tx = harness.begin().await;
     let repeat = ready(
         adapter
             .create_space(
                 &mut tx,
                 &principal(PRINCIPAL),
                 json!({
-                    "space_id": SPACE,
+                    "space_id": "sp_repeat",
                     "display_name": "a name a repeat must not write",
                     "idempotency_key": "create-repeat-2"
                 }),
@@ -5261,22 +5319,17 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
     );
     assert_eq!(repeat["result"]["status"], json!("active"));
 
-    let (display_name, revision): (Option<String>, i64) =
-        sqlx::query_as("SELECT display_name, revision FROM memory_spaces WHERE space_id = ?")
-            .bind(SPACE)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("the space row");
+    // The registry row and the carrier entry byte-identical, and the space row with them: the
+    // receipt is the only difference the repeat is allowed to leave.
     assert_eq!(
-        display_name.as_deref(),
-        Some("space"),
-        "a repeat changes no space"
+        harness.mind_rows(&mut tx, "sp_repeat").await,
+        before,
+        "a repeat writes nothing but its receipt"
     );
-    assert_eq!(revision, 1);
     assert_eq!(
         harness.count(&mut tx, "memory_grants").await,
-        1,
-        "a repeat adds no second grant row"
+        2,
+        "the seeded admin row and the creator's: a repeat adds no third"
     );
     assert_eq!(
         harness.count(&mut tx, "memory_receipts").await,

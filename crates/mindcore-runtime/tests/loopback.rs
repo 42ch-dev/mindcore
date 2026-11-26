@@ -671,28 +671,40 @@ impl Transport for RecordingTransport {
     }
 }
 
+/// The paths this suite's answers put a receipt body at: the response `payload` itself, and
+/// `payload.receipt` for `memory.receipts.get`. Those two objects, and no others, are receipts.
+const RECEIPT_PATHS: [&str; 2] = ["$.payload", "$.payload.receipt"];
+
 /// Every occurrence of the caller in one decoded wire frame that must not be there, as
-/// `path: needle`; empty when the frame carries it only where a receipt may.
+/// `path: needle`; empty when the frame carries it only in a receipt's own attribution.
 ///
 /// This walks the raw frame rather than the typed response, because `invoke_mapped` decodes into
 /// the op's DTO and drops every member the DTO does not declare: a leak under an unmodelled key
-/// is invisible after decoding but present here.
+/// is invisible after decoding but present here. Object keys are walked too: a principal used as
+/// a key discloses it as surely as a value does.
 fn caller_leaks(value: &Value, path: &str) -> Vec<String> {
     let mut leaks = Vec::new();
     match value {
         Value::Object(members) => {
             for (key, member) in members {
                 let here = format!("{path}.{key}");
-                if key.contains("mindcore_caller") {
-                    leaks.push(format!("{here}: the binding namespace as a key"));
+                if key.contains("mindcore_caller") || key.contains(PRINCIPAL) {
+                    leaks.push(format!("{here}: the caller as a key"));
                     continue;
                 }
-                // A receipt names its own requester, and that attribution is about this caller's
-                // own request rather than the scope binding. It is the only place the id may
-                // appear, and only on a receipt: any other object carrying the member leaks.
+                // A receipt's own `requester_principal_id` is the caller's attribution of the
+                // request it made, required by the receipt polling contract, and is not the
+                // admission binding. It is the one permitted occurrence: this receipt object, at
+                // the receipt's own path, holding the expected scalar. Any other position,
+                // nesting or value leaks.
                 if key == "requester_principal_id" {
-                    if !members.contains_key("receipt_id") {
-                        leaks.push(format!("{here}: the caller outside a receipt"));
+                    let attributed = RECEIPT_PATHS.contains(&path)
+                        && members.contains_key("receipt_id")
+                        && member.as_str() == Some(PRINCIPAL);
+                    if !attributed {
+                        leaks.push(format!(
+                            "{here}: the caller outside a receipt's attribution"
+                        ));
                     }
                     continue;
                 }
@@ -2758,6 +2770,7 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
         ),
     );
     let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
+    session.wire.drain();
 
     let created = wire(expect_ok(
         MemoryPort::create_export(
@@ -2782,9 +2795,17 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
         .await,
         "memory.receipts.get",
     ));
+    // The poll answers a receipt at `payload.receipt`: that is the one other place the caller may
+    // appear, and only as the receipt's own `requester_principal_id` attribution.
+    assert_caller_absent(&session, "the receipt poll answer");
     assert_eq!(polled["receipt"]["op"], json!("memory.exports.create"));
     assert_eq!(polled["receipt"]["status"], json!("committed"));
     assert_eq!(polled["receipt"]["receipt_id"], json!(receipt_id));
+    assert_eq!(
+        polled["receipt"]["requester_principal_id"],
+        json!(PRINCIPAL),
+        "the poll answers the caller's own attribution of the request it made"
+    );
 }
 
 fn typed<T: serde::de::DeserializeOwned>(value: Value) -> T {
@@ -3385,6 +3406,43 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
             .await
             .expect("count the receipts")
     };
+    // The persisted Mind row by row — space, registry, carrier — projected whole, so a write to
+    // any column of any of the three shows up as a difference.
+    let mind_rows = |pool: sqlx::SqlitePool, space: &'static str| async move {
+        let space_row = sqlx::query_scalar::<_, String>(
+            "SELECT json_object('space_id', space_id, 'display_name', display_name, \
+             'authority_host_id', authority_host_id, 'authority_generation', \
+             authority_generation, 'status', status, 'revision', revision, \
+             'created_at', created_at) FROM memory_spaces WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_one(&pool)
+        .await
+        .expect("the space row");
+        let registry = sqlx::query_scalar::<_, String>(
+            "SELECT json_object('space_id', space_id, 'knowledge_collection', \
+             knowledge_collection, 'carrier_entry_id', carrier_entry_id) \
+             FROM minds WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_one(&pool)
+        .await
+        .expect("the registry row");
+        let carrier = sqlx::query_scalar::<_, String>(
+            "SELECT json_object('entry_id', entry_id, 'revision', revision, 'payload', payload, \
+             'history_floor_revision', history_floor_revision, \
+             'cognition_head_seq', cognition_head_seq, 'superseded_by', superseded_by, \
+             'created_at', created_at, 'updated_at', updated_at) \
+             FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(format!("mind:{space}"))
+        .bind(CARRIER)
+        .fetch_one(&pool)
+        .await
+        .expect("the carrier entry");
+        let row = |json: String| serde_json::from_str::<Value>(&json).expect("the row's json");
+        (row(space_row), row(registry), row(carrier))
+    };
 
     let created = wire(expect_ok(
         MemoryPort::create_space(
@@ -3448,6 +3506,18 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
     assert_eq!(contexts, "[]", "the default grant restricts no context");
     assert_eq!(expires, None, "the default grant never expires");
 
+    // The Mind as the create left it: the space row, the registry row and the carrier entry.
+    let mind_before = mind_rows(pool.clone(), "spc_wire").await;
+    assert_eq!(
+        mind_before.1,
+        json!({
+            "space_id": "spc_wire",
+            "knowledge_collection": "mind:spc_wire",
+            "carrier_entry_id": CARRIER,
+        }),
+        "the create's registry row names the Mind's own collection and carrier"
+    );
+
     let replay = wire(expect_ok(
         MemoryPort::create_space(
             &*session.adapter,
@@ -3498,6 +3568,13 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         grants(pool.clone(), "spc_wire").await,
         1,
         "a repeat writes no second grant row"
+    );
+    // The repeat's only difference: its receipt. The space row, the registry row and the carrier
+    // entry are exactly what the create wrote.
+    assert_eq!(
+        mind_rows(pool.clone(), "spc_wire").await,
+        mind_before,
+        "a repeat writes nothing but its receipt"
     );
     let (status, revision): (String, i64) =
         sqlx::query_as("SELECT status, revision FROM memory_spaces WHERE space_id = ?")
@@ -3619,24 +3696,38 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
     assert_eq!(receipts, 0, "a frozen Mind stages no receipt");
 }
 
-/// The absence walk is not vacuous: it names a leak of the caller id under an unrelated key, the
-/// binding namespace itself, and a leak inside an array — the shapes a plain substring search of a
-/// typed response would miss.
+/// The absence walk is not vacuous, and its one permitted occurrence is narrow: a receipt's own
+/// `requester_principal_id`, at a receipt's own path, holding the expected scalar. Everything
+/// else — another key, another path, a nested value, a different principal, a principal used as
+/// an object key — is a leak.
 #[test]
 fn the_caller_absence_walk_catches_a_leak_under_any_key() {
-    let frame = |body: &str| -> Value {
-        serde_json::from_str(body).expect("the fixture frame is JSON")
-    };
-    let clean = frame(
+    let frame =
+        |body: &str| -> Value { serde_json::from_str(body).expect("the fixture frame is JSON") };
+    // The two receipt paths, and only those, carry the attribution.
+    for clean in [
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
-    );
-    assert_eq!(caller_leaks(&clean, "$"), Vec::<String>::new());
+        r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
+    ] {
+        assert_eq!(
+            caller_leaks(&frame(clean), "$"),
+            Vec::<String>::new(),
+            "the walk accepts the receipt's own attribution: {clean}"
+        );
+    }
 
     for leak in [
         r#"{"payload":{"result":{"space":"prn_loopback"}}}"#,
         r#"{"extensions":{"mindcore_caller":{"principal":"p"}}}"#,
         r#"{"payload":{"items":["ok","mindcore_caller"]}}"#,
         r#"{"payload":{"result":{"requester_principal_id":"prn_loopback"}}}"#,
+        // The reviewer's two cases: a receipt-shaped object that is not at a receipt path, with a
+        // binding nested inside the member, and the principal used as a key.
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":{"mindcore_caller":{"principal":"prn_loopback"}}}}"#,
+        r#"{"payload":{"prn_loopback":"value"}}"#,
+        // The same member at a receipt path but holding something other than the expected scalar.
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
+        r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":["prn_loopback"]}}}"#,
     ] {
         assert_eq!(
             caller_leaks(&frame(leak), "$").len(),
