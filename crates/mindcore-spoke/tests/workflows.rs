@@ -203,6 +203,40 @@ impl Harness {
         .execute(&pool)
         .await
         .expect("seed subject");
+        // The carrier entry, then the Mind registry row naming it: `minds` keys the pair foreign
+        // to `knowledge_entries`, so the entry exists before the row references it. The binding
+        // resolves every carrier access through the row now that the per-principal route map is
+        // retired.
+        sqlx::query(
+            "INSERT INTO knowledge_entries \
+             (collection, entry_id, revision, payload, created_at, updated_at) \
+             VALUES ('wren', 'ke_wren', 1, ?, ?, ?)",
+        )
+        .bind(
+            serde_json::json!({
+                "schema_version": 1,
+                "entry_id": "ke_wren",
+                "entry_type": "character",
+                "canonical_name": "ke_wren carrier",
+                "status": "confirmed",
+                "revision": 1,
+                "body": {},
+                "extensions": {}
+            })
+            .to_string(),
+        )
+        .bind(NOW)
+        .bind(NOW)
+        .execute(&pool)
+        .await
+        .expect("seed the carrier entry");
+        sqlx::query("INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)")
+            .bind(SPACE)
+            .bind("wren")
+            .bind("ke_wren")
+            .execute(&pool)
+            .await
+            .expect("seed the mind registry row");
         Self {
             _dir: dir,
             root,
@@ -354,9 +388,7 @@ impl Harness {
         caller: &str,
         side_effect: SideEffect,
     ) -> (SpiMindWorkflows, BoundaryEmbedder) {
-        let binding = MemoryWorkflowBinding::new(self.pool.clone(), true)
-            .with_knowledge_routes(routes(&[caller]))
-            .expect("the fixture route map is valid");
+        let binding = MemoryWorkflowBinding::new(self.pool.clone(), true);
         (SpiMindWorkflows::new(binding), self.embedder(side_effect))
     }
 
@@ -751,7 +783,7 @@ async fn knowledge_slot_reads_only_the_bound_collection() {
         .iter()
         .map(|entry| entry.entry_id.as_str())
         .collect();
-    assert_eq!(entries, ["ke_gate", "ke_market"]);
+    assert_eq!(entries, ["ke_gate", "ke_market", "ke_wren"]);
     assert_eq!(pack.knowledge[0].revision, Some(1));
     assert_eq!(
         pack.knowledge[0].body.summary.as_deref(),
@@ -766,7 +798,9 @@ async fn knowledge_slot_refuses_a_collection_over_the_served_bound() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
-    for index in 0..SERVED_KNOWLEDGE_LIST_LIMIT {
+    // The carrier entry is the collection's first live row, so exactly-at-the-bound means
+    // SERVED_KNOWLEDGE_LIST_LIMIT - 1 seeded rows beside it.
+    for index in 0..(SERVED_KNOWLEDGE_LIST_LIMIT - 1) {
         harness
             .entry("wren", &format!("ke_{index:04}"), "bounded entry")
             .await;
@@ -848,7 +882,7 @@ async fn knowledge_slot_hides_owner_private_entries() {
         .collect();
     assert_eq!(
         entries,
-        ["ke_gate"],
+        ["ke_gate", "ke_wren"],
         "an owner-private entry must not reach a pack with no admitted viewpoint"
     );
 }
@@ -899,7 +933,7 @@ async fn knowledge_slot_omits_a_superseded_entry() {
         .collect();
     assert_eq!(
         entries,
-        ["ke_gate"],
+        ["ke_gate", "ke_wren"],
         "a superseded entry never reaches the pack, and the private one stays withheld"
     );
 }
@@ -1110,10 +1144,13 @@ async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
 /// grant but no route of its own reads its records with an empty slot, and the recall is never
 /// refused for it.
 #[tokio::test]
-async fn an_unrouted_principal_recalls_with_an_empty_slot() {
+async fn a_caller_without_knowledge_read_recalls_with_an_empty_slot() {
+    // Under per-Mind routing there is no per-principal route map: the registry row answers every
+    // reader of this Mind's space. What still empties the slot is the knowledge grant itself —
+    // a caller without `knowledge_read` in the space reads its memory page with an empty slot,
+    // which is exactly the enforcement this test must now pin.
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
-    harness.knowledge_grant(PRINCIPAL).await;
     harness
         .record(
             "rec_a",
@@ -1122,7 +1159,7 @@ async fn an_unrouted_principal_recalls_with_an_empty_slot() {
         )
         .await;
     harness.entry("wren", "ke_gate", "closed after dusk").await;
-    let (workflows, embedder) = harness.binding("prn_2", SideEffect::None);
+    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
 
     let pack = workflows
         .recall_context(
@@ -1135,12 +1172,12 @@ async fn an_unrouted_principal_recalls_with_an_empty_slot() {
             },
         )
         .await
-        .expect("a reader with no route still reads its memory page");
+        .expect("a reader without a knowledge grant still reads its memory page");
 
     assert_eq!(record_ids(&pack), ["rec_a"]);
     assert!(
         pack.knowledge.is_empty(),
-        "the routed collection is not this reader's: {:?}",
+        "no knowledge grant means an empty slot: {:?}",
         pack.knowledge
     );
 }
@@ -2614,9 +2651,7 @@ async fn deliberate_as(
     assessment_context_id: Option<&str>,
 ) -> Result<mindcore_spi::DeliberateOutcome, SpiError> {
     let workflows = SpiMindWorkflows::new(
-        MemoryWorkflowBinding::new(harness.pool.clone(), true)
-            .with_knowledge_routes(routes(&[caller]))
-            .expect("the fixture route map is valid"),
+        MemoryWorkflowBinding::new(harness.pool.clone(), true),
     );
     let holder_value = cognition_reference(CARRIER);
     let holder: spoke_schemas::data::cognition::CognitionReference =
@@ -2640,8 +2675,12 @@ async fn deliberate_as(
         evidence: &evidence,
         timeout,
     };
+    let caller_principal: Principal = serde_json::from_value(
+        json!({ "principal_id": caller, "extensions": {} }),
+    )
+    .expect("caller principal");
     workflows
-        .deliberate(&principal(), request, None, caps)
+        .deliberate(&caller_principal, request, None, caps)
         .await
 }
 
@@ -2691,17 +2730,17 @@ async fn deliberate_harness() -> Harness {
         )
         .await;
     harness
-        .entry("wren", CARRIER, "the warden's north gate")
-        .await;
-    harness
 }
 
 fn long_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(30)
 }
 
+/// A principal holding no grants in the Mind's space cannot write its carrier: routing keys to
+/// the space id, so admission inside the space is the whole boundary and a stranger never reads
+/// the snapshot before the refusal.
 #[tokio::test]
-async fn another_principal_cannot_write_the_bound_carrier() {
+async fn a_principal_without_grants_cannot_write_the_carrier() {
     let harness = deliberate_harness().await;
     let reasoner =
         DeliberateReasoner::new(promote_verdict(), DeliberateEffect::None, &harness.pool);
@@ -2715,7 +2754,7 @@ async fn another_principal_cannot_write_the_bound_carrier() {
 
     let error = deliberate_as(&harness, "prn_2", &caps, long_timeout(), None)
         .await
-        .expect_err("only the route's caller may write its carrier");
+        .expect_err("a stranger in the space may not write its carrier");
 
     let SpiError::Settlement(reject) = error else {
         panic!("expected a settlement refusal, got {error:?}");
@@ -4178,8 +4217,6 @@ const CANCELLATION_GUARD: Duration = Duration::from_secs(5);
 /// A binding over `pool` routed like `deliberate_as` routes it.
 fn settle_binding(pool: &SqlitePool) -> MemoryWorkflowBinding {
     MemoryWorkflowBinding::new(pool.clone(), true)
-        .with_knowledge_routes(routes(&[PRINCIPAL]))
-        .expect("the fixture route map is valid")
 }
 
 fn settle_holder() -> spoke_schemas::data::cognition::CognitionReference {
@@ -4494,9 +4531,7 @@ async fn a_request_naming_neither_subject_nor_context_is_refused_before_the_verd
         ..MindCapabilities::default()
     };
     let workflows = SpiMindWorkflows::new(
-        MemoryWorkflowBinding::new(harness.pool.clone(), true)
-            .with_knowledge_routes(routes(&[PRINCIPAL]))
-            .expect("the fixture route map is valid"),
+        MemoryWorkflowBinding::new(harness.pool.clone(), true),
     );
     let holder: spoke_schemas::data::cognition::CognitionReference =
         serde_json::from_value(cognition_reference(CARRIER)).expect("holder");

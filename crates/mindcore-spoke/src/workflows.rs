@@ -5,9 +5,6 @@
 //! call reads and returns, so an embedder, reasoner or policy hook runs with no
 //! transaction open and the workflow can revalidate afterwards.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
@@ -30,7 +27,6 @@ use mindcore_base::ids::{SpaceId, SubjectId};
 use mindcore_base::ir::{
     CandidateState, MemoryJournalRow, MemoryRepository, ReceiptKey, ReceiptRead, ReceiptState,
 };
-use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spi::{
     page_fact, snapshot_fact, AbsorbSnapshot, CandidateLifecycle, CaptureOutcome,
     CapturedCandidate, CitedRecord, DeliberateSnapshot, EmbeddingIdentity, PageFact, PageVector,
@@ -57,19 +53,18 @@ const ABSORB_DECISION_OP: &str = "mindcore.absorb.decision";
 
 /// The in-process workflow binding over one SQLite pool.
 ///
-/// `knowledge_routes` maps each admitted principal id to the one collection its workflow calls
-/// reach: a principal with no route reads no knowledge and never writes a carrier. `publisher` is
+/// Every carrier access resolves through the Mind the request names: a facade
+/// handle's bound carrier, or the registry row of the request's `space_id` read
+/// on the caller's transaction. `publisher` is
 /// the host's file medium; the settlement legs require it before they stage anything, and a
 /// binding without one refuses them with no write at all.
 pub struct MemoryWorkflowBinding {
     adapter: MemoryAdapter,
     pool: SqlitePool,
-    /// Shared with every other reader of the same validated map — the adoption tool resolves its
-    /// destination here too — so both sides can never drift apart.
-    knowledge_routes: Arc<BTreeMap<String, KnowledgeScope>>,
     publisher: Option<Box<JournalPublisher>>,
     /// The one carrier a facade handle binds: `(space_id, collection, carrier_entry_id)`.
-    /// The served surface binds none, so its principal routes stay the only resolution.
+    /// The served surface binds none; its carrier access resolves the registry
+    /// row of the request's `space_id` instead.
     carrier_binding: Option<(String, String, String)>,
 }
 
@@ -81,7 +76,6 @@ impl MemoryWorkflowBinding {
         Self {
             adapter: MemoryAdapter::new(reflections),
             pool,
-            knowledge_routes: Arc::new(BTreeMap::new()),
             publisher: None,
             carrier_binding: None,
         }
@@ -268,52 +262,6 @@ impl MemoryWorkflowBinding {
         Ok(settled)
     }
 
-    /// Bind the host's route map: each exact principal id to the collection its workflow calls
-    /// reach.
-    ///
-    /// The map is the workflow collection allowlist, so a route need not name a collection that
-    /// already holds rows. An empty key, an empty destination collection, or one collection named by
-    /// two routes is refused with `InvalidInput`, so surface assembly fails instead of serving a
-    /// binding whose map must still be completed. A destination collection is one principal's
-    /// carrier collection, so a repeat would let one routed principal reach another's carriers. A
-    /// map cannot repeat a key, and `KnowledgeScope` is not a wire `Scope`, so no admission call
-    /// applies.
-    ///
-    /// The map is shared, not copied: the caller holds the same `Arc` and reads it for anything else
-    /// that must resolve a destination (the adoption tool), so one validated map has one content.
-    pub fn with_knowledge_routes(
-        mut self,
-        routes: Arc<BTreeMap<String, KnowledgeScope>>,
-    ) -> Result<Self, SpokeReject> {
-        let invalid = |message: String| SpokeReject {
-            code: SpokeRejectCode::InvalidInput,
-            message,
-            details: None,
-        };
-        for (principal, scope) in routes.iter() {
-            if principal.is_empty() {
-                return Err(invalid(
-                    "a knowledge route needs a non-empty principal id".to_string(),
-                ));
-            }
-            if scope.collection.is_empty() {
-                return Err(invalid(format!(
-                    "the knowledge route for principal {principal} names an empty collection"
-                )));
-            }
-        }
-        let mut destinations = BTreeSet::new();
-        for scope in routes.values() {
-            if !destinations.insert(scope.collection.as_str()) {
-                return Err(invalid(
-                    "a destination collection is routed to more than one principal".to_string(),
-                ));
-            }
-        }
-        self.knowledge_routes = routes;
-        Ok(self)
-    }
-
     /// Every live-admission candidate of `space_id`, read on `tx`.
     async fn space_grants(
         &self,
@@ -327,20 +275,11 @@ impl MemoryWorkflowBinding {
         admission::wire_grants(&rows).map_err(|reject| SpiError::Settlement(reject.into_spoke()))
     }
 
-    /// The collection route the host configured for `principal`, by its exact id.
-    ///
-    /// The one lookup both the carrier write and the recall slot use, so two calls for the same
-    /// admitted principal can never reach different collections. Borrowed, never cloned: the
-    /// route map is immutable for the binding's lifetime.
-    fn knowledge_route(&self, principal: &Principal) -> Option<&KnowledgeScope> {
-        self.knowledge_routes.get(principal_id(principal))
-    }
-
-    /// Bind the carrier its row states, for the facade handle that has no route
-    /// map: `with_carrier_collection(space_id, collection, carrier_entry_id)`
-    /// pins one space's deliberation to the collection and carrier the Mind's
-    /// registry row resolved at open. The served surface binds none, so its
-    /// route map stays the only resolution.
+    /// Bind the carrier its row states, for the facade handle that resolved the
+    /// Mind's registry row at open: `with_carrier_collection(space_id,
+    /// collection, carrier_entry_id)` pins one space's deliberation to it. The
+    /// served surface binds none; its carrier access reads the registry row on
+    /// the caller's transaction.
     #[must_use]
     pub fn with_carrier_collection(
         mut self,
@@ -357,15 +296,27 @@ impl MemoryWorkflowBinding {
     }
 
     /// The collection one carrier access serves: a bound Mind answers its own
-    /// collection first, and the route map answers otherwise.
-    fn carrier_collection(&self, principal: &Principal, space_id: &str) -> Option<&str> {
+    /// collection first, and otherwise the registry row of `space_id`, read on
+    /// the caller's transaction. A `space_id` with no row answers `None`, so a
+    /// carrier write refuses before any entry is read, exactly as an
+    /// unadmitted Mind answers `memory.spaces.list` nothing.
+    async fn carrier_collection(
+        &self,
+        tx: &mut Tx<'_>,
+        space_id: &str,
+    ) -> Result<Option<String>, SpiError> {
         if let Some((bound_space, collection, _)) = &self.carrier_binding {
             if bound_space == space_id {
-                return Some(collection.as_str());
+                return Ok(Some(collection.clone()));
             }
         }
-        self.knowledge_route(principal)
-            .map(|route| route.collection.as_str())
+        sqlx::query_scalar::<_, String>(
+            "SELECT knowledge_collection FROM minds WHERE space_id = ?",
+        )
+        .bind(space_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| internal(format!("the mind registry could not be read: {error}")))
     }
 
     /// A bound carrier is the only carrier this binding serves in its space: a
@@ -392,19 +343,20 @@ impl MemoryWorkflowBinding {
     /// `capabilities` in `space_id`.
     ///
     /// Resolved once, so the carrier read and its CAS append stay pinned to one collection. A
-    /// missing route is the terminal refusal before any carrier access: it is as target-free as a
-    /// missing grant, so a peer never learns whether another principal has a route.
+    /// space with no registry row is the admission refusal before any carrier access: it is as
+    /// target-free as a missing grant, so a peer never learns whether the named Mind exists.
     async fn admitted_collection(
         &self,
         tx: &mut Tx<'_>,
         principal: &Principal,
         space_id: &str,
         capabilities: &[&str],
-    ) -> Result<&str, SpiError> {
+    ) -> Result<String, SpiError> {
         let collection = self
-            .carrier_collection(principal, space_id)
+            .carrier_collection(tx, space_id)
+            .await?
             .ok_or_else(|| {
-                not_authorized("principal has no workflow knowledge route".to_string())
+                SpiError::Settlement(Reject::admission_refusal().into_spoke())
             })?;
         self.adapter
             .require_space_grants(tx, principal, space_id, capabilities)
@@ -437,13 +389,12 @@ impl MemoryWorkflowBinding {
         }
         Ok(())
     }
-
-    /// Fill the pack's knowledge slot from `principal`'s own routed collection.
+    /// Fill the pack's knowledge slot from the collection the request's `space_id` names.
     ///
-    /// The slot is independent of the memory page: a principal with no route, or without a live
-    /// [`KNOWLEDGE_READ`] grant in the request's space, reads its records with an empty slot
-    /// exactly as it would with no route map. A missing route never reveals whether another
-    /// principal has one.
+    /// The slot is independent of the memory page: a space with no registry row — a Mind the
+    /// caller never listed, or none at all — or a caller without a live [`KNOWLEDGE_READ`] grant
+    /// in the request's space reads its records with an empty slot. A missing row never reveals
+    /// whether the named Mind exists.
     ///
     /// The slot applies the same disclosure predicate as the served knowledge list. This binding
     /// carries no admitted viewpoint, so an entry a viewpoint-free read hides — an `owner`-private
@@ -458,8 +409,8 @@ impl MemoryWorkflowBinding {
         request: &MemoryRecallRequest,
     ) -> Result<Vec<KnowledgeEntry>, SpiError> {
         let Some(collection) = self
-            .knowledge_route(principal)
-            .map(|route| route.collection.as_str())
+            .carrier_collection(tx, request.space_id.as_str())
+            .await?
         else {
             return Ok(Vec::new());
         };
@@ -474,7 +425,7 @@ impl MemoryWorkflowBinding {
             }
             Err(error) => return Err(error),
         }
-        match list_entries_in(tx, collection).await {
+        match list_entries_in(tx, &collection).await {
             SpokeResult::Ok(entries) => Ok(entries
                 .into_iter()
                 .filter(|entry| knowledge_entry_visible_to_viewpoint(entry, None))
@@ -1157,7 +1108,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         let collection = self
             .admitted_collection(&mut transaction, principal, space_id, &[KNOWLEDGE_READ])
             .await?;
-        let carrier = match read_entry(&mut transaction, collection, holder.id.as_str()).await {
+        let carrier = match read_entry(&mut transaction, &collection, holder.id.as_str()).await {
             SpokeResult::Ok(carrier) => carrier,
             SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
         };
@@ -1248,7 +1199,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         self.revalidate_cited(&mut transaction, principal, space_id, cited)
             .await?;
         let header =
-            match read_carrier_header(&mut *transaction, collection, holder.id.as_str()).await {
+            match read_carrier_header(&mut *transaction, &collection, holder.id.as_str()).await {
                 SpokeResult::Ok(header) => header,
                 SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
             };
@@ -1269,7 +1220,7 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         }
         let assigned = match append_cognition(
             &mut transaction,
-            collection,
+            &collection,
             holder.id.as_str(),
             current,
             &record,

@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use mindcore_sqlite::minds::CARRIER_ENTRY_ID;
 use mindcore_spi::{
     AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
     Embedder, Evidence, MindCapabilities, MindWorkflows, PolicyHook, Reasoner, SpiError,
@@ -313,11 +314,27 @@ async fn deliberate(
             text: evidence.text.as_str(),
         })
         .collect();
+    // The carrier is the Mind's own: its registry row names the one carrier
+    // entry every Mind is created with, so a peer never names one.
+    let holder: CognitionReference = match serde_json::from_value(json!({
+        "kind": "knowledge_entry",
+        "namespace": "mindcore",
+        "id": CARRIER_ENTRY_ID,
+    })) {
+        Ok(holder) => holder,
+        Err(error) => {
+            return SpokeResult::Reject(SpokeReject {
+                code: SpokeRejectCode::InternalError,
+                message: format!("the carrier reference does not decode: {error}"),
+                details: None,
+            })
+        }
+    };
     let request = DeliberateRequest {
         space_id: &arguments.space_id,
         subject_id: Some(&arguments.subject_id),
         assessment_context_id: None,
-        holder: &arguments.holder,
+        holder: &holder,
         target: &arguments.target,
         evidence: &evidence,
         timeout: Duration::from_millis(arguments.timeout_ms.get() as u64),
@@ -452,7 +469,6 @@ struct AbsorbArguments {
 struct DeliberateArguments {
     space_id: String,
     subject_id: String,
-    holder: CognitionReference,
     target: CognitionTarget,
     evidence: Vec<EvidenceArgument>,
     timeout_ms: NonZeroUsize,
@@ -871,19 +887,20 @@ fn absorb_output() -> Value {
     })
 }
 
-/// The deliberation arguments, mirroring the pinned `spoke-schemas` request DTOs. `holder` and
-/// `target` splice the same pinned definitions `absorb` advertises — the workflow decodes exactly
-/// those DTOs, so the manifest and the handler cannot drift apart.
+/// The deliberation arguments, mirroring the pinned `spoke-schemas` request DTOs. The carrier is
+/// the Mind's own record and never a wire member: a peer still sending the retired `holder` hits
+/// the closed object's unknown-field refusal. `target` splices the same pinned definitions
+/// `absorb` advertises — the workflow decodes exactly those DTOs, so the manifest and the handler
+/// cannot drift apart.
 fn deliberate_input() -> Value {
     let mut schema = json!({
         "$id": "https://mindcore.invalid/schemas/tools/deliberate.input.schema.json",
         "type": "object",
         "additionalProperties": false,
-        "required": ["space_id", "subject_id", "holder", "target", "evidence", "timeout_ms"],
+        "required": ["space_id", "subject_id", "target", "evidence", "timeout_ms"],
         "properties": {
             "space_id": { "type": "string", "minLength": 1 },
             "subject_id": { "type": "string", "minLength": 1 },
-            "holder": { "$ref": "#/definitions/CognitionReference" },
             "target": { "$ref": "#/definitions/CognitionTarget" },
             "evidence": {
                 "type": "array",
@@ -900,10 +917,7 @@ fn deliberate_input() -> Value {
             "timeout_ms": { "type": "integer", "minimum": 1 },
         },
     });
-    schema["definitions"] = Value::Object(cognition_definitions(&[
-        "CognitionReference",
-        "CognitionTarget",
-    ]));
+    schema["definitions"] = Value::Object(cognition_definitions(&["CognitionTarget"]));
     schema
 }
 

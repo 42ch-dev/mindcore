@@ -2,7 +2,7 @@
 //! registrations, the knowledge admission is validated where the face is assembled, and the ports
 //! compose no baseline provider.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -167,11 +167,6 @@ fn adoption_source() -> AdoptionRoute {
     }
 }
 
-/// The host's route map: its one admitted principal's workflow collection.
-fn routes() -> BTreeMap<String, KnowledgeScope> {
-    BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(COLLECTION))])
-}
-
 fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
     ServeFaces {
         manifest,
@@ -183,7 +178,6 @@ fn faces(manifest: HostCapabilityManifest) -> ServeFaces {
         principals: principals(),
         providers: MindProviders::default(),
         adoption: None,
-        workflow_routes: routes(),
         tools: Vec::new(),
     }
 }
@@ -348,54 +342,9 @@ async fn manifest_follows_the_composed_faces() {
     );
 }
 
-/// The host's route map is validated once, where the surface is assembled: an empty principal key,
-/// an empty destination collection, or one destination collection claimed by two routes is the
-/// host's input error, refused before any port or registration exists.
+/// The adoption source is one collection for the whole surface; the source need not hold any row.
 #[tokio::test]
-async fn an_unroutable_destination_is_refused_at_assembly() {
-    let serve = Fixture::open().await.serve();
-    for (routes, message) in [
-        (
-            BTreeMap::from([(String::new(), KnowledgeScope::new(COLLECTION))]),
-            "a knowledge route needs a non-empty principal id",
-        ),
-        (
-            BTreeMap::from([("prn_owner".to_string(), KnowledgeScope::new(""))]),
-            "the knowledge route for principal prn_owner names an empty collection",
-        ),
-        (
-            BTreeMap::from([
-                ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
-                ("prn_other".to_string(), KnowledgeScope::new(COLLECTION)),
-            ]),
-            "a destination collection is routed to more than one principal",
-        ),
-    ] {
-        let reject = match serve.surface(ServeFaces {
-            workflow_routes: routes,
-            ..faces(metadata("runtime"))
-        }) {
-            SpokeResult::Reject(reject) => reject,
-            SpokeResult::Ok(surface) => {
-                panic!(
-                    "an unroutable destination assembled {:?}",
-                    capabilities(&surface)
-                )
-            }
-        };
-        assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
-        assert_eq!(reject.message, message);
-        assert!(
-            reject.details.is_none(),
-            "the assembly refusal carries no route details: {reject:?}"
-        );
-    }
-}
-
-/// The adoption source is one collection for the whole surface. Beside the per-principal routes it
-/// assembles, and the source need not hold any row.
-#[tokio::test]
-async fn an_adoption_source_beside_the_routes_assembles() {
+async fn an_adoption_source_assembles() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
         serve.surface(ServeFaces {
@@ -411,44 +360,12 @@ async fn an_adoption_source_beside_the_routes_assembles() {
     assert!(surface.ports.as_knowledge().is_some());
 }
 
-/// The adoption source must differ from every route destination, connected or not: a source that
-/// is also a principal's destination would let one principal's write become another's source.
-#[tokio::test]
-async fn an_adoption_source_matching_a_route_destination_is_refused_at_assembly() {
-    let serve = Fixture::open().await.serve();
-    // An unconnected principal's route is a refusal too: the copy it would write is one no
-    // knowledge-face read of the sharing principal reaches.
-    let reject = match serve.surface(ServeFaces {
-        workflow_routes: BTreeMap::from([
-            ("prn_owner".to_string(), KnowledgeScope::new(COLLECTION)),
-            ("prn_unconnected".to_string(), KnowledgeScope::new("shared")),
-        ]),
-        adoption: Some(AdoptionRoute {
-            scope_id: "spc_shared".to_string(),
-            source: KnowledgeScope::new("shared"),
-        }),
-        ..faces(metadata("runtime"))
-    }) {
-        SpokeResult::Reject(reject) => reject,
-        SpokeResult::Ok(surface) => panic!(
-            "a route destination became the adoption source {:?}",
-            capabilities(&surface)
-        ),
-    };
-    assert_eq!(reject.code, SpokeRejectCode::InvalidInput);
-    assert!(
-        reject.details.is_none(),
-        "the assembly refusal carries no route details: {reject:?}"
-    );
-}
-
 /// A source naming the collection the knowledge face serves would copy the destination into
-/// itself, so assembly refuses it even with no route map at all.
+/// itself, so assembly refuses it.
 #[tokio::test]
 async fn an_adoption_source_in_the_knowledge_faces_collection_is_refused() {
     let serve = Fixture::open().await.serve();
     let reject = match serve.surface(ServeFaces {
-        workflow_routes: BTreeMap::new(),
         adoption: Some(AdoptionRoute {
             scope_id: "spc_shared".to_string(),
             source: KnowledgeScope::new(COLLECTION),
@@ -863,13 +780,6 @@ fn two_principal_faces(manifest: HostCapabilityManifest) -> ServeFaces {
                 None,
             ),
         }),
-        // One routed principal whose workflow collection is deliberately *not* the one the
-        // knowledge face serves, and one admitted principal with no workflow route at all: under a
-        // route-derived destination both copies would land where `knowledge.get` never reads.
-        workflow_routes: BTreeMap::from([(
-            "peer-owner".to_string(),
-            KnowledgeScope::new("workflow-only"),
-        )]),
         ..faces(manifest)
     }
 }

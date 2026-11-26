@@ -274,7 +274,6 @@ fn deliberate_arguments() -> Value {
     json!({
         "space_id": "spc_1",
         "subject_id": "subj_1",
-        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_wren" },
         "target": {
             "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_gate" },
             "target_id": "prop_gate_closed",
@@ -506,7 +505,6 @@ async fn malformed_arguments_are_invalid_input() {
             json!({
                 "space_id": "spc_1",
                 "subject_id": "subj_1",
-                "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_wren" },
                 "target": {
                     "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_gate" },
                     "target_id": "prop_gate_closed",
@@ -522,7 +520,6 @@ async fn malformed_arguments_are_invalid_input() {
             json!({
                 "space_id": "spc_1",
                 "subject_id": "subj_1",
-                "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_wren" },
                 "target": {
                     "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": "ke_gate" },
                     "target_id": "prop_gate_closed",

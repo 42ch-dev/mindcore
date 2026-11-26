@@ -18,7 +18,6 @@ pub mod mind;
 pub mod minds;
 pub mod tools;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -40,7 +39,7 @@ use spoke_connect::remote::{
 };
 use spoke_operations::{
     spoke_reject, validate_manifest_tools, AdoptionPort, HistoryPort, ScopedKnowledgePort,
-    SpokeReject, SpokeRejectCode, SpokeResult,
+    SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
@@ -96,17 +95,13 @@ impl MindcoreServe {
         }
     }
 
-    /// The engine one surface serves: each workflow call resolves the collection it reaches from
-    /// the principal its admission returns, through the host's route map.
-    fn workflows(
-        &self,
-        routes: Arc<BTreeMap<String, KnowledgeScope>>,
-    ) -> Result<Arc<SpiMindWorkflows>, SpokeReject> {
+    /// The engine one surface serves: each workflow call resolves the Mind it reaches from the
+    /// `space_id` the request carries, through the registry row.
+    fn workflows(&self) -> Arc<SpiMindWorkflows> {
         let publish = Arc::clone(&self.publish);
         let binding = MemoryWorkflowBinding::new(self.store.pool(), self.reflections)
-            .with_publisher(move |targets| publish(targets))
-            .with_knowledge_routes(routes)?;
-        Ok(Arc::new(SpiMindWorkflows::new(binding)))
+            .with_publisher(move |targets| publish(targets));
+        Arc::new(SpiMindWorkflows::new(binding))
     }
 
     /// Assemble the ports, manifest and tool registrations for `ConnectResponderOptions`.
@@ -146,28 +141,10 @@ impl MindcoreServe {
                     None,
                 );
             }
-            if let Some((principal, _)) = faces
-                .workflow_routes
-                .iter()
-                .find(|(_, route)| route.collection == *source)
-            {
-                return spoke_reject(
-                    SpokeRejectCode::InvalidInput,
-                    format!(
-                        "the adoption source collection {source} is the workflow destination of principal {principal}"
-                    ),
-                    None,
-                );
-            }
         }
-        let routes = Arc::new(faces.workflow_routes);
-        let routed = !routes.is_empty();
-        let workflows = match self.workflows(Arc::clone(&routes)) {
-            Ok(workflows) => workflows,
-            Err(reject) => return SpokeResult::Reject(reject),
-        };
-        let engine: Arc<dyn MindWorkflows> = workflows.clone();
         let principals = faces.principals;
+        let workflows = self.workflows();
+        let engine: Arc<dyn MindWorkflows> = workflows.clone();
         let mut tools =
             WorkflowTools::new(engine, Arc::clone(&principals), faces.providers).registrations();
         tools.extend(
@@ -176,9 +153,6 @@ impl MindcoreServe {
                 .into_iter()
                 .filter(|tool| tool.descriptor.capability_id.as_str() != RETIRED_ADOPT_TOOL),
         );
-        if !routed {
-            tools.retain(|tool| tool.descriptor.capability_id.as_str() != tools::DELIBERATE);
-        }
         let manifest = derive_manifest(
             faces.manifest,
             faces.memory.as_deref(),
@@ -307,27 +281,17 @@ pub struct ServeFaces {
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
     /// The one host-configured adoption source, or `None` to serve no adoption. Its collection must
-    /// be non-empty and must not be [`ServeFaces::knowledge`]'s collection or any
-    /// [`ServeFaces::workflow_routes`] destination, including a route of a principal that is not
-    /// connected, and its scope id must differ from [`ServeFaces::scope_id`]; assembly refuses
-    /// otherwise. The source need not hold rows. When it is configured, the
-    /// `spoke-knowledge-adoption` face serves `knowledge.adopt` over the knowledge face's admission,
-    /// and writes into [`ServeFaces::knowledge`]'s collection — one shared collection with one slot
-    /// per `destination_entry_id`: the first adoption of a given id claims it, a repeat is answered
-    /// `already_present` with the stored copy only at the anchor revision the copy records (another
-    /// revision is a conflict), and a peer whose own admitted selection hides the copy is answered
-    /// the occupancy refusal instead of the copy.
+    /// be non-empty and must not be [`ServeFaces::knowledge`]'s collection, and its scope id must
+    /// differ from [`ServeFaces::scope_id`]; assembly refuses otherwise. The source need not hold
+    /// rows. When it is configured, the `spoke-knowledge-adoption` face serves `knowledge.adopt`
+    /// over the knowledge face's admission, and writes into [`ServeFaces::knowledge`]'s
+    /// collection — one shared collection with one slot per `destination_entry_id`: the first
+    /// adoption of a given id claims it, a repeat is answered `already_present` with the stored
+    /// copy only at the anchor revision the copy records (another revision is a conflict), and a
+    /// peer whose own admitted selection hides the copy is answered the occupancy refusal instead
+    /// of the copy.
     pub adoption: Option<AdoptionRoute>,
-    /// The host's per-principal workflow routes: each exact principal id — not a peer id — to the
-    /// one workflow collection its calls may reach. The map is the workflow collection allowlist, so
-    /// a route need not name a collection that already holds rows; each destination collection
-    /// belongs to exactly one principal route, and assembly refuses a collection named by two
-    /// routes. A route names the principal `principals` admits; a principal without one reads no
-    /// knowledge and never writes a carrier. Empty serves no deliberation and advertises none.
-    /// Routes are never read from the wire.
-    pub workflow_routes: BTreeMap<String, KnowledgeScope>,
-    /// Additional host tools: every descriptor is advertised and its handler installed, except the
-    /// ids this runtime owns — `tools.mindcore.deliberate` on a surface with an empty route map, and
+    /// Additional host tools: every descriptor is advertised and its handler installed, except
     /// the retired `tools.mindcore.adopt` on every surface.
     pub tools: Vec<ToolRegistration>,
 }

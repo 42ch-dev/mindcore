@@ -34,7 +34,7 @@ use mindcore_spi::{
 };
 use mindcore_spoke::{ServedMemory, TransferService};
 use mindcore_sqlite::{MindStore, ScopedKnowledgeStore, SqliteMemoryRepository};
-use spoke_connect::core::{derive_peer_id_from_ed25519_pubkey, CAPABILITY_SPOKE_JUDGMENT};
+use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
     ConnectResponderOptions, KnowledgeAdmission, MemoryAdmission, RemoteAdapter,
@@ -54,11 +54,13 @@ use spoke_schemas::{
 
 const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
-const CARRIER: &str = "ke_wren";
-/// The second principal's own collection and carrier holder entry.
+/// The carrier entry id every Mind is created with; the wire never names it.
+const CARRIER: &str = "ke_carrier";
+/// The second Mind's own collection; its carrier entry id is the one every Mind is created with.
 const COLLECTION_TWO: &str = "mora";
-const CARRIER_TWO: &str = "ke_mora";
 const SPACE: &str = "spc_loopback";
+/// The second Mind's space, admitted to the second peer only.
+const SPACE_TWO: &str = "spc_loopback_two";
 const SUBJECT: &str = "subj_loopback";
 const PRINCIPAL: &str = "prn_loopback";
 /// why: a transfer chunk travels back through the typed wire DTOs, which canonicalize a whole
@@ -170,10 +172,130 @@ impl Fixture {
             .await
             .expect("seed grant");
         }
+        // The carrier entry the registry row references: `minds` keys it foreign to
+        // `knowledge_entries`, so the entry exists before the row names it.
+        sqlx::query(
+            "INSERT INTO knowledge_entries \
+             (collection, entry_id, revision, payload, created_at, updated_at) \
+             VALUES (?, ?, 1, ?, ?, ?)",
+        )
+        .bind(COLLECTION)
+        .bind(CARRIER)
+        .bind(
+            json!({
+                "schema_version": 1,
+                "entry_id": CARRIER,
+                "entry_type": "note",
+                "canonical_name": format!("{CARRIER}'s carrier"),
+                "status": "confirmed",
+                "revision": 1,
+                "body": { "summary": "what this holder currently holds" },
+                "extensions": {},
+            })
+            .to_string(),
+        )
+        .bind(NOW)
+        .bind(NOW)
+        .execute(&pool)
+        .await
+        .expect("seed the carrier entry");
+        // The Mind registry row of this fixture's space: the workflow binding resolves the
+        // collection it serves from it, and a space with no row answers nothing.
+        sqlx::query(
+            "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
+        )
+        .bind(SPACE)
+        .bind(COLLECTION)
+        .bind(CARRIER)
+        .execute(&pool)
+        .await
+        .expect("seed the mind registry row");
+
         seed_record(&pool, "rec_north_gate", "the north gate is closed").await;
         seed_record(&pool, "rec_market", "the market opens at dawn").await;
         Self { dir, store }
     }
+
+    /// The second Mind: its own space, subject, records, carrier entry and registry row, ready
+    /// for a peer admitted to it alone.
+    async fn seed_second_mind(&self) {
+        let pool = self.store.pool();
+        for statement in [
+            format!(
+                "INSERT INTO memory_spaces \
+                 (space_id, display_name, authority_host_id, authority_generation, status, \
+                  revision, created_at) \
+                 VALUES ('{SPACE_TWO}', 'second mind', 'host_1', 1, 'active', 1, '{NOW}')"
+            ),
+            format!(
+                "INSERT INTO memory_subjects \
+                 (space_id, subject_id, kind_ns, kind_id, status, fenced_contexts_json, revision, \
+                  created_at) \
+                 VALUES ('{SPACE_TWO}', '{SUBJECT}', 'kind', 'belief', 'active', '[]', 1, '{NOW}')"
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .expect("seed the second mind");
+        }
+        // The carrier entry of the second Mind, before the registry row references it.
+        sqlx::query(
+            "INSERT INTO knowledge_entries \
+             (collection, entry_id, revision, payload, created_at, updated_at) \
+             VALUES (?, ?, 1, ?, ?, ?)",
+        )
+        .bind(COLLECTION_TWO)
+        .bind(CARRIER)
+        .bind(
+            json!({
+                "schema_version": 1,
+                "entry_id": CARRIER,
+                "entry_type": "note",
+                "canonical_name": format!("{CARRIER}'s carrier"),
+                "status": "confirmed",
+                "revision": 1,
+                "body": { "summary": "what this holder currently holds" },
+                "extensions": {},
+            })
+            .to_string(),
+        )
+        .bind(NOW)
+        .bind(NOW)
+        .execute(&pool)
+        .await
+        .expect("seed the second mind's carrier entry");
+        sqlx::query(
+            "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
+        )
+        .bind(SPACE_TWO)
+        .bind(COLLECTION_TWO)
+        .bind(CARRIER)
+        .execute(&pool)
+        .await
+        .expect("seed the second mind's registry row");
+        seed_record_in(&pool, SPACE_TWO, "rec_north_gate_two", "the north gate is closed").await;
+        seed_record_in(&pool, SPACE_TWO, "rec_market_two", "the market opens at dawn").await;
+    }
+
+    /// One space-wide grant for `principal` over the second Mind's space.
+    async fn grant_in_second(&self, grant_id: &str, principal: &str, capabilities: &[&str]) {
+        sqlx::query(
+            "INSERT INTO memory_grants \
+             (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+              context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+             VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+        )
+        .bind(grant_id)
+        .bind(SPACE_TWO)
+        .bind(principal)
+        .bind(json!(capabilities).to_string())
+        .bind(NOW)
+        .execute(&self.store.pool())
+        .await
+        .expect("seed grant");
+    }
+
 
     /// One space-wide grant for `principal` over this fixture's space.
     async fn grant(&self, grant_id: &str, principal: &str, capabilities: &[&str]) {
@@ -202,34 +324,6 @@ impl Fixture {
             .expect("drop the grant");
     }
 
-    /// The carrier entry the deliberation holder names.
-    async fn seed_carrier(&self) {
-        self.seed_carrier_in(COLLECTION, CARRIER).await;
-    }
-
-    /// The carrier entry one collection holds, as its holder names it.
-    async fn seed_carrier_in(&self, collection: &str, entry_id: &str) {
-        expect_ok(
-            self.store
-                .knowledge(KnowledgeScope::new(collection))
-                .put_knowledge_entry(
-                    serde_json::from_value(json!({
-                        "schema_version": 1,
-                        "entry_id": entry_id,
-                        "entry_type": "note",
-                        "canonical_name": format!("{entry_id}'s carrier"),
-                        "status": "confirmed",
-                        "body": { "summary": "what this holder currently holds" },
-                        "extensions": {},
-                    }))
-                    .expect("carrier JSON matches the schema"),
-                    None,
-                )
-                .await,
-            "write the carrier entry",
-        );
-    }
-
     /// The database file this fixture opened, for a test that reopens it after a restart.
     fn db_path(&self) -> std::path::PathBuf {
         self.dir.path().join(DB_FILE)
@@ -244,6 +338,10 @@ impl Fixture {
 }
 
 async fn seed_record(pool: &sqlx::SqlitePool, record_id: &str, text: &str) {
+    seed_record_in(pool, SPACE, record_id, text).await;
+}
+
+async fn seed_record_in(pool: &sqlx::SqlitePool, space: &str, record_id: &str, text: &str) {
     sqlx::query(
         "INSERT INTO memory_records \
          (record_id, space_id, subject_id, kind, content_json, scope_visibility, \
@@ -252,7 +350,7 @@ async fn seed_record(pool: &sqlx::SqlitePool, record_id: &str, text: &str) {
          VALUES (?, ?, ?, 'fact', ?, 'shared', NULL, ?, NULL, NULL, NULL, 1, ?, ?)",
     )
     .bind(record_id)
-    .bind(SPACE)
+    .bind(space)
     .bind(SUBJECT)
     .bind(json!({ "text": text }).to_string())
     .bind(
@@ -284,18 +382,6 @@ fn hello(host_id: &str, capabilities: &[&str]) -> HostCapabilityManifest {
     .expect("manifest JSON matches the schema")
 }
 
-/// The reserved deliberation id's descriptor, as a host could build one.
-fn deliberate_descriptor() -> ToolDescriptor {
-    serde_json::from_value(json!({
-        "schema_version": 1,
-        "capability_id": DELIBERATE,
-        "op": DELIBERATE,
-        "description": "Derive a validated verdict over supplied evidence.",
-        "input": { "type": "object" },
-        "output": { "type": "object" },
-    }))
-    .expect("tool descriptor JSON matches the schema")
-}
 
 /// The host tool's descriptor, as a host could build one.
 fn host_tool_descriptor() -> ToolDescriptor {
@@ -456,7 +542,9 @@ impl Reasoner for NoChangeReasoner {
         assert!(
             payload["records"].as_array().is_some_and(|records| records
                 .iter()
-                .any(|record| record["record_id"] == "rec_north_gate")),
+                .any(|record| record["record_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("rec_north_gate")))),
             "the authorized memory page reached the reasoner: {}",
             request.user_payload
         );
@@ -489,15 +577,21 @@ impl Reasoner for SettlingReasoner {
         assert!(
             payload["records"].as_array().is_some_and(|records| records
                 .iter()
-                .any(|record| record["record_id"] == "rec_north_gate")),
+                .any(|record| record["record_id"].as_str().is_some_and(|id| id.starts_with("rec_north_gate")))),
             "the authorized memory page reached the reasoner: {}",
             request.user_payload
         );
+        let gate_record = payload["records"].as_array()
+            .and_then(|records| records.iter()
+                .find(|record| record["record_id"].as_str().is_some_and(|id| id.starts_with("rec_north_gate"))))
+            .and_then(|record| record["record_id"].as_str())
+            .expect("the page carries the north-gate record")
+            .to_string();
         Ok(json!({
             "recommendation": { "kind": "promote", "target_kind": "belief" },
             "rationale": self.0,
             "evidence_ids": ["ev_gate"],
-            "record_ids": ["rec_north_gate"],
+            "record_ids": [gate_record],
             "record": {
                 "kind": "belief",
                 "order": 1,
@@ -511,7 +605,7 @@ impl Reasoner for SettlingReasoner {
                 "basis": {
                     "kind": "evidence",
                     "evidence": [
-                        { "kind": "memory_record", "namespace": "mindcore", "id": "rec_north_gate" }
+                        { "kind": "memory_record", "namespace": "mindcore", "id": gate_record }
                     ]
                 }
             }
@@ -548,13 +642,13 @@ impl PolicyHook for HoldingPolicy {
     }
 }
 
-/// The host's side of the surface. `workflow_routes` is the per-principal workflow route map;
-/// an empty map serves and advertises no `deliberate` at all.
+/// The host's side of the surface. `routes` is the retired per-principal route map the binding no
+/// longer reads: the registry row decides every collection, so callers pass it and it is ignored.
 fn faces(
     manifest: HostCapabilityManifest,
     memory: Option<Arc<dyn ServedMemory>>,
     providers: MindProviders,
-    workflow_routes: BTreeMap<String, KnowledgeScope>,
+    _routes: BTreeMap<String, KnowledgeScope>,
 ) -> ServeFaces {
     ServeFaces {
         manifest,
@@ -566,12 +660,12 @@ fn faces(
         principals: principal_admission(),
         providers,
         adoption: None,
-        workflow_routes,
         tools: Vec::new(),
     }
 }
 
-/// A route map putting each of `principals` onto the fixture's one collection.
+/// A retired route map shell: the registry row replaced routing, so this only keeps the call
+/// sites shaped as they were.
 fn routes(principals: &[&str]) -> BTreeMap<String, KnowledgeScope> {
     principals
         .iter()
@@ -658,9 +752,13 @@ async fn connect_as(
 }
 
 fn recall_arguments() -> Value {
+    recall_arguments_in(SPACE)
+}
+
+fn recall_arguments_in(space: &str) -> Value {
     json!({
         "request": {
-            "space_id": SPACE,
+            "space_id": space,
             "subject_id": SUBJECT,
             "selection": { "mode": "subject_all" },
             "budget": { "max_items": 10 },
@@ -680,17 +778,17 @@ fn recall_request() -> MemoryRecallRequest {
 }
 
 fn deliberate_arguments() -> Value {
-    deliberate_arguments_for(CARRIER)
+    deliberate_arguments_in(SPACE)
 }
 
-/// The same deliberation, naming `carrier` as both the holder and the target carrier.
-fn deliberate_arguments_for(carrier: &str) -> Value {
+/// The same deliberation inside `space`: the wire never names a carrier — the Mind's registry row
+/// decides it — so only the target reference varies per Mind.
+fn deliberate_arguments_in(space: &str) -> Value {
     json!({
-        "space_id": SPACE,
+        "space_id": space,
         "subject_id": SUBJECT,
-        "holder": { "kind": "knowledge_entry", "namespace": "mindcore", "id": carrier },
         "target": {
-            "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": carrier },
+            "carrier": { "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER },
             "target_id": "prop_north_gate",
             "kind": "proposition",
         },
@@ -868,8 +966,8 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
 
     assert_eq!(
         capabilities(&surface),
-        ["spoke-knowledge", "ke-ownership", RECALL_CONTEXT, ABSORB],
-        "the manifest advertises exactly the knowledge face and the served tools"
+        ["spoke-knowledge", "ke-ownership", "spoke-judgment", RECALL_CONTEXT, ABSORB, DELIBERATE],
+        "the manifest advertises the knowledge face and all three workflow tools"
     );
     assert_eq!(
         surface
@@ -878,8 +976,8 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
             .iter()
             .map(|tool| tool.capability_id.as_str())
             .collect::<Vec<_>>(),
-        [RECALL_CONTEXT, ABSORB],
-        "no deliberation route, so no deliberation tool is installed"
+        [RECALL_CONTEXT, ABSORB, DELIBERATE],
+        "the registry row routes every Mind, so the deliberation tool is always installed"
     );
 
     let session = connect(&surface, &["spoke-knowledge", RECALL_CONTEXT]).await;
@@ -905,55 +1003,47 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
     );
 }
 
-/// A route map fills recall's knowledge slot per principal: a second admitted peer routed to its own
-/// collection reads that collection's entry under its own grant, never the first principal's.
+/// The knowledge slot keys to the Mind the request names: a second admitted peer recalling its own
+/// Mind's space reads that Mind's collection entries under its own grant, never the first Mind's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() {
+async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
-    fixture.seed_carrier_in(COLLECTION_TWO, CARRIER_TWO).await;
+    fixture.seed_second_mind().await;
     fixture
-        .grant("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
+        .grant_in_second("grt_recall_peer_two", PEER_TWO_PRINCIPAL, &["recall"])
         .await;
     fixture
-        .grant(
+        .grant_in_second(
             "grt_knowledge_peer_two",
             PEER_TWO_PRINCIPAL,
             &["knowledge_read"],
         )
         .await;
     let (_dir, serve) = fixture.serve();
-    let mut workflow_routes = routes(&[PRINCIPAL]);
-    workflow_routes.insert(
-        PEER_TWO_PRINCIPAL.to_string(),
-        KnowledgeScope::new(COLLECTION_TWO),
-    );
     let mut faces = faces(
         hello("runtime", &[]),
         None,
         MindProviders::default(),
-        workflow_routes,
+        routes(&[PRINCIPAL]),
     );
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
-    assert!(
-        capabilities(&surface).contains(&DELIBERATE),
-        "the carrier route is wired: {:?}",
-        capabilities(&surface)
-    );
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[RECALL_CONTEXT]).await;
-    let mut arguments = recall_arguments();
+    let mut arguments = recall_arguments_in(SPACE_TWO);
     arguments["max_tokens"] = json!(4_000);
     let result = expect_ok(
-        session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
-        "recall by a peer that is not the route's caller",
+        session
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, arguments)
+            .await,
+        "recall by a peer admitted to the second Mind",
     );
 
-    assert_eq!(packed_record_ids(&result), ["rec_market", "rec_north_gate"]);
+    assert_eq!(packed_record_ids(&result), ["rec_market_two", "rec_north_gate_two"]);
     assert_eq!(
         packed_knowledge_ids(&result),
-        [CARRIER_TWO],
+        [CARRIER],
         "the peer's own knowledge_read grant fills the slot from its own route: {result}"
     );
 }
@@ -964,7 +1054,6 @@ async fn another_admitted_peer_recalls_its_knowledge_slot_under_a_wired_route() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
     fixture.revoke("grt_knowledge").await;
     let (_dir, serve) = fixture.serve();
     let surface = surface(
@@ -1009,7 +1098,6 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_consumer_deliberates_through_the_composed_surface() {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
     let providers = MindProviders {
@@ -1070,7 +1158,6 @@ async fn deliberation_session(
     policy: Arc<dyn PolicyHook>,
 ) -> (TempDir, MindcoreServe, Session) {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
     let (dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
@@ -1173,7 +1260,6 @@ async fn a_deliberation_judgment_identity_follows_the_attempt_content() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
     let providers = MindProviders {
@@ -1222,7 +1308,6 @@ async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
     let providers = MindProviders {
@@ -1314,16 +1399,15 @@ fn assert_judgment(response: &Value, outcome: &str) {
     );
 }
 
-/// One surface, two principals: each authenticated peer routes to its own collection and settles
-/// onto its own carrier entry, and neither call writes the other principal's carrier. A holder the
-/// routed collection does not hold is refused and writes nothing anywhere.
+/// One surface, two admitted Minds: each peer's call names its own space id and settles the
+/// cognition onto its own carrier entry, and neither call writes the other Mind's carrier. The
+/// `space_id` the request carries decides the collection, so the registry row is the only route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_routed_principals_settle_onto_their_own_carriers() {
+async fn two_minds_settle_onto_their_own_carriers() {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
-    fixture.seed_carrier_in(COLLECTION_TWO, CARRIER_TWO).await;
+    fixture.seed_second_mind().await;
     fixture
-        .grant(
+        .grant_in_second(
             "grt_settle_peer_two",
             PEER_TWO_PRINCIPAL,
             &["recall", "knowledge_read", "knowledge_write"],
@@ -1331,11 +1415,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         .await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let mut workflow_routes = routes(&[PRINCIPAL]);
-    workflow_routes.insert(
-        PEER_TWO_PRINCIPAL.to_string(),
-        KnowledgeScope::new(COLLECTION_TWO),
-    );
+    let workflow_routes = routes(&[PRINCIPAL]);
     let mut faces = faces(
         hello("runtime", &[]),
         None,
@@ -1350,7 +1430,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
     let surface = surface(&serve, faces);
 
     let first = connect(&surface, &[DELIBERATE, RECALL_CONTEXT]).await;
-    let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
+    let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER).await;
     let settled = expect_ok(
         first
             .adapter
@@ -1367,7 +1447,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
     );
     assert_eq!(carrier_revision(&pool, COLLECTION, CARRIER).await, 2);
     assert_eq!(
-        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER).await,
         1,
         "the second principal's carrier keeps its seeded revision"
     );
@@ -1376,13 +1456,13 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         [PRINCIPAL]
     );
     assert!(
-        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO)
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER)
             .await
             .is_empty(),
         "the second collection carries no assessment"
     );
     assert_eq!(
-        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        collection_state(&pool, COLLECTION_TWO, CARRIER).await,
         untouched,
         "the first call leaves the second collection's rows, carrier revision and update stamp unchanged"
     );
@@ -1392,19 +1472,19 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
     let settled = expect_ok(
         second
             .adapter
-            .invoke_tool(DELIBERATE, deliberate_arguments_for(CARRIER_TWO))
+            .invoke_tool(DELIBERATE, deliberate_arguments_in(SPACE_TWO))
             .await,
         "deliberate by the second principal",
     );
     assert_eq!(settled["status"], "settled");
-    assert_eq!(settled["record"]["holder"]["id"], CARRIER_TWO);
+    assert_eq!(settled["record"]["holder"]["id"], CARRIER);
     assert_eq!(settled["record"]["assessor"]["id"], PEER_TWO_PRINCIPAL);
     assert_eq!(
         settled["mind_state_version"], 2,
         "the second write descends from its own carrier, never the first's"
     );
     assert_eq!(
-        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER).await,
         2
     );
     assert_eq!(
@@ -1413,7 +1493,7 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         "the first principal's carrier keeps the revision its own call left"
     );
     assert_eq!(
-        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER).await,
         [PEER_TWO_PRINCIPAL]
     );
     assert_eq!(
@@ -1446,64 +1526,73 @@ async fn two_routed_principals_settle_onto_their_own_carriers() {
         [CARRIER],
         "the first principal's slot lists only its own routed collection: {first_pack}"
     );
+    let mut second_recall = recall_arguments_in(SPACE_TWO);
+    second_recall["max_tokens"] = json!(4_000);
     let second_pack = expect_ok(
-        second.adapter.invoke_tool(RECALL_CONTEXT, recall).await,
+        second
+            .adapter
+            .invoke_tool(RECALL_CONTEXT, second_recall)
+            .await,
         "recall by the second principal",
     );
     assert_eq!(
         packed_record_ids(&second_pack),
-        ["rec_market", "rec_north_gate"],
+        ["rec_market_two", "rec_north_gate_two"],
         "the second principal's memory page is served: {second_pack}"
     );
     assert_eq!(
         packed_knowledge_ids(&second_pack),
-        [CARRIER_TWO],
-        "the second principal's slot lists only its own routed collection: {second_pack}"
+        [CARRIER],
+        "the second principal's slot lists only its own Mind's collection: {second_pack}"
     );
     assert_eq!(
-        second_pack["knowledge"][0]["canonical_name"], "ke_mora's carrier",
-        "the slot carries this collection's entry, not the other principal's copy: {second_pack}"
+        second_pack["knowledge"][0]["canonical_name"], "ke_carrier's carrier",
+        "the slot carries this collection's entry, not the other Mind's copy: {second_pack}"
     );
 
     let first_before = collection_state(&pool, COLLECTION, CARRIER).await;
-    let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
+    let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER).await;
+    // The retired `holder` member: the closed argument object refuses it before any carrier access.
+    let mut with_holder = deliberate_arguments();
+    with_holder["holder"] = json!({ "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER });
     let reject = expect_reject(
         first
             .adapter
-            .invoke_tool(DELIBERATE, deliberate_arguments_for(CARRIER_TWO))
+            .invoke_tool(DELIBERATE, with_holder)
             .await,
-        "deliberate by the first principal naming the second principal's holder",
+        "deliberate still naming the retired holder member",
     );
     assert_eq!(
         reject.code,
-        SpokeRejectCode::KnowledgeEntryNotFound,
-        "the routed collection holds no such holder: {reject:?}"
-    );
-    assert!(
-        reject.message.contains(CARRIER_TWO),
-        "the refusal answers the holder the request named: {reject:?}"
+        SpokeRejectCode::InvalidInput,
+        "a retired holder member is the closed object's unknown-field refusal: {reject:?}"
     );
     assert_eq!(
         collection_state(&pool, COLLECTION, CARRIER).await,
         first_before,
-        "a foreign holder settles nothing in the caller's own collection"
+        "a refused write settles nothing in either collection"
     );
     assert_eq!(
-        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
+        collection_state(&pool, COLLECTION_TWO, CARRIER).await,
         second_before,
-        "nor in the collection that holder lives in"
     );
 }
 
-/// A principal the host did not route reaches no carrier: a peer holding `recall` and both
-/// knowledge grants in the space is still refused, target-free, and nothing is written; the same
-/// peer still recalls its memory, with an empty knowledge slot.
+/// A space that is no Mind — grants live, no registry row — reaches no carrier: a peer holding
+/// `recall` and both knowledge grants in it is still refused, target-free, and nothing is written;
+/// the same peer still recalls its memory there, with an empty knowledge slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_without_a_route_cannot_write_the_carrier() {
+async fn a_space_with_no_registry_row_reaches_no_carrier() {
     let fixture = Fixture::open().await;
-    fixture.seed_carrier().await;
+    // The second space without its Mind: the space, subjects and grants live, but no registry row.
+    fixture.seed_second_mind().await;
+    sqlx::query("DELETE FROM minds WHERE space_id = ?")
+        .bind(SPACE_TWO)
+        .execute(&fixture.store.pool())
+        .await
+        .expect("drop the registry row");
     fixture
-        .grant(
+        .grant_in_second(
             "grt_route_peer_two",
             PEER_TWO_PRINCIPAL,
             &["recall", "knowledge_read", "knowledge_write"],
@@ -1527,16 +1616,14 @@ async fn a_peer_without_a_route_cannot_write_the_carrier() {
     let reject = expect_reject(
         session
             .adapter
-            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .invoke_tool(DELIBERATE, deliberate_arguments_in(SPACE_TWO))
             .await,
-        "deliberate by a peer without a knowledge route",
+        "deliberate by a peer in a space with no registry row",
     );
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
     assert!(
-        reject
-            .message
-            .contains("principal has no workflow knowledge route"),
-        "the refusal is the missing-route rule: {reject:?}"
+        reject.message.contains("the caller is not admitted to the named mind"),
+        "the refusal is the admission rule: {reject:?}"
     );
     let refusal = format!("{reject:?}");
     assert!(
@@ -1556,20 +1643,20 @@ async fn a_peer_without_a_route_cannot_write_the_carrier() {
         "a refused carrier write leaves the entry untouched"
     );
 
-    let mut arguments = recall_arguments();
+    let mut arguments = recall_arguments_in(SPACE_TWO);
     arguments["max_tokens"] = json!(4_000);
     let recalled = expect_ok(
         session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
-        "recall by a peer without a knowledge route",
+        "recall by a peer in a space with no registry row",
     );
     assert_eq!(
         packed_record_ids(&recalled),
-        ["rec_market", "rec_north_gate"]
+        ["rec_market_two", "rec_north_gate_two"]
     );
     assert_eq!(
         recalled["knowledge"],
         json!([]),
-        "an unrouted peer reads its memory with an empty knowledge slot"
+        "a space with no registry row reads its memory with an empty knowledge slot"
     );
 }
 
@@ -1883,92 +1970,8 @@ async fn an_unserved_tool_answers_op_unsupported() {
     );
 }
 
-/// Advertisement honesty for the deliberation route: a surface assembled without a workflow caller
-/// installs no `deliberate` handler, advertises none, and answers the invoke with
-/// `op_unsupported` even when the dialer claims the id.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unwired_deliberation_route_is_neither_advertised_nor_served() {
-    let fixture = Fixture::open().await;
-    let (_dir, serve) = fixture.serve();
-    let surface = surface(
-        &serve,
-        faces(
-            hello("runtime", &[]),
-            None,
-            MindProviders::default(),
-            routes(&[]),
-        ),
-    );
-    assert!(
-        !capabilities(&surface).contains(&DELIBERATE),
-        "an unwired deliberation route is never advertised: {:?}",
-        capabilities(&surface)
-    );
-    assert!(
-        !capabilities(&surface).contains(&CAPABILITY_SPOKE_JUDGMENT),
-        "no `deliberate` registration, so no judgment family is advertised: {:?}",
-        capabilities(&surface)
-    );
-
-    let session = connect(&surface, &[DELIBERATE]).await;
-    assert_wire_deny(
-        session
-            .adapter
-            .invoke_tool(DELIBERATE, deliberate_arguments())
-            .await,
-        DELIBERATE,
-        "op_unsupported",
-    );
-}
-
-/// A host registration cannot restore the unwired route: the reserved id is dropped from the
-/// final registration set, so it is neither advertised nor installed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_host_registration_cannot_restore_an_unwired_deliberation_route() {
-    let fixture = Fixture::open().await;
-    let (_dir, serve) = fixture.serve();
-    let mut faces = faces(
-        hello("runtime", &[]),
-        None,
-        MindProviders::default(),
-        routes(&[]),
-    );
-    faces.tools = vec![ToolRegistration::new(
-        deliberate_descriptor(),
-        |_responder| {
-            let handler: ToolHandler =
-                Arc::new(|arguments: Value| Box::pin(async move { spoke_ok(arguments) }));
-            handler
-        },
-    )];
-    let surface = surface(&serve, faces);
-
-    assert!(
-        !capabilities(&surface).contains(&DELIBERATE),
-        "a host registration cannot re-advertise the unwired route: {:?}",
-        capabilities(&surface)
-    );
-    assert!(
-        surface
-            .manifest
-            .tools
-            .iter()
-            .all(|tool| tool.capability_id.as_str() != DELIBERATE),
-        "the reserved descriptor is dropped from the manifest"
-    );
-
-    let session = connect(&surface, &[DELIBERATE]).await;
-    assert_wire_deny(
-        session
-            .adapter
-            .invoke_tool(DELIBERATE, deliberate_arguments())
-            .await,
-        DELIBERATE,
-        "op_unsupported",
-    );
-}
-
 /// One shared-source entry the adoption copies: a note whose summary names what the source holds.
+
 fn shared_entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
     serde_json::from_value(json!({
         "schema_version": 1,
