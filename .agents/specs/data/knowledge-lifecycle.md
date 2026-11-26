@@ -20,9 +20,9 @@ scopes the test binds, and by the binding helpers' own tests.
 
 What does not exist yet is the composition: no served knowledge face is composed on any surface,
 no admission callback writes the binding for a peer, and `port.knowledge.put` is refused on the
-shipped dispatch-deny branch (`architecture/serving-seam.md`), so no wire request reaches either
-the guard or the unguarded store. Until layer 2 composes the face, the guard is reachable only
-from tests.
+shipped dispatch-deny branch ([`serving-seam.md`](../architecture/serving-seam.md)), so no wire
+request reaches either the guard or the unguarded store. Until layer 2 composes the face, the
+guard is reachable only from tests.
 
 A get and a list require one live grant covering `knowledge_read`; a put requires one grant covering
 both `knowledge_write` and `knowledge_read`, because Connect reads the entry through `get` before it
