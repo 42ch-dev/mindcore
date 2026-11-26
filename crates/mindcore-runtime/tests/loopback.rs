@@ -649,14 +649,15 @@ fn faces(
         memory,
         knowledge: false,
         history: false,
+        adoption: None,
         principals: principal_admission(),
         providers,
         tools: Vec::new(),
     }
 }
 
-fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
-    expect_ok(serve.surface(faces), "assemble the served surface")
+async fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
+    expect_ok(serve.surface(faces).await, "assemble the served surface")
 }
 
 struct Session {
@@ -1245,7 +1246,8 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
             None,
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
 
     assert_eq!(
         capabilities(&surface),
@@ -1311,7 +1313,7 @@ async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
     let (_dir, serve) = fixture.serve();
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[RECALL_CONTEXT]).await;
     let mut arguments = recall_arguments_in(SPACE_TWO);
@@ -1352,7 +1354,8 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &[]), None, MindProviders::default()),
-    );
+    )
+    .await;
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
         "the carrier route is wired: {:?}",
@@ -1392,7 +1395,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
         reasoner: Some(Arc::new(NoChangeReasoner)),
         ..MindProviders::default()
     };
-    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers)).await;
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
         "a wired deliberation route is advertised: {:?}",
@@ -1455,7 +1458,8 @@ async fn deliberation_session(
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[DELIBERATE]).await;
     (dir, serve, session)
 }
@@ -1551,7 +1555,7 @@ async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
         policy_hook: Some(Arc::new(HoldingPolicy)),
         ..MindProviders::default()
     };
-    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers)).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let result = expect_ok(
@@ -1596,7 +1600,7 @@ async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
         policy_hook: Some(Arc::new(AutoPolicy)),
         ..MindProviders::default()
     };
-    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers)).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let result = expect_ok(
@@ -1651,7 +1655,7 @@ async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
     // Two principals: the dialer reaches the first Mind, the second peer reaches only what it is
     // granted in the second.
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[DELIBERATE, READ_COGNITION]).await;
 
@@ -1850,7 +1854,7 @@ async fn two_minds_settle_onto_their_own_carriers() {
         },
     );
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let first = connect(&surface, &[DELIBERATE, RECALL_CONTEXT]).await;
     let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
@@ -2050,7 +2054,7 @@ async fn a_space_with_no_registry_row_reaches_no_carrier() {
         },
     );
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE, RECALL_CONTEXT]).await;
     let reject = expect_reject(
@@ -2120,7 +2124,8 @@ async fn a_frozen_mind_serves_reads_and_refuses_a_freeze_gated_write() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &[]), None, MindProviders::default()),
-    );
+    )
+    .await;
     let session = connect(&surface, &[RECALL_CONTEXT, ABSORB, READ_COGNITION]).await;
 
     let mut recall = recall_arguments();
@@ -2181,7 +2186,7 @@ async fn deliberate_cannot_distinguish_an_absent_mind_from_an_ungranted_one() {
     // No reasoner: any path that reaches the engine before admission is a different answer.
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
     let existing = expect_reject(
@@ -2232,7 +2237,7 @@ async fn a_strangers_malformed_grant_row_cannot_leak_the_minds_existence() {
     // No reasoner: a path that reaches the engine would answer differently again.
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
     let poisoned = expect_reject(
@@ -2286,7 +2291,7 @@ async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
         },
     );
     faces.principals = principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let uncovered = expect_reject(
@@ -2350,7 +2355,7 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
         },
     );
     faces.principals = principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[DELIBERATE]).await;
     sqlx::query(
@@ -2431,7 +2436,8 @@ async fn deliberate_refuses_the_subject_before_the_knowledge_coverage() {
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[DELIBERATE]).await;
 
     let subject_first = expect_reject(
@@ -2505,7 +2511,7 @@ async fn one_principal_recalls_each_mind_by_its_own_space_id() {
     let (_dir, serve) = fixture.serve();
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
     for (space, carrier, name, summary) in [
@@ -2574,7 +2580,8 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             None,
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         !capabilities(&absent).contains(&"spoke-memory"),
         "an unattached memory face is never advertised: {:?}",
@@ -2596,7 +2603,8 @@ async fn memory_ops_are_served_only_when_the_host_attaches_the_face() {
             Some(Arc::new(MemoryFace)),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         capabilities(&attached).contains(&"spoke-memory"),
         "an attached memory face is advertised: {:?}",
@@ -2706,7 +2714,7 @@ async fn the_admin_grant_view_reads_the_space_and_moves_its_marker() {
         MindProviders::default(),
     );
     faces.principals = two_principal_admission();
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
 
     let request = |payload: Value| -> MemoryGrantsListRequest {
         serde_json::from_value(payload).expect("the grants list request JSON matches the schema")
@@ -2842,7 +2850,8 @@ async fn transfer_is_advertised_and_served_when_the_service_reports_all_five() {
             Some(service),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         capabilities(&surface).contains(&"spoke-memory-transfer"),
         "a service that reports the whole family earns it: {:?}",
@@ -2973,7 +2982,8 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
             Some(service),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
     session.wire.drain();
 
@@ -3034,7 +3044,8 @@ async fn the_baseline_face_is_never_composed_or_advertised() {
             None,
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         !capabilities(&surface).contains(&"spoke-baseline"),
         "no baseline provider is composed: {:?}",
@@ -3058,7 +3069,8 @@ async fn an_unserved_tool_answers_op_unsupported() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &[]), None, MindProviders::default()),
-    );
+    )
+    .await;
     assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
 
     let session = connect(&surface, &[UNSERVED_TOOL]).await;
@@ -3083,7 +3095,8 @@ async fn an_un_routed_face_answers_a_missing_port() {
     let surface = surface(
         &serve,
         faces(hello("runtime", &claimed), None, MindProviders::default()),
-    );
+    )
+    .await;
     for capability in claimed {
         assert!(
             !capabilities(&surface).contains(&capability),
@@ -3130,7 +3143,7 @@ async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
             handler
         },
     )];
-    let surface = surface(&serve, faces);
+    let surface = surface(&serve, faces).await;
     assert!(
         capabilities(&surface).contains(&HOST_TOOL),
         "the host registration is advertised: {:?}",
@@ -3258,7 +3271,8 @@ async fn retiring_an_identity_clears_its_slot_and_partition() {
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
 
     expect_ok(
@@ -3363,7 +3377,8 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
                 ..MindProviders::default()
             },
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
 
     expect_ok(
@@ -3570,7 +3585,8 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
             })),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     assert!(
         capabilities(&surface).contains(&"spoke-memory"),
         "the attached create face advertises the memory family: {:?}",
@@ -3834,7 +3850,8 @@ async fn a_signed_create_of_an_existing_mind_without_admin_learns_nothing() {
             })),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &["spoke-memory"]).await;
     session.wire.drain();
 
@@ -3894,7 +3911,8 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
             })),
             MindProviders::default(),
         ),
-    );
+    )
+    .await;
     let session = connect(&surface, &["spoke-memory"]).await;
     session.wire.drain();
 
@@ -4110,7 +4128,7 @@ fn assert_scope_refusal<T: std::fmt::Debug>(result: SpokeResult<T>, context: &st
 }
 
 /// A surface whose knowledge face is composed, over the fixture's Mind.
-fn knowledge_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
+async fn knowledge_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
     let mut faces = faces(
         hello("runtime", &KNOWLEDGE_CAPABILITIES),
         None,
@@ -4118,7 +4136,7 @@ fn knowledge_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> Mind
     );
     faces.knowledge = true;
     faces.principals = principals;
-    surface(serve, faces)
+    surface(serve, faces).await
 }
 
 /// The composed knowledge face serves the admitted Mind's own collection: a put creates an entry
@@ -4129,7 +4147,7 @@ async fn the_composed_knowledge_face_serves_the_admitted_minds_own_entries() {
     fixture.seed_second_mind().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     assert!(
         capabilities(&surface).contains(&"spoke-knowledge"),
         "the composed face is advertised: {:?}",
@@ -4222,7 +4240,7 @@ async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
         .await
         .expect("freeze the second Mind");
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
 
     // The peer that holds no grant in the second Mind, and none in the first either.
     let session = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
@@ -4317,7 +4335,7 @@ async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
 async fn a_requested_viewpoint_is_refused_rather_than_silently_served() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     assert!(
         !capabilities(&surface).contains(&"ke-ownership"),
         "the face advertises no flag it cannot honour: {:?}",
@@ -4386,7 +4404,7 @@ async fn a_requested_viewpoint_is_refused_rather_than_silently_served() {
 async fn a_scoped_op_without_its_capability_is_the_dispatch_deny() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
     // `ke-ownership`, so the negotiated set is exactly this hello's claim.
     let session = connect(&surface, &["spoke-knowledge"]).await;
@@ -4470,7 +4488,7 @@ async fn the_knowledge_face_authorizes_each_operation_on_the_callers_own_grant()
         .await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, three_principal_admission());
+    let surface = knowledge_surface(&serve, three_principal_admission()).await;
 
     // The creator's default grant covers both: list, get and put all serve.
     let creator = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
@@ -4590,7 +4608,7 @@ async fn a_grant_covering_neither_knowledge_capability_serves_nothing() {
         .grant("grt_recall_only", PEER_TWO_PRINCIPAL, &["recall"])
         .await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     let session = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let dialer = &*session.adapter;
 
@@ -4670,7 +4688,7 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
         .await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     let forgery = Some(json!({ "mindcore_caller": { "principal": PRINCIPAL } }));
 
     let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
@@ -4889,7 +4907,7 @@ async fn no_wire_response_carries_the_caller() {
         )
         .await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     let principals = [PRINCIPAL, PEER_TWO_PRINCIPAL];
 
     let owner = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
@@ -5181,7 +5199,7 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
     let (_dir, serve) = fixture.serve();
     // The face is composed, so a request that passes the gates would be served: the denials below
     // are the gates and not a missing face.
-    let surface = knowledge_surface(&serve, raw_wire_admission());
+    let surface = knowledge_surface(&serve, raw_wire_admission()).await;
     assert!(
         surface.ports.as_scoped_knowledge().is_some(),
         "the face is composed for this ordering test"
@@ -5280,7 +5298,7 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
 async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, raw_wire_admission());
+    let surface = knowledge_surface(&serve, raw_wire_admission()).await;
     let (client, session_id) = raw_wire::open_raw_session(&surface, &KNOWLEDGE_CAPABILITIES).await;
 
     let served = raw_wire::invoke(
@@ -5316,7 +5334,7 @@ async fn a_storage_fault_during_admission_is_an_internal_error_not_a_refusal() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, principal_admission());
+    let surface = knowledge_surface(&serve, principal_admission()).await;
     // The marker is advertised, so the scoped op is decodable and reaches the face; the caller
     // holds the Mind's covering grant, so nothing but the store's health decides the answer.
     let session = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
@@ -5379,7 +5397,7 @@ async fn a_storage_fault_during_admission_is_an_internal_error_not_a_refusal() {
 async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_mind() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let surface = knowledge_surface(&serve, two_principal_admission());
+    let surface = knowledge_surface(&serve, two_principal_admission()).await;
     // The second peer holds no grant anywhere: it is the unadmitted case.
     let stranger = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let dialer = &*stranger.adapter;
@@ -5418,7 +5436,7 @@ const HISTORY_CAPABILITIES: [&str; 4] = [
 ];
 
 /// A surface whose history face is composed over the knowledge face, for `principals`.
-fn history_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
+async fn history_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> MindcoreSurface {
     let mut faces = faces(
         hello("runtime", &HISTORY_CAPABILITIES),
         None,
@@ -5427,7 +5445,7 @@ fn history_surface(serve: &MindcoreServe, principals: MemoryAdmission) -> Mindco
     faces.knowledge = true;
     faces.history = true;
     faces.principals = principals;
-    surface(serve, faces)
+    surface(serve, faces).await
 }
 
 /// `summaries.len()` revisions of `entry_id` in `collection`, written through the store the way a
@@ -5597,7 +5615,7 @@ async fn history_serves_each_mind_its_own_entry_history() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, principal_admission());
+    let surface = history_surface(&serve, principal_admission()).await;
     assert!(
         capabilities(&surface).contains(&"spoke-history"),
         "the composed face is advertised: {:?}",
@@ -5687,7 +5705,7 @@ async fn history_grants_no_access_the_knowledge_face_does_not() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, two_principal_admission());
+    let surface = history_surface(&serve, two_principal_admission()).await;
     let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let dialer = &*peer.adapter;
 
@@ -5787,7 +5805,7 @@ async fn history_replay_needs_knowledge_read() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, three_principal_admission());
+    let surface = history_surface(&serve, three_principal_admission()).await;
 
     let recall_only = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     assert_scope_refusal(
@@ -5850,7 +5868,7 @@ async fn history_prune_needs_the_write_and_read_grant() {
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, three_principal_admission());
+    let surface = history_surface(&serve, three_principal_admission()).await;
 
     // The read-only caller's prune is the knowledge face's put refusal, byte for byte, and it
     // leaves every checkpoint in place.
@@ -6015,7 +6033,7 @@ async fn the_history_face_refuses_every_mind_it_does_not_admit_alike() {
         .await
         .expect("freeze the second Mind");
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, two_principal_admission());
+    let surface = history_surface(&serve, two_principal_admission()).await;
     let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let dialer = &*peer.adapter;
 
@@ -6174,7 +6192,7 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
 
     // Before: one prune, its recorded outcome, and the checkpoint it cut.
     let first = {
-        let surface = history_surface(&serve, principal_admission());
+        let surface = history_surface(&serve, principal_admission()).await;
         let session = connect(&surface, &HISTORY_CAPABILITIES).await;
         let dialer = &*session.adapter;
         let first = expect_ok(
@@ -6223,7 +6241,7 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
         "the append wrote checkpoint 3 above the first prune's floor"
     );
     let serve = MindcoreServe::new(reopened, false, |_targets| Ok(()));
-    let surface = history_surface(&serve, principal_admission());
+    let surface = history_surface(&serve, principal_admission()).await;
     let session = connect(&surface, &HISTORY_CAPABILITIES).await;
     let dialer = &*session.adapter;
 
@@ -6400,7 +6418,7 @@ async fn a_prune_settles_its_claim_and_its_record_on_the_single_connection_pool(
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, two_principal_admission());
+    let surface = history_surface(&serve, two_principal_admission()).await;
     let peer = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let key = dedup_key(SPACE, PEER_TWO_PRINCIPAL, "key-order");
 
@@ -6509,7 +6527,7 @@ async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_resu
     )
     .await;
     let (_dir, serve) = fixture.serve();
-    let surface = history_surface(&serve, principal_admission());
+    let surface = history_surface(&serve, principal_admission()).await;
     let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
     let key = dedup_key(SPACE, PRINCIPAL, "key-unsettled");
 

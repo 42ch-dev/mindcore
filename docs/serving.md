@@ -46,7 +46,7 @@ let serve = MindcoreServe::new(
 | `history` | serve `spoke-history` over the same routed store | `false` composes and advertises none |
 | `principals` | peer id → `Principal` for workflows | the same mapping the memory face uses |
 | `providers` | embedder, reasoner and domain lens | injected into each workflow call |
-| `adoption` | the one shared source collection | see below |
+| `adoption` | `Some(AdoptionRoute)`: the one shared source collection, or `None` | describes the source only; see below |
 | `workflow_routes` | principal id → its one workflow collection | the allowlist; each destination belongs to one principal |
 | `tools` | extra host tools | the retired `tools.mindcore.adopt` id is dropped; `deliberate` is dropped when no workflow route is configured |
 
@@ -57,26 +57,31 @@ refuses.
 
 ## Adoption route
 
-`AdoptionRoute` names a shared source collection and the scope id peers use to reach it. Assembly
-refuses when:
+`AdoptionRoute` names a shared source collection and the scope id peers use to reach it. It
+describes the source side only. Assembly refuses, before any port or registration exists, when:
 
 - the scope id or collection is empty,
-- the source scope id equals the destination scope id,
-- the source collection is the knowledge face's collection,
-- the source collection is any `workflow_routes` destination, including a route of a principal
-  that is not currently connected.
+- the source collection is the collection of any Mind registered at assembly,
+- the source scope id is the id of any Mind registered at assembly,
+- the route is configured without `knowledge`.
 
-The destination is the knowledge face's collection, shared by every peer admitted there: one slot
-per `destination_entry_id`, first adoption claims it. Adoption reuses the knowledge face's
-admission, so a peer the knowledge face does not admit cannot adopt, and every copy is readable
-through the same `knowledge.get`/`list`.
+Every registered Mind is a possible destination, so a collision with one is refused whatever Mind
+holds it. A Mind created afterwards can still take a colliding id or collection: the port makes the
+same two decisions per call and answers the generic `NOT_FOUND`, so the invariant holds without a
+reassembly.
+
+The destination is not configured: each call resolves the collection from the registry row of the
+Mind the caller was admitted to, inside the copy's one transaction
+(`crates/mindcore-runtime/src/adoption.rs`). Adoption reuses the knowledge face's admission, so a
+peer the knowledge face does not admit cannot adopt, every copy is readable through the same
+`knowledge.get`/`list`, and no wire value selects either side of the copy.
 
 ## Assemble, then register
 
 ```rust
 use spoke_connect::remote::{connect_responder, ConnectResponderOptions, RemoteIdentity};
 
-let surface = match serve.surface(faces) {
+let surface = match serve.surface(faces).await {
     SpokeResult::Ok(surface) => surface,
     SpokeResult::Reject(reject) => return Err(reject.into()),
 };
