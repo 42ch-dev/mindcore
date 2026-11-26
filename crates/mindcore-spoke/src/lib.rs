@@ -35,8 +35,8 @@ use spoke_schemas::Principal;
 use sqlx::{Sqlite, Transaction};
 
 use mindcore_base::ids::{SpaceId, SubjectId};
-use mindcore_spi::SpiError;
 use mindcore_base::ir::{MemoryRepository, ReceiptFailure, ReceiptState, ReviewReceiptIr};
+use mindcore_spi::SpiError;
 use mindcore_sqlite::SqliteMemoryRepository;
 
 use crate::admission::Op;
@@ -308,10 +308,13 @@ impl MemoryAdapter {
                 subject_all: false,
             };
             if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
-                return Err(SpiError::Settlement(Reject::not_authorized(format!(
-                    "principal {caller} holds no live {capability} grant in space {}",
-                    space.as_str()
-                )).into_spoke()));
+                return Err(SpiError::Settlement(
+                    Reject::not_authorized(format!(
+                        "principal {caller} holds no live {capability} grant in space {}",
+                        space.as_str()
+                    ))
+                    .into_spoke(),
+                ));
             }
         }
         Ok(())

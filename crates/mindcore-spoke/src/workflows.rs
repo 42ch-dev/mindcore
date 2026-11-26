@@ -12,8 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 use spoke_operations::{
-    knowledge_entry_visible_to_viewpoint, SpokeReject, SpokeRejectCode,
-    SpokeResult,
+    knowledge_entry_visible_to_viewpoint, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::data::cognition::{CognitionReference, CognitionReferenceKind};
 use spoke_schemas::data::memory_candidate::PlacementScope;
@@ -44,7 +43,9 @@ use mindcore_sqlite::{
 
 use crate::admission;
 use crate::reject::Reject;
-use crate::{principal_id, MemoryAdapter, MemoryStage, Tx, KNOWLEDGE_READ, KNOWLEDGE_WRITE, RECALL};
+use crate::{
+    principal_id, MemoryAdapter, MemoryStage, Tx, KNOWLEDGE_READ, KNOWLEDGE_WRITE, RECALL,
+};
 
 /// Publishes one intent's file targets and confirms them: `Ok(())` only when
 /// every target's exact bytes landed at its path.

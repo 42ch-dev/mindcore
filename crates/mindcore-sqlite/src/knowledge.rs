@@ -752,19 +752,25 @@ impl RoutedKnowledgeStore {
             SpokeResult::Ok(false) => return history_not_found(entity_id),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
-        let entry =
-            match read_entry_at_revision(&mut tx, &self.scope.collection, entity_id, revision).await {
-                SpokeResult::Ok(entry) => entry,
-                SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::HistoryTruncated => {
-                    return SpokeResult::Reject(reject)
-                }
-                SpokeResult::Reject(reject)
-                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
-                {
-                    return history_not_found(entity_id)
-                }
-                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-            };
+        let entry = match read_entry_at_revision(
+            &mut tx,
+            &self.scope.collection,
+            entity_id,
+            revision,
+        )
+        .await
+        {
+            SpokeResult::Ok(entry) => entry,
+            SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::HistoryTruncated => {
+                return SpokeResult::Reject(reject)
+            }
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+            {
+                return history_not_found(entity_id)
+            }
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
         // Disclosure is a payload property, so the live row's visibility says nothing about the
         // replayed payload: a revision whose own fields fall outside the admitted scope is the
         // same absence as a hidden live row.

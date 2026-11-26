@@ -372,7 +372,9 @@ impl Mind {
             return written;
         }
         if let Err(error) = transaction.commit().await {
-            return uncertain(format!("knowledge write committed an unknown outcome: {error}"));
+            return uncertain(format!(
+                "knowledge write committed an unknown outcome: {error}"
+            ));
         }
         written
     }
@@ -789,20 +791,20 @@ impl Mind {
                 )
             }
         };
-        let mind_state = match mindcore_base::cognition::mind_state_value(&view, self.row.id.as_str())
-        {
-            Ok(mind_state) => mind_state,
-            Err(error) => {
-                return reject(
-                    SpokeRejectCode::InternalError,
-                    format!(
-                        "the mind state of {} cannot be projected: {error}",
-                        self.row.carrier_entry_id
-                    ),
-                    "terminal",
-                )
-            }
-        };
+        let mind_state =
+            match mindcore_base::cognition::mind_state_value(&view, self.row.id.as_str()) {
+                Ok(mind_state) => mind_state,
+                Err(error) => {
+                    return reject(
+                        SpokeRejectCode::InternalError,
+                        format!(
+                            "the mind state of {} cannot be projected: {error}",
+                            self.row.carrier_entry_id
+                        ),
+                        "terminal",
+                    )
+                }
+            };
         SpokeResult::Ok(Some(Cognition {
             carrier_revision: revision,
             records: view.records,
@@ -826,15 +828,16 @@ impl Mind {
         })) {
             Ok(holder) => holder,
             Err(error) => {
-                return retryable_internal(format!("the carrier reference does not decode: {error}"))
+                return retryable_internal(format!(
+                    "the carrier reference does not decode: {error}"
+                ))
             }
         };
-        let binding = MemoryWorkflowBinding::new(self.pool.clone(), false)
-            .with_carrier_collection(
-                self.row.id.as_str(),
-                &self.row.knowledge.collection,
-                &self.row.carrier_entry_id,
-            );
+        let binding = MemoryWorkflowBinding::new(self.pool.clone(), false).with_carrier_collection(
+            self.row.id.as_str(),
+            &self.row.knowledge.collection,
+            &self.row.carrier_entry_id,
+        );
         let workflows = SpiMindWorkflows::new(binding);
         let request = DeliberateRequest {
             space_id: self.row.id.as_str(),

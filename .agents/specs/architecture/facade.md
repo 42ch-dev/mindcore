@@ -179,5 +179,20 @@ host that needs it embeds the adapter or the served surface directly.
 - `crates/mindcore-runtime/src/mind.rs` — the handle, its operations and the `review` fold.
 - `crates/mindcore-runtime/src/journal.rs` — `journal_dir`, the crate's one journal publisher.
 - `crates/mindcore-runtime/examples/mind_facade.rs` — the documented end-to-end example:
+
   `cargo run --offline -p mindcore-runtime --example mind_facade`.
 - Tests: `crates/mindcore-runtime/tests/mind.rs`.
+
+## Change obligations
+
+- Adding, removing or renaming a facade operation, or changing what one composes, which
+  transaction it runs on or which grants it re-checks, updates the operations table and the
+  `Current state` narrative in the same change.
+- Changing the `review` fold — staging, publication ordering, the `OUTCOME_UNCERTAIN` recovery
+  contract or settlement — updates § `The `review` fold` in the same change.
+- Changing `journal_dir` confinement, durability or refusal behaviour updates the journal
+  paragraphs in the same change; changing what `open` caches or refuses updates § `The handle`.
+- Changing `deliberate` subject handling or `cognition_read` derivation updates their own
+  sections in the same change.
+- Moving a listed path or command updates `Where it lives` in the same change; weakening or
+  strengthening any invariant updates `Invariants` in the same change.

@@ -26,7 +26,9 @@ const SUBJECT: &str = "subj_wren";
 fn ok<T>(result: SpokeResult<T>, step: &str) -> T {
     match result {
         SpokeResult::Ok(value) => value,
-        SpokeResult::Reject(reject) => panic!("{step} refused: {}: {}", reject.code, reject.message),
+        SpokeResult::Reject(reject) => {
+            panic!("{step} refused: {}: {}", reject.code, reject.message)
+        }
     }
 }
 
@@ -39,9 +41,13 @@ async fn main() {
     let dir = tempfile::TempDir::new().expect("a scratch directory");
     // Creating the scratch directory wrote an entry in its parent; the host makes that entry
     // durable before anything depends on it, exactly as it will for the journal root below.
-    std::fs::File::open(dir.path().parent().expect("the scratch directory has a parent"))
-        .and_then(|parent| parent.sync_all())
-        .expect("sync the scratch directory's creation entry");
+    std::fs::File::open(
+        dir.path()
+            .parent()
+            .expect("the scratch directory has a parent"),
+    )
+    .and_then(|parent| parent.sync_all())
+    .expect("sync the scratch directory's creation entry");
     let store = MindStore::open(&dir.path().join("mind.db"))
         .await
         .expect("open the store");
@@ -82,9 +88,13 @@ async fn main() {
     std::fs::create_dir_all(&journal_root).expect("the host creates the journal root");
     // The host, not the publisher, owns the root's creation entry: creating the root writes an
     // entry in its parent, and that entry is durable only once the parent is synced.
-    std::fs::File::open(journal_root.parent().expect("the journal root has a parent"))
-        .and_then(|parent| parent.sync_all())
-        .expect("sync the journal root's creation entry");
+    std::fs::File::open(
+        journal_root
+            .parent()
+            .expect("the journal root has a parent"),
+    )
+    .and_then(|parent| parent.sync_all())
+    .expect("sync the journal root's creation entry");
     let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
         .with_journal_publisher(journal_dir(journal_root));
 
@@ -107,8 +117,8 @@ async fn main() {
 
     // 4. Review the candidate. The answer is the settled receipt: the fold — staging,
     //    publication, settlement — is the handle's, and the caller never sees it.
-    let promote: Decision = serde_json::from_value(json!({ "action": "promote" }))
-        .expect("a promote decision");
+    let promote: Decision =
+        serde_json::from_value(json!({ "action": "promote" })).expect("a promote decision");
     let reviewed = ok(
         mind.review(&candidate_id, &promote, "rev-north-gate").await,
         "review",
