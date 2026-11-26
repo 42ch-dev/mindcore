@@ -159,18 +159,62 @@ pub fn journal_dir(
                     hasher.finish()
                 }
             ));
-            std::fs::write(&temporary, content).map_err(|error| {
-                SpiError::Settlement(spoke_reject(format!(
-                    "journal target {path} could not be written: {error}"
-                )))
-            })?;
-            std::fs::File::open(&temporary)
-                .and_then(|temporary| temporary.sync_all())
+            // The temporary itself is created exclusively: `create_new` fails on any existing
+            // entry — a pre-planted symlink included — and otherwise creates a fresh regular
+            // file, so the write can never follow a symlink at the temporary name either. A
+            // leftover regular file is this target's own crashed attempt and is removed before
+            // the retry; a symlink or any other entry is refused.
+            let mut attempts = 0u32;
+            let mut temporary_file = loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
+                {
+                    Ok(temporary_file) => break temporary_file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        match std::fs::symlink_metadata(&temporary) {
+                            Ok(metadata) if metadata.file_type().is_file() => {
+                                std::fs::remove_file(&temporary).map_err(|error| {
+                                    SpiError::Settlement(spoke_reject(format!(
+                                        "the leftover temporary for {path} could not be removed: {error}"
+                                    )))
+                                })?;
+                            }
+                            _ => {
+                                return Err(SpiError::InvalidInput(format!(
+                                    "the temporary file for journal target {path} already exists as a non-file entry"
+                                )));
+                            }
+                        }
+                        attempts += 1;
+                        if attempts >= 8 {
+                            return Err(SpiError::Settlement(spoke_reject(format!(
+                                "the temporary file for journal target {path} could not be created exclusively"
+                            ))));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(SpiError::Settlement(spoke_reject(format!(
+                            "journal target {path} could not be written: {error}"
+                        ))));
+                    }
+                }
+            };
+            use std::io::Write as _;
+            temporary_file
+                .write_all(content.as_bytes())
                 .map_err(|error| {
                     SpiError::Settlement(spoke_reject(format!(
-                        "journal target {path} could not be synced: {error}"
+                        "journal target {path} could not be written: {error}"
                     )))
                 })?;
+            temporary_file.sync_all().map_err(|error| {
+                SpiError::Settlement(spoke_reject(format!(
+                    "journal target {path} could not be synced: {error}"
+                )))
+            })?;
+            drop(temporary_file);
             std::fs::rename(&temporary, &file).map_err(|error| {
                 SpiError::Settlement(spoke_reject(format!(
                     "journal target {path} could not be renamed into place: {error}"

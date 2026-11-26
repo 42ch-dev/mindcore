@@ -1530,18 +1530,69 @@ async fn the_public_publisher_never_writes_through_a_swapped_in_target_symlink()
     );
 }
 
-/// The review's publication runs off the async worker. The runtime is single-threaded, which
-/// makes scheduling fully controllable: spawned tasks run only when the test yields or awaits,
-/// so every assertion below is ordering, never timing. A watchdog thread with a hard deadline
-/// is the only guard against a hang, and it names exactly what never arrived.
+/// The temporary file itself is created exclusively: a symlink pre-placed at the temporary
+/// name is refused rather than followed, and the victim outside the root is never written.
+#[tokio::test]
+async fn the_public_publisher_never_writes_through_a_preplaced_temporary_symlink() {
+    let dir = TempDir::new().expect("temporary directory");
+    let root = dir.path().join("journal");
+    std::fs::create_dir_all(&root).expect("the host creates the root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("create the escape destination");
+    let publisher = mindcore_runtime::journal_dir(&root);
+
+    // Compute the temporary name exactly as the publisher does and pre-place a symlink there.
+    let target_path = "records/rec_preplaced.md";
+    let file = root.join(target_path);
+    let parent = file.parent().expect("the target parent").to_path_buf();
+    std::fs::create_dir_all(&parent).expect("create the target parent");
+    let temporary = parent.join(format!(
+        ".journal-{}-{:016x}.tmp",
+        std::process::id(),
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            file.hash(&mut hasher);
+            hasher.finish()
+        }
+    ));
+    std::os::unix::fs::symlink(outside.join("victim.md"), &temporary)
+        .expect("pre-place the temporary symlink");
+
+    let published = publisher(&[json!({
+        "path": target_path,
+        "content": "must never land outside",
+    })]);
+    assert!(
+        published.is_err(),
+        "a pre-placed symlink at the temporary name is refused"
+    );
+    assert!(
+        !outside.join("victim.md").exists(),
+        "the victim outside the root was never written"
+    );
+}
+
+/// The review's publication runs off the async worker. The proof is the probe's own lifecycle:
+/// the probe task is spawned while the publisher is parked inside its flush, and its join
+/// handle is observed finished — an observed state, never a scheduling assumption — before the
+/// publisher is released. Publication inlined on the executor would park the runtime thread in
+/// the publisher's blocking wait, the probe could never be polled, the handle would never
+/// finish, and the watchdog would name that exact missing signal. The watchdog is disarmed on
+/// success.
 #[tokio::test]
 async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms() {
-    let watchdog = std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-        eprintln!("TIMEOUT: the publisher's entry signal never arrived — the publication never started");
-        std::process::exit(2);
-    });
-    let _ = &watchdog;
+    let disarm = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let disarm = disarm.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if !disarm.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("TIMEOUT: the probe never completed — executor progress stopped while the publisher was parked");
+                std::process::exit(2);
+            }
+        });
+    }
 
     let (dir, store) = fixture().await;
     let owner = CallerId::new(OWNER);
@@ -1559,8 +1610,7 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         .expect("open the observer store");
 
     // The publication handshake: the publisher signals `entered` the moment it is inside its
-    // flush, then parks on a condvar until the test signals `released`. Both signals are
-    // blocking-channel rendezvous — no sleeps, no yields, no async timeouts.
+    // flush, then parks on a blocking channel until the test releases it.
     let (entered, is_entered) = mpsc::channel::<()>();
     let (release, is_released) = tokio::sync::oneshot::channel::<()>();
     let is_released = std::sync::Mutex::new(Some(is_released));
@@ -1582,30 +1632,30 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         parked.review(&candidate_id, &promote(), "rev-offworker").await
     });
 
-    // Handshake step one: wait for the publisher's entry signal. On the single-threaded
-    // runtime, awaiting the receive runs the review task — so the task is polled, the
-    // blocking publication starts, and its signal arrives — or nothing ever runs, which is
-    // what the watchdog reports.
-    tokio::task::yield_now().await;
-    let entered_blocking = tokio::task::spawn_blocking(move || {
+    // Wait for the publisher's entry signal on a blocking thread — the receive itself is the
+    // observed state: it completes exactly when the publisher is inside its flush, however the
+    // scheduler gets there.
+    let entry = tokio::task::spawn_blocking(move || {
         is_entered.recv().expect("the publisher entry signal")
     });
-    entered_blocking.await.expect("the entry signal arrived");
+    entry.await.expect("the entry signal arrived");
 
-    // Handshake step two: spawn the probe after the entry signal, yield once — on the
-    // single-threaded runtime that runs every ready task exactly once — and the probe's send
-    // must have completed. Publication inlined on the executor would block the runtime thread
-    // inside the publisher's condvar wait, the probe could never be polled, and its send would
-    // still be pending here: the test fails on a concrete state, never a timeout.
-    let (progressed, is_progressed) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let _ = progressed.send(());
-    });
-    tokio::task::yield_now().await;
-    match is_progressed.await {
-        Ok(()) => {}
-        Err(_) => panic!("executor progress stopped while the publisher was parked"),
+    // The probe: spawned after the entry signal, a bare unit of executor work. Its completion
+    // is proof of executor progress — the publisher is parked, so the probe completing means
+    // something other than the blocked publication polled it. The observation loop advances
+    // only on the handle's own observed state, with `yield_now` as a politeness hint to the
+    // scheduler, never as the ordering proof: the handle either finishes or it does not.
+    let probe = tokio::spawn(async {});
+    let mut ticks = 0u32;
+    while !probe.is_finished() {
+        tokio::task::yield_now().await;
+        ticks += 1;
+        assert!(
+            ticks < 1_000_000,
+            "the probe never completed — executor progress stopped while the publisher was parked"
+        );
     }
+    probe.await.expect("the probe joins");
     // Nothing commits before the publication confirms: the pre-opened observer reads the
     // committed state, and the staging transaction's uncommitted rows are invisible to it.
     assert_eq!(
@@ -1621,22 +1671,28 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         "committed",
         "the review settles after the publication confirms"
     );
+    disarm.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Cancellation keeps transaction ownership until the started publication ends. The runtime
-/// is single-threaded: one `yield_now` after spawning the retry runs every ready task exactly
-/// once, so the retry task is provably parked at its pool acquisition — the first await inside
-/// the fold — before the negative assertion is read. The first publication signals `entered`
-/// and then parks on a condvar; the retry's instrumented publisher records whether the first
-/// publication had finished when the retry entered its own. Ordering is evidence, never
-/// timing; the watchdog thread is the only guard against a hang.
+/// Cancellation keeps transaction ownership until the started publication ends. The evidence
+/// is a chain of observed states, never a scheduling assumption: the probe of the retry's
+/// contention is the retry's own publisher-entry flag read after the retry has been given its
+/// turn, and the turn is the observer pattern of `JoinHandle::is_finished` on a sentinel task
+/// spawned with it — a task that finishes only after the runtime has polled every task that
+/// was ready before it. The watchdog is disarmed on success.
 #[tokio::test]
 async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-        eprintln!("TIMEOUT: the publication handshake never completed — a signal never arrived");
-        std::process::exit(2);
-    });
+    let disarm = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let disarm = disarm.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if !disarm.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("TIMEOUT: the publication handshake never completed — a signal never arrived");
+                std::process::exit(2);
+            }
+        });
+    }
 
     let (dir, store) = fixture().await;
     let owner = CallerId::new(OWNER);
@@ -1670,17 +1726,20 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     // The retry handle is opened before the review starts: the store's pool has one
     // connection, and once the staging transaction holds it nothing — not even a registry read
     // — can acquire another until the transaction ends. The retry's instrumented publisher
-    // records what the first publication's finish flag read at the moment the retry entered
-    // its own flush — the ordering evidence.
-    let retry_saw_first_finished = Arc::new(std::sync::Mutex::new(None::<bool>));
-    let retry_flag = retry_saw_first_finished.clone();
+    // samples the first publication's finish flag *before writing anything*: the sample is
+    // taken the moment the retry enters its flush, so it reads the world as it was before the
+    // retry's own bytes existed.
+    let retry_sample = Arc::new(std::sync::Mutex::new(None::<bool>));
+    let retry_flag = retry_sample.clone();
     let retry_root_handle = journal_root.clone();
     let finished_probe = first_finished.clone();
     let working = {
         ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
-            journal_dir(&retry_root_handle)(targets)?;
+            // Sample before any write of this flush: the ordering evidence is the state of the
+            // first publication at the moment the retry's publication begins, not after it.
             *retry_flag.lock().expect("the retry entry lock") =
                 Some(*finished_probe.lock().expect("the finish lock"));
+            journal_dir(&retry_root_handle)(targets)?;
             Ok(())
         })
     };
@@ -1689,20 +1748,20 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         parked.review(&cancelled_id, &promote(), "rev-cancelled").await
     });
 
-    // Handshake: yield once so the review task starts, then receive the publisher's entry
-    // signal on a blocking thread, then cancel.
-    tokio::task::yield_now().await;
+    // Wait for the publisher's entry signal, then cancel. The receive itself is the observed
+    // state: it completes exactly when the publisher is inside its flush.
     let entry = tokio::task::spawn_blocking(move || {
         is_entered.recv().expect("the publisher entry signal")
     });
     entry.await.expect("the entry signal arrived");
     review.abort();
 
-    // The retry, while the first publication is still parked. One yield on the single-threaded
-    // runtime polls the retry task exactly once: it runs into the fold and parks at the pool
-    // acquisition — the pool's one connection is held by the cancelled attempt's transaction —
-    // so the negative assertion below is read with the retry provably contending, never merely
-    // unscheduled.
+    // The retry, spawned with a sentinel task behind it. The sentinel finishes only after the
+    // runtime has polled every task that was ready before it — the retry included — so the
+    // sentinel's finished handle is the observed state that the retry was polled to its first
+    // suspension point: the pool acquisition, because the pool's one connection is held by the
+    // cancelled attempt's transaction. `yield_now` inside the loop is a politeness hint to the
+    // scheduler; the loop advances only on the observed state.
     let retrying = working;
     let retry = tokio::spawn({
         let candidate_id = candidate_id.clone();
@@ -1710,9 +1769,21 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
             retrying.review(&candidate_id, &promote(), "rev-cancelled").await
         }
     });
-    tokio::task::yield_now().await;
+    let sentinel = tokio::spawn(async {});
+    let mut ticks = 0u32;
+    while !sentinel.is_finished() {
+        tokio::task::yield_now().await;
+        ticks += 1;
+        assert!(
+            ticks < 1_000_000,
+            "the sentinel never finished — the runtime never polled the spawned tasks"
+        );
+    }
+    // The retry has now been polled to its pool acquisition — it is contending — and it must
+    // not have entered its publication: the first publication is still parked, and the
+    // cancelled attempt's transaction is still the pool's tenant.
     assert!(
-        retry_saw_first_finished
+        retry_sample
             .lock()
             .expect("the retry entry lock")
             .is_none(),
@@ -1720,15 +1791,15 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     );
 
     // Release: the first publication ends, the cancelled attempt's transaction rolls back, and
-    // only then can the retry's staging acquire. Awaiting the retry runs it to completion on
-    // this runtime.
+    // only then can the retry's staging acquire.
     release.send(()).expect("release the publisher");
     let reviewed = ok(retry.await.expect("the retry task joins"));
 
-    // The ordering evidence: when the retry entered its publication, the first publication
-    // had finished — the cancelled attempt's flush ended before any retry publish began.
+    // The ordering evidence: sampled before the retry wrote anything, the first publication's
+    // finish flag was already set — the cancelled attempt's flush ended before the retry's
+    // publication began.
     assert_eq!(
-        *retry_saw_first_finished.lock().expect("the retry entry lock"),
+        *retry_sample.lock().expect("the retry entry lock"),
         Some(true),
         "the retry's publication began only after the cancelled attempt's flush ended"
     );
@@ -1747,6 +1818,7 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         1,
         "exactly one intent across both attempts"
     );
+    disarm.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// `cognition_read` reads only the collection its admitted Mind resolved at open: a colliding

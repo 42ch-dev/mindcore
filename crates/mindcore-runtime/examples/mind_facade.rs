@@ -37,6 +37,11 @@ fn value_of<T: serde::Serialize>(response: &T) -> Value {
 #[tokio::main]
 async fn main() {
     let dir = tempfile::TempDir::new().expect("a scratch directory");
+    // Creating the scratch directory wrote an entry in its parent; the host makes that entry
+    // durable before anything depends on it, exactly as it will for the journal root below.
+    std::fs::File::open(dir.path().parent().expect("the scratch directory has a parent"))
+        .and_then(|parent| parent.sync_all())
+        .expect("sync the scratch directory's creation entry");
     let store = MindStore::open(&dir.path().join("mind.db"))
         .await
         .expect("open the store");
