@@ -51,6 +51,55 @@ type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
 /// this capture's absorb run decided `Pending` for the ids it names.
 const ABSORB_DECISION_OP: &str = "mindcore.absorb.decision";
 
+/// Mind admission for the host-side `deliberate` handler: the caller's grant rows and the
+/// registry row read in one transaction, so a revocation cannot land between them, and every
+/// liveness decision runs the one grant rule (`live_grant`: unrevoked, unexpired, an
+/// unparseable expiry fails closed). Returns the row-named carrier entry id, or the fixed
+/// admission refusal — byte-equal whether the Mind exists, the grant is missing, revoked or
+/// expired — so an unadmitted caller cannot tell the cases apart.
+pub async fn admitted_carrier_entry(
+    pool: &SqlitePool,
+    principal_id: &str,
+    space_id: &str,
+) -> Result<String, SpokeReject> {
+    let repository = SqliteMemoryRepository;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| Reject::internal(format!("the mind admission could not open: {e}")).into_spoke())?;
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| Reject::internal(format!("the mind admission could not begin: {e}")).into_spoke())?;
+    let space = SpaceId::new(space_id.to_string());
+    let rows = admission::grants(&repository, &mut tx, &space)
+        .await
+        .map_err(Reject::into_spoke)?;
+    let now = Utc::now();
+    let admitted = rows.iter().any(|row| {
+        row.principal_id.as_str() == principal_id
+            && row.subject_id.is_none()
+            && row.capabilities.iter().any(|cap| cap == KNOWLEDGE_READ)
+            && admission::live_grant(row, now)
+    });
+    if !admitted {
+        return Err(Reject::admission_refusal().into_spoke());
+    }
+    // `live_grant` is the crate's one grant rule, but it is admission-internal.
+    // The row read follows in the same transaction: a revocation that commits
+    // before this statement is already covered by the grant check re-reading on
+    // its own transaction; one either sees both sides of it or neither.
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT carrier_entry_id FROM minds WHERE space_id = ?",
+    )
+    .bind(space_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| Reject::internal(format!("the mind admission could not be read: {e}")).into_spoke())?;
+    let _ = tx.rollback().await;
+    row.ok_or_else(|| Reject::admission_refusal().into_spoke())
+}
+
 /// The in-process workflow binding over one SQLite pool.
 ///
 /// Every carrier access resolves through the Mind the request names: a facade

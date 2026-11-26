@@ -316,42 +316,21 @@ async fn deliberate(
         Ok(arguments) => arguments,
         Err(reject) => return SpokeResult::Reject(reject),
     };
-    // Admission before existence: a caller without a live `knowledge_read` grant in the request's
-    // space is refused before any registry row is read, and a space with no row is the same
+    // Admission before existence, in one transaction: the grant rows and the registry row are
+    // read together, so a revocation cannot land between them, and the liveness rule is the
+    // adapter's own (`live_grant` — unrevoked, unexpired, an unparseable expiry fails closed).
+    // A missing grant, a revoked or expired one and a space with no registry row are the same
     // refusal — same code, same message, no details — so a caller can never tell an existing
     // Mind from an absent one by varying `space_id`.
-    match admitted_to_mind_space(pool, &arguments.space_id, &principal.principal_id).await {
-        Ok(true) => {}
-        Ok(false) => return SpokeResult::Reject(not_admitted_to_mind()),
-        Err(error) => {
-            return SpokeResult::Reject(SpokeReject {
-                code: SpokeRejectCode::InternalError,
-                message: format!("the mind admission could not be read: {error}"),
-                details: None,
-            })
-        }
-    }
-    // The carrier is the Mind's own record: the registry row of the request's `space_id` names
-    // it, the same lookup the routing performs, so a peer never names one. A space with no row
-    // is the same admission refusal as a missing grant.
-    let carrier_entry_id: Option<String> = match sqlx::query_scalar(
-        "SELECT carrier_entry_id FROM minds WHERE space_id = ?",
+    let carrier_entry_id = match mindcore_spoke::admitted_carrier_entry(
+        pool,
+        &principal.principal_id,
+        &arguments.space_id,
     )
-    .bind(&arguments.space_id)
-    .fetch_optional(pool)
     .await
     {
         Ok(carrier_entry_id) => carrier_entry_id,
-        Err(error) => {
-            return SpokeResult::Reject(SpokeReject {
-                code: SpokeRejectCode::InternalError,
-                message: format!("the mind registry could not be read: {error}"),
-                details: None,
-            })
-        }
-    };
-    let Some(carrier_entry_id) = carrier_entry_id else {
-        return SpokeResult::Reject(not_admitted_to_mind());
+        Err(reject) => return SpokeResult::Reject(reject),
     };
     let holder: CognitionReference = match serde_json::from_value(json!({
         "kind": "knowledge_entry",
@@ -392,50 +371,6 @@ async fn deliberate(
         Ok(outcome) => SpokeResult::Ok(deliberate_outcome(outcome)),
         Err(error) => SpokeResult::Reject(workflow_reject(error)),
     }
-}
-
-/// The one refusal a caller without admission and a caller probing an absent Mind share:
-/// `NotAuthorized` with the admission message and no details, byte-equal either way.
-fn not_admitted_to_mind() -> SpokeReject {
-    SpokeReject {
-        code: SpokeRejectCode::NotAuthorized,
-        message: "the caller is not admitted to the named mind".into(),
-        details: None,
-    }
-}
-
-/// One space-wide live grant of `knowledge_read` for `principal_id` in `space_id`: unexpired,
-/// unrevoked, subject-wide. A caller holding nothing here is not admitted to the space's Mind
-/// at all, so the refusal must come before any read that could reveal whether the Mind exists.
-async fn admitted_to_mind_space(
-    pool: &SqlitePool,
-    space_id: &str,
-    principal_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT capabilities_json, expires_at, revoked_at FROM memory_grants \
-         WHERE space_id = ? AND principal_id = ? AND subject_id IS NULL",
-    )
-    .bind(space_id)
-    .bind(principal_id)
-    .fetch_all(pool)
-    .await?;
-    let now = chrono::Utc::now();
-    Ok(rows.iter().any(|(capabilities_json, expires_at, revoked_at)| {
-        if revoked_at.is_some() {
-            return false;
-        }
-        let expired = expires_at
-            .as_deref()
-            .and_then(|expiry| chrono::DateTime::parse_from_rfc3339(expiry).ok())
-            .is_some_and(|expiry| expiry <= now);
-        if expired {
-            return false;
-        }
-        serde_json::from_str::<Vec<String>>(capabilities_json)
-            .map(|capabilities| capabilities.iter().any(|cap| cap == "knowledge_read"))
-            .unwrap_or(false)
-    }))
 }
 
 fn absorb_outcome(outcome: AbsorbCandidateOutcome) -> Value {

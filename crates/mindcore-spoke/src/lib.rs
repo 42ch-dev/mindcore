@@ -23,7 +23,7 @@ mod workflows;
 
 pub use serve::{ServedMemory, TransferService};
 pub use transfer::OPERATIONS as TRANSFER_OPERATIONS;
-pub use workflows::MemoryWorkflowBinding;
+pub use workflows::{admitted_carrier_entry, MemoryWorkflowBinding};
 
 pub(crate) use mindcore_base::ids::mint;
 

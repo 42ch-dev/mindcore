@@ -1721,6 +1721,77 @@ async fn deliberate_cannot_distinguish_an_absent_mind_from_an_ungranted_one() {
     );
 }
 
+/// Liveness is the adapter's one grant rule: an expiry that does not parse fails closed, so the
+/// grant is dead and `deliberate` is the admission refusal, not a read of the carrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
+    let fixture = Fixture::open().await;
+    // Corrupt the seeded knowledge grant's expiry in place: it can no longer be read as a time.
+    sqlx::query("UPDATE memory_grants SET expires_at = 'not-a-time' WHERE grant_id = 'grt_knowledge'")
+        .execute(&fixture.store.pool())
+        .await
+        .expect("corrupt the expiry");
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+    );
+    faces.principals = principal_admission();
+    let surface = surface(&serve, faces);
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    let reject = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate with a garbled expiry",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        reject.details.is_none(),
+        "an unparseable expiry fails closed as the plain admission refusal: {reject:?}"
+    );
+}
+
+/// Revocation is final at call time: the grant is live when the session is established, revoked
+/// before the invoke, and the call answers the admission refusal — the admission reads its
+/// state once, on its own transaction, and never a cached yes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_revoked_before_the_call_refuses_deliberate() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+    );
+    faces.principals = principal_admission();
+    let surface = surface(&serve, faces);
+
+    let session = connect(&surface, &[DELIBERATE]).await;
+    sqlx::query(
+        "UPDATE memory_grants SET revoked_at = '2026-11-21T01:00:00Z' WHERE grant_id = 'grt_knowledge'",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke the grant");
+    let reject = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate after revocation",
+    );
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        reject.details.is_none(),
+        "a revoked grant is the plain admission refusal: {reject:?}"
+    );
+}
+
 /// One principal admitted to both Minds: each recall names its own `space_id` and answers that
 /// Mind's content — entry id, canonical name and body summary — never the other's. Two different
 /// principals would not pin this: a route keyed to the principal would pass either way.
