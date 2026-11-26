@@ -368,8 +368,7 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let subject_id = request.subject_id.as_str();
-        let (rows, _space_row) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         if !admission::any_grant_for_subject(
             &rows,
             principal_id,
@@ -512,8 +511,7 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let now = Utc::now();
-        let (rows, _space_row) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let admin = admission::covered(
             &wire_grants,

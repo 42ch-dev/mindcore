@@ -339,8 +339,7 @@ impl MemoryAdapter {
             None => None,
         };
         let now = Utc::now();
-        let (rows, _space) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let base = GrantRequirement {
             capability: "review",
@@ -439,8 +438,7 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let candidate_id = request.candidate_id.to_string();
-        let (rows, _space) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let Some(head) =
             admission::candidate_head(&self.repository, tx, &space, candidate_id.as_str()).await?
         else {
@@ -691,8 +689,7 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let record_id = request.record_id.to_string();
-        let (rows, _space) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let now = Utc::now();
         let Some(head) =
@@ -770,8 +767,7 @@ impl MemoryAdapter {
         let kinds = request.kinds.clone();
         let include_tombstoned = request.include_tombstoned;
         let now = Utc::now();
-        let (rows, _space) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let list = admission::covered(
             &wire_grants,
@@ -1298,8 +1294,7 @@ impl MemoryAdapter {
         let subject_id = request.subject_id.to_string();
         let (placement, filter) = read_selection(object)?;
         let now = Utc::now();
-        let (rows, _space) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         if !admission::covered(
             &wire_grants,
@@ -1444,8 +1439,7 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let subject_id = request.subject_id.to_string();
-        let (rows, _space) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         if !admission::profile_visible(
             &rows,
             principal_id,
@@ -1621,19 +1615,9 @@ impl MemoryAdapter {
         let principal_id = principal_id(principal);
         let space = SpaceId::new(request.space_id.to_string());
         let receipt_id = request.receipt_id.to_string();
-        let (rows, _space) =
-            admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
+        let rows = admission::admit_mind(&self.repository, tx, principal_id, &space).await?;
         let wire_grants = admission::wire_grants(&rows)?;
         let now = Utc::now();
-        let participates = rows.iter().any(|row| {
-            row.principal_id.as_str() == principal_id && admission::live_grant(row, now)
-        });
-        if !participates {
-            return Err(Reject::not_authorized(format!(
-                "principal {principal_id} does not participate in space {}",
-                space.as_str()
-            )));
-        }
         let admin = admission::covered(
             &wire_grants,
             principal_id,

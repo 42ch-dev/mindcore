@@ -14,7 +14,7 @@ use mindcore_base::ir::{
     MemoryRepository, MemorySpaceRow, MemorySubjectRow, Placement, ReceiptKey, ReceiptRead,
     ReviewReceiptIr,
 };
-use mindcore_sqlite::SqliteMemoryRepository;
+use mindcore_sqlite::{SqliteMemoryRepository, SqliteRepositoryError};
 use spoke_operations::SpokeResult;
 use spoke_operations::{
     grant_covers, is_freeze_allowlisted, validate_grant_issuance, GrantRequirement, IssuedGrant,
@@ -216,25 +216,33 @@ pub(crate) fn candidate_requirement<'a>(
 /// The registry is not consulted here: a space written before it is still a
 /// space to `memory.*`; the registry gates only `memory.spaces.list` and the
 /// Mind-level reads.
+///
+/// The read is filtered to the caller's own rows at the query. Another
+/// principal's malformed row is therefore never decoded and can neither turn
+/// this refusal into a storage error nor tell the caller the space exists; a
+/// row of the caller's own that cannot decode admits nothing and answers the
+/// same target-free refusal.
 pub(crate) async fn admit_mind(
     repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
     principal: &str,
     space: &SpaceId,
-) -> AResult<(Vec<MemoryGrantRow>, MemorySpaceRow)> {
-    let rows = grants(repository, tx, space).await?;
+) -> AResult<Vec<MemoryGrantRow>> {
+    let rows = repository
+        .list_grants(tx, space, Some(principal))
+        .await
+        .map_err(|error| match error {
+            SqliteRepositoryError::InvalidRow(_) => Reject::admission_refusal(),
+            other => Reject::internal(format!("the mind admission could not be read: {other}")),
+        })?;
     let now = Utc::now();
-    let admitted = rows
-        .iter()
-        .any(|row| row.principal_id.as_str() == principal && live_grant(row, now));
-    if !admitted {
+    if !rows.iter().any(|row| live_grant(row, now)) {
         return Err(Reject::admission_refusal());
     }
-    let row = match repository.space(tx, space).await? {
-        Some(row) => row,
-        None => return Err(Reject::admission_refusal()),
-    };
-    Ok((rows, row))
+    match repository.space(tx, space).await? {
+        Some(_) => Ok(rows),
+        None => Err(Reject::admission_refusal()),
+    }
 }
 
 pub(crate) async fn space(
@@ -308,16 +316,30 @@ pub(crate) async fn grants(
 /// The protocol's own coverage evaluator takes the wire grant union; the stored
 /// row projects to it losslessly.
 pub(crate) fn wire_grants(rows: &[MemoryGrantRow]) -> AResult<Vec<MemoryGrant>> {
+    rows.iter().map(wire_grant).collect()
+}
+
+/// The wire union coverage is evaluated over: only rows that are still live. A dead row —
+/// revoked, expired, or carrying an expiry that does not parse — covers nothing, and projecting
+/// one could fail on its stored spelling, so it never reaches the projection and can never turn
+/// a refusal into a storage error.
+pub(crate) fn live_wire_grants(
+    rows: &[MemoryGrantRow],
+    now: DateTime<Utc>,
+) -> AResult<Vec<MemoryGrant>> {
     rows.iter()
-        .map(|row| {
-            serde_json::from_value(project::grant_body(row)).map_err(|error| {
-                Reject::terminal(
-                    spoke_operations::SpokeRejectCode::InternalError,
-                    format!("stored grant projection: {error}"),
-                )
-            })
-        })
+        .filter(|row| live_grant(row, now))
+        .map(wire_grant)
         .collect()
+}
+
+fn wire_grant(row: &MemoryGrantRow) -> AResult<MemoryGrant> {
+    serde_json::from_value(project::grant_body(row)).map_err(|error| {
+        Reject::terminal(
+            spoke_operations::SpokeRejectCode::InternalError,
+            format!("stored grant projection: {error}"),
+        )
+    })
 }
 
 pub(crate) fn covered(
@@ -471,9 +493,8 @@ pub(crate) async fn authorize(
     admission: &Admission<'_>,
     now: DateTime<Utc>,
 ) -> AResult<Vec<MemoryGrantRow>> {
-    let (rows, _space) =
-        admit_mind(repository, tx, admission.principal, admission.space).await?;
-    let wire = wire_grants(&rows)?;
+    let rows = admit_mind(repository, tx, admission.principal, admission.space).await?;
+    let wire = live_wire_grants(&rows, now)?;
     let space_id = admission.space.as_str();
     match &admission.coverage {
         Coverage::Requirements(requirements) => {

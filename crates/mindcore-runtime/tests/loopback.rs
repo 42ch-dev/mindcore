@@ -1936,14 +1936,17 @@ async fn a_strangers_malformed_grant_row_cannot_leak_the_minds_existence() {
     );
 }
 
-/// Liveness is the adapter's one grant rule: an expiry that does not parse fails closed, so the
-/// grant is dead and `deliberate` is the admission refusal, not a read of the carrier.
+/// Liveness is the adapter's one grant rule: an expiry that does not parse fails closed, so a
+/// dead row covers nothing. With the caller's `recall` grant still live the Mind admits it and
+/// the dead `knowledge_read` grant is the coverage gap that answers; once every row is dead the
+/// answer is the one target-free admission refusal, and no carrier is read either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
     let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
     // Corrupt the seeded knowledge grant's expiry in place: it can no longer be read as a time.
     sqlx::query("UPDATE memory_grants SET expires_at = 'not-a-time' WHERE grant_id = 'grt_knowledge'")
-        .execute(&fixture.store.pool())
+        .execute(&pool)
         .await
         .expect("corrupt the expiry");
     let (_dir, serve) = fixture.serve();
@@ -1956,23 +1959,51 @@ async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
     let surface = surface(&serve, faces);
 
     let session = connect(&surface, &[DELIBERATE]).await;
-    let reject = expect_reject(
+    let uncovered = expect_reject(
         session
             .adapter
             .invoke_tool(DELIBERATE, deliberate_arguments())
             .await,
-        "deliberate with a garbled expiry",
+        "deliberate with a dead knowledge_read grant",
     );
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
     assert!(
-        reject.details.is_none(),
-        "an unparseable expiry fails closed as the plain admission refusal: {reject:?}"
+        uncovered.message.contains("knowledge_read"),
+        "the dead row covers nothing, so the coverage refusal answers: {uncovered:?}"
+    );
+    assert_eq!(
+        uncovered
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str),
+        Some("terminal"),
+        "a dead grant cannot be retried away: {uncovered:?}"
+    );
+
+    // Every row dead now: no live grant admits the caller, so the answer is target-free.
+    sqlx::query("UPDATE memory_grants SET expires_at = 'not-a-time' WHERE grant_id = 'grt_recall'")
+        .execute(&pool)
+        .await
+        .expect("corrupt the recall expiry");
+    let rejected = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate with every grant dead",
+    );
+    assert_eq!(rejected.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        rejected.details.is_none(),
+        "an unparseable expiry fails closed as the plain admission refusal: {rejected:?}"
     );
 }
 
-/// Revocation is final at call time: the grant is live when the session is established, revoked
-/// before the invoke, and the call answers the admission refusal — the admission reads its
-/// state once, on its own transaction, and never a cached yes.
+/// Revocation is final at call time, and the refusal split is the plan's: the admission reads its
+/// state once, on its own transaction, and never a cached yes. A revoked `knowledge_read` grant
+/// on a caller the Mind still admits is the coverage gap; with every grant revoked the answer is
+/// the one target-free admission refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grant_revoked_before_the_call_refuses_deliberate() {
     let fixture = Fixture::open().await;
@@ -1993,12 +2024,31 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
     .execute(&pool)
     .await
     .expect("revoke the grant");
+    let uncovered = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "deliberate after the knowledge grant is revoked",
+    );
+    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        uncovered.message.contains("knowledge_read"),
+        "a revoked row covers nothing, so the coverage refusal answers: {uncovered:?}"
+    );
+
+    sqlx::query(
+        "UPDATE memory_grants SET revoked_at = '2026-11-21T01:00:00Z' WHERE grant_id = 'grt_recall'",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke the recall grant");
     let reject = expect_reject(
         session
             .adapter
             .invoke_tool(DELIBERATE, deliberate_arguments())
             .await,
-        "deliberate after revocation",
+        "deliberate after every grant is revoked",
     );
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
     assert!(

@@ -2,7 +2,6 @@
 //! costs, which knowledge collection fills the second slot, and the reread
 //! that keeps a snapshot moved during provider work out of a released pack.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,16 +33,6 @@ const SPACE: &str = "spc_1";
 const SUBJECT: &str = "subj_1";
 const PRINCIPAL: &str = "prn_1";
 const NOW: &str = "2026-11-20T09:00:00.000Z";
-
-/// A route map putting each of `principals` onto the fixture's one collection.
-fn routes(principals: &[&str]) -> Arc<BTreeMap<String, KnowledgeScope>> {
-    Arc::new(
-        principals
-            .iter()
-            .map(|principal| ((*principal).to_string(), KnowledgeScope::new("wren")))
-            .collect(),
-    )
-}
 
 /// What the embedder does to the store while it runs — outside every
 /// transaction the workflow holds.
@@ -383,11 +372,7 @@ impl Harness {
         }
     }
 
-    fn binding(
-        &self,
-        caller: &str,
-        side_effect: SideEffect,
-    ) -> (SpiMindWorkflows, BoundaryEmbedder) {
+    fn binding(&self, side_effect: SideEffect) -> (SpiMindWorkflows, BoundaryEmbedder) {
         let binding = MemoryWorkflowBinding::new(self.pool.clone(), true);
         (SpiMindWorkflows::new(binding), self.embedder(side_effect))
     }
@@ -763,7 +748,7 @@ async fn knowledge_slot_reads_only_the_bound_collection() {
     harness
         .entry("wanderer", "ke_elsewhere", "not this holder's")
         .await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let (workflows, embedder) = harness.binding(SideEffect::None);
 
     let pack = workflows
         .recall_context(
@@ -805,7 +790,7 @@ async fn knowledge_slot_refuses_a_collection_over_the_served_bound() {
             .entry("wren", &format!("ke_{index:04}"), "bounded entry")
             .await;
     }
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let (workflows, embedder) = harness.binding(SideEffect::None);
     let capabilities = MindCapabilities {
         embedder: Some(&embedder),
         ..MindCapabilities::default()
@@ -860,7 +845,7 @@ async fn knowledge_slot_hides_owner_private_entries() {
     harness
         .private_entry("wren", "ke_mira_diary", "ke_mira", "mira's private notes")
         .await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let (workflows, embedder) = harness.binding(SideEffect::None);
 
     let pack = workflows
         .recall_context(
@@ -911,7 +896,7 @@ async fn knowledge_slot_omits_a_superseded_entry() {
         SpokeResult::Ok(revision) => assert_eq!(revision, 2),
         SpokeResult::Reject(reject) => panic!("marking the slot entry failed: {reject:?}"),
     }
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let (workflows, embedder) = harness.binding(SideEffect::None);
 
     let pack = workflows
         .recall_context(
@@ -954,7 +939,7 @@ async fn tombstoning_a_record_prunes_its_vector_rows() {
             "2026-11-20T09:00:01.000Z",
         )
         .await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let (workflows, embedder) = harness.binding(SideEffect::None);
     workflows
         .recall_context(
             &principal(),
@@ -1011,7 +996,7 @@ async fn revoked_grant_during_provider_work_refuses_the_pack() {
             "2026-11-20T09:00:01.000Z",
         )
         .await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::RevokeGrant);
+    let (workflows, embedder) = harness.binding(SideEffect::RevokeGrant);
 
     let error = workflows
         .recall_context(
@@ -1044,7 +1029,7 @@ async fn pending_intent_during_provider_work_refuses_the_pack() {
             "2026-11-20T09:00:01.000Z",
         )
         .await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::PendingIntent);
+    let (workflows, embedder) = harness.binding(SideEffect::PendingIntent);
 
     let error = workflows
         .recall_context(
@@ -1085,7 +1070,7 @@ async fn changed_revision_during_provider_work_refuses_the_pack() {
             "2026-11-20T09:00:01.000Z",
         )
         .await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::BumpRevision);
+    let (workflows, embedder) = harness.binding(SideEffect::BumpRevision);
 
     let error = workflows
         .recall_context(
@@ -1118,7 +1103,7 @@ async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
         )
         .await;
     harness.entry("wren", "ke_gate", "closed after dusk").await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let (workflows, embedder) = harness.binding(SideEffect::None);
 
     let pack = workflows
         .recall_context(
@@ -1159,7 +1144,7 @@ async fn a_caller_without_knowledge_read_recalls_with_an_empty_slot() {
         )
         .await;
     harness.entry("wren", "ke_gate", "closed after dusk").await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::None);
+    let (workflows, embedder) = harness.binding(SideEffect::None);
 
     let pack = workflows
         .recall_context(
@@ -1198,7 +1183,7 @@ async fn revoked_knowledge_admission_during_provider_work_is_a_revision_conflict
         )
         .await;
     harness.entry("wren", "ke_gate", "closed after dusk").await;
-    let (workflows, embedder) = harness.binding(PRINCIPAL, SideEffect::RevokeKnowledgeGrant);
+    let (workflows, embedder) = harness.binding(SideEffect::RevokeKnowledgeGrant);
 
     let error = workflows
         .recall_context(

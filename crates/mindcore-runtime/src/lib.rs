@@ -131,9 +131,10 @@ impl MindcoreServe {
 
 /// The runtime's own ports: the one face this surface carries is the host's memory service.
 ///
-/// The other families stay absent — the responder answers their ops on its dispatch-deny branch
-/// as `CAPABILITY_PORT_MISSING` — because none of them can name a Mind yet; each is composed per
-/// Mind once SPOKE carries that contract.
+/// The other families stay absent — a call to each is refused on the responder's dispatch-deny
+/// branch, raw wire `op_unsupported` for knowledge and `capability_missing` for history and
+/// adoption, which the Rust dialer surfaces as `CapabilityPortMissing` — because none of them can
+/// name a Mind yet; each is composed per Mind once SPOKE carries that contract.
 struct MindPorts {
     memory: Option<Arc<dyn ServedMemory>>,
 }

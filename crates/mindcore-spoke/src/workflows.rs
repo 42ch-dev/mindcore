@@ -62,14 +62,15 @@ pub(crate) struct AdmittedCarrier {
     pub(crate) carrier_entry_id: String,
 }
 
-/// Mind admission for the host-side `deliberate` handler: the caller's grant rows and the
-/// registry row read in one transaction, so a revocation cannot land between them, and every
-/// liveness decision runs the one grant rule (`live_grant`: unrevoked, unexpired, an
-/// unparseable expiry fails closed). The deliberate handler needs a space-wide `knowledge_read`
-/// grant of its own before it touches a carrier, so a caller admitted through another capability
-/// only is refused here, before any carrier is read. Returns the row-named carrier entry id, or
-/// the fixed admission refusal — byte-equal whether the Mind exists, the grant is missing,
-/// revoked or expired — so an unadmitted caller cannot tell the cases apart.
+/// Mind admission for the host-side `deliberate` handler, in the order the plan fixes: the
+/// caller's live grant, then the space row, then the registry row, and only then the space-wide
+/// `knowledge_read` coverage — the same split [`admitted_carrier`] applies to the cognition read.
+///
+/// An unknown Mind, an unadmitted one and a frozen one the caller holds no grant in answer the
+/// one target-free refusal. A caller the named Mind admits but whose grants do not cover
+/// `knowledge_read` answers the coverage refusal instead, which is reachable only by a caller
+/// already known to hold a live grant here; the two answers are deliberately different, so a
+/// capability gap never reads as a lost admission.
 pub async fn admitted_carrier_entry(
     pool: &SqlitePool,
     principal_id: &str,
@@ -83,23 +84,9 @@ pub async fn admitted_carrier_entry(
         .begin()
         .await
         .map_err(|e| Reject::internal(format!("the mind admission could not begin: {e}")).into_spoke())?;
-    let space = SpaceId::new(space_id.to_string());
-    let rows = caller_grants(&mut tx, principal_id, &space).await?;
-    let now = Utc::now();
-    let admitted = rows.iter().any(|row| {
-        row.principal_id.as_str() == principal_id
-            && row.subject_id.is_none()
-            && row.capabilities.iter().any(|cap| cap == KNOWLEDGE_READ)
-            && admission::live_grant(row, now)
-    });
-    if !admitted {
-        return Err(Reject::admission_refusal().into_spoke());
-    }
-    let carrier = registry_carrier(&mut tx, space_id).await?;
+    let carrier = admitted_carrier(&mut tx, principal_id, space_id).await;
     let _ = tx.rollback().await;
-    carrier
-        .map(|carrier| carrier.carrier_entry_id)
-        .ok_or_else(|| Reject::admission_refusal().into_spoke())
+    carrier.map(|carrier| carrier.carrier_entry_id)
 }
 
 /// Admission of one Mind-level read, in the order the plan fixes: a live grant of the caller's in
@@ -145,8 +132,9 @@ pub(crate) async fn admitted_carrier(
         .await?
         .ok_or_else(|| Reject::admission_refusal().into_spoke())?;
     // Coverage over the same caller-only rows: another principal's grants are neither needed for
-    // a space-wide requirement nor allowed to reach this decision.
-    let grants = admission::wire_grants(&rows).map_err(|reject| reject.into_spoke())?;
+    // a space-wide requirement nor allowed to reach this decision, and a dead row of the
+    // caller's own covers nothing — projecting one would turn a refusal into a storage error.
+    let grants = admission::live_wire_grants(&rows, now).map_err(|reject| reject.into_spoke())?;
     let requirement = GrantRequirement {
         capability: KNOWLEDGE_READ,
         subject_id: None,

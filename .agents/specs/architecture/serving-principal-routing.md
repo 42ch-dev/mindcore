@@ -89,7 +89,9 @@ destination is the knowledge face's own collection. Stage 1 therefore composes n
 - the manifest advertises no `spoke-knowledge`, `ke-ownership`, `spoke-history` or
   `spoke-knowledge-adoption`, and the runtime's `MindPorts` answers `None` for every family but
   memory;
-- a call to each answers `CAPABILITY_PORT_MISSING` on the responder's dispatch-deny branch.
+- a call to each is refused on the responder's dispatch-deny branch — raw wire `op_unsupported` for
+  the knowledge family, `capability_missing` for history and adoption, each surfaced by the Rust
+  dialer as `CapabilityPortMissing` with `details.wire_code`.
 
 They return per Mind in Stage 2, once SPOKE carries request-scoped admission and an optional scope on
 knowledge get and put (`2026-11-25-one-surface-serves-many-minds.md`). Their contracts stay

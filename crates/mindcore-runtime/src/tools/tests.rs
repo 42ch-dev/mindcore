@@ -712,14 +712,28 @@ async fn deliberate_round_trips_every_outcome_branch() {
         "a no_change outcome carries no draft"
     );
 
+    let seen = fake.seen();
     assert_eq!(
-        fake.seen(),
-        [
-            "deliberate:prn_driver:spc_1:subj_1:5000:ev_1",
-            "deliberate:prn_driver:spc_1:subj_1:5000:ev_1",
-            "deliberate:prn_driver:spc_1:subj_1:5000:ev_1",
-        ]
+        seen.len(),
+        3,
+        "each branch runs the workflow once: {seen:?}"
     );
+    for entry in &seen {
+        let fields: Vec<&str> = entry.split(':').collect();
+        assert_eq!(
+            &fields[..4],
+            ["deliberate", "prn_driver", "spc_1", "subj_1"],
+            "{entry}"
+        );
+        assert_eq!(fields[5], "ev_1", "{entry}");
+        let timeout: u64 = fields[4]
+            .parse()
+            .expect("the recorded call ends with its remaining budget in milliseconds");
+        assert!(
+            (1..=5_000).contains(&timeout),
+            "the pre-check is charged against the request's budget: {entry}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -915,6 +929,89 @@ async fn read_cognition_serves_a_judgment_or_a_null_state() {
     );
 }
 
+/// The served `deliberate` keeps the plan's refusal split: a caller the Mind admits without a
+/// space-wide `knowledge_read` grant answers the coverage refusal, while an unadmitted Mind and
+/// an absent one answer one byte-equal, detail-free admission refusal. Neither refusal reaches
+/// the workflow.
+#[tokio::test]
+async fn deliberate_refuses_coverage_after_admission() {
+    let fake = Arc::new(Fake::default());
+    fake.reply_deliberate(Ok(DeliberateOutcome::NoChange {
+        verdict: json!({}),
+        judgment: judgment(),
+    }));
+    let tool = tools(Arc::clone(&fake)).await;
+
+    let mut uncovered_arguments = deliberate_arguments();
+    uncovered_arguments["space_id"] = json!("spc_4");
+    let uncovered = expect_reject(
+        tool.call(DELIBERATE, "peer-driver", uncovered_arguments)
+            .await,
+        "an admitted caller without knowledge_read",
+    );
+    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        uncovered.message.contains("knowledge_read"),
+        "the coverage refusal names the capability the caller lacks: {uncovered:?}"
+    );
+    assert_ne!(
+        uncovered.details, None,
+        "a coverage gap cannot be retried away: {uncovered:?}"
+    );
+
+    let mut unadmitted_arguments = deliberate_arguments();
+    unadmitted_arguments["space_id"] = json!("spc_3");
+    let unadmitted = expect_reject(
+        tool.call(DELIBERATE, "peer-driver", unadmitted_arguments)
+            .await,
+        "a Mind the caller is not admitted to",
+    );
+    let mut absent_arguments = deliberate_arguments();
+    absent_arguments["space_id"] = json!("spc_absent");
+    let absent = expect_reject(
+        tool.call(DELIBERATE, "peer-driver", absent_arguments).await,
+        "a space that does not exist",
+    );
+    assert_eq!(unadmitted.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        unadmitted.details, None,
+        "an admission refusal discloses no details"
+    );
+    assert_eq!(
+        unadmitted, absent,
+        "an unadmitted Mind and an absent one are one answer"
+    );
+    assert_ne!(
+        uncovered, unadmitted,
+        "an admitted caller short of one capability is not an unadmitted caller"
+    );
+    assert!(
+        fake.seen().is_empty(),
+        "no refusal above reaches the workflow"
+    );
+}
+
+/// The pre-check is charged against the request's budget: the workflow gets the remainder, and a
+/// budget the pre-check already spent starts nothing.
+#[test]
+fn the_deliberation_budget_covers_its_pre_check() {
+    let budget = Duration::from_millis(5_000);
+    assert_eq!(
+        remaining_budget(budget, Duration::from_millis(1_500)),
+        Some(Duration::from_millis(3_500))
+    );
+    assert_eq!(
+        remaining_budget(budget, budget),
+        None,
+        "a spent budget has no remainder"
+    );
+    assert_eq!(
+        remaining_budget(budget, Duration::from_millis(6_000)),
+        None,
+        "an overrun leaves nothing to start"
+    );
+}
+
 #[tokio::test]
 async fn settlement_refusals_keep_their_code_and_details() {
     let refusal = SpokeReject {
@@ -1080,6 +1177,12 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
         // schema's `minLength` either way, so the shape check is unchanged.
         if matches!(capability_id, DELIBERATE | READ_COGNITION) {
             arguments["space_id"] = json!("spc_1");
+        }
+        // The pre-check is charged against the request's budget, so this probe names a budget
+        // that a process-scheduled pre-check cannot spend: the probe measures the ABI, not the
+        // clock.
+        if capability_id == DELIBERATE {
+            arguments["timeout_ms"] = json!(30_000);
         }
         expect_ok(
             tool.call(capability_id, "peer-driver", arguments.clone())

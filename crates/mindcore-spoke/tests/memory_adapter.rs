@@ -4702,3 +4702,186 @@ async fn spaces_list_returns_only_admitted_minds() {
     );
     tx.rollback().await.expect("rollback");
 }
+
+/// Mind admission reads only the caller's own grant rows: a stranger's malformed row in an
+/// existing space never reaches a decode decision, so an unadmitted caller cannot tell that
+/// space from one that does not exist — on the guarded reads and on a mutation alike. The
+/// caller's own live grant still serves the same space with the malformed row beside it.
+#[tokio::test]
+async fn a_strangers_malformed_grant_row_cannot_leak_a_mind() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_malformed_stranger', ?, NULL, ?, 'not-json', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(SPACE)
+    .bind(STRANGER)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed the stranger's malformed grant");
+
+    let mut messages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for space in [SPACE, "sp_absent"] {
+        let mut tx = harness.begin().await;
+        for (op, result) in guarded_reads(&adapter, &mut tx, space, SUBJECT, "cnd_any").await {
+            let refusal = reject(&result);
+            assert_eq!(
+                refusal.code,
+                SpokeRejectCode::NotAuthorized,
+                "{op} in {space} answers the admission refusal"
+            );
+            assert!(
+                refusal.details.is_none(),
+                "{op} in {space} carries no details: {refusal:?}"
+            );
+            messages.insert(refusal.message.clone());
+        }
+        let capture = adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": space,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a capture into a mind the caller cannot see" },
+                    "idempotency_key": format!("cap-malformed-{space}")
+                }),
+            )
+            .await;
+        let refusal = reject(&capture);
+        assert_eq!(
+            refusal.code,
+            SpokeRejectCode::NotAuthorized,
+            "capture in {space}"
+        );
+        assert!(
+            refusal.details.is_none(),
+            "capture in {space} carries no details: {refusal:?}"
+        );
+        messages.insert(refusal.message.clone());
+        assert_eq!(
+            harness.count(&mut tx, "memory_candidates").await,
+            0,
+            "nothing is staged in {space}"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+    assert_eq!(
+        messages.len(),
+        1,
+        "the existing space with a stranger's malformed row and an absent space are one answer"
+    );
+
+    // The caller's own live grant admits it; the stranger's row is never decoded on its behalf.
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let mut tx = harness.begin().await;
+    let pack = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" },
+                        "budget": { "max_items": 4 } }),
+            )
+            .await,
+    );
+    assert!(pack["records"].is_array(), "{pack}");
+    tx.rollback().await.expect("rollback");
+}
+
+/// `memory.spaces.list` projects only Minds admission would admit: a Mind whose only live grant
+/// for the caller cannot decode is skipped, not listed and not an error, while a Mind that also
+/// holds a decodable live grant stays listed.
+#[tokio::test]
+async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
+    use mindcore_base::boundary::CallerId;
+    use mindcore_base::ids::MindId;
+    use mindcore_sqlite::minds::{self, CreateMind};
+
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let owner = "o_list";
+    let mut tx = harness.begin().await;
+    for id in ["mind_broken", "mind_extra", "mind_whole"] {
+        let created = minds::create(
+            &mut tx,
+            &CreateMind {
+                mind_id: Some(MindId::new(id)),
+                display_name: Some(format!("mind {id}")),
+                owner: CallerId::new(owner),
+            },
+        )
+        .await;
+        assert!(
+            matches!(created, SpokeResult::Ok(_)),
+            "create {id}: {created:?}"
+        );
+    }
+    // `mind_extra` gets a second live grant, so one undecodable row cannot hide it.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_extra', 'mind_extra', NULL, ?, '[\"recall\"]', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(owner)
+    .bind(NOW)
+    .execute(&mut *tx)
+    .await
+    .expect("seed the second grant");
+    for space in ["mind_broken", "mind_extra"] {
+        sqlx::query(
+            "UPDATE memory_grants SET capabilities_json = 'not-json' \
+             WHERE grant_id = (SELECT grant_id FROM memory_grants \
+                               WHERE space_id = ? AND principal_id = ? \
+                               ORDER BY grant_id LIMIT 1)",
+        )
+        .bind(space)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .expect("corrupt one grant");
+    }
+    tx.commit().await.expect("commit minds");
+
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .list_spaces(&mut tx, &principal(owner), json!({}))
+            .await,
+    );
+    let ids: Vec<&str> = body["spaces"]
+        .as_array()
+        .expect("spaces array")
+        .iter()
+        .map(|space| space["space_id"].as_str().expect("space_id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["mind_extra", "mind_whole"],
+        "a Mind admission would refuse through an undecodable row is not listed"
+    );
+
+    // The refusal the list's rule mirrors: admission reads no row it cannot decode.
+    let broken = adapter
+        .recall(
+            &mut tx,
+            &principal(owner),
+            json!({ "space_id": "mind_broken", "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "budget": { "max_items": 4 } }),
+        )
+        .await;
+    assert_eq!(
+        reject(&broken).code,
+        SpokeRejectCode::NotAuthorized,
+        "the skipped Mind answers the admission refusal"
+    );
+    tx.rollback().await.expect("rollback");
+}

@@ -10,7 +10,8 @@ Signed Rust SPOKE sessions over a host-supplied transport: the Memory face, the 
 
 Stage 1 composes no knowledge face: `ServeFaces` carries no scope, collection or knowledge
 admission, the manifest advertises neither `spoke-knowledge` nor `ke-ownership`, and every
-`port.knowledge.*` op answers `CAPABILITY_PORT_MISSING` on the responder's dispatch-deny branch.
+`port.knowledge.*` op is refused on the responder's dispatch-deny branch — raw wire `op_unsupported`,
+which the Rust dialer surfaces as `CapabilityPortMissing` with `details.wire_code`.
 `ScopedKnowledgeStore` and `RoutedKnowledgeStore` stay in `mindcore-sqlite` for Stage 2 to bind
 per Mind. The paragraphs below state the contract a restored face must satisfy.
 
@@ -34,7 +35,7 @@ The admitted Mind's grants read/write knowledge access within its scope, not unc
 
 The `spoke-history` family publishes two operations over the same signed session: `history.revisions.get` returns a `RevisionSnapshot`, `history.revisions.prune` returns `HistoryPruneResult { deleted, floor_revision }` where `floor_revision` is the local report's floor.
 
-Stage 1 composes no history face: `ServeFaces` carries no history switch, `face_capabilities` advertises no `spoke-history`, and both operations answer `CAPABILITY_PORT_MISSING` on the responder's dispatch-deny branch. The paragraphs below state the contract a restored face must satisfy, and the Stage 2 handoff at the end of this section names what it must re-implement rather than re-bind.
+Stage 1 composes no history face: `ServeFaces` carries no history switch, `face_capabilities` advertises no `spoke-history`, and both operations are refused on the responder's dispatch-deny branch — raw wire `capability_missing`, surfaced by the Rust dialer as `CapabilityPortMissing` with `details.wire_code`. The paragraphs below state the contract a restored face must satisfy, and the Stage 2 handoff at the end of this section names what it must re-implement rather than re-bind.
 
 One store fills two port roles: `RoutedKnowledgeStore` implements `spoke_operations::HistoryPort` beside `ScopedKnowledgePort`, so no second store module exists and the runtime owns no second history implementation — only the dedup record beside it. Admission is the knowledge face's, composed as `HistoryAdmission = (principals(peer)?, knowledge_admission(peer)?)`: a peer outside either callback gets that callback's refusal, and can therefore replay and prune exactly the scope it reads and writes through `port.knowledge.*`. Connect compares a present request `scope` with the admitted scope before calling the port — `NOT_FOUND` on get, `NOT_AUTHORIZED` on prune — and the port re-applies `RoutedKnowledgeStore::admit` as its own guard.
 
@@ -139,8 +140,9 @@ manifest carries it and no handler answers it even when a host registers the id.
 
 Stage 1 composes no adoption face: `ServeFaces` has no adoption setting, `face_capabilities` names
 neither `spoke-knowledge-adoption` nor its `spoke-knowledge` co-capability, and a `knowledge.adopt`
-call answers `CAPABILITY_PORT_MISSING`. The paragraphs below state the contract a restored face must
-satisfy. A restored face is composed per Mind and bound to one: its destination is that Mind's
+call is refused on the responder's dispatch-deny branch — raw wire `capability_missing`, surfaced by
+the Rust dialer as `CapabilityPortMissing` with `details.wire_code`. The paragraphs below state the
+contract a restored face must satisfy. A restored face is composed per Mind and bound to one: its destination is that Mind's
 registered collection, resolved through the registry row after admission, and there is no
 surface-wide destination setting to consume. The source stays host configuration — one collection,
 named on the wire by a `scope_id` and fixed by the host — and it is the only host-configured side of
@@ -298,7 +300,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 - Adoption's answer reports `destination_entry_id` slot occupancy — occupied or free — and nothing about the occupant: a concealed occupant is byte-identical to a visible one. That disclosure is permitted and no wider than the knowledge face it lands on, whose create-only `put_knowledge_entry` already distinguishes occupied from free while hiding the entry; entry content, revision and visibility stay undisclosed.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.
-- History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes. Stage 1 composes no history face, so `face_capabilities` names no `spoke-history` and both ops answer `CAPABILITY_PORT_MISSING`.
+- History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes. Stage 1 composes no history face, so `face_capabilities` names no `spoke-history` and both ops are refused on the dispatch-deny branch — raw wire `capability_missing`, surfaced as `CapabilityPortMissing`.
 - Every served `deliberate` response carries the judgment its own attempt produced, and every judgment it carries passed the released validator before the call returned; the identity rule [`mind-model.md`](mind-model.md) states holds on the wire, and `spoke-judgment` is advertised exactly with the tool.
 
 ## Where it lives

@@ -270,7 +270,7 @@ fn driver_error<T>(error: sqlx::Error, id: &MindId) -> SpokeResult<T> {
 }
 
 /// One row of the shared read: the registry row joined to its space row and one live-grant
-/// candidate.
+/// candidate, with the two grant columns whose decode admission requires.
 type JoinRow = (
     String,
     String,
@@ -279,6 +279,8 @@ type JoinRow = (
     String,
     String,
     Option<String>,
+    String,
+    String,
 );
 
 // The one projection and join both visibility reads share. A macro rather than a constant,
@@ -286,11 +288,18 @@ type JoinRow = (
 macro_rules! grant_columns {
     () => {
         "SELECT m.space_id, m.knowledge_collection, m.carrier_entry_id, \
-         s.display_name, s.status, s.created_at, g.expires_at \
+         s.display_name, s.status, s.created_at, g.expires_at, g.capabilities_json, \
+         g.context_ids_json \
          FROM memory_grants g \
          JOIN minds m ON m.space_id = g.space_id \
          JOIN memory_spaces s ON s.space_id = g.space_id"
     };
+}
+
+/// A joined row that admission would refuse because its grant columns do not decode admits
+/// nothing, so the registry reads skip it instead of erroring or naming a Mind.
+fn row_decodes(capabilities_json: &str, context_ids_json: &str) -> bool {
+    crate::repository::decode_grant_columns(capabilities_json, context_ids_json).is_ok()
 }
 
 // The visibility rule of `expiry_passed` in `crates/mindcore-spoke/src/admission.rs`, restated
@@ -354,15 +363,27 @@ async fn read_visible(store: &MindStore, caller: &CallerId) -> SpokeResult<Vec<M
     let mut minds = Vec::new();
     let mut emitted: Option<String> = None;
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
-        let (space_id, collection, carrier, display_name, status, created_at, expires_at) =
-            match row {
-                Ok(row) => row,
-                Err(_) => return storage_unavailable(),
-            };
+        let (
+            space_id,
+            collection,
+            carrier,
+            display_name,
+            status,
+            created_at,
+            expires_at,
+            capabilities_json,
+            context_ids_json,
+        ) = match row {
+            Ok(row) => row,
+            Err(_) => return storage_unavailable(),
+        };
         if emitted.as_deref() == Some(space_id.as_str()) {
             continue;
         }
         if !live(&expires_at) {
+            continue;
+        }
+        if !row_decodes(&capabilities_json, &context_ids_json) {
             continue;
         }
         let mind = match mind_of(
@@ -398,12 +419,24 @@ async fn read_one_visible(
     .bind(id.as_str())
     .fetch(&store.pool);
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
-        let (space_id, collection, carrier, display_name, status, created_at, expires_at) =
-            match row {
-                Ok(row) => row,
-                Err(_) => return storage_unavailable(),
-            };
+        let (
+            space_id,
+            collection,
+            carrier,
+            display_name,
+            status,
+            created_at,
+            expires_at,
+            capabilities_json,
+            context_ids_json,
+        ) = match row {
+            Ok(row) => row,
+            Err(_) => return storage_unavailable(),
+        };
         if !live(&expires_at) {
+            continue;
+        }
+        if !row_decodes(&capabilities_json, &context_ids_json) {
             continue;
         }
         return match mind_of(
@@ -432,8 +465,8 @@ pub async fn visible_mind_ids(
     tx: &mut Transaction<'_, Sqlite>,
     caller: &str,
 ) -> SpokeResult<Vec<String>> {
-    let mut rows = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT m.space_id, g.expires_at \
+    let mut rows = sqlx::query_as::<_, (String, Option<String>, String, String)>(
+        "SELECT m.space_id, g.expires_at, g.capabilities_json, g.context_ids_json \
          FROM memory_grants g \
          JOIN minds m ON m.space_id = g.space_id \
          WHERE g.principal_id = ?1 AND g.revoked_at IS NULL \
@@ -444,7 +477,7 @@ pub async fn visible_mind_ids(
     let mut ids = Vec::new();
     let mut emitted: Option<String> = None;
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
-        let (space_id, expires_at) = match row {
+        let (space_id, expires_at, capabilities_json, context_ids_json) = match row {
             Ok(row) => row,
             Err(_) => return storage_unavailable(),
         };
@@ -452,6 +485,9 @@ pub async fn visible_mind_ids(
             continue;
         }
         if !live(&expires_at) {
+            continue;
+        }
+        if !row_decodes(&capabilities_json, &context_ids_json) {
             continue;
         }
         emitted = Some(space_id.clone());

@@ -12,7 +12,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -315,6 +315,12 @@ async fn absorb(
     }
 }
 
+/// The budget the workflow still has after `spent`: a pre-check that consumed the request's
+/// deadline leaves `None`, and a zero remainder is spent rather than an empty allowance.
+fn remaining_budget(budget: Duration, spent: Duration) -> Option<Duration> {
+    budget.checked_sub(spent).filter(|left| !left.is_zero())
+}
+
 async fn deliberate(
     workflows: &dyn MindWorkflows,
     principal: &Principal,
@@ -326,12 +332,17 @@ async fn deliberate(
         Ok(arguments) => arguments,
         Err(reject) => return SpokeResult::Reject(reject),
     };
+    // The request's budget covers the whole call, and this pre-check is part of it: the DB read
+    // cannot be preempted, so its wall time is charged against the workflow's deadline instead.
+    let budget = Duration::from_millis(arguments.timeout_ms.get() as u64);
+    let started = Instant::now();
     // Admission before existence, in one transaction: the grant rows and the registry row are
     // read together, so a revocation cannot land between them, and the liveness rule is the
     // adapter's own (`live_grant` — unrevoked, unexpired, an unparseable expiry fails closed).
     // A missing grant, a revoked or expired one and a space with no registry row are the same
-    // refusal — same code, same message, no details — so a caller can never tell an existing
-    // Mind from an absent one by varying `space_id`.
+    // target-free refusal, so a caller can never tell an existing Mind from an absent one by
+    // varying `space_id`; a caller the Mind admits without `knowledge_read` answers the coverage
+    // refusal instead.
     let carrier_entry_id = match mindcore_spoke::admitted_carrier_entry(
         pool,
         &principal.principal_id,
@@ -341,6 +352,10 @@ async fn deliberate(
     {
         Ok(carrier_entry_id) => carrier_entry_id,
         Err(reject) => return SpokeResult::Reject(reject),
+    };
+    // A budget the pre-check already spent starts nothing: no reasoner, no carrier write.
+    let Some(timeout) = remaining_budget(budget, started.elapsed()) else {
+        return SpokeResult::Reject(workflow_retryable("deadline_exceeded"));
     };
     let holder: CognitionReference = match serde_json::from_value(json!({
         "kind": "knowledge_entry",
@@ -371,7 +386,7 @@ async fn deliberate(
         holder: &holder,
         target: &arguments.target,
         evidence: &evidence,
-        timeout: Duration::from_millis(arguments.timeout_ms.get() as u64),
+        timeout,
     };
     let caps = providers.capabilities();
     match workflows

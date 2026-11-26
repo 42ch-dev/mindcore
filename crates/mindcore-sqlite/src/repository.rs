@@ -902,11 +902,25 @@ fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
     })
 }
 
-fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
-    let capabilities: Vec<String> = serde_json::from_str(&row.capabilities_json)
+/// The decode rule every grant row read applies: both JSON columns are string arrays.
+///
+/// [`grant_row`] and the registry's visibility reads share it, so a Mind is visible through a row
+/// only when the row admission decodes would admit: the same malformed row must not be refused by
+/// one read and listed by another.
+pub(crate) fn decode_grant_columns(
+    capabilities_json: &str,
+    context_ids_json: &str,
+) -> RepoResult<(Vec<String>, Vec<String>)> {
+    let capabilities: Vec<String> = serde_json::from_str(capabilities_json)
         .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
-    let contexts: Vec<String> = serde_json::from_str(&row.context_ids_json)
+    let contexts: Vec<String> = serde_json::from_str(context_ids_json)
         .map_err(|error| invalid_row(format_args!("context_ids_json: {error}")))?;
+    Ok((capabilities, contexts))
+}
+
+fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
+    let (capabilities, contexts) =
+        decode_grant_columns(&row.capabilities_json, &row.context_ids_json)?;
     Ok(MemoryGrantRow {
         grant_id: row.grant_id,
         space_id: SpaceId::new(row.space_id),
