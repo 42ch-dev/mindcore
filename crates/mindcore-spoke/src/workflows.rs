@@ -54,12 +54,14 @@ type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
 /// this capture's absorb run decided `Pending` for the ids it names.
 const ABSORB_DECISION_OP: &str = "mindcore.absorb.decision";
 
-/// The carrier location of one admitted Mind: the registry row the `space_id` names.
-pub(crate) struct AdmittedCarrier {
+/// One admitted Mind as the registry row the `space_id` names: the collection its knowledge lives
+/// in and the carrier entry inside it.
+#[derive(Debug, Clone)]
+pub struct AdmittedMind {
     /// The knowledge collection the Mind's carrier lives in.
-    pub(crate) collection: String,
+    pub collection: String,
     /// The entry id the Mind's carrier row names.
-    pub(crate) carrier_entry_id: String,
+    pub carrier_entry_id: String,
 }
 
 /// The plan's carrier admission, shared by both entries below and in its fixed order: a live grant
@@ -71,7 +73,7 @@ async fn admit_carrier_location(
     principal_id: &str,
     space: &SpaceId,
     space_id: &str,
-) -> Result<(Vec<MemoryGrantRow>, AdmittedCarrier), SpokeReject> {
+) -> Result<(Vec<MemoryGrantRow>, AdmittedMind), SpokeReject> {
     let rows = caller_grants(tx, principal_id, space).await?;
     let now = Utc::now();
     if !rows.iter().any(|row| admission::live_grant(row, now)) {
@@ -96,19 +98,19 @@ async fn admit_carrier_location(
     Ok((rows, carrier))
 }
 
-/// Admission for the host-side `deliberate` handler: the steps above and nothing more.
+/// Admission of one Mind on its own transaction: the steps above and nothing more, answering the
+/// collection the Mind's knowledge lives in beside its carrier.
 ///
-/// The operation's own coverage is deliberately not checked here. `deliberate` reaches the
-/// carrier through the workflow, which reads its subject page and revalidates it before it checks
-/// `knowledge_read` and `knowledge_write`, so a caller the Mind admits but whose grants do not
-/// cover a capability still sees the refusal its request earns first — the plan's order, and the
-/// one the refused operations answered before the Mind routing. The host pre-check exists only to
-/// resolve the carrier a caller the Mind admits at all may write.
-pub async fn admitted_carrier_entry(
+/// The operation's own coverage is deliberately not checked here. A caller the Mind admits but
+/// whose grants do not cover a capability still sees the refusal its request earns first — the
+/// plan's order, and the one the refused operations answered before the Mind routing. The host
+/// pre-check exists only to resolve the collection and carrier a caller the Mind admits at all may
+/// reach.
+pub async fn admitted_mind(
     pool: &SqlitePool,
     principal_id: &str,
     space_id: &str,
-) -> Result<String, SpokeReject> {
+) -> Result<AdmittedMind, SpokeReject> {
     let mut conn = pool.acquire().await.map_err(|e| {
         Reject::internal(format!("the mind admission could not open: {e}")).into_spoke()
     })?;
@@ -118,7 +120,19 @@ pub async fn admitted_carrier_entry(
     let space = SpaceId::new(space_id.to_string());
     let located = admit_carrier_location(&mut tx, principal_id, &space, space_id).await;
     let _ = tx.rollback().await;
-    located.map(|(_, carrier)| carrier.carrier_entry_id)
+    located.map(|(_, mind)| mind)
+}
+
+/// Admission for the host-side `deliberate` handler: [`admitted_mind`], narrowed to the carrier
+/// entry id it binds the write to.
+pub async fn admitted_carrier_entry(
+    pool: &SqlitePool,
+    principal_id: &str,
+    space_id: &str,
+) -> Result<String, SpokeReject> {
+    admitted_mind(pool, principal_id, space_id)
+        .await
+        .map(|mind| mind.carrier_entry_id)
 }
 
 /// Admission of one Mind-level read: the steps above, then the space-wide `knowledge_read`
@@ -138,7 +152,7 @@ pub(crate) async fn admitted_carrier(
     tx: &mut Tx<'_>,
     principal_id: &str,
     space_id: &str,
-) -> Result<AdmittedCarrier, SpokeReject> {
+) -> Result<AdmittedMind, SpokeReject> {
     let space = SpaceId::new(space_id.to_string());
     let (rows, carrier) = admit_carrier_location(tx, principal_id, &space, space_id).await?;
     let now = Utc::now();
@@ -183,7 +197,7 @@ async fn caller_grants(
 async fn registry_carrier(
     tx: &mut Tx<'_>,
     space_id: &str,
-) -> Result<Option<AdmittedCarrier>, SpokeReject> {
+) -> Result<Option<AdmittedMind>, SpokeReject> {
     let row: Option<(String, String)> = sqlx::query_as(
         "SELECT knowledge_collection, carrier_entry_id FROM minds WHERE space_id = ?",
     )
@@ -193,7 +207,7 @@ async fn registry_carrier(
     .map_err(|e| {
         Reject::internal(format!("the mind admission could not be read: {e}")).into_spoke()
     })?;
-    Ok(row.map(|(collection, carrier_entry_id)| AdmittedCarrier {
+    Ok(row.map(|(collection, carrier_entry_id)| AdmittedMind {
         collection,
         carrier_entry_id,
     }))

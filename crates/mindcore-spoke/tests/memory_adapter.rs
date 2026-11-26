@@ -5440,3 +5440,101 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
     );
     tx.rollback().await.expect("rollback");
 }
+
+/// `admitted_mind` is the Mind admission the three faces share: an unknown Mind, an unadmitted
+/// one, a frozen one the caller holds no grant in, and a `space_id` with no registry row answer
+/// one byte-equal `NOT_AUTHORIZED` with no details, while an admitted Mind names the collection
+/// its knowledge lives in.
+#[tokio::test]
+async fn admitted_mind_answers_one_refusal_and_names_the_registered_collection() {
+    use mindcore_base::boundary::CallerId;
+    use mindcore_base::ids::MindId;
+    use mindcore_sqlite::minds::{self, CreateMind};
+
+    let harness = Harness::open().await;
+    // A live grant in a space with no registry row: the admission's third step is what refuses.
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    for (space, status) in [("sp_ungranted", "active"), ("sp_frozen", "frozen")] {
+        sqlx::query(
+            "INSERT INTO memory_spaces \
+             (space_id, display_name, authority_host_id, authority_generation, status, \
+              revision, created_at) \
+             VALUES (?, NULL, 'host_1', 1, ?, 1, ?)",
+        )
+        .bind(space)
+        .bind(status)
+        .bind(NOW)
+        .execute(&harness.pool)
+        .await
+        .expect("seed space");
+    }
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_stranger', 'sp_ungranted', NULL, ?, '[\"recall\"]', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(STRANGER)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed the stranger's grant");
+
+    let mut refusals = Vec::new();
+    for space in ["sp_absent", "sp_ungranted", "sp_frozen", SPACE] {
+        let refused = mindcore_spoke::admitted_mind(&harness.pool, PRINCIPAL, space)
+            .await
+            .expect_err("the Mind is not admitted");
+        assert_eq!(
+            refused.code,
+            SpokeRejectCode::NotAuthorized,
+            "admission in {space}"
+        );
+        assert!(
+            refused.details.is_none(),
+            "admission in {space} carries no details: {refused:?}"
+        );
+        refusals.push(refused);
+    }
+    for (index, refused) in refusals.iter().enumerate().skip(1) {
+        assert_eq!(
+            refused, &refusals[0],
+            "refusal {index} is byte-equal to the first: {refusals:?}"
+        );
+    }
+
+    // An admitted Mind: the caller's default grant is the creator's, written by the create.
+    let mut tx = harness.begin().await;
+    let created = minds::create(
+        &mut tx,
+        &CreateMind {
+            mind_id: Some(MindId::new("mind_admitted")),
+            display_name: Some("mind admitted".to_string()),
+            owner: CallerId::new(PRINCIPAL),
+        },
+    )
+    .await;
+    assert!(matches!(created, SpokeResult::Ok(_)), "create: {created:?}");
+    tx.commit().await.expect("commit mind");
+
+    let admitted = mindcore_spoke::admitted_mind(&harness.pool, PRINCIPAL, "mind_admitted")
+        .await
+        .expect("an admitted Mind is answered");
+    assert_eq!(
+        admitted.collection,
+        minds::knowledge_collection_of(&MindId::new("mind_admitted")),
+        "the admission names the collection the registry row registers"
+    );
+    assert_eq!(
+        admitted.carrier_entry_id,
+        minds::CARRIER_ENTRY_ID,
+        "the admission names the carrier entry the create wrote"
+    );
+    assert_eq!(
+        mindcore_spoke::admitted_carrier_entry(&harness.pool, PRINCIPAL, "mind_admitted")
+            .await
+            .expect("the carrier entry is answered"),
+        admitted.carrier_entry_id,
+        "the deliberate entry stays the carrier id of the same admission"
+    );
+}
