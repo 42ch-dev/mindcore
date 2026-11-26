@@ -103,6 +103,15 @@ registry row is not listed even under a live grant. The wire shape, cursor and m
 - An existing Mind the caller holds no space-wide live `admin` in answers the same target-free
   `NOT_AUTHORIZED` every other Mind-level path answers — never the library's taken-id refusal,
   which names the id.
+- That refusal is target-free, but the call's outcome is not: success means the id was free, that
+  refusal means it is taken. Since the request names the id and a new id needs no grant, an
+  authenticated peer can probe an id and claim a free one first, taking its space-wide `admin`.
+  Both inputs are settled decisions (the caller names the `space_id`; an authenticated principal
+  creates), so this is the shape rather than a defect here.
+- The invariant below therefore covers operations on an existing Mind and stops at id creation,
+  where there is no row to admit against before the create writes one. A host that cannot accept
+  the signal needs its own create admission or a server-assigned id. The decision is tracked in
+  `I-000155`; the served contract states the signal in [`serving-seam.md`](serving-seam.md).
 
 ### The un-routed operations
 
@@ -139,7 +148,9 @@ itself. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
   result mixes two Minds. The host's own memory family service dispatches its operations under the
   host's admission; which of them it dispatches was always the host's.
 - One `NOT_AUTHORIZED` with no `details` answers an unknown Mind id and a Mind the caller holds no
-  live grant in, a frozen one included, because admission runs before any existence check.
+  live grant in, a frozen one included, because admission runs before any existence check. It
+  covers operations on an existing Mind; create's outcome, which reports whether an id is free,
+  is scoped in § Creating and does not inherit this invariant.
 - No refusal discloses another Mind's collection, carrier or entry; the coverage refusal is
   reachable only by a caller already admitted to that Mind, and an existing Mind's create refusal
   names neither the caller, the Mind nor the missing capability.
