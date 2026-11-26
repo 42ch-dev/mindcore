@@ -641,6 +641,7 @@ fn faces(
         manifest,
         memory,
         knowledge: false,
+        history: false,
         principals: principal_admission(),
         providers,
         tools: Vec::new(),

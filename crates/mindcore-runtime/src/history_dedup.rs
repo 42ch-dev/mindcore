@@ -45,10 +45,6 @@
 //! `record` only fills a claim that already exists, so a caller that records without claiming
 //! writes nothing and can never produce an outcome for a prune that did not run.
 
-// `ServeFaces.history` composes this store; until that task lands nothing in the crate constructs
-// it, and a restored module that does not build warning-free would fail the workspace lint.
-#![allow(dead_code)]
-
 use std::io::Write;
 
 use async_trait::async_trait;
