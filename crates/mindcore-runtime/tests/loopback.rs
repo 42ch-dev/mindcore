@@ -4587,13 +4587,23 @@ async fn a_grant_covering_neither_knowledge_capability_serves_nothing() {
 /// namespace in its own request scope does not become the caller it names.
 ///
 /// The admitted scope is bound on every successful return, so Connect's `effective_scope` merges
-/// the request's extensions with the admitted ones and the admitted namespace wins. R's grant
-/// covers `knowledge_read` only; W's covers both. R forges W's principal id in list, get and put.
-/// The reads serve on R's own grant, and the put is the fixed refusal, writes nothing, and its
-/// entry is then created by W — which shows the refusal was R's grant and not the entry.
+/// the request's extensions with the admitted ones and the admitted namespace wins.
 ///
-/// The no-scope put is the same test without the forgery: there is nothing to merge, and the
-/// admitted binding alone decides.
+/// The test walks W's grant through three states so every operation discriminates on its own
+/// authorization decision:
+///
+/// 1. **W write-only, R read-only.** The forgery names W. List and get are served on R's
+///    `knowledge_read` and would be refused under W's write-only grant; put is refused for R and
+///    would also be refused for W, so put does not discriminate yet.
+/// 2. **W covering (both capabilities), R read-only.** The same forged put is refused while W's
+///    own covering grant would write it — the side-effect assertions below prove nothing was
+///    written, which is the put contrast.
+/// 3. **W covering, W's own positive write.** The same entry is then created by W, showing the
+///    refusals were R's grant and not the entry.
+///
+/// The no-scope put is the same test without the forgery. It is not decided by the binding:
+/// Connect passes no selector, and admission refuses a request that names no Mind before any
+/// scope is built or bound, so nothing unbound can reach the port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller() {
     let fixture = Fixture::open().await;
@@ -4744,6 +4754,54 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     .execute(&pool)
     .await
     .expect("restore the covering grant");
+
+    // The put contrast, now that the forged principal covers both capabilities again: the same
+    // request that is refused on R's `knowledge_read` would be WRITTEN if authorization took the
+    // caller from the request. The forgery reaches the wire, the answer is the fixed refusal, and
+    // neither the entry nor its cognition record exists — the two side effects W's own covering
+    // grant produces immediately below.
+    reader.wire.drain_sent();
+    assert_scope_refusal(
+        forger
+            .put_knowledge_entry_in_scope(
+                served_entry_with_cognition("ke_forged_contrast", "cog_forged_contrast"),
+                None,
+                Some(&request_scope(SPACE, forgery.clone())),
+            )
+            .await,
+        "a forged put while the forged principal covers both capabilities",
+    );
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.knowledge.put",
+        "ke_forged_contrast",
+        PRINCIPAL,
+    );
+    let contrast_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_forged_contrast")
+    .fetch_one(&pool)
+    .await
+    .expect("count the contrast entry");
+    assert_eq!(
+        contrast_entries, 0,
+        "the forged put wrote no entry: honouring the forgery would have written one"
+    );
+    let contrast_records: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cognition_records WHERE collection = ? AND entry_id = ?",
+    )
+    .bind(COLLECTION)
+    .bind("ke_forged_contrast")
+    .fetch_one(&pool)
+    .await
+    .expect("count the contrast cognition record");
+    assert_eq!(
+        contrast_records, 0,
+        "the forged put wrote no cognition record either"
+    );
+
     let owner = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
     let written = expect_ok(
         owner
@@ -5200,4 +5258,109 @@ async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
         Some(CARRIER),
         "with the marker the same request is served: {served}"
     );
+}
+
+// ---------- A storage fault during admission is not a refusal ----------
+
+/// A storage fault while the scoped admission resolves the caller's grants is answered as this
+/// request's internal error, not as the fixed `NOT_AUTHORIZED` an unadmitted caller receives.
+///
+/// Connect maps every admission `Reject` to one `deny_knowledge_scope`, so a fault returned as a
+/// `Reject` would be byte-identical to a refusal. The admission therefore raises the fault through
+/// the one channel Connect distinguishes — a panic on its blocking pool, which it catches as that
+/// request's join error and answers `INTERNAL_ERROR`. This drives both halves through the same
+/// signed session, on the same Mind, with only the store's health differing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_fault_during_admission_is_an_internal_error_not_a_refusal() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, principal_admission());
+    // The marker is advertised, so the scoped op is decodable and reaches the face; the caller
+    // holds the Mind's covering grant, so nothing but the store's health decides the answer.
+    let session = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*session.adapter;
+
+    // Half one: an intact store serves the admitted caller.
+    expect_ok(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "the admitted caller's list over a healthy store",
+    );
+
+    // Half two: the same caller, the same request, a store whose grant rows cannot be read. The
+    // table is dropped rather than emptied, so the admission's grant read fails rather than
+    // returning no rows — the difference between a fault and an admitted-nothing caller.
+    sqlx::query("DROP TABLE memory_grants")
+        .execute(&pool)
+        .await
+        .expect("remove the grants table to induce a storage fault");
+
+    let faulty = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
+        "a list while the admission's grant read fails",
+    );
+    assert_eq!(
+        faulty.code,
+        SpokeRejectCode::InternalError,
+        "a storage fault is an internal error, never the admission refusal: {faulty:?}"
+    );
+    assert_eq!(
+        faulty.message, "knowledge admission failed",
+        "Connect's own per-request admission-failure text: {faulty:?}"
+    );
+    assert_ne!(
+        faulty.code,
+        SpokeRejectCode::NotAuthorized,
+        "the fault is distinguishable from an unadmitted caller: {faulty:?}"
+    );
+    assert!(
+        !faulty.message.contains("memory_grants") && !faulty.message.contains(COLLECTION),
+        "the driver text stays host-side: {faulty:?}"
+    );
+    assert!(
+        faulty.details.is_none(),
+        "the internal answer carries no details: {faulty:?}"
+    );
+
+    assert_caller_absent_for(
+        &session,
+        &[PRINCIPAL, PEER_TWO_PRINCIPAL],
+        "the internal-error answer",
+        ExpectsReceipt::No,
+    );
+}
+
+/// The distinction in one place: with the store healthy, an unadmitted caller and an unknown Mind
+/// answer the same fixed refusal; with the store's grant read broken, the fault is an internal
+/// error. Together with the test above this pins that the fault path is additive — it changes the
+/// answer only for a broken store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_mind() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, two_principal_admission());
+    // The second peer holds no grant anywhere: it is the unadmitted case.
+    let stranger = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
+    let dialer = &*stranger.adapter;
+
+    for scope_id in [SPACE, "spc_no_such_mind"] {
+        let refused = expect_reject(
+            KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(scope_id, None))
+                .await,
+            "a list by a caller admitted to nothing",
+        );
+        assert_eq!(
+            refused.code,
+            SpokeRejectCode::NotAuthorized,
+            "{scope_id}: the fixed admission refusal: {refused:?}"
+        );
+        assert_eq!(
+            refused.message, "knowledge scope not authorized",
+            "{scope_id}: Connect's own admission-deny words"
+        );
+        assert!(
+            refused.details.is_none(),
+            "{scope_id}: no details, and no hint that the store is healthy: {refused:?}"
+        );
+    }
 }

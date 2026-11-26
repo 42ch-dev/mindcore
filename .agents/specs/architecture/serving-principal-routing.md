@@ -197,8 +197,9 @@ face that both use. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
 
 - `crates/mindcore-spoke/src/admission.rs` — `admit_mind` (grant rows, then the space row),
   `refuse_coverage`, `refuse_space_coverage` and `gate` (the freeze and subject gates).
-- `crates/mindcore-spoke/src/workflows.rs` — `admitted_mind` (the one admission the knowledge,
-  history and adoption faces share: grant rows, then the space row, then the registry row),
+- `crates/mindcore-spoke/src/workflows.rs` — `admitted_mind` (the admission the composed
+  knowledge face uses today, and the one the history and adoption faces must reuse when they are
+  composed: grant rows, then the space row, then the registry row),
   `carrier_collection` (the one registry-row lookup both readers share), `knowledge_slot`, and
   `admitted_carrier` / `admitted_carrier_entry` (the carrier admissions).
 - `crates/mindcore-sqlite/src/minds.rs` — the `minds` row, its visibility join, `create` and

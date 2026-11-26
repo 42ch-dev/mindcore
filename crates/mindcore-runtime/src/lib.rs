@@ -28,7 +28,8 @@ use serde_json::Value;
 
 use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
 use mindcore_spoke::{
-    admitted_mind, MemoryWorkflowBinding, MindKnowledgePort, ServedMemory, TRANSFER_OPERATIONS,
+    admitted_mind, is_mind_admission_refusal, MemoryWorkflowBinding, MindKnowledgePort,
+    ServedMemory, TRANSFER_OPERATIONS,
 };
 use mindcore_sqlite::{bind_caller, validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
@@ -39,7 +40,7 @@ use spoke_connect::remote::{
     ConnectResponder, MemoryAdmission, RemoteMemoryService, RemoteScopedKnowledgeFace,
     RemoteServePorts, ScopedKnowledgeAdmission, ToolHandler,
 };
-use spoke_operations::{validate_manifest_tools, ScopedKnowledgePort, SpokeResult};
+use spoke_operations::{validate_manifest_tools, ScopedKnowledgePort, SpokeReject, SpokeResult};
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Scope};
 use sqlx::SqlitePool;
@@ -177,6 +178,10 @@ impl MindcoreServe {
             Arc::new(self.store.served_knowledge()),
         ));
         let admission: ScopedKnowledgeAdmission = Arc::new(move |peer_id, selector| {
+            // Step one passes the host's own rejection through as it is — the admission rule the
+            // plan states for this callback. The host callback is the host's to classify; only the
+            // Mind admission below can tell a refusal from a storage fault on grounds this face
+            // owns.
             let principal = match principals(peer_id) {
                 SpokeResult::Ok(principal) => principal,
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -189,8 +194,14 @@ impl MindcoreServe {
             // pool, where `block_on` is legal on a multi-thread runtime.
             let admitted =
                 Handle::current().block_on(admitted_mind(&pool, &principal.principal_id, scope_id));
+            // Every refusal step — no live grant, an unadmitted or unknown Mind, no space row, no
+            // registry row — answers the one target-free value. Anything else here is a storage
+            // fault and must not be answered as that refusal.
             if let Err(reject) = admitted {
-                return SpokeResult::Reject(reject);
+                return match is_mind_admission_refusal(&reject) {
+                    true => SpokeResult::Reject(reject),
+                    false => fault_out_of_admission(&reject),
+                };
             }
             let mut scope = Scope {
                 cognition: None,
@@ -364,6 +375,29 @@ impl MindcoreSurface {
         }
         SpokeResult::Ok(())
     }
+}
+
+/// Answer a storage fault inside the scoped knowledge admission through Connect's per-request
+/// internal-error channel, never through the fixed admission refusal.
+///
+/// **Why a panic, deliberately.** Connect answers every admission `Reject` with one fixed
+/// `NOT_AUTHORIZED` (`deny_knowledge_scope`), so a database fault returned as a `Reject` would be
+/// byte-identical to an unadmitted caller and the caller could not tell a broken store from a
+/// refusal. Connect does have one fault channel: it runs this callback under
+/// `spawn_blocking`, catches a panic as that task's join error, and answers *that request* with
+/// `INTERNAL_ERROR("knowledge admission failed")` — the panic payload stays host-side and never
+/// reaches the wire, and nothing was sent to the store. Panicking here is therefore the
+/// supported way to say "not a refusal"; the `panic!` below is intentional, not incidental.
+///
+/// The message is the store's own diagnostic: it is kept host-side by Connect and is what a host
+/// logging the panic carries. It names local tables and columns, so it must not reach a peer —
+/// and it does not.
+fn fault_out_of_admission<T>(fault: &SpokeReject) -> T {
+    panic!(
+        "knowledge admission hit a storage fault, answered as this request's internal error: {} ({})",
+        fault.message,
+        fault.code.as_str()
+    )
 }
 
 /// The advertised capabilities follow the composed faces: the memory family flag when a memory

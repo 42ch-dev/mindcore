@@ -22,6 +22,7 @@ mod transfer;
 mod wire;
 mod workflows;
 
+pub use reject::is_mind_admission_refusal;
 pub use serve::{ServedMemory, TransferService};
 pub use served_knowledge::{authorize_knowledge, MindKnowledgePort};
 pub use transfer::OPERATIONS as TRANSFER_OPERATIONS;
