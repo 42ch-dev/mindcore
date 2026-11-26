@@ -35,6 +35,7 @@ const OWNER: &str = "p_wren";
 const WRITER: &str = "p_writer";
 const READER: &str = "p_reader";
 const HALF_WRITER: &str = "p_half_writer";
+const SPLIT: &str = "p_split";
 const STRANGER: &str = "p_stranger";
 const NOW: &str = "2026-11-26T09:00:00.000Z";
 
@@ -81,13 +82,18 @@ impl Harness {
     }
 
     async fn seed_grant(&self, principal: &str, capabilities: &[&str]) {
+        self.seed_grant_with_id(&format!("grt_{principal}"), principal, capabilities)
+            .await;
+    }
+
+    async fn seed_grant_with_id(&self, grant_id: &str, principal: &str, capabilities: &[&str]) {
         sqlx::query(
             "INSERT INTO memory_grants \
              (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
               shared_access, expires_at, revoked_at, revision, created_at) \
              VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
         )
-        .bind(format!("grt_{principal}"))
+        .bind(grant_id)
         .bind(MIND)
         .bind(principal)
         .bind(serde_json::to_string(capabilities).expect("capabilities"))
@@ -365,6 +371,67 @@ async fn every_served_put_requires_one_grant_covering_write_and_read() {
             "{label}: nothing was written"
         );
     }
+}
+
+/// Two grants held by one caller do not union: `knowledge_read` on one grant and
+/// `knowledge_write` on another in the same space leave the put refused, while the read grant
+/// still serves `get` and `list`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_is_refused_when_the_caller_holds_read_and_write_on_separate_grants() {
+    let harness = Harness::open().await;
+    harness
+        .seed_grant(WRITER, &["knowledge_read", "knowledge_write"])
+        .await;
+    expect_ok(
+        harness
+            .port
+            .put_scoped_knowledge_entry(
+                &bound_scope(WRITER),
+                entry_of("ke_shared", vec![belief("ke_shared", "cog_shared")]),
+                None,
+            )
+            .await,
+        "seed an entry through the covering grant",
+    );
+    harness
+        .seed_grant_with_id("grt_split_read", SPLIT, &["knowledge_read"])
+        .await;
+    harness
+        .seed_grant_with_id("grt_split_write", SPLIT, &["knowledge_write"])
+        .await;
+
+    let scope = bound_scope(SPLIT);
+    assert_fixed_refusal(
+        &expect_refused(
+            harness
+                .port
+                .put_scoped_knowledge_entry(
+                    &scope,
+                    entry_of("ke_split", vec![belief("ke_split", "cog_split")]),
+                    None,
+                )
+                .await,
+            "a put split across two grants",
+        ),
+        "a put split across two grants",
+    );
+    assert_eq!(
+        harness.rows_of("ke_split").await,
+        (0, 0, 0),
+        "the union wrote nothing"
+    );
+
+    expect_ok(
+        harness
+            .port
+            .get_scoped_knowledge_entry(&scope, "ke_shared")
+            .await,
+        "the read grant still gets the entry",
+    );
+    expect_ok(
+        harness.port.list_scoped_knowledge_entries(&scope).await,
+        "the read grant still lists the collection",
+    );
 }
 
 /// `get` and `list` require `knowledge_read`, and `knowledge_write` alone is not a read.

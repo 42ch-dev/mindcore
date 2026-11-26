@@ -738,7 +738,10 @@ fn assert_caller_absent(session: &Session, context: &str) {
         let parsed: Value = serde_json::from_str(frame)
             .unwrap_or_else(|error| panic!("{context}: the wire frame is JSON ({error}): {frame}"));
         let leaks = caller_leaks(&parsed, "$");
-        assert!(leaks.is_empty(), "{context}: the answer carries the caller: {leaks:?}");
+        assert!(
+            leaks.is_empty(),
+            "{context}: the answer carries the caller: {leaks:?}"
+        );
     }
 }
 
@@ -3305,7 +3308,9 @@ fn a_lost_create_commit_names_the_receipt_and_claims_no_outcome() {
     });
     let reject = create_commit_uncertain(&body, "the connection went away");
     assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
-    let details = reject.details.expect("the uncertain answer carries details");
+    let details = reject
+        .details
+        .expect("the uncertain answer carries details");
     assert_eq!(details["receipt_id"], json!("rct_create"));
     assert_eq!(details["retry_class"], json!("uncertain"));
     assert!(
