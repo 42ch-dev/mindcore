@@ -444,16 +444,23 @@ impl Mind {
             }
         };
 
-        // 1. Read the candidate's revision and consumption status as metadata. A content-read
-        //    path like `get_candidate` is deliberately not used here: its withhold on the
-        //    subject's unsettled intents is correct for subject content but unrelated to a
-        //    receipt, and it would keep a settled key's replay from ever reaching the adapter's
-        //    probe while any other intent of the subject is unsettled. Admission itself does
-        //    not move: `review_candidate` authorizes the write, probes the receipt first and
-        //    applies every fresh-work gate on its own. A same-key replay is digest-identical,
-        //    so this row only rebuilds the original `expected_revision` — a wrong value can
-        //    never reach a receipt.
-        let observed: Option<(i64, String)> = match sqlx::query_as(
+        // 1. Read the candidate's consumption status and revision as metadata. The answer
+        //    decides how the revision is established:
+        //    - A pending (or absent) candidate is fresh work: the facade reads it through the
+        //      adapter's `get_candidate`, whose withhold refuses while any intent of the
+        //      candidate's subject is unsettled — the refusal fresh reviews answered before
+        //      this facade ever probed receipts.
+        //    - A consumed candidate can only be a replay (settled receipt) or a retry of a
+        //      still-pending receipt, and a receipt is not subject content: the content
+        //      withhold must not gate it, so the revision is derived as metadata — exactly one
+        //      less than the consumed revision, because consumption is a candidate's only
+        //      revision bump and that is the only revision any recorded review payload for
+        //      this candidate can carry.
+        //    Admission itself does not move: `review_candidate` authorizes the write, probes
+        //    the receipt first and applies every fresh-work gate on its own. A same-key replay
+        //    is digest-identical, so either path can only rebuild the original
+        //    `expected_revision` — a wrong value can never reach a receipt.
+        let status: Option<(i64, String)> = match sqlx::query_as(
             "SELECT revision, status FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
         )
         .bind(space.as_str())
@@ -461,18 +468,59 @@ impl Mind {
         .fetch_optional(&mut *transaction)
         .await
         {
-            Ok(observed) => observed,
+            Ok(status) => status,
             Err(error) => {
                 drop(transaction);
                 return retryable_internal(format!("the candidate row could not be read: {error}"));
             }
         };
-        let (revision, consumed) = match observed {
-            Some((revision, status)) => (u64::try_from(revision).unwrap_or(0), status == "consumed"),
-            // No row: stage at revision 1, the candidate's fresh-work value. `review_candidate`
-            // answers its own `NotFound` for a candidate that never existed; a replayed key of
-            // a consumed or pruned candidate is digest-guarded before this value can matter.
-            None => (1, false),
+        let consumed = matches!(status, Some((_, ref status)) if status == "consumed");
+        let observed_revision = if consumed {
+            status.map(|(revision, _)| u64::try_from(revision).unwrap_or(0))
+        } else {
+            // Fresh work: the adapter's own content read, withhold included. A refusal is the
+            // adapter's own and rolls the transaction back.
+            let observed = self
+                .adapter
+                .get_candidate(
+                    &mut transaction,
+                    &caller,
+                    json!({ "space_id": space.as_str(), "candidate_id": candidate_id }),
+                )
+                .await;
+            match observed {
+                SpokeResult::Ok(MemoryStage::Ready(body)) => {
+                    let revision = body
+                        .get("candidate")
+                        .and_then(|candidate| candidate.get("revision"))
+                        .and_then(Value::as_u64);
+                    match revision {
+                        Some(revision) => Some(revision),
+                        None => {
+                            drop(transaction);
+                            return retryable_internal(
+                                "the candidate body carries no integer revision",
+                            );
+                        }
+                    }
+                }
+                SpokeResult::Ok(stage) => {
+                    drop(transaction);
+                    return retryable_internal(format!(
+                        "candidate read answered an unexpected stage: {stage:?}"
+                    ));
+                }
+                SpokeResult::Reject(reject) => {
+                    drop(transaction);
+                    return SpokeResult::Reject(reject);
+                }
+            }
+        };
+        let revision = match observed_revision {
+            Some(revision) => revision,
+            // No row at all: stage at revision 1, the candidate's fresh-work value —
+            // `review_candidate` answers its own `NotFound` for a candidate that never existed.
+            None => 1,
         };
         // 2. Stage on the same transaction. The adapter's dedup probe keys on
         //    (space, requester, operation, idempotency_key) and digests the whole payload, so
@@ -553,23 +601,27 @@ impl Mind {
         // 4. Publish before the staging is durable, off the async worker: the publisher writes
         //    and fsyncs synchronously, so it runs on the blocking pool while the handle's task
         //    awaits it — unrelated executor work stays schedulable for the whole flush. The
-        //    ordering is unchanged: nothing commits before the publisher has confirmed, and a
-        //    refusal rolls the transaction back — no record row, no intent and a pending
-        //    candidate are left, with the publisher's own `SpiError::Settlement` refusal
-        //    traveling unchanged. The task is awaited to completion, so it always retains
-        //    ownership of the publication, caller cancellation included.
+        //    transaction itself moves into the blocking task and comes back with the result,
+        //    so a caller that drops the review future can never release the writer before the
+        //    started publication ends: a same-key retry's own transaction waits for the first
+        //    one's rollback, and the two attempts can never publish side by side. Nothing
+        //    commits before the publisher has confirmed, a refusal rolls everything back, and
+        //    the publisher's own `SpiError::Settlement` refusal travels unchanged.
         let publish_targets = intent.targets.clone();
         let publish = {
             let publisher = Arc::clone(publisher);
-            tokio::task::spawn_blocking(move || publisher(&publish_targets))
+            tokio::task::spawn_blocking(move || {
+                let result = publisher(&publish_targets);
+                (result, transaction)
+            })
         };
-        let published = match publish.await {
-            Ok(result) => result,
+        let (published, back) = match publish.await {
+            Ok(pair) => pair,
             Err(error) => {
-                drop(transaction);
                 return retryable_internal(format!("the publication task failed to join: {error}"));
             }
         };
+        let transaction = back;
         if let Err(error) = published {
             drop(transaction);
             return match error {

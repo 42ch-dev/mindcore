@@ -1387,6 +1387,58 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
     assert_eq!(count_records(&store.pool()).await, 1, "still no second record");
 }
 
+/// Only the replay bypasses the unsettled-intent withhold: a fresh review — a new key over a
+/// candidate of a subject whose intent is unsettled — is refused with the adapter's own
+/// UNRECONCILED answer, exactly as before the facade ever probed receipts.
+#[tokio::test]
+async fn a_fresh_review_is_refused_while_the_subjects_intent_is_unsettled() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(dir.path()));
+    let candidate_id = capture_candidate(&handle, "cap-fresh-withhold", "a fresh note").await;
+
+    settle_never(&store, created.id.as_str(), SUBJECT).await;
+    let reject = reject_of(
+        handle
+            .review(&candidate_id, &promote(), "rev-fresh-withhold")
+            .await,
+    );
+    assert_eq!(
+        reject.code,
+        SpokeRejectCode::InternalError,
+        "the withhold travels as the adapter's own refusal"
+    );
+    assert_eq!(
+        reject.details.as_ref().and_then(|details| details.get("reason")),
+        Some(&json!("UNRECONCILED")),
+        "a fresh review is withheld while the subject's intent is unsettled: {reject:?}"
+    );
+    assert_eq!(count_records(&store.pool()).await, 0, "nothing is staged");
+    assert_eq!(
+        count_intents(&store.pool()).await,
+        1,
+        "only the pre-existing intent stands"
+    );
+
+    // Once the intent settles, the same review proceeds — the withhold is live state, not a
+    // dead candidate.
+    sqlx::query("UPDATE memory_journal SET state = 'applied'")
+        .execute(&store.pool())
+        .await
+        .expect("settle the outstanding intent");
+    let reviewed = ok(handle
+        .review(&candidate_id, &promote(), "rev-fresh-withhold")
+        .await);
+    assert_eq!(
+        value_of(&reviewed)["status"],
+        "committed",
+        "the fresh review settles after the intent does"
+    );
+}
+
 /// The publisher confines every target to its root: an absolute target path or one carrying
 /// `..` is refused with nothing written outside the root.
 #[tokio::test]
@@ -1427,10 +1479,13 @@ async fn the_public_publisher_refuses_a_target_outside_its_root() {
     );
 }
 
-/// The review's publication runs off the async worker: while the publisher is parked inside
-/// its flush, unrelated executor work keeps progressing, and nothing commits before the
-/// publication confirms — the records count is still zero until the review finishes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// The review's publication runs off the async worker. One worker thread drives the whole
+/// test: the publisher parks inside its flush on a rendezvous, and a probe task spawned after
+/// entry — before release — completes within the timeout only because the single worker is
+/// free to poll it. Publication inlined on the worker would park the worker itself, the probe
+/// would starve, and the timeout would fire: the regression fails, never hangs, because the
+/// probe's wait is the bounded one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms() {
     let (dir, store) = fixture().await;
     let owner = CallerId::new(OWNER);
@@ -1441,23 +1496,33 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         .with_journal_publisher(journal_dir(&journal_root));
     let candidate_id = capture_candidate(&handle, "cap-offworker", "a parked publication").await;
 
-    // A publisher parked inside its flush: it enters, signals, and waits for the test to
-    // release it. A probe task signals progress while the review is parked; if the publication
-    // ran on the executor, the probe could never be polled and the probe signal would starve.
-    let (entered, is_entered) = mpsc::channel::<()>();
-    let (release, is_released) = tokio::sync::oneshot::channel::<()>();
-    let is_released = std::sync::Mutex::new(Some(is_released));
+    // The observer is opened before the review starts, so nothing migrates or acquires the
+    // write while the staging transaction holds it.
+    let observer = MindStore::open(&dir.path().join("minds.db"))
+        .await
+        .expect("open the observer store");
+
+    // A publisher parked inside its flush on a condvar rendezvous.
+    let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let parked_root = journal_root.clone();
+    let entered_pub = entered.clone();
+    let released_pub = released.clone();
     let parked = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(move |targets| {
             journal_dir(&parked_root)(targets)?;
-            entered.send(()).expect("signal the publisher entered");
-            let receiver = is_released
-                .lock()
-                .expect("the release lock")
-                .take()
-                .expect("the publisher is entered once");
-            receiver.blocking_recv().expect("wait for the test release");
+            {
+                let (lock, cvar) = &*entered_pub;
+                let mut flag = lock.lock().expect("the entry lock");
+                *flag = true;
+                cvar.notify_all();
+                drop(flag);
+            }
+            let (lock, cvar) = &*released_pub;
+            let mut flag = lock.lock().expect("the release lock");
+            while !*flag {
+                flag = cvar.wait(flag).expect("wait for the test release");
+            }
             Ok(())
         });
 
@@ -1465,36 +1530,151 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         parked.review(&candidate_id, &promote(), "rev-offworker").await
     });
 
-    // The probe task: progress measurable only on a free executor.
+    // Wait for entry asynchronously — the probe starts only after the publisher is parked.
+    let entered_wait = entered.clone();
+    tokio::task::spawn_blocking(move || {
+        let (lock, cvar) = &*entered_wait;
+        let mut flag = lock.lock().expect("the entry lock");
+        while !*flag {
+            flag = cvar.wait(flag).expect("wait for publisher entry");
+        }
+    })
+    .await
+    .expect("the publisher is parked inside its flush");
+
+    // The probe: progress measurable only on a free single worker.
     let (progressed, is_progressed) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = progressed.send(());
     });
-
-    is_entered.recv().expect("the publisher is parked inside its flush");
     let progress = tokio::time::timeout(std::time::Duration::from_secs(5), is_progressed).await;
     assert!(
         progress.is_ok(),
         "executor progress continued while the publisher was parked"
     );
-    // Nothing commits before the publication confirms: a second pool on the same file reads
-    // the committed state — the staging transaction still holds the first pool's connection,
-    // and its uncommitted rows are invisible here.
-    let observer = MindStore::open(&dir.path().join("minds.db"))
-        .await
-        .expect("open the observer store");
+    // Nothing commits before the publication confirms: the pre-opened observer reads the
+    // committed state, and the staging transaction's uncommitted rows are invisible to it.
     assert_eq!(
         count_records(&observer.pool()).await,
         0,
         "nothing commits before the publication confirms"
     );
 
-    release.send(()).expect("release the publisher");
+    {
+        let (lock, cvar) = &*released;
+        let mut flag = lock.lock().expect("the release lock");
+        *flag = true;
+        cvar.notify_all();
+    }
     let reviewed = review.await.expect("the review task joins");
     assert_eq!(
         value_of(&ok(reviewed))["status"],
         "committed",
         "the review settles after the publication confirms"
+    );
+}
+
+/// Cancellation keeps transaction ownership until the started publication ends: the review
+/// future is dropped while the publisher is parked, yet the first attempt's transaction stays
+/// alive until the flush finishes, so a same-key retry can only stage after the first
+/// attempt's rollback — the two never publish side by side, and the retry settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let journal_root = dir.path().to_path_buf();
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(&journal_root));
+    let candidate_id = capture_candidate(&handle, "cap-cancelled", "a cancelled review").await;
+
+    let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let finished = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let parked_root = journal_root.clone();
+    let entered_pub = entered.clone();
+    let released_pub = released.clone();
+    let finished_pub = finished.clone();
+    let parked = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(move |targets| {
+            journal_dir(&parked_root)(targets)?;
+            {
+                let (lock, cvar) = &*entered_pub;
+                let mut flag = lock.lock().expect("the entry lock");
+                *flag = true;
+                cvar.notify_all();
+                drop(flag);
+            }
+            {
+                let (lock, cvar) = &*released_pub;
+                let mut flag = lock.lock().expect("the release lock");
+                while !*flag {
+                    flag = cvar.wait(flag).expect("wait for the test release");
+                }
+            }
+            {
+                let (lock, cvar) = &*finished_pub;
+                let mut flag = lock.lock().expect("the finish lock");
+                *flag = true;
+                cvar.notify_all();
+            }
+            Ok(())
+        });
+
+    // The retry handle is opened before the review starts: the store's pool has one
+    // connection, and once the staging transaction holds it nothing — not even a registry read
+    // — can acquire another until the transaction ends. That is the serialization the test
+    // relies on, and pre-opening is what keeps the test itself out of that queue.
+    let working = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(&journal_root));
+    let cancelled_id = candidate_id.clone();
+    let review = tokio::spawn(async move {
+        parked.review(&cancelled_id, &promote(), "rev-cancelled").await
+    });
+
+    // Park the publisher, then drop the review future: the cancellation.
+    let entered_wait = entered.clone();
+    tokio::task::spawn_blocking(move || {
+        let (lock, cvar) = &*entered_wait;
+        let mut flag = lock.lock().expect("the entry lock");
+        while !*flag {
+            flag = cvar.wait(flag).expect("wait for publisher entry");
+        }
+    })
+    .await
+    .expect("the publisher is parked inside its flush");
+    review.abort();
+
+    // A same-key retry now: its staging transaction cannot acquire until the cancelled
+    // attempt's transaction rolls back — and that rollback cannot happen before the parked
+    // publication ends. Release the parked publisher, then the retry settles the key. The
+    // ownership invariant is what makes this wait exist at all: if the cancelled attempt
+    // released its transaction while parked, the retry's staging and publication would race
+    // the first publish instead of queueing behind its rollback.
+    {
+        let (lock, cvar) = &*released;
+        let mut flag = lock.lock().expect("the release lock");
+        *flag = true;
+        cvar.notify_all();
+    }
+    let reviewed = ok(working
+        .review(&candidate_id, &promote(), "rev-cancelled")
+        .await);
+    assert_eq!(
+        value_of(&reviewed)["status"],
+        "committed",
+        "the same-key retry settles after the cancelled attempt finished"
+    );
+    assert_eq!(
+        count_records(&store.pool()).await,
+        1,
+        "exactly one record across both attempts"
+    );
+    assert_eq!(
+        count_intents(&store.pool()).await,
+        1,
+        "exactly one intent across both attempts"
     );
 }
 
@@ -1580,5 +1760,45 @@ async fn cognition_read_reads_only_the_collection_of_the_admitted_mind() {
         cognition.records[0]["record_id"],
         json!("cog_poisoned"),
         "the read is the admitted Mind's own carrier"
+    );
+}
+
+/// The publisher's confinement is filesystem resolution: a target whose parent resolves
+/// through a symlink inside the root to a destination outside it is refused, and the external
+/// destination is never written.
+#[tokio::test]
+async fn the_public_publisher_refuses_a_target_that_resolves_outside_its_root() {
+    let dir = TempDir::new().expect("temporary directory");
+    let root = dir.path().join("journal");
+    std::fs::create_dir_all(&root).expect("create the root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("create the escape destination");
+    std::os::unix::fs::symlink(&outside, root.join("records")).expect("plant the symlink");
+
+    let publisher = mindcore_runtime::journal_dir(&root);
+    let escaped = publisher(&[json!({
+        "path": "records/rec_symlink.md",
+        "content": "escape through the link",
+    })]);
+    assert!(
+        escaped.is_err(),
+        "a target resolving outside the root is refused"
+    );
+    assert!(
+        !outside.join("rec_symlink.md").exists(),
+        "nothing was written at the external destination"
+    );
+
+    // A symlink at the destination itself — the file the write would follow — is refused the
+    // same way: the parent chain stays inside the root, and the confined target lands.
+    publisher(&[json!({
+        "path": "profiles/rec_confined.md",
+        "content": "confined bytes",
+    })])
+    .expect("a genuinely confined target still publishes");
+    assert_eq!(
+        std::fs::read_to_string(root.join("profiles").join("rec_confined.md"))
+            .expect("the confined target"),
+        "confined bytes"
     );
 }

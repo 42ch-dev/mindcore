@@ -47,20 +47,26 @@ the adapter's own code, and a revision below an entry's floor answers the store'
 ### The `review` fold
 
 `review` answers the settled receipt, not a stage. Inside one `BEGIN IMMEDIATE` it reads the
-candidate's revision and status as metadata and stages the whole decision through
-`review_candidate`. The metadata read is deliberately not a content read: the adapter's
-`get_candidate` withholds subject content while any of the subject's intents is unsettled,
-which is correct for content but unrelated to a receipt — a settled key's replay must reach
-the adapter's probe no matter what else in the space is unsettled, whether another of the
-same subject's intents or another subject's in the same space. Admission does not move:
-`review_candidate` authorizes the write, probes the receipt first and applies every fresh-work
-gate on its own, and a replay is digest-identical, so the metadata read only rebuilds the
-original `expected_revision`.
+candidate's consumption status as metadata and then distinguishes fresh work from a replay.
+Fresh work — a pending or absent candidate — reads the candidate through the adapter's
+`get_candidate`, whose withhold refuses while any intent of the candidate's subject is
+unsettled, the refusal fresh reviews always answered. A consumed candidate can only be a
+replay or a retry of a still-pending receipt, and a receipt is not subject content: the
+withhold must not gate it, so its `expected_revision` is derived as metadata — exactly one
+less than the consumed revision, because consumption is a candidate's only revision bump.
+That is what lets a settled key's replay reach the adapter's probe no matter what else in the
+space is unsettled, whether another of the same subject's intents or another subject's in the
+same space. Admission does not move: `review_candidate` authorizes the write, probes the
+receipt first and applies every fresh-work gate on its own, and a replay is digest-identical,
+so either path only rebuilds the original `expected_revision`.
 
 The fold reads the staged intent on the same transaction and publishes the owed targets off
 the async worker — the publisher writes and fsyncs synchronously, so it runs on the blocking
-pool while nothing commits and unrelated executor work stays schedulable — **before the
-staging is durable**: a refused publication rolls everything back — no record row, no intent,
+pool while nothing commits and unrelated executor work stays schedulable. The staging
+transaction moves into the blocking task and comes back with the result, so a caller that
+drops the review future can never release the writer before the started publication ends: a
+same-key retry's transaction queues behind the first one's rollback, and two attempts never
+publish side by side — **before the staging is durable**: a refused publication rolls everything back — no record row, no intent,
 a pending candidate — and the same idempotency key can be repeated, with the publisher's own
 `SpiError::Settlement` refusal traveling unchanged. Only after a successful publication does
 the staging commit; settlement then runs on a second transaction, and any failure from there
@@ -77,13 +83,18 @@ surface deliberately: the served caller holds the receipt protocol that resolves
 leaves no record to resolve. The cost is an orphan published file when the process dies
 between publication and the staging commit.
 
-`journal_dir(root)` confines every target to its root: a target path that is absolute or
-carries `..` is refused before its first byte. Durability is anchored at `root`, which the
-host establishes as durable; publication syncs the file and every directory of the publisher's
-tree down to the target, never ancestors outside the root. Syncing a directory opens it for
-reading, so the host must grant read on `root` and every directory below it — a write-only
-journal root cannot be published, because the sync that must precede settlement would be
-refused for a reason the write itself never hit.
+`journal_dir(root)` confines every target to its canonical root: a target path that is
+absolute or carries `..` is refused before its first byte, and what remains is canonicalized —
+a parent whose resolution leaves the canonical root through a symlink below it is refused
+before anything is created or written. Durability ends at the deepest pre-existing ancestor
+of the target's parent, inclusive: everything below it was created by this publication and is
+synced on every attempt, and when `root` itself is absent the entry that names the freshly
+created root — in its existing parent — is persisted before `Ok(())`, so a settled record can
+never outlive the projection tree that proves it. Syncing a directory opens it for reading,
+so the host must grant read on the deepest pre-existing ancestor and everything below it;
+ancestors above it need only traversal — a write-only journal root cannot be published,
+because the sync that must precede settlement would be refused for a reason the write itself
+never hit.
 
 ### `deliberate` without a subject
 

@@ -37,7 +37,7 @@ use sqlx::{Sqlite, Transaction};
 use mindcore_base::ids::{SpaceId, SubjectId};
 use mindcore_spi::SpiError;
 use mindcore_base::ir::{MemoryRepository, ReceiptFailure, ReceiptState, ReviewReceiptIr};
-use mindcore_sqlite::{read_entry, SqliteMemoryRepository};
+use mindcore_sqlite::SqliteMemoryRepository;
 
 use crate::admission::Op;
 use crate::reject::{AResult, Reject};
@@ -278,67 +278,6 @@ impl MemoryAdapter {
     ) -> Result<(), SpiError> {
         self.require_space_grants(tx, principal, space_id, &[RECALL])
             .await
-    }
-
-    /// Read the carrier entry of `carrier_entry_id` in `collection` on `tx` and
-    /// derive the Mind's judgment from it — the space-wide `knowledge_read`
-    /// grant admitted first. A carrier that holds no current-view record yet
-    /// answers `None`: a Mind without a judgment is a state, not an error. Any
-    /// other derivation refusal means a stored carrier the projection cannot
-    /// read, answered as the caller-side internal failure it is.
-    pub async fn read_cognition(
-        &self,
-        tx: &mut Tx<'_>,
-        principal: &Principal,
-        space_id: &str,
-        collection: &str,
-        carrier_entry_id: &str,
-        mind_state_id: &str,
-    ) -> Result<Option<Cognition>, SpiError> {
-        self.require_space_grants(tx, principal, space_id, &[KNOWLEDGE_READ])
-            .await?;
-        let carrier = match read_entry(tx, collection, carrier_entry_id).await {
-            SpokeResult::Ok(carrier) => carrier,
-            SpokeResult::Reject(reject) => return Err(SpiError::Settlement(reject)),
-        };
-        let revision = carrier.revision.ok_or_else(|| {
-            SpiError::Settlement(
-                Reject::terminal(
-                    SpokeRejectCode::InternalError,
-                    format!("carrier {carrier_entry_id} holds no assigned revision"),
-                )
-                .into_spoke(),
-            )
-        })?;
-        let view = match mindcore_base::cognition::derive_mind_state(&carrier) {
-            Ok(view) => view,
-            Err(mindcore_base::cognition::MindError::NoRecords) => return Ok(None),
-            Err(error) => {
-                return Err(SpiError::Settlement(
-                    Reject::terminal(
-                        SpokeRejectCode::InternalError,
-                        format!("carrier {carrier_entry_id} cannot be derived: {error}"),
-                    )
-                    .into_spoke(),
-                ));
-            }
-        };
-        let records = mindcore_base::cognition::carrier_records(&carrier);
-        let mind_state = mindcore_base::cognition::mind_state_value(&view, mind_state_id)
-            .map_err(|error| {
-                SpiError::Settlement(
-                    Reject::terminal(
-                        SpokeRejectCode::InternalError,
-                        format!("the mind state of {carrier_entry_id} cannot be projected: {error}"),
-                    )
-                    .into_spoke(),
-                )
-            })?;
-        Ok(Some(Cognition {
-            carrier_revision: revision,
-            records,
-            mind_state,
-        }))
     }
 
     /// `principal`'s own live grant for every one of `capabilities` in `space_id`, on `tx`.
