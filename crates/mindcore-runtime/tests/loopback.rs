@@ -705,6 +705,25 @@ fn is_receipt_path(path: &[Step<'_>]) -> bool {
     )
 }
 
+/// Whether the answer under inspection may carry a receipt at all.
+///
+/// The receipt exception is a property of the answer's context, not of its shape: the same body
+/// that is a committed receipt on a create is a disclosure on a refusal that staged nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpectsReceipt {
+    /// A create, its replay, the fresh-key repeat, or `memory.receipts.get`: the answer is a
+    /// receipt body, or holds one at `payload.receipt`.
+    Yes,
+    /// A refusal that staged nothing — the terminal refusals this suite asserts, which answer no
+    /// `details` at all. No receipt body and no attribution may appear.
+    ///
+    /// not this class: an `OUTCOME_UNCERTAIN` answer. It is a refusal too, but it names the staged
+    /// receipt in `details.receipt_id` so the caller can resolve the outcome through
+    /// `memory.receipts.get`; that receipt is real and is not a leak. No call site applies this
+    /// walk to an uncertain answer.
+    No,
+}
+
 /// Every occurrence of the caller in one decoded wire frame that must not be there, as
 /// `path: needle`; empty when the frame carries it only in a receipt's own attribution.
 ///
@@ -712,7 +731,11 @@ fn is_receipt_path(path: &[Step<'_>]) -> bool {
 /// the op's DTO and drops every member the DTO does not declare: a leak under an unmodelled key
 /// is invisible after decoding but present here. Object keys are walked too: a principal used as
 /// a key discloses it as surely as a value does.
-fn caller_leaks<'a>(value: &'a Value, path: &mut Vec<Step<'a>>) -> Vec<String> {
+fn caller_leaks<'a>(
+    value: &'a Value,
+    expects: ExpectsReceipt,
+    path: &mut Vec<Step<'a>>,
+) -> Vec<String> {
     let mut leaks = Vec::new();
     match value {
         Value::Object(members) => {
@@ -723,15 +746,24 @@ fn caller_leaks<'a>(value: &'a Value, path: &mut Vec<Step<'a>>) -> Vec<String> {
                     path.pop();
                     continue;
                 }
+                // A refusal names no receipt: one here would be a staged outcome the operation is
+                // supposed to have left unmentioned.
+                if key == "receipt_id" && expects == ExpectsReceipt::No {
+                    leaks.push(format!("{}: a refusal carries a receipt", rendered(path)));
+                    path.pop();
+                    continue;
+                }
                 // A receipt's own `requester_principal_id` is the caller's attribution of the
                 // request it made, required by the receipt polling contract, and is not the
                 // admission binding. It is the one permitted occurrence: this receipt object, at
                 // the receipt's own path, holding the expected scalar. Any other position,
-                // nesting or value leaks.
+                // nesting or value leaks — and on an answer that expects no receipt at all, every
+                // position does.
                 if key == "requester_principal_id" {
                     // `path` ends with this member; the exemption is a property of the object
                     // holding it.
-                    let attributed = is_receipt_path(&path[..path.len() - 1])
+                    let attributed = expects == ExpectsReceipt::Yes
+                        && is_receipt_path(&path[..path.len() - 1])
                         && members.contains_key("receipt_id")
                         && member.as_str() == Some(PRINCIPAL);
                     if !attributed {
@@ -743,14 +775,14 @@ fn caller_leaks<'a>(value: &'a Value, path: &mut Vec<Step<'a>>) -> Vec<String> {
                     path.pop();
                     continue;
                 }
-                leaks.extend(caller_leaks(member, path));
+                leaks.extend(caller_leaks(member, expects, path));
                 path.pop();
             }
         }
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
                 path.push(Step::Index(index));
-                leaks.extend(caller_leaks(item, path));
+                leaks.extend(caller_leaks(item, expects, path));
                 path.pop();
             }
         }
@@ -767,15 +799,16 @@ fn caller_leaks<'a>(value: &'a Value, path: &mut Vec<Step<'a>>) -> Vec<String> {
 }
 
 /// Assert that every frame the responder answered since the last drain carries the caller
-/// nowhere, and that the call was answered at all. A frame that is not JSON fails: nothing this
-/// suite's own faces send is anything else.
-fn assert_caller_absent(session: &Session, context: &str) {
+/// nowhere, and that the call was answered at all. `expects` says whether the answer may hold a
+/// receipt; a refusal passes [`ExpectsReceipt::No`], so the attribution exception cannot excuse
+/// one. A frame that is not JSON fails: nothing this suite's own faces send is anything else.
+fn assert_caller_absent(session: &Session, context: &str, expects: ExpectsReceipt) {
     let frames = session.wire.drain();
     assert!(!frames.is_empty(), "{context}: the call was answered");
     for frame in &frames {
         let parsed: Value = serde_json::from_str(frame)
             .unwrap_or_else(|error| panic!("{context}: the wire frame is JSON ({error}): {frame}"));
-        let leaks = caller_leaks(&parsed, &mut Vec::new());
+        let leaks = caller_leaks(&parsed, expects, &mut Vec::new());
         assert!(
             leaks.is_empty(),
             "{context}: the answer carries the caller: {leaks:?}"
@@ -2838,7 +2871,7 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
     ));
     // The poll answers a receipt at `payload.receipt`: that is the one other place the caller may
     // appear, and only as the receipt's own `requester_principal_id` attribution.
-    assert_caller_absent(&session, "the receipt poll answer");
+    assert_caller_absent(&session, "the receipt poll answer", ExpectsReceipt::Yes);
     assert_eq!(polled["receipt"]["op"], json!("memory.exports.create"));
     assert_eq!(polled["receipt"]["status"], json!("committed"));
     assert_eq!(polled["receipt"]["receipt_id"], json!(receipt_id));
@@ -3516,7 +3549,7 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         .await,
         "memory.spaces.create",
     ));
-    assert_caller_absent(&session, "the create answer");
+    assert_caller_absent(&session, "the create answer", ExpectsReceipt::Yes);
     assert_eq!(created["result"]["space_id"], json!("spc_wire"));
     assert_eq!(created["result"]["created"], json!(true));
     assert_eq!(created["result"]["status"], json!("active"));
@@ -3606,7 +3639,7 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         .await,
         "the replay of a create",
     ));
-    assert_caller_absent(&session, "the replay answer");
+    assert_caller_absent(&session, "the replay answer", ExpectsReceipt::Yes);
     assert_eq!(replay["receipt_id"], first_receipt);
     assert_eq!(replay["result"], created["result"]);
     assert_eq!(
@@ -3629,7 +3662,7 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         .await,
         "a repeat create under a fresh key",
     ));
-    assert_caller_absent(&session, "the fresh-key repeat answer");
+    assert_caller_absent(&session, "the fresh-key repeat answer", ExpectsReceipt::Yes);
     assert_ne!(repeat["receipt_id"], first_receipt);
     assert_eq!(repeat["result"]["created"], json!(false));
     assert_eq!(
@@ -3701,7 +3734,7 @@ async fn a_signed_create_of_an_existing_mind_without_admin_learns_nothing() {
         .await,
         "an existing-Mind create without admin",
     );
-    assert_caller_absent(&session, "the no-admin refusal");
+    assert_caller_absent(&session, "the no-admin refusal", ExpectsReceipt::No);
     assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
     assert!(
         refusal.details.is_none(),
@@ -3761,7 +3794,7 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
         .await,
         "a create into a frozen Mind",
     );
-    assert_caller_absent(&session, "the frozen refusal");
+    assert_caller_absent(&session, "the frozen refusal", ExpectsReceipt::No);
     assert_eq!(
         refusal.code,
         SpokeRejectCode::SpaceFrozen,
@@ -3777,21 +3810,24 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
 }
 
 /// The absence walk is not vacuous, and its one permitted occurrence is narrow: a receipt's own
-/// `requester_principal_id`, at a receipt's own path, holding the expected scalar. Everything
-/// else — another key, another path, a nested value, a different principal, a principal used as
-/// an object key, a key that merely spells a receipt path — is a leak.
+/// `requester_principal_id`, at a receipt's own path, holding the expected scalar, on an answer
+/// that expects a receipt. Everything else — another key, another path, a nested value, a
+/// different principal, a principal used as an object key, a key that merely spells a receipt
+/// path, or any receipt on a refusal — is a leak.
 #[test]
 fn the_caller_absence_walk_catches_a_leak_under_any_key() {
     let frame =
         |body: &str| -> Value { serde_json::from_str(body).expect("the fixture frame is JSON") };
-    let leaks = |body: &str| -> Vec<String> { caller_leaks(&frame(body), &mut Vec::new()) };
+    let leaks = |body: &str, expects| -> Vec<String> {
+        caller_leaks(&frame(body), expects, &mut Vec::new())
+    };
     // The two receipt paths, and only those, carry the attribution.
     for clean in [
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
         r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
     ] {
         assert_eq!(
-            leaks(clean),
+            leaks(clean, ExpectsReceipt::Yes),
             Vec::<String>::new(),
             "the walk accepts the receipt's own attribution: {clean}"
         );
@@ -3814,6 +3850,26 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
         r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
         r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
     ] {
-        assert_eq!(leaks(leak).len(), 1, "the walk names the leak in: {leak}");
+        assert_eq!(
+            leaks(leak, ExpectsReceipt::Yes).len(),
+            1,
+            "the walk names the leak in: {leak}"
+        );
+    }
+
+    // A refusal stages no receipt, so the two bodies a successful create may answer — a committed
+    // receipt and a receipt under `payload.receipt` — are both leaks here, including the exact
+    // scalar the exception would otherwise permit at that path.
+    for refusal in [
+        r#"{"error":{"details":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
+        r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
+    ] {
+        assert_eq!(
+            leaks(refusal, ExpectsReceipt::No).len(),
+            2,
+            "a refusal carrying receipt attribution is two leaks — the receipt and the caller: \
+             {refusal}"
+        );
     }
 }
