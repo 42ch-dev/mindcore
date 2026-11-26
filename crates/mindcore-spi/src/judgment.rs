@@ -187,7 +187,7 @@ mod tests {
     ) -> DeliberateRequest<'a> {
         DeliberateRequest {
             space_id: "spc_1",
-            subject_id: "subj_1",
+            subject_id: Some("subj_1"),
             assessment_context_id: None,
             holder,
             target,

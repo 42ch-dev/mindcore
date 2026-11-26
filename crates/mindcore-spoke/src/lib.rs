@@ -27,18 +27,48 @@ pub use workflows::MemoryWorkflowBinding;
 
 pub(crate) use mindcore_base::ids::mint;
 
+use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use spoke_operations::{SpokeRejectCode, SpokeResult};
+use spoke_operations::{GrantRequirement, SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 use sqlx::{Sqlite, Transaction};
 
 use mindcore_base::ids::{SpaceId, SubjectId};
+use mindcore_spi::SpiError;
 use mindcore_base::ir::{MemoryRepository, ReceiptFailure, ReceiptState, ReviewReceiptIr};
 use mindcore_sqlite::SqliteMemoryRepository;
 
 use crate::admission::Op;
 use crate::reject::{AResult, Reject};
+
+/// The knowledge-read capability. A grant carrying it admits its principal to
+/// knowledge reads in that grant's space; the open capability vocabulary names
+/// no knowledge capability, and no memory capability (`recall`, `records_read`)
+/// stands in for it.
+pub(crate) const KNOWLEDGE_READ: &str = "knowledge_read";
+
+/// The carrier-write capability. Reading a collection is not authority to
+/// modify the judgment it carries, so the write transaction requires this on
+/// its own.
+pub(crate) const KNOWLEDGE_WRITE: &str = "knowledge_write";
+
+/// The memory capability the subject page was read under; the write rechecks
+/// it because a verdict over that page depends on it.
+pub(crate) const RECALL: &str = "recall";
+
+/// The derived judgment of one Mind's cognition carrier: the carrier revision
+/// the read served, its current-view records, and the `MindState` projection of
+/// them. Persisted nowhere; it is derived on every read.
+#[derive(Debug, Clone)]
+pub struct Cognition {
+    /// The carrier revision the read served.
+    pub carrier_revision: u64,
+    /// The carrier's current-view cognition records, in carrier order.
+    pub records: Vec<Value>,
+    /// The derived `MindState` wire value for this read.
+    pub mind_state: Value,
+}
 
 /// The caller-owned transaction every entry point reads and writes through.
 pub type Tx<'a> = Transaction<'a, Sqlite>;
@@ -217,6 +247,74 @@ impl MemoryAdapter {
         } else {
             Ok(())
         }
+    }
+
+    /// The space-level withhold of a subjectless deliberation: refuses while any
+    /// durable intent in the space is unsettled, whichever subject it belongs to.
+    pub(crate) async fn withhold_space_if_unsettled(
+        &self,
+        tx: &mut Tx<'_>,
+        space: &SpaceId,
+    ) -> AResult<()> {
+        let unsettled = self
+            .repository
+            .has_unsettled_intent_in_space(tx, space)
+            .await?;
+        if unsettled {
+            Err(Reject::unreconciled_space(space.as_str()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The caller's space-wide live `recall` grant, rechecked on `tx`: the
+    /// requirement shape `memory.spaces.freeze` uses, moved here from the
+    /// subject-level revalidation for a subjectless deliberation.
+    pub(crate) async fn revalidate_space(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+    ) -> Result<(), SpiError> {
+        self.require_space_grants(tx, principal, space_id, &[RECALL])
+            .await
+    }
+
+    /// `principal`'s own live grant for every one of `capabilities` in `space_id`, on `tx`.
+    ///
+    /// Live grants are re-derived on every call, so a read after provider work runs the same
+    /// admission and a revoked grant refuses it. A memory grant never substitutes for a
+    /// knowledge capability: only a capability the caller names admits its principal.
+    pub async fn require_space_grants(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+        capabilities: &[&str],
+    ) -> Result<(), SpiError> {
+        let caller = principal_id(principal);
+        let space = SpaceId::new(space_id.to_string());
+        let rows = admission::grants(&self.repository, tx, &space)
+            .await
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        let grants = admission::wire_grants(&rows)
+            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        for capability in capabilities {
+            let requirement = GrantRequirement {
+                capability,
+                subject_id: None,
+                context_ids: Vec::new(),
+                reads_shared: false,
+                subject_all: false,
+            };
+            if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
+                return Err(SpiError::Settlement(Reject::not_authorized(format!(
+                    "principal {caller} holds no live {capability} grant in space {}",
+                    space.as_str()
+                )).into_spoke()));
+            }
+        }
+        Ok(())
     }
 }
 
