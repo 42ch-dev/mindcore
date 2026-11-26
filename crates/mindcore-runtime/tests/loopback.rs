@@ -1721,6 +1721,60 @@ async fn deliberate_cannot_distinguish_an_absent_mind_from_an_ungranted_one() {
     );
 }
 
+/// Pre-authorization reads only the caller's own rows: another principal's malformed grant row
+/// in an existing Mind must not leak the space's existence through a storage error. The peer
+/// holds no grants anywhere; the malformed row belongs to a stranger in `SPACE_TWO`, and the
+/// answer for that space and for a space that is no Mind at all are byte-equal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_strangers_malformed_grant_row_cannot_leak_the_minds_existence() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_malformed_stranger', ?, NULL, 'prn_stranger', 'not-json', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(SPACE_TWO)
+    .bind(NOW)
+    .execute(&fixture.store.pool())
+    .await
+    .expect("seed the stranger's malformed grant");
+    let (_dir, serve) = fixture.serve();
+    // No reasoner: a path that reaches the engine would answer differently again.
+    let mut faces = faces(
+        hello("runtime", &[]),
+        None,
+        MindProviders::default(),
+    );
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
+
+    let session = connect_as(&surface, &PEER_TWO_SEED, &[DELIBERATE]).await;
+    let poisoned = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_in(SPACE_TWO))
+            .await,
+        "deliberate into a Mind carrying a stranger's malformed row",
+    );
+    let absent = expect_reject(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments_in("spc_no_such_mind"))
+            .await,
+        "deliberate into a space that is no Mind at all",
+    );
+    assert_eq!(
+        poisoned, absent,
+        "a stranger's malformed row and an absent Mind must be the byte-same refusal"
+    );
+    assert!(
+        poisoned.details.is_none(),
+        "the refusal carries no details either way: {poisoned:?}"
+    );
+}
+
 /// Liveness is the adapter's one grant rule: an expiry that does not parse fails closed, so the
 /// grant is dead and `deliberate` is the admission refusal, not a read of the carrier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

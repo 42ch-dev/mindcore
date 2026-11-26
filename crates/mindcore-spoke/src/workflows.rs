@@ -35,7 +35,7 @@ use mindcore_spi::{
 };
 use mindcore_sqlite::{
     append_cognition, list_entries_in, read_carrier_header, read_entry, vectors,
-    SqliteMemoryRepository,
+    SqliteMemoryRepository, SqliteRepositoryError,
 };
 
 use crate::admission;
@@ -72,9 +72,18 @@ pub async fn admitted_carrier_entry(
         .await
         .map_err(|e| Reject::internal(format!("the mind admission could not begin: {e}")).into_spoke())?;
     let space = SpaceId::new(space_id.to_string());
-    let rows = admission::grants(&repository, &mut tx, &space)
+    // Only the caller's own rows, and only the liveness fields. Another principal's malformed
+    // row must not reach this decision: an indistinguishable refusal is the answer whether the
+    // decode failure lives on the caller's own row or the space is not a Mind at all, and a
+    // row that cannot decode admits nothing.
+    let rows = repository
+        .list_grants(&mut tx, &space, Some(principal_id))
         .await
-        .map_err(Reject::into_spoke)?;
+        .map_err(|error| match error {
+            SqliteRepositoryError::InvalidRow(_) => Reject::admission_refusal().into_spoke(),
+            other => Reject::internal(format!("the mind admission could not be read: {other}"))
+                .into_spoke(),
+        })?;
     let now = Utc::now();
     let admitted = rows.iter().any(|row| {
         row.principal_id.as_str() == principal_id
