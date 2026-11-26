@@ -30,6 +30,6 @@ async-trait = "0.1"
 thiserror = "2"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-spoke-schemas = "0.18.1"
-spoke-operations = "0.18.1"
-spoke-connect = "0.18.1"
+spoke-schemas = "0.19.1"
+spoke-operations = "0.19.1"
+spoke-connect = "0.19.1"

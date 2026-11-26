@@ -1,9 +1,9 @@
 # ADR: The `create` default grant set
 
-Status: proposed — `create` grants the creating principal one grant row with `recall`, `capture`, `review`, `records_write`, `knowledge_read`, `knowledge_write` and space-wide `admin`; the owner settled the set on 2026-11-25, the library's `create` writes it, and the protocol entry point `memory.spaces.create` waits for SPOKE 0.19.0
+Status: implemented — `create` grants the creating principal one grant row with `recall`, `capture`, `review`, `records_write`, `knowledge_read`, `knowledge_write` and space-wide `admin`, and `memory.spaces.create` runs that same create for a SPOKE peer
 Date: 2026-11-25
 Class: architecture
-Related: `2026-11-25-mind-is-one-memory-space.md`, `.agents/specs/architecture/mind-model.md`
+Related: `2026-11-25-mind-is-one-memory-space.md`, `2026-11-25-one-surface-serves-many-minds.md`, `.agents/specs/architecture/mind-model.md`
 
 ## Problem
 
@@ -11,7 +11,7 @@ Before `create`, nothing created a Mind's first grant: a new Mind's minimum rows
 
 Without a fixed default set, each delivery form answers who may operate a new Mind in its own way, and the hand-written row stays the only way to start one. The set's shape is not free. `memory.grants.grant` requires a space-wide `admin` grant on the granter (`crates/mindcore-spoke/src/control.rs`, `grant`), so a creator without `admin` can never share the Mind through the one operation that shares. And `memory.candidates.review` admits only a single grant carrying both `review` and `records_write` (`crates/mindcore-spoke/src/content.rs`, `review`; `crates/mindcore-spoke/src/admission.rs`, `one_grant_covers`), so a set of one row per capability leaves the creator unable to review a candidate.
 
-## Proposal
+## Decision
 
 `create` grants the creating principal one grant row on the new Mind's space, with seven capabilities: `recall`, `capture`, `review`, `records_write`, `knowledge_read`, `knowledge_write` and `admin`. The SPOKE grant model stays; the set is what a new Mind starts with.
 
@@ -20,9 +20,9 @@ Without a fixed default set, each delivery form answers who may operate a new Mi
 - **Why space-wide and unrestricted.** `memory.subjects.ensure` needs a grant that already covers a subject that does not exist yet (`crates/mindcore-spoke/src/control.rs`, `ensure_subject`). The `deliberate` write re-checks a `subject_all` read, which only an unrestricted grant passes (`crates/mindcore-spoke/src/workflows.rs`, `revalidate_subject`).
 - **Why `admin`.** The owner's reason: without it the creator cannot share a Mind through `memory.grants.grant`. Sharing goes only through that operation, it needs a space-wide `admin` grant on the granter, and an issuance cannot exceed what the granter holds (`crates/mindcore-spoke/src/admission.rs`, `authorize_issuance`).
 - **How `create` writes the row.** Inside `create`'s transaction, the one that records the Mind and leaves no row on a failure (`2026-11-25-mind-is-one-memory-space.md`). It cannot go through `memory.grants.grant`, which requires the granter to hold `admin` already.
-- **Two entry points, one create.** A library caller creates a Mind through `create` in `crates/mindcore-runtime`, which needs no SPOKE change and is built; a SPOKE peer creates one through `memory.spaces.create`, which SPOKE does not have yet, which is A3 of Stage 2 in `2026-11-25-one-surface-serves-many-minds.md`, and which SPOKE 0.19.0 will carry (owner, 2026-11-25). On a Mindcore host both run the same create and write this set: the protocol operation calls `mindcore_sqlite::minds::create`, the operation the library entry point calls. The caller may name the `space_id`; when it does not, the library assigns one (owner, 2026-11-25). The owner's framing: one action, two interfaces, for two different products.
+- **Two entry points, one create.** A library caller creates a Mind through `create` in `crates/mindcore-runtime`; a SPOKE peer creates one through `memory.spaces.create`, which `crates/mindcore-spoke/src/control.rs`'s `MemoryAdapter::create_space` serves on the pinned `0.19` cohort. On a Mindcore host both run the same create and write this set: the protocol operation calls `mindcore_sqlite::minds::create`, the operation the library entry point calls, inside the operation's own transaction. The caller may name the `space_id`; when it does not, the library assigns one (owner, 2026-11-25). The owner's framing: one action, two interfaces, for two different products.
 
-**Pages this changes.** No existing record states a default grant set. `.agents/specs/architecture/mind-model.md` states the rule that memory reads authorize per operation under the caller's live grants, and it states the `create` operation with this set; the facade contract spec carries the facade's shape and is written with the facade.
+**Pages this changes.** `.agents/specs/architecture/mind-model.md` states the rule that memory reads authorize per operation under the caller's live grants, and it states the `create` operation with this set; the facade contract spec carries the facade's shape and is written with the facade. `.agents/specs/architecture/serving-seam.md` states the served protocol entry point and its refusal order.
 
 ## Alternatives considered
 
@@ -30,17 +30,12 @@ Without a fixed default set, each delivery form answers who may operate a new Mi
 - **A default set without `admin`.** Rejected: without `admin` a new Mind has no admin inside the SPOKE grant model, and a creator could not share it, because `memory.grants.grant` refuses a granter that holds no space-wide `admin`. The set would also leave record promotion, which needs `promote` (`crates/mindcore-spoke/src/content.rs`, `promote_record`), out of the creator's reach.
 - **A default set of one row per capability.** Rejected: `memory.candidates.review` admits only a single grant carrying both `review` and `records_write` (`crates/mindcore-spoke/src/admission.rs`, `one_grant_covers`), so one row per capability leaves the creator unable to review a candidate.
 
-## Acceptance criteria
+## Consequences
 
-- After `create`, the creating principal holds exactly one grant row on the new Mind's space, and its capabilities are `recall`, `capture`, `review`, `records_write`, `knowledge_read`, `knowledge_write` and `admin`.
-- The row has no `subject_id`, no `context_ids` and no expiry, and has the shape `memory.grants.grant` writes.
-- With that row alone, the creator runs `recall_context`, `absorb` and `deliberate` on the new Mind, and `memory.grants.grant` accepts a grant it issues to another principal.
-- A `create` that fails leaves no grant row behind.
-- A Mind created through `memory.spaces.create` on a Mindcore host carries the same single grant row as one created through the library.
-
-## Risks
-
+- After `create`, the creating principal holds exactly one grant row on the new Mind's space, and its capabilities are `recall`, `capture`, `review`, `records_write`, `knowledge_read`, `knowledge_write` and `admin`. The row has no `subject_id`, no `context_ids` and no expiry. With that row alone, the creator runs `recall_context`, `absorb` and `deliberate` on the new Mind, and `memory.grants.grant` accepts a grant it issues to another principal. A `create` that fails leaves no grant row behind.
+- A Mind created through `memory.spaces.create` on a Mindcore host carries the same single grant row as one created through the library: the operation delegates to the library's create, so the set has one writer and no second write path exists. `crates/mindcore-spoke/tests/memory_adapter.rs` asserts the row count and its content, and the signed loopback in `crates/mindcore-runtime/tests/loopback.rs` asserts them over the wire.
 - **`admin` is wider than the six it sits beside.** The adapter delegates coverage to SPOKE's `grant_covers` (`crates/mindcore-spoke/src/admission.rs`), in which `admin` implies every capability within the grant's coverage. The creator therefore also holds what the six do not name, such as record promotion (`promote`), profile update (`profile_write`, `crates/mindcore-spoke/src/content.rs`) and reflections (`reflect`, `crates/mindcore-spoke/src/reflection.rs`), and the operations that require space-wide `admin` themselves: `memory.grants.revoke`, `memory.spaces.freeze` and `memory.spaces.unfreeze` (`crates/mindcore-spoke/src/control.rs`). A reader who counts seven names understates what the row grants.
 - **The row never expires.** Whoever holds the creating principal keeps `admin` of the Mind for as long as the row stands, and sharing the Mind does not dilute it.
-- **The peer's entry point does not exist yet.** `memory.spaces.create` is not in SPOKE 0.18.1, and the adapter's space operations are `list_spaces`, `freeze_space` and `unfreeze_space` (`crates/mindcore-spoke/src/control.rs`). SPOKE 0.19.0 will carry the operation (owner, 2026-11-25); until this repository pins that cohort, a peer cannot create a Mind and only the library's `create` does.
+- **The peer's entry point exists only on a Mindcore host.** `memory.spaces.create` reaches a Mindcore host's adapter through that host's memory service; SPOKE publishes the operation and routes it, but a host that binds only `TransferService` serves the transfer family and not this operation. A peer therefore creates a Mind only where the host attaches a memory service that dispatches `memory.spaces.create` to `MemoryAdapter::create_space`.
+- A repeat create by an admin under a fresh key changes no space, grant or revision and answers `created: false` with the space's current status and revision; a replay under the same key writes nothing and answers the recorded receipt; an existing space without a space-wide live `admin` answers the fixed `NOT_AUTHORIZED` and never the library's `MIND_ALREADY_EXISTS`; a frozen space answers `SPACE_FROZEN`. Each case is asserted in `crates/mindcore-spoke/tests/memory_adapter.rs`, and the first three also over the signed session in `crates/mindcore-runtime/tests/loopback.rs`.
 - **No release before SPOKE 0.19.0.** The library's `create` merges to `main` with this set, and no release is cut before SPOKE 0.19.0; the first Mind-centric release follows it and ships the served surface's two stages as one minor (owner, 2026-11-25, `2026-11-25-one-surface-serves-many-minds.md`).

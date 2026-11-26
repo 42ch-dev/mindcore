@@ -11,15 +11,18 @@ use spoke_operations::{
 use spoke_schemas::{
     MemoryDescribeRequest, MemoryDescribeResponse, MemoryGrantsGrantRequest,
     MemoryGrantsGrantResponse, MemoryGrantsListRequest, MemoryGrantsListResponse,
-    MemoryGrantsRevokeRequest, MemoryGrantsRevokeResponse, MemorySpacesFreezeRequest,
-    MemorySpacesFreezeResponse, MemorySpacesListRequest, MemorySpacesListResponse,
-    MemorySpacesUnfreezeRequest, MemorySpacesUnfreezeResponse, MemorySubjectsEnsureRequest,
-    MemorySubjectsEnsureResponse, MemorySubjectsFenceRequest, MemorySubjectsFenceResponse,
-    MemorySubjectsGetRequest, MemorySubjectsGetResponse, Principal,
+    MemoryGrantsRevokeRequest, MemoryGrantsRevokeResponse, MemorySpacesCreateRequest,
+    MemorySpacesCreateResponse, MemorySpacesFreezeRequest, MemorySpacesFreezeResponse,
+    MemorySpacesListRequest, MemorySpacesListResponse, MemorySpacesUnfreezeRequest,
+    MemorySpacesUnfreezeResponse, MemorySubjectsEnsureRequest, MemorySubjectsEnsureResponse,
+    MemorySubjectsFenceRequest, MemorySubjectsFenceResponse, MemorySubjectsGetRequest,
+    MemorySubjectsGetResponse, Principal,
 };
 
-use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
+use mindcore_base::boundary::CallerId;
+use mindcore_base::ids::{ContextId, MindId, SpaceId, SubjectId};
 use mindcore_base::ir::{MemoryGrantRow, MemoryRepository, MemorySubjectRow};
+use mindcore_sqlite::minds::{self, CreateMind};
 
 use crate::admission::{self, Admission, Coverage};
 use crate::policy;
@@ -200,6 +203,110 @@ impl MemoryAdapter {
             )
             .await?;
         Self::recheck::<MemorySpacesUnfreezeResponse>(stage)
+    }
+
+    pub async fn create_space(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        request: Value,
+    ) -> crate::SpokeResult<MemoryStage> {
+        settle(self.create_space_body(tx, principal, request).await)
+    }
+
+    /// `memory.spaces.create` in the port's order (`ports.rs:333-339`), which differs from
+    /// [`Self::space_status`]: the dedup probe answers before any grant or freeze check, so a
+    /// replay still answers its retained receipt after a later freeze. A new id needs no grant —
+    /// an authenticated principal creates — while an existing id requires the caller's space-wide
+    /// live `admin`. That refusal never names the id the library's `MIND_ALREADY_EXISTS` names.
+    ///
+    /// The create itself is the library's [`minds::create`] on this same transaction, so the space
+    /// row, the carrier, the registry row and the creator's one default grant row are the
+    /// library's writes, not a second create path. `display_name` is the only request member that
+    /// reaches the space row; `extensions` is transport metadata and is not stored.
+    async fn create_space_body(
+        &self,
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        raw: Value,
+    ) -> AResult<MemoryStage> {
+        let request: MemorySpacesCreateRequest =
+            wire::decode(&raw, "memory.spaces.create request")?;
+        let principal_id = principal_id(principal);
+        let space_id = request.space_id.as_str();
+        let op = Self::op(
+            space_id,
+            principal_id,
+            "memory.spaces.create",
+            Some(request.idempotency_key.as_str()),
+            &raw,
+        )?;
+        if let Some(receipt) = admission::probe(&self.repository, tx, &op).await? {
+            return Self::replay::<MemorySpacesCreateResponse>(&receipt);
+        }
+        let existing = self.repository.space(tx, &op.space).await?;
+        let (created, row) = match existing {
+            Some(current) => {
+                let admission = Admission {
+                    operation: op.operation,
+                    space: &op.space,
+                    principal: principal_id,
+                    coverage: Coverage::Requirements(vec![space_wide("admin")]),
+                    issuance: None,
+                    subject_gate: None,
+                    placement_gate: None,
+                    freeze_gated: true,
+                };
+                // Create answers every existing-space caller without space-wide `admin`
+                // exactly as it answers an unadmitted Mind: the shared coverage refusal
+                // names the principal, the space and the missing capability, and this
+                // operation must disclose none of them.
+                admission::authorize(&self.repository, tx, &admission, op.now)
+                    .await
+                    .map_err(|reject| match reject.code {
+                        SpokeRejectCode::NotAuthorized => Reject::admission_refusal(),
+                        _ => reject,
+                    })?;
+                admission::gate(&self.repository, tx, &admission).await?;
+                (false, current)
+            }
+            None => {
+                let created = minds::create(
+                    tx,
+                    &CreateMind {
+                        mind_id: Some(MindId::new(space_id)),
+                        display_name: request.display_name.clone(),
+                        owner: CallerId::new(principal_id),
+                    },
+                )
+                .await;
+                if let spoke_operations::SpokeResult::Reject(reject) = created {
+                    // The space row was absent, so no refusal here is the taken-id one: a
+                    // refused create is invalid input (the id or the collection) or a storage
+                    // failure, and the caller's rollback leaves no row.
+                    return Err(match reject.code {
+                        SpokeRejectCode::InvalidInput => Reject::terminal(
+                            reject.code,
+                            "the mind id or collection is not storable",
+                        ),
+                        _ => Reject::internal("the mind could not be created"),
+                    });
+                }
+                (
+                    true,
+                    admission::space(&self.repository, tx, &op.space).await?,
+                )
+            }
+        };
+        let result = json!({
+            "space_id": space_id,
+            "status": row.status,
+            "created": created,
+            "revision": row.revision,
+        });
+        let receipt = admission::committed_receipt(&op, &mint("rct"), result);
+        self.repository.insert_receipt(tx, &receipt, None).await?;
+        Self::ready::<MemorySpacesCreateResponse>(project::receipt_body(&receipt))
     }
 
     #[allow(clippy::too_many_arguments)]

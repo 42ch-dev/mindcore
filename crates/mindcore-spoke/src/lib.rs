@@ -17,11 +17,13 @@ mod project;
 mod reflection;
 mod reject;
 mod serve;
+mod served_knowledge;
 mod transfer;
 mod wire;
 mod workflows;
 
 pub use serve::{ServedMemory, TransferService};
+pub use served_knowledge::{authorize_knowledge, MindKnowledgePort};
 pub use transfer::OPERATIONS as TRANSFER_OPERATIONS;
 pub use workflows::{admitted_carrier_entry, MemoryWorkflowBinding};
 

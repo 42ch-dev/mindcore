@@ -102,6 +102,62 @@ impl Harness {
             .expect("count")
     }
 
+    /// The persisted Mind, row by row: the space row, the registry row, the carrier entry the
+    /// registry names, and the creator's default grant. Each row is projected whole, so a write to
+    /// any column shows up — an in-place grant edit included — and `None` means the row is gone.
+    async fn mind_rows(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        space: &str,
+    ) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
+        let space_row = sqlx::query_scalar(
+            "SELECT json_object('space_id', space_id, 'display_name', display_name, \
+             'authority_host_id', authority_host_id, 'authority_generation', \
+             authority_generation, 'status', status, 'revision', revision, \
+             'created_at', created_at) FROM memory_spaces WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_optional(&mut **tx)
+        .await
+        .expect("the space row");
+        let registry = sqlx::query_scalar(
+            "SELECT json_object('space_id', space_id, 'knowledge_collection', \
+             knowledge_collection, 'carrier_entry_id', carrier_entry_id) \
+             FROM minds WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_optional(&mut **tx)
+        .await
+        .expect("the registry row");
+        let carrier = sqlx::query_scalar(
+            "SELECT json_object('entry_id', entry_id, 'revision', revision, 'payload', payload, \
+             'history_floor_revision', history_floor_revision, \
+             'cognition_head_seq', cognition_head_seq, 'superseded_by', superseded_by, \
+             'created_at', created_at, 'updated_at', updated_at) \
+             FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(format!("mind:{space}"))
+        .bind(mindcore_sqlite::minds::CARRIER_ENTRY_ID)
+        .fetch_optional(&mut **tx)
+        .await
+        .expect("the carrier entry");
+        // Every grant row in the Mind, ordered by id, so a grant edited in place — a widened
+        // `capabilities_json`, a moved expiry, a revoked row — differs from the snapshot.
+        let grants: Vec<String> = sqlx::query_scalar(
+            "SELECT json_object('grant_id', grant_id, 'principal_id', principal_id, \
+             'subject_id', subject_id, 'capabilities_json', capabilities_json, \
+             'context_ids_json', context_ids_json, 'shared_access', shared_access, \
+             'expires_at', expires_at, 'revoked_at', revoked_at, 'revision', revision, \
+             'created_at', created_at) \
+             FROM memory_grants WHERE space_id = ? ORDER BY grant_id",
+        )
+        .bind(space)
+        .fetch_all(&mut **tx)
+        .await
+        .expect("the grant rows");
+        (space_row, registry, carrier, grants)
+    }
+
     /// Count after the caller's transaction ended, when the only connection is
     /// free again.
     async fn count_pool(&self, table: &str) -> i64 {
@@ -4982,6 +5038,405 @@ async fn a_good_grant_after_an_undecodable_row_still_admits() {
     assert!(
         pack["records"].is_array(),
         "the good row after the bad one still admits the caller: {pack}"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// A create against an existing space needs space-wide `admin`, and its refusal is the fixed
+/// admission answer: an admitted caller whose live grant does not cover `admin` learns nothing
+/// about the principal, the space or the capability it lacks — the same envelope an unadmitted
+/// call receives. Coverage refusals of every other operation keep naming their cause.
+#[tokio::test]
+async fn create_of_an_existing_space_without_admin_answers_the_admission_refusal() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let refused = adapter
+        .create_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "idempotency_key": "create-no-admin" }),
+        )
+        .await;
+    let create_reject = reject(&refused);
+    assert_admission_refusal(
+        create_reject,
+        "an existing-space create without space-wide admin",
+    );
+    for needle in [PRINCIPAL, SPACE, "admin"] {
+        assert!(
+            !create_reject.message.contains(needle),
+            "the create refusal names neither the caller, the space nor the capability \
+             ({needle}): {create_reject:?}"
+        );
+    }
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        0,
+        "a refused create stages no receipt"
+    );
+
+    // Contrast: the same caller's freeze reaches the shared coverage refusal, which still
+    // names the principal and the space it lacks `admin` in.
+    let frozen = adapter
+        .freeze_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": SPACE,
+                "expected_revision": 1,
+                "idempotency_key": "freeze-no-admin"
+            }),
+        )
+        .await;
+    let freeze_reject = reject(&frozen);
+    assert_eq!(freeze_reject.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(retry_class(freeze_reject), "terminal");
+    assert!(
+        freeze_reject.message.contains(PRINCIPAL) && freeze_reject.message.contains(SPACE),
+        "the shared coverage refusal is unchanged: {freeze_reject:?}"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// A create of a new id needs no grant — an authenticated principal creates — and it writes the
+/// creator's one default grant row inside the same transaction as the space, the carrier and the
+/// registry row. The row is space-wide, with no subject, no context restriction and no expiry.
+#[tokio::test]
+async fn create_of_a_new_id_writes_the_creators_one_default_grant() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let body = ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_fresh", "idempotency_key": "create-fresh" }),
+            )
+            .await,
+    );
+    assert_eq!(body["result"]["space_id"], json!("sp_fresh"));
+    assert_eq!(body["result"]["created"], json!(true));
+    assert_eq!(body["result"]["status"], json!("active"));
+    assert_eq!(body["result"]["revision"], json!(1));
+
+    assert_eq!(
+        harness
+            .count(&mut tx, "memory_grants WHERE space_id = 'sp_fresh'")
+            .await,
+        1,
+        "a create writes exactly one grant row"
+    );
+    let (capabilities, grantee, subject, contexts, expires): (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT capabilities_json, principal_id, subject_id, context_ids_json, expires_at \
+             FROM memory_grants WHERE space_id = 'sp_fresh'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the creator's grant row");
+    let capabilities: Value = serde_json::from_str(&capabilities).expect("capabilities json");
+    assert_eq!(
+        capabilities,
+        json!([
+            "recall",
+            "capture",
+            "review",
+            "records_write",
+            "knowledge_read",
+            "knowledge_write",
+            "admin"
+        ]),
+        "the default grant set, in the owner's order"
+    );
+    assert_eq!(
+        grantee, PRINCIPAL,
+        "the default grant is issued to the creating principal"
+    );
+    assert_eq!(subject, None, "the default grant is space-wide");
+    assert_eq!(contexts, "[]", "the default grant restricts no context");
+    assert_eq!(expires, None, "the default grant never expires");
+
+    assert_eq!(
+        harness
+            .count(&mut tx, "minds WHERE space_id = 'sp_fresh'")
+            .await,
+        1
+    );
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// The dedup probe answers before the grant and freeze checks (`ports.rs:333-339`): after the
+/// space was frozen and every grant revoked, the same key still replays its recorded receipt and
+/// writes nothing — a replay is not a fresh effect and must not be refused by a later state.
+#[tokio::test]
+async fn a_retained_create_receipt_answers_before_the_grant_and_freeze_checks() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let request = json!({ "space_id": "sp_replay", "idempotency_key": "create-replay" });
+
+    let mut tx = harness.begin().await;
+    let first = ready(
+        adapter
+            .create_space(&mut tx, &principal(PRINCIPAL), request.clone())
+            .await,
+    );
+    tx.commit().await.expect("commit");
+
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = 'sp_replay'")
+        .execute(&harness.pool)
+        .await
+        .expect("freeze the mind");
+    sqlx::query("DELETE FROM memory_grants WHERE space_id = 'sp_replay'")
+        .execute(&harness.pool)
+        .await
+        .expect("revoke the creator's grant");
+
+    let mut tx = harness.begin().await;
+    let replay = ready(
+        adapter
+            .create_space(&mut tx, &principal(PRINCIPAL), request)
+            .await,
+    );
+    assert_eq!(replay["receipt_id"], first["receipt_id"]);
+    assert_eq!(replay["result"], first["result"]);
+    assert_eq!(
+        replay["result"]["created"],
+        json!(true),
+        "the replay answers the recorded create, not the space's later state"
+    );
+    assert_eq!(
+        harness
+            .count(&mut tx, "memory_grants WHERE space_id = 'sp_replay'")
+            .await,
+        0,
+        "a replay writes no grant"
+    );
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// §7.0.5 on the create path: the same key with a different payload is `IDEMPOTENCY_CONFLICT` and
+/// leaves the receipt count unchanged. The second request differs only in `display_name`, the one
+/// member that reaches the space row, so this fails if the create's digest stops binding it.
+#[tokio::test]
+async fn a_create_key_reused_with_a_different_display_name_rejects_as_idempotency_conflict() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": "sp_conflict",
+                    "display_name": "the name the key was first used for",
+                    "idempotency_key": "create-conflict"
+                }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit");
+
+    let mut tx = harness.begin().await;
+    let before = harness.count(&mut tx, "memory_receipts").await;
+    let refused = adapter
+        .create_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({
+                "space_id": "sp_conflict",
+                "display_name": "a different name under the same key",
+                "idempotency_key": "create-conflict"
+            }),
+        )
+        .await;
+    let reject = reject(&refused);
+    assert_eq!(reject.code, SpokeRejectCode::IdempotencyConflict);
+    assert_eq!(retry_class(reject), "terminal");
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        before,
+        "a conflicting key writes no second receipt"
+    );
+    assert_eq!(
+        harness
+            .count(&mut tx, "memory_spaces WHERE space_id = 'sp_conflict'")
+            .await,
+        1,
+        "a conflicting key writes no second space"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// A frozen space under a caller holding space-wide `admin` answers `SPACE_FROZEN`, and stages no
+/// receipt: the freeze gate is a lifecycle gate on the fresh effect, not a dedup answer.
+#[tokio::test]
+async fn create_of_a_frozen_space_under_admin_answers_space_frozen() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["admin"]).await;
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE)
+        .execute(&harness.pool)
+        .await
+        .expect("freeze the space");
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let refused = adapter
+        .create_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "idempotency_key": "create-frozen" }),
+        )
+        .await;
+    let create_reject = reject(&refused);
+    assert_eq!(create_reject.code, SpokeRejectCode::SpaceFrozen);
+    assert_eq!(retry_class(create_reject), "terminal");
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        0,
+        "a frozen space stages no receipt"
+    );
+    assert_eq!(
+        harness.count(&mut tx, "memory_grants").await,
+        1,
+        "the seeded admin row is the only grant: create added none"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// A repeat create by an admin under a fresh key changes no space, grant or revision, and leaves
+/// the registry row, the carrier entry and the creator's grant exactly as the create wrote them;
+/// its own receipt is the only row it adds.
+///
+/// The Mind is created here rather than seeded, because a seeded space has no registry row for a
+/// repeat to leave alone: the snapshot below only proves something when all four rows exist.
+#[tokio::test]
+async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["admin"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    let first = ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": "sp_repeat",
+                    "display_name": "space",
+                    "idempotency_key": "create-repeat-1"
+                }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit");
+    assert_eq!(first["result"]["created"], json!(true));
+    assert_eq!(first["result"]["revision"], json!(1));
+    assert_eq!(first["result"]["status"], json!("active"));
+    assert_eq!(
+        harness.count_pool("memory_receipts").await,
+        1,
+        "the first key recorded one receipt"
+    );
+
+    let mut tx = harness.begin().await;
+    let before = harness.mind_rows(&mut tx, "sp_repeat").await;
+    assert!(
+        before.0.is_some() && before.1.is_some() && before.2.is_some(),
+        "the create wrote the space, the registry row and the carrier: {before:?}"
+    );
+    // The creator's own row, pinned whole: a repeat that widened its capabilities or moved its
+    // expiry has to show up below. The seeded admin row lives in another space and is not part of
+    // this Mind's snapshot.
+    let grant_rows: Vec<Value> = before
+        .3
+        .iter()
+        .map(|row| serde_json::from_str(row).expect("grant row json"))
+        .collect();
+    assert_eq!(
+        grant_rows.len(),
+        1,
+        "the create writes one grant in the new Mind: {grant_rows:?}"
+    );
+    let creator = &grant_rows[0];
+    assert_eq!(
+        creator["principal_id"],
+        json!(PRINCIPAL),
+        "the default grant is issued to the creating principal"
+    );
+    assert_eq!(
+        creator["capabilities_json"],
+        json!(
+            r#"["recall","capture","review","records_write","knowledge_read","knowledge_write","admin"]"#
+        ),
+        "the snapshot holds the creator's full default capability set"
+    );
+    assert_eq!(creator["subject_id"], Value::Null, "space-wide");
+    assert_eq!(
+        creator["context_ids_json"],
+        json!("[]"),
+        "no context restriction"
+    );
+    assert_eq!(creator["expires_at"], Value::Null, "never expiring");
+    tx.rollback().await.expect("rollback");
+
+    let mut tx = harness.begin().await;
+    let repeat = ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": "sp_repeat",
+                    "display_name": "a name a repeat must not write",
+                    "idempotency_key": "create-repeat-2"
+                }),
+            )
+            .await,
+    );
+    assert_ne!(
+        repeat["receipt_id"], first["receipt_id"],
+        "a fresh key records its own receipt"
+    );
+    assert_eq!(repeat["result"]["created"], json!(false));
+    assert_eq!(
+        repeat["result"]["revision"],
+        json!(1),
+        "the revision did not move"
+    );
+    assert_eq!(repeat["result"]["status"], json!("active"));
+
+    // The registry row, the carrier entry, the space row and both grant rows byte-identical: the
+    // receipt is the only difference the repeat is allowed to leave.
+    assert_eq!(
+        harness.mind_rows(&mut tx, "sp_repeat").await,
+        before,
+        "a repeat writes nothing but its receipt"
+    );
+    assert_eq!(
+        harness.count(&mut tx, "memory_grants").await,
+        2,
+        "the seeded admin row and the creator's: a repeat adds no third"
+    );
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        2,
+        "one receipt per key, nothing more"
     );
     tx.rollback().await.expect("rollback");
 }
