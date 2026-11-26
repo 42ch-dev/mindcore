@@ -17,7 +17,7 @@ use spoke_operations::{
 };
 use spoke_schemas::data::revision_snapshot::{RevisionSnapshotSnapshot, Shared2};
 use spoke_schemas::knowledge_entry::{KnowledgeEntryModulesKey, KnowledgeEntryModulesValue};
-use spoke_schemas::{KnowledgeEntry, Principal, RevisionSnapshot, Scope};
+use spoke_schemas::{ExtensionKey, KnowledgeEntry, Principal, RevisionSnapshot, Scope};
 
 use crate::cognition::{
     gap_is_dedicated_appends, insert_record, read_append_prior_shape, read_records,
@@ -32,18 +32,67 @@ use crate::store::{MindStore, SnapshotSeam};
 /// live size. An over-bound collection refuses the list; it never truncates.
 pub const SERVED_KNOWLEDGE_LIST_LIMIT: usize = 512;
 
+/// The extensions namespace the host's admission callback binds the authenticated caller into.
+///
+/// The generated `ExtensionKey` pattern `^[a-z][a-z0-9_-]*$` admits this name, and its value is a
+/// JSON object holding [`CALLER_MEMBER`]. No other namespace is served.
+pub const CALLER_NAMESPACE: &str = "mindcore_caller";
+
+/// The member of [`CALLER_NAMESPACE`] that carries the caller's principal id.
+pub const CALLER_MEMBER: &str = "principal";
+
+fn caller_key() -> ExtensionKey {
+    ExtensionKey::try_from(CALLER_NAMESPACE)
+        .expect("the caller namespace matches the extension-key pattern")
+}
+
+/// Write the authenticated caller into the scope's [`CALLER_NAMESPACE`].
+///
+/// This is the admission side of the served knowledge face: the callback that resolved the peer
+/// to a `Principal` and the selector to a Mind calls this on the `Scope` it returns, so the served
+/// port can read the caller back per operation. The value is plain data and changes no visibility
+/// decision: SPOKE's knowledge predicate ignores extensions.
+pub fn bind_caller(scope: &mut Scope, principal_id: &str) {
+    let mut namespace = Map::new();
+    namespace.insert(
+        CALLER_MEMBER.to_string(),
+        Value::String(principal_id.to_string()),
+    );
+    let mut extensions = scope
+        .extensions
+        .take()
+        .unwrap_or_else(|| HashMap::new().into());
+    extensions.0.insert(caller_key(), namespace);
+    scope.extensions = Some(extensions);
+}
+
+/// The caller the admission bound into `scope`, or `None` for a scope it never bound.
+///
+/// A present but empty id is no binding: an unbound scope and a blank one refuse alike.
+pub fn bound_caller(scope: &Scope) -> Option<&str> {
+    let namespace = scope.extensions.as_ref()?.0.get(&caller_key())?;
+    match namespace.get(CALLER_MEMBER)?.as_str()? {
+        "" => None,
+        principal => Some(principal),
+    }
+}
+
 /// Refuse a scope carrying a selection the knowledge face does not serve.
 ///
 /// The host admission callback applies this to the scope it returns, before Connect merges it with
 /// a list request: that merge keeps only the request's cognition selection, so a cognition
 /// selection admitted but never validated would be dropped from the list scope while `get`/`put`
 /// still see it. The routed store applies the same rule to every caller-declared scope.
+///
+/// Absent `extensions` is admitted; a present one must be exactly the caller binding and nothing
+/// else. Every other namespace, every extra member of [`CALLER_NAMESPACE`], a `principal` that is
+/// not a non-empty string, and the cognition, timeline and fork selections are refused.
 pub fn validate_admission_scope(scope: &Scope) -> SpokeResult<()> {
     if scope.cognition.is_some()
         || scope.timeline_event_ids.is_some()
         || scope.timeline_scale.is_some()
         || scope.fork_id.is_some()
-        || scope.extensions.is_some()
+        || !is_exact_caller_binding(scope)
     {
         return spoke_reject(
             SpokeRejectCode::InvalidInput,
@@ -52,6 +101,30 @@ pub fn validate_admission_scope(scope: &Scope) -> SpokeResult<()> {
         );
     }
     SpokeResult::Ok(())
+}
+
+/// Whether `scope` carries no extension selection beyond the binding [`bind_caller`] writes: one
+/// namespace, one member, one non-empty plain string. Read as a shape rather than through
+/// [`bound_caller`] so an extra namespace or member cannot ride along with a readable binding.
+fn is_exact_caller_binding(scope: &Scope) -> bool {
+    let Some(extensions) = scope.extensions.as_ref() else {
+        return true;
+    };
+    let mut namespaces = extensions.keys();
+    if namespaces.next() != Some(&caller_key()) || namespaces.next().is_some() {
+        return false;
+    }
+    let Some(namespace) = extensions.0.get(&caller_key()) else {
+        return false;
+    };
+    let mut members = namespace.keys();
+    if members.next().map(String::as_str) != Some(CALLER_MEMBER) || members.next().is_some() {
+        return false;
+    }
+    namespace
+        .get(CALLER_MEMBER)
+        .and_then(Value::as_str)
+        .is_some_and(|principal| !principal.is_empty())
 }
 
 /// One stored entry together with the liveness marker its row carries: `superseded_by` names the
@@ -2036,6 +2109,126 @@ mod tests {
 
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    fn scope_of(scope_id: &str) -> Scope {
+        serde_json::from_value(json!({ "scope_id": scope_id })).expect("scope JSON matches schema")
+    }
+
+    fn scope_with_extensions(extensions: Value) -> Scope {
+        serde_json::from_value(json!({ "scope_id": "spc_wren", "extensions": extensions }))
+            .expect("scope JSON matches schema")
+    }
+
+    fn assert_refused(scope: &Scope, label: &str) {
+        match validate_admission_scope(scope) {
+            SpokeResult::Reject(reject) => {
+                assert_eq!(reject.code, SpokeRejectCode::InvalidInput, "{label}");
+                assert!(reject.details.is_none(), "{label}");
+            }
+            SpokeResult::Ok(()) => panic!("{label} is refused"),
+        }
+    }
+
+    /// The binding owns its shape: one namespace, one member, plain data, and a read that answers
+    /// exactly what was written.
+    #[test]
+    fn the_caller_binding_round_trips_and_validate_admission_scope_admits_it() {
+        let mut scope = scope_of("spc_wren");
+        assert_eq!(bound_caller(&scope), None, "an unbound scope has no caller");
+        assert!(
+            matches!(validate_admission_scope(&scope), SpokeResult::Ok(())),
+            "an absent extensions map is admitted"
+        );
+
+        bind_caller(&mut scope, "p_wren");
+        assert_eq!(bound_caller(&scope), Some("p_wren"));
+        let extensions = scope
+            .extensions
+            .as_ref()
+            .expect("the binding is an extension");
+        assert_eq!(
+            extensions
+                .keys()
+                .map(|key| key.as_str())
+                .collect::<Vec<_>>(),
+            vec![CALLER_NAMESPACE],
+            "the binding writes exactly one namespace"
+        );
+        assert!(
+            matches!(validate_admission_scope(&scope), SpokeResult::Ok(())),
+            "the caller namespace is the one extension namespace the face admits"
+        );
+
+        let mut blank = scope_of("spc_wren");
+        bind_caller(&mut blank, "");
+        assert_eq!(bound_caller(&blank), None, "an empty id is no binding");
+    }
+
+    /// The accepted extension surface is the binding's exact shape: an empty map, a second
+    /// namespace, a second member and a principal that is not a non-empty string are all refused.
+    #[test]
+    fn validate_admission_scope_admits_only_the_exact_caller_binding() {
+        for (label, extensions) in [
+            ("a present but empty extensions map", json!({})),
+            ("a foreign namespace", json!({ "toy_world": {} })),
+            (
+                "a foreign namespace beside the binding",
+                json!({ "mindcore_caller": { "principal": "p_wren" }, "toy_world": {} }),
+            ),
+            (
+                "the caller namespace without its member",
+                json!({ "mindcore_caller": {} }),
+            ),
+            (
+                "an extra member inside the caller namespace",
+                json!({
+                    "mindcore_caller": { "principal": "p_wren", "unsupported_selection": true }
+                }),
+            ),
+            (
+                "a non-string principal",
+                json!({ "mindcore_caller": { "principal": 7 } }),
+            ),
+            (
+                "an empty principal",
+                json!({ "mindcore_caller": { "principal": "" } }),
+            ),
+        ] {
+            assert_refused(&scope_with_extensions(extensions), label);
+        }
+
+        assert!(
+            matches!(
+                validate_admission_scope(&scope_with_extensions(
+                    json!({ "mindcore_caller": { "principal": "p_wren" } })
+                )),
+                SpokeResult::Ok(())
+            ),
+            "the binding's own shape is admitted"
+        );
+    }
+
+    /// The cognition, timeline and fork selections stay refused even though one extension
+    /// namespace is now admitted.
+    #[test]
+    fn validate_admission_scope_still_refuses_every_other_selection() {
+        for selection in [
+            json!({ "cognition": { "view": "recorded_at", "filter": {} } }),
+            json!({ "timeline_event_ids": ["tl_one"] }),
+            json!({ "timeline_scale": "day" }),
+            json!({ "fork_id": "fork_one" }),
+        ] {
+            let mut scope = scope_of("spc_wren");
+            bind_caller(&mut scope, "p_wren");
+            let mut value = serde_json::to_value(&scope).expect("scope serializes");
+            value
+                .as_object_mut()
+                .expect("scope object")
+                .extend(selection.as_object().expect("selection object").clone());
+            let scope: Scope = serde_json::from_value(value).expect("scope JSON matches schema");
+            assert_refused(&scope, &selection.to_string());
+        }
+    }
 
     fn plain_carrier(entry_id: &str) -> KnowledgeEntry {
         KnowledgeEntry {

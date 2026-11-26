@@ -35,9 +35,9 @@ While the workspace version is `0.x.y`:
 - **SPOKE follow rule** — `spoke-schemas` and `spoke-operations` are part of
   the published crates' API surface; `spoke-connect` is a workspace
   dev-dependency of `mindcore-sqlite` and is not published. All three are
-  declared at the `0.18` minor line (`>=0.18.1, <0.19.0`) and follow the same
+  declared at the `0.19` minor line (`>=0.19.1, <0.20.0`) and follow the same
   version policy. `Cargo.lock` remains the build pin: it fixes the exact
-  `0.18.x` version every checkout, CI run and `cargo publish --dry-run` builds
+  `0.19.x` version every checkout, CI run and `cargo publish --dry-run` builds
   against. A `spoke-*` **minor** bump forces a mindcore **minor** bump; a
   `spoke-*` **patch** bump may ship as a mindcore **patch**.
 - **sqlx major rule** — `sqlx` types are public: `MindStore::pool()` hands

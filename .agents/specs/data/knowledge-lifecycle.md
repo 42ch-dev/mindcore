@@ -6,6 +6,21 @@ How a knowledge entry behaves over time: the history a write leaves behind, the 
 
 ## Current state
 
+### The served write's grant rule
+
+A served knowledge face installs `mindcore_spoke::MindKnowledgePort`, which wraps `RoutedKnowledgeStore`
+and authorizes each operation on the caller's own live grant in the admitted Mind's space before the
+store is reached. The caller is not a port argument: the admission callback binds it into the
+`Scope` it returns, under the `mindcore_caller` extensions namespace
+(`.agents/adr/implemented/architecture/2026-11-26-knowledge-caller-in-scope-extensions.md`).
+
+A get and a list require one live grant covering `knowledge_read`; a put requires one grant covering
+both `knowledge_write` and `knowledge_read`, because Connect reads the entry through `get` before it
+writes. So the cognition append below is guarded rather than removed: a caller holding that grant
+appends `modules.cognition.records` exactly as before, and a caller without it is refused before any
+row is written. A scope with no binding, a caller with no live grant and a grant that does not cover
+the operation are one `NOT_AUTHORIZED` with no `details`.
+
 ### Revision history
 
 `knowledge_entry_revisions` holds one row per replaced revision:
@@ -152,6 +167,9 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 
 ## Invariants
 
+- The served write's guard precedes the store: a put without one live grant covering `knowledge_write`
+  and `knowledge_read` writes no entry, revision or cognition row, and the guard runs on the caller's
+  own grant, never a request value.
 - History, adoption and retirement share the existing immediate-transaction discipline: the write reservation is taken before claim state is read.
 - Pruning shares that discipline: one `BEGIN IMMEDIATE` reservation covers the entry read, the window computation, the deletes and the floor update. It writes only `history_floor_revision` on the entry row — never the revision — so the capture trigger saves no checkpoint of the prune itself. A retired entry's history is never deleted, and no cognition record or live payload is touched.
 - The disclosure predicate is unchanged: a hidden entry, or a retired one read through the ordinary reads and lists, is one generic local absence. The explicit lifecycle read and revision replay still see a retired entry (§ Retirement). The served face's read and prune denials are `.agents/specs/architecture/serving-seam.md`'s.
@@ -168,6 +186,10 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
   refusal hygiene: `crates/mindcore-runtime/src/adoption.rs`; its wire contract is
   `.agents/specs/architecture/serving-seam.md`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
+- Served write guard and caller binding: `crates/mindcore-spoke/src/served_knowledge.rs`
+  (`MindKnowledgePort`, `authorize_knowledge`) and `crates/mindcore-sqlite/src/knowledge.rs`
+  (`bind_caller`, `bound_caller`, `validate_admission_scope`); evidence in
+  `crates/mindcore-spoke/tests/served_knowledge.rs`.
 - Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; the prune dedup record in `crates/mindcore-runtime/src/history_dedup.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
 
 ## Served failure messages

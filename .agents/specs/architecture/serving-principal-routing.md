@@ -86,6 +86,33 @@ grants (`crates/mindcore-sqlite/src/minds.rs`, `visible_mind_ids`), in `id` orde
 exactly the Minds it may operate. A frozen Mind is listed with its `frozen` status; a space with no
 registry row is not listed even under a live grant. The wire shape, cursor and marker are unchanged.
 
+### Creating
+
+`memory.spaces.create` is Mind-routed in both directions, because it both names and writes the route:
+
+- The request names the Mind: `space_id` is required, because it is the first member of the dedup
+  namespace. A new id has no registry row yet, so there is nothing to resolve — the create writes
+  it.
+- The write is the library's `create` on the host service's one transaction, so the space row, the
+  carrier entry, the registry row and the creator's one default grant row are written once, by one
+  operation, and the route is persisted rather than configured
+  (`crates/mindcore-spoke/src/control.rs`, `create_space`).
+- The order is the port's: dedup probe, then the existing-space `admin` requirement, then the freeze
+  gate. Only an existing row is admitted and gated; a new id needs no grant, because an
+  authenticated principal creates.
+- An existing Mind the caller holds no space-wide live `admin` in answers the same target-free
+  `NOT_AUTHORIZED` every other Mind-level path answers — never the library's taken-id refusal,
+  which names the id.
+- That refusal is target-free, but the call's outcome is not: success means the id was free, that
+  refusal means it is taken. Since the request names the id and a new id needs no grant, an
+  authenticated peer can probe an id and claim a free one first, taking its space-wide `admin`.
+  Both inputs are settled decisions (the caller names the `space_id`; an authenticated principal
+  creates), so this is the shape rather than a defect here.
+- The invariant below therefore covers operations on an existing Mind and stops at id creation,
+  where there is no row to admit against before the create writes one. A host that cannot accept
+  the signal needs its own create admission or a server-assigned id. The decision is tracked in
+  `I-000155`; the served contract states the signal in [`serving-seam.md`](serving-seam.md).
+
 ### The un-routed operations
 
 `port.knowledge.*`, `history.*` and `knowledge.adopt` cannot name a Mind: the retained
@@ -99,9 +126,12 @@ destination is the knowledge face's own collection. Stage 1 therefore composes n
   the knowledge family, `capability_missing` for history and adoption, each surfaced by the Rust
   dialer as `CapabilityPortMissing` with `details.wire_code`.
 
-They return per Mind in Stage 2, once SPOKE carries request-scoped admission and an optional scope on
-knowledge get and put (`2026-11-25-one-surface-serves-many-minds.md`). Their contracts stay
-[`serving-seam.md`](serving-seam.md)'s.
+They return per Mind in Stage 2: the pinned `0.19` cohort carries request-scoped admission (A1), the
+optional scope on knowledge get and put (A2) and `memory.spaces.create` (A3)
+(`2026-11-25-one-surface-serves-many-minds.md`), and the served port that authorizes each of them on
+the caller the admitted scope carries already exists
+(`2026-11-26-knowledge-caller-in-scope-extensions.md`). What Stage 2 still owes is the composition
+itself. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
 
 ### Construction
 
@@ -118,9 +148,14 @@ knowledge get and put (`2026-11-25-one-surface-serves-many-minds.md`). Their con
   result mixes two Minds. The host's own memory family service dispatches its operations under the
   host's admission; which of them it dispatches was always the host's.
 - One `NOT_AUTHORIZED` with no `details` answers an unknown Mind id and a Mind the caller holds no
-  live grant in, a frozen one included, because admission runs before any existence check.
+  live grant in, a frozen one included, because admission runs before any existence check. It
+  covers operations on an existing Mind; create's outcome, which reports whether an id is free,
+  is scoped in § Creating and does not inherit this invariant.
 - No refusal discloses another Mind's collection, carrier or entry; the coverage refusal is
-  reachable only by a caller already admitted to that Mind.
+  reachable only by a caller already admitted to that Mind, and an existing Mind's create refusal
+  names neither the caller, the Mind nor the missing capability.
+- A create writes the Mind's route and its default grant on one transaction, and a repeat create
+  writes only its own receipt: the route a later call resolves is the one the first create wrote.
 - The three un-routed operations are never advertised and never served; a restored face re-enters
   composition only per Mind, with `serving-seam.md`'s contract.
 - The carrier record format is unchanged.
@@ -133,6 +168,9 @@ knowledge get and put (`2026-11-25-one-surface-serves-many-minds.md`). Their con
   readers share), `knowledge_slot`, and `admitted_carrier` / `admitted_carrier_entry` (the carrier
   admissions).
 - `crates/mindcore-sqlite/src/minds.rs` — the `minds` row, its visibility join and `create`.
+- `crates/mindcore-spoke/src/control.rs` — `MemoryAdapter::create_space`, the served create that
+  resolves no existing route and writes one; `crates/mindcore-runtime/tests/loopback.rs` drives it
+  on a signed session.
 - `crates/mindcore-runtime/src/tools.rs` — the served `deliberate` and `read_cognition` argument
   objects and their handler entry.
 - `crates/mindcore-runtime/src/lib.rs` — `MindPorts`, the retired-id filter and `face_capabilities`.

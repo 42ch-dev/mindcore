@@ -33,7 +33,9 @@ use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::{adoption_anchor, KnowledgeScope};
-use mindcore_sqlite::{validate_admission_scope, MindStore, SERVED_KNOWLEDGE_LIST_LIMIT};
+use mindcore_sqlite::{
+    bind_caller, validate_admission_scope, MindStore, SERVED_KNOWLEDGE_LIST_LIMIT,
+};
 use spoke_connect::core::{
     derive_peer_id_from_ed25519_pubkey, issue_capability_token, CapabilityClaims,
     CapabilityTokenProof,
@@ -1370,8 +1372,9 @@ async fn negotiated_viewpoint_cannot_bypass_admission_or_disclosure() {
     assert_eq!(hidden.code, SpokeRejectCode::KnowledgeEntryNotFound);
 }
 
-/// Every op refuses a scope carrying a selection the knowledge face does not
-/// serve, instead of silently ignoring it and answering for the bare scope.
+/// Every op of the unguarded served store refuses a caller-declared selection it does not serve,
+/// instead of silently ignoring it and answering for the bare scope — while the binding's own
+/// exact shape is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_scope_selections_are_refused_by_the_served_store() {
     let fixture = Fixture::open().await;
@@ -1390,6 +1393,13 @@ async fn unsupported_scope_selections_are_refused_by_the_served_store() {
         ("timeline scale", json!({ "timeline_scale": "day" })),
         ("fork", json!({ "fork_id": "fork_one" })),
         ("extensions", json!({ "extensions": { "toy_world": {} } })),
+        (
+            "extra caller member",
+            json!({ "extensions": {
+                "mindcore_caller": { "principal": "p_wren", "unsupported_selection": true }
+            } }),
+        ),
+        ("empty extensions", json!({ "extensions": {} })),
     ];
 
     for (label, selection) in selections {
@@ -1439,6 +1449,17 @@ async fn unsupported_scope_selections_are_refused_by_the_served_store() {
         )
         .code,
         SpokeRejectCode::KnowledgeEntryNotFound
+    );
+
+    let mut bound = scope_of(SCOPE_ID);
+    bind_caller(&mut bound, "p_wren");
+    assert_eq!(
+        expect_ok(
+            served.get_scoped_knowledge_entry(&bound, "ke_alpha").await,
+            "the binding's exact shape is served",
+        )
+        .entry_id,
+        "ke_alpha"
     );
 }
 

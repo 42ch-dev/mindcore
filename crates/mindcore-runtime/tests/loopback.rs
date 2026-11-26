@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
-use serde_json::{json, Number, Value};
+use serde_json::{json, Map, Number, Value};
 use tempfile::TempDir;
 
 use mindcore_base::ids::SpaceId;
@@ -36,8 +36,9 @@ use mindcore_sqlite::{MindStore, SqliteMemoryRepository};
 use spoke_connect::core::derive_peer_id_from_ed25519_pubkey;
 use spoke_connect::remote::{
     connect_remote_adapter, connect_responder, loopback_transport_pair, ConnectResponder,
-    ConnectResponderOptions, MemoryAdmission, RemoteAdapter, RemoteAdapterOptions,
-    RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
+    ConnectResponderOptions, LoopbackTransport, MemoryAdmission, RemoteAdapter,
+    RemoteAdapterOptions, RemoteAdapterState, RemoteIdentity, RemoteMemoryService, ToolHandler,
+    Transport, TransportError,
 };
 use spoke_operations::{
     spoke_ok, spoke_reject, validate_judgment, AdoptionPort, HistoryPort, KnowledgeEntryPort,
@@ -617,12 +618,201 @@ fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
 struct Session {
     adapter: Arc<RemoteAdapter>,
     responder: Arc<ConnectResponder>,
+    /// Every envelope the responder sent back on this session, verbatim.
+    wire: Arc<WireLog>,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.adapter.close();
         self.responder.close();
+    }
+}
+
+/// The raw inbound envelopes of one session, in arrival order.
+///
+/// A typed response is not the wire: `invoke_mapped` decodes into the op's DTO, so a member the
+/// DTO does not declare is gone before a test can see it. These are the bytes.
+#[derive(Default)]
+struct WireLog {
+    frames: Mutex<Vec<String>>,
+}
+
+impl WireLog {
+    fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.frames.lock().expect("wire log lock"))
+    }
+}
+
+/// The dialer end of the loopback, recording every envelope it receives.
+struct RecordingTransport {
+    inner: LoopbackTransport,
+    log: Arc<WireLog>,
+}
+
+#[async_trait]
+impl Transport for RecordingTransport {
+    async fn send(&self, envelope: &[u8]) -> Result<(), TransportError> {
+        self.inner.send(envelope).await
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, TransportError> {
+        let frame = self.inner.recv().await?;
+        self.log
+            .frames
+            .lock()
+            .expect("wire log lock")
+            .push(String::from_utf8_lossy(&frame).into_owned());
+        Ok(frame)
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        self.inner.close().await
+    }
+}
+
+/// One step into a decoded frame: an object member by its literal key, or an array element by its
+/// index. A key that happens to contain a dot stays one step, so it can never be read as two
+/// nesting levels.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// Render a path for a failure message. Every key is quoted, so a key that contains a dot reads as
+/// the one member it is rather than as a path.
+fn rendered(path: &[Step<'_>]) -> String {
+    let mut out = String::from("$");
+    for step in path {
+        match step {
+            Step::Key(key) => out.push_str(&format!("[\"{key}\"]")),
+            Step::Index(index) => out.push_str(&format!("[{index}]")),
+        }
+    }
+    out
+}
+
+/// Whether `path` is an object this suite's answers put a receipt body at: the response `payload`
+/// itself, and `payload.receipt` for `memory.receipts.get`.
+///
+/// The comparison is segment by segment, so a member whose literal key is `payload.receipt` is one
+/// key at one level and is not this path.
+fn is_receipt_path(path: &[Step<'_>]) -> bool {
+    matches!(
+        path,
+        [Step::Key("payload")] | [Step::Key("payload"), Step::Key("receipt")]
+    )
+}
+
+/// Whether the answer under inspection may carry a receipt at all.
+///
+/// The receipt exception is a property of the answer's context, not of its shape: the same body
+/// that is a committed receipt on a create is a disclosure on a refusal that staged nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpectsReceipt {
+    /// A create, its replay, the fresh-key repeat, or `memory.receipts.get`: the answer is a
+    /// receipt body, or holds one at `payload.receipt`.
+    Yes,
+    /// A refusal that staged nothing — the terminal refusals this suite asserts, which answer no
+    /// `details` at all. No receipt body and no attribution may appear.
+    ///
+    /// not this class: an `OUTCOME_UNCERTAIN` answer. It is a refusal too, but it names the staged
+    /// receipt in `details.receipt_id` so the caller can resolve the outcome through
+    /// `memory.receipts.get`; that receipt is real and is not a leak. No call site applies this
+    /// walk to an uncertain answer.
+    No,
+}
+
+/// Every occurrence of the caller in one decoded wire frame that must not be there, as
+/// `path: needle`; empty when the frame carries it only in a receipt's own attribution.
+///
+/// This walks the raw frame rather than the typed response, because `invoke_mapped` decodes into
+/// the op's DTO and drops every member the DTO does not declare: a leak under an unmodelled key
+/// is invisible after decoding but present here. Object keys are walked too: a principal used as
+/// a key discloses it as surely as a value does.
+fn caller_leaks<'a>(
+    value: &'a Value,
+    expects: ExpectsReceipt,
+    path: &mut Vec<Step<'a>>,
+) -> Vec<String> {
+    let mut leaks = Vec::new();
+    match value {
+        Value::Object(members) => {
+            for (key, member) in members {
+                path.push(Step::Key(key.as_str()));
+                if key.contains("mindcore_caller") || key.contains(PRINCIPAL) {
+                    leaks.push(format!("{}: the caller as a key", rendered(path)));
+                    path.pop();
+                    continue;
+                }
+                // A refusal names no receipt: one here would be a staged outcome the operation is
+                // supposed to have left unmentioned.
+                if key == "receipt_id" && expects == ExpectsReceipt::No {
+                    leaks.push(format!("{}: a refusal carries a receipt", rendered(path)));
+                    path.pop();
+                    continue;
+                }
+                // A receipt's own `requester_principal_id` is the caller's attribution of the
+                // request it made, required by the receipt polling contract, and is not the
+                // admission binding. It is the one permitted occurrence: this receipt object, at
+                // the receipt's own path, holding the expected scalar. Any other position,
+                // nesting or value leaks — and on an answer that expects no receipt at all, every
+                // position does.
+                if key == "requester_principal_id" {
+                    // `path` ends with this member; the exemption is a property of the object
+                    // holding it.
+                    let attributed = expects == ExpectsReceipt::Yes
+                        && is_receipt_path(&path[..path.len() - 1])
+                        && members.contains_key("receipt_id")
+                        && member.as_str() == Some(PRINCIPAL);
+                    if !attributed {
+                        leaks.push(format!(
+                            "{}: the caller outside a receipt's attribution",
+                            rendered(path)
+                        ));
+                    }
+                    path.pop();
+                    continue;
+                }
+                leaks.extend(caller_leaks(member, expects, path));
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(Step::Index(index));
+                leaks.extend(caller_leaks(item, expects, path));
+                path.pop();
+            }
+        }
+        Value::String(text) => {
+            for needle in ["mindcore_caller", PRINCIPAL] {
+                if text.contains(needle) {
+                    leaks.push(format!("{}: {needle}", rendered(path)));
+                }
+            }
+        }
+        _ => {}
+    }
+    leaks
+}
+
+/// Assert that every frame the responder answered since the last drain carries the caller
+/// nowhere, and that the call was answered at all. `expects` says whether the answer may hold a
+/// receipt; a refusal passes [`ExpectsReceipt::No`], so the attribution exception cannot excuse
+/// one. A frame that is not JSON fails: nothing this suite's own faces send is anything else.
+fn assert_caller_absent(session: &Session, context: &str, expects: ExpectsReceipt) {
+    let frames = session.wire.drain();
+    assert!(!frames.is_empty(), "{context}: the call was answered");
+    for frame in &frames {
+        let parsed: Value = serde_json::from_str(frame)
+            .unwrap_or_else(|error| panic!("{context}: the wire frame is JSON ({error}): {frame}"));
+        let leaks = caller_leaks(&parsed, expects, &mut Vec::new());
+        assert!(
+            leaks.is_empty(),
+            "{context}: the answer carries the caller: {leaks:?}"
+        );
     }
 }
 
@@ -640,6 +830,7 @@ async fn connect_as(
     dialer_capabilities: &[&str],
 ) -> Session {
     let pair = loopback_transport_pair();
+    let wire = Arc::new(WireLog::default());
     let dialer = peer_id(seed);
     let responder_pubkey = SigningKey::from_bytes(&RESPONDER_SEED)
         .verifying_key()
@@ -664,7 +855,10 @@ async fn connect_as(
     expect_ok(surface.register(&responder), "install the served handlers");
 
     let adapter = connect_remote_adapter(RemoteAdapterOptions {
-        transport: Arc::new(pair.client),
+        transport: Arc::new(RecordingTransport {
+            inner: pair.client,
+            log: Arc::clone(&wire),
+        }),
         local_identity: RemoteIdentity { seed: *seed },
         local_manifest: hello("loopback-dialer", dialer_capabilities),
         remote_pubkey: responder_pubkey,
@@ -685,7 +879,11 @@ async fn connect_as(
         Some(dialer.as_str()),
         "the responder serves the authenticated peer, not a claimed one"
     );
-    Session { adapter, responder }
+    Session {
+        adapter,
+        responder,
+        wire,
+    }
 }
 
 fn recall_arguments() -> Value {
@@ -2646,6 +2844,7 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
         ),
     );
     let session = connect(&surface, &["spoke-memory", "spoke-memory-transfer"]).await;
+    session.wire.drain();
 
     let created = wire(expect_ok(
         MemoryPort::create_export(
@@ -2670,9 +2869,17 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
         .await,
         "memory.receipts.get",
     ));
+    // The poll answers a receipt at `payload.receipt`: that is the one other place the caller may
+    // appear, and only as the receipt's own `requester_principal_id` attribution.
+    assert_caller_absent(&session, "the receipt poll answer", ExpectsReceipt::Yes);
     assert_eq!(polled["receipt"]["op"], json!("memory.exports.create"));
     assert_eq!(polled["receipt"]["status"], json!("committed"));
     assert_eq!(polled["receipt"]["receipt_id"], json!(receipt_id));
+    assert_eq!(
+        polled["receipt"]["requester_principal_id"],
+        json!(PRINCIPAL),
+        "the poll answers the caller's own attribution of the request it made"
+    );
 }
 
 fn typed<T: serde::de::DeserializeOwned>(value: Value) -> T {
@@ -3132,4 +3339,537 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
         2,
         "another identity's rows survive the retirement"
     );
+}
+
+/// A host memory service that routes `memory.spaces.create` to the adapter over one pool, so a
+/// peer creates a Mind on a signed session. The service is the caller of the transaction, as
+/// `TransferService` is: `BEGIN IMMEDIATE`, the adapter, then commit only after `Ready`.
+struct CreateSpaceFace {
+    pool: sqlx::SqlitePool,
+    admission: MemoryAdmission,
+}
+
+/// The create face's lost-acknowledgement answer: the commit was not confirmed, so the caller
+/// cannot know whether the Mind was written — only the receipt names which outcome to resolve.
+///
+/// The receipt id comes from the `Ready` body the adapter staged, which is the committed receipt
+/// the transaction wrote; the answer claims no commit outcome either way.
+fn create_commit_uncertain(body: &Value, error: impl std::fmt::Display) -> SpokeReject {
+    let mut details = Map::new();
+    details.insert("retry_class".to_string(), json!("uncertain"));
+    if let Some(receipt_id) = body.get("receipt_id").cloned() {
+        details.insert("receipt_id".to_string(), receipt_id);
+    }
+    SpokeReject {
+        code: SpokeRejectCode::OutcomeUncertain,
+        message: format!("memory.spaces.create commit was not confirmed: {error}"),
+        details: Some(details),
+    }
+}
+
+/// A lost commit acknowledgement names the receipt and claims no outcome: the caller resolves it
+/// through `memory.receipts.get` rather than reading the answer as a create or a refusal.
+#[test]
+fn a_lost_create_commit_names_the_receipt_and_claims_no_outcome() {
+    let body = json!({
+        "schema_version": 1,
+        "receipt_id": "rct_create",
+        "status": "committed",
+        "result": { "space_id": "spc_wire", "created": true, "status": "active", "revision": 1 },
+    });
+    let reject = create_commit_uncertain(&body, "the connection went away");
+    assert_eq!(reject.code, SpokeRejectCode::OutcomeUncertain);
+    let details = reject
+        .details
+        .expect("the uncertain answer carries details");
+    assert_eq!(details["receipt_id"], json!("rct_create"));
+    assert_eq!(details["retry_class"], json!("uncertain"));
+    assert!(
+        !reject.message.contains("committed") && !reject.message.contains("not committed"),
+        "the answer claims no commit outcome: {}",
+        reject.message
+    );
+}
+
+#[async_trait]
+impl RemoteMemoryService for CreateSpaceFace {
+    async fn invoke(&self, peer_id: &str, op: &str, payload: Value) -> SpokeResult<Value> {
+        if op != "memory.spaces.create" {
+            return spoke_reject(
+                SpokeRejectCode::CapabilityPortMissing,
+                format!("the fixture create face does not serve {op}"),
+                None,
+            );
+        }
+        let principal = match (self.admission)(peer_id) {
+            SpokeResult::Ok(principal) => principal,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return spoke_reject(
+                    SpokeRejectCode::InternalError,
+                    format!("the fixture create face could not begin: {error}"),
+                    None,
+                )
+            }
+        };
+        let stage = MemoryAdapter::new(false)
+            .create_space(&mut tx, &principal, payload)
+            .await;
+        match stage {
+            SpokeResult::Ok(MemoryStage::Ready(body)) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(body),
+                Err(error) => SpokeResult::Reject(create_commit_uncertain(&body, error)),
+            },
+            SpokeResult::Ok(_) => spoke_reject(
+                SpokeRejectCode::InternalError,
+                "create staged an outcome the fixture face cannot finish",
+                None,
+            ),
+            SpokeResult::Reject(reject) => {
+                let _ = tx.rollback().await;
+                SpokeResult::Reject(reject)
+            }
+        }
+    }
+}
+
+impl ServedMemory for CreateSpaceFace {}
+
+/// The signed create path: a peer creates a Mind over the wire, replays under the same key, and
+/// repeats under a fresh key. The create writes one default grant row carrying the seven
+/// capabilities; the replay writes nothing; the repeat changes no space, grant or revision. No
+/// answer carries the caller binding the served knowledge port reads from a scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_creates_a_mind_through_the_signed_loopback() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            Some(Arc::new(CreateSpaceFace {
+                pool: pool.clone(),
+                admission: principal_admission(),
+            })),
+            MindProviders::default(),
+        ),
+    );
+    assert!(
+        capabilities(&surface).contains(&"spoke-memory"),
+        "the attached create face advertises the memory family: {:?}",
+        capabilities(&surface)
+    );
+    let session = connect(&surface, &["spoke-memory"]).await;
+    // The handshake's own envelopes are not this test's subject; every drain from here covers
+    // exactly one create call.
+    session.wire.drain();
+
+    let grants = |pool: sqlx::SqlitePool, space: &'static str| async move {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_grants WHERE space_id = ?")
+            .bind(space)
+            .fetch_one(&pool)
+            .await
+            .expect("count the grants")
+    };
+    let receipts = |pool: sqlx::SqlitePool, space: &'static str| async move {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_receipts WHERE space_id = ?")
+            .bind(space)
+            .fetch_one(&pool)
+            .await
+            .expect("count the receipts")
+    };
+    // The persisted Mind row by row — space, registry, carrier, grants — projected whole, so a
+    // write to any column of any of them shows up as a difference; an in-place grant edit too.
+    let mind_rows = |pool: sqlx::SqlitePool, space: &'static str| async move {
+        let space_row = sqlx::query_scalar::<_, String>(
+            "SELECT json_object('space_id', space_id, 'display_name', display_name, \
+             'authority_host_id', authority_host_id, 'authority_generation', \
+             authority_generation, 'status', status, 'revision', revision, \
+             'created_at', created_at) FROM memory_spaces WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_one(&pool)
+        .await
+        .expect("the space row");
+        let registry = sqlx::query_scalar::<_, String>(
+            "SELECT json_object('space_id', space_id, 'knowledge_collection', \
+             knowledge_collection, 'carrier_entry_id', carrier_entry_id) \
+             FROM minds WHERE space_id = ?",
+        )
+        .bind(space)
+        .fetch_one(&pool)
+        .await
+        .expect("the registry row");
+        let carrier = sqlx::query_scalar::<_, String>(
+            "SELECT json_object('entry_id', entry_id, 'revision', revision, 'payload', payload, \
+             'history_floor_revision', history_floor_revision, \
+             'cognition_head_seq', cognition_head_seq, 'superseded_by', superseded_by, \
+             'created_at', created_at, 'updated_at', updated_at) \
+             FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(format!("mind:{space}"))
+        .bind(CARRIER)
+        .fetch_one(&pool)
+        .await
+        .expect("the carrier entry");
+        let grants: Vec<String> = sqlx::query_scalar(
+            "SELECT json_object('grant_id', grant_id, 'principal_id', principal_id, \
+             'subject_id', subject_id, 'capabilities_json', capabilities_json, \
+             'context_ids_json', context_ids_json, 'shared_access', shared_access, \
+             'expires_at', expires_at, 'revoked_at', revoked_at, 'revision', revision, \
+             'created_at', created_at) \
+             FROM memory_grants WHERE space_id = ? ORDER BY grant_id",
+        )
+        .bind(space)
+        .fetch_all(&pool)
+        .await
+        .expect("the grant rows");
+        let row = |json: String| serde_json::from_str::<Value>(&json).expect("the row's json");
+        (
+            row(space_row),
+            row(registry),
+            row(carrier),
+            grants
+                .iter()
+                .map(|grant| row(grant.clone()))
+                .collect::<Vec<Value>>(),
+        )
+    };
+
+    let created = wire(expect_ok(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": "spc_wire", "idempotency_key": "create-wire-1" })),
+        )
+        .await,
+        "memory.spaces.create",
+    ));
+    assert_caller_absent(&session, "the create answer", ExpectsReceipt::Yes);
+    assert_eq!(created["result"]["space_id"], json!("spc_wire"));
+    assert_eq!(created["result"]["created"], json!(true));
+    assert_eq!(created["result"]["status"], json!("active"));
+    assert_eq!(created["result"]["revision"], json!(1));
+    let first_receipt = created["receipt_id"].clone();
+    let grants_after_create = grants(pool.clone(), "spc_wire").await;
+    assert_eq!(
+        grants_after_create, 1,
+        "a create writes one default grant row"
+    );
+    assert_eq!(
+        receipts(pool.clone(), "spc_wire").await,
+        1,
+        "a create records one committed receipt"
+    );
+
+    // The creator's own grant row: the seven capabilities, and the ownership that makes them
+    // reachable — space-wide, subject-free, context-free, never expiring.
+    let (granted, grantee, subject, contexts, expires): (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT capabilities_json, principal_id, subject_id, context_ids_json, expires_at \
+         FROM memory_grants WHERE space_id = 'spc_wire'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the creator's grant row");
+    assert_eq!(
+        serde_json::from_str::<Value>(&granted).expect("capabilities json"),
+        json!([
+            "recall",
+            "capture",
+            "review",
+            "records_write",
+            "knowledge_read",
+            "knowledge_write",
+            "admin"
+        ]),
+        "the served create writes the same default grant set as the library"
+    );
+    assert_eq!(
+        grantee, PRINCIPAL,
+        "the default grant is issued to the creating principal"
+    );
+    assert_eq!(subject, None, "the default grant is space-wide");
+    assert_eq!(contexts, "[]", "the default grant restricts no context");
+    assert_eq!(expires, None, "the default grant never expires");
+
+    // The Mind as the create left it: the space row, the registry row, the carrier entry and the
+    // creator's one grant row.
+    let mind_before = mind_rows(pool.clone(), "spc_wire").await;
+    assert_eq!(
+        mind_before.1,
+        json!({
+            "space_id": "spc_wire",
+            "knowledge_collection": "mind:spc_wire",
+            "carrier_entry_id": CARRIER,
+        }),
+        "the create's registry row names the Mind's own collection and carrier"
+    );
+    assert_eq!(
+        mind_before.3.len(),
+        1,
+        "the served create wrote exactly one grant: {:?}",
+        mind_before.3
+    );
+    assert_eq!(mind_before.3[0]["principal_id"], json!(PRINCIPAL));
+    assert_eq!(mind_before.3[0]["subject_id"], Value::Null);
+    assert_eq!(mind_before.3[0]["context_ids_json"], json!("[]"));
+    assert_eq!(mind_before.3[0]["expires_at"], Value::Null);
+    assert_eq!(
+        mind_before.3[0]["capabilities_json"],
+        json!(granted),
+        "the snapshot holds the same default capability set the query above pins"
+    );
+
+    let replay = wire(expect_ok(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": "spc_wire", "idempotency_key": "create-wire-1" })),
+        )
+        .await,
+        "the replay of a create",
+    ));
+    assert_caller_absent(&session, "the replay answer", ExpectsReceipt::Yes);
+    assert_eq!(replay["receipt_id"], first_receipt);
+    assert_eq!(replay["result"], created["result"]);
+    assert_eq!(
+        grants(pool.clone(), "spc_wire").await,
+        1,
+        "a replay writes nothing"
+    );
+    assert_eq!(
+        receipts(pool.clone(), "spc_wire").await,
+        1,
+        "a replay records no second receipt"
+    );
+
+    let repeat = wire(expect_ok(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": "spc_wire", "idempotency_key": "create-wire-2" })),
+        )
+        .await,
+        "a repeat create under a fresh key",
+    ));
+    assert_caller_absent(&session, "the fresh-key repeat answer", ExpectsReceipt::Yes);
+    assert_ne!(repeat["receipt_id"], first_receipt);
+    assert_eq!(repeat["result"]["created"], json!(false));
+    assert_eq!(
+        repeat["result"]["revision"],
+        json!(1),
+        "the revision did not move"
+    );
+    // The repeat is a second recorded outcome, not a replay: one more receipt row, nothing else.
+    assert_eq!(
+        receipts(pool.clone(), "spc_wire").await,
+        2,
+        "a fresh key records its own receipt"
+    );
+    assert_eq!(
+        grants(pool.clone(), "spc_wire").await,
+        1,
+        "a repeat writes no second grant row"
+    );
+    // The repeat's only difference: its receipt. The space row, the registry row, the carrier
+    // entry and the creator's grant row are exactly what the create wrote — a widened capability
+    // set or a moved expiry on that grant would differ here.
+    assert_eq!(
+        mind_rows(pool.clone(), "spc_wire").await,
+        mind_before,
+        "a repeat writes nothing but its receipt"
+    );
+    let (status, revision): (String, i64) =
+        sqlx::query_as("SELECT status, revision FROM memory_spaces WHERE space_id = ?")
+            .bind("spc_wire")
+            .fetch_one(&pool)
+            .await
+            .expect("the space row");
+    assert_eq!(status, "active");
+    assert_eq!(revision, 1, "a repeat changes no space");
+    assert_eq!(
+        session.adapter.state(),
+        RemoteAdapterState::Established,
+        "every call stayed on the one signed session"
+    );
+}
+
+/// A peer without space-wide `admin` on an existing Mind cannot create over it, and the answer is
+/// the fixed admission refusal — never the library's `MIND_ALREADY_EXISTS`, which names the id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signed_create_of_an_existing_mind_without_admin_learns_nothing() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            Some(Arc::new(CreateSpaceFace {
+                pool: pool.clone(),
+                admission: principal_admission(),
+            })),
+            MindProviders::default(),
+        ),
+    );
+    let session = connect(&surface, &["spoke-memory"]).await;
+    session.wire.drain();
+
+    let refusal = expect_reject(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "create-wire-no-admin" })),
+        )
+        .await,
+        "an existing-Mind create without admin",
+    );
+    assert_caller_absent(&session, "the no-admin refusal", ExpectsReceipt::No);
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        refusal.details.is_none(),
+        "the create refusal carries no details: {refusal:?}"
+    );
+    for needle in [PRINCIPAL, SPACE] {
+        assert!(
+            !refusal.message.contains(needle),
+            "the create refusal names neither the caller nor the space ({needle}): {refusal:?}"
+        );
+    }
+    assert!(
+        !refusal.message.contains("already exists"),
+        "the answer is never the taken-id refusal: {refusal:?}"
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory_receipts WHERE space_id = ?")
+            .bind(SPACE)
+            .fetch_one(&pool)
+            .await
+            .expect("count the receipts");
+    assert_eq!(receipts, 0, "a refused create stages no receipt");
+}
+
+/// A frozen Mind under its admin answers `SPACE_FROZEN` on the wire, and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
+    let fixture = Fixture::open().await;
+    fixture.grant("grt_admin", PRINCIPAL, &["admin"]).await;
+    let pool = fixture.store.pool();
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE)
+        .execute(&pool)
+        .await
+        .expect("freeze the Mind");
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            Some(Arc::new(CreateSpaceFace {
+                pool: pool.clone(),
+                admission: principal_admission(),
+            })),
+            MindProviders::default(),
+        ),
+    );
+    let session = connect(&surface, &["spoke-memory"]).await;
+    session.wire.drain();
+
+    let refusal = expect_reject(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "create-wire-frozen" })),
+        )
+        .await,
+        "a create into a frozen Mind",
+    );
+    assert_caller_absent(&session, "the frozen refusal", ExpectsReceipt::No);
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::SpaceFrozen,
+        "a frozen Mind answers the frozen refusal: {refusal:?}"
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory_receipts WHERE space_id = ?")
+            .bind(SPACE)
+            .fetch_one(&pool)
+            .await
+            .expect("count the receipts");
+    assert_eq!(receipts, 0, "a frozen Mind stages no receipt");
+}
+
+/// The absence walk is not vacuous, and its one permitted occurrence is narrow: a receipt's own
+/// `requester_principal_id`, at a receipt's own path, holding the expected scalar, on an answer
+/// that expects a receipt. Everything else — another key, another path, a nested value, a
+/// different principal, a principal used as an object key, a key that merely spells a receipt
+/// path, or any receipt on a refusal — is a leak.
+#[test]
+fn the_caller_absence_walk_catches_a_leak_under_any_key() {
+    let frame =
+        |body: &str| -> Value { serde_json::from_str(body).expect("the fixture frame is JSON") };
+    let leaks = |body: &str, expects| -> Vec<String> {
+        caller_leaks(&frame(body), expects, &mut Vec::new())
+    };
+    // The two receipt paths, and only those, carry the attribution.
+    for clean in [
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
+        r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
+    ] {
+        assert_eq!(
+            leaks(clean, ExpectsReceipt::Yes),
+            Vec::<String>::new(),
+            "the walk accepts the receipt's own attribution: {clean}"
+        );
+    }
+
+    for leak in [
+        r#"{"payload":{"result":{"space":"prn_loopback"}}}"#,
+        r#"{"extensions":{"mindcore_caller":{"principal":"p"}}}"#,
+        r#"{"payload":{"items":["ok","mindcore_caller"]}}"#,
+        r#"{"payload":{"result":{"requester_principal_id":"prn_loopback"}}}"#,
+        // The reviewer's two cases: a receipt-shaped object that is not at a receipt path, with a
+        // binding nested inside the member, and the principal used as a key.
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":{"mindcore_caller":{"principal":"prn_loopback"}}}}"#,
+        r#"{"payload":{"prn_loopback":"value"}}"#,
+        // The same member at a receipt path but holding something other than the expected scalar.
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
+        r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":["prn_loopback"]}}}"#,
+        // A single member whose literal key spells a receipt path is one key at one level, not a
+        // receipt nesting: the wrong value inside it must not be read as the permitted one.
+        r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
+        r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
+    ] {
+        assert_eq!(
+            leaks(leak, ExpectsReceipt::Yes).len(),
+            1,
+            "the walk names the leak in: {leak}"
+        );
+    }
+
+    // A refusal stages no receipt, so the two bodies a successful create may answer — a committed
+    // receipt and a receipt under `payload.receipt` — are both leaks here, including the exact
+    // scalar the exception would otherwise permit at that path.
+    for refusal in [
+        r#"{"error":{"details":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
+        r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
+    ] {
+        assert_eq!(
+            leaks(refusal, ExpectsReceipt::No).len(),
+            2,
+            "a refusal carrying receipt attribution is two leaks — the receipt and the caller: \
+             {refusal}"
+        );
+    }
 }
