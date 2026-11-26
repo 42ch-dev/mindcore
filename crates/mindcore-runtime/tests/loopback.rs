@@ -5466,6 +5466,24 @@ async fn checkpoint_revisions(
     .expect("read the entry's checkpoints")
 }
 
+/// [`checkpoint_revisions`] against the table a fault test moved aside as
+/// `knowledge_entry_revisions_intact`, for the interval when the real name is a faulting view.
+async fn intact_checkpoint_revisions(
+    pool: &sqlx::SqlitePool,
+    collection: &str,
+    entry_id: &str,
+) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT revision FROM knowledge_entry_revisions_intact \
+         WHERE collection = ? AND entry_id = ? ORDER BY revision ASC",
+    )
+    .bind(collection)
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .expect("read the entry's checkpoints through the intact table")
+}
+
 /// Connect's prune dedup key for one retry identity: the RFC 8785 serialization of
 /// `[op, effective_scope, principal_id, idempotency_key]`. The admitted scope the history face
 /// returns carries the Mind's `scope_id` and nothing else, so a test can name the exact row the
@@ -6562,16 +6580,21 @@ async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_resu
         [2],
         "the prune ran"
     );
-    let (digest, outcome) = dedup_row(&pool, COLLECTION, &key).await;
+    // The failed write released the claim rather than leaving it behind, so the key is not spent.
     assert_eq!(
-        (digest, outcome),
-        (None, None),
-        "the claim settled nothing, so no acknowledged outcome exists"
+        dedup_row_count(&pool, COLLECTION).await,
+        0,
+        "the unsettled settlement left no claim, so the key stays claimable"
     );
 
-    // No phantom success on the retry either: the key is a claim with no outcome, which answers
-    // RECEIPT_EXPIRED, never the result the first call was denied.
-    let retried = expect_reject(
+    // The fault clears and the same key executes. The prune it runs now sees the state the first
+    // one left, so it deletes nothing and records that: a real result, not the answer the caller
+    // was denied and not `RECEIPT_EXPIRED`.
+    sqlx::query("DROP TRIGGER refuse_settlement")
+        .execute(&pool)
+        .await
+        .expect("remove the settlement fault");
+    let recovered = expect_ok(
         creator
             .adapter
             .prune_history(
@@ -6582,12 +6605,197 @@ async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_resu
                 Some("key-unsettled"),
             )
             .await,
-        "the same key after a failed settlement",
+        "the same key executes once the settlement fault cleared",
     );
-    assert_eq!(retried.code, SpokeRejectCode::ReceiptExpired);
+    assert_eq!(
+        (recovered.deleted, recovered.floor_revision),
+        (0, None),
+        "the recovered prune ran against the state the first one left"
+    );
+    let (digest, outcome) = dedup_row(&pool, COLLECTION, &key).await;
+    assert!(
+        digest.is_some() && outcome.is_some(),
+        "the recovered prune settled its outcome: {digest:?} / {outcome:?}"
+    );
+
+    // The key is settled once: the same request now replays instead of pruning again.
+    let replayed = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-unsettled"),
+            )
+            .await,
+        "the same key replays its recorded outcome",
+    );
+    assert_eq!(
+        (replayed.deleted, replayed.floor_revision),
+        (recovered.deleted, recovered.floor_revision),
+        "the replay answers the recorded result"
+    );
     assert_eq!(
         checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
         [2],
-        "the retry did not execute the prune a second time"
+        "no second prune ran"
+    );
+}
+
+/// A storage fault the port answers is not the key's settled outcome, and it does not consume the
+/// key either. The prune's checkpoint read fails before the cut, so the caller is told the outcome
+/// is unknown; the claim the lookup took is released, so once the fault clears the same
+/// `idempotency_key` executes and records its outcome instead of answering `RECEIPT_EXPIRED` for
+/// the database's lifetime.
+///
+/// The fault is installed on the statement the prune itself runs: a view over
+/// `knowledge_entry_revisions` calling a missing function fails at prepare time, after admission and
+/// after the claim, so the fault is the port's — the store's `InternalError`, the one fault code the
+/// served prune path answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    seed_history(
+        &fixture.store,
+        COLLECTION,
+        "ke_history",
+        &[
+            "the gate opens at dawn",
+            "the gate closes at dusk",
+            "the gate opens again at dawn",
+        ],
+    )
+    .await;
+    let (_dir, serve) = fixture.serve();
+    let surface = history_surface(&serve, principal_admission());
+    let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
+    let key = dedup_key(SPACE, PRINCIPAL, "key-faulted");
+
+    // SQLite has no read trigger, so the fault is installed on the statement the prune itself
+    // runs: `prune_entry_history` reads the entry's checkpoints from
+    // `knowledge_entry_revisions`, and a view over that table calling a missing function fails the
+    // statement at prepare time — the store's `InternalError`, answered after admission and after
+    // the claim, so the fault is the port's and not the Mind admission's.
+    sqlx::query("ALTER TABLE knowledge_entry_revisions RENAME TO knowledge_entry_revisions_intact")
+        .execute(&pool)
+        .await
+        .expect("move the checkpoints aside");
+    sqlx::query(
+        "CREATE VIEW knowledge_entry_revisions AS \
+         SELECT collection, entry_id, revision, payload, cognition_head_seq, recorded_at \
+         FROM knowledge_entry_revisions_intact WHERE no_such_function()",
+    )
+    .execute(&pool)
+    .await
+    .expect("install a checkpoint read that faults");
+
+    let faulted = expect_reject(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "a prune whose checkpoint read faulted",
+    );
+    assert_eq!(
+        faulted.code,
+        SpokeRejectCode::OutcomeUncertain,
+        "a fault is answered as an unsettled settlement, not stored: {faulted:?}"
+    );
+    assert_eq!(
+        dedup_row_count(&pool, COLLECTION).await,
+        0,
+        "the fault was neither recorded as the key's outcome nor left as a claim"
+    );
+    assert_eq!(
+        intact_checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [1, 2],
+        "the faulted prune never reached the store"
+    );
+
+    // The fault clears.
+    sqlx::query("DROP VIEW knowledge_entry_revisions")
+        .execute(&pool)
+        .await
+        .expect("drop the faulting view");
+    sqlx::query("ALTER TABLE knowledge_entry_revisions_intact RENAME TO knowledge_entry_revisions")
+        .execute(&pool)
+        .await
+        .expect("remove the fault");
+
+    // The claim was released, not retained: no row stands between this key and a retry.
+    assert_eq!(
+        dedup_row_count(&pool, COLLECTION).await,
+        0,
+        "the faulted key left no claim behind"
+    );
+
+    // The same key now executes. Released, the key is claimable again, so the retry runs the prune
+    // against the current state and records its outcome — it does not answer RECEIPT_EXPIRED.
+    let recovered = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "the same key executes once the fault cleared",
+    );
+    assert_eq!(
+        (recovered.deleted, recovered.floor_revision),
+        (1, Some(2)),
+        "the retry executed the prune it could not start under the fault"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2],
+        "the executed prune cut the older checkpoint"
+    );
+    let (digest, outcome) = dedup_row(&pool, COLLECTION, &key).await;
+    assert!(
+        digest.is_some() && outcome.is_some(),
+        "the recovery settled the key's outcome: {digest:?} / {outcome:?}"
+    );
+    let outcome = outcome.expect("the recovery recorded an outcome");
+    assert!(
+        outcome.contains("\"deleted\""),
+        "the recorded outcome is the executed prune result: {outcome}"
+    );
+
+    // And the recorded outcome now replays: the key settled exactly once.
+    let replayed = expect_ok(
+        creator
+            .adapter
+            .prune_history(
+                &scope_of(SPACE),
+                "knowledge_entry",
+                "ke_history",
+                1,
+                Some("key-faulted"),
+            )
+            .await,
+        "the same key replays its recorded outcome",
+    );
+    assert_eq!(
+        (replayed.deleted, replayed.floor_revision),
+        (recovered.deleted, recovered.floor_revision),
+        "the replay answers the recorded result"
+    );
+    assert_eq!(
+        checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
+        [2],
+        "the replay did not execute a second prune"
     );
 }
