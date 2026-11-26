@@ -145,8 +145,13 @@ impl MindcoreServe {
         let principals = faces.principals;
         let workflows = self.workflows();
         let engine: Arc<dyn MindWorkflows> = workflows.clone();
-        let mut tools =
-            WorkflowTools::new(engine, Arc::clone(&principals), faces.providers).registrations();
+        let mut tools = WorkflowTools::new(
+            engine,
+            Arc::clone(&principals),
+            faces.providers,
+            self.store.pool(),
+        )
+        .registrations();
         tools.extend(
             faces
                 .tools

@@ -56,8 +56,12 @@ const SCOPE_ID: &str = "spoke-scope-001";
 const COLLECTION: &str = "wren";
 /// The carrier entry id every Mind is created with; the wire never names it.
 const CARRIER: &str = "ke_carrier";
-/// The second Mind's own collection; its carrier entry id is the one every Mind is created with.
+/// The second Mind's own collection.
 const COLLECTION_TWO: &str = "mora";
+/// The second Mind's carrier entry id: deliberately not the production constant, so this fixture
+/// is also the regression that a Mind whose row names a different carrier id settles onto that
+/// id — and so the two Minds' knowledge content can never be interchangeable.
+const CARRIER_TWO: &str = "ke_carrier_mora";
 const SPACE: &str = "spc_loopback";
 /// The second Mind's space, admitted to the second peer only.
 const SPACE_TWO: &str = "spc_loopback_two";
@@ -246,16 +250,16 @@ impl Fixture {
              VALUES (?, ?, 1, ?, ?, ?)",
         )
         .bind(COLLECTION_TWO)
-        .bind(CARRIER)
+        .bind(CARRIER_TWO)
         .bind(
             json!({
                 "schema_version": 1,
-                "entry_id": CARRIER,
+                "entry_id": CARRIER_TWO,
                 "entry_type": "note",
-                "canonical_name": format!("{CARRIER}'s carrier"),
+                "canonical_name": "the second mind's carrier",
                 "status": "confirmed",
                 "revision": 1,
-                "body": { "summary": "what this holder currently holds" },
+                "body": { "summary": "the knowledge of the second mind, not the first" },
                 "extensions": {},
             })
             .to_string(),
@@ -270,7 +274,7 @@ impl Fixture {
         )
         .bind(SPACE_TWO)
         .bind(COLLECTION_TWO)
-        .bind(CARRIER)
+        .bind(CARRIER_TWO)
         .execute(&pool)
         .await
         .expect("seed the second mind's registry row");
@@ -1043,8 +1047,12 @@ async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
     assert_eq!(packed_record_ids(&result), ["rec_market_two", "rec_north_gate_two"]);
     assert_eq!(
         packed_knowledge_ids(&result),
-        [CARRIER],
-        "the peer's own knowledge_read grant fills the slot from its own route: {result}"
+        [CARRIER_TWO],
+        "the peer's own knowledge_read grant fills the slot from its own Mind: {result}"
+    );
+    assert_eq!(
+        result["knowledge"][0]["canonical_name"], "the second mind's carrier",
+        "the slot carries the second Mind's own content: {result}"
     );
 }
 
@@ -1402,6 +1410,8 @@ fn assert_judgment(response: &Value, outcome: &str) {
 /// One surface, two admitted Minds: each peer's call names its own space id and settles the
 /// cognition onto its own carrier entry, and neither call writes the other Mind's carrier. The
 /// `space_id` the request carries decides the collection, so the registry row is the only route.
+/// The second Mind's row names `ke_carrier_mora` — deliberately not the production constant — so
+/// settling onto it is also the regression that the carrier id comes from the registry row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_minds_settle_onto_their_own_carriers() {
     let fixture = Fixture::open().await;
@@ -1430,7 +1440,7 @@ async fn two_minds_settle_onto_their_own_carriers() {
     let surface = surface(&serve, faces);
 
     let first = connect(&surface, &[DELIBERATE, RECALL_CONTEXT]).await;
-    let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER).await;
+    let untouched = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
     let settled = expect_ok(
         first
             .adapter
@@ -1447,7 +1457,7 @@ async fn two_minds_settle_onto_their_own_carriers() {
     );
     assert_eq!(carrier_revision(&pool, COLLECTION, CARRIER).await, 2);
     assert_eq!(
-        carrier_revision(&pool, COLLECTION_TWO, CARRIER).await,
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
         1,
         "the second principal's carrier keeps its seeded revision"
     );
@@ -1456,13 +1466,13 @@ async fn two_minds_settle_onto_their_own_carriers() {
         [PRINCIPAL]
     );
     assert!(
-        carrier_assessors(&pool, COLLECTION_TWO, CARRIER)
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO)
             .await
             .is_empty(),
         "the second collection carries no assessment"
     );
     assert_eq!(
-        collection_state(&pool, COLLECTION_TWO, CARRIER).await,
+        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
         untouched,
         "the first call leaves the second collection's rows, carrier revision and update stamp unchanged"
     );
@@ -1477,14 +1487,14 @@ async fn two_minds_settle_onto_their_own_carriers() {
         "deliberate by the second principal",
     );
     assert_eq!(settled["status"], "settled");
-    assert_eq!(settled["record"]["holder"]["id"], CARRIER);
+    assert_eq!(settled["record"]["holder"]["id"], CARRIER_TWO);
     assert_eq!(settled["record"]["assessor"]["id"], PEER_TWO_PRINCIPAL);
     assert_eq!(
         settled["mind_state_version"], 2,
         "the second write descends from its own carrier, never the first's"
     );
     assert_eq!(
-        carrier_revision(&pool, COLLECTION_TWO, CARRIER).await,
+        carrier_revision(&pool, COLLECTION_TWO, CARRIER_TWO).await,
         2
     );
     assert_eq!(
@@ -1493,7 +1503,7 @@ async fn two_minds_settle_onto_their_own_carriers() {
         "the first principal's carrier keeps the revision its own call left"
     );
     assert_eq!(
-        carrier_assessors(&pool, COLLECTION_TWO, CARRIER).await,
+        carrier_assessors(&pool, COLLECTION_TWO, CARRIER_TWO).await,
         [PEER_TWO_PRINCIPAL]
     );
     assert_eq!(
@@ -1526,6 +1536,10 @@ async fn two_minds_settle_onto_their_own_carriers() {
         [CARRIER],
         "the first principal's slot lists only its own routed collection: {first_pack}"
     );
+    assert_eq!(
+        first_pack["knowledge"][0]["canonical_name"], "ke_carrier's carrier",
+        "the first slot is the first Mind's entry: {first_pack}"
+    );
     let mut second_recall = recall_arguments_in(SPACE_TWO);
     second_recall["max_tokens"] = json!(4_000);
     let second_pack = expect_ok(
@@ -1542,16 +1556,31 @@ async fn two_minds_settle_onto_their_own_carriers() {
     );
     assert_eq!(
         packed_knowledge_ids(&second_pack),
-        [CARRIER],
-        "the second principal's slot lists only its own Mind's collection: {second_pack}"
+        [CARRIER_TWO],
+        "the second Mind's slot names its own carrier entry — the regression that the carrier id          comes from the registry row, not the production constant: {second_pack}"
     );
     assert_eq!(
-        second_pack["knowledge"][0]["canonical_name"], "ke_carrier's carrier",
-        "the slot carries this collection's entry, not the other Mind's copy: {second_pack}"
+        second_pack["knowledge"][0]["canonical_name"], "the second mind's carrier",
+        "the second slot carries the second Mind's entry, never the first's: {second_pack}"
+    );
+    assert_eq!(
+        second_pack["knowledge"][0]["body"]["summary"], "the knowledge of the second mind, not the first",
+        "the content distinguishes the two Minds: {second_pack}"
+    );
+    let contamination: Vec<&str> = first_pack["knowledge"]
+        .as_array()
+        .expect("first knowledge")
+        .iter()
+        .filter_map(|entry| entry["entry_id"].as_str())
+        .filter(|id| *id == CARRIER_TWO)
+        .collect();
+    assert!(
+        contamination.is_empty(),
+        "the first Mind's recall never carries the second Mind's entry: {first_pack}"
     );
 
     let first_before = collection_state(&pool, COLLECTION, CARRIER).await;
-    let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER).await;
+    let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
     // The retired `holder` member: the closed argument object refuses it before any carrier access.
     let mut with_holder = deliberate_arguments();
     with_holder["holder"] = json!({ "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER });
@@ -1573,7 +1602,7 @@ async fn two_minds_settle_onto_their_own_carriers() {
         "a refused write settles nothing in either collection"
     );
     assert_eq!(
-        collection_state(&pool, COLLECTION_TWO, CARRIER).await,
+        collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await,
         second_before,
     );
 }

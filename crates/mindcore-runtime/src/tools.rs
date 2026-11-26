@@ -18,7 +18,6 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use mindcore_sqlite::minds::CARRIER_ENTRY_ID;
 use mindcore_spi::{
     AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
     Embedder, Evidence, MindCapabilities, MindWorkflows, PolicyHook, Reasoner, SpiError,
@@ -26,6 +25,7 @@ use mindcore_spi::{
 use spoke_connect::remote::{ConnectResponder, MemoryAdmission, ToolHandler};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
+use sqlx::SqlitePool;
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
@@ -73,20 +73,23 @@ pub(crate) struct WorkflowTools {
     workflows: Arc<dyn MindWorkflows>,
     principals: MemoryAdmission,
     providers: MindProviders,
+    pool: SqlitePool,
 }
 
 impl WorkflowTools {
     /// Bind the tools to one workflow engine, the host's peer-to-principal admission and its
-    /// providers.
+    /// providers. `pool` serves the Mind registry reads a carrier resolution needs.
     pub fn new(
         workflows: Arc<dyn MindWorkflows>,
         principals: MemoryAdmission,
         providers: MindProviders,
+        pool: SqlitePool,
     ) -> Self {
         Self {
             workflows,
             principals,
             providers,
+            pool,
         }
     }
 
@@ -156,6 +159,7 @@ impl WorkflowTools {
             Arc::clone(&self.workflows),
             Arc::clone(&self.principals),
             self.providers.clone(),
+            self.pool.clone(),
             capability_id,
             peer_id,
             arguments,
@@ -167,16 +171,19 @@ impl WorkflowTools {
         let workflows = Arc::clone(&self.workflows);
         let principals = Arc::clone(&self.principals);
         let providers = self.providers.clone();
+        let pool = self.pool.clone();
         ToolRegistration::new(descriptor, move |responder| {
             let session: Weak<ConnectResponder> = Arc::downgrade(responder);
             let workflows = Arc::clone(&workflows);
             let principals = Arc::clone(&principals);
             let providers = providers.clone();
+            let pool = pool.clone();
             let handler: ToolHandler = Arc::new(move |arguments: Value| {
                 let session = session.clone();
                 let workflows = Arc::clone(&workflows);
                 let principals = Arc::clone(&principals);
                 let providers = providers.clone();
+                let pool = pool.clone();
                 Box::pin(async move {
                     let peer_id = match authenticated_peer(&session) {
                         Ok(peer_id) => peer_id,
@@ -186,6 +193,7 @@ impl WorkflowTools {
                         workflows,
                         principals,
                         providers,
+                        pool,
                         capability_id,
                         &peer_id,
                         arguments,
@@ -221,6 +229,7 @@ async fn serve(
     workflows: Arc<dyn MindWorkflows>,
     principals: MemoryAdmission,
     providers: MindProviders,
+    pool: SqlitePool,
     capability_id: &str,
     peer_id: &str,
     arguments: Value,
@@ -232,7 +241,7 @@ async fn serve(
     match capability_id {
         RECALL_CONTEXT => recall_context(&*workflows, &principal, arguments, &providers).await,
         ABSORB => absorb(&*workflows, &principal, arguments, &providers).await,
-        DELIBERATE => deliberate(&*workflows, &principal, arguments, &providers).await,
+        DELIBERATE => deliberate(&*workflows, &principal, arguments, &providers, &pool).await,
         other => SpokeResult::Reject(SpokeReject {
             code: SpokeRejectCode::InvalidInput,
             message: format!("unknown mindcore tool {other}"),
@@ -301,25 +310,42 @@ async fn deliberate(
     principal: &Principal,
     arguments: Value,
     providers: &MindProviders,
+    pool: &SqlitePool,
 ) -> SpokeResult<Value> {
     let arguments: DeliberateArguments = match decode(arguments) {
         Ok(arguments) => arguments,
         Err(reject) => return SpokeResult::Reject(reject),
     };
-    let evidence: Vec<Evidence<'_>> = arguments
-        .evidence
-        .iter()
-        .map(|evidence| Evidence {
-            id: evidence.id.as_str(),
-            text: evidence.text.as_str(),
-        })
-        .collect();
-    // The carrier is the Mind's own: its registry row names the one carrier
-    // entry every Mind is created with, so a peer never names one.
+    // The carrier is the Mind's own record: the registry row of the request's `space_id` names
+    // it, the same lookup the routing performs, so a peer never names one. A space with no row
+    // is the admission refusal — target-free, exactly as the binding answers it.
+    let carrier_entry_id: Option<String> = match sqlx::query_scalar(
+        "SELECT carrier_entry_id FROM minds WHERE space_id = ?",
+    )
+    .bind(&arguments.space_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(carrier_entry_id) => carrier_entry_id,
+        Err(error) => {
+            return SpokeResult::Reject(SpokeReject {
+                code: SpokeRejectCode::InternalError,
+                message: format!("the mind registry could not be read: {error}"),
+                details: None,
+            })
+        }
+    };
+    let Some(carrier_entry_id) = carrier_entry_id else {
+        return SpokeResult::Reject(SpokeReject {
+            code: SpokeRejectCode::NotAuthorized,
+            message: "the caller is not admitted to the named mind".into(),
+            details: None,
+        });
+    };
     let holder: CognitionReference = match serde_json::from_value(json!({
         "kind": "knowledge_entry",
         "namespace": "mindcore",
-        "id": CARRIER_ENTRY_ID,
+        "id": carrier_entry_id,
     })) {
         Ok(holder) => holder,
         Err(error) => {
@@ -330,6 +356,14 @@ async fn deliberate(
             })
         }
     };
+    let evidence: Vec<Evidence<'_>> = arguments
+        .evidence
+        .iter()
+        .map(|evidence| Evidence {
+            id: evidence.id.as_str(),
+            text: evidence.text.as_str(),
+        })
+        .collect();
     let request = DeliberateRequest {
         space_id: &arguments.space_id,
         subject_id: Some(&arguments.subject_id),

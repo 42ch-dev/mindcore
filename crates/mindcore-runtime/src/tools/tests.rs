@@ -130,8 +130,34 @@ fn admission() -> MemoryAdmission {
     })
 }
 
-fn tools(fake: Arc<Fake>) -> WorkflowTools {
-    WorkflowTools::new(fake, admission(), MindProviders::default())
+/// A store pool with the `minds` table the carrier resolution reads: the handler looks the
+/// carrier entry id up in the registry row of the request's space, so the probe seeds the one
+/// row the tests name.
+async fn registry_pool() -> SqlitePool {
+    // One connection only: every pooled connection opens its own in-memory database, so the
+    // registry row must live on the single connection the probe serves.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite");
+    sqlx::query(
+        "CREATE TABLE minds (space_id TEXT PRIMARY KEY, knowledge_collection TEXT NOT NULL, carrier_entry_id TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create minds");
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES ('spc_1', 'wren', 'ke_wren')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed mind row");
+    pool
+}
+
+async fn tools(fake: Arc<Fake>) -> WorkflowTools {
+    WorkflowTools::new(fake, admission(), MindProviders::default(), registry_pool().await)
 }
 
 fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
@@ -295,6 +321,7 @@ async fn recall_context_round_trips_the_pack() {
 
     let value = expect_ok(
         tools(Arc::clone(&fake))
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "recall context",
@@ -326,7 +353,7 @@ async fn absorb_round_trips_every_candidate_status() {
         },
     ]));
 
-    let tool = tools(Arc::clone(&fake));
+    let tool = tools(Arc::clone(&fake)).await;
     let value = expect_ok(
         tool.call(ABSORB, "peer-driver", absorb_arguments()).await,
         "absorb",
@@ -373,7 +400,7 @@ async fn absorb_round_trips_every_candidate_status() {
 #[tokio::test]
 async fn deliberate_round_trips_every_outcome_branch() {
     let fake = Arc::new(Fake::default());
-    let tool = tools(Arc::clone(&fake));
+    let tool = tools(Arc::clone(&fake)).await;
 
     fake.reply_deliberate(Ok(DeliberateOutcome::NoChange {
         verdict: json!({ "recommendation": { "kind": "none" } }),
@@ -534,7 +561,7 @@ async fn malformed_arguments_are_invalid_input() {
     for (case, capability_id, arguments) in cases {
         let fake = Arc::new(Fake::default());
         let reject = expect_reject(
-            tools(fake)
+            tools(fake).await
                 .call(capability_id, "peer-driver", arguments)
                 .await,
             case,
@@ -548,6 +575,7 @@ async fn unadmitted_peers_are_not_authorized() {
     let fake = Arc::new(Fake::default());
     let reject = expect_reject(
         tools(Arc::clone(&fake))
+            .await
             .call(RECALL_CONTEXT, "peer-stranger", recall_arguments())
             .await,
         "stranger",
@@ -571,7 +599,7 @@ async fn settlement_refusals_keep_their_code_and_details() {
     fake.reply_absorb(Err(SpiError::Settlement(refusal.clone())));
 
     let reject = expect_reject(
-        tools(fake)
+        tools(fake).await
             .call(ABSORB, "peer-driver", absorb_arguments())
             .await,
         "settlement refusal",
@@ -585,7 +613,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
     let fake = Arc::new(Fake::default());
     fake.reply_recall(Err(SpiError::DeadlineExceeded));
     let reject = expect_reject(
-        tools(fake)
+        tools(fake).await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "deadline",
@@ -630,7 +658,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
         let fake = Arc::new(Fake::default());
         fake.reply_recall(Err(error));
         let reject = expect_reject(
-            tools(fake)
+            tools(fake).await
                 .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
                 .await,
             kind,
@@ -655,7 +683,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
         "domain redline on the north gate".into(),
     )));
     let reject = expect_reject(
-        tools(fake)
+        tools(fake).await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "policy",
@@ -683,7 +711,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
         "max_tokens is unsupported".into(),
     )));
     let reject = expect_reject(
-        tools(fake)
+        tools(fake).await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "invalid input",
@@ -697,7 +725,7 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
 #[tokio::test]
 async fn advertised_input_schemas_match_the_decoded_arguments() {
     let fake = Arc::new(Fake::default());
-    let tool = tools(Arc::clone(&fake));
+    let tool = tools(Arc::clone(&fake)).await;
 
     for descriptor in tool.descriptors() {
         let capability_id = descriptor.capability_id.as_str();
@@ -718,7 +746,13 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
             other => panic!("unadvertised tool {other}"),
         }
 
-        let arguments = minimal(&input, &input);
+        let mut arguments = minimal(&input, &input);
+        // `deliberate` resolves the carrier from the registry row of the request's space, so the
+        // manifest-shaped probe names the one Mind this harness seeds. `spc_1` satisfies the
+        // schema's `minLength` either way, so the shape check is unchanged.
+        if capability_id == DELIBERATE {
+            arguments["space_id"] = json!("spc_1");
+        }
         expect_ok(
             tool.call(capability_id, "peer-driver", arguments.clone())
                 .await,
