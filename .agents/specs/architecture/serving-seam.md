@@ -12,9 +12,21 @@ The knowledge face is composed when `ServeFaces.knowledge` is true: `MindcoreSer
 installs one `RemoteScopedKnowledgeFace { store, admission }` and `MindPorts::as_scoped_knowledge`
 answers it, so `port.knowledge.get`, `port.knowledge.put` and
 `port.scope.list_knowledge_entries` are served per Mind. The same flag advertises
-`spoke-knowledge`, `ke-ownership` and `spoke-knowledge-scoped` together, and with it false the three
-ops keep the dispatch-deny answer — raw wire `op_unsupported`, which the Rust dialer surfaces as
-`CapabilityPortMissing` with `details.wire_code`. `RoutedKnowledgeStore` stays the served storage port and `MindKnowledgePort` the `ScopedKnowledgePort` the face installs over it; `ScopedKnowledgeStore` remains the in-process local port beside `MindStore::knowledge`, not a served face.
+`spoke-knowledge` and `spoke-knowledge-scoped` together, and with it false the three ops keep the
+dispatch-deny answer — raw wire `op_unsupported`, which the Rust dialer surfaces as
+`CapabilityPortMissing` with `details.wire_code`.
+
+**`ke-ownership` is not advertised.** The admitted scope never carries a `viewpoint` — the
+callback builds it with `viewpoint: None` — so `scope_matches_admission` can never match a request
+that names one, and the face cannot honour the flag's one protocol gate. Advertising it would
+claim a capability no admitted scope can satisfy; the face advertises only what it serves. A
+request naming a `viewpoint` is therefore refused, never silently served: with the flag never
+offered, no session can negotiate it, so Connect's ownership conjunct answers wire
+`op_unsupported` before admission. Viewpoint support is not implemented in this layer.
+
+`RoutedKnowledgeStore` stays the served storage port and `MindKnowledgePort` the
+`ScopedKnowledgePort` the face installs over it; `ScopedKnowledgeStore` remains the in-process
+local port beside `MindStore::knowledge`, not a served face.
 
 The face is one composition for every Mind, and its admission is a callback, not a route map.
 Connect supplies the authenticated peer id and, through A1, the `scope_id` the request declares or
@@ -27,9 +39,9 @@ path's admission answers. There is no host-configured route map to consume and n
 collection is guessed from an entry id, `owner`, `viewpoint` or Memory `SpaceId`, and the collection
 is resolved again on every call by the store's own `admit`, on the transaction the op's statement
 runs on. Memory space and workflow knowledge grants remain separate and go through the existing
-`MemoryWorkflowBinding` admission. The `ke-ownership` protocol gate checks the negotiated flag for a
-list with an explicit `viewpoint`; it neither chooses the collection nor grants the peer entry
-access.
+`MemoryWorkflowBinding` admission. The `ke-ownership` protocol gate would check a negotiated flag
+for a list with an explicit `viewpoint`; it neither chooses the collection nor grants the peer
+entry access, and this face does not advertise the flag (above).
 
 **The caller the scope carries.** `ScopedKnowledgePort` carries no principal, so the callback binds the caller it admitted into the `Scope` it returns, under this workspace's own extensions namespace: `mindcore_caller` / `principal` (`mindcore_sqlite::bind_caller`, read back by `bound_caller`). `validate_admission_scope` admits that one namespace and refuses every other extension selection, and the callback runs both before it returns, so no scope leaves the face unbound. Binding on every successful return is an obligation, not a precaution: Connect's `effective_scope` merges admitted extension namespaces over the request's on conflict **and passes a request's extensions through unchanged when the admitted scope carries none**, so an admission that answered an unbound scope would let a peer-supplied `mindcore_caller` decide the caller. A Mind the callback cannot resolve to a live admitted grant is therefore refused, never answered with an unbound scope (`.agents/adr/implemented/architecture/2026-11-26-knowledge-caller-in-scope-extensions.md`).
 
@@ -42,11 +54,13 @@ That binding stays off the wire: neither the `mindcore_caller` namespace nor the
 | `port.knowledge.get`, `port.scope.list_knowledge_entries` | `knowledge_read` | it reads |
 | `port.knowledge.put` | `knowledge_write` **and** `knowledge_read` | it writes, and Connect reads the entry through `get` first, for the anchor check and the compare-and-swap |
 
+**The put's authorization runs after Connect's own pre-read.** The served put's grant check lives inside `MindKnowledgePort`, so it runs after Connect's `call_knowledge_op` has already read the entry through the same port's `get` — the read it performs for the anchor check and the compare-and-swap — and after Connect has evaluated its own revision and anchor verdicts against that read. The consequence, stated plainly because it is observable: **a caller whose grant covers `knowledge_read` but not `knowledge_write` can receive `STORED_REVISION_STALE` or an adoption-anchor refusal on a put it is not authorized to make**, rather than the port's `NOT_AUTHORIZED`. The order is Connect's, not this workspace's, and this layer does not change it. It discloses no entry content: the caller already reads the same entry through `get` under the same `knowledge_read`, so a revision number or an anchor verdict tells it nothing its authorized read did not already tell it. What the read grant does not buy is the write — the port still refuses it, and no entry is created or changed.
+
 Requirements never union across grants: a caller holding `knowledge_write` on one row and `knowledge_read` on another is refused, exactly as `one_grant_covers` already decides for memory. A caller holding one grant covering both appends `modules.cognition.records` exactly as before: the append is guarded, not removed. The port answers by what is wrong, never with one answer for every fault: a malformed scope — `extensions` present but not exactly the binding, which the refusal table below admits as `InvalidInput` — is a caller input error and never reaches the binding read; a well-formed scope with no binding, a caller with no live grant and a grant that does not cover the operation answer one fixed `NOT_AUTHORIZED` with no `details` in Connect's admission-deny words; and the grant read takes the pool, never sharing a snapshot with the store call. The guard is the protocol adapter's, not the storage crate's (`2026-11-20-storage-ir-layering.md`), so `RoutedKnowledgeStore` keeps no grant rule; a host that installs it directly skips the guard, and `MindcoreServe` never does.
 
 **The gate order the cohort pins.** After the static capability gate, the responder applies the scope shape check, the marker and ownership conjuncts and the cognition gate, then decodes — and the order differs with the kind of scope op:
 
-- **Shape, then marker, then ownership, then cognition** — the order the pinned cohort applies to the optional `get`/`put` case: `validate_scope_declaration` refuses a present malformed `scope` first; the marker conjunct then answers a `get` or `put` whose payload carries `scope` on a session that did not negotiate `spoke-knowledge-scoped` with wire `op_unsupported`, never a scope it would silently drop; the ownership conjunct answers a non-empty `scope.viewpoint` without `ke-ownership` with wire `op_unsupported`; then the cognition gate. This workspace's evidence covers that order in two parts, and no more: the raw wire tests establish **shape-before-marker** and **marker-before-face** for `get` and `put`; the **ownership conjunct** is established through the typed dialer on the list op, whose required scope makes ownership its only capability conjunct. The **cognition conjunct**, and ownership on the optional-scope ops, are the cohort's own and are not asserted here.
+- **Shape, then marker, then ownership, then cognition** — the order the pinned cohort applies to the optional `get`/`put` case: `validate_scope_declaration` refuses a present malformed `scope` first; the marker conjunct then answers a `get` or `put` whose payload carries `scope` on a session that did not negotiate `spoke-knowledge-scoped` with wire `op_unsupported`, never a scope it would silently drop; the ownership conjunct answers a non-empty `scope.viewpoint` without `ke-ownership` with wire `op_unsupported`; then the cognition gate. This workspace's evidence covers that order in two parts, and no more: the raw wire tests establish **shape-before-marker** and **marker-before-face** for `get` and `put`; the **ownership conjunct** is established through the typed dialer on the list op, whose required scope makes ownership its only capability conjunct — and because this face advertises no `ke-ownership`, that conjunct always refuses a viewpoint list. The **cognition conjunct**, and ownership on the optional-scope ops, are the cohort's own and are not asserted here.
 - **A required-scope query defers one shape failure.** On the list op — and the other required-scope query ops — a scope-declaration failure caused only by the cognition subtree is held as a deferred reject, the cognition gate runs first, and the reject is answered after it. Every other baseline shape failure still answers immediately. The marker conjunct never applies to these ops, since their `scope` is required rather than optional.
 - **Decode sits between two different probes.** A payload that declares a `scope` is decoded before the ports-presence check, so a malformed scoped payload answers `INVALID_INPUT` even on a host with no ports face at all. A payload without `scope` keeps the earlier order: the ports-presence check runs first, its decode failure answers next, and only a decodable call reaches `serve_knowledge_op`, which probes `as_scoped_knowledge()` before the plain knowledge face and answers `op_unsupported` when neither exists.
 
