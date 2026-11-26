@@ -8,10 +8,12 @@
 //! registrations, never from a host-supplied capability string.
 //!
 //! The crate is also the library's entry crate: [`minds`] holds the in-process entry points
-//! `create`, `list` and `get` a host calls on its `MindStore`.
+//! `create`, `list` and `get` a host calls on its `MindStore`, and [`mind`] holds the `Mind`
+//! handle a caller opens over one Mind.
 
 mod adoption;
 mod history_dedup;
+pub mod mind;
 pub mod minds;
 pub mod tools;
 
@@ -45,6 +47,7 @@ use sqlx::SqlitePool;
 
 use adoption::AdoptionService;
 use history_dedup::SqliteHistoryDedupStore;
+pub use mind::Mind;
 pub use tools::MindProviders;
 use tools::WorkflowTools;
 
