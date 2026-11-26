@@ -78,8 +78,8 @@ impl AdoptionPort for AdoptionService {
         if request.source_scope_id.as_str() != self.source.scope_id {
             return source_absent();
         }
-        // Assembly already refuses a source scope that is a registered Mind, but a Mind created
-        // afterwards can take that id, so the same decision is made here. It needs no statement.
+        // A configured source scope id that is the admitted Mind's own needs no statement to
+        // refuse: the same collision the transaction re-checks against the whole registry.
         if self.source.scope_id == scope.scope_id.as_str() {
             return source_absent();
         }
@@ -149,16 +149,20 @@ async fn adopt_in(
     {
         return SpokeResult::Reject(reject);
     }
-    // The destination is the admitted Mind's registry row. No row is the target-free refusal; a
-    // collection that is the source's own is answered as a missing source, the decision assembly
-    // cannot make for a Mind created after it.
+    // The destination is the admitted Mind's registry row. No row is the target-free refusal.
     let destination = match registered_collection(&mut **transaction, &admitted.scope_id).await {
         SpokeResult::Ok(Some(collection)) => collection,
         SpokeResult::Ok(None) => return not_authorized(),
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
-    if destination == source.source.collection {
-        return source_absent();
+    // Assembly refuses a source that is any registered Mind's, but a Mind created afterwards can
+    // take one, so the same two decisions are remade here against the whole registry — not only
+    // the admitted Mind. Otherwise a later Mind's collection would become the shared source
+    // another Mind's caller reads, with no grant checked against it.
+    match source_collides(&mut *transaction, source).await {
+        SpokeResult::Ok(false) => {}
+        SpokeResult::Ok(true) => return source_absent(),
+        SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     }
 
     let gate = Mutex::new(transaction);
@@ -396,6 +400,46 @@ fn adoption_refusal(reject: SpokeReject) -> SpokeReject {
     }
 }
 
+/// Whether the configured source names any registered Mind's collection, or its scope id names any
+/// registered Mind. Every registered Mind is a possible destination, so either collision is the
+/// same generic absence — the caller learns nothing about which Mind holds the source.
+///
+/// Reads on the adoption transaction, after the grant check, so the answer and the copy share one
+/// snapshot.
+async fn source_collides(
+    transaction: &mut Transaction<'_, Sqlite>,
+    source: &AdoptionRoute,
+) -> SpokeResult<bool> {
+    let queries = [
+        (
+            "SELECT 1 FROM minds WHERE knowledge_collection = ?",
+            source.source.collection.as_str(),
+        ),
+        (
+            "SELECT 1 FROM minds WHERE space_id = ?",
+            source.scope_id.as_str(),
+        ),
+    ];
+    for (query, value) in queries {
+        let found: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(query)
+            .bind(value)
+            .fetch_optional(&mut **transaction)
+            .await;
+        match found {
+            Ok(None) => {}
+            Ok(Some(_)) => return SpokeResult::Ok(true),
+            Err(_) => {
+                return spoke_reject(
+                    SpokeRejectCode::InternalError,
+                    "mind storage is unavailable",
+                    None,
+                )
+            }
+        }
+    }
+    SpokeResult::Ok(false)
+}
+
 /// The adopted copy as the response envelope.
 ///
 /// Built before the transaction settles, so a copy the served wire cannot describe refuses the
@@ -600,6 +644,22 @@ mod tests {
                 "seed shared/{entry_id}: {written:?}"
             );
         }
+    }
+
+    /// One registered Mind created through the production `create`, answering the collection the
+    /// registry assigned it.
+    async fn registered_mind(store: &MindStore, mind_id: &str, owner: &str) -> String {
+        let mind = ok(
+            store
+                .create_mind(&CreateMind {
+                    mind_id: Some(MindId::new(mind_id)),
+                    display_name: None,
+                    owner: CallerId::new(owner),
+                })
+                .await,
+            "create a Mind",
+        );
+        mind.knowledge.collection
     }
 
     /// One space-wide grant, as a host issues one to a peer it admits into `space`.
@@ -1025,6 +1085,81 @@ mod tests {
             authorized.code,
             SpokeRejectCode::NotFound,
             "what a registry-first order would have answered: {authorized:?}"
+        );
+        assert_ne!(
+            unauthorized, authorized,
+            "the two orders are distinguishable, so the unauthorized answer pins the order"
+        );
+    }
+
+    /// The grant check stands ahead of the registry **query**, not merely ahead of using its
+    /// answer: with the `minds` table withheld, any call that reaches that query answers a storage
+    /// fault, whatever the query would have returned and independent of whether the row is read
+    /// afterwards.
+    ///
+    /// The unauthorized caller still answers the target-free `NOT_AUTHORIZED`, so the statement
+    /// was never run. The granted creator passes the same check and does reach it, answering the
+    /// fixed adoption store fault: that control proves the broken query is genuinely reachable, so
+    /// the unauthorized answer is the check's own refusal and not an artifact of a statement that
+    /// could not fail here anyway.
+    #[tokio::test]
+    async fn the_grant_check_precedes_the_registry_query_itself() {
+        let (_dir, store, service) = service().await;
+        sqlx::query("ALTER TABLE minds RENAME TO minds_withheld")
+            .execute(&store.pool())
+            .await
+            .expect("withhold the registry table");
+
+        // The withholding is real on this pool: the production query itself now fails, so nothing
+        // below can pass because the fixture changed an unrelated table.
+        let withheld =
+            mindcore_sqlite::minds::registered_collection(&store.pool(), DESTINATION_MIND).await;
+        assert!(
+            matches!(withheld, SpokeResult::Reject(_)),
+            "the fixture must break the registry query itself: {withheld:?}"
+        );
+        let source_before = collection_rows(&store, SOURCE_COLLECTION).await;
+
+        let unauthorized = refused(
+            service
+                .adopt_knowledge_entry(
+                    &principal("prn_stranger"),
+                    &scope(DESTINATION_MIND),
+                    &request("ke_source", 1),
+                )
+                .await,
+            "an unauthorized caller while the registry query cannot answer",
+        );
+        assert_eq!(
+            unauthorized.code,
+            SpokeRejectCode::NotAuthorized,
+            "the grant is decided before the registry statement runs: {unauthorized:?}"
+        );
+        assert!(unauthorized.details.is_none(), "{unauthorized:?}");
+        assert_eq!(
+            collection_rows(&store, SOURCE_COLLECTION).await,
+            source_before,
+            "a refused adoption writes nothing"
+        );
+
+        let authorized = refused(
+            service
+                .adopt_knowledge_entry(
+                    &principal(OWNER),
+                    &scope(DESTINATION_MIND),
+                    &request("ke_source", 1),
+                )
+                .await,
+            "the granted creator reaching the withheld registry",
+        );
+        assert_eq!(
+            authorized.code,
+            SpokeRejectCode::InternalError,
+            "what a registry-first order would have answered: {authorized:?}"
+        );
+        assert_eq!(
+            authorized.message, ADOPTION_FAULT,
+            "the storage fault is the fixed adoption one: {authorized:?}"
         );
         assert_ne!(
             unauthorized, authorized,
@@ -1510,5 +1645,123 @@ mod tests {
                 "a {state} occupant must not be distinguishable from a live visible one"
             );
         }
+    }
+
+    /// A Mind created after the surface was assembled must not become the shared source: its
+    /// collection is another Mind's, so reading it would disclose its entries to a caller whose grant
+    /// covers only the admitted Mind.
+    ///
+    /// Assembly would refuse this configuration, which is why the service is built before the Mind
+    /// exists — the state a long-lived surface reaches when a Mind is created later. The caller holds
+    /// the admitted Mind's covering grant and nothing in the later Mind.
+    #[tokio::test]
+    async fn a_later_minds_collection_never_becomes_the_shared_source() {
+        let dir = TempDir::new().expect("temporary directory");
+        let store = MindStore::open(&dir.path().join("adoption.db"))
+            .await
+            .expect("open store");
+        registered_mind(&store, DESTINATION_MIND, OWNER).await;
+        seed_source(&store).await;
+        let service = AdoptionService::new(
+            store.pool(),
+            AdoptionRoute {
+                scope_id: SHARED_SCOPE.to_string(),
+                source: KnowledgeScope::new("mind:spc_future"),
+            },
+        );
+        // The Mind the configured source names now exists, and its collection holds an entry.
+        let future = registered_mind(&store, "spc_future", "prn_future_owner").await;
+        assert_eq!(future, "mind:spc_future");
+        let seeded = store
+            .knowledge(KnowledgeScope::new(&future))
+            .put_knowledge_entry(entry("ke_future"), None)
+            .await;
+        assert!(
+            matches!(seeded, SpokeResult::Ok(_)),
+            "seed {future}: {seeded:?}"
+        );
+        let source_before = collection_rows(&store, &future).await;
+        let destination_before = collection_rows(&store, DESTINATION_COLLECTION).await;
+
+        let refused_answer = refused(
+            service
+                .adopt_knowledge_entry(
+                    &principal(OWNER),
+                    &scope(DESTINATION_MIND),
+                    &request("ke_future", 1),
+                )
+                .await,
+            "a caller adopting from a later Mind's collection",
+        );
+        assert_eq!(refused_answer.code, SpokeRejectCode::NotFound);
+        assert!(refused_answer.details.is_none(), "{refused_answer:?}");
+        // Byte-identical to the generic absence a missing source entry answers: the collision must not
+        // be distinguishable from the absence it stands for.
+        let generic = AdoptionService::new(
+            store.pool(),
+            AdoptionRoute {
+                scope_id: SHARED_SCOPE.to_string(),
+                source: KnowledgeScope::new(SOURCE_COLLECTION),
+            },
+        );
+        let absent = refused(
+            generic
+                .adopt_knowledge_entry(
+                    &principal(OWNER),
+                    &scope(DESTINATION_MIND),
+                    &request("ke_missing", 1),
+                )
+                .await,
+            "a source entry the shared collection does not hold",
+        );
+        assert_eq!(refused_answer, absent);
+        assert_eq!(
+            collection_rows(&store, &future).await,
+            source_before,
+            "the other Mind's collection is untouched"
+        );
+        assert_eq!(
+            collection_rows(&store, DESTINATION_COLLECTION).await,
+            destination_before,
+            "nothing is copied into the admitted Mind"
+        );
+    }
+
+    /// The mirror: a configured source scope id that names a later-created Mind is the same generic
+    /// absence, so the peer learns nothing about which Mind the surface names.
+    #[tokio::test]
+    async fn a_later_minds_id_never_names_the_shared_source() {
+        let dir = TempDir::new().expect("temporary directory");
+        let store = MindStore::open(&dir.path().join("adoption.db"))
+            .await
+            .expect("open store");
+        registered_mind(&store, DESTINATION_MIND, OWNER).await;
+        seed_source(&store).await;
+        const LATER: &str = "spc_later";
+        let service = AdoptionService::new(
+            store.pool(),
+            AdoptionRoute {
+                scope_id: LATER.to_string(),
+                source: KnowledgeScope::new(SOURCE_COLLECTION),
+            },
+        );
+        registered_mind(&store, LATER, "prn_later_owner").await;
+        let destination_before = collection_rows(&store, DESTINATION_COLLECTION).await;
+
+        let mut later_request = request("ke_source", 1);
+        later_request.source_scope_id = LATER.parse().expect("scope id");
+        let refused_answer = refused(
+            service
+                .adopt_knowledge_entry(&principal(OWNER), &scope(DESTINATION_MIND), &later_request)
+                .await,
+            "a configured source scope id naming a later Mind",
+        );
+        assert_eq!(refused_answer.code, SpokeRejectCode::NotFound);
+        assert!(refused_answer.details.is_none(), "{refused_answer:?}");
+        assert_eq!(
+            collection_rows(&store, DESTINATION_COLLECTION).await,
+            destination_before,
+            "nothing is copied into the admitted Mind"
+        );
     }
 }

@@ -66,9 +66,10 @@ describes the source side only. Assembly refuses, before any port or registratio
 - the route is configured without `knowledge`.
 
 Every registered Mind is a possible destination, so a collision with one is refused whatever Mind
-holds it. A Mind created afterwards can still take a colliding id or collection: the port makes the
-same two decisions per call and answers the generic `NOT_FOUND`, so the invariant holds without a
-reassembly.
+holds it. A Mind created afterwards can still take a colliding id or collection, and assembly has
+already run: the port repeats both registry checks inside the adoption transaction, after the grant
+check and before the source is read, and answers the generic `NOT_FOUND`. The invariant therefore
+holds without a reassembly, and the caller cannot tell the collision from a missing source.
 
 The destination is not configured: each call resolves the collection from the registry row of the
 Mind the caller was admitted to, inside the copy's one transaction
