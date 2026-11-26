@@ -62,8 +62,18 @@
 //! that are decisions: `NOT_AUTHORIZED`, `NOT_FOUND`, `HISTORY_TRUNCATED`,
 //! `HISTORY_ENTITY_UNSUPPORTED`, `INVALID_INPUT`. [`is_storage_fault`] is that rule, it reads the
 //! reject code rather than the message text, and it is the one place to change when the served
-//! path gains a code; the caller of a fault is answered through [`outcome_not_settled`] and the
-//! claim is left as a claim, so a retry once the fault clears executes.
+//! path gains a code.
+//!
+//! On a fault the claim is **released**, not retained: [`release_claim`] deletes the unanswered row
+//! before the caller is answered, so once the fault clears the same `idempotency_key` can be
+//! claimed again and the prune can execute. Leaving the claim behind would be indistinguishable —
+//! to every later caller — from a prune that ran and never settled, and would answer
+//! `RECEIPT_EXPIRED` for the database's lifetime. The caller is still answered
+//! [`outcome_not_settled`]'s uncertain outcome: it was not told the prune succeeded, and nothing
+//! in that answer asserts the prune had no effect. The prune may in fact have committed — the
+//! commit acknowledgement is one of the faults this path covers — so a retry executes against the
+//! current state, which is the same exposure a crash between the commit and the record has always
+//! carried.
 
 use std::io::Write;
 
@@ -132,33 +142,33 @@ async fn namespace_of(pool: &SqlitePool, key: &str) -> Result<Option<String>, Sp
     }
 }
 
-/// The codes that mean the prune did not reach a decision about the Mind's history.
+/// The codes that make a reject a storage fault rather than the key's settled answer.
 ///
 /// **`INTERNAL_ERROR` is the whole list, and it is the list because of how the path is built.**
 /// Every fault on the way to a prune answer is reported as `InternalError` and nothing else:
 /// `mindcore_sqlite`'s `internal`, which every failed statement on the store, the route and the
 /// checkpoint reads maps to; `MindHistoryPort`'s `storage_unavailable`, which is the grant read's
-/// one failure answer; and Connect's own transport decode fault. A code is a fault only when it
-/// says the work could not be carried out — never a decision the work reached. The decisions are
-/// the rest: `NOT_AUTHORIZED` (the grant check refused), `NOT_FOUND` (the row is absent, retired or
-/// hidden), `HISTORY_TRUNCATED` and `HISTORY_ENTITY_UNSUPPORTED` (the request is out of range or out
-/// of coverage), `INVALID_INPUT` (`keep == 0` and the decoder's own shape checks).
+/// one failure answer; and Connect's own transport decode fault. A code is a fault when it says the
+/// work could not be carried out — never when it is a decision the work reached.
 ///
-/// The distinction is a property of the code, not of the message text: a diagnostic's words change
-/// with the driver, and matching on them would silently reclassify a refusal as a fault — or a
-/// fault as a refusal, which is the worse direction, because a fault recorded as a settled answer
-/// is permanent. A new code reaches this function as "not a fault" only by being added to this
-/// list, so the default is the safe one for a refusal that keeps the caller's answer honest.
-///
-/// A fault is **not** settled: the row keeps its claim, so a retry after the fault clears executes
-/// instead of replaying a transient storage error for the key's lifetime, and the caller's answer
-/// is the uncertain outcome [`outcome_not_settled`] describes rather than a recorded fault.
+/// **What a code outside this list does.** It is settled: its reject is written as the key's
+/// outcome and replayed verbatim to a same-key retry. That is the whole rule — there is no second
+/// check, no inspection of the message, and no code that reaches a third path. So a new code added
+/// to the served path without being added here is classified as a decision and persisted, which is
+/// the wrong answer if it actually reports a fault. The rule is stated as an allow-list of faults
+/// precisely so that mistake has to be made explicitly, in this function, by someone adding a
+/// variant; the alternative — treating everything but an enumerated set of decisions as a fault —
+/// would silently stop settling a genuine refusal whose code nobody thought to list, and a refusal
+/// that is not settled is a prune a retry re-executes.
 fn is_storage_fault(code: SpokeRejectCode) -> bool {
     matches!(code, SpokeRejectCode::InternalError)
 }
 
 /// The answer a prune gives when its outcome is not settled: a failed write, a registry fault, or
 /// a fault the port answered.
+///
+/// The claim has been released by the time this runs, so the key is claimable again; this answer
+/// tells the caller the outcome is unknown rather than that the prune did not happen.
 ///
 /// **Why a panic, deliberately.** `HistoryDedupStore::record` answers `()`
 /// (`serve_ports.rs:464-465`): it carries no error channel, and `HistoryPortService` returns the
@@ -190,6 +200,71 @@ impl SqliteHistoryDedupStore {
     /// No namespace: the admitted Mind names it, and the registry resolves it on every call.
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Drop the claim `lookup` inserted, so the key is claimable again and a retry can execute.
+    ///
+    /// This is the whole difference between "this key has no outcome" and "this key may never run
+    /// again". A storage fault says the work could not be carried out, so retrying it is the
+    /// caller's remedy; a retained claim would turn that into `RECEIPT_EXPIRED` for the database's
+    /// lifetime. Only an unanswered claim is removed: a settled row is left alone, because the
+    /// delete runs on the unsettled paths, where the row is by definition the claim and nothing
+    /// else.
+    ///
+    /// Callers reach this on the way to [`outcome_not_settled`], which diverges, so no path answers
+    /// the caller without first attempting the release.
+    ///
+    /// The namespace is resolved only to narrow the delete; it is not a precondition. A registry
+    /// fault — one of the faults this path covers — must not be able to skip the release by making
+    /// the namespace unreadable, so the statement falls back to the key alone, still restricted to
+    /// an unanswered row. That fallback is safe because the key is the canonical retry identity,
+    /// which embeds the effective scope: the same key string can only name one Mind, so the rows it
+    /// can match are that Mind's own claims, and an unanswered claim is precisely the state this
+    /// function removes. Every other row keeps its settled outcome.
+    ///
+    /// A delete that itself fails is reported host-side and does not change the answer: the caller
+    /// is already being told the outcome is uncertain, and the row's removal is what a later retry
+    /// depends on rather than what this answer asserts.
+    async fn release_claim(&self, key: &str) {
+        let released = match self.namespace_for_release(key).await {
+            Some(namespace) => sqlx::query(
+                "DELETE FROM history_dedup \
+                 WHERE namespace = ? AND key = ? \
+                   AND payload_digest IS NULL AND outcome_json IS NULL",
+            )
+            .bind(&namespace)
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected()),
+            None => sqlx::query(
+                "DELETE FROM history_dedup WHERE key = ? \
+                   AND payload_digest IS NULL AND outcome_json IS NULL",
+            )
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected()),
+        };
+        // `Ok(0)` is not a failure: the row was already settled or never claimed, and a settled
+        // outcome must never be deleted by a release path. Only a statement fault is diagnosed.
+        if let Err(error) = released {
+            let _ = writeln!(
+                std::io::stderr(),
+                "mindcore history dedup claim release fault: {error}"
+            );
+        }
+    }
+
+    /// The namespace a release needs, resolved without the fault branch: a key naming no Mind has
+    /// no row to release, and a registry fault here leaves the claim for the retry's own `lookup`
+    /// to answer.
+    async fn namespace_for_release(&self, key: &str) -> Option<String> {
+        let scope_id = scope_of(key)?;
+        match mindcore_sqlite::minds::registered_collection(&self.pool, &scope_id).await {
+            SpokeResult::Ok(collection) => collection,
+            SpokeResult::Reject(_) => None,
+        }
     }
 }
 
@@ -271,15 +346,19 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             Ok(Some(namespace)) => namespace,
             Ok(None) => return,
             // The prune may have committed and this read is what would have settled it. A
-            // registry fault is not "nothing to settle", so it takes the fault path.
-            Err(reject) => outcome_not_settled(reject.message),
+            // registry fault is not "nothing to settle", so it takes the unsettled path.
+            Err(reject) => {
+                self.release_claim(key).await;
+                outcome_not_settled(reject.message);
+            }
         };
-        // A fault is not the key's settled answer: it says the work could not be carried out, so
-        // recording it would make one transient failure permanent for this retry identity. The
-        // claim stays, and the caller is answered the uncertain outcome instead. See
-        // [`is_storage_fault`] for the rule and why it reads the code rather than the text.
+        // A fault is not the key's settled answer: it says the working could not be carried out, so
+        // recording it would make one transient failure permanent for this retry identity. The claim
+        // is released and the caller is answered the uncertain outcome. See [`is_storage_fault`] for
+        // the rule and why it reads the code rather than the text.
         if let SpokeResult::Reject(reject) = &record.outcome {
             if is_storage_fault(reject.code) {
+                self.release_claim(key).await;
                 outcome_not_settled(format!(
                     "the port answered {}: {}",
                     reject.code.as_str(),
@@ -313,8 +392,10 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         .await;
         if let Err(error) = written {
             // The statement never settled the outcome, so the caller must not be told its prune
-            // succeeded: see [`outcome_not_settled`] for the channel and the reason. The claim
-            // row stays in place, so the key answers `RECEIPT_EXPIRED` rather than re-executing.
+            // succeeded: see [`outcome_not_settled`] for the channel and the reason. The claim is
+            // released first, so a retry once the store is writable again can execute rather than
+            // reading this failure back as `RECEIPT_EXPIRED`.
+            self.release_claim(key).await;
             outcome_not_settled(error);
         }
     }
@@ -492,19 +573,6 @@ mod tests {
             .fetch_one(&store.pool())
             .await
             .expect("count the namespace's rows")
-    }
-
-    /// One row's `(payload_digest, outcome_json)`: `None`/`None` for a claim still in flight.
-    async fn dedup_row(store: &MindStore, key: &str) -> (Option<String>, Option<String>) {
-        sqlx::query_as(
-            "SELECT payload_digest, outcome_json FROM history_dedup \
-             WHERE namespace = ? AND key = ?",
-        )
-        .bind(COLLECTION)
-        .bind(key)
-        .fetch_one(&store.pool())
-        .await
-        .expect("read the namespace's dedup row")
     }
 
     async fn principal_row_count(store: &MindStore, namespace: &str, principal: &str) -> i64 {
@@ -854,8 +922,8 @@ mod tests {
     }
 
     /// A settlement failure is never answered as success, and never leaves a phantom success
-    /// behind: the claim stays a claim, so a same-key retry reads `Evicted` instead of the outcome
-    /// the caller was told it had.
+    /// behind: nothing is written, and the claim is released, so a same-key retry claims fresh and
+    /// executes instead of reading back an outcome the caller was told it had.
     ///
     /// The fault is installed as a database-level trigger refusing the `record` upsert, which is
     /// what a full disk, a locked page or a corrupt file looks like to this statement. The claim
@@ -909,17 +977,23 @@ mod tests {
             "the fault names its stage for the host's log: {message}"
         );
 
-        // No phantom success: the row is still the claim `lookup` made, so a same-key retry is
-        // refused rather than answered with an outcome that never persisted.
+        // No phantom success, and no spent key either: the claim is released, so the key can be
+        // claimed again and a retry can execute once the store is writable.
         assert_eq!(
-            dedup_row(&store, &key).await,
-            (None, None),
-            "the failed settlement wrote no outcome"
+            row_count(&store, COLLECTION).await,
+            0,
+            "the failed settlement neither wrote an outcome nor left a claim"
         );
+        // With the trigger gone the retry claims fresh and executes. The fault this test installs
+        // refuses updates, not inserts, so the claim path is open throughout.
+        sqlx::query("DROP TRIGGER refuse_settlement")
+            .execute(&store.pool())
+            .await
+            .expect("remove the settlement fault");
         assert_eq!(
             dedup.lookup(&key).await,
-            HistoryDedupLookup::Evicted,
-            "a retry sees an unsettled claim, never a success the first call never held"
+            HistoryDedupLookup::Unseen,
+            "the released key is claimable again"
         );
     }
 
@@ -951,11 +1025,12 @@ mod tests {
         }
     }
 
-    /// A storage fault the port answers is never the key's settled outcome: the claim stays a
-    /// claim, so a retry after the fault clears executes instead of replaying the fault for the
-    /// key's lifetime, and the caller who hit the fault is answered as unsettled.
+    /// A storage fault the port answers is neither the key's settled outcome nor the end of the
+    /// key: the claim is released, so a retry once the fault clears claims again and executes
+    /// instead of answering `RECEIPT_EXPIRED` for the database's lifetime. The caller who hit the
+    /// fault is answered as unsettled.
     #[tokio::test]
-    async fn a_port_fault_is_not_settled_as_the_keys_outcome() {
+    async fn a_port_fault_releases_the_claim_so_the_key_can_execute_again() {
         let dir = TempDir::new().expect("temporary directory");
         let (store, dedup) = open(&dir).await;
         let dedup = Arc::new(dedup);
@@ -988,16 +1063,27 @@ mod tests {
         );
 
         assert_eq!(
-            dedup_row(&store, &key).await,
-            (None, None),
-            "the fault was not written as the key's outcome"
+            row_count(&store, COLLECTION).await,
+            0,
+            "the fault was neither written as the key's outcome nor left as a claim"
         );
 
-        // The fault clears. The same key must execute, not replay `INTERNAL_ERROR` from the row.
+        // The fault clears and the same key claims fresh, executes, and settles. This is the whole
+        // point of releasing rather than retaining: `Evicted` here would mean the key was spent.
         assert_eq!(
             dedup.lookup(&key).await,
-            HistoryDedupLookup::Evicted,
-            "the claim is still a claim, so the key is not a recorded fault"
+            HistoryDedupLookup::Unseen,
+            "the released key is claimable again, not refused"
+        );
+        let executed = record(
+            "digest",
+            SpokeResult::Ok(json!({ "deleted": 1, "floor_revision": 2 })),
+        );
+        dedup.record(&key, executed.clone()).await;
+        assert_eq!(
+            recorded(dedup.lookup(&key).await, "after the fault cleared"),
+            executed,
+            "the recovered key settles and replays its own result"
         );
     }
 
