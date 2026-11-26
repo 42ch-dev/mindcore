@@ -113,3 +113,29 @@ principal and tests the visible set there.
 SELECT grant_id, revision FROM memory_grants
  WHERE principal_id = ? AND +space_id IN (SELECT value FROM json_each(?));
 ```
+
+### A single undecodable column aborts the whole row stream
+
+`query_as!` compiles to `sqlx::query(...).try_map(...)`, and the `?` inside that mapper ends the
+stream. One row whose column cannot be decoded (bad UTF-8, malformed JSON, an unparseable
+timestamp) therefore hides every row sorted after it — so a "skip the bad row and keep going" rule
+written outside the mapper never runs. The same shape appears in a visibility read that projects a
+whole page.
+
+### After
+
+When a read must tolerate a bad row, do not use `query_as!`. Select with `sqlx::query` and decode
+each `SqliteRow` yourself in a loop that records the failure and continues:
+
+```rust
+let mut rows = sqlx::query("SELECT grant_id, capability, expires_at FROM memory_grants WHERE space_id = ?")
+    .bind(space_id).fetch(tx.as_mut());
+let mut out = Vec::new();
+while let Some(row) = rows.try_next().await? {          // stream survives the bad row
+    match grant_of(&row) { Ok(g) => out.push(g), Err(_) => continue }   // row-local failure
+}
+```
+
+The rule this encodes: decide whether a row is decodable **at the row**, and let the loop decide
+what a failure means (skip it for a visibility read, refuse for a single-row point read). A
+`try_map` mapper cannot express that choice, because its failure is the stream's failure.
