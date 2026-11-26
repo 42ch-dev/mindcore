@@ -240,12 +240,25 @@ impl SqliteHistoryDedupStore {
     /// This is the whole difference between "this key has no outcome" and "this key may never run
     /// again". A storage fault says the work could not be carried out, so retrying it is the
     /// caller's remedy; a retained claim would turn that into `RECEIPT_EXPIRED` for the database's
-    /// lifetime. Only an unanswered claim is removed: a settled row is left alone, because the
-    /// delete runs on the unsettled paths, where the row is by definition the claim and nothing
-    /// else.
+    /// lifetime. Only an unanswered claim is removed — the guard is in the statement below — so a
+    /// settled outcome, this key's or another caller's, is never deleted here.
     ///
-    /// Callers reach this on the way to [`outcome_not_settled`], which diverges, so no path answers
-    /// the caller without first attempting the release.
+    /// **Callers.** Two methods, on four paths:
+    ///
+    /// - `lookup`, when the outcome read after its own claim insert fails. The release runs only if
+    ///   that call made the insert (`claimed`), and what follows is `HistoryDedupLookup::Evicted`
+    ///   through [`fault`] — not [`outcome_not_settled`], which is the served invoke's answer, while
+    ///   this is the dedup probe's.
+    /// - `record`, on each of the three ways it cannot settle: the registry read failed, the port
+    ///   answered a [storage fault](is_storage_fault), or the settlement write itself failed. Each
+    ///   of those then answers through [`outcome_not_settled`], which diverges.
+    ///
+    /// So the release is attempted exactly where a call has just created a claim, or arrived to
+    /// settle one and failed. Paths that answer without it never had a claim to release: `lookup`'s
+    /// namespace fault and its pool-acquisition and claim-statement faults answer `Evicted` before
+    /// any row exists, and `record` returns early, writing nothing, for a key whose namespace
+    /// resolves to no Mind — `lookup` answered `Evicted` for that key, so no prune ran and there is
+    /// no outcome to settle.
     ///
     /// The namespace is resolved only to narrow the delete; it is not a precondition. A registry
     /// fault — one of the faults this path covers — must not be able to skip the release by making
