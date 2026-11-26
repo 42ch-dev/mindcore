@@ -562,10 +562,10 @@ async fn a_refusal_names_no_caller() {
         "a put refused for want of a capability",
     );
     let rendered = format!("{refused:?}");
-    for secret in [READER, CALLER_NAMESPACE, "knowledge_write", MIND, "p_wren"] {
+    for guarded in [READER, CALLER_NAMESPACE, "knowledge_write", MIND, "p_wren"] {
         assert!(
-            !rendered.contains(secret),
-            "the refusal must not name {secret}: {rendered}"
+            !rendered.contains(guarded),
+            "the refusal must not contain a guarded caller, capability or space value"
         );
     }
 
@@ -576,10 +576,10 @@ async fn a_refusal_names_no_caller() {
         "a list refused for want of a binding",
     );
     let rendered = format!("{refused:?}");
-    for secret in [CALLER_NAMESPACE, MIND] {
+    for guarded in [CALLER_NAMESPACE, MIND] {
         assert!(
-            !rendered.contains(secret),
-            "the refusal must not name {secret}: {rendered}"
+            !rendered.contains(guarded),
+            "the refusal must not contain a guarded caller or space value"
         );
     }
 }
