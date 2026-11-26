@@ -32,6 +32,10 @@ use spoke_schemas::{
     KnowledgeAdoptRequest, KnowledgeAdoptResponse, KnowledgeEntry, Principal, Scope,
 };
 
+/// The `SchemaVersion` ceiling on the wire (`2^53 - 1`), from the pinned schema crate: every
+/// structural `schema_version` member is bounded by it, and the generated carriers are not.
+const SCHEMA_VERSION_MAX: u64 = spoke_schemas::integers::SCHEMA_VERSION_MAX;
+
 /// The one grant an adoption needs, and needs on one row: it writes a knowledge entry into the
 /// Mind's collection and returns the copy, so it is a knowledge put and a get together.
 const ADOPTION_CAPABILITIES: [&str; 2] = ["knowledge_write", "knowledge_read"];
@@ -449,14 +453,8 @@ fn adopted(outcome: AdoptionOutcome) -> SpokeResult<KnowledgeAdoptResponse> {
         AdoptionOutcome::Created(entry) => ("adopted", entry),
         AdoptionOutcome::AlreadyPresent(entry) => ("already_present", entry),
     };
-    if !served_entry_revision(&entry) {
-        return SpokeResult::Reject(adoption_fault(
-            "response",
-            format!(
-                "adopted copy {} carries a revision outside the served range",
-                entry.entry_id
-            ),
-        ));
+    if let Some(reason) = unserveable(&entry) {
+        return SpokeResult::Reject(adoption_fault("response", reason));
     }
     match serde_json::from_value(json!({ "outcome": word, "entry": entry })) {
         Ok(response) => SpokeResult::Ok(response),
@@ -464,13 +462,68 @@ fn adopted(outcome: AdoptionOutcome) -> SpokeResult<KnowledgeAdoptResponse> {
     }
 }
 
-/// Whether the served response's own revision member sits inside the served range. A created copy
-/// is assigned by the store, but a destination slot that already held this adoption can carry a
-/// stored revision above it.
-fn served_entry_revision(entry: &KnowledgeEntry) -> bool {
-    entry
+/// Why the served wire cannot carry this copy, or `None` when it can.
+///
+/// The same bounds Connect's success gate applies to an adoption response, enforced before the
+/// commit: a copy that violates one would otherwise commit and then be refused on the way out,
+/// leaving a write behind a refusal. Two members are bounded:
+///
+/// - every structural `schema_version` member, `[1, 2^53 - 1]`
+///   ([`spoke_schemas::integers::SCHEMA_VERSION_MAX`]) — the generated carriers are unbounded
+///   `NonZeroU64`, so `KnowledgeEntry`, its `source_anchor` and its `adoption_anchor` must each be
+///   checked; product-owned opaque bags are not protocol members and are skipped, as Connect skips
+///   them;
+/// - the revision-typed members `[0, 2^53]`, which for a copy are the entry's own `revision` and
+///   its anchor's `source_revision`. A created copy is assigned by the store and the anchor is
+///   built from the request, so only a destination slot an earlier call filled can carry one above
+///   [`SERVED_REVISION_BOUND`].
+fn unserveable(entry: &KnowledgeEntry) -> Option<String> {
+    let anchored = [
+        ("the entry", entry.schema_version.get()),
+        (
+            "the source anchor",
+            entry
+                .source_anchor
+                .as_ref()
+                .map(|anchor| anchor.schema_version.get())
+                .unwrap_or(1),
+        ),
+        (
+            "the adoption anchor",
+            entry
+                .adoption_anchor
+                .as_ref()
+                .map(|anchor| anchor.schema_version.0.get())
+                .unwrap_or(1),
+        ),
+    ];
+    for (member, version) in anchored {
+        if version > SCHEMA_VERSION_MAX {
+            return Some(format!(
+                "adopted copy {member} carries a schema_version above {SCHEMA_VERSION_MAX}"
+            ));
+        }
+    }
+    if entry
         .revision
-        .is_none_or(|revision| revision <= SERVED_REVISION_BOUND)
+        .is_some_and(|revision| revision > SERVED_REVISION_BOUND)
+    {
+        return Some(format!(
+            "adopted copy {} carries a revision outside the served range",
+            entry.entry_id
+        ));
+    }
+    let anchored_revision = entry
+        .adoption_anchor
+        .as_ref()
+        .is_some_and(|anchor| anchor.source_revision > SERVED_REVISION_BOUND);
+    if anchored_revision {
+        return Some(
+            "the adopted copy's anchor carries a source_revision outside the served range"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// One chain lookup as the resolver's closures answer it: absence as `None`, and a storage fault
@@ -543,7 +596,7 @@ mod tests {
 
     use mindcore_base::boundary::CallerId;
     use mindcore_base::ids::MindId;
-    use mindcore_base::knowledge::ADOPTION_FAULT;
+    use mindcore_base::knowledge::{adoption_anchor, ADOPTION_FAULT};
 
     use mindcore_sqlite::minds::CreateMind;
     use mindcore_sqlite::{read_carrier_header, MindStore};
@@ -1763,5 +1816,54 @@ mod tests {
             destination_before,
             "nothing is copied into the admitted Mind"
         );
+    }
+
+    /// The served success constraints run on the final copy, before the transaction settles: a
+    /// copy whose `schema_version` or revision members the wire cannot carry is the fixed adoption
+    /// fault, never a committed write reported as a transport failure.
+    ///
+    /// Reached through [`adopted`], the one seam the port calls after the SPI helper returns, so
+    /// removing the guard from that seam fails here rather than passing on a direct call.
+    #[tokio::test]
+    async fn an_unserveable_copy_never_becomes_a_response() {
+        // A copy the wire can carry: an anchored entry, the shape the SPI helper hands back.
+        let mut serveable = entry("ke_copy");
+        serveable.adoption_anchor = adoption_anchor(SHARED_SCOPE, "ke_source", 1);
+        let control = match adopted(AdoptionOutcome::Created(serveable.clone())) {
+            SpokeResult::Ok(response) => response,
+            SpokeResult::Reject(reject) => panic!("a serveable copy is a response: {reject:?}"),
+        };
+        assert_eq!(
+            serde_json::to_value(&control).expect("response serializes")["outcome"],
+            "adopted"
+        );
+
+        let mut entry_high = serveable.clone();
+        entry_high.schema_version = NonZeroU64::new(SCHEMA_VERSION_MAX + 1).expect("non-zero");
+        let mut anchored_high = serveable.clone();
+        anchored_high
+            .adoption_anchor
+            .as_mut()
+            .expect("the control is anchored")
+            .source_revision = SERVED_REVISION_BOUND + 1;
+        let mut revision_high = serveable.clone();
+        revision_high.revision = Some(SERVED_REVISION_BOUND + 1);
+
+        for (case, copy) in [
+            ("an entry schema_version above the wire ceiling", entry_high),
+            (
+                "an anchor source_revision outside the served range",
+                anchored_high,
+            ),
+            ("an entry revision outside the served range", revision_high),
+        ] {
+            let refused = refused(adopted(AdoptionOutcome::Created(copy)), case);
+            assert_eq!(
+                refused.code,
+                SpokeRejectCode::InternalError,
+                "{case}: {refused:?}"
+            );
+            assert_eq!(refused.message, ADOPTION_FAULT, "{case}: {refused:?}");
+        }
     }
 }

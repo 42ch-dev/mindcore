@@ -46,6 +46,7 @@ use spoke_operations::{
     KnowledgeQueryPort, MemoryPort, ScopeQueryPort, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
+use spoke_schemas::integers::SCHEMA_VERSION_MAX;
 use spoke_schemas::knowledge_entry::{
     KnowledgeEntryBody, KnowledgeEntryCanonicalName, KnowledgeEntryDisclosure,
     KnowledgeEntryModulesKey, KnowledgeEntryModulesValue, KnowledgeEntryOwner,
@@ -7357,6 +7358,29 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     .execute(&pool)
     .await
     .expect("seed a source above the served range");
+    // A source the served wire cannot carry: its `schema_version` sits above the SchemaVersion
+    // ceiling. Two layers already stop this shape before a copy exists — the served put refuses it
+    // on the way in, and the store's own payload decode refuses to hand it back — so this case pins
+    // the end-to-end outcome (the fixed fault, both collections unchanged) rather than the seam
+    // guard, which `an_unserveable_copy_never_becomes_a_response` covers directly. It is written
+    // raw because a store written by another version can hold the row.
+    let mut unserveable = served_entry("ke_unserveable", "a source the wire cannot carry");
+    unserveable.schema_version = std::num::NonZeroU64::new(SCHEMA_VERSION_MAX + 1)
+        .expect("a non-zero version above the ceiling");
+    let raw = serde_json::to_string(&unserveable).expect("the entry serializes");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES (?, ?, 1, ?, ?, ?)",
+    )
+    .bind(ADOPT_SOURCE_COLLECTION)
+    .bind("ke_unserveable")
+    .bind(&raw)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed a source the served wire cannot carry");
     // Three occupants of three destination slots: one visible, one retired, and one an owner's
     // private entry the admitted selection carries no viewpoint for.
     let destination = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
@@ -7386,7 +7410,7 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     let surface = adoption_surface(&serve, principal_admission()).await;
     let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
 
-    let cases: [(&str, KnowledgeAdoptRequest, SpokeRejectCode); 7] = [
+    let cases: [(&str, KnowledgeAdoptRequest, SpokeRejectCode); 8] = [
         (
             "a source the shared collection does not hold",
             adopt_request("ke_missing", 1, SPACE, "f-absent"),
@@ -7420,6 +7444,11 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
         (
             "a terminal above the served range",
             adopt_request("ke_high", SERVED_REVISION_BOUND + 1, SPACE, "f-high"),
+            SpokeRejectCode::InternalError,
+        ),
+        (
+            "a source whose schema_version the wire cannot carry",
+            adopt_request("ke_unserveable", 1, SPACE, "f-unserveable"),
             SpokeRejectCode::InternalError,
         ),
     ];
