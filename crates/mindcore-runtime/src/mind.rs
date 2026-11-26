@@ -276,13 +276,55 @@ impl Mind {
             }
         };
 
-        // 1–2. Stage the review on one transaction. A replay of a receipt already settled
-        // answers `Ready` and is returned as it is. The request must be byte-identical across
-        // replays of one key — the adapter's dedup probe digests the whole payload — so
-        // `expected_revision` is the constant a pending candidate always carries (capture
-        // writes revision 1 and nothing mutates a pending candidate), never a fresh read of
-        // the row: reading it would send 2 after the consumption bumped it and the replay
-        // would answer `IdempotencyConflict` instead of the recorded receipt.
+        // 1. Read the candidate as the plan requires: the revision this staging transaction
+        //    must assert, and whether an earlier review already consumed it. A refusal is the
+        //    adapter's own and rolls the transaction back.
+        let observed = self
+            .adapter
+            .get_candidate(
+                &mut transaction,
+                &caller,
+                json!({ "space_id": space.as_str(), "candidate_id": candidate_id }),
+            )
+            .await;
+        let (revision, consumed) = match observed {
+            SpokeResult::Ok(MemoryStage::Ready(body)) => {
+                let Some(candidate) = body.get("candidate") else {
+                    drop(transaction);
+                    return retryable_internal("the candidate body carries no candidate");
+                };
+                let Some(revision) = candidate.get("revision").and_then(Value::as_u64) else {
+                    drop(transaction);
+                    return retryable_internal("the candidate body carries no integer revision");
+                };
+                let consumed = candidate.get("status").and_then(Value::as_str) == Some("consumed");
+                (revision, consumed)
+            }
+            SpokeResult::Ok(stage) => {
+                drop(transaction);
+                return retryable_internal(format!(
+                    "candidate read answered an unexpected stage: {stage:?}"
+                ));
+            }
+            SpokeResult::Reject(reject) => {
+                drop(transaction);
+                return SpokeResult::Reject(reject);
+            }
+        };
+        // 2. Stage on the same transaction. The adapter's dedup probe keys on
+        //    (space, requester, operation, idempotency_key) and digests the whole payload, so
+        //    a same-key replay must rebuild a byte-identical request to reach the recorded
+        //    receipt. A consumed candidate's pre-consumption revision is exactly one less —
+        //    consumption is a candidate's only revision bump — and that is the only revision
+        //    any recorded review payload for this candidate can carry; a still-pending
+        //    candidate (including one imported at a non-1 revision) stages at its own live
+        //    revision. A different decision under one key still changes the digest and stays
+        //    an `IdempotencyConflict`.
+        let expected_revision = if consumed {
+            revision.saturating_sub(1).max(1)
+        } else {
+            revision
+        };
         let decision = match serde_json::to_value(decision) {
             Ok(decision) => decision,
             Err(error) => {
@@ -299,7 +341,7 @@ impl Mind {
                     "space_id": space.as_str(),
                     "candidate_id": candidate_id,
                     "decision": decision,
-                    "expected_revision": 1,
+                    "expected_revision": expected_revision,
                     "idempotency_key": idempotency_key,
                 }),
             )

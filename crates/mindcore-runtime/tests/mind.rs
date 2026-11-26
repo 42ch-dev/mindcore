@@ -486,3 +486,84 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
         "the staged record is durable"
     );
 }
+
+/// The plan's step 1 is a real read of the candidate: a pending candidate imported at a
+/// non-1 revision stages at that revision, and its settled same-key replay still reaches the
+/// recorded receipt. A constant `expected_revision` would refuse the first call with
+/// `RevisionConflict`.
+#[tokio::test]
+async fn a_pending_candidate_at_a_non_one_revision_reviews_and_replays() {
+    let (dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    ensure_subject(&store, created.id.as_str()).await;
+    let handle = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(dir.path()));
+    let candidate_id =
+        capture_candidate(&handle, "cap-imported-revision", "imported at five").await;
+
+    // An imported candidate keeps its own revision (transfer/activate.rs): make this one 5.
+    sqlx::query("UPDATE memory_candidates SET revision = 5 WHERE candidate_id = ?")
+        .bind(&candidate_id)
+        .execute(&store.pool())
+        .await
+        .expect("raise the pending candidate revision");
+
+    let reviewed = ok(handle
+        .review(&candidate_id, &promote(), "rev-imported-revision")
+        .await);
+    let receipt = value_of(&reviewed);
+    assert_eq!(
+        receipt["status"], "committed",
+        "revision 5 stages and settles"
+    );
+    let stored: i64 =
+        sqlx::query_scalar("SELECT revision FROM memory_candidates WHERE candidate_id = ?")
+            .bind(&candidate_id)
+            .fetch_one(&store.pool())
+            .await
+            .expect("the consumed candidate row");
+    assert_eq!(stored, 6, "consumption bumped the imported revision");
+
+    let replayed = ok(handle
+        .review(&candidate_id, &promote(), "rev-imported-revision")
+        .await);
+    assert_eq!(
+        value_of(&replayed),
+        receipt,
+        "the same key replays the recorded receipt after a non-1 revision"
+    );
+    let different =
+        serde_json::from_value::<Decision>(json!({ "action": "drop" })).expect("drop decision");
+    let conflict = reject_of(
+        handle
+            .review(&candidate_id, &different, "rev-imported-revision")
+            .await,
+    );
+    assert_eq!(
+        conflict.code,
+        SpokeRejectCode::IdempotencyConflict,
+        "a different decision under one key still refuses"
+    );
+}
+
+/// The public publisher creates a root that does not exist yet and leaves the target's exact
+/// bytes at the target's own path; the durable directory chain it syncs is unit-tested in
+/// `journal.rs` (deepest created directory first, ending at the nearest existing ancestor).
+#[tokio::test]
+async fn the_public_publisher_creates_and_publishes_a_nested_root() {
+    let dir = TempDir::new().expect("temporary directory");
+    let root = dir.path().join("nested/publish/root");
+    assert!(!root.exists(), "the root starts absent");
+    let publisher = mindcore_runtime::journal_dir(&root);
+    publisher(&[json!({
+        "path": "records/rec_nested.md",
+        "content": "exact published bytes",
+    })])
+    .expect("publish into a root that does not exist yet");
+    assert_eq!(
+        std::fs::read_to_string(root.join("records").join("rec_nested.md"))
+            .expect("the published target"),
+        "exact published bytes"
+    );
+}
