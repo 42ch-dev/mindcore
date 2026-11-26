@@ -49,17 +49,18 @@ const TOOLS_NAMESPACE: &str = "mindcore";
 /// under it.
 const RETIRED_ADOPT_TOOL: &str = "tools.mindcore.adopt";
 
-/// The tool ids the runtime reserves: the four it registers itself, plus the retired adoption
-/// tool. A host registration carrying one is dropped, so no host can advertise or install
-/// anything the runtime serves, or anything under the id a retired tool once answered. Host
-/// tools keep every other id, inside the namespace and out.
-const RESERVED_TOOLS: [&str; 5] = [
-    tools::RECALL_CONTEXT,
-    tools::ABSORB,
-    tools::DELIBERATE,
-    tools::READ_COGNITION,
-    RETIRED_ADOPT_TOOL,
-];
+/// The tool ids the runtime reserves: those it advertises, plus the retired adoption tool. A
+/// host registration carrying one is dropped, so no host can advertise or install anything the
+/// runtime serves, or anything under the id a retired tool once answered. Host tools keep every
+/// other id, inside the namespace and out.
+///
+/// The set is derived from [`WorkflowTools::advertised`] — the one list advertisement and
+/// installation both read — so a tool added there is reserved without touching this filter.
+fn reserved_tools() -> Vec<&'static str> {
+    let mut reserved: Vec<&str> = tools::WorkflowTools::advertised_ids();
+    reserved.push(RETIRED_ADOPT_TOOL);
+    reserved
+}
 
 /// The Mindcore serving side over one host store.
 ///
@@ -119,11 +120,12 @@ impl MindcoreServe {
             self.store.pool(),
         )
         .registrations();
+        let reserved = reserved_tools();
         tools.extend(
             faces
                 .tools
                 .into_iter()
-                .filter(|tool| !RESERVED_TOOLS.contains(&tool.descriptor.capability_id.as_str())),
+                .filter(|tool| !reserved.contains(&tool.descriptor.capability_id.as_str())),
         );
         let manifest = match derive_manifest(faces.manifest, faces.memory.as_deref(), &tools) {
             SpokeResult::Ok(manifest) => manifest,

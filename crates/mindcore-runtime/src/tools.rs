@@ -121,6 +121,15 @@ impl WorkflowTools {
             .collect()
     }
 
+    /// The id column of [`Self::advertised`], for the surface's reserved-id filter: the runtime's
+    /// own registrations are the source, never a second list.
+    pub(crate) fn advertised_ids() -> Vec<&'static str> {
+        Self::advertised()
+            .into_iter()
+            .map(|(capability_id, _, _, _)| capability_id)
+            .collect()
+    }
+
     /// The one list both advertisement and installation read.
     #[allow(clippy::type_complexity)]
     fn advertised() -> [(&'static str, &'static str, fn() -> Value, fn() -> Value); 4] {

@@ -136,7 +136,9 @@ the facade; nothing is persisted. The derivation runs once: the validated record
 no second extraction pass copies the carrier's history. A carrier that holds no current-view
 record yet — every Mind until its first judgment — answers `None`, not a refusal: a Mind
 without a judgment is a state, not an error. After one record, the read answers the carrier's
-current-view records and the derived `MindState` named by the Mind's id.
+current-view records and the derived `MindState` named by the Mind's id. The read applies no
+disclosure predicate — see "The facade is convenience, not a sandbox" below: an `owner`-private
+carrier answers its records here, as `knowledge_get` returns the same carrier verbatim.
 
 ## Non-goals
 
@@ -159,6 +161,15 @@ per-principal routing and disclosure predicates: a space-wide `knowledge_read` /
 The boundary the facade composes is the store's own — `read_entry`, `write_entry` and
 `list_entries_in`, the validation and revision checks inside them — not the adoption port
 `put_knowledge_entry`, which is a different surface.
+
+The same rule binds `cognition_read`. It is a read of the admitted Mind's carrier and applies no
+disclosure predicate: an `owner`-private carrier answers its records to a caller the space-wide
+`knowledge_read` grant admits, exactly as `knowledge_get` on the same handle returns that carrier
+verbatim. Disclosure is the served surface's duty, where a peer's viewpoint exists and
+`MemoryAdapter::read_cognition` filters the carrier through
+`knowledge_entry_visible_to_viewpoint`; the facade does not duplicate that filter, because a
+predicate on one read of the carrier while its sibling read returns the same carrier in full
+would be a claim the facade cannot keep.
 
 **Reflections are off.** Every handle builds its adapter and workflow binding with
 `reflections: false` and offers no switch: the reflection surface (§7.25–§7.27 of the SPOKE

@@ -1179,12 +1179,13 @@ async fn cognition_read_answers_none_then_the_judgment_and_mind_state() {
     );
 }
 
-/// The facade's read applies the knowledge slot's disclosure predicate, viewpoint-free — the
-/// same rule the served adapter read applies to the same carrier: an `owner`-private carrier
-/// with a stored judgment answers the fresh-carrier `None`, and once the carrier is
-/// space-visible the same caller reads the judgment and its derived `MindState`.
+/// The facade is convenience, not a sandbox: `cognition_read` applies no disclosure predicate, so
+/// an `owner`-private carrier's judgment stays readable by the caller the space-wide
+/// `knowledge_read` grant admits — the same caller `knowledge_get` hands the carrier to — while
+/// the served adapter read hides it. The disclosure duty lives on the served surface, where a
+/// peer's viewpoint exists; the spec records the split.
 #[tokio::test]
-async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_peer() {
+async fn cognition_read_serves_an_owner_private_carrier_to_the_in_process_caller() {
     let (_dir, store) = fixture().await;
     let owner = CallerId::new(OWNER);
     let created = ok(minds::create(&store, &request(OWNER)).await);
@@ -1242,34 +1243,28 @@ async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_pee
     let private: KnowledgeEntry = serde_json::from_value(payload).expect("the carrier decodes");
     ok(handle.knowledge_put(private, Some(revision)).await);
 
-    assert!(
-        ok(handle.cognition_read().await).is_none(),
-        "an owner-private carrier answers the fresh-carrier None: no record and no state"
-    );
-
-    // Making the carrier space-visible restores the judgment to the same caller.
-    let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
-    let revision = carrier.revision.expect("a stored carrier has a revision");
-    let mut payload = serde_json::to_value(&carrier).expect("the carrier serializes");
-    payload
-        .as_object_mut()
-        .expect("an object")
-        .remove("disclosure");
-    payload.as_object_mut().expect("an object").remove("owner");
-    let visible: KnowledgeEntry = serde_json::from_value(payload).expect("the carrier decodes");
-    ok(handle.knowledge_put(visible, Some(revision)).await);
-
-    let cognition = ok(handle.cognition_read().await).expect("the space-visible carrier reads");
+    let cognition = ok(handle.cognition_read().await)
+        .expect("an owner-private carrier still answers the in-process caller");
     assert_eq!(
         cognition.records.len(),
         1,
-        "the judgment serves once the carrier is space-visible"
+        "the facade applies no disclosure predicate: the judgment serves"
     );
     assert_eq!(cognition.records[0]["record_id"], json!("cog_hidden"));
     assert_eq!(
         cognition.mind_state["holder_entry_id"],
         json!(created.carrier_entry_id),
         "the derived state descends from the Mind's carrier"
+    );
+    let sibling = serde_json::to_value(ok(handle
+        .knowledge_get(handle.carrier_entry_id(), None)
+        .await))
+    .expect("the carrier serializes");
+    assert_eq!(
+        sibling["disclosure"],
+        json!("owner-private"),
+        "the sibling read returns the same owner-private carrier in full, which is why the facade \
+         does not filter one read and not the other"
     );
 }
 
