@@ -4,7 +4,7 @@
 
 How one Mindcore serving surface selects the knowledge collection and carrier a served call reads
 and writes: the request's Mind id is the only route input, and the Mind's registry row resolves it.
-It also states which served operations are not Mind-routed and are therefore not composed. It does
+It also states which served operations are not composed. It does
 not define memory semantics, the Connect handshake, refusal vocabulary or carrier record storage.
 The knowledge face serves `port.knowledge.*` per Mind; history and adoption stay uncomposed.
 
@@ -139,13 +139,16 @@ and served when `ServeFaces.knowledge` is true:
   caller's own live grant in the admitted Mind's space before the store is reached, per
   [`serving-seam.md`](serving-seam.md) § Knowledge.
 
-`history.*` and `knowledge.adopt` stay un-routed and uncomposed: see below.
+`history.*` and `knowledge.adopt` stay uncomposed: see below.
 
-### The un-routed operations
+### The uncomposed operations
 
-`history.*` and `knowledge.adopt` cannot name a Mind: adoption's destination is the knowledge
-face's own collection, and the retained `RoutedKnowledgeStore`'s `HistoryPort` binds one collection
-for its lifetime. This layer therefore composes neither:
+`history.*` and `knowledge.adopt` are Mind-routed in principle — both would resolve their route from
+the request's Mind id like the knowledge face, and the retained `HistoryPort` already resolves the
+registered collection per call through `admit_history` on its operation's transaction. This layer
+composes neither because the runtime pieces around them are gone, not because the route is
+missing: the durable prune dedup store and the one-transaction adoption service were removed with
+Stage 1's face, so the runtime serves neither family:
 
 - the manifest advertises no `spoke-history` or `spoke-knowledge-adoption`, and the runtime's
   `MindPorts` answers `None` for both families;
@@ -153,10 +156,10 @@ for its lifetime. This layer therefore composes neither:
   `capability_missing`, surfaced by the Rust dialer as `CapabilityPortMissing` with
   `details.wire_code`.
 
-They return per Mind in later layers: the pinned `0.19` cohort carries request-scoped admission
-(A1) and the optional scope on knowledge get and put (A2)
-(`2026-11-25-one-surface-serves-many-minds.md`), and this layer composed the knowledge face that
-both use. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
+They return per Mind in later layers, once those runtime pieces are re-implemented; the pinned
+`0.19` cohort already carries request-scoped admission (A1) and the optional scope on knowledge get
+and put (A2) (`2026-11-25-one-surface-serves-many-minds.md`), and this layer composed the knowledge
+face that both use. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
 
 ### Construction
 
@@ -186,8 +189,8 @@ both use. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
 - The composed knowledge face resolves its route per call: each served op reads the admitted
   Mind's registry row on its own statement's transaction, so one face serves many Minds and no
   collection is captured at assembly.
-- The two remaining un-routed operations are never advertised and never served; a restored face
-  re-enters composition only per Mind, with `serving-seam.md`'s contract.
+- The two uncomposed operations are never advertised and never served; a restored face re-enters
+  composition only per Mind, with `serving-seam.md`'s contract.
 - The carrier record format is unchanged.
 
 ## Where it lives
@@ -221,9 +224,9 @@ both use. Their contracts stay [`serving-seam.md`](serving-seam.md)'s.
 ## Known limit
 
 Memory, the four Mind tools and `port.knowledge.*` route per Mind. `history.*` and
-`knowledge.adopt` stay un-routed until their layers compose them, so a peer gets no history or
-adoption operation. A Mind's registry row is written once: changing its collection is a new Mind,
-not a reconfiguration, and there is no hot reload.
+`knowledge.adopt` stay uncomposed until their layers re-implement the runtime pieces they need, so a
+peer gets no history or adoption operation. A Mind's registry row is written once: changing its
+collection is a new Mind, not a reconfiguration, and there is no hot reload.
 
 ## Change obligations
 
