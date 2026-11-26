@@ -30,14 +30,14 @@ pub(crate) use mindcore_base::ids::mint;
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use spoke_operations::{GrantRequirement, SpokeRejectCode, SpokeResult};
+use spoke_operations::{GrantRequirement, SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::Principal;
 use sqlx::{Sqlite, Transaction};
 
 use mindcore_base::ids::{SpaceId, SubjectId};
 use mindcore_spi::SpiError;
 use mindcore_base::ir::{MemoryRepository, ReceiptFailure, ReceiptState, ReviewReceiptIr};
-use mindcore_sqlite::SqliteMemoryRepository;
+use mindcore_sqlite::{read_entry, SqliteMemoryRepository};
 
 use crate::admission::Op;
 use crate::reject::{AResult, Reject};
@@ -315,6 +315,69 @@ impl MemoryAdapter {
             }
         }
         Ok(())
+    }
+
+    /// Read one Mind's judgment over the caller's transaction: admission first, then the carrier
+    /// the registry row names, then the derived `MindState` — all inside `tx`, so a revocation
+    /// cannot land between admission and the read. Admission is [`workflows::admitted_carrier`]:
+    /// the caller's own grant rows and the registry row, read together, answering one fixed
+    /// refusal with no details whether the Mind is absent or the caller was never admitted.
+    /// A fresh carrier answers `records: []` and `mind_state: null`; the derivation failures a
+    /// stored carrier could raise are internal errors, because the carrier passed validation at
+    /// its write. The transaction is the caller's to end.
+    pub async fn read_cognition(
+        tx: &mut Tx<'_>,
+        principal: &Principal,
+        space_id: &str,
+    ) -> Result<Cognition, SpokeReject> {
+        let carrier = workflows::admitted_carrier(tx, principal_id(principal), space_id).await?;
+        let carrier_entry =
+            match read_entry(tx, &carrier.collection, &carrier.carrier_entry_id).await {
+                SpokeResult::Ok(entry) => entry,
+                SpokeResult::Reject(reject) => return Err(reject),
+            };
+        let revision = match carrier_entry.revision {
+            Some(revision) => revision,
+            None => {
+                return Err(Reject::internal(format!(
+                    "carrier {} holds no assigned revision",
+                    carrier.carrier_entry_id
+                ))
+                .into_spoke())
+            }
+        };
+        let view = match mindcore_base::cognition::derive_mind_state(&carrier_entry) {
+            Ok(view) => view,
+            Err(mindcore_base::cognition::MindError::NoRecords) => {
+                return Ok(Cognition {
+                    carrier_revision: revision,
+                    records: Vec::new(),
+                    mind_state: Value::Null,
+                })
+            }
+            Err(error) => {
+                return Err(Reject::internal(format!(
+                    "carrier {} cannot be derived: {error}",
+                    carrier.carrier_entry_id
+                ))
+                .into_spoke())
+            }
+        };
+        let mind_state = match mindcore_base::cognition::mind_state_value(&view, space_id) {
+            Ok(mind_state) => mind_state,
+            Err(error) => {
+                return Err(Reject::internal(format!(
+                    "the mind state of {} cannot be projected: {error}",
+                    carrier.carrier_entry_id
+                ))
+                .into_spoke())
+            }
+        };
+        Ok(Cognition {
+            carrier_revision: revision,
+            records: view.records,
+            mind_state,
+        })
     }
 }
 

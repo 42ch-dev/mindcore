@@ -51,6 +51,14 @@ type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
 /// this capture's absorb run decided `Pending` for the ids it names.
 const ABSORB_DECISION_OP: &str = "mindcore.absorb.decision";
 
+/// The carrier location of one admitted Mind: the registry row the `space_id` names.
+pub(crate) struct AdmittedCarrier {
+    /// The knowledge collection the Mind's carrier lives in.
+    pub(crate) collection: String,
+    /// The entry id the Mind's carrier row names.
+    pub(crate) carrier_entry_id: String,
+}
+
 /// Mind admission for the host-side `deliberate` handler: the caller's grant rows and the
 /// registry row read in one transaction, so a revocation cannot land between them, and every
 /// liveness decision runs the one grant rule (`live_grant`: unrevoked, unexpired, an
@@ -62,7 +70,6 @@ pub async fn admitted_carrier_entry(
     principal_id: &str,
     space_id: &str,
 ) -> Result<String, SpokeReject> {
-    let repository = SqliteMemoryRepository;
     let mut conn = pool
         .acquire()
         .await
@@ -71,13 +78,31 @@ pub async fn admitted_carrier_entry(
         .begin()
         .await
         .map_err(|e| Reject::internal(format!("the mind admission could not begin: {e}")).into_spoke())?;
+    let carrier = admitted_carrier(&mut tx, principal_id, space_id).await?;
+    let _ = tx.rollback().await;
+    Ok(carrier.carrier_entry_id)
+}
+
+/// Mind admission on the caller's transaction: the caller's grant rows and the registry row
+/// read together, so a revocation cannot land between them. Returns the row-named carrier
+/// location, or the fixed admission refusal — byte-equal whether the Mind exists, the grant is
+/// missing, revoked or expired — so an unadmitted caller cannot tell the cases apart. The
+/// space-wide `knowledge_read` grant is the one capability this admission requires: reading a
+/// collection is not authority to the rest of the Mind, but a Mind without it has no readable
+/// judgment at all.
+pub(crate) async fn admitted_carrier(
+    tx: &mut Tx<'_>,
+    principal_id: &str,
+    space_id: &str,
+) -> Result<AdmittedCarrier, SpokeReject> {
+    let repository = SqliteMemoryRepository;
     let space = SpaceId::new(space_id.to_string());
     // Only the caller's own rows, and only the liveness fields. Another principal's malformed
     // row must not reach this decision: an indistinguishable refusal is the answer whether the
     // decode failure lives on the caller's own row or the space is not a Mind at all, and a
     // row that cannot decode admits nothing.
     let rows = repository
-        .list_grants(&mut tx, &space, Some(principal_id))
+        .list_grants(tx, &space, Some(principal_id))
         .await
         .map_err(|error| match error {
             SqliteRepositoryError::InvalidRow(_) => Reject::admission_refusal().into_spoke(),
@@ -98,15 +123,18 @@ pub async fn admitted_carrier_entry(
     // The row read follows in the same transaction: a revocation that commits
     // before this statement is already covered by the grant check re-reading on
     // its own transaction; one either sees both sides of it or neither.
-    let row: Option<String> = sqlx::query_scalar(
-        "SELECT carrier_entry_id FROM minds WHERE space_id = ?",
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT knowledge_collection, carrier_entry_id FROM minds WHERE space_id = ?",
     )
     .bind(space_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|e| Reject::internal(format!("the mind admission could not be read: {e}")).into_spoke())?;
-    let _ = tx.rollback().await;
-    row.ok_or_else(|| Reject::admission_refusal().into_spoke())
+    row.map(|(collection, carrier_entry_id)| AdmittedCarrier {
+        collection,
+        carrier_entry_id,
+    })
+    .ok_or_else(|| Reject::admission_refusal().into_spoke())
 }
 
 /// The in-process workflow binding over one SQLite pool.

@@ -1,4 +1,4 @@
-//! The Mind tools served over Connect: the three workflow tools.
+//! The Mind tools served over Connect: the workflow tools and the cognition read.
 //!
 //! Connect owns the signed `{ "arguments": … }` / `{ "result": … }` wrappers; these handlers see
 //! only the argument object and return only the result value. Each handler binds to the responder
@@ -22,6 +22,7 @@ use mindcore_spi::{
     AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
     Embedder, Evidence, MindCapabilities, MindWorkflows, PolicyHook, Reasoner, SpiError,
 };
+use mindcore_spoke::MemoryAdapter;
 use spoke_connect::remote::{ConnectResponder, MemoryAdmission, ToolHandler};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
@@ -37,6 +38,8 @@ pub const RECALL_CONTEXT: &str = "tools.mindcore.recall_context";
 pub const ABSORB: &str = "tools.mindcore.absorb";
 /// Stable capability id of the deliberation workflow.
 pub const DELIBERATE: &str = "tools.mindcore.deliberate";
+/// Stable capability id of the cognition read.
+pub const READ_COGNITION: &str = "tools.mindcore.read_cognition";
 
 /// The provider capabilities a tool call injects into its workflow.
 ///
@@ -120,7 +123,7 @@ impl WorkflowTools {
 
     /// The one list both advertisement and installation read.
     #[allow(clippy::type_complexity)]
-    fn advertised() -> [(&'static str, &'static str, fn() -> Value, fn() -> Value); 3] {
+    fn advertised() -> [(&'static str, &'static str, fn() -> Value, fn() -> Value); 4] {
         [
             (
                 RECALL_CONTEXT,
@@ -139,6 +142,12 @@ impl WorkflowTools {
                 "Derive a validated verdict over supplied evidence.",
                 deliberate_input,
                 deliberate_output,
+            ),
+            (
+                READ_COGNITION,
+                "Read a Mind's current judgment and its derived mind state.",
+                read_cognition_input,
+                read_cognition_output,
             ),
         ]
     }
@@ -242,6 +251,7 @@ async fn serve(
         RECALL_CONTEXT => recall_context(&*workflows, &principal, arguments, &providers).await,
         ABSORB => absorb(&*workflows, &principal, arguments, &providers).await,
         DELIBERATE => deliberate(&*workflows, &principal, arguments, &providers, &pool).await,
+        READ_COGNITION => read_cognition(&principal, arguments, &pool).await,
         other => SpokeResult::Reject(SpokeReject {
             code: SpokeRejectCode::InvalidInput,
             message: format!("unknown mindcore tool {other}"),
@@ -370,6 +380,44 @@ async fn deliberate(
     {
         Ok(outcome) => SpokeResult::Ok(deliberate_outcome(outcome)),
         Err(error) => SpokeResult::Reject(workflow_reject(error)),
+    }
+}
+
+/// `tools.mindcore.read_cognition`: one admitted Mind's judgment, read in one transaction.
+///
+/// [`MemoryAdapter::read_cognition`] runs admission before any read — the caller's own grant
+/// rows and the registry row in this transaction — so an unadmitted caller learns nothing about
+/// whether the Mind exists, and a granted one gets `{carrier_revision, records, mind_state}`.
+/// A carrier holding no record yet answers `records: []` and a null `mind_state`.
+async fn read_cognition(
+    principal: &Principal,
+    arguments: Value,
+    pool: &SqlitePool,
+) -> SpokeResult<Value> {
+    let arguments: ReadCognitionArguments = match decode(arguments) {
+        Ok(arguments) => arguments,
+        Err(reject) => return SpokeResult::Reject(reject),
+    };
+    let mut transaction = match pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return SpokeResult::Reject(SpokeReject {
+                code: SpokeRejectCode::InternalError,
+                message: format!("the cognition read could not begin: {error}"),
+                details: None,
+            })
+        }
+    };
+    let cognition =
+        MemoryAdapter::read_cognition(&mut transaction, principal, &arguments.space_id).await;
+    drop(transaction);
+    match cognition {
+        Ok(cognition) => SpokeResult::Ok(json!({
+            "carrier_revision": cognition.carrier_revision,
+            "records": cognition.records,
+            "mind_state": cognition.mind_state,
+        })),
+        Err(reject) => SpokeResult::Reject(reject),
     }
 }
 
@@ -503,6 +551,14 @@ struct DeliberateArguments {
 struct EvidenceArgument {
     id: String,
     text: String,
+}
+
+/// The cognition read names one Mind and nothing else: the carrier and its revision come from
+/// the registry row, never from the caller.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadCognitionArguments {
+    space_id: String,
 }
 
 fn descriptor(
@@ -1023,6 +1079,63 @@ fn deliberate_output() -> Value {
                 },
             },
         ],
+    })
+}
+
+/// The cognition read's arguments: the closed `{space_id}` object, mirroring
+/// [`ReadCognitionArguments`]. The Mind's carrier is never a wire member.
+fn read_cognition_input() -> Value {
+    json!({
+        "$id": "https://mindcore.invalid/schemas/tools/read-cognition.input.schema.json",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["space_id"],
+        "properties": {
+            "space_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The Mind to read; the same id its memory requests carry.",
+            },
+        },
+    })
+}
+
+/// The cognition read's result: the carrier revision the read served, its current-view records in
+/// carrier order, and the derived `MindState` — `null` for a Mind that holds no judgment yet.
+/// `records` and `mind_state` are opaque product objects, so their openness is stated rather than
+/// left to draft-07's implicit default.
+fn read_cognition_output() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["carrier_revision", "records", "mind_state"],
+        "properties": {
+            "carrier_revision": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The carrier revision the read served.",
+            },
+            "records": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": {},
+                    "description": "One current-view SPOKE CognitionRecord, in carrier order.",
+                },
+                "description": "The carrier's current judgment; empty before its first record.",
+            },
+            "mind_state": {
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The derived SPOKE MindState (spoke-judgment).",
+                    },
+                ],
+                "description": "The derived MindState, or null for a Mind with no judgment yet.",
+            },
+        },
     })
 }
 

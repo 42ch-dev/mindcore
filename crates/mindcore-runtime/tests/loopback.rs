@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use mindcore_base::ids::SpaceId;
 use mindcore_base::ir::MemorySpaceRow;
 use mindcore_base::knowledge::{adoption_anchor_parts, KnowledgeScope};
-use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
+use mindcore_runtime::tools::{ABSORB, DELIBERATE, READ_COGNITION, RECALL_CONTEXT};
 use mindcore_runtime::{
     AdoptionRoute, MindProviders, MindcoreServe, MindcoreSurface, ServeFaces, ToolRegistration,
 };
@@ -791,6 +791,11 @@ fn deliberate_arguments_in(space: &str) -> Value {
     })
 }
 
+/// The cognition read's arguments: the Mind id alone, the same id its memory requests carry.
+fn cognition_arguments(space: &str) -> Value {
+    json!({ "space_id": space })
+}
+
 /// The record ids one recall pack carries, sorted: the pack promises no order of its own.
 fn packed_record_ids(result: &Value) -> Vec<&str> {
     let mut ids: Vec<&str> = result["records"]
@@ -959,8 +964,16 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
 
     assert_eq!(
         capabilities(&surface),
-        ["spoke-knowledge", "ke-ownership", "spoke-judgment", RECALL_CONTEXT, ABSORB, DELIBERATE],
-        "the manifest advertises the knowledge face and all three workflow tools"
+        [
+            "spoke-knowledge",
+            "ke-ownership",
+            "spoke-judgment",
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE,
+            READ_COGNITION
+        ],
+        "the manifest advertises the knowledge face and every workflow tool"
     );
     assert_eq!(
         surface
@@ -969,7 +982,7 @@ async fn remote_consumer_recalls_context_through_the_composed_surface() {
             .iter()
             .map(|tool| tool.capability_id.as_str())
             .collect::<Vec<_>>(),
-        [RECALL_CONTEXT, ABSORB, DELIBERATE],
+        [RECALL_CONTEXT, ABSORB, DELIBERATE, READ_COGNITION],
         "the registry row routes every Mind, so the deliberation tool is always installed"
     );
 
@@ -1344,6 +1357,100 @@ async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
         carrier_revision(&pool, COLLECTION, CARRIER).await,
         2,
         "the settled branch commits the cognition record"
+    );
+}
+
+/// The served cognition read over a signed session: a Mind that has judged nothing answers
+/// `records: []` and a null `mind_state`; after a settlement the same Mind answers the committed
+/// record and its derived `MindState`; and a Mind the caller holds no grant in answers exactly
+/// the refusal a space that is no Mind at all answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
+    let fixture = Fixture::open().await;
+    fixture.seed_second_mind().await;
+    let (_dir, serve) = fixture.serve();
+    let providers = MindProviders {
+        reasoner: Some(Arc::new(SettlingReasoner(SETTLING_RATIONALE))),
+        policy_hook: Some(Arc::new(AutoPolicy)),
+        ..MindProviders::default()
+    };
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+
+    let session = connect(&surface, &[DELIBERATE, READ_COGNITION]).await;
+
+    let fresh = expect_ok(
+        session
+            .adapter
+            .invoke_tool(READ_COGNITION, cognition_arguments(SPACE))
+            .await,
+        "the cognition read before any judgment",
+    );
+    assert_eq!(fresh["carrier_revision"], 1);
+    assert_eq!(fresh["records"], json!([]));
+    assert_eq!(
+        fresh["mind_state"],
+        Value::Null,
+        "a Mind with no judgment answers a null state: {fresh}"
+    );
+
+    let settled = expect_ok(
+        session
+            .adapter
+            .invoke_tool(DELIBERATE, deliberate_arguments())
+            .await,
+        "the settling deliberation",
+    );
+    assert_eq!(settled["status"], "settled");
+
+    let read = expect_ok(
+        session
+            .adapter
+            .invoke_tool(READ_COGNITION, cognition_arguments(SPACE))
+            .await,
+        "the cognition read after a judgment",
+    );
+    assert_eq!(
+        read["carrier_revision"], 2,
+        "the read serves the revision the settlement wrote: {read}"
+    );
+    let records = read["records"]
+        .as_array()
+        .expect("the read serves a records array");
+    assert_eq!(records.len(), 1, "one committed judgment is served: {read}");
+    assert_eq!(records[0]["record_id"], settled["record"]["record_id"]);
+    assert_eq!(records[0]["assessor"]["id"], PRINCIPAL);
+    assert_eq!(records[0]["holder"]["id"], CARRIER);
+    assert!(
+        read["mind_state"].is_object(),
+        "the derived MindState is served beside the record: {read}"
+    );
+    assert_eq!(read["mind_state"]["mind_state_id"], SPACE);
+    assert_eq!(read["mind_state"]["holder_entry_id"], CARRIER);
+
+    // The second Mind exists and carries a registry row, yet this peer holds no grant in it: the
+    // refusal must be the byte-same answer a space that is no Mind at all gives.
+    let unadmitted = expect_reject(
+        session
+            .adapter
+            .invoke_tool(READ_COGNITION, cognition_arguments(SPACE_TWO))
+            .await,
+        "the cognition read of a Mind the caller holds no grant in",
+    );
+    let absent = expect_reject(
+        session
+            .adapter
+            .invoke_tool(READ_COGNITION, cognition_arguments("spc_no_such_mind"))
+            .await,
+        "the cognition read of a space that is no Mind at all",
+    );
+    assert_eq!(unadmitted.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        unadmitted.details.is_none(),
+        "the refusal carries no details: {unadmitted:?}"
+    );
+    assert_eq!(
+        unadmitted, absent,
+        "an unadmitted Mind and an absent Mind must be the byte-same refusal"
     );
 }
 

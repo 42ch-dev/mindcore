@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use mindcore_base::knowledge::KnowledgeScope;
-use mindcore_runtime::tools::{ABSORB, DELIBERATE, RECALL_CONTEXT};
+use mindcore_runtime::tools::{ABSORB, DELIBERATE, READ_COGNITION, RECALL_CONTEXT};
 use mindcore_runtime::{AdoptionRoute, MindProviders, MindcoreServe, ServeFaces, ToolRegistration};
 use mindcore_spoke::{ServedMemory, TRANSFER_OPERATIONS};
 use mindcore_sqlite::{MindStore, ScopedKnowledgeStore};
@@ -234,7 +234,8 @@ async fn manifest_follows_the_composed_faces() {
             CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
-            DELIBERATE
+            DELIBERATE,
+            READ_COGNITION
         ]
     );
     assert!(
@@ -248,7 +249,7 @@ async fn manifest_follows_the_composed_faces() {
         .iter()
         .map(|tool| tool.capability_id.as_str())
         .collect();
-    assert_eq!(tools, [RECALL_CONTEXT, ABSORB, DELIBERATE]);
+    assert_eq!(tools, [RECALL_CONTEXT, ABSORB, DELIBERATE, READ_COGNITION]);
     assert!(
         surface
             .manifest
@@ -295,7 +296,8 @@ async fn manifest_follows_the_composed_faces() {
             CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
-            DELIBERATE
+            DELIBERATE,
+            READ_COGNITION
         ],
         "the history face is advertised exactly when it is served"
     );
@@ -328,7 +330,8 @@ async fn manifest_follows_the_composed_faces() {
             CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
-            DELIBERATE
+            DELIBERATE,
+            READ_COGNITION
         ],
         "the adoption face is advertised exactly when it is served"
     );
@@ -530,7 +533,8 @@ async fn attached_memory_service_is_advertised_and_served() {
             CAPABILITY_SPOKE_JUDGMENT,
             RECALL_CONTEXT,
             ABSORB,
-            DELIBERATE
+            DELIBERATE,
+            READ_COGNITION
         ]
     );
     assert!(
@@ -615,11 +619,12 @@ async fn tool_registrations_drive_advertisement_and_installation() {
             RECALL_CONTEXT,
             ABSORB,
             DELIBERATE,
+            READ_COGNITION,
             HOST_TOOL
         ]
     );
-    assert_eq!(surface.manifest.tools.len(), 4);
-    assert_eq!(surface.manifest.tools[3].capability_id.as_str(), HOST_TOOL);
+    assert_eq!(surface.manifest.tools.len(), 5);
+    assert_eq!(surface.manifest.tools[4].capability_id.as_str(), HOST_TOOL);
     assert!(
         surface
             .manifest

@@ -174,11 +174,124 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed probe grant");
+    // The carrier entry the registry row names, holding no judgment yet: the cognition read
+    // resolves `(collection, carrier_entry_id)` from the row and reads this entry through it.
+    sqlx::query(
+        "CREATE TABLE knowledge_entries (collection TEXT NOT NULL, entry_id TEXT NOT NULL, \
+         revision INTEGER NOT NULL, payload TEXT NOT NULL, superseded_by TEXT, \
+         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (collection, entry_id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("create knowledge_entries");
+    sqlx::query(
+        "INSERT INTO knowledge_entries (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES ('wren', 'ke_wren', 1, ?, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(
+        serde_json::json!({
+            "schema_version": 1,
+            "entry_id": "ke_wren",
+            "entry_type": "note",
+            "canonical_name": "wren's carrier",
+            "status": "confirmed",
+            "revision": 1,
+            "body": { "summary": "what this holder currently holds" },
+            "modules": { "cognition": { "records": [], "world_facts": [], "extensions": {} } },
+            "extensions": {},
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the carrier entry");
+    // One committed judgment on the first Mind's carrier, and a second Mind whose carrier holds
+    // none: the cognition read is exercised on both sides of `mind_state: null`.
+    sqlx::query(
+        "CREATE TABLE cognition_records (collection TEXT NOT NULL, entry_id TEXT NOT NULL, \
+         append_seq INTEGER NOT NULL, record_id TEXT NOT NULL, payload TEXT NOT NULL, \
+         append_prior_shape INTEGER, PRIMARY KEY (collection, entry_id, append_seq))",
+    )
+    .execute(&pool)
+    .await
+    .expect("create cognition_records");
+    sqlx::query(
+        "INSERT INTO cognition_records (collection, entry_id, append_seq, record_id, payload, \
+         append_prior_shape) VALUES ('wren', 'ke_wren', 1, 'cog_1', ?, NULL)",
+    )
+    .bind(
+        serde_json::to_value(cognition())
+            .expect("the cognition fixture serializes")
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the committed judgment");
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
+         VALUES ('spc_2', 'mora', 'ke_mora')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the fresh mind row");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_fresh', 'spc_2', NULL, 'prn_driver', '[\"knowledge_read\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the fresh grant");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, superseded_by, created_at, updated_at) \
+         VALUES ('mora', 'ke_mora', 1, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(
+        serde_json::json!({
+            "schema_version": 1,
+            "entry_id": "ke_mora",
+            "entry_type": "note",
+            "canonical_name": "mora's carrier",
+            "status": "confirmed",
+            "revision": 1,
+            "body": { "summary": "a holder that has not judged anything yet" },
+            "modules": { "cognition": { "records": [], "world_facts": [], "extensions": {} } },
+            "extensions": {},
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the fresh carrier entry");
+    // A Mind the probe's principal holds no grant in: the admission refusal is the same answer
+    // as a space that does not exist, so the read cannot disclose which one was named.
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
+         VALUES ('spc_3', 'ghost', 'ke_ghost')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the ghost mind row");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_ghost', 'spc_3', NULL, 'prn_other', '[\"knowledge_read\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the ghost grant");
     pool
 }
 
 async fn tools(fake: Arc<Fake>) -> WorkflowTools {
-    WorkflowTools::new(fake, admission(), MindProviders::default(), registry_pool().await)
+    tools_over(fake, registry_pool().await).await
+}
+
+async fn tools_over(fake: Arc<Fake>, pool: SqlitePool) -> WorkflowTools {
+    WorkflowTools::new(fake, admission(), MindProviders::default(), pool)
 }
 
 fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
@@ -329,6 +442,11 @@ fn deliberate_arguments() -> Value {
         "evidence": [{ "id": "ev_1", "text": "the north gate closed at dusk" }],
         "timeout_ms": 5000
     })
+}
+
+/// The cognition read names one Mind and nothing else.
+fn cognition_read_arguments(space: &str) -> Value {
+    json!({ "space_id": space })
 }
 
 #[tokio::test]
@@ -609,6 +727,79 @@ async fn unadmitted_peers_are_not_authorized() {
     );
 }
 
+/// The cognition read over one store: a Mind holding a committed judgment answers its records and
+/// the derived `MindState`; a Mind that has judged nothing answers `records: []` and a null
+/// `mind_state`; and a Mind the caller holds no grant in answers the same target-free refusal as
+/// a space that does not exist.
+#[tokio::test]
+async fn read_cognition_serves_a_judgment_or_a_null_state() {
+    let tool = tools(Arc::new(Fake::default())).await;
+
+    let committed = expect_ok(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_1"),
+        )
+        .await,
+        "a Mind with a committed judgment",
+    );
+    assert_eq!(committed["carrier_revision"], 1);
+    assert_eq!(
+        committed["records"],
+        json!([serde_json::to_value(cognition()).expect("the fixture serializes")]),
+        "the committed record is served in carrier order"
+    );
+    assert!(
+        committed["mind_state"].is_object(),
+        "the derived MindState is served beside the judgment: {committed}"
+    );
+
+    let fresh = expect_ok(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_2"),
+        )
+        .await,
+        "a Mind with no judgment yet",
+    );
+    assert_eq!(fresh["records"], json!([]));
+    assert_eq!(
+        fresh["mind_state"],
+        Value::Null,
+        "a Mind with no judgment answers a null state"
+    );
+
+    let unadmitted = expect_reject(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_3"),
+        )
+        .await,
+        "a Mind the caller is not admitted to",
+    );
+    let absent = expect_reject(
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_absent"),
+        )
+        .await,
+        "a space that does not exist",
+    );
+    assert_eq!(unadmitted.code, SpokeRejectCode::NotAuthorized);
+    assert_eq!(
+        unadmitted.details, None,
+        "an admission refusal discloses no details"
+    );
+    assert_eq!(
+        unadmitted, absent,
+        "an unadmitted Mind and an absent one are one answer"
+    );
+}
+
 #[tokio::test]
 async fn settlement_refusals_keep_their_code_and_details() {
     let refusal = SpokeReject {
@@ -764,14 +955,15 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
                 verdict: json!({}),
                 judgment: judgment(),
             })),
+            READ_COGNITION => {}
             other => panic!("unadvertised tool {other}"),
         }
 
         let mut arguments = minimal(&input, &input);
-        // `deliberate` resolves the carrier from the registry row of the request's space, so the
-        // manifest-shaped probe names the one Mind this harness seeds. `spc_1` satisfies the
+        // `deliberate` and `read_cognition` both resolve a Mind from the request's `space_id`, so
+        // the manifest-shaped probe names the one Mind this harness seeds. `spc_1` satisfies the
         // schema's `minLength` either way, so the shape check is unchanged.
-        if capability_id == DELIBERATE {
+        if matches!(capability_id, DELIBERATE | READ_COGNITION) {
             arguments["space_id"] = json!("spc_1");
         }
         expect_ok(
