@@ -3133,3 +3133,303 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
         "another identity's rows survive the retirement"
     );
 }
+
+/// A host memory service that routes `memory.spaces.create` to the adapter over one pool, so a
+/// peer creates a Mind on a signed session. The service is the caller of the transaction, as
+/// `TransferService` is: `BEGIN IMMEDIATE`, the adapter, then commit only after `Ready`.
+struct CreateSpaceFace {
+    pool: sqlx::SqlitePool,
+    admission: MemoryAdmission,
+}
+
+#[async_trait]
+impl RemoteMemoryService for CreateSpaceFace {
+    async fn invoke(&self, peer_id: &str, op: &str, payload: Value) -> SpokeResult<Value> {
+        if op != "memory.spaces.create" {
+            return spoke_reject(
+                SpokeRejectCode::CapabilityPortMissing,
+                format!("the fixture create face does not serve {op}"),
+                None,
+            );
+        }
+        let principal = match (self.admission)(peer_id) {
+            SpokeResult::Ok(principal) => principal,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return spoke_reject(
+                    SpokeRejectCode::InternalError,
+                    format!("the fixture create face could not begin: {error}"),
+                    None,
+                )
+            }
+        };
+        let stage = MemoryAdapter::new(false)
+            .create_space(&mut tx, &principal, payload)
+            .await;
+        match stage {
+            SpokeResult::Ok(MemoryStage::Ready(body)) => match tx.commit().await {
+                Ok(()) => SpokeResult::Ok(body),
+                Err(error) => spoke_reject(
+                    SpokeRejectCode::OutcomeUncertain,
+                    format!("memory.spaces.create commit was not confirmed: {error}"),
+                    None,
+                ),
+            },
+            SpokeResult::Ok(_) => spoke_reject(
+                SpokeRejectCode::InternalError,
+                "create staged an outcome the fixture face cannot finish",
+                None,
+            ),
+            SpokeResult::Reject(reject) => {
+                let _ = tx.rollback().await;
+                SpokeResult::Reject(reject)
+            }
+        }
+    }
+}
+
+impl ServedMemory for CreateSpaceFace {}
+
+/// The signed create path: a peer creates a Mind over the wire, replays under the same key, and
+/// repeats under a fresh key. The create writes one default grant row carrying the seven
+/// capabilities; the replay writes nothing; the repeat changes no space, grant or revision. No
+/// answer carries the caller binding the served knowledge port reads from a scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_creates_a_mind_through_the_signed_loopback() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            Some(Arc::new(CreateSpaceFace {
+                pool: pool.clone(),
+                admission: principal_admission(),
+            })),
+            MindProviders::default(),
+        ),
+    );
+    assert!(
+        capabilities(&surface).contains(&"spoke-memory"),
+        "the attached create face advertises the memory family: {:?}",
+        capabilities(&surface)
+    );
+    let session = connect(&surface, &["spoke-memory"]).await;
+
+    let grants = |pool: sqlx::SqlitePool, space: &'static str| async move {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_grants WHERE space_id = ?")
+            .bind(space)
+            .fetch_one(&pool)
+            .await
+            .expect("count the grants")
+    };
+
+    let created = wire(expect_ok(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": "spc_wire", "idempotency_key": "create-wire-1" })),
+        )
+        .await,
+        "memory.spaces.create",
+    ));
+    assert_eq!(created["result"]["space_id"], json!("spc_wire"));
+    assert_eq!(created["result"]["created"], json!(true));
+    assert_eq!(created["result"]["status"], json!("active"));
+    assert_eq!(created["result"]["revision"], json!(1));
+    let first_receipt = created["receipt_id"].clone();
+    let grants_after_create = grants(pool.clone(), "spc_wire").await;
+    assert_eq!(
+        grants_after_create, 1,
+        "a create writes one default grant row"
+    );
+
+    let granted: String = sqlx::query_scalar(
+        "SELECT capabilities_json FROM memory_grants WHERE space_id = 'spc_wire'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the creator's grant row");
+    assert_eq!(
+        serde_json::from_str::<Value>(&granted).expect("capabilities json"),
+        json!([
+            "recall",
+            "capture",
+            "review",
+            "records_write",
+            "knowledge_read",
+            "knowledge_write",
+            "admin"
+        ]),
+        "the served create writes the same default grant set as the library"
+    );
+    // The binding the served knowledge port reads is an extensions namespace of the admitted
+    // scope, never a wire member: no answer here may carry it.
+    assert!(
+        !created.to_string().contains("mindcore_caller"),
+        "no wire answer carries the caller binding: {created}"
+    );
+
+    let replay = wire(expect_ok(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": "spc_wire", "idempotency_key": "create-wire-1" })),
+        )
+        .await,
+        "the replay of a create",
+    ));
+    assert_eq!(replay["receipt_id"], first_receipt);
+    assert_eq!(replay["result"], created["result"]);
+    assert_eq!(
+        grants(pool.clone(), "spc_wire").await,
+        1,
+        "a replay writes nothing"
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory_receipts WHERE space_id = 'spc_wire'")
+            .fetch_one(&pool)
+            .await
+            .expect("count the receipts");
+    assert_eq!(receipts, 1, "a replay records no second receipt");
+
+    let repeat = wire(expect_ok(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": "spc_wire", "idempotency_key": "create-wire-2" })),
+        )
+        .await,
+        "a repeat create under a fresh key",
+    ));
+    assert_ne!(repeat["receipt_id"], first_receipt);
+    assert_eq!(repeat["result"]["created"], json!(false));
+    assert_eq!(
+        repeat["result"]["revision"],
+        json!(1),
+        "the revision did not move"
+    );
+    assert_eq!(
+        grants(pool.clone(), "spc_wire").await,
+        1,
+        "a repeat writes no second grant row"
+    );
+    let (status, revision): (String, i64) =
+        sqlx::query_as("SELECT status, revision FROM memory_spaces WHERE space_id = ?")
+            .bind("spc_wire")
+            .fetch_one(&pool)
+            .await
+            .expect("the space row");
+    assert_eq!(status, "active");
+    assert_eq!(revision, 1, "a repeat changes no space");
+    assert_eq!(
+        session.adapter.state(),
+        RemoteAdapterState::Established,
+        "every call stayed on the one signed session"
+    );
+}
+
+/// A peer without space-wide `admin` on an existing Mind cannot create over it, and the answer is
+/// the fixed admission refusal — never the library's `MIND_ALREADY_EXISTS`, which names the id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signed_create_of_an_existing_mind_without_admin_learns_nothing() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            Some(Arc::new(CreateSpaceFace {
+                pool: pool.clone(),
+                admission: principal_admission(),
+            })),
+            MindProviders::default(),
+        ),
+    );
+    let session = connect(&surface, &["spoke-memory"]).await;
+
+    let refusal = expect_reject(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "create-wire-no-admin" })),
+        )
+        .await,
+        "an existing-Mind create without admin",
+    );
+    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        refusal.details.is_none(),
+        "the create refusal carries no details: {refusal:?}"
+    );
+    for needle in [PRINCIPAL, SPACE] {
+        assert!(
+            !refusal.message.contains(needle),
+            "the create refusal names neither the caller nor the space ({needle}): {refusal:?}"
+        );
+    }
+    assert!(
+        !refusal.message.contains("already exists"),
+        "the answer is never the taken-id refusal: {refusal:?}"
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory_receipts WHERE space_id = ?")
+            .bind(SPACE)
+            .fetch_one(&pool)
+            .await
+            .expect("count the receipts");
+    assert_eq!(receipts, 0, "a refused create stages no receipt");
+}
+
+/// A frozen Mind under its admin answers `SPACE_FROZEN` on the wire, and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
+    let fixture = Fixture::open().await;
+    fixture.grant("grt_admin", PRINCIPAL, &["admin"]).await;
+    let pool = fixture.store.pool();
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE)
+        .execute(&pool)
+        .await
+        .expect("freeze the Mind");
+    let (_dir, serve) = fixture.serve();
+    let surface = surface(
+        &serve,
+        faces(
+            hello("runtime", &["spoke-memory"]),
+            Some(Arc::new(CreateSpaceFace {
+                pool: pool.clone(),
+                admission: principal_admission(),
+            })),
+            MindProviders::default(),
+        ),
+    );
+    let session = connect(&surface, &["spoke-memory"]).await;
+
+    let refusal = expect_reject(
+        MemoryPort::create_space(
+            &*session.adapter,
+            &principal(),
+            typed(json!({ "space_id": SPACE, "idempotency_key": "create-wire-frozen" })),
+        )
+        .await,
+        "a create into a frozen Mind",
+    );
+    assert_eq!(
+        refusal.code,
+        SpokeRejectCode::SpaceFrozen,
+        "a frozen Mind answers the frozen refusal: {refusal:?}"
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory_receipts WHERE space_id = ?")
+            .bind(SPACE)
+            .fetch_one(&pool)
+            .await
+            .expect("count the receipts");
+    assert_eq!(receipts, 0, "a frozen Mind stages no receipt");
+}

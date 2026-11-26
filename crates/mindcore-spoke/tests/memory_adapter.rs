@@ -5044,3 +5044,234 @@ async fn create_of_an_existing_space_without_admin_answers_the_admission_refusal
     );
     tx.rollback().await.expect("rollback");
 }
+
+/// A create of a new id needs no grant — an authenticated principal creates — and it writes the
+/// creator's one default grant row inside the same transaction as the space, the carrier and the
+/// registry row. The row is space-wide, with no subject, no context restriction and no expiry.
+#[tokio::test]
+async fn create_of_a_new_id_writes_the_creators_one_default_grant() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let body = ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": "sp_fresh", "idempotency_key": "create-fresh" }),
+            )
+            .await,
+    );
+    assert_eq!(body["result"]["space_id"], json!("sp_fresh"));
+    assert_eq!(body["result"]["created"], json!(true));
+    assert_eq!(body["result"]["status"], json!("active"));
+    assert_eq!(body["result"]["revision"], json!(1));
+
+    assert_eq!(
+        harness
+            .count(&mut tx, "memory_grants WHERE space_id = 'sp_fresh'")
+            .await,
+        1,
+        "a create writes exactly one grant row"
+    );
+    let (capabilities, subject, contexts, expires): (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT capabilities_json, subject_id, context_ids_json, expires_at \
+             FROM memory_grants WHERE space_id = 'sp_fresh'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the creator's grant row");
+    let capabilities: Value = serde_json::from_str(&capabilities).expect("capabilities json");
+    assert_eq!(
+        capabilities,
+        json!([
+            "recall",
+            "capture",
+            "review",
+            "records_write",
+            "knowledge_read",
+            "knowledge_write",
+            "admin"
+        ]),
+        "the default grant set, in the owner's order"
+    );
+    assert_eq!(subject, None, "the default grant is space-wide");
+    assert_eq!(contexts, "[]", "the default grant restricts no context");
+    assert_eq!(expires, None, "the default grant never expires");
+
+    assert_eq!(
+        harness
+            .count(&mut tx, "minds WHERE space_id = 'sp_fresh'")
+            .await,
+        1
+    );
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// The dedup probe answers before the grant and freeze checks (`ports.rs:333-339`): after the
+/// space was frozen and every grant revoked, the same key still replays its recorded receipt and
+/// writes nothing — a replay is not a fresh effect and must not be refused by a later state.
+#[tokio::test]
+async fn a_retained_create_receipt_answers_before_the_grant_and_freeze_checks() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let request = json!({ "space_id": "sp_replay", "idempotency_key": "create-replay" });
+
+    let mut tx = harness.begin().await;
+    let first = ready(
+        adapter
+            .create_space(&mut tx, &principal(PRINCIPAL), request.clone())
+            .await,
+    );
+    tx.commit().await.expect("commit");
+
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = 'sp_replay'")
+        .execute(&harness.pool)
+        .await
+        .expect("freeze the mind");
+    sqlx::query("DELETE FROM memory_grants WHERE space_id = 'sp_replay'")
+        .execute(&harness.pool)
+        .await
+        .expect("revoke the creator's grant");
+
+    let mut tx = harness.begin().await;
+    let replay = ready(
+        adapter
+            .create_space(&mut tx, &principal(PRINCIPAL), request)
+            .await,
+    );
+    assert_eq!(replay["receipt_id"], first["receipt_id"]);
+    assert_eq!(replay["result"], first["result"]);
+    assert_eq!(
+        replay["result"]["created"],
+        json!(true),
+        "the replay answers the recorded create, not the space's later state"
+    );
+    assert_eq!(
+        harness
+            .count(&mut tx, "memory_grants WHERE space_id = 'sp_replay'")
+            .await,
+        0,
+        "a replay writes no grant"
+    );
+    assert_eq!(harness.count(&mut tx, "memory_receipts").await, 1);
+    tx.rollback().await.expect("rollback");
+}
+
+/// A frozen space under a caller holding space-wide `admin` answers `SPACE_FROZEN`, and stages no
+/// receipt: the freeze gate is a lifecycle gate on the fresh effect, not a dedup answer.
+#[tokio::test]
+async fn create_of_a_frozen_space_under_admin_answers_space_frozen() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["admin"]).await;
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
+        .bind(SPACE)
+        .execute(&harness.pool)
+        .await
+        .expect("freeze the space");
+    let adapter = MemoryAdapter::new(true);
+    let mut tx = harness.begin().await;
+
+    let refused = adapter
+        .create_space(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": SPACE, "idempotency_key": "create-frozen" }),
+        )
+        .await;
+    let create_reject = reject(&refused);
+    assert_eq!(create_reject.code, SpokeRejectCode::SpaceFrozen);
+    assert_eq!(retry_class(create_reject), "terminal");
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        0,
+        "a frozen space stages no receipt"
+    );
+    assert_eq!(
+        harness.count(&mut tx, "memory_grants").await,
+        1,
+        "the seeded admin row is the only grant: create added none"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// A repeat create by an admin under a fresh key changes no space, grant or revision and answers
+/// `created: false` with the space's current state; its own receipt is the only row it adds.
+#[tokio::test]
+async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else() {
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["admin"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    let mut tx = harness.begin().await;
+    let first = ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "idempotency_key": "create-repeat-1" }),
+            )
+            .await,
+    );
+    tx.commit().await.expect("commit");
+    assert_eq!(first["result"]["created"], json!(false));
+    assert_eq!(first["result"]["revision"], json!(1));
+    assert_eq!(first["result"]["status"], json!("active"));
+
+    let mut tx = harness.begin().await;
+    let repeat = ready(
+        adapter
+            .create_space(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": SPACE,
+                    "display_name": "a name a repeat must not write",
+                    "idempotency_key": "create-repeat-2"
+                }),
+            )
+            .await,
+    );
+    assert_ne!(
+        repeat["receipt_id"], first["receipt_id"],
+        "a fresh key records its own receipt"
+    );
+    assert_eq!(repeat["result"]["created"], json!(false));
+    assert_eq!(
+        repeat["result"]["revision"],
+        json!(1),
+        "the revision did not move"
+    );
+    assert_eq!(repeat["result"]["status"], json!("active"));
+
+    let (display_name, revision): (Option<String>, i64) =
+        sqlx::query_as("SELECT display_name, revision FROM memory_spaces WHERE space_id = ?")
+            .bind(SPACE)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the space row");
+    assert_eq!(
+        display_name.as_deref(),
+        Some("space"),
+        "a repeat changes no space"
+    );
+    assert_eq!(revision, 1);
+    assert_eq!(
+        harness.count(&mut tx, "memory_grants").await,
+        1,
+        "a repeat adds no second grant row"
+    );
+    assert_eq!(
+        harness.count(&mut tx, "memory_receipts").await,
+        2,
+        "one receipt per key, nothing more"
+    );
+    tx.rollback().await.expect("rollback");
+}

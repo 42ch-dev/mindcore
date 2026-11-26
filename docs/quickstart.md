@@ -145,8 +145,8 @@ pins go into `Cargo.toml` directly:
 [dependencies]
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
 # match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = ">=0.18.1, <0.19.0"
-spoke-schemas = ">=0.18.1, <0.19.0"
+spoke-operations = ">=0.19.1, <0.20.0"
+spoke-schemas = ">=0.19.1, <0.20.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```

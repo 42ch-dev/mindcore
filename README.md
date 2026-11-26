@@ -85,7 +85,7 @@ SPOKE pin matches the one this workspace declares:
 ```toml
 [dependencies]
 # match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = ">=0.18.1, <0.19.0"
+spoke-operations = ">=0.19.1, <0.20.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # not published: use them from this repository
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }

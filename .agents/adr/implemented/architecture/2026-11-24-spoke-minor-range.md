@@ -1,6 +1,6 @@
-# ADR: SPOKE crates declared at the 0.18 minor line
+# ADR: SPOKE crates declared at one minor line
 
-Status: implemented — exact `=0.18.1` pins blocked downstream patch resolution, and a wider range would admit unreviewed breaking changes
+Status: implemented — exact `=0.18.1` pins blocked downstream patch resolution, and a wider range would admit unreviewed breaking changes; the line is now the `0.19` one (`>=0.19.1, <0.20.0`), moved with the cohort the create operation requires
 Date: 2026-11-24
 
 ## Problem
@@ -9,7 +9,7 @@ Date: 2026-11-24
 
 ## Decision
 
-The three spoke dependencies are declared at the `0.18` minor line in the workspace `Cargo.toml`: `>=0.18.1, <0.19.0`. `Cargo.lock` remains the build pin: it fixes the exact `0.18.x` version every checkout, CI run and publish verification builds against, and it moves only when someone deliberately updates it. The dependency-follow rule is unchanged: a spoke minor bump forces a mindcore minor bump; a spoke patch bump may ship as a mindcore patch.
+The three spoke dependencies are declared at one minor line in the workspace `Cargo.toml`, never at an exact version: `0.19.1` today, which is the range `>=0.19.1, <0.20.0`. The line was `0.18.1` (`>=0.18.1, <0.19.0`) until the cohort moved with `2026-11-25-create-default-grant-set.md`'s protocol entry point. `Cargo.lock` remains the build pin: it fixes the exact `x.y.z` version every checkout, CI run and publish verification builds against, and it moves only when someone deliberately updates it. The dependency-follow rule is unchanged: a spoke minor bump forces a mindcore minor bump; a spoke patch bump may ship as a mindcore patch.
 
 ## Alternatives considered
 
@@ -19,6 +19,6 @@ The three spoke dependencies are declared at the `0.18` minor line in the worksp
 
 ## Consequences
 
-- `cargo update -p spoke-schemas` can now move the lockfile to a new `0.18.x` patch without a Cargo.toml edit; that update is what ships as a mindcore patch. A `0.19` line still requires editing the requirement and is therefore always a mindcore minor.
-- Because the manifest admits a range, the lockfile is the only record of which `0.18.x` a build used; `--locked` builds and the committed `Cargo.lock` carry the pinning duty the manifest gave up.
-- Published crates resolve the range at install time: a consumer building `mindcore-sqlite` gets the newest `0.18.x` the registry offers, never below `0.18.1` — the first release whose spoke-schemas carries the strict timestamp parser — and not necessarily the version CI tested, which is the accepted cost of letting patch fixes reach downstream without a mindcore release.
+- `cargo update -p spoke-schemas` can now move the lockfile to a new `0.19.x` patch without a Cargo.toml edit; that update is what ships as a mindcore patch. A `0.20` line still requires editing the requirement and is therefore always a mindcore minor.
+- Because the manifest admits a range, the lockfile is the only record of which `0.19.x` a build used; `--locked` builds and the committed `Cargo.lock` carry the pinning duty the manifest gave up.
+- Published crates resolve the range at install time: a consumer building `mindcore-sqlite` gets the newest `0.19.x` the registry offers, never below `0.19.1` — the release that pins `memory.spaces.create`'s scoped filter coverage and its created-space profile policy — and not necessarily the version CI tested, which is the accepted cost of letting patch fixes reach downstream without a mindcore release.

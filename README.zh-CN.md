@@ -81,7 +81,7 @@ cargo add mindcore-base mindcore-sqlite
 ```toml
 [dependencies]
 # 与本 workspace 的 Cargo.toml 中固定的 SPOKE 版本保持一致
-spoke-operations = ">=0.18.1, <0.19.0"
+spoke-operations = ">=0.19.1, <0.20.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # 未发布：从本仓库引入
 mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
