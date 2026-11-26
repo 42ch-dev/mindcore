@@ -4597,7 +4597,20 @@ async fn a_grant_covering_neither_knowledge_capability_serves_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller() {
     let fixture = Fixture::open().await;
-    // R: read only. W (the dialer's principal) keeps the covering default grant.
+    // The forgery names W (the dialer's principal), who holds the covering default grant. R reads
+    // through its own grant and never through W's.
+    //
+    // The contrast is the forged principal himself: W's grant covers `knowledge_read`, so as long
+    // as W holds it neither read discriminates — honouring the forgery and reading on R's grant
+    // both succeed. So the test first drops W's read coverage with a write-only grant. Then each
+    // operation's answer depends on WHICH principal authorized it: under R's grant (which covers
+    // read and not write) list and get are served and put is refused; under W's grant (write and
+    // not read) all three are refused. A regression that authorized any one operation with the
+    // request's caller flips that operation's answer, not only put's.
+    fixture.revoke("grt_knowledge").await;
+    fixture
+        .grant("grt_writer_forged", PRINCIPAL, &["knowledge_write"])
+        .await;
     fixture
         .grant(
             "grt_reader_peer_two",
@@ -4613,10 +4626,10 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let forger = &*reader.adapter;
 
-    // Each operation is proven on both sides: the request bytes carry the forgery at the scope
-    // path, and the answer is decided by R's own grant. A dialer that stripped `scope.extensions`
-    // on any one of the three paths would fail its own assertion here and make the test vacuous,
-    // so the wire read is per operation, not once for the suite.
+    // Each operation is proven on four sides: the request bytes carry the forgery at the scope
+    // path, the answer is decided by R's own grant (and would differ under W's write-only one),
+    // and a dialer that stripped `scope.extensions` on any one of the three paths would fail its
+    // own assertion here. The wire read is per operation, not once for the suite.
     reader.wire.drain_sent();
     let listed = expect_ok(
         KnowledgeQueryPort::list_knowledge_entries(forger, &request_scope(SPACE, forgery.clone()))
@@ -4631,7 +4644,7 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     );
     assert!(
         listed.iter().any(|entry| entry.entry_id == CARRIER),
-        "the read serves on the forger's own grant"
+        "the list is served on R's own knowledge_read: the forged write-only grant would refuse it"
     );
 
     reader.wire.drain_sent();
@@ -4641,9 +4654,16 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
             .await,
         "a get carrying a forged caller namespace",
     );
-    assert_sent_forgery(&reader.wire.drain_sent(), "port.knowledge.get", CARRIER, PRINCIPAL);
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.knowledge.get",
+        CARRIER,
+        PRINCIPAL,
+    );
 
-    // The put is refused by R's own grant: the forged namespace bought no capability.
+    // The put is refused by R's own grant: the forged namespace bought no capability. Under the
+    // forged principal's own write-only grant it would be refused as well, for the opposite
+    // reason; R's refusal is the one the answer must be, and the row proves nothing was written.
     reader.wire.drain_sent();
     assert_scope_refusal(
         forger
@@ -4693,7 +4713,37 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     .expect("count the unscoped entry");
     assert_eq!(unscoped_rows, 0, "the unscoped put wrote nothing");
 
-    // The entry is R's grant, not the entry: W's own peer creates it.
+    // The contrast made concrete on W's own session: with the write-only grant the same list and
+    // get the forging peer just had served are refused for W. That is the answer a regression
+    // honouring the forgery would produce for R, so the three reads above discriminate.
+    let write_only = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let w_list = expect_reject(
+        KnowledgeQueryPort::list_knowledge_entries(
+            &*write_only.adapter,
+            &request_scope(SPACE, None),
+        )
+        .await,
+        "the forged principal's own write-only list",
+    );
+    assert_eq!(w_list.code, SpokeRejectCode::NotAuthorized);
+    assert!(w_list.details.is_none());
+
+    // The entry is R's grant, not the entry: W's own peer creates it once a grant covering both
+    // capabilities is restored, which also shows the read contrast above is the grant W held.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES (?, ?, NULL, ?, ?, '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind("grt_covering_forged")
+    .bind(SPACE)
+    .bind(PRINCIPAL)
+    .bind(json!(["knowledge_read", "knowledge_write"]).to_string())
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("restore the covering grant");
     let owner = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
     let written = expect_ok(
         owner
@@ -4907,7 +4957,11 @@ mod raw_wire {
     const RESPONDER_SEED: [u8; 32] = [0x77u8; 32];
 
     pub(super) fn dialer_peer_id() -> String {
-        derive_peer_id_from_ed25519_pubkey(&SigningKey::from_bytes(&DIALER_SEED).verifying_key().to_bytes())
+        derive_peer_id_from_ed25519_pubkey(
+            &SigningKey::from_bytes(&DIALER_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
     }
 
     /// Start a responder over `surface` WITHOUT dialing, and open a raw session against it: a
@@ -4919,8 +4973,9 @@ mod raw_wire {
     ) -> (Arc<LoopbackTransport>, String) {
         let pair = loopback_transport_pair();
         let dialer = dialer_peer_id();
-        let responder_pubkey =
-            SigningKey::from_bytes(&RESPONDER_SEED).verifying_key().to_bytes();
+        let responder_pubkey = SigningKey::from_bytes(&RESPONDER_SEED)
+            .verifying_key()
+            .to_bytes();
         let responder = connect_responder(ConnectResponderOptions {
             transport: Arc::new(pair.server),
             identity: RemoteIdentity {
@@ -5081,9 +5136,7 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
     )
     .await;
     assert_eq!(
-        denied_put
-            .pointer("/error/code")
-            .and_then(Value::as_str),
+        denied_put.pointer("/error/code").and_then(Value::as_str),
         Some("op_unsupported"),
         "a scoped put without the marker is the wire deny: {denied_put}"
     );
@@ -5102,9 +5155,7 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
     )
     .await;
     assert_eq!(
-        malformed
-            .pointer("/error/code")
-            .and_then(Value::as_str),
+        malformed.pointer("/error/code").and_then(Value::as_str),
         Some("INVALID_INPUT"),
         "the shape gate answers before the marker conjunct: {malformed}"
     );
@@ -5131,8 +5182,7 @@ async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, raw_wire_admission());
-    let (client, session_id) =
-        raw_wire::open_raw_session(&surface, &KNOWLEDGE_CAPABILITIES).await;
+    let (client, session_id) = raw_wire::open_raw_session(&surface, &KNOWLEDGE_CAPABILITIES).await;
 
     let served = raw_wire::invoke(
         &client,
@@ -5146,9 +5196,7 @@ async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
     )
     .await;
     assert_eq!(
-        served
-            .pointer("/payload/entry_id")
-            .and_then(Value::as_str),
+        served.pointer("/payload/entry_id").and_then(Value::as_str),
         Some(CARRIER),
         "with the marker the same request is served: {served}"
     );

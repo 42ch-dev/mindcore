@@ -541,8 +541,17 @@ impl MindStore {
         }
     }
 
-    /// The connect-served knowledge port over this store's pool. It holds no route: every call
-    /// resolves the registered collection of the `scope_id` it is given.
+    /// The storage half of the served knowledge face, over this store's pool, with no route held:
+    /// every call resolves the registered collection of the `scope_id` it is given.
+    ///
+    /// **Storage only.** This constructor performs no grant evaluation: it resolves a route and
+    /// reads or writes the collection it names, but it never asks whether the caller may do so.
+    /// A Connect host must not install the value it returns as a face directly — wrap it in
+    /// `MindKnowledgePort` (in `mindcore-spoke`), which reads the admission binding back into the
+    /// scope and authorizes each operation on the caller's own live grant, or compose the face
+    /// through the runtime's `MindcoreServe::surface` with `ServeFaces.knowledge`, which does that
+    /// wrapping. Grant evaluation lives in the adapter layer, not here
+    /// (`2026-11-20-storage-ir-layering.md`).
     pub fn served_knowledge(&self) -> RoutedKnowledgeStore {
         RoutedKnowledgeStore {
             pool: self.pool.clone(),
@@ -550,13 +559,25 @@ impl MindStore {
     }
 }
 
-/// The connect-served knowledge face over the store's shared pool.
+/// The routed **storage** adapter behind the served knowledge face, over the store's shared pool.
 ///
-/// The face resolves its route per call from the Mind registry: the admitted `Scope`'s `scope_id`
-/// names a Mind, and that Mind's registered collection is the one the op reads and writes. A
-/// `scope_id` with no registry row is `NotAuthorized` before any entry statement — no peer,
-/// payload or fallback names a collection — and the route and the op's own statements share one
-/// transaction, so a route resolved on a stale snapshot cannot serve another Mind's entries.
+/// **Storage only — not a Connect face.** The type resolves routes, reads and writes entries, and
+/// evaluates SPOKE's disclosure predicate; it does **not** evaluate grants. `ScopedKnowledgePort`
+/// carries no principal, so this adapter cannot tell whose grant an operation should be
+/// authorized on, and a host that installs it as a face answers every caller the route admits,
+/// whatever that caller may do. The caller-authorizing face is
+/// `MindKnowledgePort` (in `mindcore-spoke`), which wraps this adapter and reads the admission
+/// binding (`bound_caller`) back out of the scope; the runtime composes that wrapper.
+///
+/// The same holds for the `HistoryPort` methods this type implements: replay and prune receive
+/// the caller's `Principal` from Connect but do not evaluate it, so a history face composed over
+/// this adapter directly would serve any peer the route admits.
+///
+/// What it does do, per call: the admitted `Scope`'s `scope_id` names a Mind, and that Mind's
+/// registered collection is the one the op reads and writes. A `scope_id` with no registry row is
+/// `NotAuthorized` before any entry statement — no peer, payload or fallback names a collection —
+/// and the route and the op's own statements share one transaction, so a route resolved on a
+/// stale snapshot cannot serve another Mind's entries.
 ///
 /// Every op applies the admitted refinements and SPOKE's disclosure predicate, so an entry hidden
 /// from the peer answers like a missing one. `put` judges the submitted entry, and the existing row
