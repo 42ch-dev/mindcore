@@ -21,6 +21,7 @@
 //! `create`, `list` and `get` a host calls on its `MindStore`, and [`mind`] holds the `Mind`
 //! handle a caller opens over one Mind.
 
+mod adoption;
 mod history_dedup;
 
 pub mod journal;
