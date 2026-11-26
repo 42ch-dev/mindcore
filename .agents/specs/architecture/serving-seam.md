@@ -14,19 +14,20 @@ admission, the manifest advertises neither `spoke-knowledge` nor `ke-ownership`,
 `ScopedKnowledgeStore` and `RoutedKnowledgeStore` stay in `mindcore-sqlite` for Stage 2 to bind
 per Mind. The paragraphs below state the contract a restored face must satisfy.
 
-A restored face installs a `KnowledgeAdmission` callback in `RemoteKnowledgeFace`. Connect supplies the authenticated peer id; the callback returns the peer's one admitted `Scope` or refuses. An exact host-configured route maps the admitted `scope_id` to `KnowledgeScope.collection` on the bound SQLite pool. No fallback guesses a collection from an entry id, `owner`, `viewpoint`, or Memory `SpaceId`. Memory space and workflow knowledge grants remain separate and go through the existing `MemoryWorkflowBinding` admission. The `ke-ownership` protocol gate checks the negotiated flag for a list with an explicit `viewpoint`; it neither chooses the collection nor grants the peer entry access.
+A restored face installs a `KnowledgeAdmission` callback in `RemoteKnowledgeFace`. Connect supplies the authenticated peer id and, through A1, the `scope_id` the request declares; the callback admits that one Mind, resolving the collection and carrier through the Mind's registry row on the caller's own transaction, and returns the admitted `Scope` for that Mind or refuses. There is no host-configured route map to consume and no fallback: no collection is guessed from an entry id, `owner`, `viewpoint` or Memory `SpaceId`, and an unknown Mind id and a Mind the peer holds no grant for answer one `NOT_AUTHORIZED` with no `details`, exactly as the memory path's admission answers. Memory space and workflow knowledge grants remain separate and go through the existing `MemoryWorkflowBinding` admission. The `ke-ownership` protocol gate checks the negotiated flag for a list with an explicit `viewpoint`; it neither chooses the collection nor grants the peer entry access.
 
-`get` and `put` carry no wire scope. `list` names the admitted `scope_id` and `viewpoint`; Connect bounds the request by the admitted scope before calling the store. The scoped adapter binds the collection on every statement. Within it, entry-id, entry-type, source-id and viewpoint filters use SPOKE's knowledge predicate (including owner-private disclosure); an explicit empty set matches nothing. The face does not serve cognition, timeline or extension-based selection; refuse unsupported constraints rather than silently ignoring them. List results are in `entry_id` order. The host admission callback validates the scope it returns with `mindcore_sqlite::validate_admission_scope` before returning it: Connect's list merge keeps only the request's cognition selection, so an admitted cognition selection reaches the collection query unless it is refused at admission. A served list reads at most `SERVED_KNOWLEDGE_LIST_LIMIT` (512) **live** rows of the routed collection — the live predicate rides in the statement — and refuses a larger live set with `InternalError` naming the bound; the bound applies before disclosure filtering and never truncates silently. A retired row therefore never consumes list budget.
+`list` names the admitted `scope_id` and `viewpoint`, as it does today, and Connect bounds the request by the admitted scope before calling the store. `get` and `put` carry the optional `scope` member A2 adds, with the negotiable marker saying the responder honours it: a request that names a scope on a responder without the marker is refused as unsupported — wire `op_unsupported`, `CapabilityPortMissing` in the Rust dialer — and never served from a default collection, because a dropped scope would land the read or write in a collection the caller never named. The scoped adapter binds the admitted Mind's collection on every statement. Within it, entry-id, entry-type, source-id and viewpoint filters use SPOKE's knowledge predicate (including owner-private disclosure); an explicit empty set matches nothing. The face does not serve cognition, timeline or extension-based selection; refuse unsupported constraints rather than silently ignoring them. List results are in `entry_id` order. The host admission callback validates the scope it returns with `mindcore_sqlite::validate_admission_scope` before returning it: Connect's list merge keeps only the request's cognition selection, so an admitted cognition selection reaches the collection query unless it is refused at admission. A served list reads at most `SERVED_KNOWLEDGE_LIST_LIMIT` (512) **live** rows of the admitted Mind's collection — the live predicate rides in the statement — and refuses a larger live set with `InternalError` naming the bound; the bound applies before disclosure filtering and never truncates silently. A retired row therefore never consumes list budget.
 
-The peer's route grants read/write knowledge access within its scope, not unconstrained access to the database. `put` checks the proposed payload and any existing row against the admitted constraints on the same `BEGIN IMMEDIATE` transaction, before exposing a revision or committing a change. A missing expected revision keeps create-only semantics; a supplied one performs compare-and-swap through the common store. A hidden existing row is never overwritten, and hidden entry data/revisions are never returned. No operation probes another collection.
+The admitted Mind's grants read/write knowledge access within its scope, not unconstrained access to the database. `put` checks the proposed payload and any existing row against the admitted constraints on the same `BEGIN IMMEDIATE` transaction, before exposing a revision or committing a change. A missing expected revision keeps create-only semantics; a supplied one performs compare-and-swap through the common store. A hidden existing row is never overwritten, and hidden entry data/revisions are never returned. No operation probes another collection.
 
 | Refusal | Result |
 |---|---|
 | Required negotiated family, conditional ownership flag or serving face missing | Wire `op_unsupported`, exposed by the Rust dialer as `CapabilityPortMissing` with `details.wire_code`. |
-| Peer unadmitted or list names/widens another scope; unknown trusted route | `NotAuthorized` (`NOT_AUTHORIZED`), no target details. |
+| Peer unadmitted, or a request names or widens another Mind's scope | `NotAuthorized` (`NOT_AUTHORIZED`), no target details. |
 | Host admission returns an unsupported selection | `NotAuthorized`, no target details: refused at admission before Connect merges the scope, so the store is never reached. |
+| `get`/`put` carry a `scope` the responder's negotiated marker does not cover | Wire `op_unsupported` (`CapabilityPortMissing` in the Rust dialer): refused, never silently dropped. |
 | Malformed scope/payload, or a caller-declared (request) scope with an unsupported selection | `InvalidInput`; the unsupported-selection case is refused at the store. The responder's earlier payload-dependent gates still apply. |
-| Get id absent or hidden within the routed collection | One generic `KnowledgeEntryNotFound`. An out-of-scope put is `NotAuthorized`. |
+| Get id absent or hidden within the admitted Mind's collection | One generic `KnowledgeEntryNotFound`. An out-of-scope put is `NotAuthorized`. |
 | Admitted create hits an existing visible id; admitted update carries a stale/missing stored revision | `KnowledgeEntryAlreadyExists`; `StoredRevisionStale`, respectively. Preserve backend codes; storage failures are `InternalError`. |
 
 ### History
@@ -141,14 +142,15 @@ neither `spoke-knowledge-adoption` nor its `spoke-knowledge` co-capability, and 
 call answers `CAPABILITY_PORT_MISSING`. The paragraphs below state the contract a restored face must
 satisfy. A restored face takes the one host-configured source as an `AdoptionRoute` — a `scope_id`
 naming it on the wire and the `KnowledgeScope` the store reads — and no destination setting: the
-destination is the knowledge face's own collection, the one `knowledge.get`/`list` serve for the
-admitted peer, so a copy is readable back through that face whenever the peer's admitted selection
-admits it. The Mind's registry row selects workflow collections only and plays no part in adoption. The
+destination is the knowledge face's own collection, which on a restored per-Mind face is the
+admitting Mind's, the one `knowledge.get`/`list` serve for that Mind, so a copy is readable back
+through that face whenever the peer's admitted selection admits it. The Mind's registry row selects
+workflow collections only and plays no part in adoption. The
 Stage 2 handoff at the end of this section names what it must re-implement rather than re-bind.
 
 **Admission is the knowledge face's**, composed as `(principals(peer)?, knowledge_admission(peer)?)`
-like the history family's: a peer the knowledge face does not admit cannot adopt, and a routed
-principal the knowledge admission refuses answers `NOT_AUTHORIZED` where the removed product tool
+like the history family's: a peer the knowledge face does not admit cannot adopt, and a principal
+the knowledge admission refuses answers `NOT_AUTHORIZED` where the removed product tool
 would have served it. Neither the principal nor the admitted scope comes from the payload.
 
 **Scope mapping.** Every scope member of the request is compared, never used to select anything:
@@ -192,12 +194,11 @@ handed that occupant back, so only a copy the caller can already read carries it
 "existence is never revealed" claim would be false and is not made here.
 
 **Assembly** refuses an empty source scope id, an empty source collection, a source collection equal
-to `ServeFaces.knowledge`'s collection or to any route destination — including the route of a
-principal that is not currently connected — and a source scope id equal to `ServeFaces.scope_id`,
-all with `InvalidInput` before any port or registration exists
-(`crates/mindcore-runtime/src/lib.rs:105-150`). A source that is also a destination would let one
-principal's adopted copy become the shared entry another principal reads, and a source scope equal
-to the destination scope would let a principal adopt from its own destination.
+to the knowledge face's own collection or to any Mind's registered collection — including a Mind
+that is not currently connected — and a source scope id equal to the destination scope, all with
+`InvalidInput` before any port or registration exists. A source that is also a destination would let
+one Mind's adopted copy become the shared entry another Mind reads, and a source scope equal to the
+destination scope would let a Mind adopt from its own destination.
 
 **Terminal anchor.** The requested source resolves through `spoke_operations::resolve_retirement_chain`
 inside the same transaction before anything is read for the copy: a live source resolves to itself,
@@ -288,7 +289,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 
 ## Invariants
 
-- No caller-provided principal, scope route, or manifest capability can bypass a host admission or storage guard.
+- No caller-provided principal, Mind id, or manifest capability can bypass a host admission or storage guard.
 - No baseline provider is required for either face and an absent face/tool is denied. Advertisements and handler registrations describe the same capabilities.
 - The adoption source is host configuration and the adoption destination is the knowledge face's own collection: no wire value selects either, the request's scope members are only compared against those two, and a source equal to the destination collection, to any Mind's collection registered beside it or to the destination scope is refused before serving.
 - Adoption's answer reports `destination_entry_id` slot occupancy — occupied or free — and nothing about the occupant: a concealed occupant is byte-identical to a visible one. That disclosure is permitted and no wider than the knowledge face it lands on, whose create-only `put_knowledge_entry` already distinguishes occupied from free while hiding the entry; entry content, revision and visibility stay undisclosed.
