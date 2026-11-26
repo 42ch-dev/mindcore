@@ -629,6 +629,107 @@ impl Drop for Session {
     }
 }
 
+/// The raw inbound envelopes of one session, in arrival order.
+///
+/// A typed response is not the wire: `invoke_mapped` decodes into the op's DTO, so a member the
+/// DTO does not declare is gone before a test can see it. These are the bytes.
+#[derive(Default)]
+struct WireLog {
+    frames: Mutex<Vec<String>>,
+}
+
+impl WireLog {
+    fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.frames.lock().expect("wire log lock"))
+    }
+}
+
+/// The dialer end of the loopback, recording every envelope it receives.
+struct RecordingTransport {
+    inner: LoopbackTransport,
+    log: Arc<WireLog>,
+}
+
+#[async_trait]
+impl Transport for RecordingTransport {
+    async fn send(&self, envelope: &[u8]) -> Result<(), TransportError> {
+        self.inner.send(envelope).await
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, TransportError> {
+        let frame = self.inner.recv().await?;
+        self.log
+            .frames
+            .lock()
+            .expect("wire log lock")
+            .push(String::from_utf8_lossy(&frame).into_owned());
+        Ok(frame)
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        self.inner.close().await
+    }
+}
+
+/// Every occurrence of the caller in one decoded wire frame that must not be there, as
+/// `path: needle`; empty when the frame carries it only where a receipt may.
+///
+/// This walks the raw frame rather than the typed response, because `invoke_mapped` decodes into
+/// the op's DTO and drops every member the DTO does not declare: a leak under an unmodelled key
+/// is invisible after decoding but present here.
+fn caller_leaks(value: &Value, path: &str) -> Vec<String> {
+    let mut leaks = Vec::new();
+    match value {
+        Value::Object(members) => {
+            for (key, member) in members {
+                let here = format!("{path}.{key}");
+                if key.contains("mindcore_caller") {
+                    leaks.push(format!("{here}: the binding namespace as a key"));
+                    continue;
+                }
+                // A receipt names its own requester, and that attribution is about this caller's
+                // own request rather than the scope binding. It is the only place the id may
+                // appear, and only on a receipt: any other object carrying the member leaks.
+                if key == "requester_principal_id" {
+                    if !members.contains_key("receipt_id") {
+                        leaks.push(format!("{here}: the caller outside a receipt"));
+                    }
+                    continue;
+                }
+                leaks.extend(caller_leaks(member, &here));
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                leaks.extend(caller_leaks(item, &format!("{path}[{index}]")));
+            }
+        }
+        Value::String(text) => {
+            for needle in ["mindcore_caller", PRINCIPAL] {
+                if text.contains(needle) {
+                    leaks.push(format!("{path}: {needle}"));
+                }
+            }
+        }
+        _ => {}
+    }
+    leaks
+}
+
+/// Assert that every frame the responder answered since the last drain carries the caller
+/// nowhere, and that the call was answered at all. A frame that is not JSON fails: nothing this
+/// suite's own faces send is anything else.
+fn assert_caller_absent(session: &Session, context: &str) {
+    let frames = session.wire.drain();
+    assert!(!frames.is_empty(), "{context}: the call was answered");
+    for frame in &frames {
+        let parsed: Value = serde_json::from_str(frame)
+            .unwrap_or_else(|error| panic!("{context}: the wire frame is JSON ({error}): {frame}"));
+        let leaks = caller_leaks(&parsed, "$");
+        assert!(leaks.is_empty(), "{context}: the answer carries the caller: {leaks:?}");
+    }
+}
+
 /// Establish a real signed loopback session over `surface`, the dialer claiming exactly
 /// `dialer_capabilities` in its hello. Handlers are installed before the dialer connects.
 async fn connect(surface: &MindcoreSurface, dialer_capabilities: &[&str]) -> Session {
@@ -3516,4 +3617,31 @@ async fn a_signed_create_of_a_frozen_mind_answers_space_frozen() {
             .await
             .expect("count the receipts");
     assert_eq!(receipts, 0, "a frozen Mind stages no receipt");
+}
+
+/// The absence walk is not vacuous: it names a leak of the caller id under an unrelated key, the
+/// binding namespace itself, and a leak inside an array — the shapes a plain substring search of a
+/// typed response would miss.
+#[test]
+fn the_caller_absence_walk_catches_a_leak_under_any_key() {
+    let frame = |body: &str| -> Value {
+        serde_json::from_str(body).expect("the fixture frame is JSON")
+    };
+    let clean = frame(
+        r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
+    );
+    assert_eq!(caller_leaks(&clean, "$"), Vec::<String>::new());
+
+    for leak in [
+        r#"{"payload":{"result":{"space":"prn_loopback"}}}"#,
+        r#"{"extensions":{"mindcore_caller":{"principal":"p"}}}"#,
+        r#"{"payload":{"items":["ok","mindcore_caller"]}}"#,
+        r#"{"payload":{"result":{"requester_principal_id":"prn_loopback"}}}"#,
+    ] {
+        assert_eq!(
+            caller_leaks(&frame(leak), "$").len(),
+            1,
+            "the walk names the leak in: {leak}"
+        );
+    }
 }
