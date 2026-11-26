@@ -433,7 +433,10 @@ async fn unauthorized_capture_rejects_without_an_effect() {
         .capture(&mut tx, &principal(STRANGER), request)
         .await;
     let reject = reject(&result);
-    assert_admission_refusal(reject, "a principal with no grant in the space is not admitted");
+    assert_admission_refusal(
+        reject,
+        "a principal with no grant in the space is not admitted",
+    );
     assert_eq!(harness.count(&mut tx, "memory_candidates").await, 0);
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
     tx.rollback().await.expect("rollback");
@@ -4344,7 +4347,10 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
         )
         .await;
     let refusal = reject(&records);
-    assert_admission_refusal(refusal, "a caller with no grant is refused before any existence check");
+    assert_admission_refusal(
+        refusal,
+        "a caller with no grant is refused before any existence check",
+    );
     tx.rollback().await.expect("rollback");
 }
 
@@ -4508,12 +4514,19 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
             )
             .await;
         let refusal = reject(&receipts);
-        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "receipts in {space}");
+        assert_eq!(
+            refusal.code,
+            SpokeRejectCode::NotAuthorized,
+            "receipts in {space}"
+        );
         assert!(
             refusal.details.is_none(),
             "receipts in {space} carries no details: {refusal:?}"
         );
-        envelopes.push((format!("receipts in {space}"), serde_json::json!(refusal.message)));
+        envelopes.push((
+            format!("receipts in {space}"),
+            serde_json::json!(refusal.message),
+        ));
         let subjects_get = adapter
             .get_subject(
                 &mut tx,
@@ -4522,26 +4535,36 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
             )
             .await;
         let refusal = reject(&subjects_get);
-        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "subjects.get in {space}");
+        assert_eq!(
+            refusal.code,
+            SpokeRejectCode::NotAuthorized,
+            "subjects.get in {space}"
+        );
         assert!(
             refusal.details.is_none(),
             "subjects.get in {space} carries no details: {refusal:?}"
         );
-        envelopes.push((format!("subjects.get in {space}"), serde_json::json!(refusal.message)));
+        envelopes.push((
+            format!("subjects.get in {space}"),
+            serde_json::json!(refusal.message),
+        ));
         let grants_list = adapter
-            .list_grants(
-                &mut tx,
-                &principal(PRINCIPAL),
-                json!({ "space_id": space }),
-            )
+            .list_grants(&mut tx, &principal(PRINCIPAL), json!({ "space_id": space }))
             .await;
         let refusal = reject(&grants_list);
-        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "grants.list in {space}");
+        assert_eq!(
+            refusal.code,
+            SpokeRejectCode::NotAuthorized,
+            "grants.list in {space}"
+        );
         assert!(
             refusal.details.is_none(),
             "grants.list in {space} carries no details: {refusal:?}"
         );
-        envelopes.push((format!("grants.list in {space}"), serde_json::json!(refusal.message)));
+        envelopes.push((
+            format!("grants.list in {space}"),
+            serde_json::json!(refusal.message),
+        ));
         // The mutation path enters admission through `authorize`.
         let mutation = adapter
             .capture(
@@ -4557,12 +4580,19 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
             )
             .await;
         let refusal = reject(&mutation);
-        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "capture in {space}");
+        assert_eq!(
+            refusal.code,
+            SpokeRejectCode::NotAuthorized,
+            "capture in {space}"
+        );
         assert!(
             refusal.details.is_none(),
             "capture in {space} carries no details: {refusal:?}"
         );
-        envelopes.push((format!("capture in {space}"), serde_json::json!(refusal.message)));
+        envelopes.push((
+            format!("capture in {space}"),
+            serde_json::json!(refusal.message),
+        ));
         assert_eq!(
             harness.count(&mut tx, "memory_candidates").await,
             0,
@@ -4614,10 +4644,10 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
 /// wire shape is the one the operation projected before.
 #[tokio::test]
 async fn spaces_list_returns_only_admitted_minds() {
-    use mindcore_sqlite::minds::CreateMind;
-    use mindcore_sqlite::minds;
     use mindcore_base::boundary::CallerId;
     use mindcore_base::ids::MindId;
+    use mindcore_sqlite::minds;
+    use mindcore_sqlite::minds::CreateMind;
 
     let harness = Harness::open().await;
     harness.seed_grant(PRINCIPAL, &["recall"]).await;
@@ -4626,7 +4656,11 @@ async fn spaces_list_returns_only_admitted_minds() {
     // Two Minds for the listing owner, created out of id order so the answer
     // proves its sort, and a third for another owner alone.
     let mut tx = harness.begin().await;
-    for (id, owner) in [("mind_beta", "o_list"), ("mind_alpha", "o_list"), ("mind_gamma", "o_other")] {
+    for (id, owner) in [
+        ("mind_beta", "o_list"),
+        ("mind_alpha", "o_list"),
+        ("mind_gamma", "o_other"),
+    ] {
         let created = minds::create(
             &mut tx,
             &CreateMind {
@@ -4636,7 +4670,10 @@ async fn spaces_list_returns_only_admitted_minds() {
             },
         )
         .await;
-        assert!(matches!(created, SpokeResult::Ok(_)), "create {id}: {created:?}");
+        assert!(
+            matches!(created, SpokeResult::Ok(_)),
+            "create {id}: {created:?}"
+        );
     }
     sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = 'mind_beta'")
         .execute(&mut *tx)
@@ -4665,7 +4702,8 @@ async fn spaces_list_returns_only_admitted_minds() {
         .find(|space| space["space_id"] == json!("mind_beta"))
         .expect("mind_beta is listed");
     assert_eq!(
-        frozen["status"], json!("frozen"),
+        frozen["status"],
+        json!("frozen"),
         "a frozen Mind is listed with its frozen status"
     );
     assert!(
@@ -4697,7 +4735,8 @@ async fn spaces_list_returns_only_admitted_minds() {
             .await,
     );
     assert_eq!(
-        own["spaces"], json!([]),
+        own["spaces"],
+        json!([]),
         "a space with no registry row is excluded even under a live grant"
     );
     tx.rollback().await.expect("rollback");

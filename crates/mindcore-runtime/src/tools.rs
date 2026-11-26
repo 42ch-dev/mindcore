@@ -26,9 +26,9 @@ use mindcore_spoke::MemoryAdapter;
 use spoke_connect::remote::{ConnectResponder, MemoryAdmission, ToolHandler};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
-use sqlx::SqlitePool;
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
+use sqlx::SqlitePool;
 
 use crate::ToolRegistration;
 

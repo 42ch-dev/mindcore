@@ -794,7 +794,8 @@ async fn malformed_arguments_are_invalid_input() {
     for (case, capability_id, arguments) in cases {
         let fake = Arc::new(Fake::default());
         let reject = expect_reject(
-            tools(fake).await
+            tools(fake)
+                .await
                 .call(capability_id, "peer-driver", arguments)
                 .await,
             case,
@@ -901,8 +902,12 @@ async fn read_cognition_serves_a_judgment_or_a_null_state() {
     // Admitted (a live `recall` grant), but not to `knowledge_read`: the coverage refusal
     // answers, and it must not be the target-free admission refusal.
     let uncovered = expect_reject(
-        tool.call(READ_COGNITION, "peer-driver", cognition_read_arguments("spc_4"))
-            .await,
+        tool.call(
+            READ_COGNITION,
+            "peer-driver",
+            cognition_read_arguments("spc_4"),
+        )
+        .await,
         "an admitted caller without knowledge_read",
     );
     assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
@@ -1018,7 +1023,8 @@ async fn settlement_refusals_keep_their_code_and_details() {
     fake.reply_absorb(Err(SpiError::Settlement(refusal.clone())));
 
     let reject = expect_reject(
-        tools(fake).await
+        tools(fake)
+            .await
             .call(ABSORB, "peer-driver", absorb_arguments())
             .await,
         "settlement refusal",
@@ -1032,7 +1038,8 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
     let fake = Arc::new(Fake::default());
     fake.reply_recall(Err(SpiError::DeadlineExceeded));
     let reject = expect_reject(
-        tools(fake).await
+        tools(fake)
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "deadline",
@@ -1077,7 +1084,8 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
         let fake = Arc::new(Fake::default());
         fake.reply_recall(Err(error));
         let reject = expect_reject(
-            tools(fake).await
+            tools(fake)
+                .await
                 .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
                 .await,
             kind,
@@ -1102,7 +1110,8 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
         "domain redline on the north gate".into(),
     )));
     let reject = expect_reject(
-        tools(fake).await
+        tools(fake)
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "policy",
@@ -1130,7 +1139,8 @@ async fn workflow_failures_map_to_stable_reject_kinds() {
         "max_tokens is unsupported".into(),
     )));
     let reject = expect_reject(
-        tools(fake).await
+        tools(fake)
+            .await
             .call(RECALL_CONTEXT, "peer-driver", recall_arguments())
             .await,
         "invalid input",

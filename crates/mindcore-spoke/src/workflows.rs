@@ -109,14 +109,12 @@ pub async fn admitted_carrier_entry(
     principal_id: &str,
     space_id: &str,
 ) -> Result<String, SpokeReject> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| Reject::internal(format!("the mind admission could not open: {e}")).into_spoke())?;
-    let mut tx = conn
-        .begin()
-        .await
-        .map_err(|e| Reject::internal(format!("the mind admission could not begin: {e}")).into_spoke())?;
+    let mut conn = pool.acquire().await.map_err(|e| {
+        Reject::internal(format!("the mind admission could not open: {e}")).into_spoke()
+    })?;
+    let mut tx = conn.begin().await.map_err(|e| {
+        Reject::internal(format!("the mind admission could not begin: {e}")).into_spoke()
+    })?;
     let space = SpaceId::new(space_id.to_string());
     let located = admit_carrier_location(&mut tx, principal_id, &space, space_id).await;
     let _ = tx.rollback().await;
@@ -461,13 +459,11 @@ impl MemoryWorkflowBinding {
                 return Ok(Some(collection.clone()));
             }
         }
-        sqlx::query_scalar::<_, String>(
-            "SELECT knowledge_collection FROM minds WHERE space_id = ?",
-        )
-        .bind(space_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|error| internal(format!("the mind registry could not be read: {error}")))
+        sqlx::query_scalar::<_, String>("SELECT knowledge_collection FROM minds WHERE space_id = ?")
+            .bind(space_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| internal(format!("the mind registry could not be read: {error}")))
     }
 
     /// A bound carrier is the only carrier this binding serves in its space: a
@@ -506,9 +502,7 @@ impl MemoryWorkflowBinding {
         let collection = self
             .carrier_collection(tx, space_id)
             .await?
-            .ok_or_else(|| {
-                SpiError::Settlement(Reject::admission_refusal().into_spoke())
-            })?;
+            .ok_or_else(|| SpiError::Settlement(Reject::admission_refusal().into_spoke()))?;
         self.adapter
             .require_space_grants(tx, principal, space_id, capabilities)
             .await?;

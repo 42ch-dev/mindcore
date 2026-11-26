@@ -248,8 +248,20 @@ impl Fixture {
         .execute(&pool)
         .await
         .expect("seed the second mind's registry row");
-        seed_record_in(&pool, SPACE_TWO, "rec_north_gate_two", "the north gate is closed").await;
-        seed_record_in(&pool, SPACE_TWO, "rec_market_two", "the market opens at dawn").await;
+        seed_record_in(
+            &pool,
+            SPACE_TWO,
+            "rec_north_gate_two",
+            "the north gate is closed",
+        )
+        .await;
+        seed_record_in(
+            &pool,
+            SPACE_TWO,
+            "rec_market_two",
+            "the market opens at dawn",
+        )
+        .await;
     }
 
     /// One space-wide grant for `principal` over the second Mind's space.
@@ -269,7 +281,6 @@ impl Fixture {
         .await
         .expect("seed grant");
     }
-
 
     /// One space-wide grant for `principal` over this fixture's space.
     async fn grant(&self, grant_id: &str, principal: &str, capabilities: &[&str]) {
@@ -350,7 +361,6 @@ fn hello(host_id: &str, capabilities: &[&str]) -> HostCapabilityManifest {
     }))
     .expect("manifest JSON matches the schema")
 }
-
 
 /// The host tool's descriptor, as a host could build one.
 fn host_tool_descriptor() -> ToolDescriptor {
@@ -475,9 +485,9 @@ impl Reasoner for NoChangeReasoner {
             serde_json::from_str(request.user_payload).expect("the deliberation payload is JSON");
         assert_eq!(payload["evidence"][0]["evidence_id"], "ev_gate");
         assert!(
-            payload["records"].as_array().is_some_and(|records| records
-                .iter()
-                .any(|record| record["record_id"]
+            payload["records"]
+                .as_array()
+                .is_some_and(|records| records.iter().any(|record| record["record_id"]
                     .as_str()
                     .is_some_and(|id| id.starts_with("rec_north_gate")))),
             "the authorized memory page reached the reasoner: {}",
@@ -510,15 +520,23 @@ impl Reasoner for SettlingReasoner {
         let payload: Value =
             serde_json::from_str(request.user_payload).expect("the deliberation payload is JSON");
         assert!(
-            payload["records"].as_array().is_some_and(|records| records
-                .iter()
-                .any(|record| record["record_id"].as_str().is_some_and(|id| id.starts_with("rec_north_gate")))),
+            payload["records"]
+                .as_array()
+                .is_some_and(|records| records.iter().any(|record| record["record_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("rec_north_gate")))),
             "the authorized memory page reached the reasoner: {}",
             request.user_payload
         );
-        let gate_record = payload["records"].as_array()
-            .and_then(|records| records.iter()
-                .find(|record| record["record_id"].as_str().is_some_and(|id| id.starts_with("rec_north_gate"))))
+        let gate_record = payload["records"]
+            .as_array()
+            .and_then(|records| {
+                records.iter().find(|record| {
+                    record["record_id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("rec_north_gate"))
+                })
+            })
             .and_then(|record| record["record_id"].as_str())
             .expect("the page carries the north-gate record")
             .to_string();
@@ -591,7 +609,6 @@ fn faces(
         tools: Vec::new(),
     }
 }
-
 
 fn surface(serve: &MindcoreServe, faces: ServeFaces) -> MindcoreSurface {
     expect_ok(serve.surface(faces), "assemble the served surface")
@@ -963,11 +980,7 @@ async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
         )
         .await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(
-        hello("runtime", &[]),
-        None,
-        MindProviders::default(),
-    );
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
 
@@ -975,14 +988,14 @@ async fn another_admitted_mind_recalls_its_own_knowledge_slot() {
     let mut arguments = recall_arguments_in(SPACE_TWO);
     arguments["max_tokens"] = json!(4_000);
     let result = expect_ok(
-        session
-            .adapter
-            .invoke_tool(RECALL_CONTEXT, arguments)
-            .await,
+        session.adapter.invoke_tool(RECALL_CONTEXT, arguments).await,
         "recall by a peer admitted to the second Mind",
     );
 
-    assert_eq!(packed_record_ids(&result), ["rec_market_two", "rec_north_gate_two"]);
+    assert_eq!(
+        packed_record_ids(&result),
+        ["rec_market_two", "rec_north_gate_two"]
+    );
     assert_eq!(
         packed_knowledge_ids(&result),
         [CARRIER_TWO],
@@ -1009,11 +1022,7 @@ async fn the_route_caller_without_knowledge_read_recalls_with_an_empty_slot() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(
-            hello("runtime", &[]),
-            None,
-            MindProviders::default(),
-        ),
+        faces(hello("runtime", &[]), None, MindProviders::default()),
     );
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
@@ -1054,10 +1063,7 @@ async fn remote_consumer_deliberates_through_the_composed_surface() {
         reasoner: Some(Arc::new(NoChangeReasoner)),
         ..MindProviders::default()
     };
-    let surface = surface(
-        &serve,
-        faces(hello("runtime", &[]), None, providers),
-    );
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
     assert!(
         capabilities(&surface).contains(&DELIBERATE),
         "a wired deliberation route is advertised: {:?}",
@@ -1216,10 +1222,7 @@ async fn remote_consumer_holds_a_deliberation_with_a_valid_judgment() {
         policy_hook: Some(Arc::new(HoldingPolicy)),
         ..MindProviders::default()
     };
-    let surface = surface(
-        &serve,
-        faces(hello("runtime", &[]), None, providers),
-    );
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let result = expect_ok(
@@ -1264,10 +1267,7 @@ async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
         policy_hook: Some(Arc::new(AutoPolicy)),
         ..MindProviders::default()
     };
-    let surface = surface(
-        &serve,
-        faces(hello("runtime", &[]), None, providers),
-    );
+    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
 
     let session = connect(&surface, &[DELIBERATE]).await;
     let result = expect_ok(
@@ -1648,7 +1648,8 @@ async fn two_minds_settle_onto_their_own_carriers() {
         "the second slot carries the second Mind's entry, never the first's: {second_pack}"
     );
     assert_eq!(
-        second_pack["knowledge"][0]["body"]["summary"], "the knowledge of the second mind, not the first",
+        second_pack["knowledge"][0]["body"]["summary"],
+        "the knowledge of the second mind, not the first",
         "the content distinguishes the two Minds: {second_pack}"
     );
     let contamination: Vec<&str> = first_pack["knowledge"]
@@ -1667,12 +1668,10 @@ async fn two_minds_settle_onto_their_own_carriers() {
     let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
     // The retired `holder` member: the closed argument object refuses it before any carrier access.
     let mut with_holder = deliberate_arguments();
-    with_holder["holder"] = json!({ "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER });
+    with_holder["holder"] =
+        json!({ "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER });
     let reject = expect_reject(
-        first
-            .adapter
-            .invoke_tool(DELIBERATE, with_holder)
-            .await,
+        first.adapter.invoke_tool(DELIBERATE, with_holder).await,
         "deliberate still naming the retired holder member",
     );
     assert_eq!(
@@ -1734,7 +1733,9 @@ async fn a_space_with_no_registry_row_reaches_no_carrier() {
     );
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
     assert!(
-        reject.message.contains("the caller is not admitted to the named mind"),
+        reject
+            .message
+            .contains("the caller is not admitted to the named mind"),
         "the refusal is the admission rule: {reject:?}"
     );
     let refusal = format!("{reject:?}");
@@ -1849,11 +1850,7 @@ async fn deliberate_cannot_distinguish_an_absent_mind_from_an_ungranted_one() {
     fixture.seed_second_mind().await;
     let (_dir, serve) = fixture.serve();
     // No reasoner: any path that reaches the engine before admission is a different answer.
-    let mut faces = faces(
-        hello("runtime", &[]),
-        None,
-        MindProviders::default(),
-    );
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
 
@@ -1904,11 +1901,7 @@ async fn a_strangers_malformed_grant_row_cannot_leak_the_minds_existence() {
     .expect("seed the stranger's malformed grant");
     let (_dir, serve) = fixture.serve();
     // No reasoner: a path that reaches the engine would answer differently again.
-    let mut faces = faces(
-        hello("runtime", &[]),
-        None,
-        MindProviders::default(),
-    );
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces);
 
@@ -1946,10 +1939,12 @@ async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
     // Corrupt the seeded knowledge grant's expiry in place: it can no longer be read as a time.
-    sqlx::query("UPDATE memory_grants SET expires_at = 'not-a-time' WHERE grant_id = 'grt_knowledge'")
-        .execute(&pool)
-        .await
-        .expect("corrupt the expiry");
+    sqlx::query(
+        "UPDATE memory_grants SET expires_at = 'not-a-time' WHERE grant_id = 'grt_knowledge'",
+    )
+    .execute(&pool)
+    .await
+    .expect("corrupt the expiry");
     let (_dir, serve) = fixture.serve();
     // A reasoner is configured so the workflow reaches its snapshot: the refusal must come from
     // admission/coverage, never from the engine's missing capability.
@@ -2176,24 +2171,21 @@ async fn one_principal_recalls_each_mind_by_its_own_space_id() {
     let fixture = Fixture::open().await;
     fixture.seed_second_mind().await;
     fixture
-        .grant_in_second(
-            "grt_shared_peer",
-            PRINCIPAL,
-            &["recall", "knowledge_read"],
-        )
+        .grant_in_second("grt_shared_peer", PRINCIPAL, &["recall", "knowledge_read"])
         .await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(
-        hello("runtime", &[]),
-        None,
-        MindProviders::default(),
-    );
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = principal_admission();
     let surface = surface(&serve, faces);
 
     let session = connect(&surface, &[RECALL_CONTEXT]).await;
     for (space, carrier, name, summary) in [
-        (SPACE, CARRIER, "ke_carrier's carrier", "what this holder currently holds"),
+        (
+            SPACE,
+            CARRIER,
+            "ke_carrier's carrier",
+            "what this holder currently holds",
+        ),
         (
             SPACE_TWO,
             CARRIER_TWO,
@@ -2727,11 +2719,7 @@ async fn an_unserved_tool_answers_op_unsupported() {
     let (_dir, serve) = fixture.serve();
     let surface = surface(
         &serve,
-        faces(
-            hello("runtime", &[]),
-            None,
-            MindProviders::default(),
-        ),
+        faces(hello("runtime", &[]), None, MindProviders::default()),
     );
     assert!(!capabilities(&surface).contains(&UNSERVED_TOOL));
 
@@ -2757,11 +2745,7 @@ async fn an_un_routed_face_answers_a_missing_port() {
     ];
     let surface = surface(
         &serve,
-        faces(
-            hello("runtime", &claimed),
-            None,
-            MindProviders::default(),
-        ),
+        faces(hello("runtime", &claimed), None, MindProviders::default()),
     );
     for capability in claimed {
         assert!(
@@ -2803,13 +2787,8 @@ async fn an_un_routed_face_answers_a_missing_port() {
     }))
     .expect("request JSON matches the schema");
     assert_wire_deny(
-        AdoptionPort::adopt_knowledge_entry(
-            dialer,
-            &principal(),
-            &scope_of(SCOPE_ID),
-            &adopt,
-        )
-        .await,
+        AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &scope_of(SCOPE_ID), &adopt)
+            .await,
         "knowledge.adopt",
         "capability_missing",
     );
@@ -2819,11 +2798,7 @@ async fn an_un_routed_face_answers_a_missing_port() {
 async fn a_host_registration_reaches_its_handler_over_the_signed_session() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
-    let mut faces = faces(
-        hello("runtime", &[]),
-        None,
-        MindProviders::default(),
-    );
+    let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.tools = vec![ToolRegistration::new(
         host_tool_descriptor(),
         |_responder| {
@@ -3158,4 +3133,3 @@ async fn retiring_a_warm_identity_forces_its_next_query_embed() {
         "another identity's rows survive the retirement"
     );
 }
-
