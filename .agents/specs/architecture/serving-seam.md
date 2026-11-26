@@ -123,7 +123,7 @@ An `absorb` run that updates a record and dismisses its candidate stages two int
 
 An `absorb` replay reports what an earlier run of the same capture recorded for each consumed candidate. A candidate consumed by the update leg's dismissal is the one consumption whose result names no record, so the binding reads the update leg's own receipt — keyed by the capture key, the candidate id and `update` — for the record id: a committed receipt reports `settled` with that id and an absent one reports `dropped`. Capture and update receipts are rows of one table under one aged policy, and the binding has no per-operation retention branch; the capture receipt is minted first, so an aged-out capture receipt refuses the replay before an aged-out update receipt could be read.
 
-Two of the three workflow tools reach knowledge at all, and only they: `deliberate`'s carrier admission and `recall_context`'s knowledge slot. Deliberation settles onto exactly one carrier entry, so the Mind the request names decides it: `space_id` is resolved through the Mind's registry row on the caller's transaction (`MemoryWorkflowBinding::carrier_collection`), and a binding an in-process facade opened may pin its own Mind first. Both readers — the carrier write and the recall slot — resolve through that one lookup, so no workflow consumer can reach a collection other than the admitted Mind's. `absorb` consults no registry row. Adoption consults none either: its destination is the knowledge face's own collection, so a copy it writes is one the admitting peer reads back through `knowledge.get`. A `space_id` with no registry row is the admission refusal, before any carrier access: one `NOT_AUTHORIZED` carrying a fixed message and no `details`, so it never reveals whether a Mind exists. The row never substitutes for a live grant — every carrier write and knowledge read still re-derives the caller's own grants on its own transaction. Recall's slot is independent of the memory page and best effort for the row and the grant: a missing row, or a missing live `knowledge_read` grant in the request's space, returns the memory result with `knowledge: []`, never a refusal. That tolerance covers the row and the grant only — a grant-store read or collection-list failure is not converted into an empty slot; it propagates and fails the recall. With both the row and the grant the slot lists only the admitted Mind's collection under the same disclosure predicate as the served knowledge list, so an `owner`-private entry never reaches the pack. The registry row is the workflow collection allowlist: `create` writes it, it is not read from the wire, and no served argument names a collection, so a peer cannot select one or change a mapping without creating a Mind. `recall_context` keeps serving for a space that is no Mind, with no slot to fill, and `absorb` keeps serving because it never consults the row. Memory authorization, withholding, snapshot revalidation and token budgeting are unchanged by routing and stay separate rules: the page is still the adapter's own ACL and withholding read, so a memory grant revoked while providers run refuses the reread as before, while a knowledge grant revoked mid-flight empties the reread's slot, which makes the snapshot differ and surfaces as the retryable `RevisionConflict` rather than a released pack.
+Two of the three workflow tools reach knowledge at all, and only they: `deliberate`'s carrier admission and `recall_context`'s knowledge slot. Deliberation settles onto exactly one carrier entry, so the Mind the request names decides it: `space_id` is resolved through the Mind's registry row on the caller's transaction (`MemoryWorkflowBinding::carrier_collection`), and a binding an in-process facade opened may pin its own Mind first. Both readers — the carrier write and the recall slot — resolve through that one lookup, so no workflow consumer can reach a collection other than the admitted Mind's. `absorb` consults no registry row. Adoption resolves its destination from the same registry row after admission: it is the admitted Mind's registered collection, so a copy it writes is one the same peer reads back through that Mind's `knowledge.get`. A `space_id` with no registry row is the admission refusal, before any carrier access: one `NOT_AUTHORIZED` carrying a fixed message and no `details`, so it never reveals whether a Mind exists. The row never substitutes for a live grant — every carrier write and knowledge read still re-derives the caller's own grants on its own transaction. Recall's slot is independent of the memory page and best effort for the row and the grant: a missing row, or a missing live `knowledge_read` grant in the request's space, returns the memory result with `knowledge: []`, never a refusal. That tolerance covers the row and the grant only — a grant-store read or collection-list failure is not converted into an empty slot; it propagates and fails the recall. With both the row and the grant the slot lists only the admitted Mind's collection under the same disclosure predicate as the served knowledge list, so an `owner`-private entry never reaches the pack. The registry row is the workflow collection allowlist: `create` writes it, it is not read from the wire, and no served argument names a collection, so a peer cannot select one or change a mapping without creating a Mind. `recall_context` keeps serving for a space that is no Mind, with no slot to fill, and `absorb` keeps serving because it never consults the row. Memory authorization, withholding, snapshot revalidation and token budgeting are unchanged by routing and stay separate rules: the page is still the adapter's own ACL and withholding read, so a memory grant revoked while providers run refuses the reread as before, while a knowledge grant revoked mid-flight empties the reread's slot, which makes the snapshot differ and surfaces as the retryable `RevisionConflict` rather than a released pack.
 
 Settlement returns its original `SpokeReject` (code, message and details); malformed arguments and `SpiError::InvalidInput` return `InvalidInput`. A `PolicyRejected` policy veto is also `InvalidInput`, with `details.kind = "policy_rejected"` and the host's reason as the message — never `NotAuthorized`, which stays the lost-admission code. A deadline returns `InternalError` with `details.kind = "deadline_exceeded"` and `details.retry_class = "retryable"`: nothing committed, so the caller may repeat the call. That no-write guarantee now also covers an expiry during the store-connection wait inside `commit_cognition`, and an expiry on a connection already in hand before the begin; it stops at `BEGIN IMMEDIATE`, whose wait for SQLite's write lock is outside the request deadline, and a write that has begun keeps its actual or uncertain outcome. [`mind-model.md`](mind-model.md) owns that boundary. The other provider errors return `InternalError` with `details.kind` set to `embeddings_unavailable`, `embedding_failed`, `reasoner_unavailable`, `reasoner_failed`, or `invalid_reasoner_output` as appropriate and carry no retry class; do not reflect provider internals into the wire message. Errors use the signed error envelope, never a success DTO. The client must negotiate each tool id it intends to invoke; descriptor `capability_id` and `op` match, and the responder owns the `mindcore` namespace.
 
@@ -140,36 +140,38 @@ manifest carries it and no handler answers it even when a host registers the id.
 Stage 1 composes no adoption face: `ServeFaces` has no adoption setting, `face_capabilities` names
 neither `spoke-knowledge-adoption` nor its `spoke-knowledge` co-capability, and a `knowledge.adopt`
 call answers `CAPABILITY_PORT_MISSING`. The paragraphs below state the contract a restored face must
-satisfy. A restored face takes the one host-configured source as an `AdoptionRoute` — a `scope_id`
-naming it on the wire and the `KnowledgeScope` the store reads — and no destination setting: the
-destination is the knowledge face's own collection, which on a restored per-Mind face is the
-admitting Mind's, the one `knowledge.get`/`list` serve for that Mind, so a copy is readable back
-through that face whenever the peer's admitted selection admits it. The Mind's registry row selects
-workflow collections only and plays no part in adoption. The
-Stage 2 handoff at the end of this section names what it must re-implement rather than re-bind.
+satisfy. A restored face is composed per Mind and bound to one: its destination is that Mind's
+registered collection, resolved through the registry row after admission, and there is no
+surface-wide destination setting to consume. The source stays host configuration — one collection,
+named on the wire by a `scope_id` and fixed by the host — and it is the only host-configured side of
+the call. A copy is therefore readable back through the admitting Mind's own
+knowledge face whenever the peer's admitted selection admits it. The Stage 2 handoff at the end of
+this section names what it must re-implement rather than re-bind.
 
-**Admission is the knowledge face's**, composed as `(principals(peer)?, knowledge_admission(peer)?)`
-like the history family's: a peer the knowledge face does not admit cannot adopt, and a principal
-the knowledge admission refuses answers `NOT_AUTHORIZED` where the removed product tool
-would have served it. Neither the principal nor the admitted scope comes from the payload.
+**Admission is the admitting Mind's knowledge-face admission**, composed as
+`(principals(peer)?, knowledge_admission(peer)?)` like the history family's: a peer the knowledge
+face does not admit cannot adopt, and a principal the knowledge admission refuses answers the
+target-free `NOT_AUTHORIZED` where the removed product tool would have served it. Neither the
+principal nor the admitted scope comes from the payload; the admitted scope is the Mind's own.
 
 **Scope mapping.** Every scope member of the request is compared, never used to select anything:
 
 | Request member | Must equal | Otherwise |
 |---|---|---|
-| `source_scope_id` | `AdoptionRoute.scope_id` | `NOT_FOUND`, no details — the same generic absence as a missing source |
-| `source_entry_id` | a live or retired row of `AdoptionRoute.source` | `NOT_FOUND`, no details |
+| `source_scope_id` | the host-configured source's `scope_id` | `NOT_FOUND`, no details — the same generic absence as a missing source |
+| `source_entry_id` | a live or retired row of the host-configured source collection | `NOT_FOUND`, no details |
 | `source_revision` | the live source's current revision; never compared for a retired source; never `0` | `REVISION_CONFLICT`, no details / `INVALID_INPUT` |
-| `destination_scope_id` | the admitted `Scope.scope_id` | `NOT_AUTHORIZED`, no details, before the source is read |
+| `destination_scope_id` | the admitted Mind's `Scope.scope_id` | the target-free `NOT_AUTHORIZED`, no details, before the source is read |
 | `destination_entry_id` | absent → the resolved terminal's `source_entry_id`; a supplied value may name that same id | — |
 | `idempotency_key` | 1–128 code points | `INVALID_INPUT`, refused by Connect's decoder |
 
-The destination collection is `ServeFaces.knowledge` and nothing else. It is one shared collection
-with one slot per `destination_entry_id`: the first adoption of a given id claims that slot, and a
-later call naming the same id is answered from the stored copy's anchor instead of writing a second
-one. The admitted `Scope`'s `entry_ids`, `entry_types`, `source_id` and `viewpoint` refinements
-still apply to it, because the admitted scope is the host's statement about which entries of that
-collection the peer may reach.
+The destination collection is the admitted Mind's registered collection and nothing else: the row
+the request's Mind id resolves to, read after admission, never a surface-wide field and never a
+wire value. It is that Mind's one collection with one slot per `destination_entry_id`: the first
+adoption of a given id claims that slot, and a later call naming the same id is answered from the
+stored copy's anchor instead of writing a second one. The admitted `Scope`'s `entry_ids`,
+`entry_types`, `source_id` and `viewpoint` refinements still apply to it, because the admitted scope
+is the host's statement about which entries of that Mind's collection the peer may reach.
 Adoption applies them to the destination entry it would return and to the copy it would write: an
 entry outside the admitted selection is neither served nor written, and answers the ordinary
 occupancy refusal — `REVISION_CONFLICT` with no details, byte-identical to a visible occupant's —
@@ -180,8 +182,9 @@ as an absence by checking the row including superseded ones and answering the sa
 way no revision gate is reached and no put runs. The invariant is the observable answer — code,
 message shape and absent `details` — not a shared constructor, and no path reveals the occupant's
 content, revision or visibility. `NOT_AUTHORIZED` is reserved for a `destination_scope_id` that is
-not the admitted scope. The host's configured collection selects the destination; the admitted
-selection narrows what the call may touch inside it.
+not the admitted Mind's scope: the target-free admission refusal, never a comparison against a
+configured destination, which no longer exists. The registry row selects the destination; the
+admitted selection narrows what the call may touch inside it.
 
 **Slot occupancy is a permitted disclosure.** A create-only destination answers occupied for an
 occupied id and success for a free one, so the answer reports whether the `destination_entry_id`
@@ -194,8 +197,8 @@ handed that occupant back, so only a copy the caller can already read carries it
 "existence is never revealed" claim would be false and is not made here.
 
 **Assembly** refuses an empty source scope id, an empty source collection, a source collection equal
-to the knowledge face's own collection or to any Mind's registered collection — including a Mind
-that is not currently connected — and a source scope id equal to the destination scope, all with
+to any Mind's registered collection — the assembled Mind's own included, and including a Mind that
+is not currently connected — and a source scope id equal to the destination scope, all with
 `InvalidInput` before any port or registration exists. A source that is also a destination would let
 one Mind's adopted copy become the shared entry another Mind reads, and a source scope equal to the
 destination scope would let a Mind adopt from its own destination.
@@ -224,15 +227,15 @@ terminal; `modules` loses `cognition` rather than keeping an emptied envelope; `
 unset; `adoption_anchor` records the terminal triple; `revision`, `created_at` and `updated_at` are
 left for the store to assign; the request's `extensions` are not copied. `owner` and `disclosure` are
 inherited from the terminal rather than reset to the destination's, because the destination is
-`ServeFaces.knowledge` — the collection the knowledge face serves and the access boundary itself —
-and the port refuses every source the viewpoint-free predicate does not see, so an inherited policy
-cannot disclose anything the admitted principal could not already read. The copy's `entry_id` is the
-caller's `destination_entry_id` when supplied — a caller may supply the terminal's own id — and the
-terminal's id otherwise; the anchor names the terminal either way.
+the admitted Mind's registered collection — the collection that Mind's knowledge face serves and the
+access boundary itself — and the port refuses every source the viewpoint-free predicate does not see,
+so an inherited policy cannot disclose anything the admitted principal could not already read. The
+copy's `entry_id` is the caller's `destination_entry_id` when supplied — a caller may supply the
+terminal's own id — and the terminal's id otherwise; the anchor names the terminal either way.
 
-**Refusals and dedup.** The call reads only the host-configured source and writes only
-`ServeFaces.knowledge`, committing on one `BEGIN IMMEDIATE` transaction that commits for `adopted`
-and rolls back for `already_present`. `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT`,
+**Refusals and dedup.** The call reads only the host-configured source and writes only the admitted
+Mind's registered collection, committing on one `BEGIN IMMEDIATE` transaction that commits for
+`adopted` and rolls back for `already_present`. `NOT_FOUND`, `NOT_AUTHORIZED`, `REVISION_CONFLICT`,
 `SOURCE_RETIRED`, `ADOPTION_ANCHOR_IMMUTABLE` and `INVALID_INPUT` travel as the contract builds
 them; a repeat naming the copy's own anchor triple returns `already_present` with the stored copy,
 another revision of the same source is `REVISION_CONFLICT` with exactly `details.adopted_revision`,
@@ -291,7 +294,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 
 - No caller-provided principal, Mind id, or manifest capability can bypass a host admission or storage guard.
 - No baseline provider is required for either face and an absent face/tool is denied. Advertisements and handler registrations describe the same capabilities.
-- The adoption source is host configuration and the adoption destination is the knowledge face's own collection: no wire value selects either, the request's scope members are only compared against those two, and a source equal to the destination collection, to any Mind's collection registered beside it or to the destination scope is refused before serving.
+- Adoption's source is the one host-configured Stage 2 route and its destination is the admitted Mind's registered collection, resolved after admission: no wire value selects either, the request's scope members are only compared against those two, a source equal to any Mind's registered collection or to the destination scope is refused before serving, and a `destination_scope_id` that names anything but the admitted Mind's scope answers the target-free refusal.
 - Adoption's answer reports `destination_entry_id` slot occupancy — occupied or free — and nothing about the occupant: a concealed occupant is byte-identical to a visible one. That disclosure is permitted and no wider than the knowledge face it lands on, whose create-only `put_knowledge_entry` already distinguishes occupied from free while hiding the entry; entry content, revision and visibility stay undisclosed.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.
