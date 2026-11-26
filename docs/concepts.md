@@ -122,10 +122,14 @@ identity and verdict: equal attempt content yields an equal id, and another bran
 
 ## Trust boundary
 
-- **The host authenticates.** Mindcore never reads a principal from the wire in the runtime; the
-  host's admission maps an authenticated peer to a scope and a `Principal`.
-- **Ports refuse, they do not filter.** A wrong-scope read answers the same refusal as a missing
-  one; the peer learns nothing about what exists elsewhere.
+- **The host authenticates.** Mindcore never reads a principal from the wire; the host's admission
+  maps an authenticated peer to a `Principal`, and a served call names its own Mind, never a
+  collection.
+- **Admission precedes existence.** A call admits one Mind before it reads anything: an unknown
+  Mind id, a Mind the caller holds no live grant in, and a frozen Mind it holds none in answer one
+  `NOT_AUTHORIZED` with no details, so the refusal cannot report whether the Mind exists.
+- **Ports refuse, they do not filter.** No result mixes two Minds: a call reads and writes only the
+  collection its admitted Mind's registry row names, and a refusal names nothing outside it.
 - **One store per file.** Each opened `MindStore` owns one pool. Two stores on one file are
   unsupported, not refused.
 - **A mutating operation takes the write reservation first.** `BEGIN IMMEDIATE` precedes any claim

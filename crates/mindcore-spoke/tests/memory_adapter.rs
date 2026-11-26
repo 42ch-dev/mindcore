@@ -229,6 +229,20 @@ fn reject<T: std::fmt::Debug>(result: &SpokeResult<T>) -> &SpokeReject {
     }
 }
 
+/// The Mind-admission refusal carries no details — no `retry_class`, no
+/// target — so it is asserted by its own shape, never through `retry_class`.
+fn assert_admission_refusal(reject: &SpokeReject, context: &str) {
+    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized, "{context}");
+    assert_eq!(
+        reject.message, "the caller is not admitted to the named mind",
+        "{context}: the fixed admission message"
+    );
+    assert!(
+        reject.details.is_none(),
+        "{context}: the admission refusal carries no details: {reject:?}"
+    );
+}
+
 fn retry_class(reject: &SpokeReject) -> &str {
     reject
         .details
@@ -419,8 +433,7 @@ async fn unauthorized_capture_rejects_without_an_effect() {
         .capture(&mut tx, &principal(STRANGER), request)
         .await;
     let reject = reject(&result);
-    assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
-    assert_eq!(retry_class(reject), "terminal");
+    assert_admission_refusal(reject, "a principal with no grant in the space is not admitted");
     assert_eq!(harness.count(&mut tx, "memory_candidates").await, 0);
     assert_eq!(harness.count(&mut tx, "memory_receipts").await, 0);
     tx.rollback().await.expect("rollback");
@@ -708,10 +721,10 @@ async fn expired_grant_is_not_participation() {
         .await;
     let existing = reject(&existing);
     let unknown = reject(&unknown);
-    assert_eq!(existing.code, SpokeRejectCode::NotAuthorized);
-    assert_eq!(retry_class(existing), "terminal");
+    assert_admission_refusal(existing, "an expired grant is no admission");
     assert_eq!(existing.code, unknown.code);
     assert_eq!(existing.message, unknown.message);
+    assert_eq!(existing.details, unknown.details);
     tx.rollback().await.expect("rollback");
 }
 
@@ -1012,8 +1025,7 @@ async fn grant_expiry_is_compared_as_an_instant() {
         )
         .await;
     let refusal = reject(&expired_probe);
-    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
-    assert_eq!(retry_class(refusal), "terminal");
+    assert_admission_refusal(refusal, "an expired grant is no admission");
 
     let own = ready(
         adapter
@@ -1126,8 +1138,7 @@ async fn revoked_grant_denies_subject_and_profile_reads() {
         )
         .await;
     let refusal = reject(&subject);
-    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
-    assert_eq!(retry_class(refusal), "terminal");
+    assert_admission_refusal(refusal, "a revoked grant is no admission");
 
     let profile = adapter
         .get_profile(
@@ -1137,8 +1148,7 @@ async fn revoked_grant_denies_subject_and_profile_reads() {
         )
         .await;
     let refusal = reject(&profile);
-    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
-    assert_eq!(retry_class(refusal), "terminal");
+    assert_admission_refusal(refusal, "a revoked grant is no admission");
 
     let subject = ready(
         adapter
@@ -4334,8 +4344,7 @@ async fn concealment_and_authorization_precede_the_withhold_probe() {
         )
         .await;
     let refusal = reject(&records);
-    assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
-    assert_eq!(retry_class(refusal), "terminal");
+    assert_admission_refusal(refusal, "a caller with no grant is refused before any existence check");
     tx.rollback().await.expect("rollback");
 }
 
@@ -4443,5 +4452,497 @@ async fn receipts_poll_serves_regardless_of_unsettled_intents() {
     let refusal = reject(&theirs);
     assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized);
     assert_eq!(retry_class(refusal), "terminal");
+    tx.rollback().await.expect("rollback");
+}
+
+/// Mind admission (one served surface serves many Minds): admission runs before any existence
+/// check, so an unknown Mind, an ungranted one and a frozen one the caller holds no grant in
+/// answer one byte-equal `NOT_AUTHORIZED` with no details — before any coverage check and before
+/// the code could report whether the Mind exists. A granted caller in the frozen Mind is still
+/// served a read, because reads are not freeze-gated.
+#[tokio::test]
+async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    for (space, status) in [("sp_ungranted", "active"), ("sp_frozen", "frozen")] {
+        sqlx::query(
+            "INSERT INTO memory_spaces \
+             (space_id, display_name, authority_host_id, authority_generation, status, \
+              revision, created_at) \
+             VALUES (?, NULL, 'host_1', 1, ?, 1, ?)",
+        )
+        .bind(space)
+        .bind(status)
+        .bind(NOW)
+        .execute(&harness.pool)
+        .await
+        .expect("seed space");
+    }
+
+    let mut envelopes: Vec<(String, serde_json::Value)> = Vec::new();
+    for space in ["sp_absent", "sp_ungranted", "sp_frozen"] {
+        let mut tx = harness.begin().await;
+        for (op, result) in guarded_reads(&adapter, &mut tx, space, SUBJECT, "cnd_any").await {
+            let refusal = reject(&result);
+            assert_eq!(
+                refusal.code,
+                SpokeRejectCode::NotAuthorized,
+                "{op} in {space} answers the admission refusal"
+            );
+            assert!(
+                refusal.details.is_none(),
+                "{op} in {space} carries no details: {refusal:?}"
+            );
+            envelopes.push((
+                format!("{op} in {space}"),
+                serde_json::json!(refusal.message),
+            ));
+        }
+        // `memory.receipts.get` and the two control reads are paths
+        // `guarded_reads` does not carry.
+        let receipts = adapter
+            .get_receipt(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": space, "receipt_id": "rct_any" }),
+            )
+            .await;
+        let refusal = reject(&receipts);
+        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "receipts in {space}");
+        assert!(
+            refusal.details.is_none(),
+            "receipts in {space} carries no details: {refusal:?}"
+        );
+        envelopes.push((format!("receipts in {space}"), serde_json::json!(refusal.message)));
+        let subjects_get = adapter
+            .get_subject(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": space, "subject_id": SUBJECT }),
+            )
+            .await;
+        let refusal = reject(&subjects_get);
+        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "subjects.get in {space}");
+        assert!(
+            refusal.details.is_none(),
+            "subjects.get in {space} carries no details: {refusal:?}"
+        );
+        envelopes.push((format!("subjects.get in {space}"), serde_json::json!(refusal.message)));
+        let grants_list = adapter
+            .list_grants(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": space }),
+            )
+            .await;
+        let refusal = reject(&grants_list);
+        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "grants.list in {space}");
+        assert!(
+            refusal.details.is_none(),
+            "grants.list in {space} carries no details: {refusal:?}"
+        );
+        envelopes.push((format!("grants.list in {space}"), serde_json::json!(refusal.message)));
+        // The mutation path enters admission through `authorize`.
+        let mutation = adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": space,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a capture into a mind the caller cannot see" },
+                    "idempotency_key": format!("cap-admit-{space}")
+                }),
+            )
+            .await;
+        let refusal = reject(&mutation);
+        assert_eq!(refusal.code, SpokeRejectCode::NotAuthorized, "capture in {space}");
+        assert!(
+            refusal.details.is_none(),
+            "capture in {space} carries no details: {refusal:?}"
+        );
+        envelopes.push((format!("capture in {space}"), serde_json::json!(refusal.message)));
+        assert_eq!(
+            harness.count(&mut tx, "memory_candidates").await,
+            0,
+            "nothing is staged in {space}"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+    let messages: std::collections::HashSet<&serde_json::Value> =
+        envelopes.iter().map(|(_, value)| value).collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "every refusal in every case is byte-equal: {envelopes:?}"
+    );
+
+    // A granted caller in the frozen Mind is served a read: freeze gates
+    // writes, never reads.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_frozen', 'sp_frozen', NULL, ?, '[\"recall\"]', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(PRINCIPAL)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed grant");
+    let mut tx = harness.begin().await;
+    let recall = adapter
+        .recall(
+            &mut tx,
+            &principal(PRINCIPAL),
+            json!({ "space_id": "sp_frozen", "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "budget": { "max_items": 4 } }),
+        )
+        .await;
+    assert!(
+        matches!(recall, SpokeResult::Ok(_)),
+        "a granted caller reads a frozen Mind: {recall:?}"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// `memory.spaces.list` takes its set from the registry's join: only the Minds
+/// the caller holds a live grant in, in `id` order, a frozen one included; a
+/// space with no registry row never appears even under a live grant, and the
+/// wire shape is the one the operation projected before.
+#[tokio::test]
+async fn spaces_list_returns_only_admitted_minds() {
+    use mindcore_sqlite::minds::CreateMind;
+    use mindcore_sqlite::minds;
+    use mindcore_base::boundary::CallerId;
+    use mindcore_base::ids::MindId;
+
+    let harness = Harness::open().await;
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let adapter = MemoryAdapter::new(true);
+
+    // Two Minds for the listing owner, created out of id order so the answer
+    // proves its sort, and a third for another owner alone.
+    let mut tx = harness.begin().await;
+    for (id, owner) in [("mind_beta", "o_list"), ("mind_alpha", "o_list"), ("mind_gamma", "o_other")] {
+        let created = minds::create(
+            &mut tx,
+            &CreateMind {
+                mind_id: Some(MindId::new(id)),
+                display_name: Some(format!("mind {id}")),
+                owner: CallerId::new(owner),
+            },
+        )
+        .await;
+        assert!(matches!(created, SpokeResult::Ok(_)), "create {id}: {created:?}");
+    }
+    sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = 'mind_beta'")
+        .execute(&mut *tx)
+        .await
+        .expect("freeze mind_beta");
+    tx.commit().await.expect("commit minds");
+
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .list_spaces(&mut tx, &principal("o_list"), json!({}))
+            .await,
+    );
+    let spaces = body["spaces"].as_array().expect("spaces array");
+    let ids: Vec<&str> = spaces
+        .iter()
+        .map(|space| space["space_id"].as_str().expect("space_id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["mind_alpha", "mind_beta"],
+        "only the owner's Minds, in id order, the frozen one included"
+    );
+    let frozen = spaces
+        .iter()
+        .find(|space| space["space_id"] == json!("mind_beta"))
+        .expect("mind_beta is listed");
+    assert_eq!(
+        frozen["status"], json!("frozen"),
+        "a frozen Mind is listed with its frozen status"
+    );
+    assert!(
+        frozen.get("display_name").is_some() && frozen.get("revision").is_some(),
+        "the wire shape is the space projection: {frozen}"
+    );
+    assert_eq!(body["next_cursor"], Value::Null);
+
+    // The frozen Mind is not admission-listed for the other owner, whose own
+    // Mind is the whole of its list.
+    let other = ready(
+        adapter
+            .list_spaces(&mut tx, &principal("o_other"), json!({}))
+            .await,
+    );
+    let other_ids: Vec<&str> = other["spaces"]
+        .as_array()
+        .expect("spaces array")
+        .iter()
+        .map(|space| space["space_id"].as_str().expect("space_id"))
+        .collect();
+    assert_eq!(other_ids, ["mind_gamma"]);
+
+    // The caller's live grant in `SPACE` still admits it to memory operations,
+    // but the space carries no registry row, so the list never names it.
+    let own = ready(
+        adapter
+            .list_spaces(&mut tx, &principal(PRINCIPAL), json!({}))
+            .await,
+    );
+    assert_eq!(
+        own["spaces"], json!([]),
+        "a space with no registry row is excluded even under a live grant"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// Mind admission reads only the caller's own grant rows: a stranger's malformed row in an
+/// existing space never reaches a decode decision, so an unadmitted caller cannot tell that
+/// space from one that does not exist — on the guarded reads and on a mutation alike. The
+/// caller's own live grant still serves the same space with the malformed row beside it.
+#[tokio::test]
+async fn a_strangers_malformed_grant_row_cannot_leak_a_mind() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_malformed_stranger', ?, NULL, ?, 'not-json', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(SPACE)
+    .bind(STRANGER)
+    .bind(NOW)
+    .execute(&harness.pool)
+    .await
+    .expect("seed the stranger's malformed grant");
+
+    let mut messages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for space in [SPACE, "sp_absent"] {
+        let mut tx = harness.begin().await;
+        for (op, result) in guarded_reads(&adapter, &mut tx, space, SUBJECT, "cnd_any").await {
+            let refusal = reject(&result);
+            assert_eq!(
+                refusal.code,
+                SpokeRejectCode::NotAuthorized,
+                "{op} in {space} answers the admission refusal"
+            );
+            assert!(
+                refusal.details.is_none(),
+                "{op} in {space} carries no details: {refusal:?}"
+            );
+            messages.insert(refusal.message.clone());
+        }
+        let capture = adapter
+            .capture(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({
+                    "space_id": space,
+                    "subject_id": SUBJECT,
+                    "capture_scope": { "visibility": "shared" },
+                    "content": { "text": "a capture into a mind the caller cannot see" },
+                    "idempotency_key": format!("cap-malformed-{space}")
+                }),
+            )
+            .await;
+        let refusal = reject(&capture);
+        assert_eq!(
+            refusal.code,
+            SpokeRejectCode::NotAuthorized,
+            "capture in {space}"
+        );
+        assert!(
+            refusal.details.is_none(),
+            "capture in {space} carries no details: {refusal:?}"
+        );
+        messages.insert(refusal.message.clone());
+        assert_eq!(
+            harness.count(&mut tx, "memory_candidates").await,
+            0,
+            "nothing is staged in {space}"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+    assert_eq!(
+        messages.len(),
+        1,
+        "the existing space with a stranger's malformed row and an absent space are one answer"
+    );
+
+    // The caller's own live grant admits it; the stranger's row is never decoded on its behalf.
+    harness.seed_grant(PRINCIPAL, &["recall"]).await;
+    let mut tx = harness.begin().await;
+    let pack = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" },
+                        "budget": { "max_items": 4 } }),
+            )
+            .await,
+    );
+    assert!(pack["records"].is_array(), "{pack}");
+    tx.rollback().await.expect("rollback");
+}
+
+/// `memory.spaces.list` projects only Minds admission would admit: a Mind whose only live grant
+/// for the caller cannot decode is skipped, not listed and not an error, while a Mind that also
+/// holds a decodable live grant stays listed.
+#[tokio::test]
+async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
+    use mindcore_base::boundary::CallerId;
+    use mindcore_base::ids::MindId;
+    use mindcore_sqlite::minds::{self, CreateMind};
+
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    let owner = "o_list";
+    let mut tx = harness.begin().await;
+    for id in ["mind_broken", "mind_extra", "mind_whole"] {
+        let created = minds::create(
+            &mut tx,
+            &CreateMind {
+                mind_id: Some(MindId::new(id)),
+                display_name: Some(format!("mind {id}")),
+                owner: CallerId::new(owner),
+            },
+        )
+        .await;
+        assert!(
+            matches!(created, SpokeResult::Ok(_)),
+            "create {id}: {created:?}"
+        );
+    }
+    // `mind_extra` gets a second live grant, so one undecodable row cannot hide it.
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
+          shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_extra', 'mind_extra', NULL, ?, '[\"recall\"]', '[]', 0, NULL, NULL, 1, ?)",
+    )
+    .bind(owner)
+    .bind(NOW)
+    .execute(&mut *tx)
+    .await
+    .expect("seed the second grant");
+    for space in ["mind_broken", "mind_extra"] {
+        sqlx::query(
+            "UPDATE memory_grants SET capabilities_json = 'not-json' \
+             WHERE grant_id = (SELECT grant_id FROM memory_grants \
+                               WHERE space_id = ? AND principal_id = ? \
+                               ORDER BY grant_id LIMIT 1)",
+        )
+        .bind(space)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .expect("corrupt one grant");
+    }
+    tx.commit().await.expect("commit minds");
+
+    let mut tx = harness.begin().await;
+    let body = ready(
+        adapter
+            .list_spaces(&mut tx, &principal(owner), json!({}))
+            .await,
+    );
+    let ids: Vec<&str> = body["spaces"]
+        .as_array()
+        .expect("spaces array")
+        .iter()
+        .map(|space| space["space_id"].as_str().expect("space_id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["mind_extra", "mind_whole"],
+        "a Mind admission would refuse through an undecodable row is not listed"
+    );
+
+    // The refusal the list's rule mirrors: admission reads no row it cannot decode.
+    let broken = adapter
+        .recall(
+            &mut tx,
+            &principal(owner),
+            json!({ "space_id": "mind_broken", "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "budget": { "max_items": 4 } }),
+        )
+        .await;
+    assert_eq!(
+        reject(&broken).code,
+        SpokeRejectCode::NotAuthorized,
+        "the skipped Mind answers the admission refusal"
+    );
+
+    // The mixed set agrees with the list: the Mind with one broken and one live decodable row is
+    // listed above and served here, because admission skips the row it cannot decode exactly as
+    // the visibility read does.
+    let mixed = adapter
+        .recall(
+            &mut tx,
+            &principal(owner),
+            json!({ "space_id": "mind_extra", "subject_id": SUBJECT,
+                    "selection": { "mode": "subject_all" },
+                    "budget": { "max_items": 4 } }),
+        )
+        .await;
+    assert!(
+        matches!(mixed, SpokeResult::Ok(_)),
+        "a live decodable row admits beside a broken one: {mixed:?}"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// An undecodable grant row is invisible, not fatal: admission decodes row by row, so a good row
+/// sorted after a bad one still admits the caller and serves the read. `query_as`'s `try_map`
+/// would have ended the stream at the bad row.
+#[tokio::test]
+async fn a_good_grant_after_an_undecodable_row_still_admits() {
+    let harness = Harness::open().await;
+    let adapter = MemoryAdapter::new(true);
+    // A bad row that sorts first — `capabilities_json` holds bytes the driver cannot hand over as
+    // text — and a good row that sorts after it.
+    for (grant_id, capabilities) in [
+        ("grant_a_bad", "CAST(X'80' AS TEXT)"),
+        ("grant_z_good", "'[\"recall\"]'"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO memory_grants \
+             (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+              context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+             VALUES ('{grant_id}', '{SPACE}', NULL, '{PRINCIPAL}', {capabilities}, '[]', 0, \
+              NULL, NULL, 1, '{NOW}')"
+        )))
+        .execute(&harness.pool)
+        .await
+        .expect("insert grant");
+    }
+
+    let mut tx = harness.begin().await;
+    let pack = ready(
+        adapter
+            .recall(
+                &mut tx,
+                &principal(PRINCIPAL),
+                json!({ "space_id": SPACE, "subject_id": SUBJECT,
+                        "selection": { "mode": "subject_all" },
+                        "budget": { "max_items": 4 } }),
+            )
+            .await,
+    );
+    assert!(
+        pack["records"].is_array(),
+        "the good row after the bad one still admits the caller: {pack}"
+    );
     tx.rollback().await.expect("rollback");
 }

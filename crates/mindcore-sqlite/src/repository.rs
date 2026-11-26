@@ -12,7 +12,8 @@ use std::future::poll_fn;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Number, Value};
-use sqlx::Sqlite;
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Row, Sqlite};
 
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::{ContextId, SpaceId, SubjectId};
@@ -902,11 +903,25 @@ fn import_row(row: ImportColumns) -> RepoResult<MemoryImportRow> {
     })
 }
 
-fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
-    let capabilities: Vec<String> = serde_json::from_str(&row.capabilities_json)
+/// The decode rule every grant row read applies: both JSON columns are string arrays.
+///
+/// [`grant_row`] and the registry's visibility reads share it, so a Mind is visible through a row
+/// only when the row admission decodes would admit: the same malformed row must not be refused by
+/// one read and listed by another.
+pub(crate) fn decode_grant_columns(
+    capabilities_json: &str,
+    context_ids_json: &str,
+) -> RepoResult<(Vec<String>, Vec<String>)> {
+    let capabilities: Vec<String> = serde_json::from_str(capabilities_json)
         .map_err(|error| invalid_row(format_args!("capabilities_json: {error}")))?;
-    let contexts: Vec<String> = serde_json::from_str(&row.context_ids_json)
+    let contexts: Vec<String> = serde_json::from_str(context_ids_json)
         .map_err(|error| invalid_row(format_args!("context_ids_json: {error}")))?;
+    Ok((capabilities, contexts))
+}
+
+fn grant_row(row: GrantRow) -> RepoResult<MemoryGrantRow> {
+    let (capabilities, contexts) =
+        decode_grant_columns(&row.capabilities_json, &row.context_ids_json)?;
     Ok(MemoryGrantRow {
         grant_id: row.grant_id,
         space_id: SpaceId::new(row.space_id),
@@ -935,6 +950,63 @@ struct GrantRow {
     revoked_at: Option<String>,
     revision: i64,
     created_at: String,
+}
+
+/// `space`'s grant rows, decoded one row at a time: a row whose columns or JSON do not decode is
+/// **invisible** rather than fatal, so a good row sorted after a bad one is still read.
+///
+/// `query_as!` maps a whole row through SQLx's `try_map`, whose error ends the stream — one bad
+/// row would hide every later one. This read takes raw driver rows and decodes each one on its
+/// own, which is the rule the registry's visibility read applies: admission and the listing share
+/// it, so a Mind with one live decodable row is both listed and admitted, and only a set with no
+/// decodable row refuses. `principal_filter` narrows the read to one caller's rows; `None` reads
+/// the whole space for an admin listing.
+pub async fn decodable_grants(
+    tx: &mut Tx<'_>,
+    space: &SpaceId,
+    principal_filter: Option<&str>,
+) -> Result<Vec<MemoryGrantRow>, SqliteRepositoryError> {
+    let mut rows = sqlx::query(
+        "SELECT grant_id, space_id, subject_id, principal_id, \
+         capabilities_json, context_ids_json, shared_access, expires_at, revoked_at, \
+         revision, created_at FROM memory_grants \
+         WHERE space_id = ? AND (? IS NULL OR principal_id = ?) ORDER BY grant_id",
+    )
+    .bind(space.as_str())
+    .bind(principal_filter)
+    .bind(principal_filter)
+    .fetch(&mut **tx);
+    let mut grants = Vec::new();
+    while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+        let row = match row {
+            Ok(row) => row,
+            // A driver failure on the stream itself is not a row's fault.
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(grant) = grant_of(&row) {
+            grants.push(grant);
+        }
+    }
+    Ok(grants)
+}
+
+/// One grant row from a raw driver row, or `None` when a column or either JSON column does not
+/// decode. The caller skips it; nothing about this row ends the read.
+fn grant_of(row: &SqliteRow) -> Option<MemoryGrantRow> {
+    let row = GrantRow {
+        grant_id: row.try_get("grant_id").ok()?,
+        space_id: row.try_get("space_id").ok()?,
+        subject_id: row.try_get("subject_id").ok()?,
+        principal_id: row.try_get("principal_id").ok()?,
+        capabilities_json: row.try_get("capabilities_json").ok()?,
+        context_ids_json: row.try_get("context_ids_json").ok()?,
+        shared_access: row.try_get("shared_access").ok()?,
+        expires_at: row.try_get("expires_at").ok()?,
+        revoked_at: row.try_get("revoked_at").ok()?,
+        revision: row.try_get("revision").ok()?,
+        created_at: row.try_get("created_at").ok()?,
+    };
+    grant_row(row).ok()
 }
 
 /// A `memory_profiles` row; `list_profiles` decodes through the macro's

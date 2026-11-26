@@ -49,6 +49,19 @@ impl Reject {
         Self::terminal(SpokeRejectCode::NotFound, format!("{what} not found"))
     }
 
+    /// Mind admission: one `NOT_AUTHORIZED` an unknown, a frozen-ungranted and
+    /// an unadmitted Mind share, byte-equal in the three cases. It carries no
+    /// details at all — not even `retry_class` — because the refusal must not
+    /// disclose whether the named Mind exists, and its fixed shape is what pins
+    /// that indistinguishability.
+    pub(crate) fn admission_refusal() -> Self {
+        Self {
+            code: SpokeRejectCode::NotAuthorized,
+            message: "the caller is not admitted to the named mind".to_string(),
+            details: Map::new(),
+        }
+    }
+
     pub(crate) fn not_authorized(message: impl Into<String>) -> Self {
         Self::terminal(SpokeRejectCode::NotAuthorized, message)
     }
@@ -97,7 +110,13 @@ impl Reject {
         SpokeReject {
             code: self.code,
             message: self.message,
-            details: Some(self.details),
+            // The admission refusal carries nothing, and an empty object is
+            // still a carrier: `None` is the no-details answer on the wire.
+            details: if self.details.is_empty() {
+                None
+            } else {
+                Some(self.details)
+            },
         }
     }
 

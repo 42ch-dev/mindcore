@@ -139,6 +139,23 @@ impl Harness {
         .execute(&harness.pool)
         .await
         .expect("seed subject grant");
+        // The registry row makes the fixture space a Mind `spaces.list` may
+        // list; the carrier entry the row references is seeded first.
+        sqlx::query(
+            "INSERT INTO knowledge_entries \
+             (collection, entry_id, revision, payload, created_at, updated_at) \
+             VALUES ('mind:spc_parity', 'ke_carrier', 1, '{}', \
+              '2026-11-20T09:20:01.123Z', '2026-11-20T09:20:01.123Z')",
+        )
+        .execute(&harness.pool)
+        .await
+        .expect("seed carrier entry");
+        sqlx::query(
+            "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id)              VALUES ('spc_parity', 'mind:spc_parity', 'ke_carrier')",
+        )
+        .execute(&harness.pool)
+        .await
+        .expect("seed registry row");
         harness
     }
 
@@ -1264,10 +1281,10 @@ async fn receipt_y04_second_grant_selector() {
             SpokeResult::Reject(reject) => {
                 assert_eq!(reject.code, SpokeRejectCode::NotAuthorized, "{id}");
                 assert_eq!(
-                    reject.details.as_ref().expect("details")["retry_class"],
-                    "terminal",
-                    "{id}"
+                    reject.message, "the caller is not admitted to the named mind",
+                    "{id}: a revoked grant is no admission",
                 );
+                assert!(reject.details.is_none(), "{id}: {reject:?}");
             }
             other => panic!("non-participant poll must refuse {id}: {other:?}"),
         }

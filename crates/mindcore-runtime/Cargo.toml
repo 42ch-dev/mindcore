@@ -20,7 +20,7 @@ spoke-connect = { workspace = true, features = ["remote-adapter"] }
 spoke-operations.workspace = true
 spoke-schemas.workspace = true
 sqlx.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 ed25519-dalek = "3"

@@ -208,6 +208,42 @@ pub(crate) fn candidate_requirement<'a>(
     }
 }
 
+/// Mind admission, run before every existence check: the caller's grant rows
+/// first, then the space row. No live grant for this principal and no space
+/// row answer the same fixed `NOT_AUTHORIZED` with no details, so an unknown
+/// Mind, a frozen one the caller holds no grant in and an unadmitted one are
+/// one answer, and nothing the refusal carries says which case the caller hit.
+/// The registry is not consulted here: a space written before it is still a
+/// space to `memory.*`; the registry gates only `memory.spaces.list` and the
+/// Mind-level reads.
+///
+/// The read is filtered to the caller's own rows at the query and decodes one
+/// row at a time, skipping a row that cannot decode — the rule the registry's
+/// visibility read applies. Another principal's malformed row is therefore
+/// never decoded and can neither turn this refusal into a storage error nor
+/// tell the caller the space exists; a live decodable row of the caller's
+/// admits, and only a set with none refuses, so a Mind the list names is one
+/// admission serves.
+pub(crate) async fn admit_mind(
+    tx: &mut Tx<'_>,
+    principal: &str,
+    space: &SpaceId,
+) -> AResult<Vec<MemoryGrantRow>> {
+    let rows = mindcore_sqlite::decodable_grants(tx, space, Some(principal))
+        .await
+        .map_err(|error| {
+            Reject::internal(format!("the mind admission could not be read: {error}"))
+        })?;
+    let now = Utc::now();
+    if !rows.iter().any(|row| live_grant(row, now)) {
+        return Err(Reject::admission_refusal());
+    }
+    match SqliteMemoryRepository.space(tx, space).await? {
+        Some(_) => Ok(rows),
+        None => Err(Reject::admission_refusal()),
+    }
+}
+
 pub(crate) async fn space(
     repository: &SqliteMemoryRepository,
     tx: &mut Tx<'_>,
@@ -268,27 +304,39 @@ pub(crate) async fn record(
     Ok(repository.record(tx, space, record_id).await?)
 }
 
-pub(crate) async fn grants(
-    repository: &SqliteMemoryRepository,
-    tx: &mut Tx<'_>,
-    space: &SpaceId,
-) -> AResult<Vec<MemoryGrantRow>> {
-    Ok(repository.list_grants(tx, space, None).await?)
+pub(crate) async fn grants(tx: &mut Tx<'_>, space: &SpaceId) -> AResult<Vec<MemoryGrantRow>> {
+    mindcore_sqlite::decodable_grants(tx, space, None)
+        .await
+        .map_err(|error| Reject::internal(format!("the grant read failed: {error}")))
 }
 
 /// The protocol's own coverage evaluator takes the wire grant union; the stored
 /// row projects to it losslessly.
 pub(crate) fn wire_grants(rows: &[MemoryGrantRow]) -> AResult<Vec<MemoryGrant>> {
+    rows.iter().map(wire_grant).collect()
+}
+
+/// The wire union coverage is evaluated over: only rows that are still live. A dead row —
+/// revoked, expired, or carrying an expiry that does not parse — covers nothing, and projecting
+/// one could fail on its stored spelling, so it never reaches the projection and can never turn
+/// a refusal into a storage error.
+pub(crate) fn live_wire_grants(
+    rows: &[MemoryGrantRow],
+    now: DateTime<Utc>,
+) -> AResult<Vec<MemoryGrant>> {
     rows.iter()
-        .map(|row| {
-            serde_json::from_value(project::grant_body(row)).map_err(|error| {
-                Reject::terminal(
-                    spoke_operations::SpokeRejectCode::InternalError,
-                    format!("stored grant projection: {error}"),
-                )
-            })
-        })
+        .filter(|row| live_grant(row, now))
+        .map(wire_grant)
         .collect()
+}
+
+fn wire_grant(row: &MemoryGrantRow) -> AResult<MemoryGrant> {
+    serde_json::from_value(project::grant_body(row)).map_err(|error| {
+        Reject::terminal(
+            spoke_operations::SpokeRejectCode::InternalError,
+            format!("stored grant projection: {error}"),
+        )
+    })
 }
 
 pub(crate) fn covered(
@@ -421,10 +469,17 @@ fn refuse_coverage(admission: &Admission<'_>, requirements: &[GrantRequirement<'
     let capability = requirements
         .first()
         .map_or("any", |requirement| requirement.capability);
+    refuse_space_coverage(admission.principal, admission.space.as_str(), capability)
+}
+
+/// The post-admission coverage refusal: the caller holds a live grant in the space, so naming the
+/// capability it lacks and the space it lacks it in discloses nothing a peer could not already
+/// observe through its own grants. Callers that admit first and check coverage second reach this
+/// without an [`Admission`] value to read; [`refuse_coverage`] answers through it, so both paths
+/// speak one message.
+pub(crate) fn refuse_space_coverage(principal: &str, space: &str, capability: &str) -> Reject {
     Reject::not_authorized(format!(
-        "principal {} holds no grant covering {capability} in space {}",
-        admission.principal,
-        admission.space.as_str()
+        "principal {principal} holds no grant covering {capability} in space {space}"
     ))
 }
 
@@ -435,9 +490,8 @@ pub(crate) async fn authorize(
     admission: &Admission<'_>,
     now: DateTime<Utc>,
 ) -> AResult<Vec<MemoryGrantRow>> {
-    space(repository, tx, admission.space).await?;
-    let rows = grants(repository, tx, admission.space).await?;
-    let wire = wire_grants(&rows)?;
+    let rows = admit_mind(tx, admission.principal, admission.space).await?;
+    let wire = live_wire_grants(&rows, now)?;
     let space_id = admission.space.as_str();
     match &admission.coverage {
         Coverage::Requirements(requirements) => {
@@ -496,7 +550,7 @@ pub(crate) fn authorize_issuance(
     let Some(issued) = admission.issuance.as_ref() else {
         return Ok(());
     };
-    let wire = wire_grants(rows)?;
+    let wire = live_wire_grants(rows, now)?;
     match validate_grant_issuance(
         &wire,
         admission.principal,

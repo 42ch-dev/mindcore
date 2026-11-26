@@ -1,4 +1,4 @@
-//! The Mind tools served over Connect: the three workflow tools.
+//! The Mind tools served over Connect: the workflow tools and the cognition read.
 //!
 //! Connect owns the signed `{ "arguments": … }` / `{ "result": … }` wrappers; these handlers see
 //! only the argument object and return only the result value. Each handler binds to the responder
@@ -12,7 +12,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -22,9 +22,11 @@ use mindcore_spi::{
     AbsorbCandidateOutcome, ContextPack, DeliberateOutcome, DeliberateRequest, DomainLens,
     Embedder, Evidence, MindCapabilities, MindWorkflows, PolicyHook, Reasoner, SpiError,
 };
+use mindcore_spoke::MemoryAdapter;
 use spoke_connect::remote::{ConnectResponder, MemoryAdmission, ToolHandler};
 use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
+use sqlx::SqlitePool;
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{MemoryCaptureRequest, MemoryRecallRequest, Principal};
 
@@ -36,6 +38,8 @@ pub const RECALL_CONTEXT: &str = "tools.mindcore.recall_context";
 pub const ABSORB: &str = "tools.mindcore.absorb";
 /// Stable capability id of the deliberation workflow.
 pub const DELIBERATE: &str = "tools.mindcore.deliberate";
+/// Stable capability id of the cognition read.
+pub const READ_COGNITION: &str = "tools.mindcore.read_cognition";
 
 /// The provider capabilities a tool call injects into its workflow.
 ///
@@ -72,20 +76,23 @@ pub(crate) struct WorkflowTools {
     workflows: Arc<dyn MindWorkflows>,
     principals: MemoryAdmission,
     providers: MindProviders,
+    pool: SqlitePool,
 }
 
 impl WorkflowTools {
     /// Bind the tools to one workflow engine, the host's peer-to-principal admission and its
-    /// providers.
+    /// providers. `pool` serves the Mind registry reads a carrier resolution needs.
     pub fn new(
         workflows: Arc<dyn MindWorkflows>,
         principals: MemoryAdmission,
         providers: MindProviders,
+        pool: SqlitePool,
     ) -> Self {
         Self {
             workflows,
             principals,
             providers,
+            pool,
         }
     }
 
@@ -116,7 +123,7 @@ impl WorkflowTools {
 
     /// The one list both advertisement and installation read.
     #[allow(clippy::type_complexity)]
-    fn advertised() -> [(&'static str, &'static str, fn() -> Value, fn() -> Value); 3] {
+    fn advertised() -> [(&'static str, &'static str, fn() -> Value, fn() -> Value); 4] {
         [
             (
                 RECALL_CONTEXT,
@@ -135,6 +142,12 @@ impl WorkflowTools {
                 "Derive a validated verdict over supplied evidence.",
                 deliberate_input,
                 deliberate_output,
+            ),
+            (
+                READ_COGNITION,
+                "Read a Mind's current judgment and its derived mind state.",
+                read_cognition_input,
+                read_cognition_output,
             ),
         ]
     }
@@ -155,6 +168,7 @@ impl WorkflowTools {
             Arc::clone(&self.workflows),
             Arc::clone(&self.principals),
             self.providers.clone(),
+            self.pool.clone(),
             capability_id,
             peer_id,
             arguments,
@@ -166,16 +180,19 @@ impl WorkflowTools {
         let workflows = Arc::clone(&self.workflows);
         let principals = Arc::clone(&self.principals);
         let providers = self.providers.clone();
+        let pool = self.pool.clone();
         ToolRegistration::new(descriptor, move |responder| {
             let session: Weak<ConnectResponder> = Arc::downgrade(responder);
             let workflows = Arc::clone(&workflows);
             let principals = Arc::clone(&principals);
             let providers = providers.clone();
+            let pool = pool.clone();
             let handler: ToolHandler = Arc::new(move |arguments: Value| {
                 let session = session.clone();
                 let workflows = Arc::clone(&workflows);
                 let principals = Arc::clone(&principals);
                 let providers = providers.clone();
+                let pool = pool.clone();
                 Box::pin(async move {
                     let peer_id = match authenticated_peer(&session) {
                         Ok(peer_id) => peer_id,
@@ -185,6 +202,7 @@ impl WorkflowTools {
                         workflows,
                         principals,
                         providers,
+                        pool,
                         capability_id,
                         &peer_id,
                         arguments,
@@ -220,6 +238,7 @@ async fn serve(
     workflows: Arc<dyn MindWorkflows>,
     principals: MemoryAdmission,
     providers: MindProviders,
+    pool: SqlitePool,
     capability_id: &str,
     peer_id: &str,
     arguments: Value,
@@ -231,7 +250,8 @@ async fn serve(
     match capability_id {
         RECALL_CONTEXT => recall_context(&*workflows, &principal, arguments, &providers).await,
         ABSORB => absorb(&*workflows, &principal, arguments, &providers).await,
-        DELIBERATE => deliberate(&*workflows, &principal, arguments, &providers).await,
+        DELIBERATE => deliberate(&*workflows, &principal, arguments, &providers, &pool).await,
+        READ_COGNITION => read_cognition(&principal, arguments, &pool).await,
         other => SpokeResult::Reject(SpokeReject {
             code: SpokeRejectCode::InvalidInput,
             message: format!("unknown mindcore tool {other}"),
@@ -295,15 +315,64 @@ async fn absorb(
     }
 }
 
+/// The budget the workflow still has after `spent`: a pre-check that consumed the request's
+/// deadline leaves `None`, and a zero remainder is spent rather than an empty allowance.
+fn remaining_budget(budget: Duration, spent: Duration) -> Option<Duration> {
+    budget.checked_sub(spent).filter(|left| !left.is_zero())
+}
+
 async fn deliberate(
     workflows: &dyn MindWorkflows,
     principal: &Principal,
     arguments: Value,
     providers: &MindProviders,
+    pool: &SqlitePool,
 ) -> SpokeResult<Value> {
     let arguments: DeliberateArguments = match decode(arguments) {
         Ok(arguments) => arguments,
         Err(reject) => return SpokeResult::Reject(reject),
+    };
+    // The request's budget covers the whole call, and this pre-check is part of it: a query or
+    // connection wait is bounded by the timer, so expiry stops the pre-check rather than being
+    // answered after it returns. A timer that fires starts no reasoner work and no carrier write.
+    let budget = Duration::from_millis(arguments.timeout_ms.get() as u64);
+    let started = Instant::now();
+    // Admission before existence, in one transaction: the grant rows and the registry row are
+    // read together, so a revocation cannot land between them, and the liveness rule is the
+    // adapter's own (`live_grant` — unrevoked, unexpired, an unparseable expiry fails closed).
+    // A missing grant, a revoked or expired one and a space with no registry row are the same
+    // target-free refusal, so a caller can never tell an existing Mind from an absent one by
+    // varying `space_id`. The operation's own coverage is not checked here: the workflow reads
+    // and revalidates the subject page first and only then checks `knowledge_read`, so the
+    // request's own refusal is the one a caller sees.
+    let carrier_entry_id = match tokio::time::timeout(
+        budget,
+        mindcore_spoke::admitted_carrier_entry(pool, &principal.principal_id, &arguments.space_id),
+    )
+    .await
+    {
+        Ok(Ok(carrier_entry_id)) => carrier_entry_id,
+        Ok(Err(reject)) => return SpokeResult::Reject(reject),
+        Err(_elapsed) => return SpokeResult::Reject(workflow_retryable("deadline_exceeded")),
+    };
+    // The pre-check kept its time: the workflow gets only what is left, and an exhausted budget
+    // starts nothing either.
+    let Some(timeout) = remaining_budget(budget, started.elapsed()) else {
+        return SpokeResult::Reject(workflow_retryable("deadline_exceeded"));
+    };
+    let holder: CognitionReference = match serde_json::from_value(json!({
+        "kind": "knowledge_entry",
+        "namespace": "mindcore",
+        "id": carrier_entry_id,
+    })) {
+        Ok(holder) => holder,
+        Err(error) => {
+            return SpokeResult::Reject(SpokeReject {
+                code: SpokeRejectCode::InternalError,
+                message: format!("the carrier reference does not decode: {error}"),
+                details: None,
+            })
+        }
     };
     let evidence: Vec<Evidence<'_>> = arguments
         .evidence
@@ -317,10 +386,10 @@ async fn deliberate(
         space_id: &arguments.space_id,
         subject_id: Some(&arguments.subject_id),
         assessment_context_id: None,
-        holder: &arguments.holder,
+        holder: &holder,
         target: &arguments.target,
         evidence: &evidence,
-        timeout: Duration::from_millis(arguments.timeout_ms.get() as u64),
+        timeout,
     };
     let caps = providers.capabilities();
     match workflows
@@ -329,6 +398,44 @@ async fn deliberate(
     {
         Ok(outcome) => SpokeResult::Ok(deliberate_outcome(outcome)),
         Err(error) => SpokeResult::Reject(workflow_reject(error)),
+    }
+}
+
+/// `tools.mindcore.read_cognition`: one admitted Mind's judgment, read in one transaction.
+///
+/// [`MemoryAdapter::read_cognition`] runs admission before any read — the caller's own grant
+/// rows and the registry row in this transaction — so an unadmitted caller learns nothing about
+/// whether the Mind exists, and a granted one gets `{carrier_revision, records, mind_state}`.
+/// A carrier holding no record yet answers `records: []` and a null `mind_state`.
+async fn read_cognition(
+    principal: &Principal,
+    arguments: Value,
+    pool: &SqlitePool,
+) -> SpokeResult<Value> {
+    let arguments: ReadCognitionArguments = match decode(arguments) {
+        Ok(arguments) => arguments,
+        Err(reject) => return SpokeResult::Reject(reject),
+    };
+    let mut transaction = match pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return SpokeResult::Reject(SpokeReject {
+                code: SpokeRejectCode::InternalError,
+                message: format!("the cognition read could not begin: {error}"),
+                details: None,
+            })
+        }
+    };
+    let cognition =
+        MemoryAdapter::read_cognition(&mut transaction, principal, &arguments.space_id).await;
+    drop(transaction);
+    match cognition {
+        Ok(cognition) => SpokeResult::Ok(json!({
+            "carrier_revision": cognition.carrier_revision,
+            "records": cognition.records,
+            "mind_state": cognition.mind_state,
+        })),
+        Err(reject) => SpokeResult::Reject(reject),
     }
 }
 
@@ -452,7 +559,6 @@ struct AbsorbArguments {
 struct DeliberateArguments {
     space_id: String,
     subject_id: String,
-    holder: CognitionReference,
     target: CognitionTarget,
     evidence: Vec<EvidenceArgument>,
     timeout_ms: NonZeroUsize,
@@ -463,6 +569,14 @@ struct DeliberateArguments {
 struct EvidenceArgument {
     id: String,
     text: String,
+}
+
+/// The cognition read names one Mind and nothing else: the carrier and its revision come from
+/// the registry row, never from the caller.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadCognitionArguments {
+    space_id: String,
 }
 
 fn descriptor(
@@ -871,19 +985,20 @@ fn absorb_output() -> Value {
     })
 }
 
-/// The deliberation arguments, mirroring the pinned `spoke-schemas` request DTOs. `holder` and
-/// `target` splice the same pinned definitions `absorb` advertises — the workflow decodes exactly
-/// those DTOs, so the manifest and the handler cannot drift apart.
+/// The deliberation arguments, mirroring the pinned `spoke-schemas` request DTOs. The carrier is
+/// the Mind's own record and never a wire member: a peer still sending the retired `holder` hits
+/// the closed object's unknown-field refusal. `target` splices the same pinned definitions
+/// `absorb` advertises — the workflow decodes exactly those DTOs, so the manifest and the handler
+/// cannot drift apart.
 fn deliberate_input() -> Value {
     let mut schema = json!({
         "$id": "https://mindcore.invalid/schemas/tools/deliberate.input.schema.json",
         "type": "object",
         "additionalProperties": false,
-        "required": ["space_id", "subject_id", "holder", "target", "evidence", "timeout_ms"],
+        "required": ["space_id", "subject_id", "target", "evidence", "timeout_ms"],
         "properties": {
             "space_id": { "type": "string", "minLength": 1 },
             "subject_id": { "type": "string", "minLength": 1 },
-            "holder": { "$ref": "#/definitions/CognitionReference" },
             "target": { "$ref": "#/definitions/CognitionTarget" },
             "evidence": {
                 "type": "array",
@@ -900,10 +1015,7 @@ fn deliberate_input() -> Value {
             "timeout_ms": { "type": "integer", "minimum": 1 },
         },
     });
-    schema["definitions"] = Value::Object(cognition_definitions(&[
-        "CognitionReference",
-        "CognitionTarget",
-    ]));
+    schema["definitions"] = Value::Object(cognition_definitions(&["CognitionTarget"]));
     schema
 }
 
@@ -985,6 +1097,63 @@ fn deliberate_output() -> Value {
                 },
             },
         ],
+    })
+}
+
+/// The cognition read's arguments: the closed `{space_id}` object, mirroring
+/// [`ReadCognitionArguments`]. The Mind's carrier is never a wire member.
+fn read_cognition_input() -> Value {
+    json!({
+        "$id": "https://mindcore.invalid/schemas/tools/read-cognition.input.schema.json",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["space_id"],
+        "properties": {
+            "space_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The Mind to read; the same id its memory requests carry.",
+            },
+        },
+    })
+}
+
+/// The cognition read's result: the carrier revision the read served, its current-view records in
+/// carrier order, and the derived `MindState` — `null` for a Mind that holds no judgment yet.
+/// `records` and `mind_state` are opaque product objects, so their openness is stated rather than
+/// left to draft-07's implicit default.
+fn read_cognition_output() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["carrier_revision", "records", "mind_state"],
+        "properties": {
+            "carrier_revision": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The carrier revision the read served.",
+            },
+            "records": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": {},
+                    "description": "One current-view SPOKE CognitionRecord, in carrier order.",
+                },
+                "description": "The carrier's current judgment; empty before its first record.",
+            },
+            "mind_state": {
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "additionalProperties": {},
+                        "description": "The derived SPOKE MindState (spoke-judgment).",
+                    },
+                ],
+                "description": "The derived MindState, or null for a Mind with no judgment yet.",
+            },
+        },
     })
 }
 
