@@ -230,12 +230,15 @@ The adoption face is composed when `ServeFaces.adoption` is `Some(route)`, and a
 **Admission is the admitting Mind's knowledge-face admission**, composed as
 `(principals(peer)?, knowledge_admission(peer)?)` like the history family's: a peer the knowledge
 face does not admit cannot adopt, and a principal the knowledge admission refuses answers the
-target-free `NOT_AUTHORIZED` where the removed product tool would have served it. Neither the
-principal nor the admitted scope comes from the payload; the admitted scope is the Mind's own. The
-face installs the scoped form of that admission — `ScopedAdoptionAdmission`, the peer id and the
-request's scope selector answering the `Principal` and the admitted `Scope` — whose callback carries
-the Mind and nothing else, no caller binding, because Connect compares the request's destination
-scope with this one.
+target-free `NOT_AUTHORIZED` where the removed product tool would have served it. The face installs
+the scoped form of that admission — `ScopedAdoptionAdmission`, the peer id and the request's scope
+selector answering the `Principal` and the admitted `Scope`. **That selector is the request's
+`destination_scope_id`**: Connect hands it to the admission, so the member chooses *which Mind the
+call is admitted against*, and only after admission is its equality with the returned scope checked
+(by Connect above the port, and again by the port's own pre-transaction comparison). What the member
+cannot choose is a collection — the registry row of the Mind it selected names that — nor bypass
+admission for a Mind the caller holds no grant in. The callback carries the Mind and nothing else,
+no caller binding, and the principal still comes from the authenticated peer, never the payload.
 
 **The grant rule.** `knowledge.adopt` requires **one** live grant of the caller in the admitted
 Mind's space covering both `knowledge_write` and `knowledge_read`, on one row — it is a knowledge
@@ -261,14 +264,17 @@ later Mind out of the source:
 5. The destination slot read under the admitted selection, then the create-only write.
 6. The typed response, built before the transaction settles.
 
-**Scope mapping.** Every scope member of the request is compared, never used to select anything:
+**Scope mapping.** Every scope member of the request is compared with what the surface fixed, and
+exactly one of them doubles as a routing input: `destination_scope_id` is the selector the admission
+resolves, so it chooses which Mind the call is admitted against, and is then compared with the scope
+that admission returned. The rest are comparisons only, and no member selects a collection:
 
 | Request member | Must equal | Otherwise |
 |---|---|---|
 | `source_scope_id` | the host-configured source's `scope_id` | `NOT_FOUND`, no details — the same generic absence as a missing source |
 | `source_entry_id` | a live or retired row of the host-configured source collection | `NOT_FOUND`, no details |
 | `source_revision` | the live source's current revision; never compared for a retired source; never `0` | `REVISION_CONFLICT`, no details / `INVALID_INPUT` |
-| `destination_scope_id` | the admitted Mind's `Scope.scope_id` | the target-free `NOT_AUTHORIZED`, no details, before the source is read |
+| `destination_scope_id` | the Mind it selected, as the admission returned it; a Mind the caller holds no grant in is refused before this comparison | the target-free `NOT_AUTHORIZED`, no details, before the source is read |
 | `destination_entry_id` | absent → the resolved terminal's `source_entry_id`; a supplied value may name that same id | — |
 | `idempotency_key` | 1–128 code points | `INVALID_INPUT`, refused by Connect's decoder |
 
@@ -288,11 +294,29 @@ adoption refuses before any write, and it resolves a retired row the store's liv
 as an absence by checking the row including superseded ones and answering the same occupancy. Either
 way no revision gate is reached and no put runs. The invariant is the observable answer — code,
 message shape and absent `details` — not a shared constructor, and no path reveals the occupant's
-content, revision or visibility. `NOT_AUTHORIZED` is one answer shared by exactly two cases: a
-`destination_scope_id` that is not the admitted Mind's scope, and an admitted Mind with no registry
-row to resolve a destination from. It is the target-free admission refusal in both, never a
-comparison against a configured destination, which no longer exists. The registry row selects the
-destination; the admitted selection narrows what the call may touch inside it.
+content, revision or visibility.
+
+**The `NOT_AUTHORIZED` answers on this face**, kept apart because they do not all come from one
+place:
+
+- **The port's fixed authorization refusal** is `MindcoreServe`'s `authorize_knowledge` answer:
+  `NOT_AUTHORIZED`, `knowledge scope not authorized`, no `details`. It is one value for a caller with
+  no live grant in the admitted Mind's space, one whose grant does not cover both capabilities, and
+  — when the destination cannot be resolved — an admitted Mind with no registry row. It is byte for
+  byte the refusal a knowledge put gets for the same access, because it *is* that check.
+- **Connect's own destination mismatch** happens above the port: the request's
+  `destination_scope_id` is what Connect hands the scoped admission as the selector, and after
+  admission it compares that member with the admitted scope, answering `NOT_AUTHORIZED` with
+  `adoption destination scope is outside the admitted context`. Same code, no `details`, and the
+  source is never read — but the text is Connect's own and is not claimed to match the port's.
+- **The admission-level refusals** — an unknown Mind, an unadmitted Mind, a frozen Mind the caller
+  holds no grant in — answer with the callback's own value, which Connect's adoption branch returns
+  verbatim. Within this face those cases are byte-identical to each other, as the history section
+  states for its own callback; across families the text may differ, so the code, the absence of
+  `details` and the unreached store are the stable part of the contract, never the message.
+
+None of the three selects a collection from the wire: the registry row selects the destination, and
+the admitted selection narrows what the call may touch inside it.
 
 **Slot occupancy is a permitted disclosure.** A create-only destination answers occupied for an
 occupied id and success for a free one, so the answer reports whether the `destination_entry_id`
@@ -408,7 +432,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 
 - No caller-provided principal, Mind id, or manifest capability can bypass a host admission or storage guard.
 - No baseline provider is required for either face and an absent face/tool is denied. Advertisements and handler registrations describe the same capabilities.
-- Adoption's source is the one host-configured collection and its destination is the admitted Mind's registered collection, resolved inside the call's transaction: no wire value selects either, the request's scope members are only compared against those two, the source's collision with any registered Mind is re-checked per call against the whole registry after the grant check and before any source read, and a `destination_scope_id` that names anything but the admitted Mind's scope answers the target-free refusal.
+- Adoption's source is the one host-configured collection and its destination is the collection the Mind selected by the request's `destination_scope_id` registered; both are resolved inside the call's transaction, no wire value selects a collection, and the selector chooses only which Mind is asked of admission. The source's collision with any registered Mind is re-checked per call against the whole registry after the grant check and before any source read, and a `destination_scope_id` that differs from the scope admission returned answers the target-free refusal.
 - Adoption's answer reports `destination_entry_id` slot occupancy — occupied or free — and nothing about the occupant: a concealed occupant is byte-identical to a visible one. That disclosure is permitted and no wider than the knowledge face it lands on, whose create-only `put_knowledge_entry` already distinguishes occupied from free while hiding the entry; entry content, revision and visibility stay undisclosed.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.

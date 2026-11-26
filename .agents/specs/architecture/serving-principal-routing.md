@@ -182,9 +182,12 @@ two sides, one of which is host configuration:
   and lands in every copy's anchor; the request's `source_scope_id` is only compared with it.
 - **What it writes** is the admitted Mind's registered collection — the same collection that
   Mind's knowledge face serves — resolved inside the call's transaction from the `minds` row of
-  the Mind the request's `scope_id` named and the admission admitted. No registry row is one of the
-  two `NOT_AUTHORIZED` cases; the request's `destination_scope_id` is only compared with the
-  admitted scope.
+  the Mind the request selected and the admission admitted. **The selector is the request's
+  `destination_scope_id`**: Connect hands that member to the scoped admission, so it chooses which
+  Mind the call is admitted against, and its equality with the returned scope is checked only after
+  admission. It cannot choose a collection (the registry row names that) and cannot reach a Mind the
+  caller holds no grant in (admission refuses first, target-free). No registry row at call time is a
+  `NOT_AUTHORIZED`, through the port's own check.
 - Its route is not the source: a Mind created after assembly adopts into
   its own collection from its first call. The configured source is the surface's only host-named
   collection, and assembly plus a per-call re-check keep it from being any registered Mind's.
