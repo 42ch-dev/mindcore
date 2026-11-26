@@ -1362,19 +1362,30 @@ async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
 
 /// The served cognition read over a signed session: a Mind that has judged nothing answers
 /// `records: []` and a null `mind_state`; after a settlement the same Mind answers the committed
-/// record and its derived `MindState`; and a Mind the caller holds no grant in answers exactly
-/// the refusal a space that is no Mind at all answers.
+/// record and its derived `MindState`; a Mind the caller holds no grant in answers exactly the
+/// refusal a space that is no Mind at all answers; and a caller admitted to a Mind without
+/// `knowledge_read` answers the distinct capability-coverage refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
     let fixture = Fixture::open().await;
     fixture.seed_second_mind().await;
+    // The second peer is admitted to the second Mind through `recall` alone: a live grant, so
+    // admission passes, but no `knowledge_read` coverage. It is granted before `serve` consumes
+    // the fixture, and it cannot affect the first principal, who holds nothing in that Mind.
+    fixture
+        .grant_in_second("grt_recall_only", PEER_TWO_PRINCIPAL, &["recall"])
+        .await;
     let (_dir, serve) = fixture.serve();
     let providers = MindProviders {
         reasoner: Some(Arc::new(SettlingReasoner(SETTLING_RATIONALE))),
         policy_hook: Some(Arc::new(AutoPolicy)),
         ..MindProviders::default()
     };
-    let surface = surface(&serve, faces(hello("runtime", &[]), None, providers));
+    let mut faces = faces(hello("runtime", &[]), None, providers);
+    // Two principals: the dialer reaches the first Mind, the second peer reaches only what it is
+    // granted in the second.
+    faces.principals = two_principal_admission();
+    let surface = surface(&serve, faces);
 
     let session = connect(&surface, &[DELIBERATE, READ_COGNITION]).await;
 
@@ -1451,6 +1462,46 @@ async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
     assert_eq!(
         unadmitted, absent,
         "an unadmitted Mind and an absent Mind must be the byte-same refusal"
+    );
+
+    // A peer admitted to the second Mind, but only through `recall`: admission passes and the
+    // missing `knowledge_read` coverage is what answers. The plan keeps those two refusals
+    // distinct — the coverage refusal may name the capability and the Mind, because the caller is
+    // already known to hold a live grant here.
+    let peer = connect_as(&surface, &PEER_TWO_SEED, &[READ_COGNITION]).await;
+    let uncovered = expect_reject(
+        peer.adapter
+            .invoke_tool(READ_COGNITION, cognition_arguments(SPACE_TWO))
+            .await,
+        "the cognition read of a Mind the caller is admitted to without knowledge_read",
+    );
+    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        uncovered.message.contains("knowledge_read"),
+        "the coverage refusal names the capability the caller lacks: {uncovered:?}"
+    );
+    assert!(
+        uncovered
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str)
+            == Some("terminal"),
+        "a coverage gap cannot be retried away: {uncovered:?}"
+    );
+    assert_ne!(
+        uncovered, unadmitted,
+        "an admitted caller short of one capability is not an unadmitted caller"
+    );
+    let peer_absent = expect_reject(
+        peer.adapter
+            .invoke_tool(READ_COGNITION, cognition_arguments("spc_no_such_mind"))
+            .await,
+        "the second peer reading a space that is no Mind at all",
+    );
+    assert_eq!(
+        peer_absent, unadmitted,
+        "every unadmitted caller answers the same target-free refusal"
     );
 }
 

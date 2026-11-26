@@ -283,6 +283,75 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed the ghost grant");
+    // A Mind this principal is admitted to — it holds a live grant — but not to a
+    // `knowledge_read`: admission passes and the coverage check is the refusal that answers.
+    sqlx::query(
+        "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
+         VALUES ('spc_4', 'ash', 'ke_ash')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the underprivileged mind row");
+    sqlx::query(
+        "INSERT INTO memory_grants \
+         (grant_id, space_id, subject_id, principal_id, capabilities_json, \
+          context_ids_json, shared_access, expires_at, revoked_at, revision, created_at) \
+         VALUES ('grt_recall_only', 'spc_4', NULL, 'prn_driver', '[\"recall\"]', '[]', 0, NULL, NULL, 1, '2026-11-21T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the underprivileged grant");
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, superseded_by, created_at, updated_at) \
+         VALUES ('ash', 'ke_ash', 1, ?, NULL, '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+    )
+    .bind(
+        serde_json::json!({
+            "schema_version": 1,
+            "entry_id": "ke_ash",
+            "entry_type": "note",
+            "canonical_name": "ash's carrier",
+            "status": "confirmed",
+            "revision": 1,
+            "body": { "summary": "a holder this caller may not read" },
+            "modules": { "cognition": { "records": [], "world_facts": [], "extensions": {} } },
+            "extensions": {},
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the underprivileged carrier entry");
+    // The space rows admission reads: a live grant only ever belongs to a Mind whose space row
+    // and registry row were written with it.
+    sqlx::query(
+        "CREATE TABLE memory_spaces (space_id TEXT PRIMARY KEY, display_name TEXT, \
+         authority_host_id TEXT NOT NULL, authority_generation INTEGER NOT NULL, \
+         status TEXT NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create memory_spaces");
+    sqlx::query(
+        "CREATE TABLE memory_receipts (receipt_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, \
+         status TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create memory_receipts");
+    for space in ["spc_1", "spc_2", "spc_3", "spc_4"] {
+        sqlx::query(
+            "INSERT INTO memory_spaces \
+             (space_id, display_name, authority_host_id, authority_generation, status, revision, \
+              created_at) \
+             VALUES (?, NULL, 'host_1', 1, 'active', 1, '2026-11-21T00:00:00Z')",
+        )
+        .bind(space)
+        .execute(&pool)
+        .await
+        .expect("seed the space row");
+    }
     pool
 }
 
@@ -299,6 +368,17 @@ fn expect_ok<T>(result: SpokeResult<T>, context: &str) -> T {
         SpokeResult::Ok(value) => value,
         SpokeResult::Reject(reject) => panic!("{context}: unexpectedly rejected with {reject:?}"),
     }
+}
+
+/// One refusal rendered the way a peer decodes it from the wire: the code string, the message and
+/// the details, and nothing else.
+fn wire_refusal(reject: &SpokeReject) -> String {
+    json!({
+        "code": reject.code.as_str(),
+        "message": reject.message,
+        "details": reject.details,
+    })
+    .to_string()
 }
 
 fn expect_reject<T: std::fmt::Debug>(result: SpokeResult<T>, context: &str) -> SpokeReject {
@@ -797,6 +877,41 @@ async fn read_cognition_serves_a_judgment_or_a_null_state() {
     assert_eq!(
         unadmitted, absent,
         "an unadmitted Mind and an absent one are one answer"
+    );
+    assert_eq!(
+        wire_refusal(&unadmitted),
+        wire_refusal(&absent),
+        "the refusal is byte-equal across an unadmitted and an absent Mind"
+    );
+
+    // Admitted (a live `recall` grant), but not to `knowledge_read`: the coverage refusal
+    // answers, and it must not be the target-free admission refusal.
+    let uncovered = expect_reject(
+        tool.call(READ_COGNITION, "peer-driver", cognition_read_arguments("spc_4"))
+            .await,
+        "an admitted caller without knowledge_read",
+    );
+    assert_eq!(uncovered.code, SpokeRejectCode::NotAuthorized);
+    assert!(
+        uncovered.message.contains("knowledge_read"),
+        "the coverage refusal names the capability the caller lacks: {uncovered:?}"
+    );
+    assert!(
+        uncovered.message.contains("spc_4"),
+        "the caller is admitted, so the refusal may name the Mind: {uncovered:?}"
+    );
+    assert_eq!(
+        uncovered
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retry_class"))
+            .and_then(Value::as_str),
+        Some("terminal"),
+        "a coverage gap cannot be retried away: {uncovered:?}"
+    );
+    assert_ne!(
+        uncovered, unadmitted,
+        "an admitted caller short of one capability is not an unadmitted caller"
     );
 }
 

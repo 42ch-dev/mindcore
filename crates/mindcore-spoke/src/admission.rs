@@ -450,10 +450,17 @@ fn refuse_coverage(admission: &Admission<'_>, requirements: &[GrantRequirement<'
     let capability = requirements
         .first()
         .map_or("any", |requirement| requirement.capability);
+    refuse_space_coverage(admission.principal, admission.space.as_str(), capability)
+}
+
+/// The post-admission coverage refusal: the caller holds a live grant in the space, so naming the
+/// capability it lacks and the space it lacks it in discloses nothing a peer could not already
+/// observe through its own grants. Callers that admit first and check coverage second reach this
+/// without an [`Admission`] value to read; [`refuse_coverage`] answers through it, so both paths
+/// speak one message.
+pub(crate) fn refuse_space_coverage(principal: &str, space: &str, capability: &str) -> Reject {
     Reject::not_authorized(format!(
-        "principal {} holds no grant covering {capability} in space {}",
-        admission.principal,
-        admission.space.as_str()
+        "principal {principal} holds no grant covering {capability} in space {space}"
     ))
 }
 
