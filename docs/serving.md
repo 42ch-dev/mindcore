@@ -104,12 +104,15 @@ session is established.
 
 The manifest follows the composed faces:
 
-- `spoke-knowledge` and `ke-ownership` always (the knowledge face applies SPOKE's owner-private
-  disclosure, so a viewpoint-scoped list is truthful).
+- `spoke-knowledge`, `ke-ownership` and `spoke-knowledge-scoped` together when `knowledge` is
+  true, and none of them when it is false — the face is composed only then, and without the marker
+  it could not serve a scoped `get` or `put` at all. The knowledge face applies SPOKE's
+  owner-private disclosure, so a viewpoint-scoped list is truthful.
 - `spoke-judgment` when the deliberation tool is served.
 - `spoke-memory` when a memory service is attached; `spoke-memory-transfer` only when that service
   reports every one of `TRANSFER_OPERATIONS`. A bare `RemoteMemoryService` reports none.
-- `spoke-history` when `history` is true; `spoke-knowledge-adoption` when an adoption source is
+- `spoke-history` when `history` is true, and never otherwise; `history` requires `knowledge`, or
+  assembly refuses before any port exists. `spoke-knowledge-adoption` when an adoption source is
   configured.
 - Tools `recall_context`, `absorb` and `deliberate` under the `mindcore` namespace, plus host tools.
 
