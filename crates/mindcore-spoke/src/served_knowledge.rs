@@ -61,11 +61,15 @@ fn space_wide(capability: &str) -> GrantRequirement<'_> {
 
 /// Require ONE live grant of `principal` in `space` to cover every named `capability`.
 ///
-/// The read runs on the caller's transaction, so the grant a write is authorized on is the grant
-/// its own snapshot holds. Requirements never union: a caller holding `knowledge_write` on one
-/// grant and `knowledge_read` on another is refused. A failed statement answers the fixed storage
-/// text; a missing grant, and a grant that does not cover an operation, answer the one fixed
-/// refusal.
+/// The grant rows are read through the transaction the caller passes, so the decision sees one
+/// committed state of that principal's grants — the one that transaction's snapshot holds. It is
+/// not one atomic step with any later write: whoever calls this and then writes opens the write on
+/// its own transaction, so a revocation or an expiry that commits between the two does not stop
+/// the already-authorized write (the recorded window is store issue `I-000154`, and callers whose
+/// grant must share the write's snapshot pass the write's own transaction). Requirements never
+/// union: a caller holding `knowledge_write` on one grant and `knowledge_read` on another is
+/// refused. A failed statement answers the fixed storage text; a missing grant, and a grant that
+/// does not cover an operation, answer the one fixed refusal.
 pub async fn authorize_knowledge(
     tx: &mut Transaction<'_, Sqlite>,
     principal: &str,
