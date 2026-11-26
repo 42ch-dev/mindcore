@@ -68,12 +68,21 @@
 //! before the caller is answered, so once the fault clears the same `idempotency_key` can be
 //! claimed again and the prune can execute. Leaving the claim behind would be indistinguishable —
 //! to every later caller — from a prune that ran and never settled, and would answer
-//! `RECEIPT_EXPIRED` for the database's lifetime. The caller is still answered
-//! [`outcome_not_settled`]'s uncertain outcome: it was not told the prune succeeded, and nothing
-//! in that answer asserts the prune had no effect. The prune may in fact have committed — the
-//! commit acknowledgement is one of the faults this path covers — so a retry executes against the
-//! current state, which is the same exposure a crash between the commit and the record has always
-//! carried.
+//! `RECEIPT_EXPIRED` for the database's lifetime. The same release runs when the outcome read after
+//! the claim insert fails: that call made the claim itself, and keeping it would spend the key on a
+//! statement that never ran.
+//!
+//! The release is **best-effort**, and the recovery that follows it is conditional on its success.
+//! It is a `DELETE` against the same database that just faulted, so it can fail for the same
+//! reasons; when it does, the claim survives and the key answers `RECEIPT_EXPIRED` on every later
+//! retry, exactly as a claim left by a dead serve loop does. Nothing is lost by that fallback: the
+//! caller was already told the outcome is unknown, so the surviving claim contradicts nothing.
+//!
+//! The caller is answered [`outcome_not_settled`]'s uncertain outcome whether or not the release
+//! succeeds: it was not told the prune succeeded, and nothing in that answer asserts the prune had
+//! no effect. The prune may in fact have committed — the commit acknowledgement is one of the
+//! faults this path covers — so a retry that does execute runs against the current state, which is
+//! the same exposure a crash between the commit and the record has always carried.
 
 use std::io::Write;
 
@@ -194,12 +203,36 @@ fn outcome_not_settled(diagnostic: impl std::fmt::Display) -> ! {
 /// releases its own.
 pub(crate) struct SqliteHistoryDedupStore {
     pool: SqlitePool,
+    /// Test-only: fail the outcome read that follows the claim insert. SQLite cannot express a
+    /// fault that breaks a `SELECT` on a writable table — every construct that poisons the read
+    /// also poisons the insert or the guarded delete — so the seam is explicit here rather than a
+    /// fixture that would pass without exercising the path.
+    #[cfg(test)]
+    fault_after_claim: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SqliteHistoryDedupStore {
     /// No namespace: the admitted Mind names it, and the registry resolves it on every call.
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            fault_after_claim: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Test-only: make the outcome read that follows the claim insert fail.
+    #[cfg(test)]
+    fn fail_the_read_after_the_claim(&self) {
+        self.fault_after_claim
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: clear the seam, as a fault clearing would.
+    #[cfg(test)]
+    fn read_is_healthy_again(&self) {
+        self.fault_after_claim
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Drop the claim `lookup` inserted, so the key is claimable again and a retry can execute.
@@ -256,6 +289,37 @@ impl SqliteHistoryDedupStore {
         }
     }
 
+    /// The read that follows the claim insert: the row's digest and outcome, `None` when the key
+    /// has no row at all.
+    ///
+    /// Split out only so the test seam can fail this statement without touching the claim that
+    /// precedes it — see the struct's `fault_after_claim`. The production body is the one query the
+    /// comment on the claim already describes.
+    async fn outcome_read(
+        &self,
+        namespace: &str,
+        key: &str,
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+        #[cfg(test)]
+        if self
+            .fault_after_claim
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(sqlx::Error::Protocol(
+                "test seam: the outcome read failed after the claim".to_string(),
+            ));
+        }
+        sqlx::query_as(
+            "SELECT payload_digest, outcome_json FROM history_dedup \
+             WHERE namespace = ? AND key = ?",
+        )
+        .bind(namespace)
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await
+    }
+
     /// The namespace a release needs, resolved without the fault branch: a key naming no Mind has
     /// no row to release, and a registry fault here leaves the claim for the retry's own `lookup`
     /// to answer.
@@ -306,17 +370,25 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             Ok(result) => result.rows_affected() == 1,
             Err(error) => return fault("claim", error),
         };
-        let stored: Result<Option<(Option<String>, Option<String>)>, _> = sqlx::query_as(
-            "SELECT payload_digest, outcome_json FROM history_dedup \
-             WHERE namespace = ? AND key = ?",
-        )
-        .bind(&namespace)
-        .bind(key)
-        .fetch_optional(&mut *conn)
-        .await;
+        // The follow-up read. `outcome_read` is where the test seam can make this statement fail
+        // after the claim above has already landed.
+        let stored = self.outcome_read(&namespace, key, &mut conn).await;
         let row = match stored {
             Ok(row) => row,
-            Err(error) => return fault("lookup", error),
+            Err(error) => {
+                // This call inserted the claim a moment ago, so answering `Evicted` here would
+                // spend the key on a statement that never ran: every later retry would read the
+                // claim back as `RECEIPT_EXPIRED`. Release what this call took and keep the key
+                // claimable. Release only when the insert was ours — another caller's row, and a
+                // settled row, are not this call's to remove; the guarded delete enforces both.
+                if claimed {
+                    // The pool holds one connection and this call is holding it: releasing is a
+                    // statement of its own, so the claim's connection goes back first.
+                    drop(conn);
+                    self.release_claim(key).await;
+                }
+                return fault("lookup", error);
+            }
         };
         if claimed {
             return HistoryDedupLookup::Unseen;
@@ -1163,6 +1235,72 @@ mod tests {
             HistoryDedupLookup::Evicted,
             "an unresolvable namespace never answers Unseen or a recorded outcome"
         );
+    }
+
+    /// A read fault **after** the claim insert must not spend the key. `lookup` inserts the claim,
+    /// then reads the row back; when that read cannot run, the call has created a row it will never
+    /// fill, so answering `Evicted` without removing it would answer `RECEIPT_EXPIRED` for the key's
+    /// lifetime. The claim is released and the key is claimable again once the fault clears.
+    ///
+    /// The fault is the struct's test seam, not a database fixture: SQLite cannot express a failure
+    /// that breaks only the follow-up `SELECT` on a writable table (a broken view breaks the claim
+    /// insert and the guarded delete too, which is how an earlier version of this test passed
+    /// without exercising the path at all). The seam sits exactly at the read, so the claim is
+    /// genuinely made and only the read after it fails.
+    #[tokio::test]
+    async fn a_lookup_read_fault_releases_the_claim_it_just_made() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let key = key_for("prn_one", "key-one");
+
+        dedup.fail_the_read_after_the_claim();
+        assert_eq!(
+            dedup.lookup(&key).await,
+            HistoryDedupLookup::Evicted,
+            "a read that cannot run answers Evicted, so the prune is not executed"
+        );
+        assert_eq!(
+            row_count(&store, COLLECTION).await,
+            0,
+            "the claim this call inserted was released, not left to spend the key"
+        );
+
+        // The fault clears: the same key claims fresh and can execute. Without the release this
+        // read answers Evicted forever, because the claim the failed lookup left is still there.
+        dedup.read_is_healthy_again();
+        assert_eq!(
+            dedup.lookup(&key).await,
+            HistoryDedupLookup::Unseen,
+            "the key is claimable again, not spent by a failed read"
+        );
+        let executed = record("digest", SpokeResult::Ok(json!({ "deleted": 1 })));
+        dedup.record(&key, executed.clone()).await;
+        assert_eq!(
+            recorded(dedup.lookup(&key).await, "after the read fault cleared"),
+            executed,
+            "the recovered key settles and replays its own result"
+        );
+    }
+
+    /// The release path never removes a row that carries an outcome. A settled outcome is the key's
+    /// answer; a release is only ever for an unanswered claim.
+    #[tokio::test]
+    async fn a_release_leaves_a_settled_outcome_alone() {
+        let dir = TempDir::new().expect("temporary directory");
+        let (store, dedup) = open(&dir).await;
+        let key = key_for("prn_one", "key-one");
+        dedup.lookup(&key).await;
+        let written = record("digest", SpokeResult::Ok(json!({ "deleted": 3 })));
+        dedup.record(&key, written.clone()).await;
+
+        // The guarded delete is the same statement a release runs; against a settled row it must
+        // match nothing.
+        dedup.release_claim(&key).await;
+        assert_eq!(
+            recorded(dedup.lookup(&key).await, "a release cannot un-settle a key"),
+            written
+        );
+        assert_eq!(row_count(&store, COLLECTION).await, 1);
     }
 
     /// The `record` path a caller reaches with a key that names no Mind writes nothing and does
