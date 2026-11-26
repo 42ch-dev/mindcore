@@ -1,15 +1,16 @@
 # Quick start
 
-This tutorial takes you from an empty directory to a derived `MindState`, using the same code the
-repository's integration test runs. It is a guided path, not a complete API reference.
+This tutorial takes you from an empty directory to a derived `MindState`. The short path is the
+facade — one handle whose operations compose everything below — and the sections after it show
+what it composes, for a host that needs the manual transaction-level control. It is a guided
+path, not a complete API reference.
 
 ## What you will do
 
-1. Open an embedded SQLite store.
-2. Capture a memory and see why it is not recallable yet.
-3. Read and write a scoped knowledge entry.
-4. Derive the current judgment from a cognition carrier.
-5. Run the full first-mind story.
+1. Create a Mind and open its handle.
+2. Capture a memory, review it and recall the settled record.
+3. Write the carrier with one cognition record and read the derived `MindState`.
+4. See the transaction-level assembly the facade performs for you.
 
 ## Prerequisites
 
@@ -17,6 +18,85 @@ repository's integration test runs. It is a guided path, not a complete API refe
 - A system SQLite library the linker can find. The workspace does not enable `sqlx`'s `bundled`
   feature, so `libsqlite3-sys` links against the system library.
 - `sqlite3` CLI and `sqlx-cli` only if you also run the repository checks.
+
+## The facade path: one Mind end to end
+
+The facade is `mindcore_runtime::Mind` — the library's in-process handle over one Mind. You never
+open a transaction, shape a wire request or settle a stage yourself: each method composes the
+operation for you and admits the caller under its live grants. The complete documented example
+is [`crates/mindcore-runtime/examples/mind_facade.rs`](../crates/mindcore-runtime/examples/mind_facade.rs);
+run it from a checkout of this repository:
+
+```sh
+cargo run --offline -p mindcore-runtime --example mind_facade
+```
+
+It prints the recalled record and the derived `MindState`. In order, the example:
+
+1. `create`s a Mind through the registry — the space, the carrier entry, the registry row and the
+   owner's grant row land in one transaction — and opens the handle with `Mind::open`:
+
+```rust
+use mindcore_base::boundary::CallerId;
+use mindcore_runtime::minds::{self, CreateMind};
+use mindcore_runtime::{journal_dir, Mind};
+
+let owner = CallerId::new("caller_wren");
+let created = minds::create(&store, &CreateMind {
+    mind_id: None,
+    display_name: Some("Wren".to_string()),
+    owner: owner.clone(),
+}).await;
+
+let mind = Mind::open(&store, &owner, &created.id).await
+    .with_journal_publisher(journal_dir("journal"));
+```
+
+`open` is one registry read; a Mind the caller cannot see answers the registry's own `NotFound`.
+The journal publisher is the host's input — the facade never invents one — and `journal_dir` is
+the one publisher the crate offers. Before memory writes, the host provisions the subject rows it
+means to write under, exactly as on the served surface; the example shows the minimal seed.
+
+2. Captures a memory and reviews it, in plain arguments:
+
+```rust
+use mindcore_runtime::{Capture, Recall};
+
+let content = serde_json::json!({ "text": "the north gate is shut after dusk" });
+let captured = mind.capture(&Capture {
+    subject: "subj_wren",
+    context: None,
+    content: &content,
+    occurred_at: None,
+    kind_hint: None,
+    idempotency_key: "cap-north-gate",
+}).await;
+```
+
+`capture` takes the caller-named subject — never a default — and `review` answers the settled
+receipt instead of a stage: the fold (staging, publication, settlement) is the handle's. A failed
+publication leaves no record and the same idempotency key can be repeated.
+
+3. Recalls the reviewed record with `mind.recall`, then writes the carrier entry — the one the
+   handle names with `carrier_entry_id()`, never a coordinate you compose — with one cognition
+   record through `knowledge_put`, the single validation boundary, and reads it back with
+   `knowledge_get`. That write is an explicit carrier update, so the last step has a judgment to
+   derive.
+
+4. Reads the Mind's judgment with `mind.cognition_read()`: the carrier's current-view records and
+   the `MindState` derived from them. A fresh carrier answers `None` — a Mind without a judgment
+   is a state, not an error.
+
+`knowledge_list` and `deliberate` sit on the same handle. The facade's `deliberate` takes a
+target and evidence only — no subject — and stamps the Mind's id as the assessment context; the
+full contract is [`facade.md`](../.agents/specs/architecture/facade.md).
+
+## What the facade composes: the transaction level
+
+The rest of this page is the manual path the facade performs for you — adapter calls on
+transactions you own, the wire shapes each takes and the staged settlement of a review. Read it
+to understand what the facade composes, or use it when a host needs control the handle does not
+expose.
 
 ## Add the dependency
 

@@ -1,0 +1,113 @@
+# Architecture: the in-process facade over a Mind
+
+## Scope
+
+The convenience contract of `mindcore_runtime::Mind`, the library's in-process facade over one
+Mind: which operations it offers, what each composes, and what it never does. It excludes the
+wire contract of the served surface (`serving-seam.md`), per-principal serving routing
+(`serving-principal-routing.md`) and the record and storage invariants behind every operation
+(`mind-model.md`).
+
+## Current state
+
+### The handle
+
+`Mind::open(store, caller, mind_id)` is one registry read — `minds::get` under the caller's live
+grants — and a Mind the caller cannot see answers the registry's own `NotFound`. The handle keeps
+the row that read answers — the id, the knowledge collection, the carrier entry id — and nothing
+about grants: it caches no grant and acts on no status from the row, so a frozen Mind opens and
+every later operation re-reads the live state on its own transaction. The handle is not a grant:
+it confers no access beyond what the caller's live grants admit on every operation.
+
+Two inputs are the host's and the handle never invents them, as on the served surface: the journal
+publisher `review` settles through, supplied with `with_journal_publisher` (`journal_dir(root)` is
+the one publisher the crate offers), and the providers `deliberate` reasons with, supplied with
+`with_providers`. `review` without a publisher and `deliberate` without a reasoner are refused
+with the binding's and the workflow's own refusals.
+
+### The operations
+
+| Operation | Composes | Transaction | Grants re-checked |
+|---|---|---|---|
+| `capture(&Capture)` | the memory adapter's `capture` with the Mind's id as `space_id` | one `BEGIN IMMEDIATE`, committed | the adapter's own, over the caller-named subject and placement |
+| `review(candidate_id, decision, key)` | `get_candidate`, then `review_candidate` staged in one `BEGIN IMMEDIATE`; the staged intent read on it; publication before the staging commits; `settle_journal` on a second transaction | the fold below | the adapter's own: `review` and `records_write` over the candidate |
+| `recall(&Recall)` | the memory adapter's `recall` | one read transaction, rolled back | the adapter's own, over the caller-named selection |
+| `knowledge_get(entry_id, revision)` | `read_entry`, or `read_entry_at_revision` when a revision is named, on the row's collection | one read transaction, rolled back | space-wide `knowledge_read` |
+| `knowledge_put(entry, expected)` | `write_entry` — the one cognition validation boundary — on the row's collection | one `BEGIN IMMEDIATE`, committed | space-wide `knowledge_write` |
+| `knowledge_list()` | `list_entries_in` on the row's collection | one read transaction, rolled back | space-wide `knowledge_read` |
+| `cognition_read()` | `MemoryAdapter::read_cognition`: the carrier read and the derivation, nothing persisted | one read transaction, rolled back | space-wide `knowledge_read` |
+| `deliberate(&Deliberation)` | `SpiMindWorkflows::deliberate` with no subject, the row's carrier as holder and the Mind's id as assessment context | the workflow's own | space-wide `recall`, with the space-level withhold |
+
+No operation accepts a collection, an `owner` or a `viewpoint` from the caller. `Capture.subject`
+and `Recall.subject` are the caller's and are never defaulted; `review` reads its subject from the
+candidate's row. No step returns a facade-invented refusal: each is the registry's, the store's or
+the adapter's own code, and a revision below an entry's floor answers the store's
+`HistoryTruncated` and a moved revision its `StoredRevisionStale`.
+
+### The `review` fold
+
+`review` answers the settled receipt, not a stage. Inside one `BEGIN IMMEDIATE` it stages the whole
+decision through `review_candidate`, reads the staged intent on the same transaction and publishes
+the owed targets **before the staging is durable**: a refused publication rolls everything back —
+no record row, no intent, a pending candidate — and the same idempotency key can be repeated, with
+the publisher's own `SpiError::Settlement` refusal traveling unchanged. Only after a successful
+publication does the staging commit; settlement then runs on a second transaction, and any failure
+from there answers `OUTCOME_UNCERTAIN` because durable work may be outstanding. A receipt already
+settled is replayed as it is. The ordering differs from the served surface deliberately: the served
+caller holds the receipt protocol that resolves `OUTCOME_UNCERTAIN` over a staged record; the
+facade's caller does not, so a failed publication leaves no record to resolve. The cost is an
+orphan published file when the process dies between publication and the staging commit.
+
+### `deliberate` without a subject
+
+The facade's `deliberate` names a target and evidence only; it takes no `subject_id` and never
+chooses one. The request carries no subject, so the snapshot serves no memory page — a verdict can
+cite evidence and existing cognition records only, and a `record_ids` entry naming a memory record
+is refused as not visible — and the two checks the subject-level path runs over the subject run
+over the whole space instead: a space-wide live `recall` grant is required, and any unsettled
+intent in the space withholds the commit, whichever subject it belongs to. The record it settles
+stamps the Mind's id as `assessment_context.context_id`. The served `deliberate`, which still
+carries `subject_id`, takes the subject-level path unchanged.
+
+`create`, `list` and `get` remain the only registry entry points. The facade adds no write path
+and moves no validation point: every write still goes through the existing adapter/repository
+boundary, and the cognition module keeps its single persistence validation inside `write_entry`.
+
+### `cognition_read`
+
+The carrier is read on the handle's collection and derived; nothing is persisted. A carrier that
+holds no current-view record yet — every Mind until its first judgment — answers `None`, not a
+refusal: a Mind without a judgment is a state, not an error. After one record, the read answers
+the carrier's current-view records and the derived `MindState` named by the Mind's id.
+
+## Non-goals
+
+- The served surface and its many-Mind routing; the wire contract is unchanged — no operation is
+  added, removed or renamed and no argument changes.
+- The native binding, which will wrap this facade; the daemon; any release before SPOKE 0.19.0.
+- Space-level capabilities as a public facade surface; they stay available through the existing
+  APIs.
+- A second write path, a moved validation point, or any grant widening.
+- Subject defaulting: no facade operation chooses a subject for the caller.
+- Host provisioning: subject registration, grant administration beyond the `create` row, the
+  journal publisher and the model providers are the embedding host's, as on the served surface.
+
+## Invariants
+
+- `open` is the registry's read and nothing more: the handle caches no grant and acts on no status
+  from the row.
+- Every operation opens its own transaction and admits the caller under its live grants on it
+  before reading or writing.
+- A failed publication leaves no record, no intent and a pending candidate; a failure after a
+  durable staging answers `OUTCOME_UNCERTAIN`.
+- No facade operation accepts or derives a caller-supplied collection, owner or viewpoint.
+- A subjectless `deliberate` settles only on space-level admission and writes its record with the
+  Mind's id as the assessment context.
+
+## Where it lives
+
+- `crates/mindcore-runtime/src/mind.rs` — the handle, its operations and the `review` fold.
+- `crates/mindcore-runtime/src/journal.rs` — `journal_dir`, the crate's one journal publisher.
+- `crates/mindcore-runtime/examples/mind_facade.rs` — the documented end-to-end example:
+  `cargo run --offline -p mindcore-runtime --example mind_facade`.
+- Tests: `crates/mindcore-runtime/tests/mind.rs`.
