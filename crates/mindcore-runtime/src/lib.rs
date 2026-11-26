@@ -49,6 +49,18 @@ const TOOLS_NAMESPACE: &str = "mindcore";
 /// under it.
 const RETIRED_ADOPT_TOOL: &str = "tools.mindcore.adopt";
 
+/// The tool ids the runtime reserves: the four it registers itself, plus the retired adoption
+/// tool. A host registration carrying one is dropped, so no host can advertise or install
+/// anything the runtime serves, or anything under the id a retired tool once answered. Host
+/// tools keep every other id, inside the namespace and out.
+const RESERVED_TOOLS: [&str; 5] = [
+    tools::RECALL_CONTEXT,
+    tools::ABSORB,
+    tools::DELIBERATE,
+    tools::READ_COGNITION,
+    RETIRED_ADOPT_TOOL,
+];
+
 /// The Mindcore serving side over one host store.
 ///
 /// The workflow engine runs on the same pool the host's store serves, so a tool call and a
@@ -111,7 +123,7 @@ impl MindcoreServe {
             faces
                 .tools
                 .into_iter()
-                .filter(|tool| tool.descriptor.capability_id.as_str() != RETIRED_ADOPT_TOOL),
+                .filter(|tool| !RESERVED_TOOLS.contains(&tool.descriptor.capability_id.as_str())),
         );
         let manifest = match derive_manifest(faces.manifest, faces.memory.as_deref(), &tools) {
             SpokeResult::Ok(manifest) => manifest,
@@ -170,7 +182,9 @@ pub struct ServeFaces {
     /// Providers and the domain lens injected into each workflow call.
     pub providers: MindProviders,
     /// Additional host tools: every descriptor is advertised and its handler installed, except
-    /// the retired `tools.mindcore.adopt` on every surface.
+    /// registrations carrying one of the runtime's reserved tool ids — the four tools the
+    /// runtime registers itself and the retired `tools.mindcore.adopt` — which are dropped on
+    /// every surface.
     pub tools: Vec<ToolRegistration>,
 }
 

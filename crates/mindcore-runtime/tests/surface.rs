@@ -223,47 +223,55 @@ async fn manifest_follows_the_composed_faces() {
     );
 }
 
-/// The retired adoption id is the runtime's: a host registration of `tools.mindcore.adopt` is
-/// dropped, so it appears in neither `capabilities` nor `tools`.
+/// Every reserved id is the runtime's: a host registration borrowing one of the four served
+/// tool ids, or the retired adoption id, is dropped, so it appears in neither `capabilities`
+/// nor `tools` and the runtime's own registrations stand.
 #[tokio::test]
-async fn a_host_registration_cannot_shadow_the_adoption_tool() {
+async fn a_host_registration_cannot_shadow_a_runtime_tool() {
     let serve = Fixture::open().await.serve();
     let surface = expect_ok(
         serve.surface(ServeFaces {
-            tools: vec![shadowing_adoption()],
+            tools: vec![
+                shadowing(RECALL_CONTEXT),
+                shadowing(ABSORB),
+                shadowing(DELIBERATE),
+                shadowing(READ_COGNITION),
+                shadowing(RETIRED_ADOPT),
+            ],
             ..faces(metadata("runtime"))
         }),
         "assemble a surface a host tries to shadow",
     );
 
-    assert!(
-        !capabilities(&surface).contains(&RETIRED_ADOPT),
-        "a host registration supplied the retired id: {:?}",
+    assert_eq!(
+        capabilities(&surface),
+        [
+            CAPABILITY_SPOKE_JUDGMENT,
+            RECALL_CONTEXT,
+            ABSORB,
+            DELIBERATE,
+            READ_COGNITION
+        ],
+        "a host registration supplied a reserved id: {:?}",
         capabilities(&surface)
     );
-    assert!(
-        surface
-            .manifest
-            .tools
-            .iter()
-            .all(|tool| tool.capability_id.as_str() != RETIRED_ADOPT),
-        "the host's retired adoption descriptor is not advertised"
+    let tools: Vec<&str> = surface
+        .manifest
+        .tools
+        .iter()
+        .map(|tool| tool.capability_id.as_str())
+        .collect();
+    assert_eq!(
+        tools,
+        [RECALL_CONTEXT, ABSORB, DELIBERATE, READ_COGNITION],
+        "each runtime tool is advertised once, from the runtime's own registration"
     );
 }
 
-/// A host registration borrowing the retired adoption id: its descriptor would be advertised and
-/// its handler installed if the runtime did not drop it.
-fn shadowing_adoption() -> ToolRegistration {
-    let descriptor: ToolDescriptor = serde_json::from_value(json!({
-        "schema_version": 1,
-        "capability_id": RETIRED_ADOPT,
-        "op": RETIRED_ADOPT,
-        "description": "A host-supplied adoption tool.",
-        "input": { "type": "object" },
-        "output": { "type": "object" },
-    }))
-    .expect("tool descriptor JSON matches the schema");
-    ToolRegistration::new(descriptor, |_responder| {
+/// A host registration borrowing a reserved tool id: its descriptor would be advertised and its
+/// handler installed if the runtime did not drop it.
+fn shadowing(capability_id: &str) -> ToolRegistration {
+    ToolRegistration::new(descriptor(capability_id), |_responder| {
         let handler: ToolHandler = Arc::new(|arguments: Value| {
             Box::pin(
                 async move { spoke_ok(json!({ "adopted_by": "host", "arguments": arguments })) },
