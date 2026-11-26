@@ -426,9 +426,11 @@ fn face_capabilities(memory: Option<&dyn ServedMemory>, knowledge: bool) -> Vec<
     }
     if knowledge {
         // Without the marker a per-Mind face could not serve a scoped `get` or `put` at all.
-        // `ke-ownership` is deliberately not advertised: the admitted scope never carries a
-        // `viewpoint`, so a request naming one can never match it and would be refused after
-        // admission. Advertising the flag would claim a capability this face cannot honour.
+        // `ke-ownership` is deliberately not advertised: the admitted scope always carries
+        // `viewpoint: None`, so a request naming one can never match it. With the flag never
+        // offered, no session can negotiate it, so Connect's ownership conjunct refuses such a
+        // request — wire `op_unsupported` — before admission runs. Advertising the flag would
+        // claim a capability this face cannot honour.
         capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE.to_string());
         capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE_SCOPED.to_string());
     }

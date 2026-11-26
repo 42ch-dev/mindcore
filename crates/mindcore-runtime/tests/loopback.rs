@@ -4393,8 +4393,8 @@ async fn a_scoped_op_without_its_capability_is_the_dispatch_deny() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, principal_admission());
-    // A dialer that claims `spoke-knowledge` alone: the responder advertises all three, so the
-    // negotiated set is exactly this hello's claim.
+    // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
+    // `ke-ownership`, so the negotiated set is exactly this hello's claim.
     let session = connect(&surface, &["spoke-knowledge"]).await;
     let dialer = &*session.adapter;
 
@@ -5192,8 +5192,9 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
         surface.ports.as_scoped_knowledge().is_some(),
         "the face is composed for this ordering test"
     );
-    // A dialer that claims `spoke-knowledge` alone: the responder advertises all three, so the
-    // negotiated set is exactly this hello's claim, and the marker is absent from it.
+    // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
+    // `ke-ownership`, so the negotiated set is exactly this hello's claim, and the marker is
+    // absent from it.
     let (client, session_id) = raw_wire::open_raw_session(&surface, &["spoke-knowledge"]).await;
 
     // 1. A scoped `get` without the negotiated marker: the marker conjunct, not the face.
