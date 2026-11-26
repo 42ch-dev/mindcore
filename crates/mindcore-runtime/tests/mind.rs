@@ -1674,12 +1674,18 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
     disarm.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Cancellation keeps transaction ownership until the started publication ends. The evidence
-/// is a chain of observed states, never a scheduling assumption: the probe of the retry's
-/// contention is the retry's own publisher-entry flag read after the retry has been given its
-/// turn, and the turn is the observer pattern of `JoinHandle::is_finished` on a sentinel task
-/// spawned with it — a task that finishes only after the runtime has polled every task that
-/// was ready before it. The watchdog is disarmed on success.
+/// Cancellation keeps transaction ownership until the started publication ends. The invariant
+/// is tested directly, not through the retry: the pool has exactly one connection, so while
+/// the first publication is parked the connection is free only if the cancelled attempt
+/// released its transaction early — and a witness acquisition observes that directly. The
+/// witness is spawned with a sentinel behind it: the sentinel finishes only after the runtime
+/// has polled every task that was ready before it, so its finished handle is the observed
+/// state that the witness was polled to its acquisition. What the witness then does is the
+/// evidence, observed rather than assumed: it must NOT acquire while the first publication is
+/// parked — a parked flush with a released transaction would hand the witness the connection
+/// and the test would fail naming the premature acquisition — and it MUST acquire once the
+/// first publication has ended, which is when the correct implementation's rollback releases
+/// the connection. The watchdog is disarmed on success.
 #[tokio::test]
 async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     let disarm = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1723,26 +1729,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
             Ok(())
         });
 
-    // The retry handle is opened before the review starts: the store's pool has one
-    // connection, and once the staging transaction holds it nothing — not even a registry read
-    // — can acquire another until the transaction ends. The retry's instrumented publisher
-    // samples the first publication's finish flag *before writing anything*: the sample is
-    // taken the moment the retry enters its flush, so it reads the world as it was before the
-    // retry's own bytes existed.
-    let retry_sample = Arc::new(std::sync::Mutex::new(None::<bool>));
-    let retry_flag = retry_sample.clone();
-    let retry_root_handle = journal_root.clone();
-    let finished_probe = first_finished.clone();
-    let working = {
-        ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
-            // Sample before any write of this flush: the ordering evidence is the state of the
-            // first publication at the moment the retry's publication begins, not after it.
-            *retry_flag.lock().expect("the retry entry lock") =
-                Some(*finished_probe.lock().expect("the finish lock"));
-            journal_dir(&retry_root_handle)(targets)?;
-            Ok(())
-        })
-    };
     let cancelled_id = candidate_id.clone();
     let review = tokio::spawn(async move {
         parked.review(&cancelled_id, &promote(), "rev-cancelled").await
@@ -1756,18 +1742,16 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
     entry.await.expect("the entry signal arrived");
     review.abort();
 
-    // The retry, spawned with a sentinel task behind it. The sentinel finishes only after the
-    // runtime has polled every task that was ready before it — the retry included — so the
-    // sentinel's finished handle is the observed state that the retry was polled to its first
-    // suspension point: the pool acquisition, because the pool's one connection is held by the
-    // cancelled attempt's transaction. `yield_now` inside the loop is a politeness hint to the
-    // scheduler; the loop advances only on the observed state.
-    let retrying = working;
-    let retry = tokio::spawn({
-        let candidate_id = candidate_id.clone();
-        async move {
-            retrying.review(&candidate_id, &promote(), "rev-cancelled").await
-        }
+    // The witness: a bare pool acquisition. The pool has one connection, so it completes
+    // exactly when the connection is free — and the connection is free while the publication
+    // is parked only if the cancelled attempt released its transaction early. The sentinel is
+    // spawned behind it: its finished handle is the observed state that the witness was
+    // polled to its acquisition — the witness can only be waiting on the connection or already
+    // holding it, never merely unscheduled.
+    let witness_pool = store.pool();
+    let witness = tokio::spawn(async move {
+        let connection = witness_pool.acquire().await.expect("the witness acquisition");
+        drop(connection);
     });
     let sentinel = tokio::spawn(async {});
     let mut ticks = 0u32;
@@ -1779,34 +1763,62 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
             "the sentinel never finished — the runtime never polled the spawned tasks"
         );
     }
-    // The retry has now been polled to its pool acquisition — it is contending — and it must
-    // not have entered its publication: the first publication is still parked, and the
-    // cancelled attempt's transaction is still the pool's tenant.
-    assert!(
-        retry_sample
-            .lock()
-            .expect("the retry entry lock")
-            .is_none(),
-        "the retry must not enter its publication while the cancelled attempt's flush is live"
-    );
+    // The witness is provably at its acquisition. Give an early release every chance to hand
+    // it the connection: the rollback after a cancelled attempt runs on sqlx's connection
+    // worker thread, so the observation window spans real thread scheduling — this is the
+    // detection window for a regression, not an ordering proof for the correct behavior, and
+    // its length bounds nothing the fixed implementation depends on.
+    let window = std::time::Instant::now();
+    while window.elapsed() < std::time::Duration::from_millis(500) {
+        assert!(
+            !witness.is_finished(),
+            "the witness acquired the connection while the cancelled attempt's publication was still parked: the transaction was released before the publication ended"
+        );
+        tokio::task::yield_now().await;
+    }
 
-    // Release: the first publication ends, the cancelled attempt's transaction rolls back, and
-    // only then can the retry's staging acquire.
+    // Release the first publication: its flush ends, the finish flag is set, and only then
+    // may the connection become free — the correct implementation's rollback runs after the
+    // blocking task returns the transaction.
     release.send(()).expect("release the publisher");
-    let reviewed = ok(retry.await.expect("the retry task joins"));
-
-    // The ordering evidence: sampled before the retry wrote anything, the first publication's
-    // finish flag was already set — the cancelled attempt's flush ended before the retry's
-    // publication began.
-    assert_eq!(
-        *retry_sample.lock().expect("the retry entry lock"),
-        Some(true),
-        "the retry's publication began only after the cancelled attempt's flush ended"
+    let mut ticks = 0u32;
+    while !witness.is_finished() {
+        tokio::task::yield_now().await;
+        ticks += 1;
+        assert!(
+            ticks < 1_000_000,
+            "the witness never acquired after the publication ended — the connection was never released"
+        );
+    }
+    witness.await.expect("the witness joins");
+    assert!(
+        *first_finished.lock().expect("the finish lock"),
+        "the first publication finished before the connection became free"
     );
+
+    // The end state is clean: the cancelled attempt left nothing behind.
+    assert_eq!(
+        count_records(&store.pool()).await,
+        0,
+        "the cancelled attempt rolled everything back"
+    );
+    assert_eq!(
+        count_intents(&store.pool()).await,
+        0,
+        "no intent survives the cancellation"
+    );
+
+    // And the same key still settles through a fresh attempt — the rollback is complete, not
+    // merely invisible.
+    let working = ok(Mind::open(&store, &owner, &created.id).await)
+        .with_journal_publisher(journal_dir(&journal_root));
+    let reviewed = ok(working
+        .review(&candidate_id, &promote(), "rev-cancelled")
+        .await);
     assert_eq!(
         value_of(&reviewed)["status"],
         "committed",
-        "the same-key retry settles after the cancelled attempt finished"
+        "the same key settles after the cancelled attempt rolled back"
     );
     assert_eq!(
         count_records(&store.pool()).await,
