@@ -8,30 +8,28 @@ How a knowledge entry behaves over time: the history a write leaves behind, the 
 
 ### The served write's grant rule
 
-The guard exists; the face around it does not yet. `mindcore_spoke::MindKnowledgePort` wraps a
-served storage port (`RoutedKnowledgeStore` today) and authorizes each operation on the caller's
-own live grant in the admitted Mind's space before the store is reached, and
-`mindcore_sqlite::bind_caller` / `bound_caller` own the binding's shape: the caller is not a port
-argument, so an admission binds it into the `Scope` it returns, under the `mindcore_caller`
-extensions namespace
-(`.agents/adr/implemented/architecture/2026-11-26-knowledge-caller-in-scope-extensions.md`). These
-are proven directly, by `crates/mindcore-spoke/tests/served_knowledge.rs` driving the port with
-scopes the test binds, and by the binding helpers' own tests.
-
-What does not exist yet is the composition: no served knowledge face is composed on any surface,
-no admission callback writes the binding for a peer, and `port.knowledge.put` is refused on the
-shipped dispatch-deny branch ([`serving-seam.md`](../architecture/serving-seam.md)), so no wire
-request reaches either the guard or the unguarded store. Until layer 2 composes the face, the
-guard is reachable only from tests.
+`mindcore_spoke::MindKnowledgePort` wraps the served storage port (`RoutedKnowledgeStore`) and
+authorizes each operation on the caller's own live grant in the admitted Mind's space before the
+store is reached, and `mindcore_sqlite::bind_caller` / `bound_caller` own the binding's shape: the
+caller is not a port argument, so the admission binds it into the `Scope` it returns, under the
+`mindcore_caller` extensions namespace
+(`.agents/adr/implemented/architecture/2026-11-26-knowledge-caller-in-scope-extensions.md`). The
+face is composed: `ServeFaces.knowledge` installs it on the surface, its admission callback writes
+the binding for every peer it admits, and a wire `port.knowledge.get`, `put` or
+`port.scope.list_knowledge_entries` reaches the guard and then the store
+([`serving-seam.md`](../architecture/serving-seam.md)). Layer 1 proved the port directly, by
+`crates/mindcore-spoke/tests/served_knowledge.rs` driving it with scopes the test binds and by the
+binding helpers' own tests; the composed face proves the same rules over a signed session.
 
 A get and a list require one live grant covering `knowledge_read`; a put requires one grant covering
 both `knowledge_write` and `knowledge_read`, because Connect reads the entry through `get` before it
 writes. So the cognition append below is guarded rather than removed: a caller holding that grant
 appends `modules.cognition.records` exactly as before, and a caller without it is refused before any
-row is written. A scope with no binding, a caller with no live grant and a grant that does not cover
-the operation are one `NOT_AUTHORIZED` with no `details`. The grant read and the store call do not
-share a snapshot, so a grant revoked between them can let one in-flight write through
-(`I-000154`).
+row is written. A put that carries the two capabilities on two separate grants is refused, because
+the requirement never unions across grants. A scope with no binding, a caller with no live grant and
+a grant that does not cover the operation are one `NOT_AUTHORIZED` with no `details`. The grant read
+and the store call do not share a snapshot, so a grant revoked between them can let one in-flight
+write through (`I-000154`).
 
 ### Revision history
 
@@ -181,11 +179,11 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 
 - The served write's guard precedes the store: through `MindKnowledgePort`, a put without one live
   grant covering `knowledge_write` and `knowledge_read` writes no entry, revision or cognition row,
-  and the guard runs on the caller's bound grant, never a request value. The guard is part of the
-  port and is proven by direct tests; no served face composes it yet, so on every shipped surface
-  the knowledge operations are refused before either the guard or the store. Because the grant read
-  and the store write do not share a snapshot, a grant revoked between the two does not stop an
-  already-authorized write (`I-000154`).
+  and the guard runs on the caller's bound grant, never a request value. The composed face installs
+  that port, so every wire put passes the guard before the store, and its covering-grant case still
+  appends `modules.cognition.records` under the same grant. Because the grant read and the store
+  write do not share a snapshot, a grant revoked between the two does not stop an already-authorized
+  write (`I-000154`).
 - History, adoption and retirement share the existing immediate-transaction discipline: the write reservation is taken before claim state is read.
 - Pruning shares that discipline: one `BEGIN IMMEDIATE` reservation covers the entry read, the window computation, the deletes and the floor update. It writes only `history_floor_revision` on the entry row — never the revision — so the capture trigger saves no checkpoint of the prune itself. A retired entry's history is never deleted, and no cognition record or live payload is touched.
 - The disclosure predicate is unchanged: a hidden entry, or a retired one read through the ordinary reads and lists, is one generic local absence. The explicit lifecycle read and revision replay still see a retired entry (§ Retirement). The served face's read and prune denials are `.agents/specs/architecture/serving-seam.md`'s.
@@ -199,14 +197,17 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 - Write path, replay, explicit prune, retirement write, resolution, current-record predicate: `crates/mindcore-sqlite/src/knowledge.rs`, `cognition.rs`.
 - Adoption and the anchor codec: `crates/mindcore-spi/src/adoption.rs`, `crates/mindcore-base/src/knowledge.rs`.
 - The served half — scope comparison, retirement-chain resolution, the one transaction and the
-  refusal hygiene: `crates/mindcore-runtime/src/adoption.rs`; its wire contract is
-  `.agents/specs/architecture/serving-seam.md`.
+  refusal hygiene — lived in the removed `crates/mindcore-runtime/src/adoption.rs`; its wire
+  contract is `.agents/specs/architecture/serving-seam.md`, which states what a restored face must
+  re-implement.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
 - Served write guard and caller binding: `crates/mindcore-spoke/src/served_knowledge.rs`
   (`MindKnowledgePort`, `authorize_knowledge`) and `crates/mindcore-sqlite/src/knowledge.rs`
   (`bind_caller`, `bound_caller`, `validate_admission_scope`); evidence in
-  `crates/mindcore-spoke/tests/served_knowledge.rs`.
-- Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the flag, `HistoryAdmission` and capability in `crates/mindcore-runtime/src/lib.rs`; the prune dedup record in `crates/mindcore-runtime/src/history_dedup.rs`; over-the-wire evidence in `crates/mindcore-runtime/tests/loopback.rs`.
+  `crates/mindcore-spoke/tests/served_knowledge.rs`. The composed face that installs the port, its
+  admission callback and the signed-session evidence are `crates/mindcore-runtime/src/lib.rs`
+  (`MindcoreServe::scoped_knowledge`) and `crates/mindcore-runtime/tests/loopback.rs`.
+- Served history: the `HistoryPort` impl and `RevisionSnapshot` projection in `crates/mindcore-sqlite/src/knowledge.rs`; the family stays uncomposed, so the flag, `HistoryAdmission`, the capability and the prune dedup record named here are `crates/mindcore-runtime/src/lib.rs` and the removed `crates/mindcore-runtime/src/history_dedup.rs`, both restated in `.agents/specs/architecture/serving-seam.md` § History.
 
 ## Served failure messages
 
