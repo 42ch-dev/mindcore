@@ -509,6 +509,7 @@ pub async fn visible_mind_ids(
         "SELECT m.space_id, g.expires_at, g.capabilities_json, g.context_ids_json \
          FROM memory_grants g \
          JOIN minds m ON m.space_id = g.space_id \
+         JOIN memory_spaces s ON s.space_id = g.space_id \
          WHERE g.principal_id = ?1 AND g.revoked_at IS NULL \
          ORDER BY m.space_id, g.grant_id",
     )

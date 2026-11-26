@@ -1062,3 +1062,55 @@ async fn a_good_grant_after_an_undecodable_row_still_lists_the_mind() {
     );
     tx.rollback().await.expect("rollback");
 }
+
+/// List and the point read share one visibility rule: a registry row whose space row is missing
+/// is invisible to `minds.list`, `minds.get` and the served list's id read alike, so the two
+/// reads never disagree about a Mind's existence. The write path creates the space row with the
+/// Mind and the store never deletes one, so reaching the state takes raw SQL — the FK is
+/// disabled on one connection only to drop the row by hand.
+#[tokio::test]
+async fn a_mind_without_its_space_row_is_invisible_to_every_visibility_read() {
+    let temp = tempfile::tempdir().expect("private temporary root");
+    let path = temp.path().join("mindcore.db");
+    let store = open_store(&path).await;
+    let pool = store.pool();
+    let caller = CallerId::new("caller_wren");
+    ok(store
+        .create_mind(&request(Some("wren"), "caller_wren"))
+        .await);
+
+    {
+        let mut conn = pool.acquire().await.expect("acquire a connection");
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .expect("disable the foreign keys");
+        sqlx::query("DELETE FROM memory_spaces WHERE space_id = 'wren'")
+            .execute(&mut *conn)
+            .await
+            .expect("drop the space row");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .expect("restore the foreign keys");
+    }
+
+    let listed = ok(store.list_minds(&caller).await);
+    assert!(
+        listed.is_empty(),
+        "a Mind whose space row is gone does not list"
+    );
+    let unseen = reject(store.get_mind(&caller, &MindId::new("wren")).await);
+    assert_eq!(
+        unseen.code,
+        SpokeRejectCode::NotFound,
+        "the point read applies the same join"
+    );
+
+    let mut tx = pool_begin(&store).await;
+    assert!(
+        ok(mindcore_sqlite::minds::visible_mind_ids(&mut tx, "caller_wren").await).is_empty(),
+        "the served list's id read applies the same join"
+    );
+    tx.rollback().await.expect("rollback");
+}
