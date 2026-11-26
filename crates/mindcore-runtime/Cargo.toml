@@ -23,6 +23,8 @@ sqlx.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+base64 = "0.22"
 ed25519-dalek = "3"
+serde_jcs = "0.3"
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

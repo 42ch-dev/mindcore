@@ -885,6 +885,60 @@ fn assert_caller_absent_for(
     }
 }
 
+/// Assert that exactly one request envelope the dialer sent carries `scope` at the op's payload
+/// path, that its `extensions.mindcore_caller.principal` is `principal`, and return the frames so
+/// the caller can keep them for a later failure message.
+///
+/// Read from the request bytes rather than from the typed call: a dialer that stopped copying
+/// `scope.extensions` onto its payload would send a scope without the forged namespace, and the
+/// store-side refusal would then prove nothing about Connect's merge.
+fn assert_sent_forgery(frames: &[String], op: &str, entry: &str, principal: &str) {
+    let request = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<Value>(frame).ok())
+        .find(|frame| frame.get("op").and_then(Value::as_str) == Some(op))
+        .unwrap_or_else(|| panic!("{op} reached the wire: {frames:?}"));
+    if !entry.is_empty() {
+        assert_eq!(
+            request
+                .pointer("/payload/entry_id")
+                .or_else(|| request.pointer("/payload/entry/entry_id"))
+                .and_then(Value::as_str),
+            Some(entry),
+            "{op} carried the entry: {request}"
+        );
+    }
+    assert_eq!(
+        request
+            .pointer("/payload/scope/extensions/mindcore_caller/principal")
+            .and_then(Value::as_str),
+        Some(principal),
+        "{op} carried the forged caller at the scope path: {request}"
+    );
+    assert_eq!(
+        request
+            .pointer("/payload/scope/scope_id")
+            .and_then(Value::as_str),
+        Some(SPACE),
+        "{op} named the admitted Mind, not the forged caller: {request}"
+    );
+}
+
+/// The host admission for the raw-wire sessions: `raw_wire`'s own dialer key, mapped to the
+/// fixture's principal. The admission decides the peer, so a raw handshake with any other key is
+/// refused before the gates this suite asserts.
+fn raw_wire_admission() -> MemoryAdmission {
+    let peer_id = raw_wire::dialer_peer_id();
+    Arc::new(move |peer: &str| match peer == peer_id {
+        true => spoke_ok(principal()),
+        false => spoke_reject(
+            SpokeRejectCode::NotAuthorized,
+            format!("peer {peer} holds no workflow admission"),
+            None,
+        ),
+    })
+}
+
 /// Establish a real signed loopback session over `surface`, the dialer claiming exactly
 /// `dialer_capabilities` in its hello. Handlers are installed before the dialer connects.
 async fn connect(surface: &MindcoreSurface, dialer_capabilities: &[&str]) -> Session {
@@ -4558,34 +4612,39 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
 
     let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let forger = &*reader.adapter;
-    reader.wire.drain_sent();
 
-    // The reads are served on R's own `knowledge_read`, not on W's wider grant.
+    // Each operation is proven on both sides: the request bytes carry the forgery at the scope
+    // path, and the answer is decided by R's own grant. A dialer that stripped `scope.extensions`
+    // on any one of the three paths would fail its own assertion here and make the test vacuous,
+    // so the wire read is per operation, not once for the suite.
+    reader.wire.drain_sent();
     let listed = expect_ok(
         KnowledgeQueryPort::list_knowledge_entries(forger, &request_scope(SPACE, forgery.clone()))
             .await,
         "a list carrying a forged caller namespace",
     );
-    // The forgery is on the wire, so the merge that drops it is what protects the caller. A dialer
-    // that stopped carrying `scope.extensions` would make this test vacuous, and that is a STOP.
-    let sent = reader.wire.drain_sent();
-    assert!(
-        sent.iter()
-            .any(|frame| frame.contains("mindcore_caller") && frame.contains(PRINCIPAL)),
-        "the forged namespace reached the wire: {sent:?}"
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.scope.list_knowledge_entries",
+        "",
+        PRINCIPAL,
     );
     assert!(
         listed.iter().any(|entry| entry.entry_id == CARRIER),
         "the read serves on the forger's own grant"
     );
+
+    reader.wire.drain_sent();
     expect_ok(
         forger
             .get_knowledge_entry_in_scope(CARRIER, Some(&request_scope(SPACE, forgery.clone())))
             .await,
         "a get carrying a forged caller namespace",
     );
+    assert_sent_forgery(&reader.wire.drain_sent(), "port.knowledge.get", CARRIER, PRINCIPAL);
 
     // The put is refused by R's own grant: the forged namespace bought no capability.
+    reader.wire.drain_sent();
     assert_scope_refusal(
         forger
             .put_knowledge_entry_in_scope(
@@ -4595,6 +4654,12 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
             )
             .await,
         "a put carrying a forged caller namespace",
+    );
+    assert_sent_forgery(
+        &reader.wire.drain_sent(),
+        "port.knowledge.put",
+        "ke_forged",
+        PRINCIPAL,
     );
     let forged_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
@@ -4808,5 +4873,283 @@ async fn no_wire_response_carries_the_caller() {
         &principals,
         "the reader's unadmitted-Mind answer",
         ExpectsReceipt::No,
+    );
+}
+
+// ---------- The pinned gate order, on the wire ----------
+
+/// The gate order lives in the responder, not in the typed dialer: `RemoteAdapter` refuses a
+/// scoped `get`/`put` locally when the session did not negotiate the marker, so it can never
+/// reach the responder's `op_unsupported` branch or its shape-first `INVALID_INPUT`. These helpers
+/// drive the wire directly — a signed hello, the session snapshot, then hand-built invoke
+/// envelopes — so the ordering is proven where it actually runs.
+mod raw_wire {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{json, Value};
+
+    use mindcore_runtime::MindcoreSurface;
+    use spoke_connect::core::{derive_peer_id_from_ed25519_pubkey, sign_hello_ed25519};
+    use spoke_connect::remote::{
+        connect_responder, loopback_transport_pair, ConnectResponderOptions, LoopbackTransport,
+        RemoteIdentity, Transport,
+    };
+    use spoke_schemas::connect_hello::HostCapabilityManifest as HelloManifest;
+    use spoke_schemas::{ConnectHello, ConnectSession, HostCapabilityManifest};
+
+    /// The dialer's key: this module's own, so the session it opens is one the fixture's host
+    /// admission is told to admit.
+    pub(super) const DIALER_SEED: [u8; 32] = [0x11u8; 32];
+    const RESPONDER_SEED: [u8; 32] = [0x77u8; 32];
+
+    pub(super) fn dialer_peer_id() -> String {
+        derive_peer_id_from_ed25519_pubkey(&SigningKey::from_bytes(&DIALER_SEED).verifying_key().to_bytes())
+    }
+
+    /// Start a responder over `surface` WITHOUT dialing, and open a raw session against it: a
+    /// signed initiator hello, the responder hello, the signed session snapshot. Returns the
+    /// client end and the session id every invoke envelope must name.
+    pub(super) async fn open_raw_session(
+        surface: &MindcoreSurface,
+        dialer_capabilities: &[&str],
+    ) -> (Arc<LoopbackTransport>, String) {
+        let pair = loopback_transport_pair();
+        let dialer = dialer_peer_id();
+        let responder_pubkey =
+            SigningKey::from_bytes(&RESPONDER_SEED).verifying_key().to_bytes();
+        let responder = connect_responder(ConnectResponderOptions {
+            transport: Arc::new(pair.server),
+            identity: RemoteIdentity {
+                seed: RESPONDER_SEED,
+            },
+            manifest: surface.manifest.clone(),
+            allowlist: vec![dialer.clone()],
+            peer_keys: HashMap::from([(
+                dialer,
+                SigningKey::from_bytes(&DIALER_SEED)
+                    .verifying_key()
+                    .to_bytes(),
+            )]),
+            ports: Some(Arc::clone(&surface.ports)),
+            invoke_timeout_ms: Some(10_000),
+        })
+        .await;
+        assert!(
+            matches!(
+                surface.register(&responder),
+                spoke_operations::SpokeResult::Ok(())
+            ),
+            "install the served handlers"
+        );
+
+        let manifest: HostCapabilityManifest = serde_json::from_value(json!({
+            "schema_version": 1,
+            "host_id": "raw-dialer",
+            "roles": ["data-store"],
+            "capabilities": dialer_capabilities,
+            "namespaces": ["toy_world"],
+            "extensions": {},
+        }))
+        .expect("the dialer manifest matches the schema");
+        let hello_manifest: HelloManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).expect("manifest serializes"))
+                .expect("the hello manifest is field-identical");
+        let hello = sign_hello_ed25519(&DIALER_SEED, "raw-gate-nonce-0000", &hello_manifest, None)
+            .expect("sign the initiator hello");
+        pair.client
+            .send(&serde_json::to_vec(&hello).expect("hello bytes"))
+            .await
+            .expect("send the hello");
+        let _responder_hello: ConnectHello =
+            serde_json::from_slice(&pair.client.recv().await.expect("responder hello"))
+                .expect("decode the responder hello");
+        let session: ConnectSession =
+            serde_json::from_slice(&pair.client.recv().await.expect("session snapshot"))
+                .expect("decode the session snapshot");
+        assert_eq!(
+            session.initiator_peer_id.as_ref() as &str,
+            dialer_peer_id().as_str(),
+            "the responder bound the session to the dialer"
+        );
+        let _ = responder_pubkey;
+        (Arc::new(pair.client), session.session_id.to_string())
+    }
+
+    /// One signed invoke envelope, built the way the contract's 5-field signed object says: the
+    /// JCS bytes of `session_id`/`sequence`/`request_id`/`op`/`payload`, never `extensions`.
+    pub(super) async fn invoke(
+        client: &LoopbackTransport,
+        session_id: &str,
+        sequence: i64,
+        op: &str,
+        payload: Value,
+    ) -> Value {
+        let signed = json!({
+            "session_id": session_id,
+            "sequence": sequence,
+            "request_id": format!("raw-{op}-{sequence}"),
+            "op": op,
+            "payload": payload,
+        });
+        let jcs = serde_jcs::to_vec(&signed).expect("the signed object JCS-canonicalizes");
+        let signature = SigningKey::from_bytes(&DIALER_SEED).sign(&jcs);
+        let mut wire = signed.as_object().expect("signed object").clone();
+        wire.insert("extensions".into(), json!({}));
+        wire.insert(
+            "signature".into(),
+            json!(URL_SAFE_NO_PAD.encode(signature.to_bytes())),
+        );
+        client
+            .send(&serde_json::to_vec(&Value::Object(wire)).expect("invoke bytes"))
+            .await
+            .expect("send the invoke");
+        serde_json::from_slice(&client.recv().await.expect("invoke answer")).expect("decode")
+    }
+}
+
+/// The responder's own gate order, driven on the wire. A scoped `get` and a scoped `put` on a
+/// session that never negotiated `spoke-knowledge-scoped` answer the wire `op_unsupported` deny
+/// before the face is probed, and a malformed `scope` answers `INVALID_INPUT` before that marker
+/// conjunct — the shape first, then the marker, then the face.
+///
+/// The typed dialer cannot reach any of these: it refuses a declared scope locally, and it cannot
+/// serialize a `Scope` that is malformed. Only raw envelopes exercise the responder's branches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() {
+    let fixture = Fixture::open().await;
+    let pool = fixture.store.pool();
+    fixture
+        .grant("grt_reader_raw", PRINCIPAL, &["knowledge_read"])
+        .await;
+    let (_dir, serve) = fixture.serve();
+    // The face is composed, so a request that passes the gates would be served: the denials below
+    // are the gates and not a missing face.
+    let surface = knowledge_surface(&serve, raw_wire_admission());
+    assert!(
+        surface.ports.as_scoped_knowledge().is_some(),
+        "the face is composed for this ordering test"
+    );
+    // A dialer that claims `spoke-knowledge` alone: the responder advertises all three, so the
+    // negotiated set is exactly this hello's claim, and the marker is absent from it.
+    let (client, session_id) = raw_wire::open_raw_session(&surface, &["spoke-knowledge"]).await;
+
+    // 1. A scoped `get` without the negotiated marker: the marker conjunct, not the face.
+    let denied_get = raw_wire::invoke(
+        &client,
+        &session_id,
+        0,
+        "port.knowledge.get",
+        json!({
+            "entry_id": "ke_absent",
+            "scope": { "scope_id": SPACE },
+        }),
+    )
+    .await;
+    let code = denied_get
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .expect("the answer is an error envelope");
+    assert_eq!(
+        code, "op_unsupported",
+        "a declared scope without the marker is the wire deny, before any face call: {denied_get}"
+    );
+    let message = denied_get
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .expect("the deny carries a message");
+    assert!(
+        message.contains("spoke-knowledge-scoped"),
+        "the marker conjunct answered: {message}"
+    );
+
+    // 2. A scoped `put` on the same session: the same conjunct, so a peer cannot smuggle a write
+    //    scope past a peer that would silently drop it.
+    let denied_put = raw_wire::invoke(
+        &client,
+        &session_id,
+        1,
+        "port.knowledge.put",
+        json!({
+            "entry": served_entry("ke_raw_refused", "must not be written"),
+            "expected_base_revision": null,
+            "scope": { "scope_id": SPACE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        denied_put
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("op_unsupported"),
+        "a scoped put without the marker is the wire deny: {denied_put}"
+    );
+
+    // 3. A malformed `scope` (a present JSON `null` cognition subtree is shape, not selection)
+    //    answers `INVALID_INPUT` — before the marker conjunct would have answered.
+    let malformed = raw_wire::invoke(
+        &client,
+        &session_id,
+        2,
+        "port.knowledge.get",
+        json!({
+            "entry_id": "ke_absent",
+            "scope": { "scope_id": SPACE, "cognition": Value::Null },
+        }),
+    )
+    .await;
+    assert_eq!(
+        malformed
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("INVALID_INPUT"),
+        "the shape gate answers before the marker conjunct: {malformed}"
+    );
+
+    // 4. Nothing above reached the store: the forged-entry ids were never written.
+    for entry_id in ["ke_raw_refused"] {
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
+        )
+        .bind(COLLECTION)
+        .bind(entry_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count the refused entry");
+        assert_eq!(rows, 0, "{entry_id} was never written by a refused op");
+    }
+}
+
+/// A scoped op WITH the marker negotiated reaches the face, so the denials above are the gates:
+/// the same request that answered `op_unsupported` at step 1 is served once the session negotiates
+/// `spoke-knowledge-scoped`. This is the negative control that keeps the ordering test honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
+    let fixture = Fixture::open().await;
+    let (_dir, serve) = fixture.serve();
+    let surface = knowledge_surface(&serve, raw_wire_admission());
+    let (client, session_id) =
+        raw_wire::open_raw_session(&surface, &KNOWLEDGE_CAPABILITIES).await;
+
+    let served = raw_wire::invoke(
+        &client,
+        &session_id,
+        0,
+        "port.knowledge.get",
+        json!({
+            "entry_id": CARRIER,
+            "scope": { "scope_id": SPACE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        served
+            .pointer("/payload/entry_id")
+            .and_then(Value::as_str),
+        Some(CARRIER),
+        "with the marker the same request is served: {served}"
     );
 }
