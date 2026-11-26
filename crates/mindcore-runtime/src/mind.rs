@@ -32,7 +32,9 @@ use mindcore_sqlite::{
     list_entries_in, read_entry, read_entry_at_revision, write_entry, MindStore,
     SqliteMemoryRepository,
 };
-use spoke_operations::{SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    knowledge_entry_visible_to_viewpoint, SpokeReject, SpokeRejectCode, SpokeResult,
+};
 use spoke_schemas::data::cognition::{CognitionReference, CognitionTarget};
 use spoke_schemas::memory_candidates_review_request::Decision;
 use spoke_schemas::{
@@ -745,7 +747,9 @@ impl Mind {
     /// authorizes exactly the Mind that is read. A fresh carrier answers `None`; after one
     /// record, the judgment's records and the derived `MindState`. The record list is the one
     /// `derive_mind_state` already owns: the validated view is the single extraction, projected
-    /// once into the wire state and moved into the answer.
+    /// once into the wire state and moved into the answer. The recall knowledge slot's
+    /// disclosure predicate applies here too, viewpoint-free: an `owner`-private carrier answers
+    /// the fresh-carrier `None`, and no derivation runs on its records.
     pub async fn cognition_read(&self) -> SpokeResult<Option<Cognition>> {
         let mut transaction = match self.pool.begin().await {
             Ok(transaction) => transaction,
@@ -795,6 +799,13 @@ impl Mind {
                 )
             }
         };
+        // The knowledge slot's disclosure predicate, viewpoint-free: the `knowledge_read`
+        // coverage above stays first, but a carrier it hides — an `owner`-private one — answers
+        // the fresh-carrier `None`, and no derivation runs on its records. The served adapter
+        // read applies the same rule to the same carrier.
+        if !knowledge_entry_visible_to_viewpoint(&carrier, None) {
+            return SpokeResult::Ok(None);
+        }
         let view = match mindcore_base::cognition::derive_mind_state(&carrier) {
             Ok(view) => view,
             Err(mindcore_base::cognition::MindError::NoRecords) => return SpokeResult::Ok(None),

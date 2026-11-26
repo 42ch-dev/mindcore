@@ -1179,6 +1179,97 @@ async fn cognition_read_answers_none_then_the_judgment_and_mind_state() {
     );
 }
 
+/// The facade's read applies the knowledge slot's disclosure predicate, viewpoint-free — the
+/// same rule the served adapter read applies to the same carrier: an `owner`-private carrier
+/// with a stored judgment answers the fresh-carrier `None`, and once the carrier is
+/// space-visible the same caller reads the judgment and its derived `MindState`.
+#[tokio::test]
+async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_peer() {
+    let (_dir, store) = fixture().await;
+    let owner = CallerId::new(OWNER);
+    let created = ok(minds::create(&store, &request(OWNER)).await);
+    let handle = ok(Mind::open(&store, &owner, &created.id).await);
+
+    let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
+    let revision = carrier.revision.expect("a stored carrier has a revision");
+    let record = json!({
+        "kind": "belief",
+        "order": 1,
+        "record_id": "cog_hidden",
+        "holder": {
+            "kind": "knowledge_entry",
+            "namespace": "mindcore",
+            "id": created.carrier_entry_id,
+        },
+        "target": {
+            "carrier": {
+                "kind": "knowledge_entry",
+                "namespace": "mindcore",
+                "id": created.carrier_entry_id,
+            },
+            "target_id": "prop_north_gate",
+            "kind": "proposition",
+        },
+        "assessor": {
+            "kind": "principal",
+            "namespace": "mindcore",
+            "id": OWNER,
+        },
+        "assessor_role": "holder_self_report",
+        "basis": {
+            "kind": "evidence",
+            "evidence": [{ "kind": "memory_record", "namespace": "mindcore", "id": "rec_gate" }],
+        },
+        "assessment_context": { "context_id": created.id.as_str() },
+        "assessed_at": "2026-11-20T09:00:00Z",
+        "effective_at": "2026-11-20T09:00:00Z",
+        "view": "current",
+        "q": {
+            "value": 0.8,
+            "assertion": "belief_attribution",
+            "method": "two_witness_reports",
+            "calibration": "uncalibrated",
+        },
+        "extensions": {},
+    });
+    let judged = mindcore_base::cognition::append_cognition_record(&carrier, record)
+        .expect("one valid record appends to the carrier");
+
+    // Mark the judging carrier `owner`-private through the same knowledge write path.
+    let mut payload = serde_json::to_value(&judged).expect("the carrier serializes");
+    payload["disclosure"] = json!("owner-private");
+    payload["owner"] = json!(OWNER);
+    let private: KnowledgeEntry = serde_json::from_value(payload).expect("the carrier decodes");
+    ok(handle.knowledge_put(private, Some(revision)).await);
+
+    assert!(
+        ok(handle.cognition_read().await).is_none(),
+        "an owner-private carrier answers the fresh-carrier None: no record and no state"
+    );
+
+    // Making the carrier space-visible restores the judgment to the same caller.
+    let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
+    let revision = carrier.revision.expect("a stored carrier has a revision");
+    let mut payload = serde_json::to_value(&carrier).expect("the carrier serializes");
+    payload.as_object_mut().expect("an object").remove("disclosure");
+    payload.as_object_mut().expect("an object").remove("owner");
+    let visible: KnowledgeEntry = serde_json::from_value(payload).expect("the carrier decodes");
+    ok(handle.knowledge_put(visible, Some(revision)).await);
+
+    let cognition = ok(handle.cognition_read().await).expect("the space-visible carrier reads");
+    assert_eq!(
+        cognition.records.len(),
+        1,
+        "the judgment serves once the carrier is space-visible"
+    );
+    assert_eq!(cognition.records[0]["record_id"], json!("cog_hidden"));
+    assert_eq!(
+        cognition.mind_state["holder_entry_id"],
+        json!(created.carrier_entry_id),
+        "the derived state descends from the Mind's carrier"
+    );
+}
+
 #[tokio::test]
 async fn deliberate_without_a_space_wide_recall_grant_is_refused_and_writes_nothing() {
     let (_dir, store) = fixture().await;
