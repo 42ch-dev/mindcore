@@ -1,4 +1,5 @@
-//! `KnowledgeEntryPort` adapter: one fixed collection over the store's shared pool.
+//! `KnowledgeEntryPort` adapter: a fixed-collection local port and the registry-routed served
+//! face, over the store's shared pool.
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -540,21 +541,22 @@ impl MindStore {
         }
     }
 
-    /// The connect-served knowledge port: the admitted `scope_id` selects `scope`'s collection.
-    pub fn served_knowledge(
-        &self,
-        scope_id: impl Into<String>,
-        scope: KnowledgeScope,
-    ) -> RoutedKnowledgeStore {
-        RoutedKnowledgeStore::new(self.pool.clone(), scope_id, scope)
+    /// The connect-served knowledge port over this store's pool. It holds no route: every call
+    /// resolves the registered collection of the `scope_id` it is given.
+    pub fn served_knowledge(&self) -> RoutedKnowledgeStore {
+        RoutedKnowledgeStore {
+            pool: self.pool.clone(),
+        }
     }
 }
 
 /// The connect-served knowledge face over the store's shared pool.
 ///
-/// The host configures one exact route: an admitted `Scope` naming `scope_id` reads and writes
-/// `scope`'s collection, and any other id is `NotAuthorized` before a statement runs — no peer,
-/// payload or fallback picks a collection.
+/// The face resolves its route per call from the Mind registry: the admitted `Scope`'s `scope_id`
+/// names a Mind, and that Mind's registered collection is the one the op reads and writes. A
+/// `scope_id` with no registry row is `NotAuthorized` before any entry statement — no peer,
+/// payload or fallback names a collection — and the route and the op's own statements share one
+/// transaction, so a route resolved on a stale snapshot cannot serve another Mind's entries.
 ///
 /// Every op applies the admitted refinements and SPOKE's disclosure predicate, so an entry hidden
 /// from the peer answers like a missing one. `put` judges the submitted entry, and the existing row
@@ -562,63 +564,36 @@ impl MindStore {
 /// hidden existing row is `NotAuthorized` and never overwritten.
 pub struct RoutedKnowledgeStore {
     pool: SqlitePool,
-    scope_id: String,
-    scope: KnowledgeScope,
 }
 
 impl RoutedKnowledgeStore {
-    fn new(pool: SqlitePool, scope_id: impl Into<String>, scope: KnowledgeScope) -> Self {
-        Self {
-            pool,
-            scope_id: scope_id.into(),
-            scope,
+    /// The admission every op starts with, on the transaction the op's statement runs on: a
+    /// selection this face does not serve is refused, and a Mind the registry does not name is the
+    /// same target-free refusal an unknown one gives.
+    async fn admit(&self, tx: &mut Transaction<'_, Sqlite>, scope: &Scope) -> SpokeResult<String> {
+        if let SpokeResult::Reject(reject) = validate_admission_scope(scope) {
+            return SpokeResult::Reject(reject);
         }
-    }
-
-    /// The collection this port serves. The history dedup store namespaces its rows with it, so
-    /// two surfaces on one database that route to different collections never share a record.
-    pub fn collection(&self) -> &str {
-        &self.scope.collection
-    }
-
-    /// The admission every op starts with: an unconfigured `scope_id` and a selection this face
-    /// does not serve are refused instead of ignored.
-    fn admit(&self, scope: &Scope) -> SpokeResult<()> {
-        if scope.scope_id != self.scope_id {
-            return not_authorized();
-        }
-        validate_admission_scope(scope)
-    }
-
-    /// The routed collection's live rows, bounded by [`SERVED_KNOWLEDGE_LIST_LIMIT`]: an
-    /// over-bound live set refuses the list instead of growing memory and work with its size.
-    /// The projection runs inside one read transaction, so the carrier payloads and the
-    /// record rows project from one whole committed state.
-    async fn served_entries(&self) -> SpokeResult<Vec<KnowledgeEntry>> {
-        let mut tx = match self.pool.begin().await {
-            Ok(tx) => tx,
-            Err(_) => return storage_unavailable(),
-        };
-        match entries(&mut tx, &self.scope.collection, &SnapshotSeam::default()).await {
-            SpokeResult::Ok(listed) => match tx.commit().await {
-                Ok(()) => SpokeResult::Ok(listed),
-                Err(_) => storage_unavailable(),
-            },
+        match crate::minds::registered_collection(&mut **tx, &scope.scope_id).await {
+            SpokeResult::Ok(Some(collection)) => SpokeResult::Ok(collection),
+            SpokeResult::Ok(None) => not_authorized(),
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
     }
 
-    /// One served read: the collection's one route, the caller's admission, and the disclosure
-    /// predicate all apply before the entry leaves the store.
+    /// One served read: the registered route, the caller's admission, and the disclosure
+    /// predicate all apply before the entry leaves the store. The route is read on the read's own
+    /// snapshot, so the collection statement and the entry statement cannot disagree.
     async fn served_get(&self, scope: &Scope, entry_id: &str) -> SpokeResult<KnowledgeEntry> {
-        if let SpokeResult::Reject(reject) = self.admit(scope) {
-            return SpokeResult::Reject(reject);
-        }
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(_) => return storage_unavailable(),
         };
-        let entry = match read_entry(&mut tx, &self.scope.collection, entry_id).await {
+        let collection = match self.admit(&mut tx, scope).await {
+            SpokeResult::Ok(collection) => collection,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        let entry = match read_entry(&mut tx, &collection, entry_id).await {
             SpokeResult::Ok(entry) => match tx.commit().await {
                 Ok(()) => entry,
                 Err(_) => return storage_unavailable(),
@@ -637,33 +612,28 @@ impl RoutedKnowledgeStore {
         }
     }
 
-    /// One served write: the submitted entry, and the existing row, are judged before the store
-    /// can reveal a revision.
+    /// One served write: the registered route is resolved inside the write transaction, and the
+    /// submitted entry and the existing row are judged before the store can reveal a revision.
     async fn served_put(
         &self,
         scope: &Scope,
         entry: KnowledgeEntry,
         expected_base_revision: Option<u64>,
     ) -> SpokeResult<KnowledgeEntry> {
-        if let SpokeResult::Reject(reject) = self.admit(scope) {
-            return SpokeResult::Reject(reject);
-        }
+        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => transaction,
+            Err(_) => return storage_unavailable(),
+        };
+        let collection = match self.admit(&mut transaction, scope).await {
+            SpokeResult::Ok(collection) => collection,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
         match visible(&entry, scope) {
             SpokeResult::Ok(true) => {}
             SpokeResult::Ok(false) => return not_authorized(),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
-        let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
-            Ok(transaction) => transaction,
-            Err(_) => return storage_unavailable(),
-        };
-        let existing = read_stored_row(
-            &mut transaction,
-            &self.scope.collection,
-            &entry.entry_id,
-            false,
-        )
-        .await;
+        let existing = read_stored_row(&mut transaction, &collection, &entry.entry_id, false).await;
         let existing = match existing {
             SpokeResult::Ok(existing) => Some(existing),
             SpokeResult::Reject(reject)
@@ -687,13 +657,8 @@ impl RoutedKnowledgeStore {
                 SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
             }
         }
-        let written = write_entry(
-            &mut transaction,
-            &self.scope.collection,
-            entry,
-            expected_base_revision,
-        )
-        .await;
+        let written =
+            write_entry(&mut transaction, &collection, entry, expected_base_revision).await;
         let entry = match written {
             SpokeResult::Ok(entry) => entry,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
@@ -704,13 +669,25 @@ impl RoutedKnowledgeStore {
         SpokeResult::Ok(entry)
     }
 
-    /// The served list: the collection's live rows, filtered by the caller's disclosure predicate.
+    /// The served list: the registered collection's live rows, bounded by
+    /// [`SERVED_KNOWLEDGE_LIST_LIMIT`] — an over-bound live set refuses the list instead of growing
+    /// memory and work with its size — filtered by the caller's disclosure predicate. The
+    /// projection and the route run inside one read transaction, so the carrier payloads and the
+    /// record rows project from one whole committed state.
     async fn served_list(&self, scope: &Scope) -> SpokeResult<Vec<KnowledgeEntry>> {
-        if let SpokeResult::Reject(reject) = self.admit(scope) {
-            return SpokeResult::Reject(reject);
-        }
-        let entries = match self.served_entries().await {
-            SpokeResult::Ok(entries) => entries,
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return storage_unavailable(),
+        };
+        let collection = match self.admit(&mut tx, scope).await {
+            SpokeResult::Ok(collection) => collection,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        let entries = match entries(&mut tx, &collection, &SnapshotSeam::default()).await {
+            SpokeResult::Ok(entries) => match tx.commit().await {
+                Ok(()) => entries,
+                Err(_) => return storage_unavailable(),
+            },
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
         match filter_knowledge_entries_by_scope(&entries, scope) {
@@ -788,7 +765,8 @@ impl HistoryPort for RoutedKnowledgeStore {
 
 impl RoutedKnowledgeStore {
     /// One served history read: a missing, retired or hidden row answers `NOT_FOUND` like the
-    /// knowledge face's get, and the replay keeps its own `HistoryTruncated` refusal.
+    /// knowledge face's get, and the replay keeps its own `HistoryTruncated` refusal. The route is
+    /// resolved on the read's own snapshot.
     async fn served_history_get(
         &self,
         scope: &Scope,
@@ -796,15 +774,15 @@ impl RoutedKnowledgeStore {
         entity_id: &str,
         revision: u64,
     ) -> SpokeResult<RevisionSnapshot> {
-        if let SpokeResult::Reject(reject) = self.admit_history(scope, entity_kind) {
-            return SpokeResult::Reject(reject);
-        }
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(_) => return storage_unavailable(),
         };
-        let stored = match read_stored_row(&mut tx, &self.scope.collection, entity_id, false).await
-        {
+        let collection = match self.admit_history(&mut tx, scope, entity_kind).await {
+            SpokeResult::Ok(collection) => collection,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        let stored = match read_stored_row(&mut tx, &collection, entity_id, false).await {
             SpokeResult::Ok(stored) => stored,
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
@@ -825,14 +803,7 @@ impl RoutedKnowledgeStore {
             SpokeResult::Ok(false) => return history_not_found(entity_id),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
-        let entry = match read_entry_at_revision(
-            &mut tx,
-            &self.scope.collection,
-            entity_id,
-            revision,
-        )
-        .await
-        {
+        let entry = match read_entry_at_revision(&mut tx, &collection, entity_id, revision).await {
             SpokeResult::Ok(entry) => entry,
             SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::HistoryTruncated => {
                 return SpokeResult::Reject(reject)
@@ -864,7 +835,7 @@ impl RoutedKnowledgeStore {
 
     /// One served prune: a missing, a retired and a peer-hidden row are the one absence, so the
     /// answer never tells a peer admitted to the collection which of the three it asked for. The
-    /// row read and the cut share one `BEGIN IMMEDIATE`.
+    /// route, the row read and the cut share one `BEGIN IMMEDIATE`.
     async fn served_history_prune(
         &self,
         scope: &Scope,
@@ -872,27 +843,31 @@ impl RoutedKnowledgeStore {
         entity_id: &str,
         keep: u64,
     ) -> SpokeResult<HistoryPruneResult> {
-        if let SpokeResult::Reject(reject) = self.admit_history(scope, entity_kind) {
-            return SpokeResult::Reject(reject);
-        }
-        if keep == 0 {
-            return invalid_input("a history prune keeps at least one checkpoint");
-        }
         let mut transaction = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(transaction) => transaction,
             Err(_) => return storage_unavailable(),
         };
-        let stored =
-            match read_stored_row(&mut transaction, &self.scope.collection, entity_id, false).await
+        let collection = match self
+            .admit_history(&mut transaction, scope, entity_kind)
+            .await
+        {
+            SpokeResult::Ok(collection) => collection,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        // The keep boundary follows admission, so a zero keep cannot mask an unserved route or an
+        // unserved kind.
+        if keep == 0 {
+            return invalid_input("a history prune keeps at least one checkpoint");
+        }
+        let stored = match read_stored_row(&mut transaction, &collection, entity_id, false).await {
+            SpokeResult::Ok(stored) => stored,
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
             {
-                SpokeResult::Ok(stored) => stored,
-                SpokeResult::Reject(reject)
-                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
-                {
-                    return history_not_found(entity_id)
-                }
-                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-            };
+                return history_not_found(entity_id)
+            }
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
         if stored.superseded_by.is_some() {
             return history_not_found(entity_id);
         }
@@ -905,21 +880,19 @@ impl RoutedKnowledgeStore {
             SpokeResult::Ok(false) => return history_not_found(entity_id),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
-        let report =
-            match prune_entry_history(&mut transaction, &self.scope.collection, entity_id, keep)
-                .await
+        let report = match prune_entry_history(&mut transaction, &collection, entity_id, keep).await
+        {
+            SpokeResult::Ok(report) => report,
+            // Both reads run under this one BEGIN IMMEDIATE reservation, so the helper's probe
+            // cannot disagree with the permission read above; this arm normalizes the helper's
+            // own contract rather than an intervening disappearance.
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
             {
-                SpokeResult::Ok(report) => report,
-                // Both reads run under this one BEGIN IMMEDIATE reservation, so the helper's probe
-                // cannot disagree with the permission read above; this arm normalizes the helper's
-                // own contract rather than an intervening disappearance.
-                SpokeResult::Reject(reject)
-                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
-                {
-                    return history_not_found(entity_id)
-                }
-                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-            };
+                return history_not_found(entity_id)
+            }
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
         if transaction.commit().await.is_err() {
             return storage_unavailable();
         }
@@ -929,11 +902,18 @@ impl RoutedKnowledgeStore {
         })
     }
 
-    /// Both history ops start here: the knowledge face's route, then the kind this store serves.
-    fn admit_history(&self, scope: &Scope, entity_kind: &str) -> SpokeResult<()> {
-        if let SpokeResult::Reject(reject) = self.admit(scope) {
-            return SpokeResult::Reject(reject);
-        }
+    /// Both history ops start here: the knowledge face's admission and registered route on the
+    /// caller's transaction, then the kind this store serves.
+    async fn admit_history(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        scope: &Scope,
+        entity_kind: &str,
+    ) -> SpokeResult<String> {
+        let collection = match self.admit(tx, scope).await {
+            SpokeResult::Ok(collection) => collection,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
         if entity_kind != KNOWLEDGE_ENTRY_KIND {
             let mut details = Map::new();
             details.insert(
@@ -946,7 +926,7 @@ impl RoutedKnowledgeStore {
                 Some(details),
             );
         }
-        SpokeResult::Ok(())
+        SpokeResult::Ok(collection)
     }
 }
 

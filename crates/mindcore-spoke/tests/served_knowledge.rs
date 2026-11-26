@@ -17,7 +17,6 @@ use tempfile::TempDir;
 use mindcore_base::boundary::CallerId;
 use mindcore_base::cognition::CARRIER_NAMESPACE;
 use mindcore_base::ids::MindId;
-use mindcore_base::knowledge::KnowledgeScope;
 use mindcore_spoke::MindKnowledgePort;
 use mindcore_sqlite::minds::{knowledge_collection_of, CreateMind};
 use mindcore_sqlite::{
@@ -70,8 +69,7 @@ impl Harness {
         }
         tx.commit().await.expect("commit mind");
 
-        let collection = KnowledgeScope::new(knowledge_collection_of(&MindId::new(MIND)));
-        let routed = Arc::new(store.served_knowledge(MIND, collection));
+        let routed = Arc::new(store.served_knowledge());
         let port = MindKnowledgePort::new(store.pool(), routed.clone());
         Self {
             _dir: dir,
