@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 mindcore-base = { path = "../mindcore-base" }
 mindcore-sqlite = { path = "../mindcore-sqlite" }
 mindcore-spi = { path = "../mindcore-spi" }

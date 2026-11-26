@@ -445,10 +445,14 @@ pub struct Evidence<'a> {
 pub struct DeliberateRequest<'a> {
     /// Memory space the deliberation runs in.
     pub space_id: &'a str,
-    /// Subject the cognition belongs to.
-    pub subject_id: &'a str,
+    /// Subject the cognition belongs to, or `None` for the space-level
+    /// deliberation of the in-process facade: with no subject there is no
+    /// memory page to read, and the grant revalidation and the unsettled-intent
+    /// check move from the subject to the whole space.
+    pub subject_id: Option<&'a str>,
     /// Assessment context stamped onto the record. `None` derives it from
-    /// [`Self::subject_id`]; a supplied id is only validated by the record
+    /// [`Self::subject_id`] when one is present; a request naming neither is
+    /// `InvalidInput`. A supplied id is only validated by the record
     /// schema and never widens admission or the storage route.
     pub assessment_context_id: Option<&'a str>,
     /// The holder this verdict is attributed to.

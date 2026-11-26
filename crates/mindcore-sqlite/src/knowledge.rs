@@ -147,7 +147,7 @@ impl ScopedKnowledgeStore {
                 ))
             }
         };
-        match read_entry_revision(&mut tx, &self.scope.collection, entry_id, revision).await {
+        match read_entry_at_revision(&mut tx, &self.scope.collection, entry_id, revision).await {
             SpokeResult::Ok(entry) => match tx.commit().await {
                 Ok(()) => SpokeResult::Ok(entry),
                 Err(error) => internal(format!(
@@ -752,19 +752,25 @@ impl RoutedKnowledgeStore {
             SpokeResult::Ok(false) => return history_not_found(entity_id),
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         }
-        let entry =
-            match read_entry_revision(&mut tx, &self.scope.collection, entity_id, revision).await {
-                SpokeResult::Ok(entry) => entry,
-                SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::HistoryTruncated => {
-                    return SpokeResult::Reject(reject)
-                }
-                SpokeResult::Reject(reject)
-                    if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
-                {
-                    return history_not_found(entity_id)
-                }
-                SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-            };
+        let entry = match read_entry_at_revision(
+            &mut tx,
+            &self.scope.collection,
+            entity_id,
+            revision,
+        )
+        .await
+        {
+            SpokeResult::Ok(entry) => entry,
+            SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::HistoryTruncated => {
+                return SpokeResult::Reject(reject)
+            }
+            SpokeResult::Reject(reject)
+                if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
+            {
+                return history_not_found(entity_id)
+            }
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
         // Disclosure is a payload property, so the live row's visibility says nothing about the
         // replayed payload: a revision whose own fields fall outside the admitted scope is the
         // same absence as a hidden live row.
@@ -1382,7 +1388,7 @@ pub async fn prune_entry_history(
 /// the live row stands in when no saved revision is that recent. The gap between them is advanced
 /// by dedicated appends alone, so it subtracts from the checkpoint head and the records are read
 /// only through that derived head — a later record never reaches an earlier replay.
-async fn read_entry_revision(
+pub async fn read_entry_at_revision(
     tx: &mut Transaction<'_, Sqlite>,
     collection: &str,
     entry_id: &str,

@@ -12,8 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 use spoke_operations::{
-    knowledge_entry_visible_to_viewpoint, GrantRequirement, SpokeReject, SpokeRejectCode,
-    SpokeResult,
+    knowledge_entry_visible_to_viewpoint, SpokeReject, SpokeRejectCode, SpokeResult,
 };
 use spoke_schemas::data::cognition::{CognitionReference, CognitionReferenceKind};
 use spoke_schemas::data::memory_candidate::PlacementScope;
@@ -44,26 +43,13 @@ use mindcore_sqlite::{
 
 use crate::admission;
 use crate::reject::Reject;
-use crate::{principal_id, MemoryAdapter, MemoryStage, Tx};
+use crate::{
+    principal_id, MemoryAdapter, MemoryStage, Tx, KNOWLEDGE_READ, KNOWLEDGE_WRITE, RECALL,
+};
 
 /// Publishes one intent's file targets and confirms them: `Ok(())` only when
 /// every target's exact bytes landed at its path.
 type JournalPublisher = dyn Fn(&[Value]) -> Result<(), SpiError> + Send + Sync;
-
-/// The knowledge-read capability. A grant carrying it admits its principal to
-/// knowledge reads in that grant's space; the open capability vocabulary names
-/// no knowledge capability, and no memory capability (`recall`, `records_read`)
-/// stands in for it.
-const KNOWLEDGE_READ: &str = "knowledge_read";
-
-/// The carrier-write capability. Reading a collection is not authority to
-/// modify the judgment it carries, so the write transaction requires this on
-/// its own.
-const KNOWLEDGE_WRITE: &str = "knowledge_write";
-
-/// The memory capability the subject page was read under; the write rechecks
-/// it because a verdict over that page depends on it.
-const RECALL: &str = "recall";
 
 /// The journal op of the durable absorb-decision marker. The row is applied,
 /// carries no targets and settles nothing: it only tells a capture replay that
@@ -83,6 +69,9 @@ pub struct MemoryWorkflowBinding {
     /// destination here too — so both sides can never drift apart.
     knowledge_routes: Arc<BTreeMap<String, KnowledgeScope>>,
     publisher: Option<Box<JournalPublisher>>,
+    /// The one carrier a facade handle binds: `(space_id, collection, carrier_entry_id)`.
+    /// The served surface binds none, so its principal routes stay the only resolution.
+    carrier_binding: Option<(String, String, String)>,
 }
 
 impl MemoryWorkflowBinding {
@@ -95,6 +84,7 @@ impl MemoryWorkflowBinding {
             pool,
             knowledge_routes: Arc::new(BTreeMap::new()),
             publisher: None,
+            carrier_binding: None,
         }
     }
 
@@ -347,41 +337,60 @@ impl MemoryWorkflowBinding {
         self.knowledge_routes.get(principal_id(principal))
     }
 
-    /// `principal`'s own live grant for every one of `capabilities` in `space_id`, on `tx`.
-    ///
-    /// Live grants are re-derived on every call, so a read after provider work runs the same
-    /// admission and a revoked grant refuses it. A memory grant never substitutes for this, and a
-    /// knowledge read never stands in for [`KNOWLEDGE_WRITE`].
-    async fn require_knowledge_grants(
-        &self,
-        tx: &mut Tx<'_>,
-        principal: &Principal,
+    /// Bind the carrier its row states, for the facade handle that has no route
+    /// map: `with_carrier_collection(space_id, collection, carrier_entry_id)`
+    /// pins one space's deliberation to the collection and carrier the Mind's
+    /// registry row resolved at open. The served surface binds none, so its
+    /// route map stays the only resolution.
+    #[must_use]
+    pub fn with_carrier_collection(
+        mut self,
         space_id: &str,
-        capabilities: &[&str],
+        collection: &str,
+        carrier_entry_id: &str,
+    ) -> Self {
+        self.carrier_binding = Some((
+            space_id.to_string(),
+            collection.to_string(),
+            carrier_entry_id.to_string(),
+        ));
+        self
+    }
+
+    /// The collection one carrier access serves: a bound Mind answers its own
+    /// collection first, and the route map answers otherwise.
+    fn carrier_collection(&self, principal: &Principal, space_id: &str) -> Option<&str> {
+        if let Some((bound_space, collection, _)) = &self.carrier_binding {
+            if bound_space == space_id {
+                return Some(collection.as_str());
+            }
+        }
+        self.knowledge_route(principal)
+            .map(|route| route.collection.as_str())
+    }
+
+    /// A bound carrier is the only carrier this binding serves in its space: a
+    /// holder naming any other entry is refused before any carrier read or
+    /// append, so the binding's identity is enforced and not merely resolved.
+    fn require_bound_carrier(
+        &self,
+        space_id: &str,
+        holder: &CognitionReference,
     ) -> Result<(), SpiError> {
-        let caller = principal_id(principal);
-        let space = SpaceId::new(space_id.to_string());
-        let grants = self.space_grants(tx, space_id).await?;
-        for capability in capabilities {
-            let requirement = GrantRequirement {
-                capability,
-                subject_id: None,
-                context_ids: Vec::new(),
-                reads_shared: false,
-                subject_all: false,
-            };
-            if !admission::covered(&grants, caller, space.as_str(), Utc::now(), &requirement) {
-                return Err(not_authorized(format!(
-                    "principal {caller} holds no live {capability} grant in space {}",
-                    space.as_str()
+        if let Some((bound_space, _, carrier_entry_id)) = &self.carrier_binding {
+            if bound_space == space_id && carrier_entry_id != holder.id.as_str() {
+                return Err(SpiError::InvalidInput(format!(
+                    "holder {} does not name the carrier this binding serves",
+                    holder.id.as_str()
                 )));
             }
         }
         Ok(())
     }
 
-    /// The collection the carrier write serves: `principal` must have a route and hold a live
-    /// grant for every one of `capabilities` in `space_id`.
+    /// The collection the carrier write serves: `principal` must have a route —
+    /// or the binding a bound carrier — and hold a live grant for every one of
+    /// `capabilities` in `space_id`.
     ///
     /// Resolved once, so the carrier read and its CAS append stay pinned to one collection. A
     /// missing route is the terminal refusal before any carrier access: it is as target-free as a
@@ -394,12 +403,12 @@ impl MemoryWorkflowBinding {
         capabilities: &[&str],
     ) -> Result<&str, SpiError> {
         let collection = self
-            .knowledge_route(principal)
-            .map(|route| route.collection.as_str())
+            .carrier_collection(principal, space_id)
             .ok_or_else(|| {
                 not_authorized("principal has no workflow knowledge route".to_string())
             })?;
-        self.require_knowledge_grants(tx, principal, space_id, capabilities)
+        self.adapter
+            .require_space_grants(tx, principal, space_id, capabilities)
             .await?;
         Ok(collection)
     }
@@ -456,7 +465,8 @@ impl MemoryWorkflowBinding {
             return Ok(Vec::new());
         };
         match self
-            .require_knowledge_grants(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
+            .adapter
+            .require_space_grants(tx, principal, request.space_id.as_str(), &[KNOWLEDGE_READ])
             .await
         {
             Ok(()) => {}
@@ -1101,31 +1111,50 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         &self,
         principal: &Principal,
         space_id: &str,
-        subject_id: &str,
+        subject_id: Option<&str>,
         holder: &CognitionReference,
         max_items: u64,
     ) -> Result<DeliberateSnapshot, SpiError> {
+        self.require_bound_carrier(space_id, holder)?;
         let mut transaction = self.pool.begin().await.map_err(|error| {
             internal(format!(
                 "deliberation read transaction could not begin: {error}"
             ))
         })?;
-        let records = ready(
-            self.adapter
-                .recall(
-                    &mut transaction,
-                    principal,
-                    json!({
-                        "space_id": space_id,
-                        "subject_id": subject_id,
-                        "selection": { "mode": "subject_all" },
-                        "budget": { "max_items": max_items },
-                    }),
-                )
-                .await,
-            "memory.recall",
-        );
-        let records = decode_records(records?)?;
+        // With no subject there is no page to read: the space-level revalidation
+        // and unsettled-intent check stand in place of the subject page's own
+        // admission and withhold, and the snapshot serves an empty memory page.
+        let records = match subject_id {
+            Some(subject_id) => {
+                let records = ready(
+                    self.adapter
+                        .recall(
+                            &mut transaction,
+                            principal,
+                            json!({
+                                "space_id": space_id,
+                                "subject_id": subject_id,
+                                "selection": { "mode": "subject_all" },
+                                "budget": { "max_items": max_items },
+                            }),
+                        )
+                        .await,
+                    "memory.recall",
+                );
+                decode_records(records?)?
+            }
+            None => {
+                self.adapter
+                    .revalidate_space(&mut transaction, principal, space_id)
+                    .await?;
+                let space = SpaceId::new(space_id.to_string());
+                self.adapter
+                    .withhold_space_if_unsettled(&mut transaction, &space)
+                    .await
+                    .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+                Vec::new()
+            }
+        };
         let collection = self
             .admitted_collection(&mut transaction, principal, space_id, &[KNOWLEDGE_READ])
             .await?;
@@ -1157,13 +1186,14 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         &self,
         principal: &Principal,
         space_id: &str,
-        subject_id: &str,
+        subject_id: Option<&str>,
         holder: &CognitionReference,
         expected_carrier_revision: u64,
         record: Value,
         cited: &[CitedRecord],
         deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
+        self.require_bound_carrier(space_id, holder)?;
         // The pool holds one connection in production, so an acquire can wait
         // for another statement indefinitely: the request deadline bounds that
         // wait, and a connection in hand is re-checked before the begin. Both
@@ -1197,12 +1227,25 @@ impl WorkflowBinding for MemoryWorkflowBinding {
             )
             .await?;
         let space = SpaceId::new(space_id.to_string());
-        self.revalidate_subject(&mut transaction, principal, space_id, subject_id)
-            .await?;
-        self.adapter
-            .withhold_if_unsettled(&mut transaction, &space, subject_id)
-            .await
-            .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+        match subject_id {
+            Some(subject_id) => {
+                self.revalidate_subject(&mut transaction, principal, space_id, subject_id)
+                    .await?;
+                self.adapter
+                    .withhold_if_unsettled(&mut transaction, &space, subject_id)
+                    .await
+                    .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+            }
+            None => {
+                self.adapter
+                    .revalidate_space(&mut transaction, principal, space_id)
+                    .await?;
+                self.adapter
+                    .withhold_space_if_unsettled(&mut transaction, &space)
+                    .await
+                    .map_err(|reject| SpiError::Settlement(reject.into_spoke()))?;
+            }
+        }
         self.revalidate_cited(&mut transaction, principal, space_id, cited)
             .await?;
         let header =

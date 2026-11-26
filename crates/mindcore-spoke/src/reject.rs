@@ -67,6 +67,18 @@ impl Reject {
         .detail("subject_id", Value::String(subject_id.to_string()))
     }
 
+    /// The space-level withholding of a subjectless deliberation: any durable
+    /// intent in the space is unsettled, whichever subject it belongs to. The
+    /// refusal names the space and no subject.
+    pub(crate) fn unreconciled_space(space_id: &str) -> Self {
+        Self::terminal(
+            SpokeRejectCode::InternalError,
+            "space content is withheld until its durable intents settle",
+        )
+        .detail("reason", Value::String("UNRECONCILED".to_string()))
+        .detail("space_id", Value::String(space_id.to_string()))
+    }
+
     /// An optional family or op this adapter build does not serve (§4.1).
     pub(crate) fn unsupported(op: &str) -> Self {
         Self::terminal(
