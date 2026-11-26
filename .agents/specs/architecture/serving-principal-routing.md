@@ -286,9 +286,11 @@ configurations are refused the same way.
 Memory, the four Mind tools, `port.knowledge.*`, `history.*` and `knowledge.adopt` all route per
 Mind. A Mind's registry row is written once: changing its collection is a new Mind, not a
 reconfiguration, and there is no hot reload. Adoption's configured source is checked against the
-registry at assembly and again, inside the call's transaction, on every call, so a Mind created
-later can never become that source; its recorded outcomes live for one service instance, since the
-shipped dedup store for adoption is Connect's bounded in-memory default.
+registry at assembly and again, inside the copy's transaction, on every actual copy execution, so a
+Mind created later can never become that source; a replay that already holds a recorded outcome
+redoes only Mind admission and re-runs neither that check nor the grant check. Its recorded outcomes
+live for one service instance, since the shipped dedup store for adoption is Connect's bounded
+in-memory default.
 
 ## Change obligations
 
