@@ -357,6 +357,66 @@ impl Harness {
         .expect("seed knowledge entry");
     }
 
+    /// Rewrites the carrier entry's payload, revision unchanged: the shape the
+    /// disclosure fix reads is the live row's current payload.
+    async fn set_carrier_payload(&self, payload: Value) {
+        sqlx::query(
+            "UPDATE knowledge_entries SET payload = ? \
+             WHERE collection = 'wren' AND entry_id = 'ke_wren'",
+        )
+        .bind(payload.to_string())
+        .execute(&self.pool)
+        .await
+        .expect("rewrite the carrier payload");
+    }
+
+    /// One schema-valid belief judgment on the carrier, stored the way a
+    /// dedicated append stores it: a `cognition_records` row the read hydrates
+    /// into the payload's `records` member.
+    async fn judgment(&self, record_id: &str) {
+        let reference = |kind: &str, id: &str| json!({ "kind": kind, "id": id, "namespace": "mindcore" });
+        let record = json!({
+            "assessed_at": NOW,
+            "assessment_context": { "context_id": "ctx_gate" },
+            "assessor": reference("knowledge_entry", "ke_wren"),
+            "assessor_role": "holder_self_report",
+            "basis": {
+                "acquisition": "Perception",
+                "evidence": [reference("memory_record", "rec_gate")],
+                "kind": "evidence",
+            },
+            "effective_at": NOW,
+            "extensions": {},
+            "holder": reference("knowledge_entry", "ke_wren"),
+            "kind": "belief",
+            "order": 1,
+            "q": {
+                "assertion": "belief_attribution",
+                "calibration": "uncalibrated",
+                "method": "single_self_report",
+                "value": 0.4,
+            },
+            "record_id": record_id,
+            "target": {
+                "carrier": reference("knowledge_entry", "ke_wren"),
+                "kind": "proposition",
+                "target_id": "prop_gate_closed",
+            },
+            "truth": "True",
+            "view": "current",
+        });
+        sqlx::query(
+            "INSERT INTO cognition_records \
+             (collection, entry_id, append_seq, record_id, payload, append_prior_shape) \
+             VALUES ('wren', 'ke_wren', 1, ?, ?, 0)",
+        )
+        .bind(record_id)
+        .bind(record.to_string())
+        .execute(&self.pool)
+        .await
+        .expect("seed the judgment record");
+    }
+
     fn embedder(&self, side_effect: SideEffect) -> BoundaryEmbedder {
         BoundaryEmbedder {
             identity: EmbeddingIdentity {
@@ -921,6 +981,80 @@ async fn knowledge_slot_omits_a_superseded_entry() {
         ["ke_gate", "ke_wren"],
         "a superseded entry never reaches the pack, and the private one stays withheld"
     );
+}
+
+/// `read_cognition` applies the knowledge slot's disclosure predicate, viewpoint-free: an
+/// `owner`-private carrier's judgments answer the empty view a Mind that has judged nothing
+/// answers — no records and a null `MindState` derived from the filtered set — while a
+/// space-visible carrier still serves its record and derived state to the same
+/// `knowledge_read` peer.
+#[tokio::test]
+async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_peer() {
+    let harness = Harness::open().await;
+    harness.grant(&["knowledge_read"]).await;
+    // One judgment on the carrier, stored the way a dedicated append stores it: a
+    // `cognition_records` row the read hydrates into the payload's module.
+    let module = json!({
+        "records": [],
+        "world_facts": [],
+        "extensions": {},
+    });
+    let private_payload = json!({
+        "schema_version": 1,
+        "entry_id": "ke_wren",
+        "entry_type": "character",
+        "canonical_name": "ke_wren carrier",
+        "status": "confirmed",
+        "revision": 1,
+        "body": {},
+        "disclosure": "owner-private",
+        "owner": "prn_owner",
+        "modules": { "cognition": module },
+        "extensions": {},
+    });
+    harness.set_carrier_payload(private_payload).await;
+    harness.judgment("rec_judgment").await;
+    let mut tx = harness.pool.begin().await.expect("begin hidden read");
+    let hidden = MemoryAdapter::read_cognition(&mut tx, &principal(), SPACE)
+        .await
+        .expect("the hidden carrier read");
+    assert_eq!(hidden.carrier_revision, 1);
+    assert_eq!(
+        hidden.records,
+        Vec::<Value>::new(),
+        "an owner-private carrier serves no records to a viewpoint-free peer"
+    );
+    assert_eq!(
+        hidden.mind_state,
+        Value::Null,
+        "the derived state follows the filtered set: {hidden:?}"
+    );
+    drop(tx);
+
+    // The same carrier made space-visible reads whole: the record and its derived MindState.
+    let visible_payload = json!({
+        "schema_version": 1,
+        "entry_id": "ke_wren",
+        "entry_type": "character",
+        "canonical_name": "ke_wren carrier",
+        "status": "confirmed",
+        "revision": 1,
+        "body": {},
+        "modules": { "cognition": module },
+        "extensions": {},
+    });
+    harness.set_carrier_payload(visible_payload).await;
+    let mut tx = harness.pool.begin().await.expect("begin visible read");
+    let visible = MemoryAdapter::read_cognition(&mut tx, &principal(), SPACE)
+        .await
+        .expect("the space-visible carrier read");
+    assert_eq!(visible.carrier_revision, 1);
+    let records = &visible.records;
+    assert_eq!(records.len(), 1, "the judgment serves once visible: {visible:?}");
+    assert_eq!(records[0]["record_id"], "rec_judgment");
+    assert!(visible.mind_state.is_object(), "the derived state serves beside the record");
+    assert_eq!(visible.mind_state["mind_state_id"], SPACE);
+    assert_eq!(visible.mind_state["holder_entry_id"], "ke_wren");
 }
 
 /// Tombstoning a record prunes its stored vectors in the tombstone's own transaction:

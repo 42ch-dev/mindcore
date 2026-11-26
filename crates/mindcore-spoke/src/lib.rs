@@ -30,7 +30,10 @@ pub(crate) use mindcore_base::ids::mint;
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use spoke_operations::{GrantRequirement, SpokeReject, SpokeRejectCode, SpokeResult};
+use spoke_operations::{
+    knowledge_entry_visible_to_viewpoint, GrantRequirement, SpokeReject, SpokeRejectCode,
+    SpokeResult,
+};
 use spoke_schemas::Principal;
 use sqlx::{Sqlite, Transaction};
 
@@ -329,7 +332,10 @@ impl MemoryAdapter {
     /// A fresh carrier answers `records: []` and `mind_state: null`; a stored carrier that cannot
     /// be derived is a terminal `InternalError`, matching the facade's `cognition_read`, because
     /// the carrier passed validation at its write and repeating the read cannot change it. The
-    /// transaction is the caller's to end.
+    /// recall knowledge slot's disclosure predicate applies here too, viewpoint-free: an
+    /// `owner`-private carrier answers the same empty view a Mind that has judged nothing
+    /// answers, and the derived `MindState` sees the filtered set. The transaction is the
+    /// caller's to end.
     pub async fn read_cognition(
         tx: &mut Tx<'_>,
         principal: &Principal,
@@ -354,6 +360,16 @@ impl MemoryAdapter {
                 .into_spoke())
             }
         };
+        // The knowledge slot's disclosure predicate, viewpoint-free: admission and the
+        // `knowledge_read` coverage above stay first, but a carrier they hide — an
+        // `owner`-private one — answers the empty view, and no derivation runs on its records.
+        if !knowledge_entry_visible_to_viewpoint(&carrier_entry, None) {
+            return Ok(Cognition {
+                carrier_revision: revision,
+                records: Vec::new(),
+                mind_state: Value::Null,
+            });
+        }
         let view = match mindcore_base::cognition::derive_mind_state(&carrier_entry) {
             Ok(view) => view,
             Err(mindcore_base::cognition::MindError::NoRecords) => {
