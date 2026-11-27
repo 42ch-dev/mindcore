@@ -8,10 +8,12 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * The hosts this package is built and tested on — the same set `package.json`'s `os` field
- * declares. The artifact names below are keyed by exactly these entries, so a platform cannot be
- * in one list and not the other; a host missing here is refused by name, which is the truth,
- * rather than being told the addon is unbuilt.
+ * The hosts this package declares, matching `package.json`'s `os` field; the artifact names below
+ * are keyed by exactly these entries, so the two cannot drift. A host missing here is refused by
+ * name, which is the truth, rather than being told the addon is unbuilt.
+ *
+ * `darwin` is declared and unexercised by CI: the workflow runs `ubuntu-latest` only. It is a
+ * supported host whose addon name is known, not one whose build and test path CI has proven.
  */
 const PLATFORMS = ['darwin', 'linux'];
 

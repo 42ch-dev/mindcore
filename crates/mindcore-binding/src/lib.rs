@@ -1,13 +1,23 @@
 //! The Node addon over the in-process facade: one store handle per client, the registry entry
 //! points, and [`settle`], the one place a `SpokeReject` becomes `code`, `message` and `details`.
 //!
-//! Every export answers a result object instead of rejecting through napi: a napi rejection
+//! Every export answers a result object — `{ ok: true, value }` or
+//! `{ ok: false, code, message, details? }` — instead of rejecting through napi, whose rejection
 //! carries a message and neither the facade's code nor its details. `index.js` is the one place
 //! that object becomes a value or an error.
 //!
+//! Two failures are outside that contract, and deliberately so. A facade outcome and a guard this
+//! addon runs over a JavaScript value (a revision that is not a whole number, an `occurredAt` that
+//! is not RFC 3339, a wire object that does not decode) both arrive as a result object. But an
+//! argument that does not match the declared `#[napi(object)]` shape at all — a missing `maxItems`,
+//! a `content` that is not an object — is refused by napi's own argument validation before any
+//! export body runs, and reaches JavaScript as a plain `TypeError` with no `code` and no `details`.
+//! A caller that switches on `code` must therefore treat "not a `MindcoreError`" as the
+//! argument-shape case.
+//!
 //! The addon opens no socket and declares no wire shape: each export calls an existing public
 //! function of `mindcore-runtime`. The one transaction it opens itself is `ensureSubject`'s, the
-//! host duty a memory write needs before `capture`.
+//! host duty a memory write needs before `capture`; it begins immediate like every other writer.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -509,7 +519,12 @@ pub async fn client_ensure_subject(
         SpokeResult::Ok(principal) => principal,
         SpokeResult::Reject(reject) => return settle::<()>(SpokeResult::Reject(reject)),
     };
-    let mut tx = match client.store.pool().begin().await {
+    // `BEGIN IMMEDIATE`, like every other writer in the workspace: this transaction reads the
+    // subject row and then inserts it, and a deferred transaction that upgrades after another
+    // connection has committed cannot wait for the lock — SQLite answers `SQLITE_BUSY_SNAPSHOT`,
+    // which the busy timeout does not retry. Taking the write lock up front is what the facade's
+    // own writes do.
+    let mut tx = match client.store.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(error) => {
             return settle::<()>(spoke_reject(
