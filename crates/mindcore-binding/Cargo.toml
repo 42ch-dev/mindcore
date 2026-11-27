@@ -25,6 +25,9 @@ mindcore-sqlite = { path = "../mindcore-sqlite", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+# The store's open error is sqlx's own: classifying it by kind and code needs the type, not a
+# match on its rendered message.
+sqlx.workspace = true
 spoke-operations.workspace = true
 spoke-schemas.workspace = true
 
@@ -33,3 +36,6 @@ napi-build = "2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# The addon's own exports are `async` and run on napi's runtime in production; the tests that
+# exercise them build a runtime directly, so tokio's macros are a test-only dependency here.
+tokio.workspace = true

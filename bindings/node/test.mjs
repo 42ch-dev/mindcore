@@ -2,9 +2,19 @@
 // mind_facade.rs` through `index.js`, then the three refusals that are cheapest to get wrong.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  existsSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { after, describe, it } from 'node:test';
 
 import { MindView, MindcoreClient, MindcoreError } from './index.js';
@@ -13,10 +23,20 @@ const CALLER = 'caller_wren';
 const SUBJECT = 'subj_wren';
 const TEXT = 'the north gate is shut after dusk';
 
-// Every store, its journal root and its keys live in this throwaway directory, which is removed
-// after the run; nothing here is committed and no path is reused between runs.
-const root = mkdtempSync(join(tmpdir(), 'mindcore-binding-'));
-after(() => rmSync(root, { recursive: true, force: true }));
+// Every store, its journal root and its keys live under one throwaway directory, and every other
+// directory a case creates is tracked here too, so the run leaves nothing behind.
+const temporaryDirectories = [];
+function scratchDirectory(prefix) {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+const root = scratchDirectory('mindcore-binding-');
+after(() => {
+  for (const directory of temporaryDirectories) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 /** A client over its own store file and journal root under `root`; `journal` off keeps no publisher. */
 function open(name, { journal = true } = {}) {
@@ -25,6 +45,17 @@ function open(name, { journal = true } = {}) {
     callerId: CALLER,
     journalDir: journal ? join(root, `${name}-journal`) : undefined,
   });
+}
+
+/**
+ * The loader keys its artifact table by the platforms it declares, and `package.json`'s `os` is
+ * meant to be that same set. Nothing in the runtime can compare the two, so this does: a platform
+ * added to one and not the other fails here rather than shipping as a comment that is not true.
+ */
+function declaredPlatforms() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
+  return manifest.os;
 }
 
 describe('the in-process binding', () => {
@@ -107,6 +138,28 @@ describe('the in-process binding', () => {
     );
   });
 
+  it('refuses a journalDir that is not a directory as invalid input', async () => {
+    // A caller-supplied path is the caller's mistake to hear about, with the path named and the
+    // io kind carried — not an internal fault.
+    const path = join(root, 'not-a-directory');
+    writeFileSync(path, 'this is a file');
+    await assert.rejects(
+      () =>
+        MindcoreClient.open({
+          storePath: join(root, 'refused.db'),
+          callerId: CALLER,
+          journalDir: join(path, 'journal'),
+        }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INVALID_INPUT');
+        assert.equal(error.details.journalDir, join(path, 'journal'));
+        assert.equal(typeof error.details.kind, 'string');
+        return true;
+      },
+    );
+  });
+
   it('refuses review on a client opened without a journal root', async () => {
     // No `journalDir`: the handle keeps no publisher, and `review` refuses before staging.
     const client = await open('no-journal', { journal: false });
@@ -123,6 +176,170 @@ describe('the in-process binding', () => {
       (error) => {
         assert.ok(error instanceof MindcoreError);
         assert.equal(error.code, 'INVALID_INPUT');
+        return true;
+      },
+    );
+  });
+
+  it('serves one store file when a relative storePath outlives a directory change', async () => {
+    // A relative `storePath` is resolved once, at open: the client keeps the absolute name, so no
+    // later working-directory change can make a connection name a second database. The assertion is
+    // about that second database not existing — the pool's one connection stays open here, so a
+    // reconnect is not something this test can force from the public surface.
+    const previous = process.cwd();
+    const opener = scratchDirectory('mindcore-store-a-');
+    const elsewhere = scratchDirectory('mindcore-store-b-');
+    let client;
+    let mindId;
+    try {
+      process.chdir(opener);
+      client = await MindcoreClient.open({ storePath: 'relative.db', callerId: CALLER });
+      mindId = (await client.createMind({ displayName: 'Relative store' })).id;
+    } finally {
+      process.chdir(previous);
+    }
+
+    process.chdir(elsewhere);
+    try {
+      const minds = await client.listMinds();
+      assert.deepEqual(
+        minds.map((row) => row.id),
+        [mindId],
+      );
+    } finally {
+      process.chdir(previous);
+    }
+
+    assert.ok(
+      existsSync(join(opener, 'relative.db')),
+      'the store is the file named at open',
+    );
+    assert.ok(
+      !existsSync(join(elsewhere, 'relative.db')),
+      'the directory current afterwards gained no second database',
+    );
+  });
+
+  it('provisions subjects on one store from two clients while the other writes', async () => {
+    // `ensureSubject` takes the write lock up front (`BEGIN IMMEDIATE`): a deferred transaction that
+    // upgrades after another connection's commit cannot be waited out, and SQLite answers
+    // SQLITE_BUSY_SNAPSHOT instead of retrying. Both clients share one file, so their write locks
+    // interleave — every call must settle as success.
+    const storePath = join(root, 'race.db');
+    const writer = await MindcoreClient.open({
+      storePath,
+      callerId: CALLER,
+      journalDir: join(root, 'race-journal'),
+    });
+    const mind = await writer.createMind({ displayName: 'Raced' });
+    const other = await MindcoreClient.open({
+      storePath,
+      callerId: CALLER,
+      journalDir: join(root, 'race-journal'),
+    });
+
+    const provisions = Array.from({ length: 8 }, (_, index) =>
+      other.ensureSubject(mind.id, `subj_race_${index}`),
+    );
+    const writes = [
+      writer.ensureSubject(mind.id, 'subj_race_writer'),
+      mind.capture({
+        subject: 'subj_race_writer',
+        content: { text: TEXT },
+        idempotencyKey: 'cap-race',
+      }),
+    ];
+    // Every one of these must resolve: a busy or stale-snapshot refusal fails the case.
+    await Promise.all([...provisions, ...writes]);
+  });
+
+  it('creates a Mind when createMind is called with no argument', async () => {
+    // The declaration says `options?`; the wrapper's default keeps that true against an addon
+    // argument that is otherwise undefined.
+    const client = await open('defaults');
+    const mind = await client.createMind();
+    assert.ok(mind instanceof MindView);
+    assert.match(mind.id, /^spc_/);
+    const minds = await client.listMinds();
+    assert.deepEqual(
+      minds.map((row) => row.id),
+      [mind.id],
+      'the no-argument create registered exactly that Mind',
+    );
+    assert.equal(minds[0].displayName, null, 'an unnamed Mind carries no display name');
+  });
+
+  it('reports what a store that fails to open actually reported', async () => {
+    // Both probes pass on a regular, writable file of garbage: the failure is inside the pool, and
+    // the refusal must carry that failure's own kind rather than a stand-in. The path reported is
+    // the resolved one — the client opened that name, not the spelling that led to it.
+    const path = join(root, 'garbage.db');
+    writeFileSync(path, 'not a database at all, not even close');
+    const resolved = realpathSync(root);
+    const resolvedPath = join(resolved, 'garbage.db');
+    await assert.rejects(
+      () => MindcoreClient.open({ storePath: path, callerId: CALLER }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INTERNAL_ERROR');
+        assert.equal(error.details.storePath, resolvedPath);
+        assert.equal(typeof error.details.kind, 'string');
+        assert.notEqual(error.details.kind, 'other error');
+        return true;
+      },
+    );
+  });
+
+  it('declares the same platforms the loader knows how to load', async () => {
+    const { PLATFORMS } = await import('./index.js');
+    assert.deepEqual(
+      declaredPlatforms(),
+      PLATFORMS,
+      'package.json os and the loader platform list must be the same set, in the same order',
+    );
+  });
+
+  it('refuses an empty journalDir as a name-shape error', async () => {
+    // `''` names no directory at all: the caller's spelling, refused as such rather than as a
+    // filesystem fault.
+    await assert.rejects(
+      () =>
+        MindcoreClient.open({
+          storePath: join(root, 'empty-journal.db'),
+          callerId: CALLER,
+          journalDir: '',
+        }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INVALID_INPUT');
+        assert.equal(error.details.journalDir, '');
+        return true;
+      },
+    );
+  });
+
+  it('opens a store through a symlink to a file, and refuses one to a directory', async () => {
+    const target = join(root, 'real.db');
+    const linkedFile = join(root, 'linked.db');
+    symlinkSync(target, linkedFile);
+    const client = await MindcoreClient.open({ storePath: linkedFile, callerId: CALLER });
+    const mind = await client.createMind({ displayName: 'Through a link' });
+    assert.match(mind.id, /^spc_/);
+
+    const directory = join(root, 'a-directory');
+    mkdirSync(directory);
+    const linkedDirectory = join(root, 'linked-directory');
+    symlinkSync(directory, linkedDirectory);
+    await assert.rejects(
+      () =>
+        MindcoreClient.open({
+          storePath: linkedDirectory,
+          callerId: CALLER,
+        }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INVALID_INPUT');
+        assert.equal(error.details.kind, 'is a directory');
         return true;
       },
     );
@@ -152,7 +369,7 @@ describe('the in-process binding', () => {
     // A relative root names the directory that was current at open. The client retains the
     // resolved absolute path, so a later working-directory change cannot move the publication.
     const previous = process.cwd();
-    const elsewhere = mkdtempSync(join(tmpdir(), 'mindcore-elsewhere-'));
+    const elsewhere = scratchDirectory('mindcore-elsewhere-');
     const journalName = 'relative-journal';
     let mind;
     let candidateId;
