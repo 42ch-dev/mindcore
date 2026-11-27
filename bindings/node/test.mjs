@@ -160,6 +160,39 @@ describe('the in-process binding', () => {
     );
   });
 
+  it('provisions subjects on one store from two clients while the other writes', async () => {
+    // `ensureSubject` takes the write lock up front (`BEGIN IMMEDIATE`): a deferred transaction that
+    // upgrades after another connection's commit cannot be waited out, and SQLite answers
+    // SQLITE_BUSY_SNAPSHOT instead of retrying. Both clients share one file, so their write locks
+    // interleave — every call must settle as success.
+    const storePath = join(root, 'race.db');
+    const writer = await MindcoreClient.open({
+      storePath,
+      callerId: CALLER,
+      journalDir: join(root, 'race-journal'),
+    });
+    const mind = await writer.createMind({ displayName: 'Raced' });
+    const other = await MindcoreClient.open({
+      storePath,
+      callerId: CALLER,
+      journalDir: join(root, 'race-journal'),
+    });
+
+    const provisions = Array.from({ length: 8 }, (_, index) =>
+      other.ensureSubject(mind.id, `subj_race_${index}`),
+    );
+    const writes = [
+      writer.ensureSubject(mind.id, 'subj_race_writer'),
+      mind.capture({
+        subject: 'subj_race_writer',
+        content: { text: TEXT },
+        idempotencyKey: 'cap-race',
+      }),
+    ];
+    // Every one of these must resolve: a busy or stale-snapshot refusal fails the case.
+    await Promise.all([...provisions, ...writes]);
+  });
+
   it('creates a Mind when createMind is called with no argument', async () => {
     // The declaration says `options?`; the wrapper's default keeps that true against an addon
     // argument that is otherwise undefined.
