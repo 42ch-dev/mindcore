@@ -474,8 +474,25 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             // The resolved type decides: a symlink to a directory is a directory, and a journal root
             // reached through one is the operator's arrangement, not a fault. `metadata` follows the
             // link, so a link to a file or a FIFO still fails the gate below.
-            let metadata = std::fs::metadata(level)
-                .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
+            let metadata = match std::fs::metadata(level) {
+                Ok(metadata) => metadata,
+                // The nearest existing level cannot be read. If it is the root itself that is a
+                // journal fault; if it is an ancestor, it stops the walk like any other ancestor —
+                // the levels below it exist and are the operator's, and this start creates nothing
+                // above them.
+                Err(error) if level != dir && !chain.is_empty() => {
+                    eprintln!(
+                        "mindcore-daemon: journal: cannot inspect an ancestor ({error}); continuing"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(DaemonError::Journal(format!(
+                        "{}: {error}",
+                        level.display()
+                    )))
+                }
+            };
             if !metadata.is_dir() {
                 return Err(DaemonError::Journal(format!(
                     "{}: exists and is not a directory",
@@ -491,12 +508,36 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
     }
-    // Top-down: create what is missing, then sync every level's parent whether it was created now
-    // or was already there. `synced` is keyed on the resolved parent, so the second walk below costs
-    // nothing for a plain path and only adds the entries the first walk could not name.
+    // Top-down. Each missing level is created; each level's holding directory is flushed.
+    //
+    // Which failures are fatal is decided by *which directory* is being flushed, not by where it sits
+    // in the walk:
+    //
+    //   fatal      a directory this start created — losing its entry would take the levels beneath it
+    //              — and the root's own holding directory when the root already existed;
+    //   skipped    every other directory, because the operator supplied it. A `0o300` ancestor cannot
+    //              be opened for `fsync`, and that is not this start's failure.
+    //
+    // So the fatal set is built first, by path, and the loop asks whether the directory it is about to
+    // flush is in it. Deciding per-iteration from chain indices was wrong twice over.
+    let root_existed = existing == Some(0);
+    let mut fatal: Vec<PathBuf> = Vec::new();
+    for (index, level) in chain.iter().enumerate() {
+        if created_at(index, existing) {
+            if let Some(parent) = holding_directory(level) {
+                fatal.push(parent.to_path_buf());
+            }
+        }
+    }
+    if root_existed {
+        if let Some(parent) = holding_directory(dir) {
+            fatal.push(parent.to_path_buf());
+        }
+    }
+
     let mut synced: Vec<PathBuf> = Vec::new();
     for (index, level) in chain.iter().enumerate().rev() {
-        if Some(index) != existing {
+        if created_at(index, existing) {
             // Owner-only, not the umask's choice: the journal holds what the Mind settled on, and a
             // directory some other user can write into is a publication target they control. Only
             // levels this start creates get the mode; a pre-existing level keeps its own.
@@ -515,25 +556,46 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             .await
             .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))??;
         }
-        sync_level_entry(level, &mut synced).await?;
+
+        let Some(parent) = holding_directory(level) else {
+            continue;
+        };
+        let is_fatal = fatal.iter().any(|f| f == parent);
+        match sync_once(parent, &mut synced).await {
+            Ok(()) => {}
+            Err(error) if is_fatal => return Err(error),
+            Err(error) => eprintln!(
+                "mindcore-daemon: journal: cannot flush {} ({error}); continuing",
+                parent.display()
+            ),
+        }
     }
-    // A symlink in the chain means the journal really lives somewhere else. The first walk flushed
-    // the entry that names the link; the directory holding the *target* has its own entry, in its own
-    // parent, that nothing above has touched — so the resolved chain is walked too. A path with no
-    // symlink resolves to itself and every level here is already in `synced`.
+    // A symlink in the chain means the journal really lives somewhere else. The chain walk flushed
+    // the entry that names the link; the directory that really holds the root has its own entry, in
+    // its own parent, which nothing in that walk names — so that one entry is flushed too.
+    //
+    // Exactly one extra entry, never the ancestors above it: a root at `/srv/link/journal` resolving to
+    // `/data/journal` costs the chain's entries plus `/data` here, and stops. A plain path resolves to
+    // itself, so its holding directory is already in `synced` and this adds nothing — the walk stays
+    // one flush per level, and never touches a directory above the chain.
     let resolved = std::fs::canonicalize(dir).map_err(|error| {
         DaemonError::Journal(format!(
             "{}: the journal root cannot be resolved after it was created: {error}",
             dir.display()
         ))
     })?;
-    for level in resolved.ancestors() {
-        sync_level_entry(level, &mut synced).await?;
+    // The root's own entry, so a failure here is the root's: fatal, unlike an ancestor's.
+    if resolved != dir {
+        sync_level_entry(&resolved, &mut synced).await?;
     }
     Ok(())
 }
 
-/// Syncs `level`'s parent (the directory holding `level`'s entry) once per resolved directory.
+/// Flushes the directory holding `level`'s entry, once per resolved directory.
+///
+/// A level's own name lives in its parent, so creating or discovering `level` dirties that parent.
+/// The filesystem root has no parent and no directory holds its entry, so `holding_directory` answers
+/// `None` there and this does nothing.
 async fn sync_level_entry(level: &Path, synced: &mut Vec<PathBuf>) -> Result<(), DaemonError> {
     let Some(parent) = holding_directory(level) else {
         return Ok(());
@@ -556,6 +618,15 @@ async fn sync_once(parent: &Path, synced: &mut Vec<PathBuf>) -> Result<(), Daemo
     sync_parent(parent).await
 }
 
+/// Whether `chain[index]` was created by this start: everything below the first pre-existing level
+/// is, and that level and everything above it is not. Nothing pre-existing means every level is ours.
+fn created_at(index: usize, existing: Option<usize>) -> bool {
+    match existing {
+        None => true,
+        Some(first_existing) => index < first_existing,
+    }
+}
+
 /// The directory holding `level`'s entry; `None` at the filesystem root, which no directory holds.
 fn holding_directory(level: &Path) -> Option<&Path> {
     match level.parent() {
@@ -571,10 +642,12 @@ fn holding_directory(level: &Path) -> Option<&Path> {
 /// sync. `Some("")` is not that: it is what `Path::new("journal").parent()` answers, and it means the
 /// **current directory** — `Path::new("").parent()` is the `None` case — so a single-segment relative
 /// journal root syncs `"."` rather than skipping its own entry.
-/// Syncs `parent`, so the directory entry just created beneath it is durable.
+/// Flushes one directory: `fsync` on `parent`, so every entry it holds is durable.
 ///
-/// A failed sync is a journal fault naming the directory: reporting a clean start on a chain that is
-/// not yet on disk would promise durability the daemon does not have.
+/// This is the syscall itself; which directories deserve one is [`sync_level_entry`]'s and
+/// [`sync_once`]'s decision. A failure is a journal fault naming the directory — the caller has
+/// already established that the directory holds an entry this start is responsible for, so a
+/// clean-start report without it would promise durability the daemon does not have.
 async fn sync_parent(parent: &Path) -> Result<(), DaemonError> {
     #[cfg(test)]
     record_injected_sync(parent);
@@ -642,9 +715,11 @@ fn sync_attempts(path: &Path) -> usize {
 /// Forgets the attempts recorded for `path` only: the seam is one global, so a global wipe would
 /// race with another test's count.
 #[cfg(test)]
-/// Zeroes the count for `path`, so a test that syncs, clears and syncs again sees 1 then 1.
+/// Resets the count for `path` to zero, keeping the row.
 ///
-/// `retain` would drop the row and the second read would be indistinguishable from the first.
+/// The contract the tests rely on: after `clear`, one flush reads as `1`, not as an absent row. That
+/// is why this zeroes rather than removes — a removed row and a never-counted row would be the same
+/// reading, and the retry tests could not tell one flush from none.
 fn clear_sync_attempts(path: &Path) {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut attempts = SYNC_ATTEMPTS.lock().expect("sync attempt lock");
@@ -1789,10 +1864,11 @@ mod tests {
         assert!(holding_directory(Path::new("/")).is_none());
     }
 
-    /// A symlink in the chain means the journal really lives elsewhere; the directory holding the
-    /// target has an entry nothing in the configured walk names, so it must be flushed too.
+    /// A symlink in the chain means the journal really lives elsewhere. The daemon creates `journal`
+    /// inside the target directory, which dirties that directory — so the target is flushed, and the
+    /// walk stops there rather than climbing the target's ancestors.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_symlinked_journal_root_syncs_the_targets_directory() {
+    async fn a_symlinked_journal_root_syncs_the_target_directory() {
         let dir = TempDir::new().expect("temporary directory");
         let elsewhere = TempDir::new().expect("temporary directory");
         let real = elsewhere.path().join("real");
@@ -1800,14 +1876,23 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).expect("link to the real directory");
 
-        // The entry that names `real` lives in `elsewhere`, which the configured walk never visits.
+        // The directory the level was created in is the target, which the configured walk names only
+        // as the link.
+        clear_sync_attempts(&real);
         clear_sync_attempts(elsewhere.path());
         journal_root(&link.join("journal"))
             .await
             .expect("create through the link");
-        assert!(
-            sync_attempts(elsewhere.path()) > 0,
-            "the target's own directory entry was flushed"
+        assert_eq!(
+            sync_attempts(&real),
+            1,
+            "the target directory holds the new level, so it is flushed"
+        );
+        // Bounded: the target's own ancestors are the operator's and are not walked.
+        assert_eq!(
+            sync_attempts(elsewhere.path()),
+            0,
+            "the walk stops at the target, not at its ancestors"
         );
 
         // A plain path is unchanged: one flush per level, and no resolved walk adds any.
@@ -1826,7 +1911,112 @@ mod tests {
         assert_eq!(sync_attempts(dir.path()), 1, "the ancestor once");
     }
 
-    /// The chain sync is idempotent across restarts, not first-creation-only. A start that created a
+    /// An ancestor *above* the root's holding directory cannot be flushed and is skipped, not fatal.
+    ///
+    /// The ancestor must sit at least two levels above the root, or it is the directory this start
+    /// created its level in — and that flush is deliberately fatal. `0o300` is the mode that
+    /// separates the two requirements: write and search, so `mkdir` beneath it succeeds, but not read,
+    /// so `open(O_RDONLY)` for `fsync` fails (measured on this platform; `0o711` still opens, and
+    /// `0o000`/`0o100` deny `mkdir`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unflushable_ancestor_above_the_root_is_skipped() {
+        // Mode bits do not constrain uid 0, so the environment cannot be built as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = TempDir::new().expect("temporary directory");
+        let ancestor = dir.path().join("ancestor");
+        std::fs::create_dir(&ancestor).expect("create the ancestor");
+        // The root's holding directory, which already exists, so the daemon creates only the leaf.
+        let holder = ancestor.join("holder");
+        std::fs::create_dir(&holder).expect("create the holder");
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o300))
+            .expect("make the ancestor writable but unreadable");
+
+        let root = holder.join("journal");
+        let outcome = journal_root(&root).await;
+        // Restore before asserting, so a failure leaves nothing unreachable behind.
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755))
+            .expect("restore the ancestor");
+
+        outcome.expect("an unflushable ancestor above the root must not refuse the start");
+        assert!(root.is_dir(), "the root was created and accepted");
+    }
+
+    /// The walk is bounded by the chain: a root under an existing directory flushes that directory and
+    /// stops, so the cost is one flush per level and no ancestor is ever opened.
+    ///
+    /// Counted on the chain's own directories, never on a shared one: every test's tempdir sits under
+    /// the same `/var/folders/.../T`, so asserting that a shared parent was never flushed races with
+    /// the other tests running in parallel — the first version of this test did, failing one run in
+    /// five. Boundedness is therefore asserted where it is a property of this call alone: the flush
+    /// count on the chain's own two directories, which a walk that climbed to `/` would exceed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_walk_stops_at_the_root_s_holding_directory() {
+        let outer = TempDir::new().expect("temporary directory");
+        let holder = outer.path().join("holder");
+        std::fs::create_dir(&holder).expect("create the holder");
+
+        clear_sync_attempts(&holder);
+        clear_sync_attempts(outer.path());
+        journal_root(&holder.join("journal"))
+            .await
+            .expect("create the root");
+
+        // The chain is `[root, holder, outer]`: one flush each, and it stops there.
+        assert_eq!(sync_attempts(&holder), 1, "the holding directory, once");
+        assert_eq!(
+            sync_attempts(outer.path()),
+            1,
+            "the holding directory's own entry, once"
+        );
+        // The whole cost: two flushes for a two-level chain, one directory each. That the walk stops
+        // here rather than climbing is asserted without a shared path in
+        // `the_walk_never_claims_an_entry_above_the_chain`.
+    }
+
+    /// The walk's fatal set is exactly the holders of the levels this start created — never a directory
+    /// above them. Asserted on the decision itself, so no shared path's counters are involved.
+    #[test]
+    fn the_fatal_set_names_only_holders_of_created_levels() {
+        // `[root, holder, /srv]` where `/srv` is the first pre-existing level.
+        let root = Path::new("/srv/holder/journal");
+        let holder = Path::new("/srv/holder");
+        let srv = Path::new("/srv");
+        let chain: Vec<&Path> = vec![root, holder, srv];
+        let existing = Some(2);
+
+        let created: Vec<&Path> = chain
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| created_at(*index, existing))
+            .map(|(_, level)| *level)
+            .collect();
+        assert_eq!(
+            created,
+            vec![root, holder],
+            "only the missing levels are ours"
+        );
+
+        // Their holders: `holder` (for the root) and `/srv` (for `holder`). `/srv` is in the chain and
+        // is a level this start created a child in, so flushing it is owed — and nothing above `/srv`
+        // is named at all.
+        let mut fatal: Vec<&Path> = created
+            .iter()
+            .filter_map(|level| holding_directory(level))
+            .collect();
+        assert_eq!(fatal, vec![holder, srv]);
+        fatal.retain(|path| {
+            path.parent()
+                .is_some_and(|parent| parent != Path::new("/srv"))
+        });
+        assert!(
+            !fatal.iter().any(|path| *path == Path::new("/")),
+            "the filesystem root is never in the fatal set"
+        );
+    }
+
+    /// The chain sync is idempotent across restarts, not first-creation-only.    /// The chain sync is idempotent across restarts, not first-creation-only. A start that created a
     /// level and then failed before syncing its entry leaves nothing marking which entry is unproven,
     /// so the next start must re-sync every component — including the ones it found already there.
     #[tokio::test(flavor = "multi_thread")]
@@ -1854,7 +2044,8 @@ mod tests {
             "the first start attempted it once"
         );
 
-        // Second start, seam cleared: the level now exists, and its parent is synced again.
+        // Second start, seam cleared: the root now exists, so its own holding directory is flushed
+        // again — the entry may still be unsynced from the start that failed above.
         clear_sync_attempts(&parent);
         journal_root(&root)
             .await
@@ -1862,7 +2053,7 @@ mod tests {
         assert_eq!(
             sync_attempts(&parent),
             1,
-            "the restart re-synced the already-existing level's parent"
+            "the restart re-flushed the already-existing root's own entry"
         );
     }
 
