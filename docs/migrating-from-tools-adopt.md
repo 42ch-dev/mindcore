@@ -14,7 +14,7 @@ A caller moves as follows.
 | `entry_id` | `source_entry_id` |
 | positive integer `expected_source_revision` | positive integer `source_revision` |
 | — | `source_scope_id`, required: it must equal `ServeFaces.adoption`'s `AdoptionRoute.scope_id` |
-| — | `destination_scope_id`, required: it must equal the peer's admitted scope id |
+| — | `destination_scope_id`, required: the admitted Mind's scope id |
 | — | `idempotency_key`, required: 1–128 code points |
 | — | `destination_entry_id`, optional: absent, the copy takes the resolved terminal's entry id |
 | `outcome` `created` | `outcome` `adopted` |
@@ -22,38 +22,48 @@ A caller moves as follows.
 
 ## The destination moved
 
-The destination is no longer per-principal. `knowledge.adopt` writes the copy into the collection
-the knowledge face serves (`ServeFaces.knowledge`), not the adopting principal's `workflow_routes`
-entry. A copy is therefore readable through the same `knowledge.get`/`list` that admitted the
-adoption.
+The destination is no longer per-principal. `knowledge.adopt` writes the copy into the knowledge
+collection of the Mind the call is admitted against — the same collection that Mind's
+`knowledge.get`/`list` read — not into a collection selected for the adopting principal. A copy is
+therefore readable through the same `knowledge.get`/`list` that admitted the adoption.
 
-That collection is shared: it holds one slot per `destination_entry_id`, and the first adoption of
-a given id claims it. A repeat answers `already_present` with the stored copy only when its anchor
-names the same source revision. A copy adopted at another revision is `REVISION_CONFLICT` with
-`details.adopted_revision`, and a peer whose admitted selection hides the copy is answered the
-occupancy refusal, not the copy.
+No host field and no wire member picks that collection: `destination_scope_id` selects the Mind,
+and the Mind's registry row supplies the collection it serves.
 
-`workflow_routes` now selects and authorizes workflow calls only, and authorizes nothing for
-adoption. A principal with knowledge admission and no workflow route adopts normally.
+The slot rules are per collection: it holds one slot per `destination_entry_id`, and the first
+adoption of a given id claims it. A repeat answers `already_present` with the stored copy only
+when its anchor names the same source revision. A copy adopted at another revision is
+`REVISION_CONFLICT` with `details.adopted_revision`, and a peer whose admitted selection hides the
+copy is answered the occupancy refusal, not the copy.
+
+Adoption consults no workflow-facing setting: it needs one live grant in that Mind's space,
+covering both `knowledge_write` and `knowledge_read`. A principal holding that grant adopts
+normally.
 
 ## Breaking assembly change
 
-A host that set the adoption source and `ServeFaces.knowledge` to the same collection used to
-assemble, because the copy went to the principal's distinct route collection. Assembly now refuses
-that configuration (`InvalidInput`, "the adoption source collection is the collection the
-knowledge face serves").
+A host that pointed the adoption source at a collection a Mind serves used to assemble, because
+the copy went to a collection selected per principal. Assembly now refuses that configuration
+(`InvalidInput`, "the adoption source <collection> is a registered Mind's knowledge collection"),
+and refuses a source scope id equal to a registered Mind's id the same way. Every registered Mind
+is a possible destination, so the collision is refused whatever Mind holds it; the port repeats
+both checks per call, because a Mind created after assembly can still take a colliding id or
+collection.
 
 Migrate by:
 
-1. naming a distinct adoption source collection — it must differ from
-   `ServeFaces.knowledge.collection` and from every `workflow_routes` destination, and
-2. no longer expecting a route to name an adoption destination.
+1. naming a distinct adoption source collection — it must differ from every registered Mind's
+   knowledge collection, and its scope id from every registered Mind's id, and
+2. no longer expecting any configuration to name an adoption destination — the admitted Mind's
+   registry row is that destination.
 
 ## Two behaviour changes
 
-- **Knowledge admission is now required as well.** Adoption admits through
-  `(principals(peer)?, knowledge_admission(peer)?)`, so a routed principal the knowledge face does
-  not admit answers `NOT_AUTHORIZED` where the product tool served it.
+- **Knowledge adoption requires the knowledge grant as well.** Admission runs the Mind's admission
+  and then the operation's own grant, so a peer the knowledge face does not admit — or one whose
+  live grant there does not cover both `knowledge_write` and `knowledge_read` — answers
+  `NOT_AUTHORIZED` where the product tool served it. That includes a replayed adoption: the grant
+  is checked at admission, before Connect answers the recorded outcome.
 - **The source resolves through its retirement chain before the copy is written.** An adopted
   entry's anchor names the live terminal rather than a retired hop. A chain that cannot resolve —
   a cycle, an ambiguous merge, a missing hop, more than 32 edges — answers `SOURCE_RETIRED` with
