@@ -157,12 +157,14 @@ impl DaemonConfig {
     }
 }
 
-/// Refuses a seed file group or other can read or write.
+/// Refuses a seed file group or other can read, write or execute.
 ///
 /// The seed is the responder's signing identity. Anyone who can read it can speak as this daemon, and
 /// anyone who can write it can put their own key in its place and speak as this daemon too — so a
-/// mode with any group or other bit set is a configuration fault rather than a warning. Only the mode
-/// bits are reported, never the bytes, so the refusal can be shown without leaking the key.
+/// mode with any group or other bit set is a configuration fault rather than a warning. The execute
+/// bits are included because the message says "group or other": a mode the guard lets through must
+/// not be one the wording claims to refuse. Only the mode bits are reported, never the bytes, so the
+/// refusal can be shown without leaking the key.
 #[cfg(unix)]
 fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt;
@@ -174,11 +176,12 @@ fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
         .permissions()
         .mode()
         & 0o777;
-    // Any group or other bit: `0o0620` is writable by group, which is as fatal as readable.
-    if mode & 0o066 != 0 {
+    // Every group and other bit, execute included: `0o0620` is writable by group, as fatal as
+    // readable, and `0o0611` is executable — the wording says "group or other", so all three count.
+    if mode & 0o077 != 0 {
         return Err(DaemonError::Config(format!(
-            "identity.seed_file {}: mode {mode:04o} is readable or writable by group or other; \
-             use 0600",
+            "identity.seed_file {}: mode {mode:04o} is readable, writable or executable by group or \
+             other; use 0600",
             path.display()
         )));
     }
@@ -397,7 +400,7 @@ journal_dir = "{}"
                 assert!(message.contains("identity.seed_file"), "{message}");
                 assert!(message.contains("0644"), "the mode is named: {message}");
                 assert!(
-                    message.contains("readable or writable by group or other"),
+                    message.contains("readable, writable or executable by group or other"),
                     "{message}"
                 );
                 assert!(
@@ -434,6 +437,10 @@ journal_dir = "{}"
             (0o620, "group-writable"),
             (0o602, "other-writable"),
             (0o622, "group- and other-writable"),
+            // Execute only: the wording says "group or other", so these count too.
+            (0o611, "group-executable and other-executable"),
+            (0o641, "group-readable and other-executable"),
+            (0o601, "other-executable"),
         ] {
             write_seed(&seed, SEED);
             std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(mode))
@@ -445,7 +452,7 @@ journal_dir = "{}"
                         "{label}: the mode is named: {message}"
                     );
                     assert!(
-                        message.contains("readable or writable by group or other"),
+                        message.contains("readable, writable or executable by group or other"),
                         "{label}: {message}"
                     );
                     assert!(
