@@ -474,25 +474,11 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             // The resolved type decides: a symlink to a directory is a directory, and a journal root
             // reached through one is the operator's arrangement, not a fault. `metadata` follows the
             // link, so a link to a file or a FIFO still fails the gate below.
-            let metadata = match std::fs::metadata(level) {
-                Ok(metadata) => metadata,
-                // The nearest existing level cannot be read. If it is the root itself that is a
-                // journal fault; if it is an ancestor, it stops the walk like any other ancestor —
-                // the levels below it exist and are the operator's, and this start creates nothing
-                // above them.
-                Err(error) if level != dir && !chain.is_empty() => {
-                    eprintln!(
-                        "mindcore-daemon: journal: cannot inspect an ancestor ({error}); continuing"
-                    );
-                    break;
-                }
-                Err(error) => {
-                    return Err(DaemonError::Journal(format!(
-                        "{}: {error}",
-                        level.display()
-                    )))
-                }
-            };
+            // A level that cannot be inspected is a journal fault, wherever in the chain it sits: the
+            // walk cannot tell an ancestor from the level beneath the root, and stopping early would
+            // skip the flush this start owes — which is the defect this rule exists to prevent.
+            let metadata = std::fs::metadata(level)
+                .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
             if !metadata.is_dir() {
                 return Err(DaemonError::Journal(format!(
                     "{}: exists and is not a directory",
@@ -508,33 +494,16 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
     }
-    // Top-down. Each missing level is created; each level's holding directory is flushed.
+    // Top-down. Each missing level is created, and every level of the chain has its holding directory
+    // flushed.
     //
-    // Which failures are fatal is decided by *which directory* is being flushed, not by where it sits
-    // in the walk:
-    //
-    //   fatal      a directory this start created — losing its entry would take the levels beneath it
-    //              — and the root's own holding directory when the root already existed;
-    //   skipped    every other directory, because the operator supplied it. A `0o300` ancestor cannot
-    //              be opened for `fsync`, and that is not this start's failure.
-    //
-    // So the fatal set is built first, by path, and the loop asks whether the directory it is about to
-    // flush is in it. Deciding per-iteration from chain indices was wrong twice over.
-    let root_existed = existing == Some(0);
-    let mut fatal: Vec<PathBuf> = Vec::new();
-    for (index, level) in chain.iter().enumerate() {
-        if created_at(index, existing) {
-            if let Some(parent) = holding_directory(level) {
-                fatal.push(parent.to_path_buf());
-            }
-        }
-    }
-    if root_existed {
-        if let Some(parent) = holding_directory(dir) {
-            fatal.push(parent.to_path_buf());
-        }
-    }
-
+    // Every level of the chain, whether this start created it or found it: a start that created a
+    // level and then failed before flushing its holder aborted, but the directory it made is still
+    // there. Next time that level is "pre-existing", and treating its holder as an operator's
+    // directory would warn and carry on — publishing under an entry nobody ever made durable. So the
+    // chain is this start's responsibility in full; only directories *above* it are the operator's,
+    // where a fault is reported and skipped (`holding_directory` never names one, so the walk cannot
+    // reach them at all).
     let mut synced: Vec<PathBuf> = Vec::new();
     for (index, level) in chain.iter().enumerate().rev() {
         if created_at(index, existing) {
@@ -560,15 +529,9 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
         let Some(parent) = holding_directory(level) else {
             continue;
         };
-        let is_fatal = fatal.iter().any(|f| f == parent);
-        match sync_once(parent, &mut synced).await {
-            Ok(()) => {}
-            Err(error) if is_fatal => return Err(error),
-            Err(error) => eprintln!(
-                "mindcore-daemon: journal: cannot flush {} ({error}); continuing",
-                parent.display()
-            ),
-        }
+        // Fatal throughout the chain: see above. A level created by an earlier failed start is
+        // indistinguishable from one this start creates, and both owe a durable entry.
+        sync_once(parent, &mut synced).await?;
     }
     // A symlink in the chain means the journal really lives somewhere else. The chain walk flushed
     // the entry that names the link; the directory that really holds the root has its own entry, in
@@ -1911,46 +1874,60 @@ mod tests {
         assert_eq!(sync_attempts(dir.path()), 1, "the ancestor once");
     }
 
-    /// An ancestor *above* the root's holding directory cannot be flushed and is skipped, not fatal.
-    ///
-    /// The ancestor must sit at least two levels above the root, or it is the directory this start
-    /// created its level in — and that flush is deliberately fatal. `0o300` is the mode that
-    /// separates the two requirements: write and search, so `mkdir` beneath it succeeds, but not read,
-    /// so `open(O_RDONLY)` for `fsync` fails (measured on this platform; `0o711` still opens, and
-    /// `0o000`/`0o100` deny `mkdir`).
+    /// A level whose holder flush failed on one start must not become "pre-existing, therefore the
+    /// operator's" on the next: the directory it created is still there, and its entry was never made
+    /// durable. So the chain stays fatal in full, and a restart re-attempts the same flush.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_unflushable_ancestor_above_the_root_is_skipped() {
-        // Mode bits do not constrain uid 0, so the environment cannot be built as root.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
+    async fn a_failed_holder_flush_is_retried_fatally_on_the_next_start() {
         let dir = TempDir::new().expect("temporary directory");
-        let ancestor = dir.path().join("ancestor");
-        std::fs::create_dir(&ancestor).expect("create the ancestor");
-        // The root's holding directory, which already exists, so the daemon creates only the leaf.
-        let holder = ancestor.join("holder");
+        let holder = dir.path().join("holder");
         std::fs::create_dir(&holder).expect("create the holder");
-        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o300))
-            .expect("make the ancestor writable but unreadable");
-
         let root = holder.join("journal");
-        let outcome = journal_root(&root).await;
-        // Restore before asserting, so a failure leaves nothing unreachable behind.
-        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755))
-            .expect("restore the ancestor");
 
-        outcome.expect("an unflushable ancestor above the root must not refuse the start");
-        assert!(root.is_dir(), "the root was created and accepted");
+        // First start: the root is created, then the flush of its holder fails.
+        clear_sync_attempts(&holder);
+        push_injected_sync_failure(&holder);
+        match journal_root(&root).await {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("injected sync fault"), "{message}")
+            }
+            other => panic!("the armed first start must fail, not {other:?}"),
+        }
+        assert!(
+            root.is_dir(),
+            "the level was created before the flush failed"
+        );
+
+        // Second start, fault cleared: the level now exists, and the same holder is flushed again —
+        // and this time a failure is still fatal, because it is the same owed entry.
+        clear_sync_attempts(&holder);
+        journal_root(&root)
+            .await
+            .expect("the retry accepts the directory");
+        assert_eq!(
+            sync_attempts(&holder),
+            1,
+            "the restart re-attempts the same level's holder"
+        );
+
+        // A permanently failing holder refuses every start, not just the one that created the level.
+        push_injected_sync_failure(&holder);
+        match journal_root(&root).await {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("injected sync fault"), "{message}")
+            }
+            other => panic!("a pre-existing level's failed flush must still refuse, not {other:?}"),
+        }
     }
 
     /// The walk is bounded by the chain: a root under an existing directory flushes that directory and
-    /// stops, so the cost is one flush per level and no ancestor is ever opened.
+    /// stops, so the cost is one flush per level.
     ///
     /// Counted on the chain's own directories, never on a shared one: every test's tempdir sits under
     /// the same `/var/folders/.../T`, so asserting that a shared parent was never flushed races with
     /// the other tests running in parallel — the first version of this test did, failing one run in
-    /// five. Boundedness is therefore asserted where it is a property of this call alone: the flush
-    /// count on the chain's own two directories, which a walk that climbed to `/` would exceed.
+    /// five. Boundedness is asserted where it is a property of this call alone: the flush count on
+    /// the chain's own two directories, which a walk that climbed to `/` would exceed.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_walk_stops_at_the_root_s_holding_directory() {
         let outer = TempDir::new().expect("temporary directory");
@@ -1970,49 +1947,46 @@ mod tests {
             1,
             "the holding directory's own entry, once"
         );
-        // The whole cost: two flushes for a two-level chain, one directory each. That the walk stops
-        // here rather than climbing is asserted without a shared path in
-        // `the_walk_never_claims_an_entry_above_the_chain`.
+        // The whole cost: two flushes for a two-level chain, one directory each.
     }
 
-    /// The walk's fatal set is exactly the holders of the levels this start created — never a directory
-    /// above them. Asserted on the decision itself, so no shared path's counters are involved.
-    #[test]
-    fn the_fatal_set_names_only_holders_of_created_levels() {
-        // `[root, holder, /srv]` where `/srv` is the first pre-existing level.
-        let root = Path::new("/srv/holder/journal");
-        let holder = Path::new("/srv/holder");
-        let srv = Path::new("/srv");
-        let chain: Vec<&Path> = vec![root, holder, srv];
-        let existing = Some(2);
+    /// Every directory the walk flushes is inside the chain and fatal, and nothing above the chain is
+    /// named at all. Driven through `journal_root` itself so the split is the code's, not a
+    /// reimplementation of it: with the fault armed on the chain's highest holder the start refuses, and
+    /// with it armed on the directory above the chain the start succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fault_inside_the_chain_refuses_and_one_above_it_does_not() {
+        let outer = TempDir::new().expect("temporary directory");
+        let holder = outer.path().join("holder");
+        std::fs::create_dir(&holder).expect("create the holder");
+        let root = holder.join("journal");
 
-        let created: Vec<&Path> = chain
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| created_at(*index, existing))
-            .map(|(_, level)| *level)
-            .collect();
+        // Inside the chain: the holder of a level, fatal.
+        push_injected_sync_failure(&holder);
+        match journal_root(&root).await {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("injected sync fault"), "{message}")
+            }
+            other => panic!("a fault on the chain's own holder must refuse, not {other:?}"),
+        }
+        assert!(root.is_dir(), "the levels were created before the refusal");
+
+        // Above the chain: `outer` holds the chain's top level, and the walk never flushes it — it is
+        // the operator's. A fault there is never taken, so the start succeeds.
+        clear_sync_attempts(outer.path());
+        push_injected_sync_failure(outer.path());
+        journal_root(&root)
+            .await
+            .expect("a fault above the chain is never reached, so it cannot refuse");
         assert_eq!(
-            created,
-            vec![root, holder],
-            "only the missing levels are ours"
+            sync_attempts(outer.path()),
+            0,
+            "the walk never flushed a directory above the chain"
         );
-
-        // Their holders: `holder` (for the root) and `/srv` (for `holder`). `/srv` is in the chain and
-        // is a level this start created a child in, so flushing it is owed — and nothing above `/srv`
-        // is named at all.
-        let mut fatal: Vec<&Path> = created
-            .iter()
-            .filter_map(|level| holding_directory(level))
-            .collect();
-        assert_eq!(fatal, vec![holder, srv]);
-        fatal.retain(|path| {
-            path.parent()
-                .is_some_and(|parent| parent != Path::new("/srv"))
-        });
+        // The armed fault is still there: nothing consumed it, which is the point.
         assert!(
-            !fatal.iter().any(|path| *path == Path::new("/")),
-            "the filesystem root is never in the fatal set"
+            take_injected_sync_failure(outer.path()),
+            "the fault above the chain was never taken"
         );
     }
 
