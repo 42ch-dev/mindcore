@@ -152,12 +152,13 @@ impl BoundSocket {
     /// The explicit cleanup a failed start calls: `Drop` cannot report, so it is only the last
     /// resort. Clears `armed` first, so a later `Drop` neither repeats the attempt nor reports a
     /// second, contradictory answer.
-    fn cleanup(&mut self) -> Result<(), DaemonError> {
+    async fn cleanup(&mut self) -> Result<(), DaemonError> {
         if !self.armed {
             return Ok(());
         }
         self.armed = false;
         remove_if_own(&self.path, self.identity)
+            .await
             .map_err(|fault| DaemonError::Socket(format!("{}: {fault}", self.path.display())))
     }
 
@@ -175,7 +176,11 @@ impl Drop for BoundSocket {
     /// because `Drop` cannot report; a name that changed identity is left alone by `remove_if_own`
     /// exactly as the drain would leave it.
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let _ = remove_if_own_blocking(&self.path, self.identity);
     }
 }
 
@@ -192,7 +197,7 @@ pub async fn run(
     let store = MindStore::open(&store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", store_path.display())))?;
-    journal_root(&config.journal.dir)?;
+    journal_root(&config.journal.dir).await?;
     // `MindcoreServe` owns the store, so the pool handle is kept here: it is the reachable route
     // to the awaited close the drain order names, and it closes the same pool.
     let pool = store.pool();
@@ -220,7 +225,7 @@ pub async fn run(
     // The guard owns the bound name from here, and the steps below are prepared without letting
     // `?` drop it: a failure is cleaned up explicitly, so the refusal can report what the removal
     // did instead of leaving `Drop` to swallow it.
-    let mut bound = match listen(&config) {
+    let mut bound = match listen(&config).await {
         Ok(bound) => bound,
         Err(error) => {
             // No listener exists, but the store's pool is open: end its connections before the
@@ -233,7 +238,7 @@ pub async fn run(
         Ok(prepared) => prepared,
         Err(error) => {
             pool.close().await;
-            return Err(cleanup_refusal(&mut bound, error));
+            return Err(cleanup_refusal(&mut bound, error).await);
         }
     };
     // The accept loop owns the listener from here; the guard has nothing left to undo.
@@ -261,12 +266,32 @@ pub async fn run(
     connections.shutdown().await;
     drain_sessions(&std::mem::take(&mut *host.live.lock().expect("live lock")));
     // Only the socket this daemon bound is removed; a name since replaced is refused and stays.
-    let removed = remove_own_socket(&config.socket_path, host.socket);
+    let removed = remove_own_socket(&config.socket_path, host.socket).await;
     // Step 4: the store's connections finish rather than being cut when the runtime drops. Inline
     // so the pool's type stays the surface's business, not this module's.
     pool.close().await;
     drop(lock);
-    serving.and(removed)
+    settle(serving, removed, &config.socket_path)
+}
+
+/// The drain's last word: both faults travel.
+///
+/// `Result::and` would report only the accept fault and drop the removal's, leaving an operator who
+/// sees a non-zero exit with no idea the socket name is still there.
+fn settle(
+    serving: Result<(), DaemonError>,
+    removed: Result<(), DaemonError>,
+    socket_path: &Path,
+) -> Result<(), DaemonError> {
+    match (serving, removed) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(serving), Err(removed)) => Err(DaemonError::Socket(format!(
+            "{serving} and the socket name could not be removed ({removed}): remove {} before the \
+             next start",
+            socket_path.display()
+        ))),
+    }
 }
 
 /// Installs the surface's handlers, or answers why not.
@@ -329,8 +354,8 @@ async fn prepare(
 ///
 /// `Drop` cannot report, so the removal is explicit here: when it fails too the message names the
 /// removal error and the leftover path, the same wording `bind` uses for the window inside itself.
-fn cleanup_refusal(bound: &mut BoundSocket, error: DaemonError) -> DaemonError {
-    match bound.cleanup() {
+async fn cleanup_refusal(bound: &mut BoundSocket, error: DaemonError) -> DaemonError {
+    match bound.cleanup().await {
         Ok(()) => error,
         Err(cleanup) => DaemonError::Socket(format!(
             "{error} and the socket name could not be removed ({cleanup}): remove {} before the \
@@ -348,7 +373,7 @@ fn cleanup_refusal(bound: &mut BoundSocket, error: DaemonError) -> DaemonError {
 /// start found already there. A start that failed after creating a level but before syncing its
 /// entry left that entry unproven, and nothing marks which one it was — so the next start redoes the
 /// whole chain, and redoing an already-durable sync costs one `fsync`.
-fn journal_root(dir: &Path) -> Result<(), DaemonError> {
+async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
     // Bottom-up: every level from the root up to the first one that exists, which is included.
     let mut chain: Vec<&Path> = Vec::new();
     let mut existing = None;
@@ -381,17 +406,22 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             // Owner-only, not the umask's choice: the journal holds what the Mind settled on, and a
             // directory some other user can write into is a publication target they control. Only
             // levels this start creates get the mode; a pre-existing level keeps its own.
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(JOURNAL_DIR_MODE);
-            }
-            builder
-                .create(level)
-                .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
+            let path = level.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(JOURNAL_DIR_MODE);
+                }
+                builder
+                    .create(&path)
+                    .map_err(|error| DaemonError::Journal(format!("{}: {error}", path.display())))
+            })
+            .await
+            .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))??;
         }
-        sync_parent_of(level)?;
+        sync_parent_of(level).await?;
     }
     Ok(())
 }
@@ -402,11 +432,11 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
 /// sync. `Some("")` is not that: it is what `Path::new("journal").parent()` answers, and it means the
 /// **current directory** — `Path::new("").parent()` is the `None` case — so a single-segment relative
 /// journal root syncs `"."` rather than skipping its own entry.
-fn sync_parent_of(level: &Path) -> Result<(), DaemonError> {
+async fn sync_parent_of(level: &Path) -> Result<(), DaemonError> {
     match level.parent() {
         None => Ok(()),
-        Some(parent) if parent.as_os_str().is_empty() => sync_parent(Path::new(".")),
-        Some(parent) => sync_parent(parent),
+        Some(parent) if parent.as_os_str().is_empty() => sync_parent(Path::new(".")).await,
+        Some(parent) => sync_parent(parent).await,
     }
 }
 
@@ -414,7 +444,7 @@ fn sync_parent_of(level: &Path) -> Result<(), DaemonError> {
 ///
 /// A failed sync is a journal fault naming the directory: reporting a clean start on a chain that is
 /// not yet on disk would promise durability the daemon does not have.
-fn sync_parent(parent: &Path) -> Result<(), DaemonError> {
+async fn sync_parent(parent: &Path) -> Result<(), DaemonError> {
     #[cfg(test)]
     record_injected_sync(parent);
     #[cfg(test)]
@@ -424,9 +454,18 @@ fn sync_parent(parent: &Path) -> Result<(), DaemonError> {
             parent.display()
         )));
     }
-    File::open(parent)
-        .and_then(|parent| parent.sync_all())
-        .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))
+    // `fsync` blocks the thread it runs on, and this one is a runtime worker: a parked worker cannot
+    // drive the accept loop or a session. The blocking pool is where a syscall of unknown duration
+    // belongs.
+    let path = parent.to_path_buf();
+    let fault = tokio::task::spawn_blocking(move || {
+        File::open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| DaemonError::Journal(format!("{}: {error}", path.display())))
+    })
+    .await
+    .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))?;
+    fault
 }
 
 /// A test seam: the next sync of this exact directory fails, and every sync attempt is counted. An
@@ -676,17 +715,51 @@ fn drain_sessions(live: &[(usize, Arc<ConnectResponder>)]) {
 // shortcut: POSIX cannot unlink by inode, so a process running as the same user can replace the
 // name between the identity check and `remove_file`. The daemon is not designed to resist a local
 // same-user attacker — upgrade if that changes.
-fn remove_own_socket(socket_path: &Path, owned: SocketIdentity) -> Result<(), DaemonError> {
+async fn remove_own_socket(socket_path: &Path, owned: SocketIdentity) -> Result<(), DaemonError> {
     remove_if_own(socket_path, owned)
+        .await
         .map_err(|fault| DaemonError::Socket(format!("{}: {fault}", socket_path.display())))
 }
 
 /// The conditional unlink both callers share: `NotFound` is the intended end state, and a name
 /// that is no longer the socket `owned` names — a different file type, or a different device and
 /// inode — is refused with nothing removed.
-fn remove_if_own(socket_path: &Path, owned: SocketIdentity) -> Result<(), String> {
+async fn remove_if_own(socket_path: &Path, owned: SocketIdentity) -> Result<(), String> {
+    if matches!(check_is_own(socket_path, owned)?, Occupant::Absent) {
+        return Ok(());
+    }
+    // `unlink` is fast on a local filesystem but is still a syscall, and it must not park a runtime
+    // worker mid-drain.
+    let path = socket_path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::remove_file(&path))
+        .await
+        .map_err(|error| format!("the socket name could not be removed: {error}"))?
+        .map_err(|error| format!("the socket name could not be removed: {error}"))
+}
+
+/// The synchronous form, for `Drop`: it cannot await, and a start that reaches it has already
+/// failed, so one inline syscall is not a serving delay.
+fn remove_if_own_blocking(socket_path: &Path, owned: SocketIdentity) -> Result<(), String> {
+    if matches!(check_is_own(socket_path, owned)?, Occupant::Absent) {
+        return Ok(());
+    }
+    std::fs::remove_file(socket_path)
+        .map_err(|error| format!("the socket name could not be removed: {error}"))
+}
+
+/// What a removal should do with the name it found.
+enum Occupant {
+    /// Nothing is there: already the intended end state, and nothing to unlink.
+    Absent,
+    /// The socket this daemon bound: unlink it.
+    Own,
+}
+
+/// The rules both removals share: absent is the intended end state, a different occupant is refused
+/// with nothing touched, and only a socket of the recorded identity may be unlinked.
+fn check_is_own(socket_path: &Path, owned: SocketIdentity) -> Result<Occupant, String> {
     let metadata = match std::fs::symlink_metadata(socket_path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Occupant::Absent),
         Err(error) => return Err(format!("the socket name could not be inspected: {error}")),
         Ok(metadata) => metadata,
     };
@@ -702,8 +775,7 @@ fn remove_if_own(socket_path: &Path, owned: SocketIdentity) -> Result<(), String
                 .to_string(),
         );
     }
-    std::fs::remove_file(socket_path)
-        .map_err(|error| format!("the socket name could not be removed: {error}"))
+    Ok(Occupant::Own)
 }
 
 /// Binds `socket_path`, removing the name only when it is a socket established to be dead, and
@@ -713,7 +785,7 @@ fn remove_if_own(socket_path: &Path, owned: SocketIdentity) -> Result<(), String
 /// the seed file, any other file, a directory, a symlink or a device — is refused rather than
 /// destroyed. The one removal on a start re-checks the identity it just took, so a socket swapped
 /// in between the probe and the unlink survives.
-fn listen(config: &DaemonConfig) -> Result<BoundSocket, DaemonError> {
+async fn listen(config: &DaemonConfig) -> Result<BoundSocket, DaemonError> {
     let socket_path = &config.socket_path;
     let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", socket_path.display()));
 
@@ -733,7 +805,9 @@ fn listen(config: &DaemonConfig) -> Result<BoundSocket, DaemonError> {
     // A socket is the one kind this daemon may remove, and only when its own probe says no
     // listener answers.
     let stale = SocketIdentity::of(&metadata);
-    match std::os::unix::net::UnixStream::connect(socket_path) {
+    // The async dial: a synchronous connect on a socket whose listener is slow to answer would park
+    // a runtime worker, and this runs before the accept loop that same worker must then drive.
+    match UnixStream::connect(socket_path).await {
         Ok(_) => return Err(fail("a live listener already owns the name".to_string())),
         Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
         Err(error) => {
@@ -744,7 +818,7 @@ fn listen(config: &DaemonConfig) -> Result<BoundSocket, DaemonError> {
     }
     // Bound to the identity taken before the probe: a socket swapped in since is refused and
     // stays, because it is not the one this start established to be dead.
-    remove_if_own(socket_path, stale).map_err(fail)?;
+    remove_if_own(socket_path, stale).await.map_err(fail)?;
     BoundSocket::bind(socket_path)
 }
 
@@ -1099,7 +1173,7 @@ mod tests {
         let config = config(dir.path());
         let bytes = b"somebody else's file";
         std::fs::write(&config.socket_path, bytes).expect("write the file");
-        match listen(&config) {
+        match listen(&config).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("regular file"), "{message}");
                 assert!(message.contains("does not remove"), "{message}");
@@ -1122,7 +1196,7 @@ mod tests {
         // A bound-then-dropped listener leaves its name behind, exactly like a crashed daemon.
         drop(UnixListener::bind(&config.socket_path).expect("leave a stale socket"));
         assert!(config.socket_path.exists(), "the stale name is there");
-        let bound = listen(&config).expect("replace a stale socket");
+        let bound = listen(&config).await.expect("replace a stale socket");
         let (listener, identity) = bound.into_parts();
         assert_eq!(
             identity,
@@ -1146,7 +1220,7 @@ mod tests {
             socket_path: alias.clone(),
             ..config.clone()
         };
-        match listen(&aliased) {
+        match listen(&aliased).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("symbolic link"), "{message}")
             }
@@ -1169,7 +1243,7 @@ mod tests {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
         let live = UnixListener::bind(&config.socket_path).expect("bind the live listener");
-        match listen(&config) {
+        match listen(&config).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("live listener"), "{message}")
             }
@@ -1181,14 +1255,14 @@ mod tests {
 
     /// A daemon that exits non-zero has bound no socket: a bind under a missing directory fails
     /// and names the path.
-    #[test]
-    fn a_bind_failure_names_the_path() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bind_failure_names_the_path() {
         let dir = TempDir::new().expect("temporary directory");
         let config = DaemonConfig {
             socket_path: dir.path().join("absent").join("daemon.sock"),
             ..config(dir.path())
         };
-        match listen(&config) {
+        match listen(&config).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("absent"), "{message}")
             }
@@ -1198,22 +1272,22 @@ mod tests {
     }
 
     /// The journal root is the host's to create and make durable before the first publication.
-    #[test]
-    fn the_journal_root_is_created_with_its_parent_synced() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_journal_root_is_created_with_its_parent_synced() {
         let dir = TempDir::new().expect("temporary directory");
         let root = dir.path().join("journal");
-        journal_root(&root).expect("create the journal root");
+        journal_root(&root).await.expect("create the journal root");
         assert!(root.is_dir());
     }
 
     /// A regular file where the journal root belongs is a journal fault naming it, not a success:
     /// publishing into whatever the path really names would be worse than refusing to start.
-    #[test]
-    fn a_journal_component_that_is_not_a_directory_is_refused() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_component_that_is_not_a_directory_is_refused() {
         let dir = TempDir::new().expect("temporary directory");
         let file = dir.path().join("journal");
         std::fs::write(&file, b"not a directory").expect("write the file");
-        match journal_root(&file) {
+        match journal_root(&file).await {
             Err(DaemonError::Journal(message)) => {
                 assert!(message.contains("not a directory"), "{message}");
                 assert!(
@@ -1231,12 +1305,12 @@ mod tests {
     }
 
     /// An ancestor that is a file is refused too, not just the leaf.
-    #[test]
-    fn a_journal_ancestor_that_is_not_a_directory_is_refused() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_ancestor_that_is_not_a_directory_is_refused() {
         let dir = TempDir::new().expect("temporary directory");
         let file = dir.path().join("new-parent");
         std::fs::write(&file, b"file").expect("write the file");
-        match journal_root(&file.join("journal")) {
+        match journal_root(&file.join("journal")).await {
             Err(DaemonError::Journal(message)) => {
                 assert!(message.contains("not a directory"), "{message}");
             }
@@ -1247,8 +1321,8 @@ mod tests {
     /// Every level this start creates is owner-only, not the umask's choice: the journal holds what
     /// the Mind settled on, and a directory another user can write into is a publication target they
     /// control. A level that already existed keeps the mode it had.
-    #[test]
-    fn a_created_journal_level_is_owner_only_and_an_existing_one_keeps_its_mode() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_created_journal_level_is_owner_only_and_an_existing_one_keeps_its_mode() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().expect("temporary directory");
@@ -1259,7 +1333,7 @@ mod tests {
             .expect("give the ancestor its own mode");
 
         let root = existing.join("a").join("b");
-        journal_root(&root).expect("create two levels");
+        journal_root(&root).await.expect("create two levels");
         for level in [existing.join("a"), root] {
             let mode = std::fs::metadata(&level)
                 .expect("stat the created level")
@@ -1282,14 +1356,86 @@ mod tests {
         assert_eq!(kept, 0o750, "a pre-existing level keeps {kept:04o}");
     }
 
+    /// The probe runs on a single-worker runtime against a socket whose backlog is full, and the
+    /// start still finishes. This is a smoke test, not a discriminating one: a `connect` on a local
+    /// Unix socket returns immediately whether or not the backlog has room and whether the dial is
+    /// async or blocking, so both implementations pass here. What it does guard is that the async
+    /// rewrite did not introduce a wait that never resolves — a real regression class when a probe
+    /// is moved onto the runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_full_backlog_does_not_park_the_probe() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        let live = UnixListener::bind(&config.socket_path).expect("bind the socket");
+
+        // Fill the backlog: these dials are accepted into the queue and never dequeued.
+        let mut queued = Vec::new();
+        for _ in 0..32 {
+            match UnixStream::connect(&config.socket_path).await {
+                Ok(stream) => queued.push(stream),
+                Err(_) => break,
+            }
+        }
+        assert!(!queued.is_empty(), "the backlog took at least one dial");
+
+        let probing = tokio::spawn({
+            let config = config.clone();
+            async move { listen(&config).await }
+        });
+        // On one worker, this timer firing is the evidence the probe yielded instead of blocking.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        probing.abort();
+        drop(live);
+        drop(queued);
+    }
+
+    /// A drain where the accept loop failed and the socket name also could not be removed reports
+    /// both: an operator who sees a non-zero exit must learn the name is still there, which `and`
+    /// would have thrown away.
+    #[test]
+    fn a_drain_that_failed_twice_names_both_faults_and_the_leftover() {
+        let path = Path::new("/run/mindcore/daemon.sock");
+        let error = settle(
+            Err(DaemonError::Socket(
+                "accept: too many open files".to_string(),
+            )),
+            Err(DaemonError::Socket(format!(
+                "{}: the name is no longer this daemon's socket",
+                path.display()
+            ))),
+            path,
+        )
+        .expect_err("both faults are an error");
+
+        let message = error.to_string();
+        assert!(message.contains("too many open files"), "{message}");
+        assert!(message.contains("could not be removed"), "{message}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the refusal names the leftover: {message}"
+        );
+        assert!(message.contains("before the next start"), "{message}");
+
+        // One fault keeps its own message, and two successes stay clean.
+        assert!(
+            settle(Err(DaemonError::Socket("accept".to_string())), Ok(()), path)
+                .expect_err("one fault")
+                .to_string()
+                .contains("accept")
+        );
+        settle(Ok(()), Ok(()), path).expect("nothing failed");
+    }
+
     /// A single-segment relative journal root still syncs its own directory entry. `Path::new("journal")`
     /// answers `Some("")`, which is the **current directory**, not the filesystem root — only `None` is
     /// the root. Skipping the empty parent would leave `journal`'s own entry unproven.
-    #[test]
-    fn a_single_relative_segment_syncs_the_current_directory() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_single_relative_segment_syncs_the_current_directory() {
         let here = Path::new(".");
         clear_sync_attempts(here);
-        sync_parent_of(Path::new("journal")).expect("sync the current directory");
+        sync_parent_of(Path::new("journal"))
+            .await
+            .expect("sync the current directory");
         assert_eq!(
             sync_attempts(Path::new(".")),
             1,
@@ -1297,7 +1443,9 @@ mod tests {
         );
 
         // A restart repeats it: the entry may still be unsynced from a start that failed here.
-        sync_parent_of(Path::new("journal")).expect("sync it again");
+        sync_parent_of(Path::new("journal"))
+            .await
+            .expect("sync it again");
         assert_eq!(
             sync_attempts(Path::new(".")),
             2,
@@ -1313,8 +1461,12 @@ mod tests {
         std::fs::create_dir(&parent).expect("create the ancestor");
         clear_sync_attempts(&parent);
         clear_sync_attempts(dir.path());
-        sync_parent_of(&parent.join("journal")).expect("sync the leaf's entry");
-        sync_parent_of(&parent).expect("sync the ancestor's entry");
+        sync_parent_of(&parent.join("journal"))
+            .await
+            .expect("sync the leaf's entry");
+        sync_parent_of(&parent)
+            .await
+            .expect("sync the ancestor's entry");
         assert_eq!(sync_attempts(&parent), 1, "the leaf's entry is in parent");
         assert_eq!(
             sync_attempts(dir.path()),
@@ -1324,15 +1476,17 @@ mod tests {
 
         // The filesystem root has no entry in any directory: nothing to sync, and not an error.
         clear_sync_attempts(here);
-        sync_parent_of(Path::new("/")).expect("the root needs no sync");
+        sync_parent_of(Path::new("/"))
+            .await
+            .expect("the root needs no sync");
         assert_eq!(sync_attempts(Path::new(".")), 0, "the root syncs nothing");
     }
 
     /// The chain sync is idempotent across restarts, not first-creation-only. A start that created a
     /// level and then failed before syncing its entry leaves nothing marking which entry is unproven,
     /// so the next start must re-sync every component — including the ones it found already there.
-    #[test]
-    fn a_restart_retries_the_sync_of_an_already_existing_level() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_retries_the_sync_of_an_already_existing_level() {
         let dir = TempDir::new().expect("temporary directory");
         let root = dir.path().join("journal");
         let parent = dir.path().to_path_buf();
@@ -1340,7 +1494,7 @@ mod tests {
         // First start: the leaf is created, then its parent's sync fails.
         clear_sync_attempts(&parent);
         push_injected_sync_failure(&parent);
-        match journal_root(&root) {
+        match journal_root(&root).await {
             Err(DaemonError::Journal(message)) => {
                 assert!(message.contains("injected sync fault"), "{message}")
             }
@@ -1358,7 +1512,9 @@ mod tests {
 
         // Second start, seam cleared: the level now exists, and its parent is synced again.
         clear_sync_attempts(&parent);
-        journal_root(&root).expect("the retry accepts the directory");
+        journal_root(&root)
+            .await
+            .expect("the retry accepts the directory");
         assert_eq!(
             sync_attempts(&parent),
             1,
@@ -1368,13 +1524,13 @@ mod tests {
 
     /// A sync that fails is a journal fault, not a success: the daemon must not report a clean start
     /// on a chain that is not on disk yet.
-    #[test]
-    fn a_failed_parent_sync_is_a_journal_fault() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_parent_sync_is_a_journal_fault() {
         let dir = TempDir::new().expect("temporary directory");
         let root = dir.path().join("new-parent").join("journal");
         let armed_parent = dir.path().join("new-parent");
         push_injected_sync_failure(&armed_parent);
-        match journal_root(&root) {
+        match journal_root(&root).await {
             Err(DaemonError::Journal(message)) => {
                 assert!(message.contains("injected sync fault"), "{message}");
                 assert!(
@@ -1388,18 +1544,20 @@ mod tests {
 
     /// Two missing levels: each newly created entry must be linked in its own parent, not just the
     /// leaf inside a directory that is itself not yet durable.
-    #[test]
-    fn every_journal_level_is_created_and_synced() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_journal_level_is_created_and_synced() {
         let dir = TempDir::new().expect("temporary directory");
         let root = dir.path().join("new-parent").join("journal");
-        journal_root(&root).expect("create two levels");
+        journal_root(&root).await.expect("create two levels");
         assert!(
             dir.path().join("new-parent").is_dir(),
             "the ancestor exists"
         );
         assert!(root.is_dir(), "the leaf exists");
         // A second call finds every level and does nothing, which must not be an error.
-        journal_root(&root).expect("an existing root is accepted");
+        journal_root(&root)
+            .await
+            .expect("an existing root is accepted");
     }
 
     /// The socket is owner-only whatever the process umask is: who may connect is part of the
@@ -1483,7 +1641,7 @@ mod tests {
             socket_path: alias.clone(),
             ..config.clone()
         };
-        match listen(&collided) {
+        match listen(&collided).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("symbolic link"), "{message}")
             }
@@ -1518,7 +1676,7 @@ mod tests {
             .permissions();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
             .expect("close the parent");
-        let outcome = listen(&config);
+        let outcome = listen(&config).await;
         std::fs::set_permissions(&parent, original).expect("reopen the parent");
         match outcome {
             Err(DaemonError::Socket(_)) => {}
@@ -1541,7 +1699,7 @@ mod tests {
         // No identity is recorded for a name this daemon never bound, so a directory there is a
         // type refusal before any unlink is attempted.
         let foreign = SocketIdentity { dev: 0, ino: 0 };
-        match remove_own_socket(&path, foreign) {
+        match remove_own_socket(&path, foreign).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(
                     message.contains("no longer this daemon's socket"),
@@ -1553,7 +1711,9 @@ mod tests {
         assert!(path.is_dir(), "the directory survives");
         // An absent name is the intended end state.
         std::fs::remove_dir(&path).expect("clear the directory");
-        remove_own_socket(&path, foreign).expect("an absent name is already removed");
+        remove_own_socket(&path, foreign)
+            .await
+            .expect("an absent name is already removed");
     }
 
     /// The guard cannot cover the window inside `bind` itself: if the identity read fails after a
@@ -1653,7 +1813,7 @@ mod tests {
             "assemble the surface the start serves",
         );
 
-        let mut bound = listen(&config).expect("bind the socket");
+        let mut bound = listen(&config).await.expect("bind the socket");
         // Closed after the bind: the bind needs a writable directory, the cleanup does not get one.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))
             .expect("make the directory read-only");
@@ -1661,7 +1821,7 @@ mod tests {
             Err(failure) => failure,
             Ok(_) => panic!("an undecodable peer key fails the prepare"),
         };
-        let refusal = cleanup_refusal(&mut bound, failure);
+        let refusal = cleanup_refusal(&mut bound, failure).await;
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
             .expect("restore the directory");
 
@@ -1775,12 +1935,12 @@ mod tests {
     async fn the_drain_refuses_a_socket_name_replaced_by_a_regular_file() {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
-        let (listener, bound) = listen(&config).expect("bind the socket").into_parts();
+        let (listener, bound) = listen(&config).await.expect("bind the socket").into_parts();
         // The listener still owns the socket; swap the name anyway, as a same-user process could.
         std::fs::remove_file(&config.socket_path).expect("unlink the socket");
         let bytes = b"the replacement's own bytes";
         std::fs::write(&config.socket_path, bytes).expect("write the replacement");
-        match remove_own_socket(&config.socket_path, bound) {
+        match remove_own_socket(&config.socket_path, bound).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("became a regular file"), "{message}")
             }
@@ -1818,7 +1978,7 @@ mod tests {
             ino: u64::MAX,
         };
         assert_ne!(claimed, real, "the stated identity is not the socket's");
-        match remove_if_own(&config.socket_path, claimed) {
+        match remove_if_own(&config.socket_path, claimed).await {
             Err(message) => assert!(message.contains("replaced by another socket"), "{message}"),
             Ok(()) => panic!("a socket of another identity must not be removed"),
         }
@@ -1828,7 +1988,9 @@ mod tests {
         );
 
         // The identity taken from `lstat` names this socket, so the same call removes it.
-        remove_if_own(&config.socket_path, real).expect("the matching identity removes the name");
+        remove_if_own(&config.socket_path, real)
+            .await
+            .expect("the matching identity removes the name");
         assert!(
             !config.socket_path.exists(),
             "the matching identity removed the name"
