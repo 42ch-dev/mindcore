@@ -95,10 +95,17 @@ impl BoundSocket {
             Err(error) => {
                 // The identity read failed, so this is the name this call just bound. The guard
                 // does not exist yet, and `remove_if_own` could not check without the same read.
-                let _ = std::fs::remove_file(path);
-                return Err(fail(format!(
-                    "the bound socket could not be inspected: {error}"
-                )));
+                //
+                // shortcut: a read-only socket directory cannot be cleaned up by anyone, so when
+                // the removal fails too the refusal names the leftover path instead of hiding it.
+                return Err(match std::fs::remove_file(path) {
+                    Ok(()) => fail(format!("the bound socket could not be inspected: {error}")),
+                    Err(removal) => fail(format!(
+                        "the bound socket could not be inspected ({error}) and the name could not \
+                         be removed ({removal}): remove {} before the next start",
+                        path.display()
+                    )),
+                });
             }
         };
         Ok(Self {
@@ -314,16 +321,36 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
 /// the bind and this read are adjacent and a parent made unsearchable fails the bind first.
 fn bound_identity(path: &Path) -> std::io::Result<SocketIdentity> {
     #[cfg(test)]
-    if INJECT_IDENTITY_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if let Some(failure) = INJECT_IDENTITY_FAILURE
+        .lock()
+        .expect("identity seam lock")
+        .take()
+    {
+        // The seam is the only moment between the bind and the read, so a test needs it to take
+        // the directory's write permission before the fallback tries to unlink.
+        if let Some(directory) = failure.close_directory {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500));
+        }
         return Err(std::io::Error::other("injected identity read failure"));
     }
     std::fs::symlink_metadata(path).map(|metadata| SocketIdentity::of(&metadata))
 }
 
-/// A test seam armed by the regression below: the next identity read after a bind fails.
+/// A test seam armed by the regressions below: the next identity read after a bind fails, and it
+/// may first make `close_directory` read-only so the fallback's removal fails too.
 #[cfg(test)]
-static INJECT_IDENTITY_FAILURE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[derive(Default)]
+struct IdentityFailure {
+    close_directory: Option<PathBuf>,
+}
+
+#[cfg(test)]
+static INJECT_IDENTITY_FAILURE: Mutex<Option<IdentityFailure>> = Mutex::new(None);
+
+/// The seam is one global, so the tests that arm it must not overlap.
+#[cfg(test)]
+static IDENTITY_SEAM_LOCK: Mutex<()> = Mutex::new(());
 
 /// A test seam: when installed, a connection task parks here — after its responder is tracked and
 /// before it registers — so a drain can be driven while a session is still setting up.
@@ -1032,7 +1059,8 @@ mod tests {
     async fn an_identity_read_failure_inside_bind_leaves_no_socket() {
         let dir = TempDir::new().expect("temporary directory");
         let path = dir.path().join("daemon.sock");
-        INJECT_IDENTITY_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _serial = IDENTITY_SEAM_LOCK.lock().expect("seam lock");
+        *INJECT_IDENTITY_FAILURE.lock().expect("seam") = Some(IdentityFailure::default());
         match BoundSocket::bind(&path) {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("could not be inspected"), "{message}")
@@ -1042,6 +1070,51 @@ mod tests {
         assert!(
             !path.exists(),
             "bind removed the name it could not identify"
+        );
+    }
+
+    /// An unwritable socket directory is an environment property, not a defect: nobody can remove
+    /// the name. The refusal must then say both faults and name the leftover, rather than report a
+    /// removal that did not happen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unremovable_leftover_is_named_in_the_both_fail_refusal() {
+        // The mode bits do not constrain uid 0, so the environment cannot be built as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = TempDir::new().expect("temporary directory");
+        let parent = dir.path().join("socket-dir");
+        std::fs::create_dir(&parent).expect("create the socket directory");
+        let path = parent.join("daemon.sock");
+        // The bind needs a writable directory; the seam below closes it before the fallback's
+        // unlink, which is exactly the environment the refusal describes.
+        let seam = IdentityFailure {
+            close_directory: Some(parent.clone()),
+        };
+        let _serial = IDENTITY_SEAM_LOCK.lock().expect("seam lock");
+        *INJECT_IDENTITY_FAILURE.lock().expect("seam") = Some(seam);
+        let outcome = BoundSocket::bind(&path);
+        // Restore before asserting, so a failure does not leave an unwritable directory behind.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("restore the directory");
+        match outcome {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("could not be inspected"), "{message}");
+                assert!(message.contains("could not be removed"), "{message}");
+                assert!(
+                    message.contains(&path.display().to_string()),
+                    "the refusal names the leftover: {message}"
+                );
+                assert!(
+                    message.contains("before the next start"),
+                    "the refusal says what to do: {message}"
+                );
+            }
+            other => panic!("an unremovable leftover is a socket refusal, not {other:?}"),
+        }
+        assert!(
+            path.exists(),
+            "the leftover is still there, as the refusal says"
         );
     }
 
