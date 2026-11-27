@@ -155,7 +155,7 @@ them.
   journal root. `MindView` holds one `Mind`, opened with `Mind::with_journal_publisher(journal_dir(root))`
   when `journalDir` was given.
 - An integer argument (`revision`, `expectedBaseRevision`) arrives as `f64` and is converted to
-  `u64`; `maxItems` and `maxBytes` arrive as `u32`. A wire object (`entry`, `decision`) is decoded
+  `u64`; `maxItems` and `maxBytes` are whole numbers bounded by `u32::MAX`. A wire object (`entry`, `decision`) is decoded
   from `serde_json::Value` into its published type, and a response is serialized back to one.
 - `Cognition` and the registry `Mind` row carry no serde derive, so the addon projects each into
   the camelCase object above (`Cognition`, `MindInfo`); `MindStatus` becomes `'active'` or
@@ -218,7 +218,6 @@ holds has no `SpokeResult` to settle.
    reported as that, not as an unbuilt addon.
 2. Otherwise `<repository>/target/debug/` joined with the platform's artifact name:
    `libmindcore_binding.dylib` (`darwin`), `libmindcore_binding.so` (`linux`),
-   `mindcore_binding.dll` (`win32`).
 3. Otherwise the same name under `target/release`.
 
 `bindings/node/package.json` declares `os: ["darwin", "linux"]`, and the artifact table carries

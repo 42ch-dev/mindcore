@@ -45,7 +45,7 @@ is never re-read, and a running daemon is reconfigured only by restarting it.
 | `host_id` | string | yes, non-empty | `HostCapabilityManifest.host_id` in the signed hello |
 | `history` | bool | no, default `false` | composes the per-Mind history face |
 | `invoke.timeout_ms` | integer | no | `ConnectResponderOptions.invoke_timeout_ms`; absent keeps spoke_connect's own default |
-| `identity.seed_file` | path | yes | file holding the responder's Ed25519 seed as 64 hex digits |
+| `identity.seed_file` | path | yes | file holding the responder's Ed25519 seed as 64 hex digits; group/other bits (read, write or execute) are refused naming the path and the mode |
 | `peers.<peer_id>.public_key` | string | yes, per peer | the peer's Ed25519 public key as 64 hex digits |
 | `peers.<peer_id>.principal` | string | yes, per peer, non-empty | the `Principal.principal_id` the authenticated peer maps to |
 | `journal.dir` | path | yes | the journal root `journal_dir` publishes under |
