@@ -34,7 +34,9 @@ not own:
   path is refused with its type; only a name that `is_socket()` and answers `ConnectionRefused` is
   stale.
 
-**Evidence.** `crates/mindcore-daemon/src/lock.rs`, `src/serve.rs`; the measurements are recorded in
-the plan's review bundle (`review/qc1.md`, `review/pm-acceptance.md`) and reproduced by
-`a_hard_link_in_the_same_directory_is_refused`, `a_symlink_re_pointed_after_resolution_cannot_move_the_store`
-and `the_drain_refuses_a_socket_name_replaced_by_a_regular_file`.
+**Evidence.** `crates/mindcore-daemon/src/lock.rs` and `src/serve.rs`; the behaviour is pinned by
+`a_hard_link_in_the_same_directory_is_refused`, `a_cross_directory_hard_link_is_refused`,
+`a_symlink_re_pointed_after_resolution_cannot_move_the_store` and
+`the_drain_refuses_a_socket_name_replaced_by_a_regular_file`. The macOS measurements that motivated
+the design are not reproducible from this repository — re-measure them on the target you ship to
+instead of trusting this note.
