@@ -53,6 +53,11 @@ struct Host {
     socket: SocketIdentity,
     /// The live responders the drain walks; a connection removes its own entry when it ends.
     live: Mutex<Vec<(usize, Arc<ConnectResponder>)>>,
+    /// Test seam: parks this host's first connection before its registration, so a drain can be
+    /// driven while a session is still setting up. Per host, not global: the connection the
+    /// register-rejection test drives belongs to a different host and must not be the one parked.
+    #[cfg(test)]
+    park_setup: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     /// Test seam: makes `Surface::register` answer `Reject` for this host only.
     ///
     /// A refused registration is not constructible through the public API — `derive_manifest`
@@ -62,9 +67,25 @@ struct Host {
     reject_registration: bool,
 }
 
-/// A test seam: makes the next probe dial pending, so the timeout branch is reachable.
+/// A test seam: makes the next probe of this exact path pending, so the timeout branch is reachable.
+///
+/// Keyed to the path and consumed only on a match. A bare flag was wrong: the probe tests run in
+/// parallel, and a global one-shot let one test's arming be taken by another's dial — which made
+/// both this test and the live-listener refusal fail intermittently.
 #[cfg(test)]
-static PENDING_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PENDING_PROBE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn take_pending_probe(path: &Path) -> bool {
+    let mut armed = PENDING_PROBE.lock().expect("pending probe lock");
+    match armed.as_ref() {
+        Some(armed_path) if armed_path == path => {
+            *armed = None;
+            true
+        }
+        _ => false,
+    }
+}
 
 /// What a liveness probe established about the name.
 #[derive(Debug)]
@@ -83,7 +104,7 @@ enum Probe {
 /// otherwise hold a start indefinitely, and a dial that has not answered says nothing either way.
 async fn probe_liveness(path: &Path, budget: std::time::Duration) -> Probe {
     #[cfg(test)]
-    if PENDING_PROBE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if take_pending_probe(path) {
         // A dial that neither answers nor is refused: the case a full, undrained backlog produces
         // and a test cannot build. Only the branch is under test.
         return match tokio::time::timeout(budget, std::future::pending::<()>()).await {
@@ -413,6 +434,8 @@ async fn prepare(
         invoke_timeout_ms: config.invoke.timeout_ms,
         live: Mutex::new(Vec::new()),
         #[cfg(test)]
+        park_setup: None,
+        #[cfg(test)]
         reject_registration: false,
     });
     Ok(host)
@@ -469,7 +492,9 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             .filter(|parent| !parent.as_os_str().is_empty());
     }
     // Top-down: create what is missing, then sync every level's parent whether it was created now
-    // or was already there.
+    // or was already there. `synced` is keyed on the resolved parent, so the second walk below costs
+    // nothing for a plain path and only adds the entries the first walk could not name.
+    let mut synced: Vec<PathBuf> = Vec::new();
     for (index, level) in chain.iter().enumerate().rev() {
         if Some(index) != existing {
             // Owner-only, not the umask's choice: the journal holds what the Mind settled on, and a
@@ -490,9 +515,54 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             .await
             .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))??;
         }
-        sync_parent_of(level).await?;
+        sync_level_entry(level, &mut synced).await?;
+    }
+    // A symlink in the chain means the journal really lives somewhere else. The first walk flushed
+    // the entry that names the link; the directory holding the *target* has its own entry, in its own
+    // parent, that nothing above has touched — so the resolved chain is walked too. A path with no
+    // symlink resolves to itself and every level here is already in `synced`.
+    let resolved = std::fs::canonicalize(dir).map_err(|error| {
+        DaemonError::Journal(format!(
+            "{}: the journal root cannot be resolved after it was created: {error}",
+            dir.display()
+        ))
+    })?;
+    for level in resolved.ancestors() {
+        sync_level_entry(level, &mut synced).await?;
     }
     Ok(())
+}
+
+/// Syncs `level`'s parent (the directory holding `level`'s entry) once per resolved directory.
+async fn sync_level_entry(level: &Path, synced: &mut Vec<PathBuf>) -> Result<(), DaemonError> {
+    let Some(parent) = holding_directory(level) else {
+        return Ok(());
+    };
+    sync_once(parent, synced).await
+}
+
+/// [`sync_parent`], skipped for a directory this call has already flushed.
+///
+/// The key is the directory's resolved path, not the spelling it arrived as: a relative root's
+/// configured walk names the current directory `.` while the resolved walk names the same directory
+/// absolutely, and both must count as one flush. A directory that cannot be resolved is keyed by its
+/// spelling, so it still gets exactly one.
+async fn sync_once(parent: &Path, synced: &mut Vec<PathBuf>) -> Result<(), DaemonError> {
+    let key = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    if synced.contains(&key) {
+        return Ok(());
+    }
+    synced.push(key);
+    sync_parent(parent).await
+}
+
+/// The directory holding `level`'s entry; `None` at the filesystem root, which no directory holds.
+fn holding_directory(level: &Path) -> Option<&Path> {
+    match level.parent() {
+        None => None,
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        Some(parent) => Some(parent),
+    }
 }
 
 /// Syncs the directory holding `level`'s entry, so that entry is durable.
@@ -501,14 +571,6 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
 /// sync. `Some("")` is not that: it is what `Path::new("journal").parent()` answers, and it means the
 /// **current directory** — `Path::new("").parent()` is the `None` case — so a single-segment relative
 /// journal root syncs `"."` rather than skipping its own entry.
-async fn sync_parent_of(level: &Path) -> Result<(), DaemonError> {
-    match level.parent() {
-        None => Ok(()),
-        Some(parent) if parent.as_os_str().is_empty() => sync_parent(Path::new(".")).await,
-        Some(parent) => sync_parent(parent).await,
-    }
-}
-
 /// Syncs `parent`, so the directory entry just created beneath it is durable.
 ///
 /// A failed sync is a journal fault naming the directory: reporting a clean start on a chain that is
@@ -549,32 +611,50 @@ static SYNC_ATTEMPTS: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn record_injected_sync(path: &Path) {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut attempts = SYNC_ATTEMPTS.lock().expect("sync attempt lock");
-    match attempts.iter_mut().find(|(seen, _)| seen == path) {
+    match attempts
+        .iter_mut()
+        .find(|(seen, _)| std::fs::canonicalize(seen).unwrap_or_else(|_| seen.clone()) == key)
+    {
         Some((_, count)) => *count += 1,
-        None => attempts.push((path.to_path_buf(), 1)),
+        None => attempts.push((key, 1)),
     }
 }
 
 /// How many times `path` has been synced since the last [`clear_sync_attempts`] for it.
+///
+/// Counted by resolved spelling: the code syncs whichever spelling reached it, and on macOS `/var`
+/// canonicalizes to `/private/var`, so comparing spellings would mis-count a directory the walk
+/// really flushed.
 #[cfg(test)]
 fn sync_attempts(path: &Path) -> usize {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     SYNC_ATTEMPTS
         .lock()
         .expect("sync attempt lock")
         .iter()
-        .find(|(seen, _)| seen == path)
-        .map_or(0, |(_, count)| *count)
+        .filter(|(seen, _)| std::fs::canonicalize(seen).unwrap_or_else(|_| seen.clone()) == key)
+        .map(|(_, count)| *count)
+        .sum()
 }
 
 /// Forgets the attempts recorded for `path` only: the seam is one global, so a global wipe would
 /// race with another test's count.
 #[cfg(test)]
+/// Zeroes the count for `path`, so a test that syncs, clears and syncs again sees 1 then 1.
+///
+/// `retain` would drop the row and the second read would be indistinguishable from the first.
 fn clear_sync_attempts(path: &Path) {
-    SYNC_ATTEMPTS
-        .lock()
-        .expect("sync attempt lock")
-        .retain(|(seen, _)| seen != path);
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut attempts = SYNC_ATTEMPTS.lock().expect("sync attempt lock");
+    match attempts
+        .iter_mut()
+        .find(|(seen, _)| std::fs::canonicalize(seen).unwrap_or_else(|_| seen.clone()) == key)
+    {
+        Some((_, count)) => *count = 0,
+        None => attempts.push((key, 0)),
+    }
 }
 
 #[cfg(test)]
@@ -587,8 +667,11 @@ fn push_injected_sync_failure(path: &Path) {
 
 #[cfg(test)]
 fn take_injected_sync_failure(path: &Path) -> bool {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut armed = INJECT_SYNC_FAILURE.lock().expect("sync seam lock");
-    match armed.iter().position(|armed_path| armed_path == path) {
+    match armed.iter().position(|armed_path| {
+        std::fs::canonicalize(armed_path).unwrap_or_else(|_| armed_path.clone()) == key
+    }) {
         Some(index) => {
             armed.remove(index);
             true
@@ -661,7 +744,7 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
         .lock()
         .expect("live lock")
         .push((id, Arc::clone(&responder)));
-    park_in_setup().await;
+    park_in_setup(&host).await;
     // A dialer may invoke an advertised tool as soon as its session is established, and the
     // responder never installs handlers from the manifest. `register` is synchronous, so no lock
     // of this module's is held across an `await`.
@@ -747,24 +830,33 @@ fn take_injected_failure(path: &Path) -> Option<IdentityFailure> {
 /// A test seam: when installed, a connection task parks here — after its responder is tracked and
 /// before it registers — so a drain can be driven while a session is still setting up.
 #[cfg(test)]
+/// The resume half of the park. Which connection parks is decided by `Host::park_setup`, so only the
+/// arming test's host reaches this; the global holds nothing that identifies a connection.
 static SETUP_PARK: Mutex<Option<SetupPark>> = Mutex::new(None);
 
 #[cfg(test)]
 struct SetupPark {
-    parked: tokio::sync::mpsc::UnboundedSender<()>,
     resume: tokio::sync::mpsc::UnboundedReceiver<()>,
 }
 
 #[cfg(test)]
-async fn park_in_setup() {
-    let seam = SETUP_PARK.lock().expect("setup seam lock").take();
-    let Some(mut seam) = seam else { return };
-    let _ = seam.parked.send(());
-    let _ = seam.resume.recv().await;
+async fn park_in_setup(host: &Host) {
+    // Only this host's connection parks. A process-wide one-shot let the register-rejection test's
+    // own `serve_connection` take the park, after which the drain test found nothing tracked — an
+    // intermittent failure unrelated to the code under test.
+    #[cfg(test)]
+    if let Some(parked) = &host.park_setup {
+        let _ = parked.send(());
+        let seam = SETUP_PARK.lock().expect("setup seam lock").take();
+        let Some(mut seam) = seam else { return };
+        let _ = seam.resume.recv().await;
+    }
+    #[cfg(not(test))]
+    let _ = host;
 }
 
 #[cfg(not(test))]
-async fn park_in_setup() {}
+async fn park_in_setup(_host: &Host) {}
 
 /// Tells every live session to close. `ConnectResponder::close` is synchronous and idempotent.
 fn drain_sessions(live: &[(usize, Arc<ConnectResponder>)]) {
@@ -1465,10 +1557,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_probe_that_outlives_its_budget_is_inconclusive() {
         let dir = TempDir::new().expect("temporary directory");
-        PENDING_PROBE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let silent = dir.path().join("silent.sock");
+        *PENDING_PROBE.lock().expect("pending probe lock") = Some(silent.clone());
 
         let started = std::time::Instant::now();
-        let outcome = probe_liveness(&dir.path().join("silent.sock"), PROBE_TIMEOUT).await;
+        let outcome = probe_liveness(&silent, PROBE_TIMEOUT).await;
         assert!(
             started.elapsed() >= PROBE_TIMEOUT,
             "the budget was actually waited out, not skipped"
@@ -1644,45 +1737,45 @@ mod tests {
         settle(Ok(()), Ok(()), path).expect("nothing failed");
     }
 
-    /// A single-segment relative journal root still syncs its own directory entry. `Path::new("journal")`
-    /// answers `Some("")`, which is the **current directory**, not the filesystem root — only `None` is
-    /// the root. Skipping the empty parent would leave `journal`'s own entry unproven.
+    /// A single-segment relative journal root still syncs its own directory entry.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_single_relative_segment_syncs_the_current_directory() {
         let here = Path::new(".");
         clear_sync_attempts(here);
-        sync_parent_of(Path::new("journal"))
+        let mut synced = Vec::new();
+        sync_level_entry(Path::new("journal"), &mut synced)
             .await
             .expect("sync the current directory");
         assert_eq!(
-            sync_attempts(Path::new(".")),
+            sync_attempts(here),
             1,
             "a one-segment relative level syncs the current directory"
         );
 
         // A restart repeats it: the entry may still be unsynced from a start that failed here.
-        sync_parent_of(Path::new("journal"))
+        clear_sync_attempts(here);
+        let mut synced = Vec::new();
+        sync_level_entry(Path::new("journal"), &mut synced)
             .await
             .expect("sync it again");
         assert_eq!(
-            sync_attempts(Path::new(".")),
-            2,
-            "every start re-syncs the current directory"
+            sync_attempts(here),
+            1,
+            "every start re-syncs it: one flush in this start's own count"
         );
 
         // Two segments under an existing directory: the leaf's entry lives in `parent`, and
-        // `parent`'s own entry in the directory holding it. Derived from a real temp dir so the
-        // directories exist; a relative `parent/...` would need a process-wide chdir, which is
-        // unsafe while the harness runs tests in parallel.
+        // `parent`'s own entry in the directory holding it.
         let dir = TempDir::new().expect("temporary directory");
         let parent = dir.path().join("parent");
         std::fs::create_dir(&parent).expect("create the ancestor");
         clear_sync_attempts(&parent);
         clear_sync_attempts(dir.path());
-        sync_parent_of(&parent.join("journal"))
+        let mut synced = Vec::new();
+        sync_level_entry(&parent.join("journal"), &mut synced)
             .await
             .expect("sync the leaf's entry");
-        sync_parent_of(&parent)
+        sync_level_entry(&parent, &mut synced)
             .await
             .expect("sync the ancestor's entry");
         assert_eq!(sync_attempts(&parent), 1, "the leaf's entry is in parent");
@@ -1693,11 +1786,44 @@ mod tests {
         );
 
         // The filesystem root has no entry in any directory: nothing to sync, and not an error.
-        clear_sync_attempts(here);
-        sync_parent_of(Path::new("/"))
+        assert!(holding_directory(Path::new("/")).is_none());
+    }
+
+    /// A symlink in the chain means the journal really lives elsewhere; the directory holding the
+    /// target has an entry nothing in the configured walk names, so it must be flushed too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_journal_root_syncs_the_targets_directory() {
+        let dir = TempDir::new().expect("temporary directory");
+        let elsewhere = TempDir::new().expect("temporary directory");
+        let real = elsewhere.path().join("real");
+        std::fs::create_dir(&real).expect("create the real directory");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link to the real directory");
+
+        // The entry that names `real` lives in `elsewhere`, which the configured walk never visits.
+        clear_sync_attempts(elsewhere.path());
+        journal_root(&link.join("journal"))
             .await
-            .expect("the root needs no sync");
-        assert_eq!(sync_attempts(Path::new(".")), 0, "the root syncs nothing");
+            .expect("create through the link");
+        assert!(
+            sync_attempts(elsewhere.path()) > 0,
+            "the target's own directory entry was flushed"
+        );
+
+        // A plain path is unchanged: one flush per level, and no resolved walk adds any.
+        let plain_parent = dir.path().join("plain");
+        std::fs::create_dir(&plain_parent).expect("create the plain parent");
+        clear_sync_attempts(&plain_parent);
+        clear_sync_attempts(dir.path());
+        journal_root(&plain_parent.join("journal"))
+            .await
+            .expect("create the plain root");
+        assert_eq!(
+            sync_attempts(&plain_parent),
+            1,
+            "the plain case still flushes each level once"
+        );
+        assert_eq!(sync_attempts(dir.path()), 1, "the ancestor once");
     }
 
     /// The chain sync is idempotent across restarts, not first-creation-only. A start that created a
@@ -2246,6 +2372,7 @@ mod tests {
             peer_keys: HashMap::new(),
             invoke_timeout_ms: Some(1_000),
             live: Mutex::new(Vec::new()),
+            park_setup: None,
             reject_registration: true,
         });
 
@@ -2288,6 +2415,7 @@ mod tests {
         let listener = UnixListener::bind(&config.socket_path).expect("bind the listener");
         let socket =
             SocketIdentity::of(&std::fs::symlink_metadata(&config.socket_path).expect("lstat"));
+        let (park_setup, mut park_signal) = tokio::sync::mpsc::unbounded_channel();
         // The same wiring `prepare` builds, without the signals this test never awaits.
         let host = Arc::new(Host {
             socket,
@@ -2297,14 +2425,12 @@ mod tests {
             peer_keys: peer_keys(&config).expect("decode the peer keys"),
             invoke_timeout_ms: config.invoke.timeout_ms,
             live: Mutex::new(Vec::new()),
-            #[cfg(test)]
+            park_setup: Some(park_setup),
             reject_registration: false,
         });
 
-        let (parked, mut park_signal) = tokio::sync::mpsc::unbounded_channel();
         let (resume, parked_resume) = tokio::sync::mpsc::unbounded_channel();
         *SETUP_PARK.lock().expect("setup seam lock") = Some(SetupPark {
-            parked,
             resume: parked_resume,
         });
 
