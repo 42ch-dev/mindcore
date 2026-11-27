@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+# `shutdown(2)` on the socket's own descriptor: teardown must not queue behind a blocked writer.
+libc = "0.2"
 mindcore-sqlite = { path = "../mindcore-sqlite", version = "0.1.0" }
 serde.workspace = true
 spoke-connect = { workspace = true, features = ["remote-adapter"] }

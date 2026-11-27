@@ -6,16 +6,27 @@
 //!
 //! Both ends of a session use the same framing: [`UnixSocketTransport::connect`] dials and
 //! [`UnixSocketTransport::from_stream`] wraps an accepted stream. `send` and `recv` take `&self`,
-//! so the stream is split — the write half behind a mutex (prefix and body written under one
-//! lock, so two concurrent sends never interleave) and the read half behind its own.
+//! so the stream is split: the write half behind a mutex (prefix and body written under one lock,
+//! so two concurrent sends never interleave) and the read half behind its own.
+//!
+//! Teardown never waits for either half. `spoke-connect`'s trait hands out `&self`, and on this
+//! tokio `&UnixStream` is not `AsyncWrite` — only `UnixStream` and the owned halves are — so a
+//! shutdown through a borrow is unavailable and any shutdown routed through a half's mutex would
+//! block behind a writer parked on a peer that stopped reading. The socket's own descriptor is
+//! captured before the split and `shutdown(2)` is issued on it directly: the call is immediate,
+//! needs no lock, and interrupts both a blocked `write_all` (which then fails) and a blocked read.
 //!
 //! Framing faults travel in [`TransportError::Io`], because `spoke-connect` has exactly `Closed`
 //! and `Io` and the daemon adds no variant. A peer closing at a frame boundary answers `Closed`;
-//! one closing inside a prefix or a body answers `Io` (`truncated frame`). A length of `0` or
-//! above [`MAX_FRAME`] is a protocol fault: the body is not read, the transport closes itself, and
-//! the fault never reaches the responder as a message.
+//! one closing inside a prefix or a body answers `Io` (`truncated frame`). Every framing fault is
+//! terminal: the transport marks itself closed, wakes [`UnixSocketTransport::closed`] and shuts the
+//! socket down, so the bytes after the fault are never read and the fault never reaches the
+//! responder as a message. A length of `0` or above [`MAX_FRAME`] is such a fault; `send` refuses
+//! one rather than writing a frame the peer must reject.
 
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use spoke_connect::remote::{Transport, TransportError};
@@ -33,6 +44,10 @@ pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 /// One end of a Unix-socket session, framed as length-prefixed envelopes.
 #[derive(Debug)]
 pub struct UnixSocketTransport {
+    /// The socket's descriptor, captured before the split. Both halves share it, and this struct
+    /// owns both, so it stays open for the transport's whole life. Teardown uses it precisely
+    /// because it is reachable without either half's mutex.
+    fd: RawFd,
     /// The read half. Its own mutex, so a pending `recv` and a `send` do not contend.
     reader: Mutex<OwnedReadHalf>,
     /// The write half. Held across the prefix and the body so frames stay whole.
@@ -40,6 +55,10 @@ pub struct UnixSocketTransport {
     /// `true` once the transport is closed. The sender keeps the value, so a late
     /// [`UnixSocketTransport::closed`] still resolves.
     closed: watch::Sender<bool>,
+    /// Whether `shutdown(2)` has run. Separate from `closed` because a framing fault sets the flag
+    /// *and* tears the socket down, and a later `close` must not try the shutdown again while still
+    /// reporting success.
+    shutdown_done: AtomicBool,
 }
 
 impl UnixSocketTransport {
@@ -54,18 +73,21 @@ impl UnixSocketTransport {
     /// Wraps an accepted stream — the server end of a session.
     #[must_use]
     pub fn from_stream(stream: UnixStream) -> Self {
+        let fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         Self {
+            fd,
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
             closed: watch::Sender::new(false),
+            shutdown_done: AtomicBool::new(false),
         }
     }
 
     /// Resolves once this transport is closed.
     ///
     /// The connection task awaits this and then drops its responder: the peer hung up, the
-    /// responder ended the session, or the daemon is draining.
+    /// responder ended the session, a framing fault, or the daemon is draining.
     pub async fn closed(&self) {
         let mut closed = self.closed.subscribe();
         // The sender lives in `self`, so this only errors if the transport itself is gone.
@@ -76,26 +98,61 @@ impl UnixSocketTransport {
         *self.closed.borrow()
     }
 
-    /// Marks the transport closed and wakes every waiter. Answers whether this call closed it.
-    fn mark_closed(&self) -> bool {
-        !self.closed.send_replace(true)
+    /// Marks the transport closed and wakes every waiter.
+    fn mark_closed(&self) {
+        self.closed.send_replace(true);
+    }
+
+    /// Shuts both directions of the socket down, at most once, without taking either half's lock.
+    ///
+    /// A blocked `write_all` on the write half fails once this runs, and a blocked read on the read
+    /// half ends, so no task stays parked on a peer that stopped reading. A peer that already went
+    /// away answers `NotConnected`, which is the state this call is asking for anyway.
+    fn shutdown_socket(&self) {
+        if self.shutdown_done.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // SAFETY: `fd` is the descriptor of the socket this struct's two halves were split from,
+        // and this struct owns both, so it is open here. `shutdown` only signals the socket; it
+        // neither closes nor reallocates the descriptor, so the halves and tokio's registration
+        // stay valid afterwards.
+        let rc = unsafe { libc::shutdown(self.fd, libc::SHUT_RDWR) };
+        if rc != 0 {
+            // Best effort, as `close` promises: the transport is closed either way, and the only
+            // error worth ignoring is a peer that already tore its side down.
+            let _ = std::io::Error::last_os_error();
+        }
+    }
+
+    /// The terminal transition: mark closed, then release the socket.
+    fn terminate(&self) {
+        self.mark_closed();
+        self.shutdown_socket();
     }
 
     /// Reads one frame: the 4-byte prefix, then exactly that many body bytes.
+    ///
+    /// Every fault here is terminal — the transport is closed and the socket shut down before the
+    /// error returns, so a truncated frame cannot leave a half-usable session behind.
     async fn read_frame(&self, reader: &mut OwnedReadHalf) -> Result<Vec<u8>, TransportError> {
         // Read by hand rather than `read_exact`: an EOF after some prefix bytes is a truncated
         // frame, while one before any is the peer closing at a frame boundary.
         let mut prefix = [0u8; 4];
         let mut filled = 0;
         while filled < prefix.len() {
-            let read = reader
-                .read(&mut prefix[filled..])
-                .await
-                .map_err(|error| TransportError::Io(format!("read frame prefix: {error}")))?;
+            let read = match reader.read(&mut prefix[filled..]).await {
+                Ok(read) => read,
+                Err(error) => {
+                    self.terminate();
+                    return Err(TransportError::Io(format!("read frame prefix: {error}")));
+                }
+            };
             if read == 0 {
                 return if filled == 0 {
+                    // The peer closed on a frame boundary: an orderly end, not a framing fault.
                     Err(TransportError::Closed)
                 } else {
+                    self.terminate();
                     Err(TransportError::Io(format!(
                         "truncated frame: {filled} of 4 prefix bytes"
                     )))
@@ -106,24 +163,25 @@ impl UnixSocketTransport {
 
         let len = u32::from_be_bytes(prefix);
         if len == 0 || len > MAX_FRAME {
-            // The session is unusable: mark it closed and leave the body in the socket. The write
-            // half is not shut down here — a concurrent `send` may hold it blocked on a peer that
-            // stopped reading — the connection task's drop after `closed()` tears the socket down.
-            self.mark_closed();
+            // The body stays in the socket: nothing is read after a length this size rejects.
+            self.terminate();
             return Err(TransportError::Io(format!(
                 "frame length {len} outside 1..={MAX_FRAME}; body not read"
             )));
         }
 
         let mut body = vec![0u8; len as usize];
-        reader.read_exact(&mut body).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                TransportError::Io(format!("truncated frame: body of {len} bytes cut short"))
-            } else {
-                TransportError::Io(format!("read frame body: {error}"))
+        match reader.read_exact(&mut body).await {
+            Ok(_) => Ok(body),
+            Err(error) => {
+                self.terminate();
+                Err(if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    TransportError::Io(format!("truncated frame: body of {len} bytes cut short"))
+                } else {
+                    TransportError::Io(format!("read frame body: {error}"))
+                })
             }
-        })?;
-        Ok(body)
+        }
     }
 }
 
@@ -159,6 +217,11 @@ impl Transport for UnixSocketTransport {
             .write_all(envelope)
             .await
             .map_err(|error| TransportError::Io(format!("write frame body: {error}")))?;
+        // A close during the write shuts the socket down; the write may have completed on a peer
+        // that is now gone, and it must not be reported as a delivered frame.
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
         Ok(())
     }
 
@@ -168,8 +231,8 @@ impl Transport for UnixSocketTransport {
         }
         let mut closed = self.closed.subscribe();
         let mut reader = self.reader.lock().await;
-        // A pending recv fails fast when the daemon closes the transport. Dropping the read
-        // future can only lose bytes no later recv can be asked for: close is terminal.
+        // A pending recv fails fast when the transport closes. Dropping the read future can only
+        // lose bytes no later recv can be asked for: close is terminal.
         tokio::select! {
             frame = self.read_frame(&mut reader) => frame,
             _ = closed.wait_for(|closed| *closed) => Err(TransportError::Closed),
@@ -177,15 +240,9 @@ impl Transport for UnixSocketTransport {
     }
 
     async fn close(&self) -> Result<(), TransportError> {
-        if !self.mark_closed() {
-            return Ok(());
-        }
-        // Wake a pending `recv` first (done above), then give the peer a clean frame boundary. A
-        // send already holding the write half is left alone: waiting for a peer that stopped
-        // reading would block drain, and dropping the halves shuts the write side anyway.
-        if let Ok(mut writer) = self.writer.try_lock() {
-            let _ = writer.shutdown().await;
-        }
+        // Idempotent on both halves of the work: the flag is already set on a repeat, and the
+        // shutdown is skipped once done — including when a framing fault got here first.
+        self.terminate();
         Ok(())
     }
 }
@@ -194,6 +251,9 @@ impl Transport for UnixSocketTransport {
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
     /// A listener bound to a path inside a tempdir that outlives it.
@@ -215,6 +275,32 @@ mod tests {
         let accepted = accept.await.expect("accept task");
         // The tempdir goes with `bound`; the connected pair does not need the name.
         (dialer, accepted)
+    }
+
+    /// The transport reports itself closed — the signal the connection task awaits.
+    async fn assert_closed(transport: &UnixSocketTransport) {
+        tokio::time::timeout(Duration::from_secs(5), transport.closed())
+            .await
+            .expect("the closed signal fires");
+    }
+
+    /// The peer's next read is EOF, i.e. this side really released the socket rather than merely
+    /// dropping a reference to it.
+    async fn assert_peer_sees_eof(peer: &mut UnixStream) {
+        let mut buf = [0u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    // Drain whatever was already buffered until the stream ends.
+                    Ok(0) => return Ok(()),
+                    Ok(_) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .expect("the peer is not left waiting");
+        read.expect("the peer reads EOF, not an error");
     }
 
     #[tokio::test]
@@ -257,7 +343,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_prefix_cut_short_is_an_io_error_not_a_panic() {
+    async fn an_invalid_prefix_releases_the_socket_while_the_transport_is_still_held() {
+        let (mut peer, accepted) = UnixStream::pair().expect("pair");
+        let transport = UnixSocketTransport::from_stream(accepted);
+
+        // A zero length and a body the transport must never read.
+        peer.write_all(&0u32.to_be_bytes()).await.expect("prefix");
+        peer.write_all(b"body that must stay unread")
+            .await
+            .expect("body");
+
+        let error = transport.recv().await.expect_err("protocol fault");
+        assert!(
+            matches!(&error, TransportError::Io(message) if message.contains('0')),
+            "the fault names the length: {error:?}"
+        );
+
+        // The transport is still alive here — this is the F-001 case: the socket must be shut down
+        // regardless, so the peer sees EOF and the connection task's wait resolves.
+        assert_closed(&transport).await;
+        assert_peer_sees_eof(&mut peer).await;
+        assert!(
+            matches!(transport.send(b"late").await, Err(TransportError::Closed)),
+            "nothing is sent after a framing fault"
+        );
+        assert!(
+            matches!(transport.recv().await, Err(TransportError::Closed)),
+            "nothing is received after a framing fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversize_prefix_releases_the_socket_while_the_transport_is_still_held() {
+        let (mut peer, accepted) = UnixStream::pair().expect("pair");
+        let transport = UnixSocketTransport::from_stream(accepted);
+        let oversize = MAX_FRAME + 1;
+
+        peer.write_all(&oversize.to_be_bytes())
+            .await
+            .expect("prefix");
+        peer.write_all(b"body that must stay unread")
+            .await
+            .expect("body");
+
+        let error = transport.recv().await.expect_err("protocol fault");
+        let named = oversize.to_string();
+        assert!(
+            matches!(&error, TransportError::Io(message) if message.contains(&named)),
+            "the fault names the length {oversize}: {error:?}"
+        );
+
+        assert_closed(&transport).await;
+        assert_peer_sees_eof(&mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn a_prefix_cut_short_is_terminal() {
         let (mut peer, accepted) = UnixStream::pair().expect("pair");
         let transport = UnixSocketTransport::from_stream(accepted);
 
@@ -269,30 +410,72 @@ mod tests {
             matches!(&error, TransportError::Io(message) if message.contains("truncated")),
             "half a prefix then EOF is Io: {error:?}"
         );
+
+        assert_closed(&transport).await;
+        assert!(
+            matches!(transport.send(b"late").await, Err(TransportError::Closed)),
+            "a send after a truncated prefix fails"
+        );
+        assert!(
+            matches!(transport.recv().await, Err(TransportError::Closed)),
+            "a recv after a truncated prefix fails"
+        );
     }
 
     #[tokio::test]
-    async fn a_zero_or_oversize_prefix_is_io_and_leaves_the_body_unread() {
-        for prefix in [0u32, MAX_FRAME + 1] {
-            let (mut peer, accepted) = UnixStream::pair().expect("pair");
-            let transport = UnixSocketTransport::from_stream(accepted);
+    async fn a_body_cut_short_is_terminal() {
+        let (mut peer, accepted) = UnixStream::pair().expect("pair");
+        let transport = UnixSocketTransport::from_stream(accepted);
 
-            peer.write_all(&prefix.to_be_bytes()).await.expect("prefix");
-            peer.write_all(b"body that must stay unread")
-                .await
-                .expect("body");
+        // A well-formed length whose body never arrives in full.
+        peer.write_all(&10u32.to_be_bytes()).await.expect("prefix");
+        peer.write_all(b"abc").await.expect("part of the body");
+        peer.shutdown().await.expect("hang up");
 
-            let error = transport.recv().await.expect_err("protocol fault");
-            let named = prefix.to_string();
-            assert!(
-                matches!(&error, TransportError::Io(message) if message.contains(&named)),
-                "the fault names the length {prefix}: {error:?}"
-            );
-            assert!(
-                matches!(transport.recv().await, Err(TransportError::Closed)),
-                "a framing fault closes the transport, so the body is never delivered"
-            );
-        }
+        let error = transport.recv().await.expect_err("truncated body");
+        assert!(
+            matches!(&error, TransportError::Io(message) if message.contains("truncated")),
+            "a short body is Io: {error:?}"
+        );
+
+        assert_closed(&transport).await;
+        assert!(
+            matches!(transport.send(b"late").await, Err(TransportError::Closed)),
+            "a send after a truncated body fails"
+        );
+        assert!(
+            matches!(transport.recv().await, Err(TransportError::Closed)),
+            "a recv after a truncated body fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_interrupts_a_send_blocked_on_a_peer_that_does_not_read() {
+        let (mut peer, accepted) = UnixStream::pair().expect("pair");
+        let transport = std::sync::Arc::new(UnixSocketTransport::from_stream(accepted));
+
+        // Larger than any socket buffer, so the send parks — and within `MAX_FRAME`, so it is a
+        // legitimate frame rather than an immediate protocol refusal.
+        let body = vec![7u8; 8 * 1024 * 1024];
+        let sending = tokio::spawn({
+            let transport = std::sync::Arc::clone(&transport);
+            async move { transport.send(&body).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!sending.is_finished(), "the send is blocked on the peer");
+
+        transport.close().await.expect("close");
+        let sent = tokio::time::timeout(Duration::from_secs(5), sending)
+            .await
+            .expect("the blocked send wakes on close")
+            .expect("send task");
+        assert!(
+            sent.is_err(),
+            "a send interrupted by close fails instead of reporting a delivered frame: {sent:?}"
+        );
+
+        assert_closed(&transport).await;
+        assert_peer_sees_eof(&mut peer).await;
     }
 
     #[tokio::test]
@@ -312,7 +495,7 @@ mod tests {
         );
         assert!(
             matches!(accepted.recv().await, Err(TransportError::Closed)),
-            "the peer sees the close as a frame boundary"
+            "the peer sees the close as the end of the stream"
         );
     }
 
@@ -327,7 +510,7 @@ mod tests {
         });
         dialer.close().await.expect("close");
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("the connection task's wait resolves on close")
             .expect("closed signal task");
