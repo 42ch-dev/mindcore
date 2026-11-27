@@ -117,6 +117,14 @@ jobs:
       - run: cargo test --locked --workspace
         env:
           SQLX_OFFLINE: "true"
+      # The addon is a workspace member and `bindings/node` declares no dependency, so this is one
+      # step on the Node and the cache the job already has, not a second job and not an npm install.
+      - name: binding
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          cargo build --locked -p mindcore-binding
+          node --test bindings/node/test.mjs
 
   corpus:
     runs-on: ubuntu-latest

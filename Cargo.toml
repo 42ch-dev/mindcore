@@ -7,6 +7,7 @@ members = [
     "crates/mindcore-spoke",
     "crates/mindcore-runtime",
     "crates/mindcore-daemon",
+    "crates/mindcore-binding",
 ]
 default-members = [
     "crates/mindcore-base",

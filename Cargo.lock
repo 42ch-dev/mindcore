@@ -435,6 +435,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f421161cb492475f1661ddc9815a745a1c894592070661180fdec3d4872e9c3"
 
 [[package]]
+name = "convert_case"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1af709f1f33454bf52eadfc8c78b3b9ef9cb26fb54d16dc9cd9a7299f899fd1b"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,6 +548,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "ctor"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea691ed9f36489d087419b8b2ba3ef27d89621380b4178c73e2445a379e4e0f4"
+dependencies = [
+ "link-section",
 ]
 
 [[package]]
@@ -1660,6 +1678,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,6 +2044,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "link-section"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d9aae57673c1a235149777a74d152f3210ebd3e3b13346d2cdb6809e566bd3c"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2085,6 +2119,27 @@ dependencies = [
  "spoke-operations",
  "spoke-schemas",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mindcore-binding"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "mindcore-base",
+ "mindcore-runtime",
+ "mindcore-spoke",
+ "mindcore-sqlite",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "serde",
+ "serde_json",
+ "spoke-operations",
+ "spoke-schemas",
+ "sqlx",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2276,6 +2331,66 @@ dependencies = [
  "smallvec",
  "tracing",
  "unsigned-varint",
+]
+
+[[package]]
+name = "napi"
+version = "3.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3638796ff28754eaeca96cda32e0c4e2e30b83d0e53f32a4537d6a8bcf15f532"
+dependencies = [
+ "bitflags",
+ "ctor",
+ "futures",
+ "libc",
+ "napi-build",
+ "napi-sys",
+ "nohash-hasher",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "napi-build"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb4c45ca811160461dba7eccc68b66702ddb5c9f30afb16007caac3c0eb6e2a"
+
+[[package]]
+name = "napi-derive"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3f284288c8a2a4a66519e24dcc0cbfa1b7e0abc37bdd073185c68276f08f3d3"
+dependencies = [
+ "convert_case",
+ "napi-derive-backend",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+ "unicode-ident",
+]
+
+[[package]]
+name = "napi-derive-backend"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32477ed34450779386e6aaa3b33bcf3916035b7de0fee68b73716f65a3894003"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "napi-sys"
+version = "3.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d153beb7d5c973f4b9395be8a83054a28968b61188f1dd1a2cc2321af22daea2"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -3771,6 +3886,12 @@ name = "unicode-properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "universal-hash"

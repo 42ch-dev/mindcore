@@ -1,0 +1,41 @@
+[package]
+name = "mindcore-binding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The Node addon: the in-process facade as a native module"
+publish = false
+
+[lib]
+# A `cdylib` is the whole product: nothing in the workspace links this crate back.
+crate-type = ["cdylib"]
+
+[dependencies]
+# `serde-json` is how a wire object crosses unchanged; `tokio_rt` runs every async export on the
+# addon's own runtime and answers a Promise. `strict` validates an argument against its Rust type
+# before any facade call.
+napi = { version = "3", features = ["serde-json", "tokio_rt"] }
+napi-derive = { version = "3", default-features = false, features = ["strict"] }
+mindcore-base = { path = "../mindcore-base", version = "0.1.0" }
+mindcore-runtime = { path = "../mindcore-runtime", version = "0.1.0" }
+mindcore-spoke = { path = "../mindcore-spoke", version = "0.1.0" }
+mindcore-sqlite = { path = "../mindcore-sqlite", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+# The store's open error is sqlx's own: classifying it by kind and code needs the type, not a
+# match on its rendered message.
+sqlx.workspace = true
+spoke-operations.workspace = true
+spoke-schemas.workspace = true
+
+[build-dependencies]
+napi-build = "2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# The addon's own exports are `async` and run on napi's runtime in production; the tests that
+# exercise them build a runtime directly, so tokio's macros are a test-only dependency here.
+tokio.workspace = true
