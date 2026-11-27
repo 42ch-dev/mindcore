@@ -1,0 +1,28 @@
+[package]
+name = "mindcore-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The sidecar daemon: one store file, one Unix socket, the SPOKE-peer delivery form"
+publish = false
+
+[lib]
+name = "mindcore_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mindcore-daemon"
+path = "src/main.rs"
+
+[dependencies]
+mindcore-sqlite = { path = "../mindcore-sqlite", version = "0.1.0" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# `parse` + `serde` are all the daemon reads; no TOML is ever written.
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
