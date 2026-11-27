@@ -7,12 +7,12 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The addon's file name as cargo writes it, per platform: a `cdylib` is
-// `libmindcore_binding.{dylib,so}` on macOS and Linux, `mindcore_binding.dll` on Windows.
+// The addon's file name as cargo writes it, per platform. Only the platforms `package.json`'s `os`
+// field declares appear here: a host missing from this table is refused by name below, which is
+// the truth, rather than being told the addon is unbuilt.
 const ARTIFACTS = {
   darwin: 'libmindcore_binding.dylib',
   linux: 'libmindcore_binding.so',
-  win32: 'mindcore_binding.dll',
 };
 
 /** What `package.json`'s `os` field declares: the hosts this package is built and tested on. */
@@ -41,16 +41,29 @@ function loadBinding() {
         'them. A build for this host can still be named with MINDCORE_BINDING_PATH.',
     );
   }
-  const candidates = ['debug', 'release'].map((profile) =>
-    join(fileURLToPath(new URL('../../', import.meta.url)), 'target', profile, artifact),
-  );
-  for (const path of candidates) {
-    if (existsSync(path)) return openAddon(path);
+  const candidates = ['debug', 'release'].map((profile) => ({
+    profile,
+    path: join(fileURLToPath(new URL('../../', import.meta.url)), 'target', profile, artifact),
+  }));
+  const found = candidates.filter((candidate) => existsSync(candidate.path));
+  if (found.length === 0) {
+    throw new Error(
+      `the mindcore binding is not built: no addon at ${candidates.map((c) => c.path).join(', ')}; ` +
+        `build it with cargo build -p mindcore-binding. It ships for ${SUPPORTED.join(', ')}.`,
+    );
   }
-  throw new Error(
-    `the mindcore binding is not built: no addon at ${candidates.join(', ')}; ` +
-      `build it with cargo build -p mindcore-binding. It ships for ${SUPPORTED.join(', ')}.`,
-  );
+  // Debug wins, as it always has. When a release build also exists, say so once: a measurement
+  // that meant release must not silently run debug code, and the two paths are indistinguishable
+  // from the outside.
+  if (found.length > 1) {
+    process.emitWarning(
+      `the mindcore binding loaded the ${found[0].profile} addon at ${found[0].path}, ` +
+        `but a ${found[1].profile} build also exists at ${found[1].path}; ` +
+        'name MINDCORE_BINDING_PATH to choose one deliberately.',
+      'MindcoreBindingShadow',
+    );
+  }
+  return openAddon(found[0].path);
 }
 
 const binding = loadBinding();
