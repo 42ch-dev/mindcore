@@ -236,9 +236,22 @@ selector answering the `Principal` and the admitted `Scope`. **That selector is 
 `destination_scope_id`**: Connect hands it to the admission, so the member chooses *which Mind the
 call is admitted against*, and only after admission is its equality with the returned scope checked
 (by Connect above the port, and again by the port's own pre-transaction comparison). What the member
-cannot choose is a collection — the registry row of the Mind it selected names that — nor bypass
+could choose is a collection — the registry row of the Mind it selected names that — nor bypass
 admission for a Mind the caller holds no grant in. The callback carries the Mind and nothing else,
 no caller binding, and the principal still comes from the authenticated peer, never the payload.
+
+**The admission also enforces the operation grant.** `lib.rs::admit_adoption_grant` runs after
+`admitted_mind`, on the callback's blocking pool: it opens its own short transaction, calls the same
+`authorize_knowledge` the port calls, requiring one live grant of the caller in the admitted Mind's
+space covering both `knowledge_write` and `knowledge_read`, and rolls the transaction back without
+writing. It exists because Connect answers a **recorded adoption replay** after Mind admission alone:
+the dedup lookup happens above the port, so a peer whose knowledge grant was revoked could receive
+the recorded entry while any other live grant still admits it to the Mind. Requiring the grant in
+admission refuses that peer on every path, replayed outcomes included, and the recorded-replay path
+itself needs no change. It is deliberately **not** one step with the port's check: the two are
+separate transactions, so a revocation that commits between admission and the port does not stop the
+copy the port then authorizes — the same recorded window the knowledge and history faces carry as
+`I-000154`, and narrower here because the replay path is closed.
 
 **The grant rule.** `knowledge.adopt` requires **one** live grant of the caller in the admitted
 Mind's space covering both `knowledge_write` and `knowledge_read`, on one row — it is a knowledge
@@ -346,12 +359,14 @@ call re-makes the same two decisions against the whole registry inside its trans
 
 **A claimable source id disables shared adoption, by design.** Mind creation accepts any authenticated
 peer claiming a free id (owner decision, `I-000155`), so a peer can register a Mind whose id is the
-configured source's `scope_id`. From that moment the call-time registry check refuses every adoption
-into every Mind — the source is a registered Mind's id, which is exactly refusal five — and the
-failure is deliberate rather than a defect to narrow. Hosts that admit arbitrary peers must
-therefore treat a shared source's `scope_id` as reserved configuration: an id no peer can claim, and
-one they never hand out as a Mind id. `I-000155` owns the create semantics; this page owns only the
-consequence for a composed adoption face.
+configured source's `scope_id`. From that moment the call-time registry check refuses every fresh
+adoption execution — a copy execution entering the transaction — into every Mind, because the source
+is a registered Mind's id, which is exactly refusal five. A same-key same-digest reconnect that
+already holds a recorded outcome never enters the transaction and so re-runs neither this check nor
+the operation grant; it answers the recorded outcome. The failure is deliberate rather than a defect
+to narrow. Hosts that admit arbitrary peers must therefore treat a shared source's `scope_id` as
+reserved configuration: an id no peer can claim, and one they never hand out as a Mind id. `I-000155`
+owns the create semantics; this page owns only the consequence for a composed adoption face.
 
 **The call-time `NOT_FOUND` cases.** Three request or registry states answer the same generic
 `NOT_FOUND` with no `details`, so a peer cannot tell them apart:
@@ -373,12 +388,16 @@ the copy's own `entry_id` is `destination_entry_id` when supplied and the termin
 A chain that cannot resolve — a cycle, an ambiguous merge, a missing hop, more than the resolver's
 32 edges — answers `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order. A
 retired source's requested revision is not compared, because the anchor records the terminal's own
-revision; a live source that moved off the requested revision answers `REVISION_CONFLICT` with no
-details. A resolved terminal whose own revision is above Mindcore's served ceiling of `2^53 - 1` has
-no conformant success to report, because the anchor is the only carrier of that revision: the
-`adoption_anchor.source_revision` member records the terminal's revision and must satisfy the
-IEEE-754 safe-integer bound, which is Mindcore's own check and narrower than the numeric check
-Connect applies to the request. The copy's own `revision` is never that value — it is the
+revision. A live source that moved off the requested revision is classified by the copy helper after
+the destination slot is read, so the repeat rule below decides it: a repeat whose stored anchor
+records the requested revision is served `already_present`, and one anchored at another revision is
+`REVISION_CONFLICT`. A resolved terminal whose *stored* revision is above Mindcore's served ceiling of
+`2^53 - 1` has no conformant success to report, because the anchor is the only carrier of that
+revision: the `adoption_anchor.source_revision` member records the terminal's revision and must
+satisfy the IEEE-754 safe-integer bound, which is Mindcore's own check and narrower than the numeric
+check Connect applies to the request. That guard bounds the stored revision a create would anchor,
+never the requested one: a request naming an out-of-range revision the source does not hold is the
+copy helper's ordinary conflict. The copy's own `revision` is never that value — it is the
 destination row's write revision, assigned by the store (`1` on a create) — so the response's
 `entry.revision` is checked separately on return. The call refuses before writing anything, with the
 fixed fault message and `details.kind = "store"`; the copy is never committed for a response the
@@ -407,8 +426,10 @@ the same rule; a re-read answering absence or occupancy is that occupancy, one r
 `NOT_AUTHORIZED` or `REVISION_CONFLICT` travels as the destination reported it, and one faulting for
 storage reasons becomes the fixed `InternalError` below rather than the put's own refusal. Any other
 store answer becomes `InternalError` with the fixed message `knowledge adoption could not complete`
-and `details.kind` naming the failing stage (`begin`, `commit`, `store` or `response`); the serde,
-SQL and stored-payload text stays on the host side and never enters the signed refusal. A stored
+and exactly one `details` member, `kind: "store"` — the only value an adoption fault carries. The
+failing stage (`begin`, `commit`, `store` or `response`) and the serde, SQL and stored-payload text
+are host-side diagnostics: they name local tables and columns, so they go to the host's stderr and
+never enter the signed refusal. A stored
 `adoption_anchor` revision above `2^53 - 1` is the same fixed `store` fault, never a
 `REVISION_CONFLICT` carrying the out-of-range integer — but only when that anchor names the
 requested source scope and entry. An unrelated occupant's anchor is never read as this adoption's

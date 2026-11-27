@@ -242,11 +242,13 @@ async fn adopt_in(
         .as_deref()
         .map(String::as_str)
         .unwrap_or(terminal.source_entry_id.as_str());
-    // A new anchor records `expected_revision`, so a value the served wire cannot carry would
-    // commit a copy whose response Connect must reject as a transport fault. Refuse before the
-    // write instead: the caller's request was in range, the stored source is not servable. An
-    // occupied slot's own above-range anchor is the helper's `store` fault, not this guard.
-    if expected_revision > SERVED_REVISION_BOUND {
+    // The anchor a create writes records the terminal's stored revision, so a stored value the
+    // served wire cannot carry is refused before the write: no copy commits for a response Connect
+    // must reject as a transport fault. This bounds the *stored* revision, never the requested one —
+    // a request naming an out-of-range revision that the source does not hold is the copy helper's
+    // ordinary revision conflict, and only an unserveable stored source is a store fault. An
+    // occupied slot's own above-range anchor is likewise the helper's `store` fault, not this guard.
+    if terminal.source_revision > SERVED_REVISION_BOUND {
         return spoke_reject(
             SpokeRejectCode::InternalError,
             format!(
@@ -875,6 +877,33 @@ mod tests {
                 .and_then(|details| details.get("adopted_revision")),
             Some(&json!(1)),
             "the conflict names the revision the stored copy anchors: {stale:?}"
+        );
+
+        // A requested revision outside the served range that the source does not hold is still the
+        // revision conflict, not a store fault: the guard bounds the revision a create would
+        // *anchor*, and this call anchors nothing. `2^53` is the endpoint above the ceiling.
+        let beyond = refused(
+            service
+                .adopt_knowledge_entry(
+                    &owner,
+                    &admitted,
+                    &request("ke_source", SERVED_REVISION_BOUND + 1),
+                )
+                .await,
+            "a requested revision outside the served range",
+        );
+        assert_eq!(
+            beyond.code,
+            SpokeRejectCode::RevisionConflict,
+            "an unheld request revision is a conflict, never a store fault: {beyond:?}"
+        );
+        assert_eq!(
+            beyond
+                .details
+                .as_ref()
+                .and_then(|details| details.get("adopted_revision")),
+            Some(&json!(1)),
+            "the conflict still names the stored copy's anchor revision: {beyond:?}"
         );
 
         let absent = refused(
