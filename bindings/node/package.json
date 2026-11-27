@@ -5,6 +5,10 @@
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
+  "os": [
+    "darwin",
+    "linux"
+  ],
   "scripts": {
     "test": "node --test test.mjs"
   }
