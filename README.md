@@ -73,9 +73,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```
 
-`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io as the `0.1.0-alpha.1`
-pre-release — an exact pin, because Cargo's `"0.1"` does not match a pre-release. The facade is
-`publish = false`, so this example takes the whole family from this repository at one revision.
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io at `0.1.0`, the version this
+workspace declares, so a `"0.1"` requirement matches; a host that needs only the record model and
+the store takes them from the registry. The facade is `publish = false`, so this example takes the
+whole family from this repository at one revision — a registry `mindcore-base` beside a git
+`mindcore-runtime` would be two copies of the same types.
 
 ```rust
 use mindcore_base::boundary::CallerId;
@@ -129,9 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The full story — recall, review of a staged candidate, adoption from a shared collection, doubt,
-evidence, a shared change, a reopen and the refusals — is [docs/quickstart.md](docs/quickstart.md),
-and the same sequence is asserted by the workspace example:
+The facade path — create a Mind, capture, review, recall, write the carrier and read the derived
+judgment, and deliberate with a host reasoner — is [docs/quickstart.md](docs/quickstart.md). The
+whole record story — adoption, doubt, evidence, a shared change, a reopen and the refusals — is
+asserted by the workspace example:
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01

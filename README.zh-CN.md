@@ -69,9 +69,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```
 
-`mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 在 crates.io 上是 `0.1.0-alpha.1` 预发布版本，
-必须精确固定——Cargo 的 `"0.1"` 匹配不到预发布版本。facade 为 `publish = false`，因此这个示例把
-整个 family 从本仓库的同一个 revision 引入。
+`mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 在 crates.io 上是 `0.1.0`，与这个 workspace
+声明的版本一致，因此 `"0.1"` 要求可以匹配；只需要记录模型与 store 的宿主可以直接从 registry 引入。
+facade 为 `publish = false`，因此这个示例把整个 family 从本仓库的同一个 revision 引入——把 registry
+的 `mindcore-base` 与 git 的 `mindcore-runtime` 混用会得到同一套类型的两份副本。
 
 ```rust
 use mindcore_base::boundary::CallerId;
@@ -124,9 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-完整的故事——recall、对暂存 candidate 的 review、从共享 collection 采纳、怀疑、证据、共享变更、
-重新打开以及各种拒绝——见 [docs/quickstart.md](docs/quickstart.md)，同一串动作也由仓库 example
-断言：
+facade 路径——创建 Mind、capture、review、recall、写入 carrier 并读取推导出的 judgment，以及在
+宿主提供 reasoner 时 deliberate——见 [docs/quickstart.md](docs/quickstart.md)。完整的记录故事——
+采纳、怀疑、证据、共享变更、重新打开以及各种拒绝——由仓库 example 断言：
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
