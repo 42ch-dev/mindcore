@@ -47,28 +47,28 @@ Each stage will merge on its own, behind the capability it advertises, and will 
 | Write-gate plus commit latency | S3/S4, measured S12 | one 8 KiB document | Mandatory | p99 ≤ 50 ms |
 | Catch-up per step | S5, measured S12 | chains of 100, 1 000 and 10 000 one-document commits from 10%, 50% and 100% behind | Mandatory | per-step p99 ≤ 100 ms; 10 000 steps ≤ 30 s |
 | Compiler-version rebuild | S5, measured S12 | a 500-document Mind | Mandatory | p99 ≤ 2 s, one transaction per document |
-| Rank invariance and isolation | S7, measured S12 | one Mind before and after another Mind's corpus doubles; hidden rows in the top candidates | Mandatory | identical order and ties; `k` visible rows; hidden rows change no count |
+| Rank invariance and isolation | S7, measured S12 | one Mind before and after another Mind's corpus doubles; hidden documents among the top candidates | Mandatory | identical order and ties; `k` visible rows; no visible score or order changes when hidden documents are added or removed |
 | Old-client response bytes | S9, measured S12 | a peer without the features; a collection with no document-backed entry | Mandatory | dynamic entries byte-identical; the document-free collection byte-identical |
 | Restore from backup | S12 | a completed backup | Mandatory | every read, version and history answer identical on a fresh host |
 | L1 first-pass closure | S6, measured S12 | accepted tasks needing no hydration | Reported | target ≥ 70% |
-| Head-discovery cost | S5, measured S12 | collection head enumeration per catch-up round | Reported | measured separately from replay cost |
+| Head-discovery cost | S5, measured S12 | collection head enumeration on every collection search and catch-up invocation | Reported | measured per search and separately from replay; it is a search-path cost, not avoided by the cursor |
 | Cache hit rate | S3/S5, measured S12 | a rename series and a revert series | Reported | target ≥ 90% |
 | Index backfill | S5, measured S12 | a 2 000-document collection written before the indexes | Reported | batches of 100; measured |
 | Oracle whole-document baseline | S7, measured S12 | the same corpus and questions | Reported | bounds the achievable gain; no gate |
 
 **Stage gates will be as concrete as the metrics.**
 
-- S1: an external implementation compiles and passes the suite; the publish-phase failure case is in it.
+- S1: an external implementation compiles and passes the groups its capabilities require — every provider the read and write-refusal groups, a writable one the writable-publication group including a publish-phase failure.
 - S2: positive fixtures compile byte-exactly; every rule has a refusal case; a blank-line-only change outside a fence compiles to the same fingerprint; a trailing-whitespace document is refused; an indentation change that alters block structure changes the fingerprint.
-- S3: a create against an existing head is refused; a tombstone keeps the head; a publish failure leaves every named document old or new and reports the unpublished ones.
-- S4: every rejection in the format and lineage lists refuses with rule and byte range; a moved dependency refuses before publication; a dropped response is resolved by the receipt; activation preserves a seeded legacy row.
-- S5: each crash window is injected; a head with no cursor is adopted; dropping the derived set preserves review decisions.
-- S6: L0 has no body, L1 no prose, a pinned handle returns its version and never answers `ViewStale`, a hidden item answers as absent.
-- S7: hidden rows in the top candidates still yield `k` visible rows; L0 is document-ranked; sections come only from the selected documents, capped per document.
-- S8: the classification table holds; declared lineage replays after a crash; no automatic re-anchor.
-- S9: the direct round trip, the receipt and the old-client bytes pass.
+- S3: a create against an existing head is refused; a tombstone keeps the head; an attempt ref is created before staging and revoked at release, so a paused attempt cannot stage; a batch decision consumes no staging credential; a decided batch retains its credentials and settles once, while an undecided attempt is revoked at expiry; a revoked attempt answers `attempt revoked` even when its staging credential is gone, and only a live attempt answers `staging expired`; a mutual move builds in either order; a publish failure leaves every named document old or new, settles each target by reachability and reports only the truly unpublished ones.
+- S4: every rejection in the format and lineage lists refuses with rule and byte range; a dependency already moved at the post-staging check refuses and one that moves afterwards produces a finding; a partial batch answers `incomplete` with each published target's version and commit and only the unpublished ones retryable; a dropped response is resolved by the receipt; a released attempt cannot create its first credential, stage or publish; a cross-document operation writes its lineage record before the batch decision ref, and a failed write leaves no decision ref and no head move; a create retried after a released claim yields exactly one root; a delete through the negotiated tool appends a tombstone and its lost response is resolved by its own request id and digest; a head published before its claim repair is served by a read, and an ordinary update cannot resurrect the id; activation preserves a seeded legacy row.
+- S5: each crash window is injected; a head with no cursor is adopted; dropping the derived set preserves review decisions, and rebuilding with changed anchors follows the valid owners.
+- S6: L0 has no body, L1 no prose and a complete handle per section, a pinned handle returns its version and never answers `ViewStale`, a hidden item answers as absent, and a diff with a hidden side answers as not found.
+- S7: hidden rows in the top candidates still yield `k` visible rows and change no visible score or order; the search's visibility decision matches the read predicate item by item; L0 is document-ranked; sections come only from the selected documents, capped per document.
+- S8: the classification table holds; a successor attaches only to a published target — the containing commit for a same-document target, the recorded candidate for a cross-document one — independent of publication order; a same-document target stores no commit id; a cross-document binding survives removing staging and batch refs and a garbage collection; a late target publication refreshes the source finding on the target's projection or a source finding read without rebuilding the source; declared lineage replays after a crash; no automatic re-anchor.
+- S9: the direct round trip including L1-carried handles, the peer delete through the negotiated tool with its tombstone replay and its own request id, the receipt and the old-client bytes pass.
 - S10: schemas, cohort, assemble carrier, scoped FFI and SDK parity are delivered.
-- S11: the read-only provider passes the shared suite without a compiler or a vector channel.
+- S11: the read-only provider passes the read and write-refusal groups without a compiler or a vector channel.
 - S12: the restore drill passes, then the evaluation runs on the complete feature.
 
 **If a measured gate misses, the response will be a mechanism fix or a recorded decision — not a dropped layer and not a restated goal.** Selection, fusion, prefixing, index level and caching are the levers; the scope of the feature is not.
@@ -102,4 +102,4 @@ Each stage will merge on its own, behind the capability it advertises, and will 
 - **Evaluation cost.** Several buckets with a re-measured baseline costs time. Mitigation: the harness reuses existing statement and provider-call instrumentation, and the baseline is measured once per run.
 - **The restore drill is slow and unglamorous.** Mitigation: it is a stage gate, not a checklist item; its input is a real backup, and its output is a comparison of every read and history answer.
 - **The standardisation cohort depends on an external release window.** Mitigation: S9 delivers the peer path on its own; S10 is scheduled by that window, not by demand, and stays in this plan.
-- **Head enumeration adds a discovery cost to search.** Mitigation: it is measured separately (reported), bounded by document count, and removed from the hot path by the per-document cursor.
+- **Head enumeration adds a discovery cost to search.** Mitigation: it is measured per search (reported), bounded by the document count, and the per-document cursor removes replay of unchanged documents but not the enumeration; this record states it as a search-path cost rather than calling it outside the hot path.
