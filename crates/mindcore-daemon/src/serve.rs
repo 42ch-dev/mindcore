@@ -65,6 +65,9 @@ struct Host {
 /// The mode every socket this daemon binds carries: owner read/write, nobody else.
 const SOCKET_MODE: u32 = 0o600;
 
+/// The mode every journal directory this daemon creates carries: owner only.
+const JOURNAL_DIR_MODE: u32 = 0o700;
+
 /// The device and inode of the socket name this daemon created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SocketIdentity {
@@ -375,7 +378,17 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
     // or was already there.
     for (index, level) in chain.iter().enumerate().rev() {
         if Some(index) != existing {
-            std::fs::create_dir(level)
+            // Owner-only, not the umask's choice: the journal holds what the Mind settled on, and a
+            // directory some other user can write into is a publication target they control. Only
+            // levels this start creates get the mode; a pre-existing level keeps its own.
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(JOURNAL_DIR_MODE);
+            }
+            builder
+                .create(level)
                 .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
         }
         sync_parent_of(level)?;
@@ -1229,6 +1242,44 @@ mod tests {
             }
             other => panic!("a file above the journal root is a journal fault, not {other:?}"),
         }
+    }
+
+    /// Every level this start creates is owner-only, not the umask's choice: the journal holds what
+    /// the Mind settled on, and a directory another user can write into is a publication target they
+    /// control. A level that already existed keeps the mode it had.
+    #[test]
+    fn a_created_journal_level_is_owner_only_and_an_existing_one_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temporary directory");
+        // An ancestor this run did not create, with a mode of its own.
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).expect("create the ancestor");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o750))
+            .expect("give the ancestor its own mode");
+
+        let root = existing.join("a").join("b");
+        journal_root(&root).expect("create two levels");
+        for level in [existing.join("a"), root] {
+            let mode = std::fs::metadata(&level)
+                .expect("stat the created level")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                JOURNAL_DIR_MODE,
+                "{} is {mode:04o}, not owner-only",
+                level.display()
+            );
+        }
+
+        let kept = std::fs::metadata(&existing)
+            .expect("stat the existing level")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(kept, 0o750, "a pre-existing level keeps {kept:04o}");
     }
 
     /// A single-segment relative journal root still syncs its own directory entry. `Path::new("journal")`

@@ -157,11 +157,12 @@ impl DaemonConfig {
     }
 }
 
-/// Refuses a seed file group or other can read.
+/// Refuses a seed file group or other can read or write.
 ///
-/// The seed is the responder's signing identity: anyone who can read it can speak as this daemon, so
-/// a readable-by-others mode is a configuration fault rather than a warning. Only the mode bits are
-/// reported — never the bytes — so the refusal can be shown without leaking the key.
+/// The seed is the responder's signing identity. Anyone who can read it can speak as this daemon, and
+/// anyone who can write it can put their own key in its place and speak as this daemon too — so a
+/// mode with any group or other bit set is a configuration fault rather than a warning. Only the mode
+/// bits are reported, never the bytes, so the refusal can be shown without leaking the key.
 #[cfg(unix)]
 fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt;
@@ -173,9 +174,11 @@ fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
         .permissions()
         .mode()
         & 0o777;
-    if mode & 0o044 != 0 {
+    // Any group or other bit: `0o0620` is writable by group, which is as fatal as readable.
+    if mode & 0o066 != 0 {
         return Err(DaemonError::Config(format!(
-            "identity.seed_file {}: mode {mode:04o} is readable by group or other; use 0600",
+            "identity.seed_file {}: mode {mode:04o} is readable or writable by group or other; \
+             use 0600",
             path.display()
         )));
     }
@@ -399,7 +402,10 @@ journal_dir = "{}"
             Err(DaemonError::Config(message)) => {
                 assert!(message.contains("identity.seed_file"), "{message}");
                 assert!(message.contains("0644"), "the mode is named: {message}");
-                assert!(message.contains("readable by group or other"), "{message}");
+                assert!(
+                    message.contains("readable or writable by group or other"),
+                    "{message}"
+                );
                 assert!(
                     !message.contains(&SEED[..8]),
                     "the refusal must not carry the seed: {message}"
@@ -420,18 +426,46 @@ journal_dir = "{}"
         });
     }
 
-    /// Group-readable is refused too: the check is any bit in group or other, not only other.
+    /// Any group or other bit is refused, not only a read bit: `0620` is group-writable, which lets
+    /// an attacker replace the key rather than merely read it.
     #[test]
-    fn a_group_readable_seed_is_refused() {
+    fn every_group_or_other_bit_is_refused() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let seed = dir.path().join("seed");
+        for (mode, label) in [
+            (0o640u32, "group-readable"),
+            (0o604, "other-readable"),
+            (0o620, "group-writable"),
+            (0o602, "other-writable"),
+            (0o622, "group- and other-writable"),
+        ] {
+            write_seed(&seed, SEED);
+            std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(mode))
+                .expect("set the mode");
+            match read_seed(&seed) {
+                Err(DaemonError::Config(message)) => {
+                    assert!(
+                        message.contains(&format!("{mode:04o}")),
+                        "{label}: the mode is named: {message}"
+                    );
+                    assert!(
+                        message.contains("readable or writable by group or other"),
+                        "{label}: {message}"
+                    );
+                    assert!(
+                        !message.contains(&SEED[..8]),
+                        "{label}: the refusal must not carry the seed: {message}"
+                    );
+                }
+                other => panic!("a {label} seed is a config fault, not {other:?}"),
+            }
+        }
+
+        // Owner-only still parses.
         write_seed(&seed, SEED);
-        std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o640))
-            .expect("widen the seed to group-readable");
-        let error = read_seed(&seed).expect_err("a group-readable seed is refused");
-        assert!(error.to_string().contains("0640"), "{error}");
+        read_seed(&seed).expect("a 0600 seed parses");
     }
 
     /// The seed is a private key, and `main` prints the error: the digits must never travel.
