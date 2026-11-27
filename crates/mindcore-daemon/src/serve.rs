@@ -90,9 +90,17 @@ impl BoundSocket {
         let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", path.display()));
         let listener = UnixListener::bind(path).map_err(|error| fail(error.to_string()))?;
         // Taken after the bind, so it names the socket this process created.
-        let identity = std::fs::symlink_metadata(path)
-            .map(|metadata| SocketIdentity::of(&metadata))
-            .map_err(|error| fail(format!("the bound socket could not be inspected: {error}")))?;
+        let identity = match bound_identity(path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                // The identity read failed, so this is the name this call just bound. The guard
+                // does not exist yet, and `remove_if_own` could not check without the same read.
+                let _ = std::fs::remove_file(path);
+                return Err(fail(format!(
+                    "the bound socket could not be inspected: {error}"
+                )));
+            }
+        };
         Ok(Self {
             listener: Some(listener),
             identity,
@@ -299,6 +307,23 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
         .expect("live lock")
         .retain(|(live_id, _)| *live_id != id);
 }
+
+/// The identity of the socket `bind` just created at `path`, following no symlink.
+///
+/// Split out so the seam below can fail it: a real `lstat` failure cannot be interposed on, because
+/// the bind and this read are adjacent and a parent made unsearchable fails the bind first.
+fn bound_identity(path: &Path) -> std::io::Result<SocketIdentity> {
+    #[cfg(test)]
+    if INJECT_IDENTITY_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected identity read failure"));
+    }
+    std::fs::symlink_metadata(path).map(|metadata| SocketIdentity::of(&metadata))
+}
+
+/// A test seam armed by the regression below: the next identity read after a bind fails.
+#[cfg(test)]
+static INJECT_IDENTITY_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// A test seam: when installed, a connection task parks here — after its responder is tracked and
 /// before it registers — so a drain can be driven while a session is still setting up.
@@ -998,6 +1023,26 @@ mod tests {
         // An absent name is the intended end state.
         std::fs::remove_dir(&path).expect("clear the directory");
         remove_own_socket(&path, foreign).expect("an absent name is already removed");
+    }
+
+    /// The guard cannot cover the window inside `bind` itself: if the identity read fails after a
+    /// successful bind, `bind` unlinks the name before answering the error, so the start leaves no
+    /// socket behind either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_identity_read_failure_inside_bind_leaves_no_socket() {
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("daemon.sock");
+        INJECT_IDENTITY_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+        match BoundSocket::bind(&path) {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("could not be inspected"), "{message}")
+            }
+            other => panic!("an unreadable identity is a socket refusal, not {other:?}"),
+        }
+        assert!(
+            !path.exists(),
+            "bind removed the name it could not identify"
+        );
     }
 
     /// A failure between `bind` and the hand-over leaves no socket behind: the guard unlinks the
