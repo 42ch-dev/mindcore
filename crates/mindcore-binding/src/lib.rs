@@ -279,19 +279,38 @@ impl MindcoreClient {
 /// creates it. The **resolved absolute** path is what the client retains, so every later
 /// publication lands under the root the caller named at open even after the process changes its
 /// working directory — a relative root means one directory then, and that directory afterwards.
+///
+/// The walk is synchronous and does real file I/O: it runs on the blocking pool rather than on the
+/// async worker, so an `open` over a slow or network filesystem cannot stall every other call on
+/// the addon's runtime. A join failure is the addon's own `INTERNAL_ERROR`.
 #[napi]
 pub async fn open_client(options: ClientOptions) -> ClientResult {
     let journal_root = match &options.journal_dir {
-        Some(dir) => match durable_root(Path::new(dir)) {
-            Ok(resolved) => Some(resolved),
-            Err(error) => {
-                return ClientResult::refused(&SpokeReject {
-                    code: SpokeRejectCode::InternalError,
-                    message: format!("the journal root {dir} is not durable: {error}"),
-                    details: None,
-                })
+        Some(dir) => {
+            let configured = PathBuf::from(dir);
+            let durable = configured.clone();
+            let walked = napi::tokio::task::spawn_blocking(move || durable_root(&durable)).await;
+            match walked {
+                Ok(Ok(resolved)) => Some(resolved),
+                Ok(Err(error)) => {
+                    return ClientResult::refused(&SpokeReject {
+                        code: SpokeRejectCode::InternalError,
+                        message: format!("the journal root {dir} is not durable: {error}"),
+                        details: None,
+                    })
+                }
+                Err(error) => {
+                    return ClientResult::refused(&SpokeReject {
+                        code: SpokeRejectCode::InternalError,
+                        message: format!(
+                            "the journal root {} could not be prepared: {error}",
+                            configured.display()
+                        ),
+                        details: None,
+                    })
+                }
             }
-        },
+        }
         None => None,
     };
     match MindStore::open(Path::new(&options.store_path)).await {
