@@ -368,14 +368,21 @@ pub async fn client_ensure_subject(
 /// The host duty a journal root requires: the root exists, and every entry on the way to it is
 /// durable before the first publication writes into it.
 ///
-/// The chain is the *canonical* one. `journal_dir` canonicalizes the root it serves, so a root
-/// reached through a symlink publishes beneath the link's target; the entries that must be
-/// durable are the target's, never the link's.
+/// Two chains are made durable, in this order:
 ///
-/// The walk is idempotent, not first-creation-only: every level from the root up to the filesystem
-/// root has its parent synced unconditionally — including levels that already existed and levels
-/// an earlier start created but never proved durable. Nothing records which entry a failed start
-/// left unproven, so a restart redoes the whole chain; an already-durable `fsync` costs one call.
+/// 1. The *canonical* one. `journal_dir` canonicalizes the root it serves, so a root reached
+///    through a symlink publishes beneath the link's target; the entries beneath the target are
+///    the target's and are created here if they are missing.
+/// 2. The *configured* one. The publisher is handed the path as configured, so the entry naming a
+///    symlink — and every directory on the way to it — must be durable too; a crash that lost the
+///    link entry would leave the canonical chain intact but the configured root unreachable.
+///    Nothing is resolved or created on this pass: it only flushes the entries an existing level
+///    already has. With no symlink on the path it repeats the first pass, at one `fsync` per level.
+///
+/// Both walks are idempotent, not first-creation-only: every level from the root up to the
+/// filesystem root has its parent synced unconditionally — including levels that already existed
+/// and levels an earlier start created but never proved durable. Nothing records which entry a
+/// failed start left unproven, so a restart redoes the whole chain.
 ///
 /// A level another process created between a start's look and its `create_dir` is not a failure:
 /// `AlreadyExists` is the same outcome, and the entry still gets its sync. A level that is not a
@@ -417,6 +424,29 @@ fn durable_root(root: &Path) -> std::io::Result<()> {
         if let Some(parent) = level.parent() {
             sync_parent(parent)?;
         }
+    }
+    sync_configured_chain(root)
+}
+
+/// The entries naming `root` as it was configured, symlink included: for every level that exists,
+/// its parent is flushed. Nothing is created and nothing is resolved — a level that is not there
+/// was never established at that spelling, so it has no entry to make durable.
+fn sync_configured_chain(root: &Path) -> std::io::Result<()> {
+    let mut cursor = Some(root);
+    while let Some(level) = cursor {
+        if std::fs::symlink_metadata(level).is_ok() {
+            // `Path::new("journal").parent()` is the empty path, which names the current
+            // directory; only `None` — the filesystem root — has no directory holding its entry.
+            let parent = match level.parent() {
+                None => None,
+                Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+                Some(parent) => Some(parent),
+            };
+            if let Some(parent) = parent {
+                sync_parent(parent)?;
+            }
+        }
+        cursor = level.parent().filter(|parent| !parent.as_os_str().is_empty());
     }
     Ok(())
 }
@@ -589,9 +619,12 @@ mod tests {
         assert_eq!(after_first, 1, "the failed attempt is counted");
 
         durable_root(&root).expect("the retry succeeds");
+        // The retry adds one sync per pass — the canonical chain and the configured one, which
+        // repeat each other when no symlink is on the path. `after_first` counts only the single
+        // attempt the first start got through before the injected fault aborted it.
         assert_eq!(
             syncs_of(&level_parent),
-            after_first + 1,
+            after_first + 2,
             "the retry syncs the level it now finds already there"
         );
     }
@@ -612,44 +645,49 @@ mod tests {
 
         durable_root(&lower).expect("an existing root starts");
 
+        // One sync per pass: the canonical chain and the configured one, which coincide here.
         assert_eq!(
             syncs_of(&upper),
-            before_lower + 1,
+            before_lower + 2,
             "the lower level's entry is synced in the upper directory"
         );
         assert_eq!(
             syncs_of(&scratch_path),
-            before_upper + 1,
+            before_upper + 2,
             "the upper level's entry is synced in the scratch directory"
         );
     }
 
-    /// Point 1 of the re-review: the chain is the canonical one, so a root reached through a
-    /// symlink syncs the target's entries — the ones `journal_dir` publishes beneath — and never
-    /// the link's own.
+    /// A root reached through a symlink needs both chains durable: the target's, which the
+    /// publisher writes beneath, and the configured one, whose entry naming the link would
+    /// otherwise be the one a crash loses. The link and its target sit under different parents, so
+    /// the two halves of the walk are told apart by which parent got the `fsync`.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_root_syncs_the_targets_parents() {
+    fn a_symlinked_root_syncs_the_links_parent_and_the_targets_parent() {
         let scratch = tempfile::TempDir::new().expect("a scratch directory");
         let scratch_path = canonical(scratch.path());
-        let target = scratch_path.join("target");
-        std::fs::create_dir(&target).expect("the target directory");
-        let link = scratch_path.join("link");
+        let links = scratch_path.join("links");
+        let targets = scratch_path.join("targets");
+        std::fs::create_dir(&links).expect("the link's directory");
+        std::fs::create_dir(&targets).expect("the target's directory");
+        let target = targets.join("t");
+        std::fs::create_dir(&target).expect("the target");
+        let link = links.join("root");
         std::os::unix::fs::symlink(&target, &link).expect("the symlink");
-        let link_parent = syncs_of(&link);
-        let target_parent = syncs_of(&scratch_path);
+        let links_before = syncs_of(&links);
+        let targets_before = syncs_of(&targets);
 
         durable_root(&link.join("journal")).expect("a root reached through the link starts");
 
         assert!(target.join("journal").is_dir(), "the target holds the root");
         assert!(
-            syncs_of(&scratch_path) > target_parent,
-            "the target's parent is synced, not the link's"
+            syncs_of(&targets) > targets_before,
+            "the canonical chain syncs the target's parent"
         );
-        assert_eq!(
-            syncs_of(&link),
-            link_parent,
-            "the link itself is never a level of the chain"
+        assert!(
+            syncs_of(&links) > links_before,
+            "the configured chain syncs the directory holding the link"
         );
     }
 
