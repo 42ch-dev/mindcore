@@ -236,19 +236,14 @@ async fn adopt_in(
         true => request.source_revision,
         false => terminal.source_revision,
     };
-
-    let destination_id = request
-        .destination_entry_id
-        .as_deref()
-        .map(String::as_str)
-        .unwrap_or(terminal.source_entry_id.as_str());
-    // The anchor a create writes records the terminal's stored revision, so a stored value the
-    // served wire cannot carry is refused before the write: no copy commits for a response Connect
-    // must reject as a transport fault. This bounds the *stored* revision, never the requested one —
-    // a request naming an out-of-range revision that the source does not hold is the copy helper's
-    // ordinary revision conflict, and only an unserveable stored source is a store fault. An
-    // occupied slot's own above-range anchor is likewise the helper's `store` fault, not this guard.
-    if terminal.source_revision > SERVED_REVISION_BOUND {
+    // Only a retired source anchors a stored revision this call discovered: the live branch anchors
+    // the caller's requested value, which the copy helper compares and classifies itself. A stored
+    // revision the served wire cannot carry would commit a copy whose response Connect must reject
+    // as a transport fault, so it refuses here, before the write. The live branch is deliberately not
+    // guarded: its `source_revision` comes from the row's `revision` column while the anchor records
+    // the request, so guarding it would refuse a conformant answer as a store fault whenever the two
+    // disagree — an out-of-range request against a live source stays the helper's conflict.
+    if !live_source && terminal.source_revision > SERVED_REVISION_BOUND {
         return spoke_reject(
             SpokeRejectCode::InternalError,
             format!(
@@ -258,6 +253,12 @@ async fn adopt_in(
             None,
         );
     }
+
+    let destination_id = request
+        .destination_entry_id
+        .as_deref()
+        .map(String::as_str)
+        .unwrap_or(terminal.source_entry_id.as_str());
     let src = AdoptionSource {
         collection,
         gate: &gate,

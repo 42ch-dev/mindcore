@@ -236,9 +236,10 @@ selector answering the `Principal` and the admitted `Scope`. **That selector is 
 `destination_scope_id`**: Connect hands it to the admission, so the member chooses *which Mind the
 call is admitted against*, and only after admission is its equality with the returned scope checked
 (by Connect above the port, and again by the port's own pre-transaction comparison). What the member
-could choose is a collection — the registry row of the Mind it selected names that — nor bypass
-admission for a Mind the caller holds no grant in. The callback carries the Mind and nothing else,
-no caller binding, and the principal still comes from the authenticated peer, never the payload.
+cannot choose is a collection — the registry row of the Mind it selected names that — nor can it
+bypass admission for a Mind the caller holds no grant in. The callback carries the Mind and nothing
+else, no caller binding, and the principal still comes from the authenticated peer, never the
+payload.
 
 **The admission also enforces the operation grant.** `lib.rs::admit_adoption_grant` runs after
 `admitted_mind`, on the callback's blocking pool: it opens its own short transaction, calls the same
@@ -357,16 +358,19 @@ another Mind reads, and a source scope equal to a Mind's id would let that Mind 
 destination. Refusals four and five see only the Minds that exist at assembly, which is why the
 call re-makes the same two decisions against the whole registry inside its transaction.
 
-**A claimable source id disables shared adoption, by design.** Mind creation accepts any authenticated
-peer claiming a free id (owner decision, `I-000155`), so a peer can register a Mind whose id is the
-configured source's `scope_id`. From that moment the call-time registry check refuses every fresh
-adoption execution — a copy execution entering the transaction — into every Mind, because the source
-is a registered Mind's id, which is exactly refusal five. A same-key same-digest reconnect that
-already holds a recorded outcome never enters the transaction and so re-runs neither this check nor
-the operation grant; it answers the recorded outcome. The failure is deliberate rather than a defect
-to narrow. Hosts that admit arbitrary peers must therefore treat a shared source's `scope_id` as
-reserved configuration: an id no peer can claim, and one they never hand out as a Mind id. `I-000155`
-owns the create semantics; this page owns only the consequence for a composed adoption face.
+**A claimable source id disables shared adoption, by design.** Mind creation accepts any
+authenticated peer claiming a free id (owner decision, `I-000155`), so a peer can register a Mind
+whose id is the configured source's `scope_id`. From that moment the call-time registry check refuses
+every fresh adoption execution — a copy execution entering the transaction — into every Mind,
+because the source is a registered Mind's id, which is exactly refusal five. A same-key same-digest
+reconnect that already holds a recorded outcome skips the port's in-transaction checks — this
+collision re-check and the grant check inside the transaction — and answers the recorded outcome
+unchanged. The admission's own grant read still runs, because Connect admits before it consults the
+dedup record, and that read is what refuses a revoked peer on every path, replay included. The
+failure is deliberate rather than a defect to narrow. Hosts that admit arbitrary peers must
+therefore treat a shared source's `scope_id` as reserved configuration: an id no peer can claim, and
+one they never hand out as a Mind id. `I-000155` owns the create semantics; this page owns only the
+consequence for a composed adoption face.
 
 **The call-time `NOT_FOUND` cases.** Three request or registry states answer the same generic
 `NOT_FOUND` with no `details`, so a peer cannot tell them apart:

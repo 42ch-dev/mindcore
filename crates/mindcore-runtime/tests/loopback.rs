@@ -7704,8 +7704,10 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
         .await
         .expect("close the retirement cycle");
     }
-    // A live source whose row sits above the served revision range. Its payload is the ordinary
-    // written shape; the revision column is what the resolver reports.
+    // A retired source whose terminal sits above the served revision range. Only the retired branch
+    // anchors a stored revision this call discovered — `load_retirement_entry` reads it from the row's
+    // `revision` column — so only there is an above-range value a copy the response cannot describe.
+    // A live source is not guarded: it anchors the caller's requested revision instead.
     sqlx::query(
         "INSERT INTO knowledge_entries \
          (collection, entry_id, revision, payload, created_at, updated_at) \
@@ -7715,14 +7717,36 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     .bind("ke_high")
     .bind(SERVED_REVISION_BOUND as i64 + 1)
     .bind(
-        serde_json::to_string(&served_entry("ke_high", "a source above the served range"))
-            .expect("the entry serializes"),
+        serde_json::to_string(&served_entry(
+            "ke_high",
+            "a terminal above the served range",
+        ))
+        .expect("the entry serializes"),
     )
     .bind(NOW)
     .bind(NOW)
     .execute(&pool)
     .await
-    .expect("seed a source above the served range");
+    .expect("seed a terminal above the served range");
+    // The retired hop that resolves to it, so the above-range row is the terminal rather than the
+    // requested entry: a retired source's copy anchors the terminal's own stored revision.
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, superseded_by, created_at, updated_at) \
+         VALUES (?, ?, 1, ?, ?, ?, ?)",
+    )
+    .bind(ADOPT_SOURCE_COLLECTION)
+    .bind("ke_high_hop")
+    .bind(
+        serde_json::to_string(&served_entry("ke_high_hop", "a retired hop"))
+            .expect("the entry serializes"),
+    )
+    .bind("ke_high")
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed the retired hop onto it");
     // A source the served wire cannot carry: its `schema_version` sits above the SchemaVersion
     // ceiling. Two layers already stop this shape before a copy exists — the served put refuses it
     // on the way in, and the store's own payload decode refuses to hand it back — so this case pins
@@ -7746,6 +7770,26 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     .execute(&pool)
     .await
     .expect("seed a source the served wire cannot carry");
+    // A live source whose row `revision` column is out of the served range while its payload's own
+    // revision is in range. The live branch anchors the caller's requested revision, never this
+    // column, so the two disagreeing is not a store fault and the copy is written from the payload.
+    let mut live_high_payload =
+        served_entry("ke_live_high", "a live source above the served range");
+    live_high_payload.revision = Some(1);
+    sqlx::query(
+        "INSERT INTO knowledge_entries \
+         (collection, entry_id, revision, payload, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(ADOPT_SOURCE_COLLECTION)
+    .bind("ke_live_high")
+    .bind(SERVED_REVISION_BOUND as i64 + 1)
+    .bind(serde_json::to_string(&live_high_payload).expect("the entry serializes"))
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await
+    .expect("seed a live source whose column and payload revisions disagree");
     // Three occupants of three destination slots: one visible, one retired, and one an owner's
     // private entry the admitted selection carries no viewpoint for.
     let destination = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
@@ -7774,6 +7818,26 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     let (_dir, serve) = fixture.serve();
     let surface = adoption_surface(&serve, principal_admission()).await;
     let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
+
+    // The live source whose row revision and payload revision disagree is adopted, not refused: the
+    // live branch anchors the requested revision, so the out-of-range column never becomes the
+    // anchor and the call is not a store fault.
+    let live_high = expect_ok(
+        AdoptionPort::adopt_knowledge_entry(
+            &*session.adapter,
+            &principal(),
+            &scope_of(SPACE),
+            &adopt_request("ke_live_high", 1, SPACE, "f-live-high"),
+        )
+        .await,
+        "a live source whose revision column sits above the served range",
+    );
+    let live_high = wire(live_high);
+    assert_eq!(live_high["outcome"], "adopted", "{live_high}");
+    assert_eq!(
+        live_high["entry"]["adoption_anchor"]["source_revision"], 1,
+        "the anchor records the requested revision, never the row column: {live_high}"
+    );
 
     let cases: [(&str, KnowledgeAdoptRequest, SpokeRejectCode); 8] = [
         (
@@ -7808,7 +7872,7 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
         ),
         (
             "a terminal above the served range",
-            adopt_request("ke_high", SERVED_REVISION_BOUND + 1, SPACE, "f-high"),
+            adopt_request("ke_high_hop", 1, SPACE, "f-high"),
             SpokeRejectCode::InternalError,
         ),
         (
