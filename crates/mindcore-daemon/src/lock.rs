@@ -41,11 +41,16 @@ impl StoreLock {
         create_if_absent(store_path)?;
         refuse_second_name(store_path)?;
         let path = lock_path(store_path);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut open = OpenOptions::new();
+        open.read(true).write(true).create(true).truncate(false);
+        // Owner-only for the same reason as the store: the lock names a store, and its mode should
+        // not be the umask's choice either. An existing lock file keeps its own mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        let file = open
             .open(&path)
             .map_err(|error| DaemonError::Store(format!("{}: {error}", path.display())))?;
         match file.try_lock() {
@@ -250,6 +255,36 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(kept, 0o640, "an existing store keeps {kept:04o}");
+    }
+
+    /// The lock file this daemon creates is owner-only, like the store it names; an existing lock
+    /// keeps its own mode.
+    #[test]
+    fn a_created_lock_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("mind.db");
+        let guard = acquire(&store).expect("acquire");
+        let lock = lock_file_for(&store);
+        let mode = std::fs::metadata(&lock)
+            .expect("stat the lock")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the lock is {mode:04o}, not owner-only");
+
+        // An existing lock file is left alone.
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o640))
+            .expect("give it its own mode");
+        drop(guard);
+        acquire(&store).expect("reacquire");
+        let kept = std::fs::metadata(&lock)
+            .expect("stat the lock")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(kept, 0o640, "an existing lock keeps {kept:04o}");
     }
 
     /// The lock is a separate file beside the store's canonical name, and the store's own bytes and
