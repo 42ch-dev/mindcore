@@ -365,34 +365,287 @@ pub async fn client_ensure_subject(
     settle(settled)
 }
 
-/// The host duty a journal root requires: the root exists, and the entry naming it is durable
-/// before the first publication writes into it.
+/// The host duty a journal root requires: the root exists, and every entry on the way to it is
+/// durable before the first publication writes into it.
 ///
-/// One level at a time, each level's entry synced before the next is created: the publisher only
-/// ever syncs beneath the root, so every entry created here — not just the root's own — is owed
-/// its durability by the caller.
+/// The walk is idempotent, not first-creation-only: every level from the root up to the nearest
+/// one that exists has *its parent* synced unconditionally, including levels an earlier start
+/// found already there. A start that failed after creating a level but before syncing its entry
+/// left that entry unproven, and nothing marks which one it was; redoing a durable sync costs one
+/// `fsync`. The publisher only ever syncs beneath the root, so these entries are the caller's.
+///
+/// A level another process created between this walk's check and its `create_dir` is not a
+/// failure: `AlreadyExists` is the same outcome, and the entry still gets its sync. A path
+/// component that exists and is not a directory is refused by name — accepting it would publish
+/// into whatever the path really names.
 fn durable_root(root: &Path) -> std::io::Result<()> {
-    if root.exists() {
-        return if root.is_dir() {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "exists and is not a directory",
-            ))
-        };
+    // Bottom-up: every level from the root up to the first one that exists, which is included.
+    let mut chain: Vec<&Path> = Vec::new();
+    let mut existing = None;
+    let mut cursor = Some(root);
+    while let Some(level) = cursor {
+        // `metadata` follows a symlink, which is right here: the publisher canonicalizes the root
+        // and serves what it resolves to, so a symlinked root is a directory root.
+        match std::fs::metadata(level) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(not_a_directory(level));
+                }
+                chain.push(level);
+                existing = Some(chain.len() - 1);
+                break;
+            }
+            // A level that is not there, or that cannot be reached because an ancestor is not a
+            // directory: keep climbing. The ancestor itself still resolves, so this walk reaches
+            // it and refuses it under its own name rather than the unreachable level's.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                chain.push(level)
+            }
+            Err(error) => return Err(error),
+        }
+        cursor = level.parent().filter(|parent| !parent.as_os_str().is_empty());
     }
-    // An existing ancestor is where creation starts; a missing one is created first, so its entry
-    // is synced by that level's own call.
-    if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
-        durable_root(parent)?;
+    // Top-down: create what is missing, then sync every level's parent whether this start created
+    // that level or found it already there.
+    for (index, level) in chain.iter().enumerate().rev() {
+        if Some(index) != existing {
+            #[cfg(test)]
+            create_concurrently(level);
+            match std::fs::create_dir(level) {
+                Ok(()) => {}
+                // Another process may have created the level between the check above and this
+                // call; that is the same outcome, and the entry still gets its sync.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !std::fs::metadata(level)?.is_dir() {
+                        return Err(not_a_directory(level));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        sync_parent_of(level)?;
     }
-    std::fs::create_dir(root)?;
-    // `Path::new("journal").parent()` is the empty path, which names the current directory; only
-    // `None` — the filesystem root — has no directory holding its entry.
-    match root.parent() {
+    Ok(())
+}
+
+/// The refusal of a path component that is not a directory, naming it: accepting it would publish
+/// into whatever the path really names.
+fn not_a_directory(level: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{} exists and is not a directory", level.display()),
+    )
+}
+
+/// Syncs the directory holding `level`'s entry, so that entry is durable.
+///
+/// Only `None` means the filesystem root, where no directory holds the entry and there is nothing
+/// to sync. `Some("")` is not that: it is what `Path::new("journal").parent()` answers, and it
+/// names the current directory.
+fn sync_parent_of(level: &Path) -> std::io::Result<()> {
+    match level.parent() {
         None => Ok(()),
-        Some(parent) if parent.as_os_str().is_empty() => std::fs::File::open(".")?.sync_all(),
-        Some(parent) => std::fs::File::open(parent)?.sync_all(),
+        Some(parent) if parent.as_os_str().is_empty() => sync_parent(Path::new(".")),
+        Some(parent) => sync_parent(parent),
+    }
+}
+
+fn sync_parent(parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    record_sync(parent);
+    #[cfg(test)]
+    if take_injected_sync_failure(parent) {
+        return Err(std::io::Error::other(format!(
+            "{}: injected sync fault",
+            parent.display()
+        )));
+    }
+    std::fs::File::open(parent)?.sync_all()
+}
+
+/// A test seam: the next sync of this exact directory fails, and every attempt is counted. An
+/// `fsync` fault cannot be built from a test's side, so this is the only way to pin that a failed
+/// sync is retried by the next start rather than skipped because the level now exists.
+#[cfg(test)]
+static INJECT_SYNC_FAILURE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static SYNC_ATTEMPTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_sync(parent: &Path) {
+    SYNC_ATTEMPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(parent.to_path_buf());
+}
+
+#[cfg(test)]
+fn take_injected_sync_failure(parent: &Path) -> bool {
+    let mut pending = INJECT_SYNC_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match pending.iter().position(|path| path == parent) {
+        Some(index) => {
+            pending.remove(index);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A test seam: the next create of this exact level lands as another process's. `true` plants a
+/// directory (the benign race), `false` a regular file (the refusal). Without it the window
+/// between this walk's check and its `create_dir` cannot be entered from a test.
+#[cfg(test)]
+static CREATE_CONCURRENTLY: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn create_concurrently(level: &Path) {
+    let planted = {
+        let mut pending = CREATE_CONCURRENTLY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .iter()
+            .position(|(path, _)| path == level)
+            .map(|index| pending.remove(index).1)
+    };
+    match planted {
+        Some(true) => {
+            let _ = std::fs::create_dir(level);
+        }
+        Some(false) => {
+            let _ = std::fs::File::create(level);
+        }
+        None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{durable_root, sync_parent_of, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE, SYNC_ATTEMPTS};
+    use std::path::{Path, PathBuf};
+
+    // Every seam is keyed by path and each test owns a fresh temporary root, so a shared global
+    // needs no reset between tests — and a reset would clobber a test still running.
+
+    fn syncs_of(path: &Path) -> usize {
+        SYNC_ATTEMPTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|attempt| attempt.as_path() == path)
+            .count()
+    }
+
+    /// The whole point of the idempotent walk: a level an earlier start created but never proved
+    /// durable is synced again by the next start, not skipped because it now exists.
+    #[test]
+    fn a_failed_sync_is_retried_for_the_level_it_created() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let root = scratch.path().join("a").join("journal");
+        let level_parent: PathBuf = scratch.path().join("a");
+        INJECT_SYNC_FAILURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(level_parent.clone());
+
+        assert!(durable_root(&root).is_err(), "the injected sync fails the start");
+        assert!(root.is_dir(), "the level was created before the sync failed");
+        let after_first = syncs_of(&level_parent);
+        assert_eq!(after_first, 1, "the failed attempt is counted");
+
+        durable_root(&root).expect("the retry succeeds");
+        assert!(
+            syncs_of(&level_parent) > after_first,
+            "the retry syncs the level it now finds already there"
+        );
+    }
+
+    /// A level another process created between the check and `create_dir` is the same outcome, not
+    /// a failure, and its entry still gets synced.
+    #[test]
+    fn a_level_created_concurrently_is_not_a_failure() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let root = scratch.path().join("a").join("journal");
+        let raced: PathBuf = scratch.path().join("a");
+        CREATE_CONCURRENTLY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((raced.clone(), true));
+
+        durable_root(&root).expect("the race is not a failure");
+        assert!(root.is_dir());
+        assert!(
+            syncs_of(&raced) >= 1,
+            "the raced level's entry is still synced"
+        );
+    }
+
+    /// An ancestor that is a regular file is refused under its own name, not under the level
+    /// beneath it that cannot be reached through it.
+    #[test]
+    fn a_file_ancestor_is_refused_by_its_own_name() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let blocker = scratch.path().join("blocker");
+        std::fs::File::create(&blocker).expect("a regular file");
+        let root = blocker.join("sub").join("journal");
+
+        let error = durable_root(&root).expect_err("a file cannot hold a journal root");
+        let message = error.to_string();
+        assert!(
+            message.contains(&blocker.display().to_string()),
+            "the refusal names the blocking component: {message}"
+        );
+        assert!(
+            !message.contains("sub/journal"),
+            "the unreachable level is not the one named: {message}"
+        );
+    }
+
+    /// The post-`create_dir` check is what refuses a component that is not a directory; without it
+    /// the walk would accept the path and publish into whatever it names.
+    #[test]
+    fn a_component_that_is_not_a_directory_is_refused_by_name() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let root = scratch.path().join("a").join("journal");
+        let raced: PathBuf = scratch.path().join("a");
+        CREATE_CONCURRENTLY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((raced.clone(), false));
+
+        let error = durable_root(&root).expect_err("a file cannot be a journal root level");
+        assert!(
+            error.to_string().contains(&raced.display().to_string()),
+            "the refusal names the component: {error}"
+        );
+    }
+
+    /// `journal_dir` canonicalizes the root and serves what it resolves to, so a symlinked root is
+    /// a directory root — refusing it would refuse a layout the publisher supports.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_a_directory_root() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let resolved = scratch.path().join("resolved");
+        std::fs::create_dir(&resolved).expect("the resolved directory");
+        let link = scratch.path().join("journal");
+        std::os::unix::fs::symlink(&resolved, &link).expect("the symlink");
+
+        durable_root(&link).expect("a symlinked root is accepted");
+    }
+
+    /// `Path::new("journal").parent()` is `Some("")`, which names the current directory; only
+    /// `None` is the filesystem root with no entry to sync.
+    #[test]
+    fn a_single_segment_relative_level_syncs_the_current_directory() {
+        sync_parent_of(Path::new("journal")).expect("the current directory syncs");
     }
 }

@@ -2137,6 +2137,7 @@ dependencies = [
  "serde_json",
  "spoke-operations",
  "spoke-schemas",
+ "tempfile",
 ]
 
 [[package]]

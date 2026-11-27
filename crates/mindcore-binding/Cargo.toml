@@ -30,3 +30,6 @@ spoke-schemas.workspace = true
 
 [build-dependencies]
 napi-build = "2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
