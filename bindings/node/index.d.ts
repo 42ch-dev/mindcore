@@ -187,7 +187,7 @@ export declare class MindcoreError extends Error {
    * Built by `settle` for each refusal; a caller reads one, never constructs one. The JavaScript
    * constructor takes the refusal's three members in that order.
    */
-  constructor(code: string, message: string, details?: unknown);
+  constructor(code: string, message: string, details?: object);
   /**
    * The SPOKE wire code of the refusal (`NOT_FOUND`, `STORED_REVISION_STALE`, …), or
    * `BINDING_DEFECT` for an answer this addon could not render. Not a closed union: the facade
