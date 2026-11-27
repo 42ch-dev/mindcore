@@ -185,12 +185,6 @@ fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-// The daemon is Unix-only (a Unix socket is its whole transport), so no non-Unix fallback is owed.
-#[cfg(not(unix))]
-fn refuse_readable_seed(_path: &Path) -> Result<(), DaemonError> {
-    Ok(())
-}
-
 /// Decodes a value that must be exactly 64 hex digits.
 ///
 /// The messages name the failure and the observed length only: the same helper decodes the
