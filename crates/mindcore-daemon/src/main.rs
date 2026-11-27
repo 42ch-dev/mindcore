@@ -1,7 +1,9 @@
 //! The `mindcore-daemon` binary: `--config`, the start phase sequence and the exit-code mapping.
 //!
-//! Every phase begins only after the previous one succeeded, so a failed start leaves nothing
-//! behind and a daemon that exits non-zero has bound no socket.
+//! Every phase begins only after the previous one succeeded, so a daemon that exits non-zero has
+//! bound no socket. What a failed start does leave behind is the lock file, a store the lock
+//! created, the journal root, and — when the socket directory is unwritable — the socket name,
+//! which the refusal names.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -76,5 +78,51 @@ fn config_path(args: impl Iterator<Item = String>) -> Result<Option<PathBuf>, St
     match config {
         Some(path) => Ok(Some(path)),
         None => Err("--config is required".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config_path;
+
+    /// `config_path` over `arguments`, as `main` calls it.
+    fn parse(arguments: &[&str]) -> Result<Option<std::path::PathBuf>, String> {
+        config_path(arguments.iter().map(|argument| (*argument).to_string()))
+    }
+
+    /// The argument contract the exit-code table names: `--help` answers `None` (exit 0), and
+    /// `--config <path>` answers the path.
+    #[test]
+    fn the_documented_arguments_answer_their_values() {
+        assert_eq!(parse(&["--help"]).expect("--help"), None, "--help exits 0");
+        assert_eq!(parse(&["-h"]).expect("-h"), None, "-h exits 0");
+        assert_eq!(
+            parse(&["--config", "/tmp/daemon.toml"]).expect("--config"),
+            Some(std::path::PathBuf::from("/tmp/daemon.toml")),
+        );
+    }
+
+    /// Every unusable argument list is an error, which `main` maps to exit 1.
+    #[test]
+    fn every_unusable_argument_list_is_refused() {
+        let cases: [(&str, &[&str]); 5] = [
+            ("no arguments", &[]),
+            ("a value-less --config", &["--config"]),
+            (
+                "a repeated --config",
+                &["--config", "a.toml", "--config", "b.toml"],
+            ),
+            ("an unknown argument", &["--socket", "a.sock"]),
+            ("--help after a path", &["--config", "a.toml", "--help"]),
+        ];
+        for (case, arguments) in cases {
+            // `--help` anywhere answers usage and exit 0, which is the one documented exception.
+            if case == "--help after a path" {
+                assert!(parse(arguments).is_ok(), "{case}");
+                continue;
+            }
+            assert!(parse(arguments).is_err(), "{case} is refused");
+        }
+        assert!(parse(&["--config", "a.toml"]).is_ok(), "the valid form");
     }
 }

@@ -251,8 +251,8 @@ fn scope_of(scope_id: &str) -> Scope {
     serde_json::from_value(json!({ "scope_id": scope_id })).expect("scope JSON matches the schema")
 }
 
-/// The lock file beside the store: the daemon leaves it in place, and nothing else in this
-/// directory is named like it.
+/// The lock file beside the store's canonical name: the daemon leaves it in place, and nothing else
+/// in this directory is named `<store>.lock`.
 fn lock_file(dir: &Path) -> PathBuf {
     let mut locks: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read the directory")
@@ -260,11 +260,37 @@ fn lock_file(dir: &Path) -> PathBuf {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".mindcore-store-") && name.ends_with(".lock"))
+                .is_some_and(|name| name.ends_with(".lock"))
         })
         .collect();
     assert_eq!(locks.len(), 1, "one lock file beside the store: {locks:?}");
     locks.remove(0)
+}
+
+/// The daemon's socket is owner-only whatever the umask of the shell that started it was: who may
+/// connect is part of the process contract, and an integration test is the only place the real
+/// binary's mode is observable.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_binds_an_owner_only_socket() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("a scratch directory");
+    seed(dir.path()).await;
+    std::fs::write(dir.path().join(SEED_FILE), hex(&RESPONDER_SEED)).expect("write the seed");
+    let socket = dir.path().join(SOCKET_FILE);
+    let config = write(dir.path(), "daemon.toml", &config_text(dir.path(), &socket));
+
+    let daemon = Daemon::spawn(&config);
+    wait_for_socket(&socket).await;
+
+    let mode = std::fs::metadata(&socket)
+        .expect("stat the socket")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the socket is {mode:o}, not owner-only");
+    drop(daemon);
 }
 
 /// A signed dialer reads a stored entry out of the daemon's own store, over the socket the daemon

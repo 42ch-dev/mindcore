@@ -27,6 +27,9 @@ pub enum DaemonError {
     /// The socket could not be bound.
     #[error("socket: {0}")]
     Socket(String),
+    /// A shutdown signal could not be listened for; the drain could never be reached.
+    #[error("signal: {0}")]
+    Signal(String),
     /// Another daemon holds this store's lock.
     #[error("another daemon holds the lock on {0}")]
     LockHeld(std::path::PathBuf),

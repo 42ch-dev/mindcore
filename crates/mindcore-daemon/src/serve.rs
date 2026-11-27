@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::ErrorKind;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +50,9 @@ struct Host {
     /// The live responders the drain walks; a connection removes its own entry when it ends.
     live: Mutex<Vec<(usize, Arc<ConnectResponder>)>>,
 }
+
+/// The mode every socket this daemon binds carries: owner read/write, nobody else.
+const SOCKET_MODE: u32 = 0o600;
 
 /// The device and inode of the socket name this daemon created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +92,14 @@ impl BoundSocket {
     fn bind(path: &Path) -> Result<Self, DaemonError> {
         let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", path.display()));
         let listener = UnixListener::bind(path).map_err(|error| fail(error.to_string()))?;
+        // Owner-only, not the umask's choice: who may hand this daemon a connection is part of the
+        // process contract, not a property of the shell that started it.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE)).map_err(
+            |error| {
+                let _ = std::fs::remove_file(path);
+                fail(format!("the socket mode could not be set: {error}"))
+            },
+        )?;
         // Taken after the bind, so it names the socket this process created.
         let identity = match bound_identity(path) {
             Ok(identity) => identity,
@@ -157,9 +168,12 @@ impl Drop for BoundSocket {
 ///
 /// The lock arrives held and is dropped last, after every live session has been told to close.
 pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonError> {
-    let store = MindStore::open(&config.store_path)
+    // The canonical spelling, the same one the lock was taken on: SQLite names its write-ahead log
+    // after the path, so opening another spelling would split the log across two names.
+    let store_path = crate::lock::canonical_store_path(&config.store_path)?;
+    let store = MindStore::open(&store_path)
         .await
-        .map_err(|error| DaemonError::Store(format!("{}: {error}", config.store_path.display())))?;
+        .map_err(|error| DaemonError::Store(format!("{}: {error}", store_path.display())))?;
     journal_root(&config.journal.dir)?;
     // `MindcoreServe` owns the store, so the pool handle is kept here: it is the reachable route
     // to the awaited close the drain order names, and it closes the same pool.
@@ -181,13 +195,28 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
             )))
         }
     };
+    // Both signals are installed before the socket exists. From the moment the name is bound an
+    // ordinary supervisor stop must reach the drain; a signal listener that cannot be installed is
+    // its own start failure, reported as such.
+    let (mut terminate, mut interrupt) = signals()?;
     // The guard owns the bound name from here, and the steps below are prepared without letting
     // `?` drop it: a failure is cleaned up explicitly, so the refusal can report what the removal
     // did instead of leaving `Drop` to swallow it.
-    let mut bound = listen(&config)?;
-    let (host, mut terminate, mut interrupt) = match prepare(surface, &config, &mut bound).await {
+    let mut bound = match listen(&config) {
+        Ok(bound) => bound,
+        Err(error) => {
+            // No listener exists, but the store's pool is open: end its connections before the
+            // start fails rather than cutting them when the runtime drops.
+            pool.close().await;
+            return Err(error);
+        }
+    };
+    let host = match prepare(surface, &config, &mut bound).await {
         Ok(prepared) => prepared,
-        Err(error) => return Err(cleanup_refusal(&mut bound, error)),
+        Err(error) => {
+            pool.close().await;
+            return Err(cleanup_refusal(&mut bound, error));
+        }
     };
     // The accept loop owns the listener from here; the guard has nothing left to undo.
     let (listener, _) = bound.into_parts();
@@ -222,30 +251,32 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
     serving.and(removed)
 }
 
-/// Every step between a bound name and a listener the accept loop can own: the seed read, the
-/// allowlist and peer keys, the host wiring, and both shutdown signals.
+/// Both shutdown signal streams, installed before the socket exists.
+///
+/// A signal the process cannot listen for is its own start failure: without it no signal could reach
+/// the drain, and the socket name would outlive a process killed some other way.
+fn signals() -> Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal), DaemonError> {
+    Ok((
+        signal(SignalKind::terminate())
+            .map_err(|error| DaemonError::Signal(format!("cannot listen for SIGTERM: {error}")))?,
+        signal(SignalKind::interrupt())
+            .map_err(|error| DaemonError::Signal(format!("cannot listen for SIGINT: {error}")))?,
+    ))
+}
+
+/// The remaining steps between a bound name and a listener the accept loop can own: the seed read,
+/// the allowlist and peer keys, and the host wiring.
 ///
 /// It takes the guard by `&mut` and never removes the name itself: on failure the caller cleans up
-/// explicitly, so the refusal can carry the removal's own outcome. Both signals are installed before
-/// the socket serves, because a process that cannot hear them would serve until it was killed some
-/// other way and leave the name for no reason.
+/// explicitly, so the refusal can carry the removal's own outcome.
 async fn prepare(
     surface: Arc<MindcoreSurface>,
     config: &DaemonConfig,
     bound: &mut BoundSocket,
-) -> Result<
-    (
-        Arc<Host>,
-        tokio::signal::unix::Signal,
-        tokio::signal::unix::Signal,
-    ),
-    DaemonError,
-> {
+) -> Result<Arc<Host>, DaemonError> {
     let seed = crate::config::read_seed(&config.identity.seed_file)?;
     let allowlist: Vec<String> = config.peers.keys().cloned().collect();
     let peer_keys = peer_keys(config)?;
-    let terminate = shutdown_signal(SignalKind::terminate())?;
-    let interrupt = shutdown_signal(SignalKind::interrupt())?;
     let host = Arc::new(Host {
         socket: bound.identity(),
         surface,
@@ -255,7 +286,7 @@ async fn prepare(
         invoke_timeout_ms: config.invoke.timeout_ms,
         live: Mutex::new(Vec::new()),
     });
-    Ok((host, terminate, interrupt))
+    Ok(host)
 }
 
 /// Cleans up after a failed `prepare` and folds both faults into one refusal.
@@ -273,18 +304,38 @@ fn cleanup_refusal(bound: &mut BoundSocket, error: DaemonError) -> DaemonError {
     }
 }
 
-/// Creates the journal root and syncs its parent, so the new directory is durable before the first
-/// publication writes into it.
+/// Creates the journal root and makes every level it added durable before the first publication
+/// writes into it.
+///
+/// Each missing level is created one at a time from the nearest existing ancestor, and the parent of
+/// every level created is synced: syncing only the leaf's parent would persist `journal` inside a
+/// directory that itself has no entry in its own parent yet, so a crash could take the whole chain
+/// away after the daemon reported a clean start.
 fn journal_root(dir: &Path) -> Result<(), DaemonError> {
-    std::fs::create_dir_all(dir)
-        .map_err(|error| DaemonError::Journal(format!("{}: {error}", dir.display())))?;
-    let parent = match dir.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    File::open(parent)
-        .and_then(|parent| parent.sync_all())
-        .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cursor = Some(dir);
+    while let Some(current) = cursor {
+        if current.exists() {
+            break;
+        }
+        missing.push(current);
+        cursor = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+    }
+    // Deepest last, so the root's own entry is the final sync.
+    for level in missing.iter().rev() {
+        std::fs::create_dir(level)
+            .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
+        let parent = match level.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        File::open(&parent)
+            .and_then(|parent| parent.sync_all())
+            .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))?;
+    }
+    Ok(())
 }
 
 /// The accept loop; it ends when its listener is dropped, which happens when `run` drops this
@@ -369,15 +420,10 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
 /// the bind and this read are adjacent and a parent made unsearchable fails the bind first.
 fn bound_identity(path: &Path) -> std::io::Result<SocketIdentity> {
     #[cfg(test)]
-    if let Some(failure) = INJECT_IDENTITY_FAILURE
-        .lock()
-        .expect("identity seam lock")
-        .take()
-    {
+    if let Some(failure) = take_injected_failure(path) {
         // The seam is the only moment between the bind and the read, so a test needs it to take
         // the directory's write permission before the fallback tries to unlink.
         if let Some(directory) = failure.close_directory {
-            use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500));
         }
         return Err(std::io::Error::other("injected identity read failure"));
@@ -385,8 +431,10 @@ fn bound_identity(path: &Path) -> std::io::Result<SocketIdentity> {
     std::fs::symlink_metadata(path).map(|metadata| SocketIdentity::of(&metadata))
 }
 
-/// A test seam armed by the regressions below: the next identity read after a bind fails, and it
-/// may first make `close_directory` read-only so the fallback's removal fails too.
+/// A test seam armed by the regressions below: the next identity read of **this exact path** fails,
+/// and it may first make `close_directory` read-only so the fallback's removal fails too.
+///
+/// Keyed to the path and consumed only on a match, so a bind in another test never takes it.
 #[cfg(test)]
 #[derive(Default)]
 struct IdentityFailure {
@@ -394,11 +442,17 @@ struct IdentityFailure {
 }
 
 #[cfg(test)]
-static INJECT_IDENTITY_FAILURE: Mutex<Option<IdentityFailure>> = Mutex::new(None);
+static INJECT_IDENTITY_FAILURE: Mutex<Option<(PathBuf, IdentityFailure)>> = Mutex::new(None);
 
-/// The seam is one global, so the tests that arm it must not overlap.
+/// Takes the seam's fault when `path` is the armed one; leaves it otherwise.
 #[cfg(test)]
-static IDENTITY_SEAM_LOCK: Mutex<()> = Mutex::new(());
+fn take_injected_failure(path: &Path) -> Option<IdentityFailure> {
+    let mut armed = INJECT_IDENTITY_FAILURE.lock().expect("identity seam lock");
+    match armed.as_ref() {
+        Some((armed_path, _)) if armed_path == path => armed.take().map(|(_, failure)| failure),
+        _ => None,
+    }
+}
 
 /// A test seam: when installed, a connection task parks here — after its responder is tracked and
 /// before it registers — so a drain can be driven while a session is still setting up.
@@ -421,17 +475,6 @@ async fn park_in_setup() {
 
 #[cfg(not(test))]
 async fn park_in_setup() {}
-
-/// One `SIGTERM` or `SIGINT` stream.
-///
-/// A signal the process cannot listen for is a start failure: without both, no signal could ever
-/// reach the drain and the socket name would outlive a process killed some other way. It is
-/// reported through the phase that owns the listener, so it keeps exit code 1.
-fn shutdown_signal(kind: SignalKind) -> Result<tokio::signal::unix::Signal, DaemonError> {
-    signal(kind).map_err(|error| {
-        DaemonError::Surface(format!("cannot listen for a shutdown signal: {error}"))
-    })
-}
 
 /// Tells every live session to close. `ConnectResponder::close` is synchronous and idempotent.
 fn drain_sessions(live: &[(usize, Arc<ConnectResponder>)]) {
@@ -614,8 +657,6 @@ fn peer_keys(config: &DaemonConfig) -> Result<HashMap<String, [u8; 32]>, DaemonE
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use mindcore_base::boundary::CallerId;
     use mindcore_runtime::minds::{self, CreateMind};
     use tempfile::TempDir;
@@ -980,6 +1021,54 @@ mod tests {
         assert!(root.is_dir());
     }
 
+    /// Two missing levels: each newly created entry must be linked in its own parent, not just the
+    /// leaf inside a directory that is itself not yet durable.
+    #[test]
+    fn every_journal_level_is_created_and_synced() {
+        let dir = TempDir::new().expect("temporary directory");
+        let root = dir.path().join("new-parent").join("journal");
+        journal_root(&root).expect("create two levels");
+        assert!(
+            dir.path().join("new-parent").is_dir(),
+            "the ancestor exists"
+        );
+        assert!(root.is_dir(), "the leaf exists");
+        // A second call finds every level and does nothing, which must not be an error.
+        journal_root(&root).expect("an existing root is accepted");
+    }
+
+    /// The socket is owner-only whatever the process umask is: who may connect is part of the
+    /// contract, not a property of the shell that started the daemon.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_bound_socket_is_owner_only() {
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("daemon.sock");
+        let bound = BoundSocket::bind(&path).expect("bind the socket");
+        let mode = std::fs::metadata(&path)
+            .expect("stat the socket")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, SOCKET_MODE, "the socket is {mode:o}, not owner-only");
+        drop(bound);
+    }
+
+    /// Both signal streams exist before the socket does: a supervisor stop arriving the moment the
+    /// name appears must reach the drain, not the default action.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_signals_are_installed_before_the_socket_exists() {
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("daemon.sock");
+        let (terminate, interrupt) = signals().expect("install both signals");
+        // The ordering the start relies on: signals first, then the name.
+        assert!(!path.exists(), "no socket exists before the bind");
+        let bound = BoundSocket::bind(&path).expect("bind after the signals");
+        assert!(path.exists(), "the name exists only after both handlers do");
+        drop(terminate);
+        drop(interrupt);
+        drop(bound);
+    }
+
     /// F-001 end to end: a socket path naming the store is refused, because the store is a regular
     /// file and the daemon unlinks nothing that is not a dead socket. The bytes survive.
     #[tokio::test(flavor = "multi_thread")]
@@ -1107,8 +1196,8 @@ mod tests {
     async fn an_identity_read_failure_inside_bind_leaves_no_socket() {
         let dir = TempDir::new().expect("temporary directory");
         let path = dir.path().join("daemon.sock");
-        let _serial = IDENTITY_SEAM_LOCK.lock().expect("seam lock");
-        *INJECT_IDENTITY_FAILURE.lock().expect("seam") = Some(IdentityFailure::default());
+        *INJECT_IDENTITY_FAILURE.lock().expect("seam") =
+            Some((path.clone(), IdentityFailure::default()));
         match BoundSocket::bind(&path) {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("could not be inspected"), "{message}")
@@ -1139,8 +1228,7 @@ mod tests {
         let seam = IdentityFailure {
             close_directory: Some(parent.clone()),
         };
-        let _serial = IDENTITY_SEAM_LOCK.lock().expect("seam lock");
-        *INJECT_IDENTITY_FAILURE.lock().expect("seam") = Some(seam);
+        *INJECT_IDENTITY_FAILURE.lock().expect("seam") = Some((path.clone(), seam));
         let outcome = BoundSocket::bind(&path);
         // Restore before asserting, so a failure does not leave an unwritable directory behind.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
@@ -1254,6 +1342,63 @@ mod tests {
             !config.socket_path.exists(),
             "the guard removed the name bound before the failure"
         );
+    }
+
+    /// The registration window is upstream's, not this crate's: `connect_responder` spawns its own
+    /// task before returning and offers no paused start, so a dialer can reach a handler lookup
+    /// first. This pins the answer is the fail-closed deny and not a hang — the bounded wait is the
+    /// assertion, because a request that never resolves fails the test on the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_invoke_before_registration_answers_the_dispatch_deny() {
+        use spoke_connect::remote::{
+            connect_responder, loopback_transport_pair, ConnectResponderOptions, RemoteIdentity,
+        };
+
+        let pair = loopback_transport_pair();
+        let (server, client) = (pair.server, pair.client);
+        let responder = connect_responder(ConnectResponderOptions {
+            transport: Arc::new(server),
+            identity: RemoteIdentity { seed: [0x33u8; 32] },
+            manifest: serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "host_id": "registration-window",
+                "roles": ["data-store"],
+                "capabilities": ["spoke-knowledge"],
+                "namespaces": [],
+                "extensions": {},
+            }))
+            .expect("the manifest matches the schema"),
+            allowlist: Vec::new(),
+            peer_keys: HashMap::new(),
+            ports: None,
+            invoke_timeout_ms: Some(2_000),
+        })
+        .await;
+        // Deliberately no `register` call: this is the window the daemon closes immediately.
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            responder.invoke_tool("tools.mindcore.recall_context", serde_json::json!({})),
+        )
+        .await
+        .expect("a pre-registration invoke must answer, not hang");
+        match answered {
+            SpokeResult::Reject(reject) => {
+                // The dialer's own session is not established here, so either the dispatch deny or
+                // a session refusal is a fail-closed answer; what must not happen is silence.
+                assert!(
+                    matches!(
+                        reject.code,
+                        SpokeRejectCode::CapabilityPortMissing
+                            | SpokeRejectCode::NotAuthorized
+                            | SpokeRejectCode::InternalError
+                    ),
+                    "a pre-registration invoke answers a refuse: {reject:?}"
+                );
+            }
+            SpokeResult::Ok(_) => panic!("nothing is registered, so nothing can be served"),
+        }
+        drop(client);
+        responder.close();
     }
 
     /// A name replaced by a regular file after the bind belongs to whoever replaced it. The drain

@@ -1,14 +1,14 @@
-//! The single-instance lock: one daemon per store directory entry per host.
+//! The single-instance lock: one daemon per store file per host.
 //!
-//! The lock is an exclusive advisory lock on a lock file beside the store, named for the store's
-//! inode identity. It is taken before the store is opened, so a second instance is refused without
-//! running a migration, and because it is a file of its own it is independent of SQLite's lock
-//! space — the store stays fully usable while the lock is held.
+//! The lock is an exclusive advisory lock on `<canonical store>.lock`, taken before the store is
+//! opened, so a second instance is refused without running a migration. Because it is a file of its
+//! own it is independent of SQLite's lock space — the store stays fully usable while the lock is
+//! held — and because it names the store's one canonical path, every way of reaching that store
+//! answers the same lock.
 //!
-//! Every name that resolves to one directory entry contends on one lock: the path itself, any
-//! symlink to it (including a dangling one, whose creation lands on the target) and a hard link in
-//! the same directory, which shares the inode the name is derived from. A hard link in another
-//! directory is the documented limit below.
+//! A store with more than one name is refused rather than locked. SQLite's write-ahead log is named
+//! for the file it belongs to, not for its inode, so a second hard link would open the same bytes
+//! under a different `-wal` and miss committed but uncheckpointed pages.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -31,11 +31,15 @@ const _: () = {
 impl StoreLock {
     /// Takes the lock for `store_path`'s database, or answers [`DaemonError::LockHeld`].
     ///
-    /// A store this run is about to create is created here first, empty, so it has an inode to name
-    /// the lock after; SQLite initializes an empty file on open. This runs before
-    /// `MindStore::open`, so a losing instance never opens or migrates the store.
+    /// A store this run is about to create is created here first, empty; SQLite initializes an
+    /// empty file on open. This runs before `MindStore::open`, so a losing instance never opens or
+    /// migrates the store. A store reachable under more than one name is refused: the database must
+    /// have exactly one, or its write-ahead log would be split across the aliases.
     pub fn acquire(store_path: &Path) -> Result<Self, DaemonError> {
-        let path = lock_path(store_path)?;
+        let real = resolve(store_path)?;
+        create_if_absent(&real)?;
+        refuse_second_name(&real)?;
+        let path = lock_path(&real);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -53,61 +57,61 @@ impl StoreLock {
     }
 }
 
-/// `<store directory>/.mindcore-store-<dev>-<ino>.lock`, creating the store when it is absent.
-fn lock_path(store_path: &Path) -> Result<PathBuf, DaemonError> {
-    let real = resolve(store_path)?;
-    if !real.exists() {
-        OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&real)
-            .map_err(|error| DaemonError::Store(format!("{}: {error}", real.display())))?;
+/// Creates the store when it is absent, so it has a name to lock and a link count to read.
+fn create_if_absent(store: &Path) -> Result<(), DaemonError> {
+    if store.exists() {
+        return Ok(());
     }
-    let dir = real
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    Ok(dir.join(lock_name(&real)?))
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(store)
+        .map_err(|error| DaemonError::Store(format!("{}: {error}", store.display())))?;
+    Ok(())
 }
 
-/// `.mindcore-store-<dev>-<ino>.lock` — the store's inode identity, in its own directory.
+/// Refuses a store reachable under more than one name.
 ///
-/// Two names in one directory that reach one inode therefore answer one lock file.
-#[cfg(unix)]
-fn lock_name(store: &Path) -> Result<String, DaemonError> {
+/// A hard link is another name for the same bytes, and SQLite's `-wal` and `-shm` files are named
+/// for the path rather than the inode: a second link would write its own log beside itself and a
+/// restart through either name could miss the other's committed pages. One name is the contract, so
+/// the second is a start failure, not a narrower kind of support.
+fn refuse_second_name(store: &Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::metadata(store)
-        .map_err(|error| DaemonError::Store(format!("{}: {error}", store.display())))?;
-    Ok(format!(
-        ".mindcore-store-{}-{}.lock",
-        metadata.dev(),
-        metadata.ino()
-    ))
+    let links = std::fs::metadata(store)
+        .map_err(|error| DaemonError::Store(format!("{}: {error}", store.display())))?
+        .nlink();
+    if links > 1 {
+        return Err(DaemonError::Config(format!(
+            "store_path {}: {links} hard links; a store must have exactly one name",
+            store.display()
+        )));
+    }
+    Ok(())
 }
 
-// shortcut: without `dev`/`ino` the name falls back to the store's file name, so a hard link under
-// another name — same directory or not — gets its own lock and could start a second daemon;
-// upgrade when Windows becomes a target and needs the guarantee.
-#[cfg(not(unix))]
-fn lock_name(store: &Path) -> Result<String, DaemonError> {
-    let name = store.file_name().ok_or_else(|| {
-        DaemonError::Config(format!(
-            "store_path {}: names no file to lock",
-            store.display()
-        ))
-    })?;
-    let mut lock = name.to_os_string();
+/// `<canonical store>.lock` — the one lock file a store's single name answers.
+fn lock_path(store: &Path) -> PathBuf {
+    let mut lock = store.as_os_str().to_os_string();
     lock.push(".lock");
-    Ok(lock.to_string_lossy().into_owned())
+    PathBuf::from(lock)
+}
+
+/// `store_path`'s canonical spelling — the one path SQLite and its sidecars are named after.
+///
+/// The lock is taken on this path, and the store must be opened on it too: a store reachable under
+/// two names would otherwise get two write-ahead logs.
+pub fn canonical_store_path(store_path: &Path) -> Result<PathBuf, DaemonError> {
+    resolve(store_path)
 }
 
 /// How many alias hops a store path may take. A chain longer than this is refused rather than
 /// walked, so a symlink loop cannot spin here.
 const MAX_ALIAS_HOPS: usize = 16;
 
-/// The database's real path.
+/// The database's canonical path: the one spelling SQLite and its sidecars are named after.
 ///
 /// `canonicalize` answers it whenever the store exists. Otherwise the final component may itself
 /// be a symlink to a database that does not exist yet, so the link is followed by hand: the literal
@@ -167,9 +171,9 @@ mod tests {
         std::fs::canonicalize(path).expect("resolved path")
     }
 
-    /// The lock path for a store that already exists, without creating anything.
+    /// The lock path a store's canonical name answers, without creating anything.
     fn lock_file_for(store: &Path) -> PathBuf {
-        lock_path(store).expect("lock path")
+        lock_path(&resolve(store).expect("the store's canonical path"))
     }
 
     fn assert_held(error: &DaemonError, locked: &Path) {
@@ -200,30 +204,31 @@ mod tests {
         assert_eq!(std::fs::read(&store).expect("read"), BYTES);
     }
 
-    /// The lock is a separate file beside the store, named for the store's inode, and the store's
-    /// own bytes and length are untouched by taking it.
-    #[cfg(unix)]
+    /// The lock is a separate file beside the store's canonical name, and the store's own bytes and
+    /// length are untouched by taking it.
     #[test]
     fn the_lock_is_a_separate_file_beside_the_store() {
-        use std::os::unix::fs::MetadataExt;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("mind.db");
         std::fs::write(&store, BYTES).expect("create the store file");
-        let metadata = std::fs::metadata(&store).expect("store metadata");
 
         let lock = lock_file_for(&store);
+        assert_ne!(
+            lock,
+            resolved(&store),
+            "the lock is not the store file: {}",
+            lock.display()
+        );
+        assert_eq!(
+            lock.file_name().and_then(|name| name.to_str()),
+            Some("mind.db.lock"),
+            "the lock is named for the store's one name: {}",
+            lock.display()
+        );
         assert_eq!(
             lock.parent(),
             Some(resolved(dir.path()).as_path()),
-            "the lock lives in the store's directory: {}",
-            lock.display()
-        );
-        assert_ne!(lock, store, "the lock is not the store file");
-        assert_eq!(
-            lock.file_name().and_then(|name| name.to_str()),
-            Some(format!(".mindcore-store-{}-{}.lock", metadata.dev(), metadata.ino()).as_str()),
-            "the lock is named for the store's inode: {}",
+            "the lock sits beside the canonical store: {}",
             lock.display()
         );
 
@@ -291,8 +296,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_dangling_alias_locks_the_target() {
-        use std::os::unix::fs::MetadataExt;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let resolved_dir = resolved(dir.path());
         let store = dir.path().join("mind.db");
@@ -304,15 +307,10 @@ mod tests {
         let first = StoreLock::acquire(&alias).expect("acquire the dangling alias");
         assert!(store.exists(), "the alias created the target");
 
-        let metadata = std::fs::metadata(&store).expect("target metadata");
-        let expected = resolved_dir.join(format!(
-            ".mindcore-store-{}-{}.lock",
-            metadata.dev(),
-            metadata.ino()
-        ));
+        let expected = resolved_dir.join("mind.db.lock");
         assert!(
             expected.exists(),
-            "the alias locked the target's name: {}",
+            "the alias locked the target's canonical name: {}",
             expected.display()
         );
         assert!(
@@ -330,22 +328,27 @@ mod tests {
     /// A hard link in the same directory shares the inode, so it shares the lock.
     #[cfg(unix)]
     #[test]
-    fn a_hard_link_in_the_same_directory_reaches_the_same_lock() {
+    fn a_hard_link_in_the_same_directory_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("mind.db");
         std::fs::write(&store, BYTES).expect("create the store file");
         let link = dir.path().join("hard.db");
         std::fs::hard_link(&store, &link).expect("hard link");
 
-        assert_eq!(lock_file_for(&store), lock_file_for(&link));
-
-        let first = StoreLock::acquire(&store).expect("acquire through the first name");
-        let error = StoreLock::acquire(&link).expect_err("acquire through the hard link");
-        assert_held(&error, &link);
+        // Two names, one database: SQLite's sidecars are named for the path, so one of the two
+        // would write a log the other never reads. Refused, not served under a narrower rule.
+        for name in [&store, &link] {
+            match StoreLock::acquire(name) {
+                Err(DaemonError::Config(message)) => {
+                    assert!(message.contains("hard links"), "{message}");
+                    assert!(message.contains("exactly one name"), "{message}");
+                }
+                Err(other) => panic!("a hard-linked store is a config refusal, not {other:?}"),
+                Ok(_) => panic!("a store with two names must not start"),
+            }
+        }
+        assert_eq!(std::fs::read(&store).expect("read"), BYTES);
         assert_eq!(std::fs::read(&link).expect("read"), BYTES);
-
-        drop(first);
-        StoreLock::acquire(&link).expect("the hard link acquires once the guard drops");
     }
 
     /// The documented limit, pinned so it stays explicit: a hard link in another directory names a
@@ -356,7 +359,7 @@ mod tests {
     /// issue for the iteration that needs it.
     #[cfg(unix)]
     #[test]
-    fn a_cross_directory_hard_link_names_its_own_lock() {
+    fn a_cross_directory_hard_link_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let elsewhere = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("mind.db");
@@ -364,24 +367,17 @@ mod tests {
         let link = elsewhere.path().join("mind.db");
         std::fs::hard_link(&store, &link).expect("hard link across directories");
 
-        let store_lock = lock_file_for(&store);
-        let link_lock = lock_file_for(&link);
-        assert_ne!(
-            store_lock, link_lock,
-            "a cross-directory hard link names its own lock"
-        );
-        assert_eq!(store_lock.parent(), Some(resolved(dir.path()).as_path()));
-        assert_eq!(
-            link_lock.parent(),
-            Some(resolved(elsewhere.path()).as_path())
-        );
-
-        // Two directory entries, two inodes' worth of naming, two locks — the pinned limit.
-        let first = StoreLock::acquire(&store).expect("acquire through the first name");
-        let second = StoreLock::acquire(&link).expect("acquire through the other directory");
-        assert_eq!(std::fs::read(&link).expect("read"), BYTES);
-        drop(first);
-        drop(second);
+        // The link count is a property of the inode, so the other directory does not matter: one
+        // database with two names is refused from either side.
+        for name in [&store, &link] {
+            match StoreLock::acquire(name) {
+                Err(DaemonError::Config(message)) => {
+                    assert!(message.contains("hard links"), "{message}");
+                }
+                Err(other) => panic!("a hard-linked store is a config refusal, not {other:?}"),
+                Ok(_) => panic!("a store linked across directories must not start"),
+            }
+        }
     }
 
     /// An unusable store parent is a config fault naming the path, not a lock failure.

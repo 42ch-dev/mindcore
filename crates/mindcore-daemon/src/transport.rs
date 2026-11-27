@@ -132,19 +132,13 @@ impl UnixSocketTransport {
         // never be skipped — it is what tells the peer the stream ended and what makes a parked
         // `write_all` fail — so it goes first and is unaffected by a `SHUT_RD` refusal after it.
         unsafe {
-            let write_side = libc::shutdown(self.fd, libc::SHUT_WR);
             // A peer that already tore its side down answers `NotConnected`, which is the state
             // this call is asking for anyway; any other error still leaves the transport closed,
             // which is what `close` promises.
-            if write_side != 0 {
-                let _ = std::io::Error::last_os_error();
-            }
+            let _ = libc::shutdown(self.fd, libc::SHUT_WR);
             // Wake a parked read. This too may be refused on a half-closed socket; the read half's
             // pending `recv` still fails, because `recv` watches the closed signal.
-            let read_side = libc::shutdown(self.fd, libc::SHUT_RD);
-            if read_side != 0 {
-                let _ = std::io::Error::last_os_error();
-            }
+            let _ = libc::shutdown(self.fd, libc::SHUT_RD);
         }
         // Published after the call, under the lock: a waiter that reads `true` learns the socket is
         // really shut, not that a shutdown is under way.
@@ -245,11 +239,13 @@ impl Transport for UnixSocketTransport {
         }
         .await;
         if let Err(error) = written {
-            return Err(if self.is_closed() {
-                TransportError::Closed
-            } else {
-                TransportError::Io(format!("write frame: {error}"))
-            });
+            // Part of a frame may be on the stream: the framing is now broken for this peer, so
+            // the transport ends exactly as a failed read does rather than staying half usable.
+            if self.is_closed() {
+                return Err(TransportError::Closed);
+            }
+            self.terminate().await;
+            return Err(TransportError::Io(format!("write frame: {error}")));
         }
         // A close during the write shuts the socket down; the write may have completed on a peer
         // that is now gone, and it must not be reported as a delivered frame.
