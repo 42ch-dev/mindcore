@@ -128,6 +128,22 @@ describe('the in-process binding', () => {
     );
   });
 
+  it('creates a Mind when createMind is called with no argument', async () => {
+    // The declaration says `options?`; the wrapper's default keeps that true against an addon
+    // argument that is otherwise undefined.
+    const client = await open('defaults');
+    const mind = await client.createMind();
+    assert.ok(mind instanceof MindView);
+    assert.match(mind.id, /^spc_/);
+    const minds = await client.listMinds();
+    assert.deepEqual(
+      minds.map((row) => row.id),
+      [mind.id],
+      'the no-argument create registered exactly that Mind',
+    );
+    assert.equal(minds[0].displayName, null, 'an unnamed Mind carries no display name');
+  });
+
   it('refuses ensureSubject for a caller without a grant on that Mind', async () => {
     // The binding performs no authorization of its own: the adapter's admission answers, so the
     // refusal arrives with its own code rather than one the binding invented.
