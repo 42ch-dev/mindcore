@@ -36,6 +36,8 @@ The complete lifecycle will be delivered in twelve dependency-ordered stages, al
 
 Each stage will merge on its own, behind the capability it advertises, and will change no caller-visible behaviour before the stage that serves that behaviour. Later stages will be planned work in the same feature, not options to drop.
 
+**Optional model enhancement will never be a baseline gate.** The deterministic compiler, container navigation and baseline ranking are mandatory. A model-generated abstract is an optional derived artifact with model/prompt/input provenance and a deterministic fallback; it is not required for availability, the write gate, compilation, baseline ranking or acceptance. Evaluation will run the mandatory deterministic baseline first and report an enhancement-enabled run separately.
+
 **Metrics will have one owner, one input and a declared class.** A mandatory gate blocks its stage or the release; a reported metric is measured and published without blocking.
 
 | Metric | Owner stage | Input | Class | Condition |
@@ -55,21 +57,22 @@ Each stage will merge on its own, behind the capability it advertises, and will 
 | Cache hit rate | S3/S5, measured S12 | a rename series and a revert series | Reported | target ≥ 90% |
 | Index backfill | S5, measured S12 | a 2 000-document collection written before the indexes | Reported | batches of 100; measured |
 | Oracle whole-document baseline | S7, measured S12 | the same corpus and questions | Reported | bounds the achievable gain; no gate |
+| Optional model enhancement | S2/S6/S7, measured S12 | the same corpus with enhancement enabled and disabled | Reported | deterministic baseline is mandatory; enhancement quality/cost reported separately, with model/prompt/input provenance |
 
 **Stage gates will be as concrete as the metrics.**
 
 - S1: an external implementation compiles and passes the groups its capabilities require — every provider the read and write-refusal groups, a writable one the writable-publication group including a publish-phase failure.
-- S2: positive fixtures compile byte-exactly; every rule has a refusal case; a blank-line-only change outside a fence compiles to the same fingerprint; a trailing-whitespace document is refused; an indentation change that alters block structure changes the fingerprint.
+- S2: positive fixtures compile byte-exactly; every rule has a refusal case; a blank-line-only change outside a fence compiles to the same fingerprint; a trailing-whitespace document is refused; an indentation change that alters block structure changes the fingerprint; no model call is on the compile or gate path, and an optional abstract carries model/prompt/input provenance with deterministic fallback.
 - S3: a create against an existing head is refused; a tombstone keeps the head; an attempt ref is created before staging and revoked at release, so a paused attempt cannot stage; a batch decision consumes no staging credential; a decided batch retains its credentials and settles once, while an undecided attempt is revoked at expiry; a revoked attempt answers `attempt revoked` even when its staging credential is gone, and only a live attempt answers `staging expired`; a mutual move builds in either order; a publish failure leaves every named document old or new, settles each target by reachability and reports only the truly unpublished ones.
 - S4: every rejection in the format and lineage lists refuses with rule and byte range; a dependency already moved at the post-staging check refuses and one that moves afterwards produces a finding; a partial batch answers `incomplete` with each published target's version and commit and only the unpublished ones retryable; a dropped response is resolved by the receipt; a released attempt cannot create its first credential, stage or publish; a cross-document operation writes its lineage record before the batch decision ref, and a failed write leaves no decision ref and no head move; a create retried after a released claim yields exactly one root; a delete through the negotiated tool appends a tombstone and its lost response is resolved by its own request id and digest; a head published before its claim repair is served by a read, and an ordinary update cannot resurrect the id; activation preserves a seeded legacy row.
-- S5: each crash window is injected; a head with no cursor is adopted; dropping the derived set preserves review decisions, and rebuilding with changed anchors follows the valid owners.
-- S6: L0 has no body, L1 no prose and a complete handle per section, a pinned handle returns its version and never answers `ViewStale`, a hidden item answers as absent, and a diff with a hidden side answers as not found.
-- S7: hidden rows in the top candidates still yield `k` visible rows and change no visible score or order; the search's visibility decision matches the read predicate item by item; L0 is document-ranked; sections come only from the selected documents, capped per document.
+- S5: each crash window is injected; a head with no cursor is adopted; dropping the derived set preserves review decisions, and rebuilding with changed anchors follows the valid owners; container navigation is derived from child versions and folder metadata with no parent commit, and shared and Mind-owned heads are discovered once by stable id in the admitted tenant.
+- S6: node-level layers are present: a container L1 is bounded child navigation and key constraints, a document L1 is section outline with a complete handle per section, and L2 is exact leaf content; no model is required for container availability or baseline ranking. Pinned handles return their version and never answer `ViewStale`, a hidden item answers as absent, and a diff with a hidden side answers as not found.
+- S7: hidden rows in the top candidates still yield `k` visible rows and change no visible score or order; the search's visibility decision matches the read predicate item by item; shared and Mind-owned documents enter only the admitted tenant's visible set; L0 is document-ranked; sections come only from the selected documents, capped per document; a model-enhanced embedding uses its own identity and deterministic fallback.
 - S8: the classification table holds; a successor attaches only to a published target — the containing commit for a same-document target, the recorded candidate for a cross-document one — independent of publication order; a same-document target stores no commit id; a cross-document binding survives removing staging and batch refs and a garbage collection; a late target publication refreshes the source finding on the target's projection or a source finding read without rebuilding the source; declared lineage replays after a crash; no automatic re-anchor.
-- S9: the direct round trip including L1-carried handles, the peer delete through the negotiated tool with its tombstone replay and its own request id, the receipt and the old-client bytes pass.
+- S9: the direct round trip including L1-carried handles, explicit layer selection with no implicit traversal, container-node views, the peer delete through the negotiated tool with its tombstone replay and its own request id, the receipt and the old-client bytes pass. Admission derives tenant from the authenticated caller/session, a raw extension hint cannot select it, ambiguous or foreign tenants are refused, and same-named Mind ids in different tenants do not collide; no second Mind-routing field is introduced.
 - S10: schemas, cohort, assemble carrier, scoped FFI and SDK parity are delivered.
 - S11: the read-only provider passes the read and write-refusal groups without a compiler or a vector channel.
-- S12: the restore drill passes, then the evaluation runs on the complete feature.
+- S12: the restore drill passes, then the evaluation runs on the complete feature, including shared visibility and directory navigation acceptance; the deterministic baseline runs first, and any model enhancement is reported separately with provenance, never as a baseline gate.
 
 **If a measured gate misses, the response will be a mechanism fix or a recorded decision — not a dropped layer and not a restated goal.** Selection, fusion, prefixing, index level and caching are the levers; the scope of the feature is not.
 
@@ -93,6 +96,9 @@ Each stage will merge on its own, behind the capability it advertises, and will 
 - No stage will merge a caller-visible change before the stage that serves it, and no later stage will be removed to make an earlier one ship.
 - A missed gate will produce a recorded mechanism decision and a revised mechanism, not a reduced scope.
 - The old-client conformance case will stay green through every stage.
+- A shared document will be referenced by id and readable by many admitted Minds in one tenant with one history; an unadmitted or foreign tenant will be refused, and same-named Mind ids in different tenants will not collide.
+- Folder and container views will be composed from document heads and child versions; a folder move will produce new versions for affected documents and no collection-wide commit or sequence.
+- No acceptance gate will require a model artifact. The deterministic baseline is mandatory; optional model enhancement is evaluated and reported separately with provenance and a deterministic fallback.
 
 ## Risks
 
