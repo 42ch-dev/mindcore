@@ -29,6 +29,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use spoke_connect::remote::{Transport, TransportError};
@@ -36,6 +37,63 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{watch, Mutex};
+
+/// A transport that withholds the peer's first frame until the host says the session is ready.
+///
+/// `spoke-connect`'s responder starts its own task before `connect_responder` returns and installs
+/// no handlers from the manifest, so a dialer that completes its hello at once can invoke an
+/// advertised tool before the host has registered one and be answered `op_unsupported`. Holding the
+/// first `recv` until registration is done closes that window from this side: the responder cannot
+/// read the hello, so it cannot establish a session, so nothing can be invoked.
+///
+/// `send` and `close` are never gated. The responder's hello reply is one `send`, and a start that
+/// fails must still be able to close the session it opened; only inbound traffic waits.
+pub struct GatedTransport {
+    inner: Arc<dyn Transport>,
+    /// Closed until [`GatedTransport::open`]. A `watch` rather than a one-shot, so a `recv` that
+    /// starts after the gate opened still sees `true`.
+    gate: watch::Sender<bool>,
+}
+
+impl GatedTransport {
+    /// Wraps `inner`, with the gate closed.
+    #[must_use]
+    pub fn new(inner: Arc<dyn Transport>) -> Self {
+        let (gate, _) = watch::channel(false);
+        Self { inner, gate }
+    }
+
+    /// Opens the gate: the next `recv` reads its frame, and every later one does so at once.
+    pub fn open(&self) {
+        self.gate.send_replace(true);
+    }
+
+    /// The wrapped transport, for a caller that needs its own handle.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn Transport> {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl Transport for GatedTransport {
+    async fn send(&self, envelope: &[u8]) -> Result<(), TransportError> {
+        self.inner.send(envelope).await
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, TransportError> {
+        // Waits only while closed; once opened the next poll returns at once.
+        let mut gate = self.gate.subscribe();
+        if !*gate.borrow() {
+            let _ = gate.wait_for(|open| *open).await;
+        }
+        self.inner.recv().await
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        self.inner.close().await
+    }
+}
 
 /// The largest body one frame may carry: 16 MiB (16,777,216 bytes).
 ///
@@ -282,6 +340,7 @@ impl Transport for UnixSocketTransport {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use tokio::io::AsyncReadExt;
@@ -619,5 +678,60 @@ mod tests {
             .await
             .expect("the connection task's wait resolves on close")
             .expect("closed signal task");
+    }
+
+    /// The gate is load-bearing: with it closed the responder never reads the dialer's hello, so the
+    /// session never establishes — the exact window the daemon closes before registering handlers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_gate_withholds_the_hello() {
+        use spoke_connect::remote::{
+            connect_responder, loopback_transport_pair, ConnectResponderOptions, RemoteIdentity,
+        };
+
+        let pair = loopback_transport_pair();
+        let gated = Arc::new(GatedTransport::new(Arc::new(pair.server)));
+        let responder = connect_responder(ConnectResponderOptions {
+            transport: Arc::clone(&gated) as Arc<dyn Transport>,
+            identity: RemoteIdentity { seed: [0x51u8; 32] },
+            manifest: serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "host_id": "gate",
+                "roles": ["data-store"],
+                "capabilities": [],
+                "namespaces": [],
+                "extensions": {},
+            }))
+            .expect("manifest"),
+            allowlist: Vec::new(),
+            peer_keys: HashMap::new(),
+            ports: None,
+            invoke_timeout_ms: Some(1_000),
+        })
+        .await;
+
+        // A dialer's frame sits in the loopback channel; the gated responder must not read it.
+        let client = pair.client;
+        client
+            .send(&serde_json::to_vec(&serde_json::json!({"op": "hello"})).expect("frame"))
+            .await
+            .expect("send a first frame");
+
+        // Never opened: the handshake cannot make progress, so the state stays pre-established.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(
+            responder.state(),
+            spoke_connect::remote::ConnectResponderState::Established,
+            "a closed gate must keep the session unestablished"
+        );
+
+        // Opening it releases the frame, and the responder's own state machine takes over.
+        gated.open();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(
+            responder.state(),
+            spoke_connect::remote::ConnectResponderState::Handshaking,
+            "an opened gate lets the responder read"
+        );
+        responder.close();
     }
 }

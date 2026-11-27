@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 
 use crate::config::{hex32, DaemonConfig};
 use crate::lock::StoreLock;
-use crate::transport::UnixSocketTransport;
+use crate::transport::{GatedTransport, UnixSocketTransport};
 use crate::DaemonError;
 
 /// What every connection shares: the one assembled surface and the responder's own wiring.
@@ -166,11 +166,14 @@ impl Drop for BoundSocket {
 
 /// Runs the serving phase of the lifecycle order: store, journal, surface, listen, accept, drain.
 ///
-/// The lock arrives held and is dropped last, after every live session has been told to close.
-pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonError> {
-    // The canonical spelling, the same one the lock was taken on: SQLite names its write-ahead log
-    // after the path, so opening another spelling would split the log across two names.
-    let store_path = crate::lock::canonical_store_path(&config.store_path)?;
+/// `store_path` is the caller's one canonical resolution, the same path the lock was taken on; it is
+/// opened here unchanged. The lock arrives held and is dropped last, after every live session has
+/// been told to close.
+pub async fn run(
+    config: DaemonConfig,
+    store_path: PathBuf,
+    lock: StoreLock,
+) -> Result<(), DaemonError> {
     let store = MindStore::open(&store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", store_path.display())))?;
@@ -316,6 +319,16 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
     let mut cursor = Some(dir);
     while let Some(current) = cursor {
         if current.exists() {
+            // An existing component that is not a directory cannot be a journal root: accepting it
+            // would publish into whatever the path really names.
+            let metadata = std::fs::symlink_metadata(current)
+                .map_err(|error| DaemonError::Journal(format!("{}: {error}", current.display())))?;
+            if !metadata.is_dir() {
+                return Err(DaemonError::Journal(format!(
+                    "{}: exists and is not a directory",
+                    current.display()
+                )));
+            }
             break;
         }
         missing.push(current);
@@ -331,11 +344,51 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
             _ => PathBuf::from("."),
         };
-        File::open(&parent)
-            .and_then(|parent| parent.sync_all())
-            .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))?;
+        sync_parent(&parent)?;
     }
     Ok(())
+}
+
+/// Syncs `parent`, so the directory entry just created beneath it is durable.
+///
+/// A failed sync is a journal fault naming the directory: reporting a clean start on a chain that is
+/// not yet on disk would promise durability the daemon does not have.
+fn sync_parent(parent: &Path) -> Result<(), DaemonError> {
+    #[cfg(test)]
+    if take_injected_sync_failure(parent) {
+        return Err(DaemonError::Journal(format!(
+            "{}: injected sync fault",
+            parent.display()
+        )));
+    }
+    File::open(parent)
+        .and_then(|parent| parent.sync_all())
+        .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))
+}
+
+/// A test seam: the next sync of this exact directory fails. An `fsync` fault cannot be built from
+/// a test's side, so this is the only way to pin that the failure is propagated rather than ignored.
+#[cfg(test)]
+static INJECT_SYNC_FAILURE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn push_injected_sync_failure(path: &Path) {
+    INJECT_SYNC_FAILURE
+        .lock()
+        .expect("sync seam lock")
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn take_injected_sync_failure(path: &Path) -> bool {
+    let mut armed = INJECT_SYNC_FAILURE.lock().expect("sync seam lock");
+    match armed.iter().position(|armed_path| armed_path == path) {
+        Some(index) => {
+            armed.remove(index);
+            true
+        }
+        None => false,
+    }
 }
 
 /// The accept loop; it ends when its listener is dropped, which happens when `run` drops this
@@ -373,8 +426,14 @@ async fn accept(
 /// before this task yields, and the two held together until the session ends.
 async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
     let transport = Arc::new(UnixSocketTransport::from_stream(stream));
+    // The responder may read the dialer's hello before this task gets to register a single
+    // handler. The gate withholds that first frame until registration is done, so a session
+    // cannot be established into an empty handler registry.
+    let gated = Arc::new(GatedTransport::new(
+        Arc::clone(&transport) as Arc<dyn Transport>
+    ));
     let options = ConnectResponderOptions {
-        transport: Arc::clone(&transport) as Arc<dyn Transport>,
+        transport: Arc::clone(&gated) as Arc<dyn Transport>,
         identity: RemoteIdentity { seed: host.seed },
         manifest: host.surface.manifest.clone(),
         allowlist: host.allowlist.clone(),
@@ -406,6 +465,8 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
             .retain(|(live_id, _)| *live_id != id);
         return;
     }
+    // Registered: the dialer's hello may now be read and its tool invokes served.
+    gated.open();
     transport.closed().await;
     responder.close();
     host.live
@@ -442,16 +503,28 @@ struct IdentityFailure {
 }
 
 #[cfg(test)]
-static INJECT_IDENTITY_FAILURE: Mutex<Option<(PathBuf, IdentityFailure)>> = Mutex::new(None);
+static INJECT_IDENTITY_FAILURE: Mutex<Vec<(PathBuf, IdentityFailure)>> = Mutex::new(Vec::new());
 
-/// Takes the seam's fault when `path` is the armed one; leaves it otherwise.
+/// Arms the next identity read of `path` to fail.
+#[cfg(test)]
+fn push_injected_failure(path: &Path, failure: IdentityFailure) {
+    INJECT_IDENTITY_FAILURE
+        .lock()
+        .expect("identity seam lock")
+        .push((path.to_path_buf(), failure));
+}
+
+/// Removes the first armed fault whose path is `path`, leaving every other entry in place.
+///
+/// A queue rather than one slot, so two tests arming different paths run in parallel without
+/// stealing each other's fault and without a serializing lock.
 #[cfg(test)]
 fn take_injected_failure(path: &Path) -> Option<IdentityFailure> {
     let mut armed = INJECT_IDENTITY_FAILURE.lock().expect("identity seam lock");
-    match armed.as_ref() {
-        Some((armed_path, _)) if armed_path == path => armed.take().map(|(_, failure)| failure),
-        _ => None,
-    }
+    let index = armed
+        .iter()
+        .position(|(armed_path, _)| armed_path == path)?;
+    Some(armed.remove(index).1)
 }
 
 /// A test seam: when installed, a connection task parks here — after its responder is tracked and
@@ -1021,6 +1094,64 @@ mod tests {
         assert!(root.is_dir());
     }
 
+    /// A regular file where the journal root belongs is a journal fault naming it, not a success:
+    /// publishing into whatever the path really names would be worse than refusing to start.
+    #[test]
+    fn a_journal_component_that_is_not_a_directory_is_refused() {
+        let dir = TempDir::new().expect("temporary directory");
+        let file = dir.path().join("journal");
+        std::fs::write(&file, b"not a directory").expect("write the file");
+        match journal_root(&file) {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("not a directory"), "{message}");
+                assert!(
+                    message.contains(&file.display().to_string()),
+                    "the refusal names it: {message}"
+                );
+            }
+            other => panic!("a file at the journal root is a journal fault, not {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&file).expect("read the file"),
+            b"not a directory",
+            "the file is untouched"
+        );
+    }
+
+    /// An ancestor that is a file is refused too, not just the leaf.
+    #[test]
+    fn a_journal_ancestor_that_is_not_a_directory_is_refused() {
+        let dir = TempDir::new().expect("temporary directory");
+        let file = dir.path().join("new-parent");
+        std::fs::write(&file, b"file").expect("write the file");
+        match journal_root(&file.join("journal")) {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("not a directory"), "{message}");
+            }
+            other => panic!("a file above the journal root is a journal fault, not {other:?}"),
+        }
+    }
+
+    /// A sync that fails is a journal fault, not a success: the daemon must not report a clean start
+    /// on a chain that is not on disk yet.
+    #[test]
+    fn a_failed_parent_sync_is_a_journal_fault() {
+        let dir = TempDir::new().expect("temporary directory");
+        let root = dir.path().join("new-parent").join("journal");
+        let armed_parent = dir.path().join("new-parent");
+        push_injected_sync_failure(&armed_parent);
+        match journal_root(&root) {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("injected sync fault"), "{message}");
+                assert!(
+                    message.contains(&armed_parent.display().to_string()),
+                    "the refusal names the directory that failed to sync: {message}"
+                );
+            }
+            other => panic!("a failed sync is a journal fault, not {other:?}"),
+        }
+    }
+
     /// Two missing levels: each newly created entry must be linked in its own parent, not just the
     /// leaf inside a directory that is itself not yet durable.
     #[test]
@@ -1087,8 +1218,10 @@ mod tests {
             socket_path: config.store_path.clone(),
             ..config.clone()
         };
-        let lock = StoreLock::acquire(&collided.store_path).expect("take the lock");
-        match run(collided, lock).await {
+        let store_path = crate::lock::canonical_store_path(&collided.store_path)
+            .expect("resolve the store path");
+        let lock = StoreLock::acquire(&store_path).expect("take the lock");
+        match run(collided, store_path, lock).await {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("regular file"), "{message}")
             }
@@ -1196,8 +1329,7 @@ mod tests {
     async fn an_identity_read_failure_inside_bind_leaves_no_socket() {
         let dir = TempDir::new().expect("temporary directory");
         let path = dir.path().join("daemon.sock");
-        *INJECT_IDENTITY_FAILURE.lock().expect("seam") =
-            Some((path.clone(), IdentityFailure::default()));
+        push_injected_failure(&path, IdentityFailure::default());
         match BoundSocket::bind(&path) {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("could not be inspected"), "{message}")
@@ -1228,7 +1360,7 @@ mod tests {
         let seam = IdentityFailure {
             close_directory: Some(parent.clone()),
         };
-        *INJECT_IDENTITY_FAILURE.lock().expect("seam") = Some((path.clone(), seam));
+        push_injected_failure(&path, seam);
         let outcome = BoundSocket::bind(&path);
         // Restore before asserting, so a failure does not leave an unwritable directory behind.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
@@ -1330,8 +1462,10 @@ mod tests {
             )]),
             ..config(dir.path())
         };
-        let lock = StoreLock::acquire(&config.store_path).expect("take the lock");
-        match run(config.clone(), lock).await {
+        let store_path =
+            crate::lock::canonical_store_path(&config.store_path).expect("resolve the store path");
+        let lock = StoreLock::acquire(&store_path).expect("take the lock");
+        match run(config.clone(), store_path, lock).await {
             Err(DaemonError::Config(message)) => {
                 assert!(message.contains("public_key"), "{message}")
             }

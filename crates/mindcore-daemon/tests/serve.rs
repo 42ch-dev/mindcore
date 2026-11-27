@@ -233,11 +233,16 @@ fn hello(capabilities: &[&str]) -> HostCapabilityManifest {
 
 /// One signed session over `stream`, the dialer claiming the knowledge face's two flags.
 async fn dial(stream: UnixStream) -> Arc<RemoteAdapter> {
+    dial_claiming(stream, &KNOWLEDGE_CAPABILITIES).await
+}
+
+/// A dialer whose hello negotiates exactly `capabilities`, so a test can ask for a tool id too.
+async fn dial_claiming(stream: UnixStream, capabilities: &[&str]) -> Arc<RemoteAdapter> {
     let responder_pubkey = public_key(&RESPONDER_SEED);
     connect_remote_adapter(RemoteAdapterOptions {
         transport: Arc::new(UnixSocketTransport::from_stream(stream)),
         local_identity: RemoteIdentity { seed: DIALER_SEED },
-        local_manifest: hello(&KNOWLEDGE_CAPABILITIES),
+        local_manifest: hello(capabilities),
         remote_pubkey: responder_pubkey,
         allowlist: vec![derive_peer_id_from_ed25519_pubkey(&responder_pubkey)],
         invoke_timeout_ms: Some(10_000),
@@ -265,6 +270,51 @@ fn lock_file(dir: &Path) -> PathBuf {
         .collect();
     assert_eq!(locks.len(), 1, "one lock file beside the store: {locks:?}");
     locks.remove(0)
+}
+
+/// The first thing a dialer does after its hello is invoke a tool the daemon advertises. The
+/// daemon's gate holds the hello until `Surface::register` has run, so this cannot land in an empty
+/// handler registry: the answer must come from the served path, never `op_unsupported`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_invoked_right_after_the_handshake_is_served() {
+    let dir = TempDir::new().expect("a scratch directory");
+    seed(dir.path()).await;
+    std::fs::write(dir.path().join(SEED_FILE), hex(&RESPONDER_SEED)).expect("write the seed");
+    let socket = dir.path().join(SOCKET_FILE);
+    let config = write(dir.path(), "daemon.toml", &config_text(dir.path(), &socket));
+
+    let _daemon = Daemon::spawn(&config);
+    // The dialer negotiates the tool id in its hello, as a caller must before invoking it.
+    let adapter = dial_claiming(
+        wait_for_socket(&socket).await,
+        &[
+            "spoke-knowledge",
+            "spoke-knowledge-scoped",
+            "tools.mindcore.recall_context",
+        ],
+    )
+    .await;
+
+    // No delay between the handshake and the invoke: the gate is what makes this safe.
+    let answered = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.invoke_tool("tools.mindcore.recall_context", json!({})),
+    )
+    .await
+    .expect("an immediate tool invoke must answer, not hang");
+
+    match answered {
+        // A served-path refusal is a pass: the handler existed and ran, and this bare call is
+        // legitimately refused (no Mind, no budget). What must never appear is the dispatch deny.
+        SpokeResult::Reject(reject) => {
+            let text = format!("{reject:?}");
+            assert!(
+                !text.contains("op_unsupported") && !text.contains("no handler registered"),
+                "the handler must be registered before the hello: {text}"
+            );
+        }
+        SpokeResult::Ok(_) => {}
+    }
 }
 
 /// The daemon's socket is owner-only whatever the umask of the shell that started it was: who may

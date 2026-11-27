@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mindcore_daemon::config;
-use mindcore_daemon::lock::StoreLock;
+use mindcore_daemon::lock::{self, StoreLock};
 use mindcore_daemon::serve;
 use mindcore_daemon::DaemonError;
 
@@ -49,12 +49,15 @@ async fn main() -> ExitCode {
 /// root, the surface, the listener and the drain.
 async fn start(config_path: &Path) -> Result<(), DaemonError> {
     let config = config::load(config_path)?;
+    // Resolved once, and the same `PathBuf` goes to the lock and to `MindStore::open`: resolving
+    // twice would let a symlink re-pointed between the calls open a file the lock never named.
+    let store_path = lock::canonical_store_path(&config.store_path)?;
     // The lock precedes the store: `open` creates the file and runs the embedded migration, so a
-    // second instance must be refused before it. The lock is a file of its own beside the store,
-    // named for the store's inode, so every alias of the store contends on it while the store
-    // itself stays unlocked for SQLite.
-    let lock = StoreLock::acquire(&config.store_path)?;
-    serve::run(config, lock).await
+    // second instance must be refused before it. The lock is a file of its own beside the store's
+    // one canonical name, so every spelling and every symlink contends on it while the store itself
+    // stays unlocked for SQLite.
+    let lock = StoreLock::acquire(&store_path)?;
+    serve::run(config, store_path, lock).await
 }
 
 /// `--config <path>`, or `--help` answering `None`.

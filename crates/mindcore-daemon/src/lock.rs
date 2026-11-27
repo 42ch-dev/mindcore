@@ -29,17 +29,18 @@ const _: () = {
 };
 
 impl StoreLock {
-    /// Takes the lock for `store_path`'s database, or answers [`DaemonError::LockHeld`].
+    /// Takes the lock for the store at `store_path`, which MUST already be
+    /// [`canonical_store_path`]'s answer, or answers [`DaemonError::LockHeld`].
     ///
-    /// A store this run is about to create is created here first, empty; SQLite initializes an
-    /// empty file on open. This runs before `MindStore::open`, so a losing instance never opens or
-    /// migrates the store. A store reachable under more than one name is refused: the database must
-    /// have exactly one, or its write-ahead log would be split across the aliases.
+    /// The caller resolves once and hands the same path to `MindStore::open`, so the lock, the
+    /// database and its sidecars all name one file: resolving again here would reopen the door a
+    /// re-pointed symlink could walk through between the two calls. A store this run is about to
+    /// create is created here first, empty. This runs before `MindStore::open`, so a losing instance
+    /// never opens or migrates the store. A store reachable under more than one name is refused.
     pub fn acquire(store_path: &Path) -> Result<Self, DaemonError> {
-        let real = resolve(store_path)?;
-        create_if_absent(&real)?;
-        refuse_second_name(&real)?;
-        let path = lock_path(&real);
+        create_if_absent(store_path)?;
+        refuse_second_name(store_path)?;
+        let path = lock_path(store_path);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -173,13 +174,21 @@ mod tests {
 
     /// The lock path a store's canonical name answers, without creating anything.
     fn lock_file_for(store: &Path) -> PathBuf {
-        lock_path(&resolve(store).expect("the store's canonical path"))
+        lock_path(&canonical_store_path(store).expect("the store's canonical path"))
     }
 
+    /// The lock for `store`, resolved once exactly as `main` does it.
+    fn acquire(store: &Path) -> Result<StoreLock, DaemonError> {
+        let store_path = canonical_store_path(store)?;
+        StoreLock::acquire(&store_path)
+    }
+
+    /// A held lock answers `LockHeld` naming the store's canonical path.
     fn assert_held(error: &DaemonError, locked: &Path) {
+        let canonical = resolved(locked);
         assert!(
-            matches!(error, DaemonError::LockHeld(path) if path == locked),
-            "a held lock is LockHeld naming {locked:?}: {error:?}"
+            matches!(error, DaemonError::LockHeld(path) if path == &canonical),
+            "a held lock is LockHeld naming {canonical:?}: {error:?}"
         );
         assert_eq!(error.exit_code(), 2);
     }
@@ -193,13 +202,13 @@ mod tests {
         let store = dir.path().join("mind.db");
         std::fs::write(&store, BYTES).expect("create the store file");
 
-        let first = StoreLock::acquire(&store).expect("first acquire");
-        let error = StoreLock::acquire(&store).expect_err("second acquire");
+        let first = acquire(&store).expect("first acquire");
+        let error = acquire(&store).expect_err("second acquire");
         assert_held(&error, &store);
         assert_eq!(std::fs::read(&store).expect("read"), BYTES);
 
         drop(first);
-        let second = StoreLock::acquire(&store).expect("acquire after the guard dropped");
+        let second = acquire(&store).expect("acquire after the guard dropped");
         drop(second);
         assert_eq!(std::fs::read(&store).expect("read"), BYTES);
     }
@@ -249,7 +258,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("mind.db");
 
-        let first = StoreLock::acquire(&store).expect("acquire a store that does not exist");
+        let first = acquire(&store).expect("acquire a store that does not exist");
         assert!(store.exists(), "the lock created the store file");
         assert_eq!(
             std::fs::metadata(&store).expect("metadata").len(),
@@ -265,10 +274,10 @@ mod tests {
         );
         opened.expect("opened").close().await;
 
-        let error = StoreLock::acquire(&store).expect_err("second acquire");
+        let error = acquire(&store).expect_err("second acquire");
         assert_held(&error, &store);
         drop(first);
-        StoreLock::acquire(&store).expect("acquire after the guard dropped");
+        acquire(&store).expect("acquire after the guard dropped");
     }
 
     /// A store reached through a symlink is the same directory entry, so it is the same lock.
@@ -283,12 +292,12 @@ mod tests {
 
         assert_eq!(lock_file_for(&store), lock_file_for(&alias));
 
-        let first = StoreLock::acquire(&store).expect("acquire through the real name");
-        let error = StoreLock::acquire(&alias).expect_err("acquire through the alias");
-        assert_held(&error, &alias);
+        let first = acquire(&store).expect("acquire through the real name");
+        let error = acquire(&alias).expect_err("acquire through the alias");
+        assert_held(&error, &store);
 
         drop(first);
-        StoreLock::acquire(&alias).expect("the alias acquires once the guard drops");
+        acquire(&alias).expect("the alias acquires once the guard drops");
     }
 
     /// A dangling alias of a store that does not exist yet: acquiring through the alias must land
@@ -304,7 +313,7 @@ mod tests {
         assert!(!store.exists(), "the target does not exist yet");
 
         // Nothing has created the target: acquiring the alias is what creates it.
-        let first = StoreLock::acquire(&alias).expect("acquire the dangling alias");
+        let first = acquire(&alias).expect("acquire the dangling alias");
         assert!(store.exists(), "the alias created the target");
 
         let expected = resolved_dir.join("mind.db.lock");
@@ -318,11 +327,11 @@ mod tests {
             "no lock was named for the alias itself"
         );
 
-        let error = StoreLock::acquire(&store).expect_err("acquire the target");
+        let error = acquire(&store).expect_err("acquire the target");
         assert_held(&error, &store);
 
         drop(first);
-        StoreLock::acquire(&store).expect("acquire after the guard dropped");
+        acquire(&store).expect("acquire after the guard dropped");
     }
 
     /// A hard link in the same directory shares the inode, so it shares the lock.
@@ -380,13 +389,82 @@ mod tests {
         }
     }
 
+    /// Resolution happens once, before the lock is taken. A symlink re-pointed after that point
+    /// cannot move the store: the caller holds a `PathBuf`, and both the lock and the database are
+    /// named from it, not from the link it was read through.
+    #[tokio::test]
+    async fn a_symlink_re_pointed_after_resolution_cannot_move_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first.db");
+        let second = elsewhere.path().join("second.db");
+        // A real database, so opening the resolved path is the observable "the right file opened".
+        mindcore_sqlite::MindStore::open(&first)
+            .await
+            .expect("create the first store")
+            .close()
+            .await;
+        let first_bytes = std::fs::read(&first).expect("read the first store");
+        std::fs::write(&second, b"other bytes").expect("create the second store");
+        let link = dir.path().join("store.db");
+        std::os::unix::fs::symlink(&first, &link).expect("point the link at the first store");
+
+        // The one resolution the start performs.
+        let resolved = canonical_store_path(&link).expect("resolve once");
+        assert_eq!(
+            resolved,
+            resolved_of(&first),
+            "the link resolves to the first store"
+        );
+
+        // Re-point the link to a different database after resolution.
+        std::fs::remove_file(&link).expect("unlink the link");
+        std::os::unix::fs::symlink(&second, &link).expect("re-point at the second store");
+
+        // The lock and the open both use the resolved path, so neither follows the new target.
+        let guard = StoreLock::acquire(&resolved).expect("lock the resolved path");
+        let lock = lock_path(&resolved);
+        assert_eq!(
+            lock.parent(),
+            Some(resolved_of(dir.path()).as_path()),
+            "the lock sits under the resolved parent: {}",
+            lock.display()
+        );
+        assert_eq!(
+            lock.file_name().and_then(|name| name.to_str()),
+            Some("first.db.lock"),
+            "the lock is the resolved name's: {}",
+            lock.display()
+        );
+        let opened = mindcore_sqlite::MindStore::open(&resolved)
+            .await
+            .expect("open the resolved path");
+        opened.close().await;
+        assert_eq!(
+            std::fs::read(&first).expect("read the first store"),
+            first_bytes,
+            "the resolved store is the one opened"
+        );
+        assert_eq!(
+            std::fs::read(&second).expect("read the second store"),
+            b"other bytes",
+            "the re-pointed target was never touched"
+        );
+        drop(guard);
+    }
+
+    /// `path` resolved, for comparisons that are about identity rather than spelling.
+    fn resolved_of(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).expect("canonical path")
+    }
+
     /// An unusable store parent is a config fault naming the path, not a lock failure.
     #[test]
     fn an_unresolvable_parent_is_a_config_fault() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("absent").join("mind.db");
 
-        let error = StoreLock::acquire(&store).expect_err("unresolvable parent");
+        let error = canonical_store_path(&store).expect_err("unresolvable parent");
         assert!(
             matches!(&error, DaemonError::Config(message) if message.contains("store_path")),
             "a missing parent is a config fault naming the path: {error:?}"
