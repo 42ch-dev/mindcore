@@ -121,6 +121,20 @@ impl BoundSocket {
         self.identity
     }
 
+    /// Unlinks the name this guard bound, reporting whether it could.
+    ///
+    /// The explicit cleanup a failed start calls: `Drop` cannot report, so it is only the last
+    /// resort. Clears `armed` first, so a later `Drop` neither repeats the attempt nor reports a
+    /// second, contradictory answer.
+    fn cleanup(&mut self) -> Result<(), DaemonError> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        remove_if_own(&self.path, self.identity)
+            .map_err(|fault| DaemonError::Socket(format!("{}: {fault}", self.path.display())))
+    }
+
     /// Disarms the guard and hands the listener over: from here the name belongs to the caller.
     fn into_parts(mut self) -> (UnixListener, SocketIdentity) {
         self.armed = false;
@@ -130,12 +144,12 @@ impl BoundSocket {
 }
 
 impl Drop for BoundSocket {
-    /// Best-effort: `Drop` cannot report, and a name that changed identity is left alone by
-    /// `remove_if_own` exactly as the drain would leave it.
+    /// Last resort only: a start that returned without calling `cleanup` or `into_parts` still
+    /// leaves no name behind. `cleanup` disarms first, so the two never both unlink. Best-effort
+    /// because `Drop` cannot report; a name that changed identity is left alone by `remove_if_own`
+    /// exactly as the drain would leave it.
     fn drop(&mut self) {
-        if self.armed {
-            let _ = remove_if_own(&self.path, self.identity);
-        }
+        let _ = self.cleanup();
     }
 }
 
@@ -167,14 +181,14 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
             )))
         }
     };
-    // Both signals are installed before the socket exists: a process that cannot hear them would
-    // serve until it was killed some other way and leave the name for no reason.
-    let mut terminate = shutdown_signal(SignalKind::terminate())?;
-    let mut interrupt = shutdown_signal(SignalKind::interrupt())?;
-    // Held as a guard: every `?` from here to `into_parts` drops it, and the name it bound goes
-    // with it, so a start that fails after `bind` leaves no socket behind.
-    let bound = listen(&config)?;
-    let host = Arc::new(host(surface, &config, bound.identity())?);
+    // The guard owns the bound name from here, and the steps below are prepared without letting
+    // `?` drop it: a failure is cleaned up explicitly, so the refusal can report what the removal
+    // did instead of leaving `Drop` to swallow it.
+    let mut bound = listen(&config)?;
+    let (host, mut terminate, mut interrupt) = match prepare(surface, &config, &mut bound).await {
+        Ok(prepared) => prepared,
+        Err(error) => return Err(cleanup_refusal(&mut bound, error)),
+    };
     // The accept loop owns the listener from here; the guard has nothing left to undo.
     let (listener, _) = bound.into_parts();
 
@@ -208,21 +222,55 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
     serving.and(removed)
 }
 
-/// The daemon's own wiring for one assembled surface.
-fn host(
+/// Every step between a bound name and a listener the accept loop can own: the seed read, the
+/// allowlist and peer keys, the host wiring, and both shutdown signals.
+///
+/// It takes the guard by `&mut` and never removes the name itself: on failure the caller cleans up
+/// explicitly, so the refusal can carry the removal's own outcome. Both signals are installed before
+/// the socket serves, because a process that cannot hear them would serve until it was killed some
+/// other way and leave the name for no reason.
+async fn prepare(
     surface: Arc<MindcoreSurface>,
     config: &DaemonConfig,
-    socket: SocketIdentity,
-) -> Result<Host, DaemonError> {
-    Ok(Host {
-        socket,
+    bound: &mut BoundSocket,
+) -> Result<
+    (
+        Arc<Host>,
+        tokio::signal::unix::Signal,
+        tokio::signal::unix::Signal,
+    ),
+    DaemonError,
+> {
+    let seed = crate::config::read_seed(&config.identity.seed_file)?;
+    let allowlist: Vec<String> = config.peers.keys().cloned().collect();
+    let peer_keys = peer_keys(config)?;
+    let terminate = shutdown_signal(SignalKind::terminate())?;
+    let interrupt = shutdown_signal(SignalKind::interrupt())?;
+    let host = Arc::new(Host {
+        socket: bound.identity(),
         surface,
-        seed: crate::config::read_seed(&config.identity.seed_file)?,
-        allowlist: config.peers.keys().cloned().collect(),
-        peer_keys: peer_keys(config)?,
+        seed,
+        allowlist,
+        peer_keys,
         invoke_timeout_ms: config.invoke.timeout_ms,
         live: Mutex::new(Vec::new()),
-    })
+    });
+    Ok((host, terminate, interrupt))
+}
+
+/// Cleans up after a failed `prepare` and folds both faults into one refusal.
+///
+/// `Drop` cannot report, so the removal is explicit here: when it fails too the message names the
+/// removal error and the leftover path, the same wording `bind` uses for the window inside itself.
+fn cleanup_refusal(bound: &mut BoundSocket, error: DaemonError) -> DaemonError {
+    match bound.cleanup() {
+        Ok(()) => error,
+        Err(cleanup) => DaemonError::Socket(format!(
+            "{error} and the socket name could not be removed ({cleanup}): remove {} before the \
+             next start",
+            bound.path.display()
+        )),
+    }
 }
 
 /// Creates the journal root and syncs its parent, so the new directory is durable before the first
@@ -1118,6 +1166,65 @@ mod tests {
         );
     }
 
+    /// A post-bind step that fails in a read-only socket directory: nobody can remove the name, so
+    /// the refusal must name both causes and the path, and the name must still be there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_prepare_in_a_read_only_directory_names_both_causes() {
+        // The mode bits do not constrain uid 0, so the environment cannot be built as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = TempDir::new().expect("temporary directory");
+        let parent = dir.path().join("socket-dir");
+        std::fs::create_dir(&parent).expect("create the socket directory");
+        let config = DaemonConfig {
+            socket_path: parent.join("daemon.sock"),
+            // Not 64 hex digits: `prepare`'s peer-key decode is the step that fails.
+            peers: BTreeMap::from([(
+                "peer-a".to_string(),
+                PeerConfig {
+                    public_key: "nonsense".to_string(),
+                    principal: "prn_a".to_string(),
+                },
+            )]),
+            ..config(dir.path())
+        };
+        let store = MindStore::open(&config.store_path)
+            .await
+            .expect("open the store");
+        let surface = expect_ok(
+            MindcoreServe::new(store, false, |_| Ok(()))
+                .surface(faces(&config))
+                .await,
+            "assemble the surface the start serves",
+        );
+
+        let mut bound = listen(&config).expect("bind the socket");
+        // Closed after the bind: the bind needs a writable directory, the cleanup does not get one.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))
+            .expect("make the directory read-only");
+        let failure = match prepare(Arc::new(surface), &config, &mut bound).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("an undecodable peer key fails the prepare"),
+        };
+        let refusal = cleanup_refusal(&mut bound, failure);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("restore the directory");
+
+        let message = refusal.to_string();
+        assert!(message.contains("public_key"), "{message}");
+        assert!(message.contains("could not be removed"), "{message}");
+        assert!(
+            message.contains(&config.socket_path.display().to_string()),
+            "the refusal names the leftover: {message}"
+        );
+        assert!(message.contains("before the next start"), "{message}");
+        assert!(
+            config.socket_path.exists(),
+            "the leftover is still there, as the refusal says"
+        );
+    }
+
     /// A failure between `bind` and the hand-over leaves no socket behind: the guard unlinks the
     /// name it bound. `config::load` validates peer keys, so a directly constructed config is the
     /// only way to fail there — exactly the injected failure this covers.
@@ -1223,7 +1330,16 @@ mod tests {
         let listener = UnixListener::bind(&config.socket_path).expect("bind the listener");
         let socket =
             SocketIdentity::of(&std::fs::symlink_metadata(&config.socket_path).expect("lstat"));
-        let host = Arc::new(host(Arc::new(surface), &config, socket).expect("build the host"));
+        // The same wiring `prepare` builds, without the signals this test never awaits.
+        let host = Arc::new(Host {
+            socket,
+            surface: Arc::new(surface),
+            seed: crate::config::read_seed(&config.identity.seed_file).expect("read the seed"),
+            allowlist: config.peers.keys().cloned().collect(),
+            peer_keys: peer_keys(&config).expect("decode the peer keys"),
+            invoke_timeout_ms: config.invoke.timeout_ms,
+            live: Mutex::new(Vec::new()),
+        });
 
         let (parked, mut park_signal) = tokio::sync::mpsc::unbounded_channel();
         let (resume, parked_resume) = tokio::sync::mpsc::unbounded_channel();
