@@ -109,6 +109,7 @@ pub fn load(path: &Path) -> Result<DaemonConfig, DaemonError> {
 
 /// The responder's Ed25519 seed: `path` must hold exactly 64 hex digits.
 pub fn read_seed(path: &Path) -> Result<[u8; 32], DaemonError> {
+    refuse_readable_seed(path)?;
     std::fs::read_to_string(path)
         .map_err(|error| {
             DaemonError::Config(format!("identity.seed_file {}: {error}", path.display()))
@@ -156,6 +157,37 @@ impl DaemonConfig {
     }
 }
 
+/// Refuses a seed file group or other can read.
+///
+/// The seed is the responder's signing identity: anyone who can read it can speak as this daemon, so
+/// a readable-by-others mode is a configuration fault rather than a warning. Only the mode bits are
+/// reported — never the bytes — so the refusal can be shown without leaking the key.
+#[cfg(unix)]
+fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = std::fs::metadata(path)
+        .map_err(|error| {
+            DaemonError::Config(format!("identity.seed_file {}: {error}", path.display()))
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o044 != 0 {
+        return Err(DaemonError::Config(format!(
+            "identity.seed_file {}: mode {mode:04o} is readable by group or other; use 0600",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+// The daemon is Unix-only (a Unix socket is its whole transport), so no non-Unix fallback is owed.
+#[cfg(not(unix))]
+fn refuse_readable_seed(_path: &Path) -> Result<(), DaemonError> {
+    Ok(())
+}
+
 /// Decodes a value that must be exactly 64 hex digits.
 ///
 /// The messages name the failure and the observed length only: the same helper decodes the
@@ -197,9 +229,18 @@ mod tests {
     const PEER_KEY: &str = "0202020202020202020202020202020202020202020202020202020202020202";
 
     /// Writes a seed file into `dir` and answers the minimal config naming it.
+    /// A seed file no other user may read, as the contract requires of a real one.
+    fn write_seed(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write seed");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("make the seed owner-only");
+    }
+
     fn minimal(dir: &Path) -> String {
         let seed = dir.join("seed");
-        std::fs::write(&seed, SEED).expect("write seed");
+        write_seed(&seed, SEED);
         format!(
             r#"
 store_path = "{}"
@@ -302,7 +343,7 @@ principal = "principal-a"
     fn the_old_flat_keys_are_unknown() {
         let dir = tempfile::tempdir().expect("tempdir");
         let seed = dir.path().join("seed");
-        std::fs::write(&seed, SEED).expect("write seed");
+        write_seed(&seed, SEED);
         let text = format!(
             r#"
 store_path = "{}"
@@ -328,7 +369,7 @@ journal_dir = "{}"
     fn a_short_seed_names_the_key() {
         let dir = tempfile::tempdir().expect("tempdir");
         let text = minimal(dir.path());
-        std::fs::write(dir.path().join("seed"), &SEED[..62]).expect("short seed");
+        write_seed(&dir.path().join("seed"), &SEED[..62]);
         let error = load(&write(dir.path(), &text)).expect_err("short seed");
 
         let message = error.to_string();
@@ -342,6 +383,57 @@ journal_dir = "{}"
         );
     }
 
+    /// A seed any other user could read is the responder's identity handed out: refused before it is
+    /// decoded, with the mode named and never the bytes.
+    #[test]
+    fn a_world_readable_seed_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = dir.path().join("seed");
+        write_seed(&seed, SEED);
+        std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o644))
+            .expect("widen the seed");
+
+        match read_seed(&seed) {
+            Err(DaemonError::Config(message)) => {
+                assert!(message.contains("identity.seed_file"), "{message}");
+                assert!(message.contains("0644"), "the mode is named: {message}");
+                assert!(message.contains("readable by group or other"), "{message}");
+                assert!(
+                    !message.contains(&SEED[..8]),
+                    "the refusal must not carry the seed: {message}"
+                );
+            }
+            other => panic!("a world-readable seed is a config fault, not {other:?}"),
+        }
+
+        // Owner-only parses.
+        std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600))
+            .expect("narrow the seed");
+        assert_eq!(read_seed(&seed).expect("a 0600 seed parses"), {
+            let mut bytes = [0u8; 32];
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&SEED[index * 2..index * 2 + 2], 16).expect("hex");
+            }
+            bytes
+        });
+    }
+
+    /// Group-readable is refused too: the check is any bit in group or other, not only other.
+    #[test]
+    fn a_group_readable_seed_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = dir.path().join("seed");
+        write_seed(&seed, SEED);
+        std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o640))
+            .expect("widen the seed to group-readable");
+        let error = read_seed(&seed).expect_err("a group-readable seed is refused");
+        assert!(error.to_string().contains("0640"), "{error}");
+    }
+
     /// The seed is a private key, and `main` prints the error: the digits must never travel.
     #[test]
     fn the_seed_value_never_reaches_the_error() {
@@ -349,7 +441,7 @@ journal_dir = "{}"
         let text = minimal(dir.path());
         // A well-formed 64-digit seed plus one accidental trailing character.
         let secret = format!("{SEED}x");
-        std::fs::write(dir.path().join("seed"), &secret).expect("malformed seed");
+        write_seed(&dir.path().join("seed"), &secret);
         let error = load(&write(dir.path(), &text)).expect_err("malformed seed");
 
         let message = error.to_string();

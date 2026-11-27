@@ -50,22 +50,43 @@ use tokio::sync::{watch, Mutex};
 /// fails must still be able to close the session it opened; only inbound traffic waits.
 pub struct GatedTransport {
     inner: Arc<dyn Transport>,
-    /// Closed until [`GatedTransport::open`]. A `watch` rather than a one-shot, so a `recv` that
-    /// starts after the gate opened still sees `true`.
-    gate: watch::Sender<bool>,
+    /// Which of the three states the gate is in. A `watch` rather than a one-shot, so a `recv` that
+    /// starts after the gate resolved still sees the answer.
+    gate: watch::Sender<GateState>,
+}
+
+/// The gate's three answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateState {
+    /// The host has not said whether the session may start: a `recv` waits.
+    Closed,
+    /// Registration succeeded: inbound frames may be read.
+    Open,
+    /// Registration failed and the session is being closed: a `recv` reports `Closed` at once.
+    ///
+    /// This is a state, not an `open()`, because opening would release the read task into a
+    /// transport that never carries a frame: the host that refused the registration will not serve
+    /// the session, so the only honest answer is that it is over.
+    Rejected,
 }
 
 impl GatedTransport {
     /// Wraps `inner`, with the gate closed.
     #[must_use]
     pub fn new(inner: Arc<dyn Transport>) -> Self {
-        let (gate, _) = watch::channel(false);
+        let (gate, _) = watch::channel(GateState::Closed);
         Self { inner, gate }
     }
 
     /// Opens the gate: the next `recv` reads its frame, and every later one does so at once.
     pub fn open(&self) {
-        self.gate.send_replace(true);
+        self.gate.send_replace(GateState::Open);
+    }
+
+    /// Tells a waiting `recv` that the session is over, so its task can end rather than wait for a
+    /// frame this host will never serve.
+    pub fn reject(&self) {
+        self.gate.send_replace(GateState::Rejected);
     }
 
     /// The wrapped transport, for a caller that needs its own handle.
@@ -82,10 +103,17 @@ impl Transport for GatedTransport {
     }
 
     async fn recv(&self) -> Result<Vec<u8>, TransportError> {
-        // Waits only while closed; once opened the next poll returns at once.
         let mut gate = self.gate.subscribe();
-        if !*gate.borrow() {
-            let _ = gate.wait_for(|open| *open).await;
+        let mut state = *gate.borrow_and_update();
+        if state == GateState::Closed {
+            // Waits only while the host has not decided; the sender lives in `self`, so a closed
+            // channel means this transport is gone and the inner one answers for itself.
+            if let Ok(resolved) = gate.wait_for(|state| *state != GateState::Closed).await {
+                state = *resolved;
+            }
+        }
+        if state == GateState::Rejected {
+            return Err(TransportError::Closed);
         }
         self.inner.recv().await
     }
@@ -342,6 +370,8 @@ mod tests {
 
     use std::collections::HashMap;
     use std::time::Duration;
+
+    use spoke_connect::remote::loopback_transport_pair;
 
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
@@ -733,5 +763,59 @@ mod tests {
             "an opened gate lets the responder read"
         );
         responder.close();
+    }
+
+    /// A `recv` parked on the closed gate must end when the host rejects the session. This is the
+    /// leak the daemon closes on a registration failure: the responder's read task waits here, and
+    /// `close` cannot reach a task that never entered the inner transport — so a rejection must
+    /// resolve the gate, not leave it closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rejected_gate_ends_a_parked_recv() {
+        let pair = loopback_transport_pair();
+        let gated = Arc::new(GatedTransport::new(Arc::new(pair.server)));
+        let waiting = {
+            let gated = Arc::clone(&gated);
+            tokio::spawn(async move { gated.recv().await })
+        };
+        // Let the task reach the gate, so this is the parked case and not a race.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the recv is parked on the closed gate"
+        );
+
+        gated.reject();
+        let answered = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("a rejected gate must resolve a parked recv")
+            .expect("the recv task did not panic");
+        assert_eq!(
+            answered.err(),
+            Some(TransportError::Closed),
+            "the parked recv answers Closed, so its task can end"
+        );
+    }
+
+    /// Opening the gate is not a substitute: a parked recv then waits on the inner transport, which
+    /// a rejected host never writes to. Pinned so a later simplification cannot swap one for the
+    /// other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_the_gate_releases_the_recv_into_the_inner_transport() {
+        let pair = loopback_transport_pair();
+        let gated = Arc::new(GatedTransport::new(Arc::new(pair.server)));
+        let waiting = {
+            let gated = Arc::clone(&gated);
+            tokio::spawn(async move { gated.recv().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gated.open();
+        // The inner transport carries nothing, so the recv stays pending: it is no longer the gate
+        // that holds it, and that is exactly why a rejection is a distinct state.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an opened gate hands the recv to the inner transport, which has no frame"
+        );
+        waiting.abort();
     }
 }

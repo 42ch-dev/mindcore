@@ -252,6 +252,16 @@ async fn dial_claiming(stream: UnixStream, capabilities: &[&str]) -> Arc<RemoteA
     .expect("the signed session must establish")
 }
 
+/// The responder's seed file, owner-only: the daemon refuses a seed group or other can read.
+fn write_seed(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let seed = dir.join(SEED_FILE);
+    std::fs::write(&seed, hex(&RESPONDER_SEED)).expect("write the seed");
+    std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600))
+        .expect("make the seed owner-only");
+}
+
 fn scope_of(scope_id: &str) -> Scope {
     serde_json::from_value(json!({ "scope_id": scope_id })).expect("scope JSON matches the schema")
 }
@@ -279,7 +289,7 @@ fn lock_file(dir: &Path) -> PathBuf {
 async fn a_tool_invoked_right_after_the_handshake_is_served() {
     let dir = TempDir::new().expect("a scratch directory");
     seed(dir.path()).await;
-    std::fs::write(dir.path().join(SEED_FILE), hex(&RESPONDER_SEED)).expect("write the seed");
+    write_seed(dir.path());
     let socket = dir.path().join(SOCKET_FILE);
     let config = write(dir.path(), "daemon.toml", &config_text(dir.path(), &socket));
 
@@ -327,7 +337,7 @@ async fn the_daemon_binds_an_owner_only_socket() {
 
     let dir = TempDir::new().expect("a scratch directory");
     seed(dir.path()).await;
-    std::fs::write(dir.path().join(SEED_FILE), hex(&RESPONDER_SEED)).expect("write the seed");
+    write_seed(dir.path());
     let socket = dir.path().join(SOCKET_FILE);
     let config = write(dir.path(), "daemon.toml", &config_text(dir.path(), &socket));
 
@@ -349,7 +359,7 @@ async fn the_daemon_binds_an_owner_only_socket() {
 async fn a_signed_dialer_reads_a_stored_entry_over_the_socket() {
     let dir = TempDir::new().expect("a scratch directory");
     let mind = seed(dir.path()).await;
-    std::fs::write(dir.path().join(SEED_FILE), hex(&RESPONDER_SEED)).expect("write the seed");
+    write_seed(dir.path());
     let socket = dir.path().join(SOCKET_FILE);
     let config = write(dir.path(), "daemon.toml", &config_text(dir.path(), &socket));
 
@@ -376,7 +386,7 @@ async fn a_signed_dialer_reads_a_stored_entry_over_the_socket() {
 async fn a_second_instance_is_refused_and_sigterm_stops_the_first() {
     let dir = TempDir::new().expect("a scratch directory");
     let _mind = seed(dir.path()).await;
-    std::fs::write(dir.path().join(SEED_FILE), hex(&RESPONDER_SEED)).expect("write the seed");
+    write_seed(dir.path());
     let socket = dir.path().join(SOCKET_FILE);
     let config = write(dir.path(), "daemon.toml", &config_text(dir.path(), &socket));
 

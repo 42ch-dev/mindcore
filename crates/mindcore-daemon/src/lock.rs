@@ -63,11 +63,17 @@ fn create_if_absent(store: &Path) -> Result<(), DaemonError> {
     if store.exists() {
         return Ok(());
     }
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(store)
+    let mut open = OpenOptions::new();
+    open.create(true).write(true).truncate(false);
+    // Owner-only from the moment it exists: the store holds the session data, and the umask of
+    // whatever started the daemon is not the place to decide who may read it. An existing store
+    // keeps the mode it already has — this only runs on the file this call creates.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    open.open(store)
         .map_err(|error| DaemonError::Store(format!("{}: {error}", store.display())))?;
     Ok(())
 }
@@ -211,6 +217,39 @@ mod tests {
         let second = acquire(&store).expect("acquire after the guard dropped");
         drop(second);
         assert_eq!(std::fs::read(&store).expect("read"), BYTES);
+    }
+
+    /// The store this daemon creates is owner-only whatever the umask is: it holds the session data,
+    /// and who may read it is not the shell's decision. An existing store keeps its own mode.
+    #[test]
+    fn a_created_store_is_owner_only_and_an_existing_one_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("mind.db");
+        acquire(&store).expect("acquire a store that does not exist");
+        let mode = std::fs::metadata(&store)
+            .expect("stat the created store")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the created store is {mode:04o}, not owner-only"
+        );
+
+        // An existing store is left alone.
+        let existing = dir.path().join("existing.db");
+        std::fs::write(&existing, BYTES).expect("create the store");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640))
+            .expect("give it its own mode");
+        acquire(&existing).expect("acquire an existing store");
+        let kept = std::fs::metadata(&existing)
+            .expect("stat the existing store")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(kept, 0o640, "an existing store keeps {kept:04o}");
     }
 
     /// The lock is a separate file beside the store's canonical name, and the store's own bytes and
