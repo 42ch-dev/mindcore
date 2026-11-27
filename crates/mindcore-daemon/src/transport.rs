@@ -88,12 +88,6 @@ impl GatedTransport {
     pub fn reject(&self) {
         self.gate.send_replace(GateState::Rejected);
     }
-
-    /// The wrapped transport, for a caller that needs its own handle.
-    #[must_use]
-    pub fn inner(&self) -> &Arc<dyn Transport> {
-        &self.inner
-    }
 }
 
 #[async_trait]
