@@ -29,7 +29,7 @@ It is a guided path, not a complete API reference. The record model is in
 The shortest path is the documented example, run from a checkout of this repository:
 
 ```sh
-cargo run -p mindcore-runtime --example mind_facade
+cargo run --locked -p mindcore-runtime --example mind_facade
 ```
 
 It prints the recalled record and the derived `MindState`, and its source

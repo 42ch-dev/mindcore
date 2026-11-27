@@ -194,7 +194,7 @@ host that needs it embeds the adapter or the served surface directly.
 - `crates/mindcore-runtime/src/journal.rs` — `journal_dir`, the crate's one journal publisher.
 - `crates/mindcore-runtime/examples/mind_facade.rs` — the documented end-to-end example:
 
-  `cargo run -p mindcore-runtime --example mind_facade`.
+  `cargo run --locked -p mindcore-runtime --example mind_facade`.
 - Tests: `crates/mindcore-runtime/tests/mind.rs`.
 
 ## Change obligations
