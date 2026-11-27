@@ -360,12 +360,15 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
 
 /// Syncs the directory holding `level`'s entry, so that entry is durable.
 ///
-/// A level with no parent is the filesystem root: no directory holds its entry, so there is nothing
-/// to sync.
+/// Only `None` means the filesystem root, where no directory holds the entry and there is nothing to
+/// sync. `Some("")` is not that: it is what `Path::new("journal").parent()` answers, and it means the
+/// **current directory** — `Path::new("").parent()` is the `None` case — so a single-segment relative
+/// journal root syncs `"."` rather than skipping its own entry.
 fn sync_parent_of(level: &Path) -> Result<(), DaemonError> {
     match level.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => sync_parent(parent),
-        _ => Ok(()),
+        None => Ok(()),
+        Some(parent) if parent.as_os_str().is_empty() => sync_parent(Path::new(".")),
+        Some(parent) => sync_parent(parent),
     }
 }
 
@@ -407,7 +410,7 @@ fn record_injected_sync(path: &Path) {
     }
 }
 
-/// How many times `path` has been synced since the last [`clear_sync_attempts`].
+/// How many times `path` has been synced since the last [`clear_sync_attempts`] for it.
 #[cfg(test)]
 fn sync_attempts(path: &Path) -> usize {
     SYNC_ATTEMPTS
@@ -418,9 +421,14 @@ fn sync_attempts(path: &Path) -> usize {
         .map_or(0, |(_, count)| *count)
 }
 
+/// Forgets the attempts recorded for `path` only: the seam is one global, so a global wipe would
+/// race with another test's count.
 #[cfg(test)]
-fn clear_sync_attempts() {
-    SYNC_ATTEMPTS.lock().expect("sync attempt lock").clear();
+fn clear_sync_attempts(path: &Path) {
+    SYNC_ATTEMPTS
+        .lock()
+        .expect("sync attempt lock")
+        .retain(|(seen, _)| seen != path);
 }
 
 #[cfg(test)]
@@ -1184,6 +1192,52 @@ mod tests {
         }
     }
 
+    /// A single-segment relative journal root still syncs its own directory entry. `Path::new("journal")`
+    /// answers `Some("")`, which is the **current directory**, not the filesystem root — only `None` is
+    /// the root. Skipping the empty parent would leave `journal`'s own entry unproven.
+    #[test]
+    fn a_single_relative_segment_syncs_the_current_directory() {
+        let here = Path::new(".");
+        clear_sync_attempts(here);
+        sync_parent_of(Path::new("journal")).expect("sync the current directory");
+        assert_eq!(
+            sync_attempts(Path::new(".")),
+            1,
+            "a one-segment relative level syncs the current directory"
+        );
+
+        // A restart repeats it: the entry may still be unsynced from a start that failed here.
+        sync_parent_of(Path::new("journal")).expect("sync it again");
+        assert_eq!(
+            sync_attempts(Path::new(".")),
+            2,
+            "every start re-syncs the current directory"
+        );
+
+        // Two segments under an existing directory: the leaf's entry lives in `parent`, and
+        // `parent`'s own entry in the directory holding it. Derived from a real temp dir so the
+        // directories exist; a relative `parent/...` would need a process-wide chdir, which is
+        // unsafe while the harness runs tests in parallel.
+        let dir = TempDir::new().expect("temporary directory");
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).expect("create the ancestor");
+        clear_sync_attempts(&parent);
+        clear_sync_attempts(dir.path());
+        sync_parent_of(&parent.join("journal")).expect("sync the leaf's entry");
+        sync_parent_of(&parent).expect("sync the ancestor's entry");
+        assert_eq!(sync_attempts(&parent), 1, "the leaf's entry is in parent");
+        assert_eq!(
+            sync_attempts(dir.path()),
+            1,
+            "the ancestor's own entry is in its parent"
+        );
+
+        // The filesystem root has no entry in any directory: nothing to sync, and not an error.
+        clear_sync_attempts(here);
+        sync_parent_of(Path::new("/")).expect("the root needs no sync");
+        assert_eq!(sync_attempts(Path::new(".")), 0, "the root syncs nothing");
+    }
+
     /// The chain sync is idempotent across restarts, not first-creation-only. A start that created a
     /// level and then failed before syncing its entry leaves nothing marking which entry is unproven,
     /// so the next start must re-sync every component — including the ones it found already there.
@@ -1194,7 +1248,7 @@ mod tests {
         let parent = dir.path().to_path_buf();
 
         // First start: the leaf is created, then its parent's sync fails.
-        clear_sync_attempts();
+        clear_sync_attempts(&parent);
         push_injected_sync_failure(&parent);
         match journal_root(&root) {
             Err(DaemonError::Journal(message)) => {
@@ -1213,7 +1267,7 @@ mod tests {
         );
 
         // Second start, seam cleared: the level now exists, and its parent is synced again.
-        clear_sync_attempts();
+        clear_sync_attempts(&parent);
         journal_root(&root).expect("the retry accepts the directory");
         assert_eq!(
             sync_attempts(&parent),
