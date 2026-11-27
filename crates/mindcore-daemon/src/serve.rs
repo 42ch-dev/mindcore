@@ -13,8 +13,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::ErrorKind;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::FileTypeExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mindcore_base::knowledge::KnowledgeScope;
@@ -53,9 +53,6 @@ struct Host {
 ///
 /// The lock arrives held and is dropped last, after every live session has been told to close.
 pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonError> {
-    // Before anything is opened: a socket path naming a file the daemon owns would be unlinked by
-    // the stale-name recovery, so the config is refused while the store is still untouched.
-    refuse_owned_socket(&config)?;
     let store = MindStore::open(&config.store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", config.store_path.display())))?;
@@ -274,85 +271,62 @@ fn remove_socket(socket_path: &Path) -> Result<(), DaemonError> {
     }
 }
 
-/// Refuses a socket path naming a file the daemon owns.
+/// Binds `socket_path`, removing the name only when it is a socket established to be dead.
 ///
-/// The stale-name recovery unlinks whatever occupies `socket_path`, so a name that resolves to
-/// the store or to the responder's seed would destroy it. Both sides are compared by identity
-/// when they exist — `dev`/`ino`, so a symlink, a hard link or a `..` spelling cannot hide an
-/// alias — and by canonical parent plus file name when one side is absent.
-fn refuse_owned_socket(config: &DaemonConfig) -> Result<(), DaemonError> {
-    for (key, path) in [
-        ("store_path", &config.store_path),
-        ("identity.seed_file", &config.identity.seed_file),
-    ] {
-        if same_file(&config.socket_path, path) {
-            return Err(DaemonError::Config(format!(
-                "socket_path {} names the same file as {key} {}",
-                config.socket_path.display(),
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Whether `a` and `b` name one directory entry.
-fn same_file(a: &Path, b: &Path) -> bool {
-    if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
-        return a.dev() == b.dev() && a.ino() == b.ino();
-    }
-    match (resolved(a), resolved(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
-}
-
-/// `path` with its parent canonicalized and its own name kept, so two absent names still compare
-/// as the entries they would create.
-fn resolved(path: &Path) -> Option<PathBuf> {
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    Some(std::fs::canonicalize(parent).ok()?.join(path.file_name()?))
-}
-
-/// Binds `socket_path`, removing a leftover name only when it is established to be dead.
-///
-/// A name occupied by a live listener is a start failure. A socket whose probe is refused is a
-/// leftover from a crashed daemon and is removed; a socket the probe cannot reach — permission,
-/// resource, any other fault — is not established to be dead and is refused. A plain file there
-/// is a leftover too: it is not a listener, so no probe could reach one. The owned-file check runs
-/// again immediately before the removal, so an alias cannot slip between the two.
+/// Nothing that is not a socket is ever unlinked, so a name the daemon does not own — the store,
+/// the seed file, any other file, a directory, a symlink or a device — is refused rather than
+/// destroyed. That removes the check-then-unlink race instead of narrowing it: the only unlink on
+/// a start is a socket whose own probe was refused, so an alias can no longer be reached at all.
 fn listen(config: &DaemonConfig) -> Result<UnixListener, DaemonError> {
     let socket_path = &config.socket_path;
     let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", socket_path.display()));
-    let first = match UnixListener::bind(socket_path) {
-        Ok(listener) => return Ok(listener),
-        Err(error) => error,
-    };
+    let bind = || UnixListener::bind(socket_path).map_err(|error| fail(error.to_string()));
+
     let file_type = match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) => metadata.file_type(),
-        // The name went away between the two calls: the first bind's own message says why.
-        Err(error) if error.kind() == ErrorKind::NotFound => return Err(fail(first.to_string())),
+        // A free name is the ordinary start.
+        Err(error) if error.kind() == ErrorKind::NotFound => return bind(),
         Err(error) => return Err(fail(error.to_string())),
+        Ok(metadata) => metadata.file_type(),
     };
-    if file_type.is_socket() {
-        match std::os::unix::net::UnixStream::connect(socket_path) {
-            Ok(_) => return Err(fail("a live listener already owns the name".to_string())),
-            // The one answer that establishes the listener is gone.
-            Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
-            Err(error) => {
-                return Err(fail(format!(
-                    "the name could not be probed, so its liveness is unknown: {error}"
-                )))
-            }
+    if !file_type.is_socket() {
+        return Err(fail(format!(
+            "the name is occupied by {}, which this daemon does not remove; move it aside first",
+            file_type_name(&file_type)
+        )));
+    }
+    // A socket is the one kind this daemon may remove, and only when its own probe says no
+    // listener answers.
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => return Err(fail("a live listener already owns the name".to_string())),
+        Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
+        Err(error) => {
+            return Err(fail(format!(
+                "the name could not be probed, so its liveness is unknown: {error}"
+            )))
         }
     }
-    refuse_owned_socket(config)?;
     std::fs::remove_file(socket_path)
-        .map_err(|error| fail(format!("a stale name could not be removed: {error}")))?;
-    UnixListener::bind(socket_path).map_err(|error| fail(error.to_string()))
+        .map_err(|error| fail(format!("a stale socket could not be removed: {error}")))?;
+    bind()
+}
+
+/// The file type's name in a refusal, so the operator knows what occupies the path.
+fn file_type_name(file_type: &std::fs::FileType) -> &'static str {
+    if file_type.is_file() {
+        "a regular file"
+    } else if file_type.is_dir() {
+        "a directory"
+    } else if file_type.is_symlink() {
+        "a symbolic link"
+    } else if file_type.is_fifo() {
+        "a FIFO"
+    } else if file_type.is_char_device() {
+        "a character device"
+    } else if file_type.is_block_device() {
+        "a block device"
+    } else {
+        "an unsupported file type"
+    }
 }
 
 /// The host's peer-to-principal mapping: a peer with an entry answers its principal, any other
@@ -678,14 +652,71 @@ mod tests {
         }
     }
 
+    /// A regular file at the name is refused and survives: the daemon unlinks nothing it does not
+    /// own, so the withdrawn "replace a leftover file" rule can no longer destroy one.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_leftover_file_at_the_socket_path_is_replaced() {
+    async fn a_regular_file_at_the_socket_path_is_refused_and_survives() {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
-        std::fs::write(&config.socket_path, b"not a socket").expect("write the leftover");
-        let listener = listen(&config).expect("replace a leftover name");
+        let bytes = b"somebody else's file";
+        std::fs::write(&config.socket_path, bytes).expect("write the file");
+        match listen(&config) {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("regular file"), "{message}");
+                assert!(message.contains("does not remove"), "{message}");
+            }
+            Err(other) => panic!("a regular file is a socket refusal, not {other:?}"),
+            Ok(_) => panic!("a regular file must not be replaced"),
+        }
+        assert_eq!(
+            std::fs::read(&config.socket_path).expect("read the file"),
+            bytes,
+            "the file survives the refusal"
+        );
+    }
+
+    /// A stale socket — its listener is gone — is the one name the daemon replaces.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_socket_is_replaced() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        // A bound-then-dropped listener leaves its name behind, exactly like a crashed daemon.
+        drop(UnixListener::bind(&config.socket_path).expect("leave a stale socket"));
+        assert!(config.socket_path.exists(), "the stale name is there");
+        let listener = listen(&config).expect("replace a stale socket");
         assert!(config.socket_path.exists(), "the replacement name is bound");
         drop(listener);
+    }
+
+    /// A symlink to a live listener is refused before any probe, and the listener keeps serving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlink_to_a_live_listener_is_refused_and_the_listener_serves() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        let real = dir.path().join("real.sock");
+        let live = UnixListener::bind(&real).expect("bind the live listener");
+        let alias = dir.path().join("alias.sock");
+        std::os::unix::fs::symlink(&real, &alias).expect("link to the listener");
+        let aliased = DaemonConfig {
+            socket_path: alias.clone(),
+            ..config.clone()
+        };
+        match listen(&aliased) {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("symbolic link"), "{message}")
+            }
+            Err(other) => panic!("a symlink is a socket refusal, not {other:?}"),
+            Ok(_) => panic!("a symlink is never bound or removed"),
+        }
+        assert!(alias.exists(), "the symlink survives");
+        assert!(real.exists(), "the listener's name survives");
+        // The listener still answers, so nothing replaced its name.
+        drop(
+            UnixStream::connect(&real)
+                .await
+                .expect("the listener serves"),
+        );
+        drop(live);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -730,53 +761,65 @@ mod tests {
         assert!(root.is_dir());
     }
 
-    /// F-001: a socket path naming the store is refused while the store is still untouched. The
-    /// file is not a database on purpose — the refusal must happen before anything opens it.
+    /// F-001 end to end: a socket path naming the store is refused, because the store is a regular
+    /// file and the daemon unlinks nothing that is not a dead socket. The bytes survive.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_socket_path_naming_the_store_is_refused_and_the_store_survives() {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
-        let bytes = b"the daemon's own bytes, not a database";
-        std::fs::write(&config.store_path, bytes).expect("write the store");
+        // A real database, opened and closed, so the refusal protects genuine bytes.
+        MindStore::open(&config.store_path)
+            .await
+            .expect("create the store")
+            .close()
+            .await;
+        let bytes = std::fs::read(&config.store_path).expect("read the store");
+        assert!(!bytes.is_empty(), "the store has content to protect");
         let collided = DaemonConfig {
             socket_path: config.store_path.clone(),
             ..config.clone()
         };
         let lock = StoreLock::acquire(&collided.store_path).expect("take the lock");
         match run(collided, lock).await {
-            Err(DaemonError::Config(message)) => {
-                assert!(message.contains("socket_path"), "{message}");
-                assert!(message.contains("store_path"), "{message}");
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("regular file"), "{message}")
             }
-            Err(other) => panic!("a colliding socket path is a config refusal, not {other:?}"),
+            Err(other) => panic!("a colliding socket path is a socket refusal, not {other:?}"),
             Ok(()) => panic!("a socket path naming the store must not serve"),
         }
         assert_eq!(
-            std::fs::read(&config.store_path).expect("read the store"),
+            std::fs::read(&config.store_path).expect("read the store again"),
             bytes,
             "the store survives the refusal"
         );
     }
 
-    /// F-001's alias case: a symlink to the store is the store, so recovery must refuse it too.
-    #[test]
-    fn a_symlink_to_the_store_is_not_a_socket_path() {
+    /// The alias form of the same case: a symlink to the store is refused as a symlink, and the
+    /// store keeps its bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlink_to_the_store_is_refused_and_the_store_survives() {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
-        std::fs::write(&config.store_path, b"store").expect("write the store");
+        let bytes = b"the store's bytes";
+        std::fs::write(&config.store_path, bytes).expect("write the store");
         let alias = dir.path().join("alias.sock");
         std::os::unix::fs::symlink(&config.store_path, &alias).expect("link to the store");
         let collided = DaemonConfig {
             socket_path: alias.clone(),
             ..config.clone()
         };
-        assert!(same_file(&alias, &config.store_path), "the alias resolves");
-        match refuse_owned_socket(&collided) {
-            Err(DaemonError::Config(message)) => {
-                assert!(message.contains("store_path"), "{message}")
+        match listen(&collided) {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("symbolic link"), "{message}")
             }
-            other => panic!("a socket path naming the store is refused, not {other:?}"),
+            other => panic!("a symlink is a socket refusal, not {other:?}"),
         }
+        assert!(alias.exists(), "the symlink survives");
+        assert_eq!(
+            std::fs::read(&config.store_path).expect("read the store"),
+            bytes,
+            "the store survives"
+        );
     }
 
     /// F-003: a probe that cannot establish the listener is dead removes nothing. Only a refused
