@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::ErrorKind;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -45,8 +45,27 @@ struct Host {
     allowlist: Vec<String>,
     peer_keys: HashMap<String, [u8; 32]>,
     invoke_timeout_ms: Option<u64>,
+    /// The socket this daemon bound, so a removal can prove it is removing its own name.
+    socket: SocketIdentity,
     /// The live responders the drain walks; a connection removes its own entry when it ends.
     live: Mutex<Vec<(usize, Arc<ConnectResponder>)>>,
+}
+
+/// The device and inode of the socket name this daemon created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketIdentity {
+    /// The identity of whatever occupies `path`, following no symlink.
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
 }
 
 /// Runs the serving phase of the lifecycle order: store, journal, surface, listen, accept, drain.
@@ -81,8 +100,8 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
     // serve until it was killed some other way and leave the name for no reason.
     let mut terminate = shutdown_signal(SignalKind::terminate())?;
     let mut interrupt = shutdown_signal(SignalKind::interrupt())?;
-    let host = Arc::new(host(surface, &config)?);
-    let listener = listen(&config)?;
+    let (listener, socket) = listen(&config)?;
+    let host = Arc::new(host(surface, &config, socket)?);
 
     // Every accepted connection is owned by `connections`, so the drain can end each one rather
     // than hope it finished setting up. Dropping the accept future drops the listener with it.
@@ -105,7 +124,8 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
     drain_sessions(&live);
     connections.shutdown().await;
     drain_sessions(&std::mem::take(&mut *host.live.lock().expect("live lock")));
-    let removed = remove_socket(&config.socket_path);
+    // Only the socket this daemon bound is removed; a name since replaced is refused and stays.
+    let removed = remove_own_socket(&config.socket_path, host.socket);
     // Step 4: the store's connections finish rather than being cut when the runtime drops. Inline
     // so the pool's type stays the surface's business, not this module's.
     pool.close().await;
@@ -114,8 +134,13 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
 }
 
 /// The daemon's own wiring for one assembled surface.
-fn host(surface: Arc<MindcoreSurface>, config: &DaemonConfig) -> Result<Host, DaemonError> {
+fn host(
+    surface: Arc<MindcoreSurface>,
+    config: &DaemonConfig,
+    socket: SocketIdentity,
+) -> Result<Host, DaemonError> {
     Ok(Host {
+        socket,
         surface,
         seed: crate::config::read_seed(&config.identity.seed_file)?,
         allowlist: config.peers.keys().cloned().collect(),
@@ -255,39 +280,65 @@ fn drain_sessions(live: &[(usize, Arc<ConnectResponder>)]) {
     }
 }
 
-/// Removes the socket name — the signal that the daemon has stopped serving.
+/// Removes the socket name — the signal that the daemon has stopped serving — but only while the
+/// name is still the socket this daemon bound.
 ///
-/// It is given only after every session has been told to close, and its failure is reported: a
-/// daemon that leaves the name behind while exiting 0 claims a clean stop it did not reach. An
-/// absent name is the intended end state, not a failure.
-fn remove_socket(socket_path: &Path) -> Result<(), DaemonError> {
-    match std::fs::remove_file(socket_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(DaemonError::Socket(format!(
-            "{}: the socket name could not be removed: {error}",
-            socket_path.display()
-        ))),
-    }
+/// The drain gives the name only after every session has been told to close, and reports its
+/// failure: a daemon that leaves the name behind while exiting 0 claims a clean stop it did not
+/// reach. An absent name is the intended end state. A name replaced since the bind belongs to
+/// whoever replaced it, and is refused rather than removed.
+///
+// shortcut: POSIX cannot unlink by inode, so a process running as the same user can replace the
+// name between the identity check and `remove_file`. The daemon is not designed to resist a local
+// same-user attacker — upgrade if that changes.
+fn remove_own_socket(socket_path: &Path, owned: SocketIdentity) -> Result<(), DaemonError> {
+    remove_if_own(socket_path, owned)
+        .map_err(|fault| DaemonError::Socket(format!("{}: {fault}", socket_path.display())))
 }
 
-/// Binds `socket_path`, removing the name only when it is a socket established to be dead.
+/// The conditional unlink both callers share: `NotFound` is the intended end state, and a name
+/// that is no longer the socket `owned` names — a different file type, or a different device and
+/// inode — is refused with nothing removed.
+fn remove_if_own(socket_path: &Path, owned: SocketIdentity) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("the socket name could not be inspected: {error}")),
+        Ok(metadata) => metadata,
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(format!(
+            "the name is no longer this daemon's socket: it became {}",
+            file_type_name(&metadata.file_type())
+        ));
+    }
+    if SocketIdentity::of(&metadata) != owned {
+        return Err(
+            "the name is no longer this daemon's socket: it was replaced by another socket"
+                .to_string(),
+        );
+    }
+    std::fs::remove_file(socket_path)
+        .map_err(|error| format!("the socket name could not be removed: {error}"))
+}
+
+/// Binds `socket_path`, removing the name only when it is a socket established to be dead, and
+/// answers the bound socket's identity.
 ///
 /// Nothing that is not a socket is ever unlinked, so a name the daemon does not own — the store,
 /// the seed file, any other file, a directory, a symlink or a device — is refused rather than
-/// destroyed. That removes the check-then-unlink race instead of narrowing it: the only unlink on
-/// a start is a socket whose own probe was refused, so an alias can no longer be reached at all.
-fn listen(config: &DaemonConfig) -> Result<UnixListener, DaemonError> {
+/// destroyed. The one removal on a start re-checks the identity it just took, so a socket swapped
+/// in between the probe and the unlink survives.
+fn listen(config: &DaemonConfig) -> Result<(UnixListener, SocketIdentity), DaemonError> {
     let socket_path = &config.socket_path;
     let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", socket_path.display()));
-    let bind = || UnixListener::bind(socket_path).map_err(|error| fail(error.to_string()));
 
-    let file_type = match std::fs::symlink_metadata(socket_path) {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
         // A free name is the ordinary start.
-        Err(error) if error.kind() == ErrorKind::NotFound => return bind(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return bind(socket_path),
         Err(error) => return Err(fail(error.to_string())),
-        Ok(metadata) => metadata.file_type(),
+        Ok(metadata) => metadata,
     };
+    let file_type = metadata.file_type();
     if !file_type.is_socket() {
         return Err(fail(format!(
             "the name is occupied by {}, which this daemon does not remove; move it aside first",
@@ -296,6 +347,7 @@ fn listen(config: &DaemonConfig) -> Result<UnixListener, DaemonError> {
     }
     // A socket is the one kind this daemon may remove, and only when its own probe says no
     // listener answers.
+    let stale = SocketIdentity::of(&metadata);
     match std::os::unix::net::UnixStream::connect(socket_path) {
         Ok(_) => return Err(fail("a live listener already owns the name".to_string())),
         Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
@@ -305,9 +357,21 @@ fn listen(config: &DaemonConfig) -> Result<UnixListener, DaemonError> {
             )))
         }
     }
-    std::fs::remove_file(socket_path)
-        .map_err(|error| fail(format!("a stale socket could not be removed: {error}")))?;
-    bind()
+    // Bound to the identity taken before the probe: a socket swapped in since is refused and
+    // stays, because it is not the one this start established to be dead.
+    remove_if_own(socket_path, stale).map_err(fail)?;
+    bind(socket_path)
+}
+
+/// Binds `socket_path`, answering the listener and the identity of the name it created.
+fn bind(socket_path: &Path) -> Result<(UnixListener, SocketIdentity), DaemonError> {
+    let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", socket_path.display()));
+    let listener = UnixListener::bind(socket_path).map_err(|error| fail(error.to_string()))?;
+    // Taken after the bind, so it names the socket this process created.
+    let socket = std::fs::symlink_metadata(socket_path)
+        .map(|metadata| SocketIdentity::of(&metadata))
+        .map_err(|error| fail(format!("the bound socket could not be inspected: {error}")))?;
+    Ok((listener, socket))
 }
 
 /// The file type's name in a refusal, so the operator knows what occupies the path.
@@ -683,7 +747,12 @@ mod tests {
         // A bound-then-dropped listener leaves its name behind, exactly like a crashed daemon.
         drop(UnixListener::bind(&config.socket_path).expect("leave a stale socket"));
         assert!(config.socket_path.exists(), "the stale name is there");
-        let listener = listen(&config).expect("replace a stale socket");
+        let (listener, bound) = listen(&config).expect("replace a stale socket");
+        assert_eq!(
+            bound,
+            SocketIdentity::of(&std::fs::symlink_metadata(&config.socket_path).expect("lstat")),
+            "the boundary identity names the socket just bound"
+        );
         assert!(config.socket_path.exists(), "the replacement name is bound");
         drop(listener);
     }
@@ -856,22 +925,83 @@ mod tests {
         drop(live);
     }
 
-    /// F-004: a name that cannot be removed is a start-phase failure, not a clean exit. A
-    /// directory stands in for a name the filesystem refuses to unlink.
+    /// A name that cannot be removed is a start-phase failure, not a clean exit. A directory
+    /// stands in for a name the filesystem refuses to unlink.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_socket_name_that_cannot_be_removed_is_reported() {
         let dir = TempDir::new().expect("temporary directory");
         let path = dir.path().join("daemon.sock");
         std::fs::create_dir(&path).expect("create a name that is not a socket");
-        match remove_socket(&path) {
+        // No identity is recorded for a name this daemon never bound, so a directory there is a
+        // type refusal before any unlink is attempted.
+        let foreign = SocketIdentity { dev: 0, ino: 0 };
+        match remove_own_socket(&path, foreign) {
             Err(DaemonError::Socket(message)) => {
-                assert!(message.contains("could not be removed"), "{message}")
+                assert!(
+                    message.contains("no longer this daemon's socket"),
+                    "{message}"
+                )
             }
             other => panic!("an unremovable name is a socket failure, not {other:?}"),
         }
+        assert!(path.is_dir(), "the directory survives");
         // An absent name is the intended end state.
         std::fs::remove_dir(&path).expect("clear the directory");
-        remove_socket(&path).expect("an absent name is already removed");
+        remove_own_socket(&path, foreign).expect("an absent name is already removed");
+    }
+
+    /// A name replaced by a regular file after the bind belongs to whoever replaced it. The drain
+    /// refuses to remove it and reports the refusal, so a clean-exit claim is never made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_drain_refuses_a_socket_name_replaced_by_a_regular_file() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        let (listener, bound) = listen(&config).expect("bind the socket");
+        // The listener still owns the socket; swap the name anyway, as a same-user process could.
+        std::fs::remove_file(&config.socket_path).expect("unlink the socket");
+        let bytes = b"the replacement's own bytes";
+        std::fs::write(&config.socket_path, bytes).expect("write the replacement");
+        match remove_own_socket(&config.socket_path, bound) {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("became a regular file"), "{message}")
+            }
+            other => panic!("a replaced name is refused, not {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&config.socket_path).expect("read the replacement"),
+            bytes,
+            "the replacement survives the drain"
+        );
+        drop(listener);
+    }
+
+    /// Stale recovery binds its removal to the identity it probed: a socket swapped in between the
+    /// probe and the unlink is a different socket, so it is refused and survives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_recovery_refuses_a_socket_swapped_before_removal() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        let stale = UnixListener::bind(&config.socket_path).expect("leave a stale socket");
+        let probed = SocketIdentity::of(
+            &std::fs::symlink_metadata(&config.socket_path).expect("lstat the stale socket"),
+        );
+        drop(stale);
+        // A dropped listener leaves its name; the swap is exactly that name taken over.
+        std::fs::remove_file(&config.socket_path).expect("clear the stale name");
+        let replacement = UnixListener::bind(&config.socket_path).expect("swap in another socket");
+        let swapped = SocketIdentity::of(
+            &std::fs::symlink_metadata(&config.socket_path).expect("lstat the replacement"),
+        );
+        assert_ne!(probed, swapped, "the replacement is a different inode");
+        match remove_if_own(&config.socket_path, probed) {
+            Err(message) => assert!(message.contains("replaced by another socket"), "{message}"),
+            Ok(()) => panic!("a swapped socket must not be removed"),
+        }
+        assert!(
+            config.socket_path.exists(),
+            "the swapped-in socket survives the refused removal"
+        );
+        drop(replacement);
     }
 
     /// F-002: a connection accepted and parked before its registration is owned by the drain. Its
@@ -891,8 +1021,10 @@ mod tests {
                 .await,
             "assemble the surface the connection serves",
         );
-        let host = Arc::new(host(Arc::new(surface), &config).expect("build the host"));
         let listener = UnixListener::bind(&config.socket_path).expect("bind the listener");
+        let socket =
+            SocketIdentity::of(&std::fs::symlink_metadata(&config.socket_path).expect("lstat"));
+        let host = Arc::new(host(Arc::new(surface), &config, socket).expect("build the host"));
 
         let (parked, mut park_signal) = tokio::sync::mpsc::unbounded_channel();
         let (resume, parked_resume) = tokio::sync::mpsc::unbounded_channel();
