@@ -53,6 +53,13 @@ struct Host {
     socket: SocketIdentity,
     /// The live responders the drain walks; a connection removes its own entry when it ends.
     live: Mutex<Vec<(usize, Arc<ConnectResponder>)>>,
+    /// Test seam: makes `Surface::register` answer `Reject` for this host only.
+    ///
+    /// A refused registration is not constructible through the public API — `derive_manifest`
+    /// validates every descriptor before assembly — so the rejection branch is reachable only
+    /// through this field, and keying it to one `Host` keeps it out of every other test.
+    #[cfg(test)]
+    reject_registration: bool,
 }
 
 /// The mode every socket this daemon binds carries: owner read/write, nobody else.
@@ -259,6 +266,22 @@ pub async fn run(
     serving.and(removed)
 }
 
+/// Installs the surface's handlers, or answers why not.
+///
+/// One call so the start's ordering has a single site: the connection task passes this result to the
+/// rejection branch, which must run before the responder is closed.
+fn registration(host: &Host, responder: &Arc<ConnectResponder>) -> SpokeResult<()> {
+    #[cfg(test)]
+    if host.reject_registration {
+        return spoke_reject(
+            SpokeRejectCode::InternalError,
+            "injected registration failure",
+            None,
+        );
+    }
+    host.surface.register(responder)
+}
+
 /// Both shutdown signal streams, installed before the socket exists.
 ///
 /// A signal the process cannot listen for is its own start failure: without it no signal could reach
@@ -293,6 +316,8 @@ async fn prepare(
         peer_keys,
         invoke_timeout_ms: config.invoke.timeout_ms,
         live: Mutex::new(Vec::new()),
+        #[cfg(test)]
+        reject_registration: false,
     });
     Ok(host)
 }
@@ -476,8 +501,14 @@ async fn accept(
                 // The set owns the task: dropping it aborts the task, and `run`'s drain joins.
                 connections.spawn(async move { serve_connection(stream, id, host).await });
             }
-            // Finished sessions are reaped here, so a long-lived daemon does not accumulate them.
-            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            // Finished sessions are reaped here, so a long-lived daemon does not accumulate them. A
+            // task that panicked is reported rather than silently dropped: its connection died
+            // without the daemon saying so.
+            Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = joined {
+                    eprintln!("mindcore-daemon: connection task failed: {error}");
+                }
+            }
         }
     }
 }
@@ -513,11 +544,16 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
     // A dialer may invoke an advertised tool as soon as its session is established, and the
     // responder never installs handlers from the manifest. `register` is synchronous, so no lock
     // of this module's is held across an `await`.
-    if let SpokeResult::Reject(reject) = host.surface.register(&responder) {
+    if let SpokeResult::Reject(reject) = registration(&host, &responder) {
         eprintln!(
             "mindcore-daemon: surface: {}: {}",
             reject.code, reject.message
         );
+        // Before `close`, and as a rejection rather than an opening: the responder's read task is
+        // parked on the gate, and `close` cannot reach it there. Opening would release it into a
+        // transport this host will never serve a frame through; rejecting tells it the session is
+        // over, so the task ends instead of waiting.
+        gated.reject();
         responder.close();
         host.live
             .lock()
@@ -806,6 +842,9 @@ mod tests {
     fn config(dir: &Path) -> DaemonConfig {
         let seed = dir.join("seed");
         std::fs::write(&seed, SEED).expect("write seed");
+        // The contract requires an owner-only seed, so the fixture gives one.
+        std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600))
+            .expect("make the seed owner-only");
         DaemonConfig {
             store_path: dir.join("store.db"),
             socket_path: dir.join("daemon.sock"),
@@ -1746,6 +1785,58 @@ mod tests {
         drop(live);
     }
 
+    /// A registration the responder refuses must end the connection task, not park it forever. The
+    /// responder's read task waits on the gate, which `close` cannot reach; without the rejection
+    /// state the task would sit there until the process died.
+    ///
+    /// The production path runs: `serve_connection` itself, over a real socket pair, with a seam that
+    /// makes its `register` answer `Reject`. A refused registration is not otherwise constructible —
+    /// `derive_manifest` validates every descriptor before assembly, and `register_tool_handler`
+    /// refuses a non-`tools.` id — so the seam is the only way to reach this branch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_register_rejection_ends_the_connection_task() {
+        let Fixture {
+            _dir,
+            config,
+            store,
+        } = Fixture::open().await;
+        let surface = expect_ok(
+            MindcoreServe::new(store, false, |_| Ok(()))
+                .surface(faces(&config))
+                .await,
+            "assemble the surface the connection serves",
+        );
+        let (client, server) = UnixStream::pair().expect("a socket pair");
+        let host = Arc::new(Host {
+            socket: SocketIdentity { dev: 0, ino: 0 },
+            surface: Arc::new(surface),
+            seed: crate::config::read_seed(&config.identity.seed_file).expect("read the seed"),
+            allowlist: Vec::new(),
+            peer_keys: HashMap::new(),
+            invoke_timeout_ms: Some(1_000),
+            live: Mutex::new(Vec::new()),
+            reject_registration: true,
+        });
+
+        let task = tokio::spawn({
+            let host = Arc::clone(&host);
+            async move { serve_connection(server, 0, host).await }
+        });
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        assert!(
+            ended.is_ok(),
+            "the connection task must end on a register rejection, not park on the gate"
+        );
+        ended
+            .expect("the task finished")
+            .expect("the connection task did not panic");
+        assert!(
+            host.live.lock().expect("live lock").is_empty(),
+            "the rejected session is untracked"
+        );
+        drop(client);
+    }
+
     /// F-002: a connection accepted and parked before its registration is owned by the drain. Its
     /// responder is tracked from the moment it exists, so the drain closes it; the task itself is
     /// then cancelled, so nothing inserts after the snapshot and no session survives the name.
@@ -1775,6 +1866,8 @@ mod tests {
             peer_keys: peer_keys(&config).expect("decode the peer keys"),
             invoke_timeout_ms: config.invoke.timeout_ms,
             live: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            reject_registration: false,
         });
 
         let (parked, mut park_signal) = tokio::sync::mpsc::unbounded_channel();
