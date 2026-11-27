@@ -239,7 +239,7 @@ fn classify(
     // the served ceiling has no conformant copy or refusal to report: refuse as a store fault
     // rather than interpolate it.
     if adopted.is_some_and(|adopted| adopted > SERVED_REVISION_BOUND) {
-        return SpokeResult::Reject(adoption_fault("store"));
+        return SpokeResult::Reject(adoption_fault());
     }
     match adopted {
         Some(adopted) if expected_source_revision == adopted => {
@@ -671,7 +671,7 @@ mod tests {
             .await
             {
                 SpokeResult::Reject(reject) => {
-                    assert_eq!(reject, adoption_fault("store"));
+                    assert_eq!(reject, adoption_fault());
                     assert!(
                         !reject.message.contains(&out_of_range.to_string()),
                         "the out-of-range revision is never interpolated: {reject:?}"

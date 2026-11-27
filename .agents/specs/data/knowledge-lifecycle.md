@@ -58,14 +58,9 @@ An unassigned revision, revision 0, a value above the representable range, a rev
 
 ### Adoption
 
-`mindcore_spi::adopt_knowledge_entry(src, dst, source_scope_id, source_entry_id,
-destination_entry_id, expected_source_revision)` copies a shared entry into the destination
-collection through the caller's two scoped ports. It is the local half of the served `knowledge.adopt`
-operation; the retirement-chain resolution that precedes it belongs to the served face, so the
-source this function sees is already the terminal. The served defaults, refusal vocabulary, terminal
-resolution, destination selection and dedup are
-[`serving-seam.md`](../architecture/serving-seam.md)'s; everything below is this helper's own
-behavior over the two ports it is given.
+**The served adoption grant rule.** `knowledge.adopt` is a put and a get together — it writes a copy into the admitted Mind's collection and returns it — so it needs one live grant of the caller in that Mind's space covering both `knowledge_write` and `knowledge_read`, on one row, never two grants that split the pair. The check is the first thing the face's `BEGIN IMMEDIATE` transaction does, ahead of every read, and it delegates to the knowledge face's `authorize_knowledge`; its refusal is therefore that face's fixed `NOT_AUTHORIZED` with no `details`, byte for byte the answer a put gets, and no copy is written. The source it copies from is the host's configured collection; the destination and the grant are the admitted Mind's, so adoption grants no access the knowledge face does not.
+
+**Retirement, copy and disclosure in the served operation** are the helper's rules below, applied inside that same transaction. `mindcore_spi::adopt_knowledge_entry(src, dst, source_scope_id, source_entry_id, destination_entry_id, expected_source_revision)` copies a shared entry into the destination collection through the caller's two scoped ports. It is the local half of the served `knowledge.adopt` operation; the retirement-chain resolution that precedes it belongs to the served face, so the source this function sees is already the terminal. The served defaults, refusal vocabulary, terminal resolution, destination selection and dedup are [`serving-seam.md`](../architecture/serving-seam.md)'s; everything below is this helper's own behavior over the two ports it is given.
 
 - The destination is addressed by `destination_entry_id`, never by the source id: the caller
   resolves it — the served runtime defaults it to the resolved terminal's id, and a supplied value
@@ -188,6 +183,7 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 - Pruning shares that discipline: one `BEGIN IMMEDIATE` reservation covers the entry read, the window computation, the deletes and the floor update. It writes only `history_floor_revision` on the entry row — never the revision — so the capture trigger saves no checkpoint of the prune itself. A retired entry's history is never deleted, and no cognition record or live payload is touched.
 - The disclosure predicate is unchanged: a hidden entry, or a retired one read through the ordinary reads and lists, is one generic local absence. The explicit lifecycle read and revision replay still see a retired entry (§ Retirement). The served face's read and prune denials are `.agents/specs/architecture/serving-seam.md`'s.
 - The current-row read, the header read, the default list and the scoped put keep their statement counts; the filter is an added predicate.
+- The served adoption guard is inside the one transaction: `AdoptionService` checks one live grant covering `knowledge_write` and `knowledge_read` ahead of every read, so a caller without it reads no source row and writes no copy, and the grant and the copy share one snapshot. A source that collides with a Mind registered after assembly is refused by the call's own re-check against the whole registry, after that grant check and before any source read.
 - A retired row and its history are never deleted; no committed cognition record is rewritten.
 - The CAS compares the stored revision **column** against the caller's expectation; the marking path additionally refuses a column/payload disagreement before writing, while the full put decodes the stored payload for the anchor gate but never compares that payload's revision with the revision column, so it cannot detect that drift.
 
@@ -196,10 +192,11 @@ Only one writer can hold the reservation, and an acquisition that cannot obtain 
 - History table, trigger, retirement column: `crates/mindcore-sqlite/migrations/0001_init.sql`.
 - Write path, replay, explicit prune, retirement write, resolution, current-record predicate: `crates/mindcore-sqlite/src/knowledge.rs`, `cognition.rs`.
 - Adoption and the anchor codec: `crates/mindcore-spi/src/adoption.rs`, `crates/mindcore-base/src/knowledge.rs`.
-- The served half — scope comparison, retirement-chain resolution, the one transaction and the
-  refusal hygiene — lived in the removed `crates/mindcore-runtime/src/adoption.rs`; its wire
-  contract is `.agents/specs/architecture/serving-seam.md`, which states what a restored face must
-  re-implement.
+- The served half — scope comparison, the source's per-call collision re-check, retirement-chain
+  resolution, the one transaction and the refusal hygiene: `crates/mindcore-runtime/src/adoption.rs`
+  (`AdoptionService`, `AdoptionRoute`); its face wiring is `MindcoreServe::served_adoption` in
+  `crates/mindcore-runtime/src/lib.rs`, and its wire contract is
+  `.agents/specs/architecture/serving-seam.md`.
 - End-to-end evidence: `crates/mindcore-sqlite/tests/knowledge_lifecycle.rs`.
 - Served write guard and caller binding: `crates/mindcore-spoke/src/served_knowledge.rs`
   (`MindKnowledgePort`, `authorize_knowledge`) and `crates/mindcore-sqlite/src/knowledge.rs`

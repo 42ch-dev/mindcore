@@ -2,7 +2,7 @@
 
 ## Scope
 
-Signed Rust SPOKE sessions over a host-supplied transport: the Memory face, the four Mind tools, the composed per-Mind Knowledge and History faces, and the adoption face contract a restored per-Mind composition must satisfy. The library does not own a listener, accept loop, identity provisioning, publisher, or model provider.
+Signed Rust SPOKE sessions over a host-supplied transport: the Memory face, the four Mind tools, and the composed per-Mind Knowledge, History and adoption faces. The library does not own a listener, accept loop, identity provisioning, publisher, or model provider.
 
 ## Current state
 
@@ -190,7 +190,7 @@ Connect owns the signed `{ "arguments": {…} }` request and `{ "result": … }`
 | `tools.mindcore.absorb` | `request` (`MemoryCaptureRequest`) | Array of `{status, candidate_id}` with `status` = `pending`, `dropped`, or `settled` (adds `record_ids`) |
 | `tools.mindcore.deliberate` | `space_id`, `subject_id`, `target`, `evidence` (`[{id, text}]`), positive integer `timeout_ms` | `{status, verdict, judgment}` with `status` = `no_change`, `needs_review` (adds `draft`), or `settled` (adds `record`, `mind_state_version`) |
 | `tools.mindcore.read_cognition` | `space_id` | `{carrier_revision, records, mind_state}`; a Mind that has judged nothing answers `records: []` and a null `mind_state` |
-| `knowledge.adopt` (capability `spoke-knowledge-adoption`, which requires `spoke-knowledge`; not composed) | `source_scope_id`, `source_entry_id`, positive integer `source_revision`, `destination_scope_id`, optional `destination_entry_id`, `idempotency_key`, optional `extensions` | `{outcome, entry}` with `outcome` = `adopted` or `already_present`; `entry` is the stored copy either way |
+| `knowledge.adopt` (capability `spoke-knowledge-adoption`, which requires `spoke-knowledge`; composed when `ServeFaces.adoption` is configured) | `source_scope_id`, `source_entry_id`, positive integer `source_revision`, `destination_scope_id`, optional `destination_entry_id`, `idempotency_key`, optional `extensions` | `{outcome, entry}` with `outcome` = `adopted` or `already_present`; `entry` is the stored copy either way |
 
 `deliberate` takes no `holder`: the Mind's registry row names the carrier, and a peer that still
 sends the retired member is refused `InvalidInput` by the closed object. Every served argument
@@ -223,32 +223,72 @@ rather than kept as a second authority: assembly drops its reserved `tools.mindc
 host registration in both adoption configurations (`crates/mindcore-runtime/src/lib.rs:165`), so no
 manifest carries it and no handler answers it even when a host registers the id.
 
-Stage 1 composes no adoption face: `ServeFaces` has no adoption setting, `face_capabilities` names
-neither `spoke-knowledge-adoption` nor its `spoke-knowledge` co-capability, and a `knowledge.adopt`
-call is refused on the responder's dispatch-deny branch — raw wire `capability_missing`, surfaced by
-the Rust dialer as `CapabilityPortMissing` with `details.wire_code`. The paragraphs below state the
-contract a restored face must satisfy. A restored face is composed per Mind and bound to one: its destination is that Mind's
-registered collection, resolved through the registry row after admission, and there is no
-surface-wide destination setting to consume. The source stays host configuration — one collection,
-named on the wire by a `scope_id` and fixed by the host — and it is the only host-configured side of
-the call. A copy is therefore readable back through the admitting Mind's own
-knowledge face whenever the peer's admitted selection admits it. The Stage 2 handoff at the end of
-this section names what it must re-implement rather than re-bind.
+The adoption face is composed when `ServeFaces.adoption` is `Some(route)`, and advertised as `spoke-knowledge-adoption` together with its required `spoke-knowledge` co-capability. It is one composition for every Mind: the route describes the **source side only** — the one collection every admitted Mind adopts from, plus the host-owned `scope_id` naming it on the wire and recorded in every copy's anchor — and nothing in it names a destination. The destination is resolved on every actual copy execution, inside that execution's transaction, from the registry row of the Mind the caller was admitted to, so no collection is fixed for a principal or for the surface and a Mind created after assembly adopts from its first call. A copy is therefore readable back through the admitting Mind's own knowledge face whenever the peer's admitted selection admits it.
+
+`crates/mindcore-runtime/src/adoption.rs`'s `AdoptionService` is that transaction, and `crates/mindcore-runtime/src/lib.rs` installs it as the face. The request's own comparisons run before any transaction opens — `source_scope_id` against the configured source, the configured source id against the admitted scope id, `destination_scope_id` against the admitted scope, and a zero `source_revision` — so a refusal there holds no statement and no snapshot. One `BEGIN IMMEDIATE` transaction then covers everything that reads or writes a row: the grant check, the destination resolution, the source's collision re-check, the retirement-chain resolution, the destination slot read, the create-only write, the anchor and inherited-governance rules and the typed response. It commits only for `adopted` and rolls back for `already_present` and for every refusal, so no caller observes a source read without its destination write and a refused response leaves no copy. Connect's `AdoptionPortService` wraps it with its wire decode and its dedup envelope; that envelope carries no transactional guarantee of its own.
 
 **Admission is the admitting Mind's knowledge-face admission**, composed as
 `(principals(peer)?, knowledge_admission(peer)?)` like the history family's: a peer the knowledge
 face does not admit cannot adopt, and a principal the knowledge admission refuses answers the
-target-free `NOT_AUTHORIZED` where the removed product tool would have served it. Neither the
-principal nor the admitted scope comes from the payload; the admitted scope is the Mind's own.
+target-free `NOT_AUTHORIZED` where the removed product tool would have served it. The face installs
+the scoped form of that admission — `ScopedAdoptionAdmission`, the peer id and the request's scope
+selector answering the `Principal` and the admitted `Scope`. **That selector is the request's
+`destination_scope_id`**: Connect hands it to the admission, so the member chooses *which Mind the
+call is admitted against*, and only after admission is its equality with the returned scope checked
+(by Connect above the port, and again by the port's own pre-transaction comparison). What the member
+cannot choose is a collection — the registry row of the Mind it selected names that — nor can it
+bypass admission for a Mind the caller holds no grant in. The callback carries the Mind and nothing
+else, no caller binding, and the principal still comes from the authenticated peer, never the
+payload.
 
-**Scope mapping.** Every scope member of the request is compared, never used to select anything:
+**The admission also enforces the operation grant.** `lib.rs::admit_adoption_grant` runs after
+`admitted_mind`, on the callback's blocking pool: it opens its own short transaction, calls the same
+`authorize_knowledge` the port calls, requiring one live grant of the caller in the admitted Mind's
+space covering both `knowledge_write` and `knowledge_read`, and rolls the transaction back without
+writing. It exists because Connect answers a **recorded adoption replay** after Mind admission alone:
+the dedup lookup happens above the port, so a peer whose knowledge grant was revoked could receive
+the recorded entry while any other live grant still admits it to the Mind. Requiring the grant in
+admission refuses that peer on every path, replayed outcomes included, and the recorded-replay path
+itself needs no change. It is deliberately **not** one step with the port's check: the two are
+separate transactions, so a revocation that commits between admission and the port does not stop the
+copy the port then authorizes — the same recorded window the knowledge and history faces carry as
+`I-000154`, and narrower here because the replay path is closed.
+
+**The grant rule.** `knowledge.adopt` requires **one** live grant of the caller in the admitted
+Mind's space covering both `knowledge_write` and `knowledge_read`, on one row — it is a knowledge
+put and a get together, and requirements never union across grants. The check runs first inside the
+transaction, ahead of every read, and delegates to the knowledge face's own `authorize_knowledge`,
+so its refusal is that face's fixed `NOT_AUTHORIZED` with no `details`, byte for byte the answer a
+put gets. A caller the check refuses therefore learns nothing the knowledge face would not tell it,
+and no copy is written.
+
+**The transaction's step order**, because the reads are ordered and one re-check is what keeps a
+later Mind out of the source:
+
+1. The grant check above, on the transaction's own snapshot.
+2. The destination: the admitted Mind's `minds` row. No row is the target-free `NOT_AUTHORIZED`.
+3. The source's collision re-check, against the **whole** registry: the configured source is
+   `NOT_FOUND` if any Mind's `knowledge_collection` equals it or any Mind's `space_id` equals the
+   configured source scope id. Assembly refuses those same two configurations, but a Mind created
+   after assembly can take either, and the source must not become a collection another Mind's
+   caller reads with no grant checked against it. The re-check is therefore the call's contract,
+   not a limitation: it runs after the grant check and before any source read, and it answers the
+   same generic absence a missing source does.
+4. The source's retirement-chain resolution, and the terminal's revision rules.
+5. The destination slot read under the admitted selection, then the create-only write.
+6. The typed response, built before the transaction settles.
+
+**Scope mapping.** Every scope member of the request is compared with what the surface fixed, and
+exactly one of them doubles as a routing input: `destination_scope_id` is the selector the admission
+resolves, so it chooses which Mind the call is admitted against, and is then compared with the scope
+that admission returned. The rest are comparisons only, and no member selects a collection:
 
 | Request member | Must equal | Otherwise |
 |---|---|---|
 | `source_scope_id` | the host-configured source's `scope_id` | `NOT_FOUND`, no details — the same generic absence as a missing source |
 | `source_entry_id` | a live or retired row of the host-configured source collection | `NOT_FOUND`, no details |
 | `source_revision` | the live source's current revision; never compared for a retired source; never `0` | `REVISION_CONFLICT`, no details / `INVALID_INPUT` |
-| `destination_scope_id` | the admitted Mind's `Scope.scope_id` | the target-free `NOT_AUTHORIZED`, no details, before the source is read |
+| `destination_scope_id` | the Mind it selected, as the admission returned it; a Mind the caller holds no grant in is refused before this comparison | the target-free `NOT_AUTHORIZED`, no details, before the source is read |
 | `destination_entry_id` | absent → the resolved terminal's `source_entry_id`; a supplied value may name that same id | — |
 | `idempotency_key` | 1–128 code points | `INVALID_INPUT`, refused by Connect's decoder |
 
@@ -268,10 +308,29 @@ adoption refuses before any write, and it resolves a retired row the store's liv
 as an absence by checking the row including superseded ones and answering the same occupancy. Either
 way no revision gate is reached and no put runs. The invariant is the observable answer — code,
 message shape and absent `details` — not a shared constructor, and no path reveals the occupant's
-content, revision or visibility. `NOT_AUTHORIZED` is reserved for a `destination_scope_id` that is
-not the admitted Mind's scope: the target-free admission refusal, never a comparison against a
-configured destination, which no longer exists. The registry row selects the destination; the
-admitted selection narrows what the call may touch inside it.
+content, revision or visibility.
+
+**The `NOT_AUTHORIZED` answers on this face**, kept apart because they do not all come from one
+place:
+
+- **The port's fixed authorization refusal** is `MindcoreServe`'s `authorize_knowledge` answer:
+  `NOT_AUTHORIZED`, `knowledge scope not authorized`, no `details`. It is one value for a caller with
+  no live grant in the admitted Mind's space, one whose grant does not cover both capabilities, and
+  — when the destination cannot be resolved — an admitted Mind with no registry row. It is byte for
+  byte the refusal a knowledge put gets for the same access, because it *is* that check.
+- **Connect's own destination mismatch** happens above the port: the request's
+  `destination_scope_id` is what Connect hands the scoped admission as the selector, and after
+  admission it compares that member with the admitted scope, answering `NOT_AUTHORIZED` with
+  `adoption destination scope is outside the admitted context`. Same code, no `details`, and the
+  source is never read — but the text is Connect's own and is not claimed to match the port's.
+- **The admission-level refusals** — an unknown Mind, an unadmitted Mind, a frozen Mind the caller
+  holds no grant in — answer with the callback's own value, which Connect's adoption branch returns
+  verbatim. Within this face those cases are byte-identical to each other, as the history section
+  states for its own callback; across families the text may differ, so the code, the absence of
+  `details` and the unreached store are the stable part of the contract, never the message.
+
+None of the three selects a collection from the wire: the registry row selects the destination, and
+the admitted selection narrows what the call may touch inside it.
 
 **Slot occupancy is a permitted disclosure.** A create-only destination answers occupied for an
 occupied id and success for a free one, so the answer reports whether the `destination_entry_id`
@@ -283,12 +342,49 @@ one occupant detail it can return, `details.adopted_revision`, needs the destina
 handed that occupant back, so only a copy the caller can already read carries it. An absolute
 "existence is never revealed" claim would be false and is not made here.
 
-**Assembly** refuses an empty source scope id, an empty source collection, a source collection equal
-to any Mind's registered collection — the assembled Mind's own included, and including a Mind that
-is not currently connected — and a source scope id equal to the destination scope, all with
-`InvalidInput` before any port or registration exists. A source that is also a destination would let
-one Mind's adopted copy become the shared entry another Mind reads, and a source scope equal to the
-destination scope would let a Mind adopt from its own destination.
+**Assembly** refuses five configurations, every one with `InvalidInput` before any port or
+registration exists:
+
+1. an empty source scope id;
+2. an empty source collection;
+3. adoption requested without the knowledge face that admits it (`ServeFaces.adoption` with
+   `ServeFaces.knowledge` false);
+4. a source collection equal to any registered Mind's `knowledge_collection` — the assembled Mind's
+   own included, and including a Mind that is not currently connected;
+5. a source scope id equal to any registered Mind's `space_id`.
+
+A source that is also a destination would let one Mind's adopted copy become the shared entry
+another Mind reads, and a source scope equal to a Mind's id would let that Mind adopt from its own
+destination. Refusals four and five see only the Minds that exist at assembly, which is why the
+call re-makes the same two decisions against the whole registry inside its transaction.
+
+**A claimable source id disables shared adoption, by design.** Mind creation accepts any
+authenticated peer claiming a free id (owner decision, `I-000155`), so a peer can register a Mind
+whose id is the configured source's `scope_id`. From that moment the call-time registry check
+refuses every fresh adoption execution — a copy execution entering the transaction — into every
+Mind, because the source is a registered Mind's id, which is exactly refusal five. A same-key
+same-digest reconnect that already holds a recorded outcome skips the port's in-transaction checks —
+this collision re-check and the grant check inside the transaction — and is answered the recorded
+result with `outcome` normalized to `already_present`: every other member of that result is served
+as it was recorded, and nothing is re-derived from the store. The admission's own grant read still
+runs, because Connect admits before it consults the dedup record, and that read is what refuses a
+revoked peer on every path, replay included. The failure is deliberate rather than a defect to
+narrow. Hosts that admit arbitrary peers must therefore treat a shared source's `scope_id` as
+reserved configuration: an id no peer can claim, and one they never hand out as a Mind id.
+`I-000155` owns the create semantics; this page owns only the consequence for a composed adoption
+face.
+
+**The call-time `NOT_FOUND` cases.** Three request or registry states answer the same generic
+`NOT_FOUND` with no `details`, so a peer cannot tell them apart:
+
+- `source_scope_id` is not the configured source's `scope_id`;
+- the configured source collides with a registered Mind — the re-check in the transaction's step 3,
+  which is how a Mind created after assembly is refused;
+- the requested `source_entry_id` is not a live or retired row of the configured source collection.
+
+The first and third are the refusals the request's pre-transaction checks and the source read
+produce; the second is the re-check. All three answer the fixed `source knowledge entry not found`,
+which is also why the collision is indistinguishable from an absent entry.
 
 **Terminal anchor.** The requested source resolves through `spoke_operations::resolve_retirement_chain`
 inside the same transaction before anything is read for the copy: a live source resolves to itself,
@@ -298,12 +394,16 @@ the copy's own `entry_id` is `destination_entry_id` when supplied and the termin
 A chain that cannot resolve — a cycle, an ambiguous merge, a missing hop, more than the resolver's
 32 edges — answers `SOURCE_RETIRED` with `details.retirement_chain`, the visited ids in order. A
 retired source's requested revision is not compared, because the anchor records the terminal's own
-revision; a live source that moved off the requested revision answers `REVISION_CONFLICT` with no
-details. A resolved terminal whose own revision is above Mindcore's served ceiling of `2^53 - 1` has
-no conformant success to report, because the anchor is the only carrier of that revision: the
-`adoption_anchor.source_revision` member records the terminal's revision and must satisfy the
-IEEE-754 safe-integer bound, which is Mindcore's own check and narrower than the numeric check
-Connect applies to the request. The copy's own `revision` is never that value — it is the
+revision. A live source that moved off the requested revision is classified by the copy helper after
+the destination slot is read, so the repeat rule below decides it: a repeat whose stored anchor
+records the requested revision is served `already_present`, and one anchored at another revision is
+`REVISION_CONFLICT`. A resolved terminal whose *stored* revision is above Mindcore's served ceiling of
+`2^53 - 1` has no conformant success to report, because the anchor is the only carrier of that
+revision: the `adoption_anchor.source_revision` member records the terminal's revision and must
+satisfy the IEEE-754 safe-integer bound, which is Mindcore's own check and narrower than the numeric
+check Connect applies to the request. That guard bounds the stored revision a create would anchor,
+never the requested one: a request naming an out-of-range revision the source does not hold is the
+copy helper's ordinary conflict. The copy's own `revision` is never that value — it is the
 destination row's write revision, assigned by the store (`1` on a create) — so the response's
 `entry.revision` is checked separately on return. The call refuses before writing anything, with the
 fixed fault message and `details.kind = "store"`; the copy is never committed for a response the
@@ -332,8 +432,10 @@ the same rule; a re-read answering absence or occupancy is that occupancy, one r
 `NOT_AUTHORIZED` or `REVISION_CONFLICT` travels as the destination reported it, and one faulting for
 storage reasons becomes the fixed `InternalError` below rather than the put's own refusal. Any other
 store answer becomes `InternalError` with the fixed message `knowledge adoption could not complete`
-and `details.kind` naming the failing stage (`begin`, `commit`, `store` or `response`); the serde,
-SQL and stored-payload text stays on the host side and never enters the signed refusal. A stored
+and exactly one `details` member, `kind: "store"` — the only value an adoption fault carries. The
+failing stage (`begin`, `commit`, `store` or `response`) and the serde, SQL and stored-payload text
+are host-side diagnostics: they name local tables and columns, so they go to the host's stderr and
+never enter the signed refusal. A stored
 `adoption_anchor` revision above `2^53 - 1` is the same fixed `store` fault, never a
 `REVISION_CONFLICT` carrying the out-of-range integer — but only when that anchor names the
 requested source scope and entry. An unrelated occupant's anchor is never read as this adoption's
@@ -355,23 +457,8 @@ before hello using its own trusted routing, verifies the selected peer against t
 session, and re-evaluates actual admission at call time. The runtime serves one manifest and one
 handler set per surface and exposes no per-principal manifest or handler set.
 
-**Stage 2 handoff: the single transaction is not in the retained ports.** `crates/mindcore-sqlite`
-implements `ScopedKnowledgePort` and `HistoryPort` but no `spoke_operations::AdoptionPort`, and the
-operation's body — the destination read, the retirement-chain resolution, the create-only write, the
-anchor and inherited-governance rules and the typed response — lived in the removed
-`crates/mindcore-runtime/src/adoption.rs` (`AdoptionService`). Its request checks ran before the
-transaction: `source_scope_id` against the configured source (`NOT_FOUND`), `destination_scope_id`
-against the admitted scope (`NOT_AUTHORIZED`) and a zero `source_revision` (`INVALID_INPUT`) were
-answered with no transaction open, so they held no statement and no snapshot. Its one
-`BEGIN IMMEDIATE` transaction then covered everything that reads or writes a row — the destination
-read, the source's chain resolution, the create-only write, the anchor and the typed response — and
-committed only for `adopted`, rolling back for `already_present` and for every refusal, so no caller
-could observe a source read without its destination write and a refused response left no copy.
-Stage 2 must re-implement that transaction before composing any per-Mind adoption face: a body
-assembled from separate port calls cannot carry it, because the destination read and the create-only
-write would no longer share the source read's snapshot or its rollback. The pre-transaction request
-checks must stay outside it, where a refusal opens nothing. Connect's `AdoptionPortService` dedup
-envelope is unchanged by this — it never carried the transactional guarantee.
+**Where the transaction lives, and why not in the storage crate.** `crates/mindcore-sqlite`
+implements `ScopedKnowledgePort` and `HistoryPort` but no `spoke_operations::AdoptionPort`, and it does not gain one: the operation needs the registry read, the source's collision re-check and two scoped port handles over one transaction, and grant evaluation belongs to the protocol adapter (`2026-11-20-storage-ir-layering.md`). `crates/mindcore-runtime/src/adoption.rs`'s `AdoptionService` holds that transaction and supplies the two borrowed-transaction port handles; `crates/mindcore-spi`'s `adopt_knowledge_entry_typed` keeps the copy, repeat and occupancy rules. A body assembled from separate port calls could not carry the guarantee, because the destination read and the create-only write would no longer share the source read's snapshot or its rollback — which is why the transaction is one function, not a sequence. Connect's `AdoptionPortService` dedup envelope is outside it and never carried that guarantee.
 
 ### Store shape
 
@@ -381,7 +468,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 
 - No caller-provided principal, Mind id, or manifest capability can bypass a host admission or storage guard.
 - No baseline provider is required for either face and an absent face/tool is denied. Advertisements and handler registrations describe the same capabilities.
-- Adoption's source is the one host-configured Stage 2 route and its destination is the admitted Mind's registered collection, resolved after admission: no wire value selects either, the request's scope members are only compared against those two, a source equal to any Mind's registered collection or to the destination scope is refused before serving, and a `destination_scope_id` that names anything but the admitted Mind's scope answers the target-free refusal.
+- Adoption's source is the one host-configured collection and its destination is the collection the Mind selected by the request's `destination_scope_id` registered; both are resolved inside the copy's transaction, no wire value selects a collection, and the selector chooses only which Mind is asked of admission. The source's collision with any registered Mind is re-checked against the whole registry on every actual copy execution — after the grant check and before any source read — while a replay that already holds a recorded outcome redoes only Mind admission and re-runs neither check; and a `destination_scope_id` that differs from the scope admission returned answers the target-free refusal.
 - Adoption's answer reports `destination_entry_id` slot occupancy — occupied or free — and nothing about the occupant: a concealed occupant is byte-identical to a visible one. That disclosure is permitted and no wider than the knowledge face it lands on, whose create-only `put_knowledge_entry` already distinguishes occupied from free while hiding the entry; entry content, revision and visibility stay undisclosed.
 - Ablation: peer admission plus scoped storage are both required. Connect authenticates the peer and bounds the list request; the store applies the admitted collection and entry rules before reading, revealing or mutating data.
 - An admitted scope is validated where the face is assembled and again in the store: neither Connect's list merge nor a caller-declared scope may drop or bypass an admitted constraint.
@@ -396,7 +483,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 - SQLite scoped store beside `crates/mindcore-sqlite/src/knowledge.rs` and its borrowed-transaction helpers; the served face binds it per Mind through `RoutedKnowledgeStore`, which resolves the registered collection on every call. The same file implements `HistoryPort` for `RoutedKnowledgeStore` and projects the replay onto `RevisionSnapshot`.
 - `crates/mindcore-spoke/src/workflows.rs` owns workflow storage admission and the settlement transaction; `crates/mindcore-spi` owns the workflow contracts and their orchestration.
 - `crates/mindcore-spoke/src/control.rs` owns `MemoryAdapter::create_space`, `list_spaces`, `freeze_space` and `unfreeze_space`; `crates/mindcore-spoke/src/served_knowledge.rs` owns `MindKnowledgePort` and the `authorize_knowledge` check; `crates/mindcore-sqlite/src/knowledge.rs` owns `bind_caller`, `bound_caller` and `validate_admission_scope`.
-- `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces` (manifest metadata, the memory service, the knowledge and history switches, the peer-to-principal admission, providers and host tools), the runtime's `MindPorts`, `MindcoreServe::scoped_knowledge` and `MindcoreServe::served_history` (the two faces and the shared `admit_peer` admission), the retired-id filter and `face_capabilities`; the composed faces are `ServeFaces.knowledge` and `ServeFaces.history`, while adoption stays uncomposed, so `crates/mindcore-runtime/src/adoption.rs` (`AdoptionService`) remains removed and a restored face must re-implement it (the Stage 2 handoff paragraph above). `spoke-connect`'s `AdoptionPortService` keeps its wire decode, effective-scope check and dedup seam, unused until that face is composed again; `crates/mindcore-runtime/src/tools.rs` owns the served workflow tool registrations and their advertised ABI. `crates/mindcore-runtime/src/history_dedup.rs` owns `SqliteHistoryDedupStore`. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session — the knowledge face's served ops and its two adversarial loopbacks, the history face's per-Mind replay and prune with its grant and admission cases, and the adoption family's `CapabilityPortMissing` denial; `crates/mindcore-runtime/tests/surface.rs` asserts the three knowledge capabilities exactly when `ServeFaces.knowledge` is true, `spoke-history` exactly when `ServeFaces.history` is, and the assembly refusal of `history` without `knowledge`.
+- `crates/mindcore-runtime/src/lib.rs` owns `ServeFaces` (manifest metadata, the memory service, the knowledge, history and adoption switches, the peer-to-principal admission, providers and host tools), the runtime's `MindPorts`, `MindcoreServe::scoped_knowledge`, `MindcoreServe::served_history` and `MindcoreServe::served_adoption` (the three faces, the shared `admit_peer` admission and `adoption_assembly`'s five refusals), the retired-id filter and `face_capabilities`; the composed faces are `ServeFaces.knowledge`, `ServeFaces.history` and `ServeFaces.adoption`, and `crates/mindcore-runtime/src/adoption.rs` owns the adoption transaction (`AdoptionService`, `AdoptionRoute`) while `crates/mindcore-runtime/src/history_dedup.rs` owns `SqliteHistoryDedupStore`. `spoke-connect`'s `AdoptionPortService` supplies the wire decode, effective-scope check and dedup seam around that port; `crates/mindcore-runtime/src/tools.rs` owns the served workflow tool registrations and their advertised ABI. `crates/mindcore-runtime/tests/loopback.rs` asserts each advertisement against a signed session — the knowledge face's served ops and its two adversarial loopbacks, the history face's per-Mind replay and prune with its grant and admission cases, and the adoption face's adopt-and-read-back, grant, target-free and `NOT_FOUND` cases over the composed surface; `crates/mindcore-runtime/tests/surface.rs` asserts the three knowledge capabilities exactly when `ServeFaces.knowledge` is true, `spoke-history` exactly when `ServeFaces.history` is, `spoke-knowledge-adoption` exactly when `ServeFaces.adoption` is `Some`, and the assembly refusals of `history` or `adoption` without `knowledge`.
 
 ## Change obligations
 

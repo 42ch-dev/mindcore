@@ -21,6 +21,7 @@
 //! `create`, `list` and `get` a host calls on its `MindStore`, and [`mind`] holds the `Mind`
 //! handle a caller opens over one Mind.
 
+mod adoption;
 mod history_dedup;
 
 pub mod journal;
@@ -32,29 +33,34 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use mindcore_base::ids::SpaceId;
 use mindcore_spi::{EmbeddingIdentity, MindWorkflows, SpiError, SpiMindWorkflows};
 use mindcore_spoke::{
-    admitted_mind, is_mind_admission_refusal, MemoryWorkflowBinding, MindHistoryPort,
-    MindKnowledgePort, ServedMemory, TRANSFER_OPERATIONS,
+    admitted_mind, authorize_knowledge, is_mind_admission_refusal, MemoryWorkflowBinding,
+    MindHistoryPort, MindKnowledgePort, ServedMemory, TRANSFER_OPERATIONS,
 };
 use mindcore_sqlite::{bind_caller, validate_admission_scope, vectors, MindStore};
 use spoke_connect::core::{
     CAPABILITY_SPOKE_HISTORY, CAPABILITY_SPOKE_JUDGMENT, CAPABILITY_SPOKE_KNOWLEDGE,
-    CAPABILITY_SPOKE_KNOWLEDGE_SCOPED, CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
+    CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION, CAPABILITY_SPOKE_KNOWLEDGE_SCOPED,
+    CAPABILITY_SPOKE_MEMORY, CAPABILITY_SPOKE_MEMORY_TRANSFER,
 };
 use spoke_connect::remote::{
-    ConnectResponder, HistoryAdmission, HistoryPortService, MemoryAdmission, RemoteHistoryService,
-    RemoteMemoryService, RemoteScopedKnowledgeFace, RemoteServePorts, ScopedHistoryAdmission,
+    AdoptionAdmission, AdoptionPortService, ConnectResponder, HistoryAdmission, HistoryPortService,
+    MemoryAdmission, RemoteAdoptionService, RemoteHistoryService, RemoteMemoryService,
+    RemoteScopedKnowledgeFace, RemoteServePorts, ScopedAdoptionAdmission, ScopedHistoryAdmission,
     ScopedKnowledgeAdmission, ToolHandler,
 };
 use spoke_operations::{
-    validate_manifest_tools, ScopedKnowledgePort, SpokeReject, SpokeRejectCode, SpokeResult,
+    validate_manifest_tools, AdoptionPort, ScopedKnowledgePort, SpokeReject, SpokeRejectCode,
+    SpokeResult,
 };
 use spoke_schemas::host_capability_manifest::ToolDescriptor;
 use spoke_schemas::{HostCapabilityManifest, Principal, Scope};
 use sqlx::SqlitePool;
 use tokio::runtime::Handle;
 
+pub use adoption::AdoptionRoute;
 pub use journal::journal_dir;
 pub use mind::{Capture, Deliberation, Mind, Recall};
 pub use mindcore_spoke::Cognition;
@@ -130,7 +136,10 @@ impl MindcoreServe {
     /// Nothing is served until the host creates its responder and calls
     /// [`MindcoreSurface::register`]: `connect_responder` starts its own receive task and never
     /// installs handlers from the manifest.
-    pub fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
+    ///
+    /// Asynchronous because the adoption source is checked against the registry: the source must
+    /// not collide with any Mind that exists at assembly.
+    pub async fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
         // Both history ops admit through the knowledge face's callbacks, so a history face
         // without the knowledge face has no admission to run. No port is built and no
         // registration is derived before this answer.
@@ -140,6 +149,9 @@ impl MindcoreServe {
                 message: "ServeFaces.history requires ServeFaces.knowledge".to_string(),
                 details: None,
             });
+        }
+        if let SpokeResult::Reject(reject) = self.adoption_assembly(&faces).await {
+            return SpokeResult::Reject(reject);
         }
         let principals = faces.principals;
         let workflows = self.workflows();
@@ -172,11 +184,16 @@ impl MindcoreServe {
             }
             _ => None,
         };
+        let adoption_configured = faces.adoption.is_some();
+        let adoption = faces
+            .adoption
+            .map(|route| self.served_adoption(Arc::clone(&principals), route));
         let manifest = match derive_manifest(
             faces.manifest,
             faces.memory.as_deref(),
             faces.knowledge,
             faces.history,
+            adoption_configured,
             &tools,
         ) {
             SpokeResult::Ok(manifest) => manifest,
@@ -187,12 +204,60 @@ impl MindcoreServe {
                 memory: faces.memory,
                 knowledge,
                 history,
+                adoption,
             }),
             manifest,
             tools,
             workflows,
             pool: self.store.pool(),
         })
+    }
+
+    /// The adoption source's assembly refusals, all before any port or registration exists: an
+    /// empty scope id or collection, a source that collides with a registered Mind's collection
+    /// or id — every registered Mind is a possible destination — and adoption requested without
+    /// the knowledge face that admits it.
+    ///
+    /// Checks three and four see the Minds that exist at assembly; the port makes the same two
+    /// decisions per call, because a Mind created afterwards can take a colliding id or
+    /// collection.
+    async fn adoption_assembly(&self, faces: &ServeFaces) -> SpokeResult<()> {
+        let Some(route) = &faces.adoption else {
+            return SpokeResult::Ok(());
+        };
+        if route.scope_id.is_empty() {
+            return invalid_input("the adoption source names an empty scope id");
+        }
+        if route.source.collection.is_empty() {
+            return invalid_input("the adoption source names an empty collection");
+        }
+        // The face admits through the knowledge face's callbacks and needs its co-capability, so
+        // a route without that face has no admission to run.
+        if !faces.knowledge {
+            return invalid_input("ServeFaces.adoption requires ServeFaces.knowledge");
+        }
+        let pool = self.store.pool();
+        if let SpokeResult::Reject(reject) = registered(
+            &pool,
+            "SELECT 1 FROM minds WHERE knowledge_collection = ?",
+            &route.source.collection,
+            "knowledge collection",
+        )
+        .await
+        {
+            return SpokeResult::Reject(reject);
+        }
+        if let SpokeResult::Reject(reject) = registered(
+            &pool,
+            "SELECT 1 FROM minds WHERE space_id = ?",
+            &route.scope_id,
+            "id",
+        )
+        .await
+        {
+            return SpokeResult::Reject(reject);
+        }
+        SpokeResult::Ok(())
     }
 
     /// The per-Mind scoped knowledge face: one store and one admission for every Mind.
@@ -282,6 +347,133 @@ impl MindcoreServe {
                 .with_dedup_store(Arc::new(history_dedup::SqliteHistoryDedupStore::new(pool))),
         )
     }
+
+    /// The per-Mind adoption face: layer 4's one-transaction copy over the configured source,
+    /// admitted through the knowledge face's callbacks and answered with the admitted scope as it
+    /// is — the caller binding belongs to the face that binds it, and Connect's destination check
+    /// compares the request's destination with this scope.
+    ///
+    /// The admission runs Mind admission and then the operation's own grant, through the same
+    /// [`authorize_knowledge`] call the port makes: Connect answers a recorded adoption replay
+    /// after admission alone, so a peer whose knowledge grant was revoked would otherwise receive
+    /// the recorded entry while any other Mind grant still admits it. Requiring the grant here
+    /// refuses that peer on every path, replayed outcomes included.
+    ///
+    /// The peer-only admission `AdoptionPortService::new` requires never answers:
+    /// `with_scoped_admission` replaces it in place. The dedup default is Connect's bounded
+    /// in-memory store, because an adoption's recorded outcome need not outlive the session.
+    fn served_adoption(
+        &self,
+        principals: MemoryAdmission,
+        route: AdoptionRoute,
+    ) -> Arc<dyn RemoteAdoptionService> {
+        let pool = self.store.pool();
+        let port: Arc<dyn AdoptionPort + Send + Sync> =
+            Arc::new(crate::adoption::AdoptionService::new(pool.clone(), route));
+        let admission_pool = pool.clone();
+        let admission: ScopedAdoptionAdmission = Arc::new(move |peer_id, selector| {
+            let (principal, scope_id) =
+                match admit_peer(&admission_pool, &principals, peer_id, selector) {
+                    SpokeResult::Ok(admitted) => admitted,
+                    SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+                };
+            // Synchronous callback on Connect's blocking pool, like `admit_peer`: the grant read
+            // takes its own transaction and is rolled back, so admission never writes.
+            let granted = admit_adoption_grant(&admission_pool, &principal.principal_id, &scope_id);
+            if let SpokeResult::Reject(reject) = granted {
+                return SpokeResult::Reject(reject);
+            }
+            SpokeResult::Ok((
+                principal,
+                Scope {
+                    cognition: None,
+                    entry_ids: None,
+                    entry_types: None,
+                    extensions: None,
+                    fork_id: None,
+                    scope_id,
+                    source_id: None,
+                    timeline_event_ids: None,
+                    timeline_scale: None,
+                    viewpoint: None,
+                },
+            ))
+        });
+        let peer_only: AdoptionAdmission = Arc::new(no_peer_only_admission);
+        Arc::new(AdoptionPortService::new(port, peer_only).with_scoped_admission(admission))
+    }
+}
+
+/// The operation grant the adoption face's admission requires: one live grant in the Mind's space
+/// covering both capabilities, decided by [`authorize_knowledge`] — the same call, on its own
+/// transaction, the port makes inside the copy's.
+///
+/// It is not one atomic step with any later write; the port re-checks on the transaction that
+/// writes. This read exists so no path reaches a recorded outcome without it.
+fn admit_adoption_grant(pool: &SqlitePool, principal: &str, scope_id: &str) -> SpokeResult<()> {
+    // Synchronous because Connect's admission is, like `admit_peer`: the responder runs the
+    // callback on its blocking pool, where `block_on` is legal on a multi-thread runtime.
+    Handle::current().block_on(async {
+        let mut transaction = match pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(_) => return admission_storage_unavailable(),
+        };
+        let decided = authorize_knowledge(
+            &mut transaction,
+            principal,
+            &SpaceId::new(scope_id),
+            &crate::adoption::ADOPTION_CAPABILITIES,
+        )
+        .await;
+        let _ = transaction.rollback().await;
+        decided
+    })
+}
+
+/// The admission's storage answer: the same fixed text the knowledge face gives, so a broken store
+/// is never reported as the admission refusal.
+fn admission_storage_unavailable<T>() -> SpokeResult<T> {
+    SpokeResult::Reject(SpokeReject {
+        code: SpokeRejectCode::InternalError,
+        message: "knowledge storage is unavailable".to_string(),
+        details: None,
+    })
+}
+
+/// Whether `value` occupies a registry row of `query`. `Ok` answers a free value; a taken one is
+/// the adoption source's assembly refusal, naming `what`, and a statement failure is the fixed
+/// storage answer.
+async fn registered(
+    pool: &SqlitePool,
+    query: &'static str,
+    value: &str,
+    what: &str,
+) -> SpokeResult<()> {
+    let taken: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(query)
+        .bind(value)
+        .fetch_optional(pool)
+        .await;
+    match taken {
+        Ok(None) => SpokeResult::Ok(()),
+        Ok(Some(_)) => invalid_input(format!(
+            "the adoption source {value} is a registered Mind's {what}"
+        )),
+        Err(_) => SpokeResult::Reject(SpokeReject {
+            code: SpokeRejectCode::InternalError,
+            message: "mind storage is unavailable".to_string(),
+            details: None,
+        }),
+    }
+}
+
+/// The adoption source's assembly refusal: the host's configuration is not one the surface can
+/// serve, and no port or registration is built.
+fn invalid_input(message: impl Into<String>) -> SpokeResult<()> {
+    SpokeResult::Reject(SpokeReject {
+        code: SpokeRejectCode::InvalidInput,
+        message: message.into(),
+        details: None,
+    })
 }
 
 /// Steps one to three of the served-face admission, shared by the knowledge and history callbacks:
@@ -322,33 +514,32 @@ fn admit_peer(
     }
 }
 
-/// The peer-only admission a `HistoryPortService` requires before it is given a scoped one. It
-/// never answers: no request reaches it once [`HistoryPortService::with_scoped_admission`] has
-/// replaced it, and a face that composed this one alone would have no Mind to admit to.
+/// The peer-only admission a `HistoryPortService` or `AdoptionPortService` requires before it is
+/// given a scoped one. It never answers: no request reaches it once
+/// [`HistoryPortService::with_scoped_admission`] has replaced it, and a face that composed this one
+/// alone would have no Mind to admit to.
 fn no_peer_only_admission(_peer_id: &str) -> SpokeResult<(Principal, Scope)> {
     SpokeResult::Reject(SpokeReject {
         code: SpokeRejectCode::CapabilityPortMissing,
-        message: "the history face admits through its scoped admission only".to_string(),
+        message: "the served face admits through its scoped admission only".to_string(),
         details: None,
     })
 }
 
-/// The runtime's own ports: the host's memory service and, when `ServeFaces.knowledge` asks for
-/// it, the per-Mind scoped knowledge and history faces.
+/// The runtime's own ports: the host's memory service and, when `ServeFaces` asks for them, the
+/// per-Mind scoped knowledge, history and adoption faces.
 ///
-/// Adoption alone stays absent. It is Mind-routed in principle — it names the Mind its request
-/// declares, exactly as knowledge does — but its runtime pieces were removed with the Stage 1
-/// face, and the single-transaction copy a composed face owes is layer 4's work. A call to it is
-/// refused on the responder's dispatch-deny branch, wire `capability_missing`, which the Rust
-/// dialer surfaces as `CapabilityPortMissing`. History composes here instead: the same routed
-/// store, its grant-checking port and its durable dedup record, so a replay and a prune are
-/// served per Mind rather than refused. The storage under both is already registry-routed:
-/// `RoutedKnowledgeStore` resolves the Mind's collection per call on the transaction each op
-/// opens.
+/// Each face composes behind its own configuration: knowledge when the flag asks for it, history
+/// over that same routed store, and adoption when the host configured a source. A call to a face
+/// the host did not compose is refused on the responder's dispatch-deny branch, wire
+/// `capability_missing`, which the Rust dialer surfaces as `CapabilityPortMissing`. The storage
+/// under all three is registry-routed: each op resolves the Mind's collection on the transaction
+/// it opens.
 struct MindPorts {
     memory: Option<Arc<dyn ServedMemory>>,
     knowledge: Option<Arc<RemoteScopedKnowledgeFace>>,
     history: Option<Arc<dyn RemoteHistoryService>>,
+    adoption: Option<Arc<dyn RemoteAdoptionService>>,
 }
 
 /// The responder takes the family's bare service; `ServedMemory` only adds the operation report.
@@ -367,6 +558,10 @@ impl RemoteServePorts for MindPorts {
 
     fn as_history(&self) -> Option<Arc<dyn RemoteHistoryService>> {
         self.history.clone()
+    }
+
+    fn as_adoption(&self) -> Option<Arc<dyn RemoteAdoptionService>> {
+        self.adoption.clone()
     }
 }
 
@@ -409,6 +604,19 @@ pub struct ServeFaces {
     /// with the admitted one byte for byte), and Connect's durable dedup store. `false` composes
     /// and advertises neither.
     pub history: bool,
+    /// The adoption source, or `None` for no adoption face.
+    ///
+    /// `Some(route)` composes the `spoke-knowledge-adoption` family and advertises it: layer 4's
+    /// one-transaction copy reads `route.source` for every admitted Mind and writes the collection
+    /// that Mind registered, resolved inside the call's transaction. The route describes the
+    /// source side only — no destination is configured, so no wire value selects where a copy
+    /// lands and no route map returns. `None` composes and advertises none.
+    ///
+    /// Requires [`ServeFaces::knowledge`]: the face admits through that face's callbacks and needs
+    /// its co-capability. Assembly refuses (`InvalidInput`) before any port or registration is
+    /// built when the scope id or collection is empty, or when either collides with a registered
+    /// Mind — every registered Mind is a possible destination.
+    pub adoption: Option<AdoptionRoute>,
     /// Maps the authenticated peer to the `Principal` the workflows admit. The same host mapping
     /// the memory face uses; never read from the wire.
     pub principals: MemoryAdmission,
@@ -533,12 +741,14 @@ fn fault_out_of_admission<T>(fault: &SpokeReject) -> T {
 
 /// The advertised capabilities follow the composed faces: the memory family flag when a memory
 /// service is attached and the transfer family flag when that service reports every one of
-/// [`TRANSFER_OPERATIONS`]; the two knowledge flags the face can honour and `spoke-history` when
-/// each face is composed. No other family is composed, so none is advertised.
+/// [`TRANSFER_OPERATIONS`]; the two knowledge flags the face can honour, `spoke-history` and
+/// `spoke-knowledge-adoption` when each face is composed. No other family is composed, so none is
+/// advertised.
 fn face_capabilities(
     memory: Option<&dyn ServedMemory>,
     knowledge: bool,
     history: bool,
+    adoption: bool,
 ) -> Vec<String> {
     let mut capabilities = Vec::new();
     if let Some(memory) = memory {
@@ -564,6 +774,9 @@ fn face_capabilities(
     if history {
         capabilities.push(CAPABILITY_SPOKE_HISTORY.to_string());
     }
+    if adoption {
+        capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE_ADOPTION.to_string());
+    }
     capabilities
 }
 
@@ -574,9 +787,10 @@ fn derive_manifest(
     memory: Option<&dyn ServedMemory>,
     knowledge: bool,
     history: bool,
+    adoption: bool,
     tools: &[ToolRegistration],
 ) -> SpokeResult<HostCapabilityManifest> {
-    manifest.capabilities = face_capabilities(memory, knowledge, history);
+    manifest.capabilities = face_capabilities(memory, knowledge, history, adoption);
     if tools
         .iter()
         .any(|tool| tool.descriptor.capability_id.as_str() == tools::DELIBERATE)
