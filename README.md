@@ -60,13 +60,24 @@ and writes the same SQLite store through `mindcore-sqlite`.
 
 ```toml
 [dependencies]
-mindcore-base = "0.1"
-mindcore-sqlite = "0.1"
+# The facade is unpublished, so the whole mindcore family comes from this repository at one
+# revision: a registry `mindcore-base` beside a git `mindcore-runtime` would be a second copy of
+# the same crate, and the facade would not accept its types.
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
-spoke-operations = ">=0.19.1, <0.20.0"
-serde_json = "1"
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
 ```
+
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io at `0.1.0`, the version this
+workspace declares, so a `"0.1"` requirement matches; a host that needs only the record model and
+the store takes them from the registry. The facade is `publish = false`, so this example takes the
+whole family from this repository at one revision — a registry `mindcore-base` beside a git
+`mindcore-runtime` would be two copies of the same types.
 
 ```rust
 use mindcore_base::boundary::CallerId;
@@ -96,6 +107,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }).await)?;
     let mind = ok(Mind::open(&store, &caller, &row.id).await)?;
 
+    // The host provisions the subject row a memory write needs; `capture` answers NOT_FOUND for
+    // an unknown subject.
+    sqlx::query(
+        "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
+         VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(row.id.as_str())
+    .bind("wren")
+    .execute(&store.pool())
+    .await?;
+
     ok(mind.capture(&Capture {
         subject: "wren",
         context: None,
@@ -109,9 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The full story — recall, review of a staged candidate, adoption from a shared collection, doubt,
-evidence, a shared change, a reopen and the refusals — is [docs/quickstart.md](docs/quickstart.md),
-and the same sequence is asserted by the workspace example:
+The facade path — create a Mind, capture, review, recall, write the carrier and read the derived
+judgment, and deliberate with a host reasoner — is [docs/quickstart.md](docs/quickstart.md). The
+whole record story — adoption, doubt, evidence, a shared change, a reopen and the refusals — is
+asserted by the workspace example:
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
@@ -156,8 +179,10 @@ The obligations the host takes, the `ServeFaces` fields and the served-operation
   resolves through the source's retirement chain, so it names the live terminal rather than a
   retired hop.
 - **Immutable migrations.** A published migration file never changes — the lock records its
-  sha256 — and new schema arrives as appended files. A database whose applied migrations still
-  match the embedded set reopens; anything else is refused rather than converted.
+  sha256 — and new schema arrives as appended files. A database whose applied set is a prefix of
+  the embedded set reopens, and the appended files are applied; a version the embedded set does not
+  contain (`VersionMissing`), a changed checksum (`VersionMismatch`) or a pending file that reruns
+  over tables already present (`ExecuteMigration`) is refused rather than converted.
 
 What `open` accepts and refuses is [storage compatibility](docs/storage-compatibility.md); the
 version policy behind it is [SemVer](docs/semver.md).
@@ -165,8 +190,8 @@ version policy behind it is [SemVer](docs/semver.md).
 ## Status and limits
 
 - **Alpha, and mostly unpublished.** `mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on
-  crates.io; the registry currently holds an alpha. `mindcore-spoke`, `mindcore-runtime`,
-  `mindcore-daemon` and `mindcore-binding` are `publish = false` and come from this repository.
+  crates.io at `0.1.0`; `mindcore-spoke`, `mindcore-runtime`, `mindcore-daemon` and
+  `mindcore-binding` are `publish = false` and come from this repository.
 - **Mind-level only.** The facade and the served surface expose Mind-level operations. The
   space-level capabilities beneath them are an advanced surface that is not exposed, and the
   operations not yet served per Mind are not composed.

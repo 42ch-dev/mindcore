@@ -29,32 +29,39 @@ It is a guided path, not a complete API reference. The record model is in
 The shortest path is the documented example, run from a checkout of this repository:
 
 ```sh
-cargo run --offline -p mindcore-runtime --example mind_facade
+cargo run --locked -p mindcore-runtime --example mind_facade
 ```
 
 It prints the recalled record and the derived `MindState`, and its source
 ([`crates/mindcore-runtime/examples/mind_facade.rs`](../crates/mindcore-runtime/examples/mind_facade.rs))
-is the complete, runnable version of every step below. The rest of this page walks through it.
+is the complete, runnable version of steps 1–6. Step 7 needs a provider the example does not
+construct; the rest of this page walks through every step.
 
 ## Add the dependency
 
 ```toml
 [dependencies]
-mindcore-base = "0.1"
-mindcore-sqlite = "0.1"
+# The facade is unpublished, so the whole mindcore family comes from this repository at one
+# revision: a registry `mindcore-base` beside a git `mindcore-runtime` would be a second copy of
+# the same crate, and the facade would not accept its types.
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
-# match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = ">=0.19.1, <0.20.0"
-spoke-schemas = ">=0.19.1, <0.20.0"
-# for the host's own provisioning writes (step 3)
+# The SPOKE versions this workspace pins.
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+# For the host's own subject provisioning (step 3).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```
 
-`mindcore-base` and `mindcore-sqlite` are on crates.io; let Cargo resolve the version the registry
-holds. `mindcore-runtime` is not published and comes from this repository.
-`[workspace.package].version` in the repository is the source of truth for what a release contains.
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io at `0.1.0`, the version
+`[workspace.package].version` declares at this head, so a `"0.1"` requirement matches. A host that
+needs only the record model and the store can take them from the registry. Embedding the facade
+needs `mindcore-runtime`, which is `publish = false`, so the family comes from one source: the git
+entries above, whose revision `Cargo.lock` records. A registry `mindcore-base` beside a git
+`mindcore-runtime` would load two copies of the same types.
 
 ## 1. Create a Mind
 
@@ -280,8 +287,9 @@ bounded, and a collection over 512 live entries answers the store's own
 
 ## 7. Deliberate, when the host supplies a reasoner
 
-`deliberate` takes a target and the evidence the verdict may rest on — no subject — and stamps the
-Mind's id as the assessment context:
+`deliberate` is not in `mind_facade`: the example assembles no providers, and the call needs the
+host's `Reasoner` before it can complete. It takes a target and the evidence the verdict may rest
+on — no subject — and stamps the Mind's id as the assessment context:
 
 ```rust
 use std::time::Duration;

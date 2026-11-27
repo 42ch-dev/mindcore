@@ -160,6 +160,9 @@ on a **multi-thread** runtime. A single-thread runtime cannot run the callback's
 ### Assemble, then register
 
 ```rust
+use spoke_connect::remote::{connect_responder, ConnectResponderOptions, RemoteIdentity};
+use spoke_operations::SpokeResult;
+
 let surface = match serve.surface(faces).await {
     SpokeResult::Ok(surface) => surface,
     SpokeResult::Reject(reject) => return Err(reject.into()),

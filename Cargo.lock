@@ -2137,7 +2137,9 @@ dependencies = [
  "serde_json",
  "spoke-operations",
  "spoke-schemas",
+ "sqlx",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

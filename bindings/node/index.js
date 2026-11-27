@@ -7,16 +7,28 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The addon's file name as cargo writes it, per platform: a `cdylib` is
-// `libmindcore_binding.{dylib,so}` on macOS and Linux, `mindcore_binding.dll` on Windows.
+/**
+ * The hosts this package declares, matching `package.json`'s `os` field; the artifact names below
+ * are keyed by exactly these entries, so the two cannot drift. A host missing here is refused by
+ * name, which is the truth, rather than being told the addon is unbuilt.
+ *
+ * `darwin` is declared and unexercised by CI: the workflow runs `ubuntu-latest` only. It is a
+ * supported host whose addon name is known, not one whose build and test path CI has proven.
+ */
+export const PLATFORMS = ['darwin', 'linux'];
+
+/** The addon's file name as cargo writes it, per declared platform. */
 const ARTIFACTS = {
   darwin: 'libmindcore_binding.dylib',
   linux: 'libmindcore_binding.so',
-  win32: 'mindcore_binding.dll',
 };
 
-/** What `package.json`'s `os` field declares: the hosts this package is built and tested on. */
-const SUPPORTED = ['darwin', 'linux'];
+// The table and the list cannot drift: every declared platform names an artifact.
+for (const platform of PLATFORMS) {
+  if (!ARTIFACTS[platform]) {
+    throw new Error(`no addon name for the declared platform ${platform}`);
+  }
+}
 
 /** The addon at one path, loaded under the name cargo gave it: nothing is copied or renamed. */
 function openAddon(path) {
@@ -37,20 +49,33 @@ function loadBinding() {
   const artifact = ARTIFACTS[process.platform];
   if (!artifact) {
     throw new Error(
-      `the mindcore binding ships for ${SUPPORTED.join(', ')}; ${process.platform} is not one of ` +
+      `the mindcore binding ships for ${PLATFORMS.join(', ')}; ${process.platform} is not one of ` +
         'them. A build for this host can still be named with MINDCORE_BINDING_PATH.',
     );
   }
-  const candidates = ['debug', 'release'].map((profile) =>
-    join(fileURLToPath(new URL('../../', import.meta.url)), 'target', profile, artifact),
-  );
-  for (const path of candidates) {
-    if (existsSync(path)) return openAddon(path);
+  const candidates = ['debug', 'release'].map((profile) => ({
+    profile,
+    path: join(fileURLToPath(new URL('../../', import.meta.url)), 'target', profile, artifact),
+  }));
+  const found = candidates.filter((candidate) => existsSync(candidate.path));
+  if (found.length === 0) {
+    throw new Error(
+      `the mindcore binding is not built: no addon at ${candidates.map((c) => c.path).join(', ')}; ` +
+        `build it with cargo build -p mindcore-binding. It ships for ${PLATFORMS.join(', ')}.`,
+    );
   }
-  throw new Error(
-    `the mindcore binding is not built: no addon at ${candidates.join(', ')}; ` +
-      `build it with cargo build -p mindcore-binding. It ships for ${SUPPORTED.join(', ')}.`,
-  );
+  // Debug wins, as it always has. When a release build also exists, say so once: a measurement
+  // that meant release must not silently run debug code, and the two paths are indistinguishable
+  // from the outside.
+  if (found.length > 1) {
+    process.emitWarning(
+      `the mindcore binding loaded the ${found[0].profile} addon at ${found[0].path}, ` +
+        `but a ${found[1].profile} build also exists at ${found[1].path}; ` +
+        'name MINDCORE_BINDING_PATH to choose one deliberately.',
+      'MindcoreBindingShadow',
+    );
+  }
+  return openAddon(found[0].path);
 }
 
 const binding = loadBinding();

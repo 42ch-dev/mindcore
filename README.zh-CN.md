@@ -56,13 +56,23 @@ binding 在自己的进程内调用 facade，而不是去连另一个进程；�
 
 ```toml
 [dependencies]
-mindcore-base = "0.1"
-mindcore-sqlite = "0.1"
+# facade 尚未发布，因此整个 mindcore family 取自本仓库的同一个 revision：
+# 把 registry 的 `mindcore-base` 与 git 的 `mindcore-runtime` 混用会得到同一套类型的第二份副本，
+# facade 不会接受它。
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
-spoke-operations = ">=0.19.1, <0.20.0"
-serde_json = "1"
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
 ```
+
+`mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 在 crates.io 上是 `0.1.0`，与这个 workspace
+声明的版本一致，因此 `"0.1"` 要求可以匹配；只需要记录模型与 store 的宿主可以直接从 registry 引入。
+facade 为 `publish = false`，因此这个示例把整个 family 从本仓库的同一个 revision 引入——把 registry
+的 `mindcore-base` 与 git 的 `mindcore-runtime` 混用会得到同一套类型的两份副本。
 
 ```rust
 use mindcore_base::boundary::CallerId;
@@ -92,6 +102,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }).await)?;
     let mind = ok(Mind::open(&store, &caller, &row.id).await)?;
 
+    // 宿主先写入 memory 写操作所需的 subject 行；`capture` 对未知 subject 回答 NOT_FOUND。
+    sqlx::query(
+        "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
+         VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(row.id.as_str())
+    .bind("wren")
+    .execute(&store.pool())
+    .await?;
+
     ok(mind.capture(&Capture {
         subject: "wren",
         context: None,
@@ -105,9 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-完整的故事——recall、对暂存 candidate 的 review、从共享 collection 采纳、怀疑、证据、共享变更、
-重新打开以及各种拒绝——见 [docs/quickstart.md](docs/quickstart.md)，同一串动作也由仓库 example
-断言：
+facade 路径——创建 Mind、capture、review、recall、写入 carrier 并读取推导出的 judgment，以及在
+宿主提供 reasoner 时 deliberate——见 [docs/quickstart.md](docs/quickstart.md)。完整的记录故事——
+采纳、怀疑、证据、共享变更、重新打开以及各种拒绝——由仓库 example 断言：
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
@@ -146,7 +166,9 @@ transport、身份、准入与 journal publisher。提供同样东西的嵌入�
 - **可解析的 provenance。** 被采纳的副本锚定到来源的 scope、entry 与 revision，并沿来源的
   retirement chain 解析，因此它命名的是存活终端，而不是已退休的中间跳。
 - **不可变的 migration。** 已发布的 migration 文件永不改变——lock 记录其 sha256——新 schema 以新增
-  文件追加。已应用 migration 仍与内嵌集合一致的数据库可以重开；否则会被拒绝，而不是被转换。
+  文件追加。已应用集合是内嵌集合前缀的数据库可以重开，追加的文件会被应用；内嵌集合不含的版本
+  （`VersionMissing`）、校验和发生变化的文件（`VersionMismatch`），以及会在已存在表上重跑的待应用
+  文件（`ExecuteMigration`），都会被拒绝，而不是被转换。
 
 `open` 接受与拒绝哪些数据库见[存储兼容性](docs/storage-compatibility.md)；其背后的版本策略见
 [SemVer](docs/semver.md)。
@@ -154,8 +176,8 @@ transport、身份、准入与 journal publisher。提供同样东西的嵌入�
 ## 状态与边界
 
 - **alpha，且大多未发布。** `mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 已发布到
-  crates.io，registry 上目前是 alpha 版本。`mindcore-spoke`、`mindcore-runtime`、
-  `mindcore-daemon` 与 `mindcore-binding` 均为 `publish = false`，由本仓库引入。
+  crates.io 的 `0.1.0`；`mindcore-spoke`、`mindcore-runtime`、`mindcore-daemon` 与
+  `mindcore-binding` 均为 `publish = false`，由本仓库引入。
 - **只到 Mind 层。** facade 与 served surface 只暴露 Mind 层操作。其下的 space 层能力属于尚未暴露
   的高级表面，尚未按 Mind 提供的操作也不会被组合。
 - **没有 HTTP 表面。** 本仓库不含任何 HTTP listener、route 或 request type；跨进程契约是
