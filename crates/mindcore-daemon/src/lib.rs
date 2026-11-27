@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod lock;
+pub mod transport;
 
 /// A start failure, which `main` maps to the process exit code.
 #[derive(Debug, thiserror::Error)]
