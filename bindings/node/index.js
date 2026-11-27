@@ -7,27 +7,49 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ARTIFACT = `libmindcore_binding.${process.platform === 'darwin' ? 'dylib' : 'so'}`;
+// The addon's file name as cargo writes it, per platform: a `cdylib` is
+// `libmindcore_binding.{dylib,so}` on macOS and Linux, `mindcore_binding.dll` on Windows.
+const ARTIFACTS = {
+  darwin: 'libmindcore_binding.dylib',
+  linux: 'libmindcore_binding.so',
+  win32: 'mindcore_binding.dll',
+};
+
+/** What `package.json`'s `os` field declares: the hosts this package is built and tested on. */
+const SUPPORTED = ['darwin', 'linux'];
+
+/** The addon at one path, loaded under the name cargo gave it: nothing is copied or renamed. */
+function openAddon(path) {
+  const addon = new Module(path, null);
+  process.dlopen(addon, path);
+  return addon.exports;
+}
 
 /** The addon: the one path `MINDCORE_BINDING_PATH` names, else the debug build, else release. */
 function loadBinding() {
   const explicit = process.env.MINDCORE_BINDING_PATH;
-  const candidates = explicit
-    ? [explicit]
-    : ['debug', 'release'].map((profile) =>
-        join(fileURLToPath(new URL('../../', import.meta.url)), 'target', profile, ARTIFACT),
-      );
+  if (explicit) {
+    if (!existsSync(explicit)) {
+      throw new Error(`MINDCORE_BINDING_PATH names ${explicit}, which does not exist`);
+    }
+    return openAddon(explicit);
+  }
+  const artifact = ARTIFACTS[process.platform];
+  if (!artifact) {
+    throw new Error(
+      `the mindcore binding ships for ${SUPPORTED.join(', ')}; ${process.platform} is not one of ` +
+        'them. A build for this host can still be named with MINDCORE_BINDING_PATH.',
+    );
+  }
+  const candidates = ['debug', 'release'].map((profile) =>
+    join(fileURLToPath(new URL('../../', import.meta.url)), 'target', profile, artifact),
+  );
   for (const path of candidates) {
-    if (!existsSync(path)) continue;
-    // `process.dlopen` on a fresh module loads the addon under the name cargo gave it, so
-    // nothing is copied or renamed.
-    const addon = new Module(path, null);
-    process.dlopen(addon, path);
-    return addon.exports;
+    if (existsSync(path)) return openAddon(path);
   }
   throw new Error(
     `the mindcore binding is not built: no addon at ${candidates.join(', ')}; ` +
-      'build it with cargo build -p mindcore-binding',
+      `build it with cargo build -p mindcore-binding. It ships for ${SUPPORTED.join(', ')}.`,
   );
 }
 
@@ -61,7 +83,7 @@ export class MindcoreClient {
     return new MindcoreClient(settle(await binding.openClient(options)));
   }
 
-  async createMind(options) {
+  async createMind(options = {}) {
     return new MindView(settle(await binding.clientCreateMind(this.#handle, options)));
   }
 
