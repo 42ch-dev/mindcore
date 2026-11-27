@@ -20,11 +20,16 @@ path = "src/main.rs"
 async-trait.workspace = true
 # `shutdown(2)` on the socket's own descriptor: teardown must not queue behind a blocked writer.
 libc = "0.2"
+mindcore-base = { path = "../mindcore-base", version = "0.1.0" }
+mindcore-runtime = { path = "../mindcore-runtime", version = "0.1.0" }
 mindcore-sqlite = { path = "../mindcore-sqlite", version = "0.1.0" }
 serde.workspace = true
+serde_json.workspace = true
 spoke-connect = { workspace = true, features = ["remote-adapter"] }
+spoke-operations.workspace = true
+spoke-schemas.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "sync", "io-util", "time"] }
+tokio = { workspace = true, features = ["net", "sync", "io-util", "time", "signal"] }
 # `parse` + `serde` are all the daemon reads; no TOML is ever written.
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 

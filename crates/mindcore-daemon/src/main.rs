@@ -3,14 +3,13 @@
 //! Every phase begins only after the previous one succeeded, so a failed start leaves nothing
 //! behind and a daemon that exits non-zero has bound no socket.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mindcore_daemon::config;
 use mindcore_daemon::lock::StoreLock;
+use mindcore_daemon::serve;
 use mindcore_daemon::DaemonError;
-use mindcore_sqlite::MindStore;
 
 const USAGE: &str = "\
 usage: mindcore-daemon --config <path>
@@ -44,39 +43,16 @@ async fn main() -> ExitCode {
     }
 }
 
-/// The start sequence: config, lock, store, journal root, then the serving phase.
+/// The start sequence: config, lock, then the serving phase, which owns the store, the journal
+/// root, the surface, the listener and the drain.
 async fn start(config_path: &Path) -> Result<(), DaemonError> {
     let config = config::load(config_path)?;
     // The lock precedes the store: `open` creates the file and runs the embedded migration, so a
     // second instance must be refused before it. The lock is a file of its own beside the store,
     // named for the store's inode, so every alias of the store contends on it while the store
     // itself stays unlocked for SQLite.
-    let _lock = StoreLock::acquire(&config.store_path)?;
-    let store = MindStore::open(&config.store_path)
-        .await
-        .map_err(|error| DaemonError::Store(format!("{}: {error}", config.store_path.display())))?;
-    journal_root(&config.journal.dir)?;
-
-    // The serving phase takes the assembled surface, the listener, the accept loop and the drain;
-    // until it exists the process must not report a clean start it cannot serve.
-    store.close().await;
-    Err(DaemonError::Surface(
-        "the serving phase is not built into this binary".into(),
-    ))
-}
-
-/// Creates the journal root and syncs its parent, so the new directory is durable before the first
-/// publication writes into it.
-fn journal_root(dir: &Path) -> Result<(), DaemonError> {
-    std::fs::create_dir_all(dir)
-        .map_err(|error| DaemonError::Journal(format!("{}: {error}", dir.display())))?;
-    let parent = match dir.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    File::open(parent)
-        .and_then(|parent| parent.sync_all())
-        .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))
+    let lock = StoreLock::acquire(&config.store_path)?;
+    serve::run(config, lock).await
 }
 
 /// `--config <path>`, or `--help` answering `None`.

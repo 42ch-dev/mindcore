@@ -160,7 +160,7 @@ impl DaemonConfig {
 ///
 /// The messages name the failure and the observed length only: the same helper decodes the
 /// responder's private seed, and an error reaches stderr through `main`.
-fn hex32(value: &str) -> Result<[u8; 32], String> {
+pub(crate) fn hex32(value: &str) -> Result<[u8; 32], String> {
     let mut digits = Vec::with_capacity(64);
     for byte in value.bytes() {
         let digit = match byte {
