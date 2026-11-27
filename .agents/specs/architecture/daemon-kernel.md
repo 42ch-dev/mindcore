@@ -69,8 +69,9 @@ missing, when a key is unknown, when a hex value is not 64 hex digits, when `hos
 `store_path` must resolve as well: one that does not is refused at `resolve` with the same exit
 code.
 
-A fault in `identity.seed_file` never prints the seed. The message names the key and the observed
-length only, because `main` prints it and the seed is a private key.
+A fault in `identity.seed_file` never prints the seed. The two faults read differently and neither
+carries bytes: a group/other permission bit names the path and the observed mode; a malformed seed
+names the key and the observed length. `main` prints the message, and the seed is a private key.
 
 | Exit code | Meaning |
 |---|---|
