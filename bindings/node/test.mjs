@@ -2,7 +2,7 @@
 // mind_facade.rs` through `index.js`, then the three refusals that are cheapest to get wrong.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -125,6 +125,72 @@ describe('the in-process binding', () => {
         assert.equal(error.code, 'INVALID_INPUT');
         return true;
       },
+    );
+  });
+
+  it('refuses ensureSubject for a caller without a grant on that Mind', async () => {
+    // The binding performs no authorization of its own: the adapter's admission answers, so the
+    // refusal arrives with its own code rather than one the binding invented.
+    const owner = await open('authorized');
+    const mind = await owner.createMind({ displayName: 'Wren' });
+    const stranger = await MindcoreClient.open({
+      storePath: join(root, 'authorized.db'),
+      callerId: 'caller_stranger',
+      journalDir: join(root, 'authorized-journal'),
+    });
+    await assert.rejects(
+      () => stranger.ensureSubject(mind.id, SUBJECT),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'NOT_AUTHORIZED');
+        return true;
+      },
+    );
+  });
+
+  it('keeps a relative journal root pointing where it did at open', async () => {
+    // A relative root names the directory that was current at open. The client retains the
+    // resolved absolute path, so a later working-directory change cannot move the publication.
+    const previous = process.cwd();
+    const elsewhere = mkdtempSync(join(tmpdir(), 'mindcore-elsewhere-'));
+    const journalName = 'relative-journal';
+    let mind;
+    let candidateId;
+    try {
+      process.chdir(root);
+      const client = await MindcoreClient.open({
+        storePath: join(root, 'relative.db'),
+        callerId: CALLER,
+        journalDir: journalName,
+      });
+      mind = await client.createMind({ displayName: 'Relative' });
+      await client.ensureSubject(mind.id, SUBJECT);
+      const captured = await mind.capture({
+        subject: SUBJECT,
+        content: { text: TEXT },
+        idempotencyKey: 'cap-relative',
+      });
+      candidateId = captured.result.candidate_ids[0];
+    } finally {
+      process.chdir(previous);
+    }
+
+    // The publication happens with the process elsewhere: only a root resolved at open lands in
+    // the directory the root named.
+    process.chdir(elsewhere);
+    try {
+      await mind.review(candidateId, { action: 'promote' }, 'rev-relative');
+    } finally {
+      process.chdir(previous);
+    }
+
+    assert.ok(
+      existsSync(join(root, journalName, 'records')),
+      'the review published under the root the open named, not the directory current at review',
+    );
+    assert.ok(
+      !existsSync(join(elsewhere, journalName)),
+      'the directory current at publication gained nothing',
     );
   });
 });

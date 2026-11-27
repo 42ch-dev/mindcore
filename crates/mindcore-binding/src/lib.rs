@@ -9,6 +9,7 @@
 //! function of `mindcore-runtime`. The one transaction it opens itself is `ensureSubject`'s, the
 //! host duty a memory write needs before `capture`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -273,24 +274,31 @@ impl MindcoreClient {
 
 /// Open the one store file this client serves.
 ///
-/// `journalDir`, when given, is created and its entry made durable here: that is the host duty
-/// `journalDir` requires, because the publisher serves an existing root and never creates it.
+/// `journalDir`, when given, is created, resolved and its whole chain made durable here: that is
+/// the host duty `journalDir` requires, because the publisher serves an existing root and never
+/// creates it. The **resolved absolute** path is what the client retains, so every later
+/// publication lands under the root the caller named at open even after the process changes its
+/// working directory — a relative root means one directory then, and that directory afterwards.
 #[napi]
 pub async fn open_client(options: ClientOptions) -> ClientResult {
-    if let Some(dir) = &options.journal_dir {
-        if let Err(error) = durable_root(Path::new(dir)) {
-            return ClientResult::refused(&SpokeReject {
-                code: SpokeRejectCode::InternalError,
-                message: format!("the journal root {dir} is not durable: {error}"),
-                details: None,
-            });
-        }
-    }
+    let journal_root = match &options.journal_dir {
+        Some(dir) => match durable_root(Path::new(dir)) {
+            Ok(resolved) => Some(resolved),
+            Err(error) => {
+                return ClientResult::refused(&SpokeReject {
+                    code: SpokeRejectCode::InternalError,
+                    message: format!("the journal root {dir} is not durable: {error}"),
+                    details: None,
+                })
+            }
+        },
+        None => None,
+    };
     match MindStore::open(Path::new(&options.store_path)).await {
         Ok(store) => ClientResult::answered(MindcoreClient {
             store: Arc::new(store),
             caller: CallerId::new(options.caller_id),
-            journal_root: options.journal_dir.map(PathBuf::from),
+            journal_root,
         }),
         Err(error) => ClientResult::refused(&SpokeReject {
             code: SpokeRejectCode::InternalError,
@@ -482,6 +490,24 @@ pub async fn mind_knowledge_get(view: &MindView, entry_id: String, revision: Opt
     settle(view.mind.knowledge_get(&entry_id, revision).await)
 }
 
+/// One knowledge entry as JavaScript supplied it, decoded into its published type. Anything the
+/// wire type refuses to decode is the caller's `INVALID_INPUT`, naming the member.
+fn knowledge_entry(value: Value) -> SpokeResult<KnowledgeEntry> {
+    match serde_json::from_value(value) {
+        Ok(entry) => SpokeResult::Ok(entry),
+        Err(error) => invalid_input(format!("entry is not a knowledge entry: {error}")),
+    }
+}
+
+/// One review decision as JavaScript supplied it: the wire type's `decision` member, tagged on
+/// `action`.
+fn review_decision(value: Value) -> SpokeResult<ReviewDecision> {
+    match serde_json::from_value(value) {
+        Ok(decision) => SpokeResult::Ok(decision),
+        Err(error) => invalid_input(format!("decision is not a review decision: {error}")),
+    }
+}
+
 /// Write one entry of this Mind's collection, against the revision the caller read it at.
 #[napi]
 pub async fn mind_knowledge_put(
@@ -495,12 +521,10 @@ pub async fn mind_knowledge_put(
             return settle::<KnowledgeEntry>(SpokeResult::Reject(reject))
         }
     };
-    let entry: KnowledgeEntry = match serde_json::from_value(entry) {
-        Ok(entry) => entry,
-        Err(error) => {
-            return settle::<KnowledgeEntry>(invalid_input(format!(
-                "entry is not a knowledge entry: {error}"
-            )))
+    let entry = match knowledge_entry(entry) {
+        SpokeResult::Ok(entry) => entry,
+        SpokeResult::Reject(reject) => {
+            return settle::<KnowledgeEntry>(SpokeResult::Reject(reject))
         }
     };
     settle(view.mind.knowledge_put(entry, expected).await)
@@ -540,12 +564,10 @@ pub async fn mind_review(
     decision: Value,
     idempotency_key: String,
 ) -> Value {
-    let decision: ReviewDecision = match serde_json::from_value(decision) {
-        Ok(decision) => decision,
-        Err(error) => {
-            return settle::<MemoryCandidatesReviewResponse>(invalid_input(format!(
-                "decision is not a review decision: {error}"
-            )))
+    let decision = match review_decision(decision) {
+        SpokeResult::Ok(decision) => decision,
+        SpokeResult::Reject(reject) => {
+            return settle::<MemoryCandidatesReviewResponse>(SpokeResult::Reject(reject))
         }
     };
     settle(
@@ -580,26 +602,31 @@ pub async fn mind_cognition_read(view: &MindView) -> Value {
 }
 
 /// The host duty a journal root requires: the root exists, and every entry on the way to it is
-/// durable before the first publication writes into it.
+/// durable before the first publication writes into it. Answers the absolute path it resolved to,
+/// which is the root the caller must retain.
 ///
-/// One walk over the path as configured, from the filesystem root down to the root itself. For
-/// each level `L`:
+/// Two walks, both idempotent — not first-creation-only, because nothing records which entry a
+/// failed start left unproven, so a restart redoes both:
 ///
-/// 1. `L` is created when missing, and refused under its own name when it is not a directory.
-/// 2. The entry naming `L` in the directory that holds it is flushed — the configured spelling,
-///    which is what the publisher is handed.
-/// 3. `L` is resolved, and when it resolves somewhere else — a symlink at *this* depth, not only
-///    the leaf — the entry naming the resolved path in *its* directory is flushed too. A crash
-///    that lost either entry would leave one of the two spellings unreachable.
+/// 1. The configured spelling, from the filesystem root down to `root`: each level is created when
+///    missing, refused under its own name when it is not a directory, and the entry naming it in
+///    the directory that holds it is flushed.
+/// 2. The resolved chain, from `root`'s canonical form up to the filesystem root: the entry naming
+///    each level in its own holding directory is flushed as well.
 ///
-/// The walk is idempotent, not first-creation-only: every level has its parents synced
-/// unconditionally, including levels that already existed and levels an earlier start created but
-/// never proved durable. Nothing records which entry a failed start left unproven, so a restart
-/// redoes the whole chain. A path with no symlink resolves to itself, so step 3 adds nothing there.
+/// The second walk is what makes a symlink safe at any depth. `/existing/link` resolving to
+/// `/other/new/real` puts `new` — the directory holding `real`'s entry — outside every name the
+/// configured walk visited, so walk 1 alone can report success while a crash loses the entry a
+/// successful publication depended on. A path with no symlink resolves to itself, and the second
+/// walk then repeats only entries the first already flushed.
 ///
-/// A level another process created between the look and the `create_dir` is not a failure:
-/// `AlreadyExists` is the same outcome, and the entry still gets its sync.
-fn durable_root(root: &Path) -> std::io::Result<()> {
+/// An entry is flushed at most once per call: the two walks overlap on every ancestor of the
+/// configured root, and a directory `fsync` is idempotent anyway. A level another process created
+/// between the look and the `create_dir` is not a failure — `AlreadyExists` is the same outcome,
+/// and the entry still gets its sync. A resolution failure after creation is a journal fault
+/// naming the path: nothing can be published under a root whose real name is unknown.
+fn durable_root(root: &Path) -> std::io::Result<PathBuf> {
+    let mut synced: HashSet<PathBuf> = HashSet::new();
     // Leaf first, so the same vector serves the top-down pass in reverse.
     let mut chain: Vec<&Path> = Vec::new();
     let mut cursor = Some(root);
@@ -629,17 +656,36 @@ fn durable_root(root: &Path) -> std::io::Result<()> {
             Err(error) => return Err(error),
         }
         if let Some(parent) = holding_directory(level) {
-            sync_parent(parent)?;
+            sync_once(parent, &mut synced)?;
         }
-        // A symlink at this level: the resolved path's entry needs the same flush. `L` exists by
-        // now, so a resolution that fails leaves nothing to sync here.
-        if let Ok(resolved) = std::fs::canonicalize(level) {
-            if resolved.as_path() != *level {
-                if let Some(parent) = resolved.parent() {
-                    sync_parent(parent)?;
-                }
-            }
+    }
+    let resolved = std::fs::canonicalize(root).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "the journal root {} cannot be resolved after it was created: {error}",
+                root.display()
+            ),
+        )
+    })?;
+    let mut resolved_chain: Vec<&Path> = Vec::new();
+    let mut cursor = Some(resolved.as_path());
+    while let Some(level) = cursor {
+        resolved_chain.push(level);
+        cursor = level.parent();
+    }
+    for level in resolved_chain {
+        if let Some(parent) = holding_directory(level) {
+            sync_once(parent, &mut synced)?;
         }
+    }
+    Ok(resolved)
+}
+
+/// [`sync_parent`], skipped for a directory this call has already flushed.
+fn sync_once(parent: &Path, synced: &mut HashSet<PathBuf>) -> std::io::Result<()> {
+    if synced.insert(parent.to_path_buf()) {
+        sync_parent(parent)?;
     }
     Ok(())
 }
@@ -741,8 +787,8 @@ fn create_concurrently(level: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        durable_root, optional_revision, settle, whole_number, BINDING_DEFECT, CREATE_CONCURRENTLY,
-        INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
+        durable_root, knowledge_entry, occurred_at, optional_revision, review_decision, settle,
+        whole_number, BINDING_DEFECT, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
     };
     use std::path::{Path, PathBuf};
 
@@ -803,6 +849,66 @@ mod tests {
                 .is_some_and(|message| message.contains("Unserializable")),
             "the message names what could not be serialized: {answer}"
         );
+    }
+
+    /// One conversion's refusal as its code and message; the value type differs per conversion.
+    fn refusal_of<T>(
+        convert: impl Fn() -> spoke_operations::SpokeResult<T>,
+    ) -> (spoke_operations::SpokeRejectCode, String) {
+        match convert() {
+            spoke_operations::SpokeResult::Reject(reject) => (reject.code, reject.message),
+            spoke_operations::SpokeResult::Ok(_) => panic!("the conversion accepted a bad member"),
+        }
+    }
+
+    /// Every argument that is not of the type its export declares is the caller's own
+    /// `INVALID_INPUT`, refused before any facade call, with the member named. A revision is
+    /// covered below; these are the other three conversions the exports perform.
+    #[test]
+    fn a_member_of_the_wrong_shape_is_invalid_input_naming_the_member() {
+        use serde_json::json;
+        use spoke_operations::{SpokeRejectCode, SpokeResult};
+
+        let refusals = [
+            (
+                "occurredAt",
+                refusal_of(|| occurred_at(Some("not-a-timestamp"))),
+            ),
+            (
+                "entry",
+                refusal_of(|| knowledge_entry(json!({ "no_entry_id": true }))),
+            ),
+            (
+                "decision",
+                refusal_of(|| review_decision(json!({ "action": "maybe" }))),
+            ),
+        ];
+        for (member, (code, message)) in refusals {
+            assert_eq!(code, SpokeRejectCode::InvalidInput, "{member}: {message}");
+            assert!(
+                message.contains(member),
+                "the refusal names {member}: {message}"
+            );
+        }
+
+        // The accepting side of the same three conversions, so the refusals above are the
+        // conversion's own rather than a helper that always rejects.
+        assert!(matches!(
+            occurred_at(Some("2026-01-01T00:30:00Z")),
+            SpokeResult::Ok(Some(_))
+        ));
+        assert!(matches!(occurred_at(None), SpokeResult::Ok(None)));
+        assert!(matches!(
+            knowledge_entry(json!({
+                "body": {}, "canonical_name": "c", "entry_id": "e", "entry_type": "t",
+                "extensions": {}, "schema_version": 1, "status": "confirmed",
+            })),
+            SpokeResult::Ok(_)
+        ));
+        assert!(matches!(
+            review_decision(json!({ "action": "promote" })),
+            SpokeResult::Ok(_)
+        ));
     }
 
     /// A revision arrives as a JavaScript `number`: only a finite, whole, non-negative one below
@@ -1037,20 +1143,93 @@ mod tests {
     }
 
     /// `Path::new("journal").parent()` is the empty path, which names the current directory: a
-    /// single-segment relative root is created there and its entry synced, not skipped.
+    /// single-segment relative root is created there, its entry synced, and answered as the
+    /// absolute path it named — which is what the client retains, so a later working-directory
+    /// change cannot move a publication.
+    ///
+    /// The working directory is process-wide, so the tests that set it hold `CWD` and no other
+    /// test touches it.
     #[test]
-    fn a_single_segment_relative_root_is_created_and_synced() {
-        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+    fn a_relative_root_resolves_to_the_directory_it_was_named_in() {
+        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = tempfile::TempDir::new().expect("a scratch directory");
+        let second = tempfile::TempDir::new().expect("another scratch directory");
+        let first_path = canonical(first.path());
+        let second_path = canonical(second.path());
         let previous = std::env::current_dir().expect("a current directory");
-        std::env::set_current_dir(scratch.path()).expect("enter the scratch directory");
-        let result = durable_root(Path::new("journal"));
-        let created = Path::new("journal").is_dir();
-        std::env::set_current_dir(&previous).expect("leave the scratch directory");
 
-        result.expect("a relative root starts");
+        std::env::set_current_dir(&first_path).expect("enter the first directory");
+        let resolved = durable_root(Path::new("journal"));
+        std::env::set_current_dir(&second_path).expect("enter the second directory");
+        let created_here = Path::new("journal").is_dir();
+        std::env::set_current_dir(&previous).expect("leave the scratch directories");
+
+        assert_eq!(
+            resolved.expect("a relative root starts"),
+            first_path.join("journal"),
+            "a relative root is answered as the absolute path it named"
+        );
         assert!(
-            created,
-            "the relative root is created in the current directory"
+            first_path.join("journal").is_dir(),
+            "the relative root is created in the directory that was current"
+        );
+        assert!(
+            !created_here,
+            "the directory entered afterwards gained nothing: the root was resolved once"
+        );
+    }
+
+    /// The resolved chain, not only the configured one: `/existing/link` resolving to
+    /// `/other/new/real` puts `new` — the directory holding `real`'s entry — outside every name the
+    /// configured path visits. The configured walk cannot flush it, so only the second walk can.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_another_directory_syncs_the_targets_whole_chain() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let scratch_path = canonical(scratch.path());
+        let configured = scratch_path.join("configured");
+        let other = scratch_path.join("other");
+        let link_target = other.join("new").join("real");
+        std::fs::create_dir(&configured).expect("the configured chain's directory");
+        std::fs::create_dir_all(other.join("new")).expect("the target's parent");
+        std::fs::create_dir(&link_target).expect("the link target");
+        let link = configured.join("link");
+        std::os::unix::fs::symlink(&link_target, &link).expect("the symlink");
+        let holding_new = other.join("new");
+        let holding_other = other.clone();
+        let new_before = syncs_of(&holding_new);
+        let other_before = syncs_of(&holding_other);
+
+        let resolved = durable_root(&link.join("journal")).expect("the root through the link");
+
+        assert_eq!(resolved, link_target.join("journal"));
+        assert!(
+            syncs_of(&holding_new) > new_before,
+            "the directory holding the resolved level is synced, though no configured name visits it"
+        );
+        assert!(
+            syncs_of(&holding_other) > other_before,
+            "every ancestor of the resolved root is synced, not only its deepest level"
+        );
+    }
+
+    /// One call flushes an entry once. The two walks overlap on every ancestor of the configured
+    /// root; the count pins that the overlap is not re-synced.
+    #[test]
+    fn an_entry_shared_by_both_walks_is_flushed_once() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let scratch_path = canonical(scratch.path());
+        let root = scratch_path.join("a").join("journal");
+        std::fs::create_dir(scratch_path.join("a")).expect("the level");
+        let before = syncs_of(&scratch_path);
+
+        durable_root(&root).expect("a root with no symlink starts");
+
+        assert_eq!(
+            syncs_of(&scratch_path),
+            before + 1,
+            "the shared ancestor is flushed once, not once per walk"
         );
     }
 }

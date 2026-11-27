@@ -184,6 +184,11 @@ export interface Cognition {
 /** A facade refusal: a SPOKE wire code, a message and the refusal's structured payload. */
 export declare class MindcoreError extends Error {
   /**
+   * Built by `settle` for each refusal; a caller reads one, never constructs one. The JavaScript
+   * constructor takes the refusal's three members in that order.
+   */
+  constructor(code: string, message: string, details?: unknown);
+  /**
    * The SPOKE wire code of the refusal (`NOT_FOUND`, `STORED_REVISION_STALE`, …), or
    * `BINDING_DEFECT` for an answer this addon could not render. Not a closed union: the facade
    * keeps adding codes, and a defect is not a refusal.
@@ -194,16 +199,20 @@ export declare class MindcoreError extends Error {
 }
 
 export declare class MindcoreClient {
+  /** Only `MindcoreClient.open` builds one: the constructor takes the addon's opaque handle. */
+  private constructor(handle: object);
   /** Open the one store file this client serves. */
   static open(options: MindcoreClientOptions): Promise<MindcoreClient>;
   createMind(options?: CreateMindOptions): Promise<MindView>;
   listMinds(): Promise<MindInfo[]>;
   getMind(id: string): Promise<MindView>;
-  /** Provision the subject row a memory write needs. */
+  /** Provision the subject row a memory write needs; the adapter's admission authorizes it. */
   ensureSubject(mindId: string, subjectId: string): Promise<void>;
 }
 
 export declare class MindView {
+  /** Only `createMind` and `getMind` build one: the constructor takes the addon's opaque handle. */
+  private constructor(handle: object);
   /** The Mind's registry id, read at open. */
   readonly id: string;
   /** The entry in the Mind's collection that holds its current judgment. */
