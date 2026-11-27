@@ -166,7 +166,9 @@ transport、身份、准入与 journal publisher。提供同样东西的嵌入�
 - **可解析的 provenance。** 被采纳的副本锚定到来源的 scope、entry 与 revision，并沿来源的
   retirement chain 解析，因此它命名的是存活终端，而不是已退休的中间跳。
 - **不可变的 migration。** 已发布的 migration 文件永不改变——lock 记录其 sha256——新 schema 以新增
-  文件追加。已应用 migration 仍与内嵌集合一致的数据库可以重开；否则会被拒绝，而不是被转换。
+  文件追加。已应用集合是内嵌集合前缀的数据库可以重开，追加的文件会被应用；内嵌集合不含的版本
+  （`VersionMissing`）、校验和发生变化的文件（`VersionMismatch`），以及会在已存在表上重跑的待应用
+  文件（`ExecuteMigration`），都会被拒绝，而不是被转换。
 
 `open` 接受与拒绝哪些数据库见[存储兼容性](docs/storage-compatibility.md)；其背后的版本策略见
 [SemVer](docs/semver.md)。
@@ -174,8 +176,8 @@ transport、身份、准入与 journal publisher。提供同样东西的嵌入�
 ## 状态与边界
 
 - **alpha，且大多未发布。** `mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 已发布到
-  crates.io，registry 上目前是 alpha 版本。`mindcore-spoke`、`mindcore-runtime`、
-  `mindcore-daemon` 与 `mindcore-binding` 均为 `publish = false`，由本仓库引入。
+  crates.io 的 `0.1.0`；`mindcore-spoke`、`mindcore-runtime`、`mindcore-daemon` 与
+  `mindcore-binding` 均为 `publish = false`，由本仓库引入。
 - **只到 Mind 层。** facade 与 served surface 只暴露 Mind 层操作。其下的 space 层能力属于尚未暴露
   的高级表面，尚未按 Mind 提供的操作也不会被组合。
 - **没有 HTTP 表面。** 本仓库不含任何 HTTP listener、route 或 request type；跨进程契约是

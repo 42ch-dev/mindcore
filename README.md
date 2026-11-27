@@ -179,8 +179,10 @@ The obligations the host takes, the `ServeFaces` fields and the served-operation
   resolves through the source's retirement chain, so it names the live terminal rather than a
   retired hop.
 - **Immutable migrations.** A published migration file never changes — the lock records its
-  sha256 — and new schema arrives as appended files. A database whose applied migrations still
-  match the embedded set reopens; anything else is refused rather than converted.
+  sha256 — and new schema arrives as appended files. A database whose applied set is a prefix of
+  the embedded set reopens, and the appended files are applied; a version the embedded set does not
+  contain (`VersionMissing`), a changed checksum (`VersionMismatch`) or a pending file that reruns
+  over tables already present (`ExecuteMigration`) is refused rather than converted.
 
 What `open` accepts and refuses is [storage compatibility](docs/storage-compatibility.md); the
 version policy behind it is [SemVer](docs/semver.md).
@@ -188,8 +190,8 @@ version policy behind it is [SemVer](docs/semver.md).
 ## Status and limits
 
 - **Alpha, and mostly unpublished.** `mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on
-  crates.io; the registry currently holds an alpha. `mindcore-spoke`, `mindcore-runtime`,
-  `mindcore-daemon` and `mindcore-binding` are `publish = false` and come from this repository.
+  crates.io at `0.1.0`; `mindcore-spoke`, `mindcore-runtime`, `mindcore-daemon` and
+  `mindcore-binding` are `publish = false` and come from this repository.
 - **Mind-level only.** The facade and the served surface expose Mind-level operations. The
   space-level capabilities beneath them are an advanced surface that is not exposed, and the
   operations not yet served per Mind are not composed.
