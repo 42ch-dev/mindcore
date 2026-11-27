@@ -360,17 +360,19 @@ call re-makes the same two decisions against the whole registry inside its trans
 
 **A claimable source id disables shared adoption, by design.** Mind creation accepts any
 authenticated peer claiming a free id (owner decision, `I-000155`), so a peer can register a Mind
-whose id is the configured source's `scope_id`. From that moment the call-time registry check refuses
-every fresh adoption execution — a copy execution entering the transaction — into every Mind,
-because the source is a registered Mind's id, which is exactly refusal five. A same-key same-digest
-reconnect that already holds a recorded outcome skips the port's in-transaction checks — this
-collision re-check and the grant check inside the transaction — and answers the recorded outcome
-unchanged. The admission's own grant read still runs, because Connect admits before it consults the
-dedup record, and that read is what refuses a revoked peer on every path, replay included. The
-failure is deliberate rather than a defect to narrow. Hosts that admit arbitrary peers must
-therefore treat a shared source's `scope_id` as reserved configuration: an id no peer can claim, and
-one they never hand out as a Mind id. `I-000155` owns the create semantics; this page owns only the
-consequence for a composed adoption face.
+whose id is the configured source's `scope_id`. From that moment the call-time registry check
+refuses every fresh adoption execution — a copy execution entering the transaction — into every
+Mind, because the source is a registered Mind's id, which is exactly refusal five. A same-key
+same-digest reconnect that already holds a recorded outcome skips the port's in-transaction checks —
+this collision re-check and the grant check inside the transaction — and is answered the recorded
+result with `outcome` normalized to `already_present`: every other member of that result is served
+as it was recorded, and nothing is re-derived from the store. The admission's own grant read still
+runs, because Connect admits before it consults the dedup record, and that read is what refuses a
+revoked peer on every path, replay included. The failure is deliberate rather than a defect to
+narrow. Hosts that admit arbitrary peers must therefore treat a shared source's `scope_id` as
+reserved configuration: an id no peer can claim, and one they never hand out as a Mind id.
+`I-000155` owns the create semantics; this page owns only the consequence for a composed adoption
+face.
 
 **The call-time `NOT_FOUND` cases.** Three request or registry states answer the same generic
 `NOT_FOUND` with no `details`, so a peer cannot tell them apart:

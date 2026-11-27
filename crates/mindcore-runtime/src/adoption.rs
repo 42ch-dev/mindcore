@@ -476,9 +476,16 @@ fn adopted(outcome: AdoptionOutcome) -> SpokeResult<KnowledgeAdoptResponse> {
 ///   checked; product-owned opaque bags are not protocol members and are skipped, as Connect skips
 ///   them;
 /// - the revision-typed members `[0, 2^53]`, which for a copy are the entry's own `revision` and
-///   its anchor's `source_revision`. A created copy is assigned by the store and the anchor is
-///   built from the request, so only a destination slot an earlier call filled can carry one above
-///   [`SERVED_REVISION_BOUND`].
+///   its anchor's `source_revision`.
+///
+/// Neither revision is guaranteed in range by construction: the anchor records the revision the
+/// copy was taken from, which is the stored source's on a retired branch and the request's on a
+/// live one, while the entry's own `revision` is whatever the destination row holds. This function
+/// therefore tests the value actually in hand rather than a value some earlier check is assumed to
+/// have bounded. It is the backstop, not the only fence: [`adopt_in`] refuses an unserveable stored
+/// terminal revision before any write on the branch where that stored value is what gets anchored,
+/// and this guard covers a destination slot an earlier call filled — including one a live source's
+/// request could never produce.
 fn unserveable(entry: &KnowledgeEntry) -> Option<String> {
     let anchored = [
         ("the entry", entry.schema_version.get()),
