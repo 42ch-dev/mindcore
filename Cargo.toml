@@ -6,6 +6,7 @@ members = [
     "crates/mindcore-sqlite",
     "crates/mindcore-spoke",
     "crates/mindcore-runtime",
+    "crates/mindcore-daemon",
 ]
 default-members = [
     "crates/mindcore-base",
@@ -13,6 +14,7 @@ default-members = [
     "crates/mindcore-sqlite",
     "crates/mindcore-spoke",
     "crates/mindcore-runtime",
+    "crates/mindcore-daemon",
 ]
 
 [workspace.package]
