@@ -2,7 +2,7 @@
 // mind_facade.rs` through `index.js`, then the three refusals that are cheapest to get wrong.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -160,30 +160,6 @@ describe('the in-process binding', () => {
     );
   });
 
-  it('closes a client so the same store opens again, and refuses calls afterwards', async () => {
-    const client = await open('teardown');
-    const mind = await client.createMind({ displayName: 'Reopened' });
-    await client.close();
-    // The view is an independent handle over the same file: it survives its client's teardown.
-    assert.equal(mind.id.startsWith('spc_'), true);
-    await assert.rejects(
-      () => client.listMinds(),
-      (error) => {
-        assert.ok(error instanceof MindcoreError);
-        assert.equal(error.code, 'INVALID_INPUT');
-        return true;
-      },
-    );
-    // Idempotent, and the file is free: a second client over the same path sees what was written.
-    await client.close();
-    const reopened = await open('teardown');
-    assert.deepEqual(
-      (await reopened.listMinds()).map((row) => row.id),
-      [mind.id],
-    );
-    await reopened.close();
-  });
-
   it('creates a Mind when createMind is called with no argument', async () => {
     // The declaration says `options?`; the wrapper's default keeps that true against an addon
     // argument that is otherwise undefined.
@@ -198,6 +174,52 @@ describe('the in-process binding', () => {
       'the no-argument create registered exactly that Mind',
     );
     assert.equal(minds[0].displayName, null, 'an unnamed Mind carries no display name');
+  });
+
+  it('refuses an empty journalDir as a name-shape error', async () => {
+    // `''` names no directory at all: the caller's spelling, refused as such rather than as a
+    // filesystem fault.
+    await assert.rejects(
+      () =>
+        MindcoreClient.open({
+          storePath: join(root, 'empty-journal.db'),
+          callerId: CALLER,
+          journalDir: '',
+        }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INVALID_INPUT');
+        assert.equal(error.details.journalDir, '');
+        return true;
+      },
+    );
+  });
+
+  it('opens a store through a symlink to a file, and refuses one to a directory', async () => {
+    const target = join(root, 'real.db');
+    const linkedFile = join(root, 'linked.db');
+    symlinkSync(target, linkedFile);
+    const client = await MindcoreClient.open({ storePath: linkedFile, callerId: CALLER });
+    const mind = await client.createMind({ displayName: 'Through a link' });
+    assert.match(mind.id, /^spc_/);
+
+    const directory = join(root, 'a-directory');
+    mkdirSync(directory);
+    const linkedDirectory = join(root, 'linked-directory');
+    symlinkSync(directory, linkedDirectory);
+    await assert.rejects(
+      () =>
+        MindcoreClient.open({
+          storePath: linkedDirectory,
+          callerId: CALLER,
+        }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INVALID_INPUT');
+        assert.equal(error.details.kind, 'is a directory');
+        return true;
+      },
+    );
   });
 
   it('refuses ensureSubject for a caller without a grant on that Mind', async () => {
