@@ -5,12 +5,16 @@
 //! `SIGTERM` or `SIGINT` — the drain.
 //!
 //! The surface is assembled once and shared by every connection. Each accepted stream gets its
-//! own transport and responder in a task of its own; the live responders sit in one collection
-//! that `drain` walks before the socket name is removed.
+//! own transport and responder in a task of its own, every task is owned by one `JoinSet`, and
+//! the live responders sit in one collection the drain walks. Nothing the daemon owns is ever
+//! unlinked: `socket_path` may not name the store or the seed file, checked before the start and
+//! again immediately before any stale name is removed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mindcore_base::knowledge::KnowledgeScope;
@@ -25,6 +29,7 @@ use spoke_operations::{spoke_ok, spoke_reject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::{HostCapabilityManifest, Principal};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::task::JoinSet;
 
 use crate::config::{hex32, DaemonConfig};
 use crate::lock::StoreLock;
@@ -40,7 +45,7 @@ struct Host {
     allowlist: Vec<String>,
     peer_keys: HashMap<String, [u8; 32]>,
     invoke_timeout_ms: Option<u64>,
-    /// The live responders `drain` walks; a connection removes its own entry when it ends.
+    /// The live responders the drain walks; a connection removes its own entry when it ends.
     live: Mutex<Vec<(usize, Arc<ConnectResponder>)>>,
 }
 
@@ -48,6 +53,9 @@ struct Host {
 ///
 /// The lock arrives held and is dropped last, after every live session has been told to close.
 pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonError> {
+    // Before anything is opened: a socket path naming a file the daemon owns would be unlinked by
+    // the stale-name recovery, so the config is refused while the store is still untouched.
+    refuse_owned_socket(&config)?;
     let store = MindStore::open(&config.store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", config.store_path.display())))?;
@@ -76,33 +84,48 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
     // serve until it was killed some other way and leave the name for no reason.
     let mut terminate = shutdown_signal(SignalKind::terminate())?;
     let mut interrupt = shutdown_signal(SignalKind::interrupt())?;
-    let host = Arc::new(Host {
+    let host = Arc::new(host(surface, &config)?);
+    let listener = listen(&config)?;
+
+    // Every accepted connection is owned by `connections`, so the drain can end each one rather
+    // than hope it finished setting up. Dropping the accept future drops the listener with it.
+    let mut connections: JoinSet<()> = JoinSet::new();
+    let serving = {
+        let accepting = accept(listener, &host, &mut connections);
+        tokio::pin!(accepting);
+        tokio::select! {
+            outcome = &mut accepting => outcome,
+            _ = terminate.recv() => Ok(()),
+            _ = interrupt.recv() => Ok(()),
+        }
+    };
+
+    // The drain, in the stated order. Closing first lets a session end its in-flight work; the
+    // shutdown then cancels whatever was still setting up — a task suspended in
+    // `connect_responder` or between its responder and its registration — so no responder can
+    // outlive this snapshot, and the second walk catches one registered inside that window.
+    let live = std::mem::take(&mut *host.live.lock().expect("live lock"));
+    drain_sessions(&live);
+    connections.shutdown().await;
+    drain_sessions(&std::mem::take(&mut *host.live.lock().expect("live lock")));
+    let removed = remove_socket(&config.socket_path);
+    // Step 4: the store's connections finish rather than being cut when the runtime drops. Inline
+    // so the pool's type stays the surface's business, not this module's.
+    pool.close().await;
+    drop(lock);
+    serving.and(removed)
+}
+
+/// The daemon's own wiring for one assembled surface.
+fn host(surface: Arc<MindcoreSurface>, config: &DaemonConfig) -> Result<Host, DaemonError> {
+    Ok(Host {
         surface,
         seed: crate::config::read_seed(&config.identity.seed_file)?,
         allowlist: config.peers.keys().cloned().collect(),
-        peer_keys: peer_keys(&config)?,
+        peer_keys: peer_keys(config)?,
         invoke_timeout_ms: config.invoke.timeout_ms,
         live: Mutex::new(Vec::new()),
-    });
-    let listener = listen(&config.socket_path)?;
-
-    let serving = tokio::select! {
-        outcome = accept(&listener, &host) => outcome,
-        _ = terminate.recv() => Ok(()),
-        _ = interrupt.recv() => Ok(()),
-    };
-
-    // Every exit path drains: a failed accept keeps the sessions it already accepted, and the
-    // socket name must not outlive the process that answers on it. The listener is dropped first
-    // so the accept loop ends before any session is closed.
-    drop(listener);
-    let live = std::mem::take(&mut *host.live.lock().expect("live lock"));
-    drain(&config.socket_path, &live);
-    // Step 4 of the drain order: the store's connections finish rather than being cut when the
-    // runtime drops. Inline so the pool's type stays the surface's business, not this module's.
-    pool.close().await;
-    drop(lock);
-    serving
+    })
 }
 
 /// Creates the journal root and syncs its parent, so the new directory is durable before the first
@@ -119,18 +142,34 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
         .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))
 }
 
-/// The accept loop; it ends when its listener is dropped, which `run` does before draining.
-async fn accept(listener: &UnixListener, host: &Arc<Host>) -> Result<(), DaemonError> {
+/// The accept loop; it ends when its listener is dropped, which happens when `run` drops this
+/// future, and reaps each connection task as it finishes.
+async fn accept(
+    listener: UnixListener,
+    host: &Arc<Host>,
+    connections: &mut JoinSet<()>,
+) -> Result<(), DaemonError> {
     let mut next_id = 0usize;
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            Err(error) => return Err(DaemonError::Socket(format!("accept: {error}"))),
-        };
-        let host = Arc::clone(host);
-        let id = next_id;
-        next_id += 1;
-        tokio::spawn(async move { serve_connection(stream, id, host).await });
+        tokio::select! {
+            accepted = listener.accept() => {
+                // An accept fault ends the loop; `run` drains what was already accepted and
+                // reports it, because a daemon that cannot accept is not serving.
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        return Err(DaemonError::Socket(format!("accept: {error}")))
+                    }
+                };
+                let host = Arc::clone(host);
+                let id = next_id;
+                next_id += 1;
+                // The set owns the task: dropping it aborts the task, and `run`'s drain joins.
+                connections.spawn(async move { serve_connection(stream, id, host).await });
+            }
+            // Finished sessions are reaped here, so a long-lived daemon does not accumulate them.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
     }
 }
 
@@ -148,21 +187,29 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
         invoke_timeout_ms: host.invoke_timeout_ms,
     };
     let responder = connect_responder(options).await;
-    // Before this task's own body can yield: a dialer may invoke an advertised tool as soon as
-    // its session is established, and the responder never installs handlers from the manifest.
-    // `register` is synchronous, so no lock of this module's is held across an `await`.
+    // Tracked before this task's next await, so the drain owns the session from the moment it
+    // exists: `connect_responder` spawned the responder's own task with an `Arc` of its own, and
+    // an aborted connection task would otherwise leave that session serving unclosed.
+    host.live
+        .lock()
+        .expect("live lock")
+        .push((id, Arc::clone(&responder)));
+    park_in_setup().await;
+    // A dialer may invoke an advertised tool as soon as its session is established, and the
+    // responder never installs handlers from the manifest. `register` is synchronous, so no lock
+    // of this module's is held across an `await`.
     if let SpokeResult::Reject(reject) = host.surface.register(&responder) {
         eprintln!(
             "mindcore-daemon: surface: {}: {}",
             reject.code, reject.message
         );
         responder.close();
+        host.live
+            .lock()
+            .expect("live lock")
+            .retain(|(live_id, _)| *live_id != id);
         return;
     }
-    host.live
-        .lock()
-        .expect("live lock")
-        .push((id, Arc::clone(&responder)));
     transport.closed().await;
     responder.close();
     host.live
@@ -170,6 +217,28 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
         .expect("live lock")
         .retain(|(live_id, _)| *live_id != id);
 }
+
+/// A test seam: when installed, a connection task parks here — after its responder is tracked and
+/// before it registers — so a drain can be driven while a session is still setting up.
+#[cfg(test)]
+static SETUP_PARK: Mutex<Option<SetupPark>> = Mutex::new(None);
+
+#[cfg(test)]
+struct SetupPark {
+    parked: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+#[cfg(test)]
+async fn park_in_setup() {
+    let seam = SETUP_PARK.lock().expect("setup seam lock").take();
+    let Some(mut seam) = seam else { return };
+    let _ = seam.parked.send(());
+    let _ = seam.resume.recv().await;
+}
+
+#[cfg(not(test))]
+async fn park_in_setup() {}
 
 /// One `SIGTERM` or `SIGINT` stream.
 ///
@@ -182,16 +251,108 @@ fn shutdown_signal(kind: SignalKind) -> Result<tokio::signal::unix::Signal, Daem
     })
 }
 
-/// Steps one to three of the drain: close every live session, then remove the socket name.
-///
-/// The name is the signal that the daemon has stopped serving, so it is given only after every
-/// responder has been told to close. A removal that fails is not reported: the name is reused by
-/// the next start's stale-name recovery.
-fn drain(socket_path: &Path, live: &[(usize, Arc<ConnectResponder>)]) {
+/// Tells every live session to close. `ConnectResponder::close` is synchronous and idempotent.
+fn drain_sessions(live: &[(usize, Arc<ConnectResponder>)]) {
     for (_, responder) in live {
         responder.close();
     }
-    let _ = std::fs::remove_file(socket_path);
+}
+
+/// Removes the socket name — the signal that the daemon has stopped serving.
+///
+/// It is given only after every session has been told to close, and its failure is reported: a
+/// daemon that leaves the name behind while exiting 0 claims a clean stop it did not reach. An
+/// absent name is the intended end state, not a failure.
+fn remove_socket(socket_path: &Path) -> Result<(), DaemonError> {
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DaemonError::Socket(format!(
+            "{}: the socket name could not be removed: {error}",
+            socket_path.display()
+        ))),
+    }
+}
+
+/// Refuses a socket path naming a file the daemon owns.
+///
+/// The stale-name recovery unlinks whatever occupies `socket_path`, so a name that resolves to
+/// the store or to the responder's seed would destroy it. Both sides are compared by identity
+/// when they exist — `dev`/`ino`, so a symlink, a hard link or a `..` spelling cannot hide an
+/// alias — and by canonical parent plus file name when one side is absent.
+fn refuse_owned_socket(config: &DaemonConfig) -> Result<(), DaemonError> {
+    for (key, path) in [
+        ("store_path", &config.store_path),
+        ("identity.seed_file", &config.identity.seed_file),
+    ] {
+        if same_file(&config.socket_path, path) {
+            return Err(DaemonError::Config(format!(
+                "socket_path {} names the same file as {key} {}",
+                config.socket_path.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `a` and `b` name one directory entry.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+        return a.dev() == b.dev() && a.ino() == b.ino();
+    }
+    match (resolved(a), resolved(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `path` with its parent canonicalized and its own name kept, so two absent names still compare
+/// as the entries they would create.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Some(std::fs::canonicalize(parent).ok()?.join(path.file_name()?))
+}
+
+/// Binds `socket_path`, removing a leftover name only when it is established to be dead.
+///
+/// A name occupied by a live listener is a start failure. A socket whose probe is refused is a
+/// leftover from a crashed daemon and is removed; a socket the probe cannot reach — permission,
+/// resource, any other fault — is not established to be dead and is refused. A plain file there
+/// is a leftover too: it is not a listener, so no probe could reach one. The owned-file check runs
+/// again immediately before the removal, so an alias cannot slip between the two.
+fn listen(config: &DaemonConfig) -> Result<UnixListener, DaemonError> {
+    let socket_path = &config.socket_path;
+    let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", socket_path.display()));
+    let first = match UnixListener::bind(socket_path) {
+        Ok(listener) => return Ok(listener),
+        Err(error) => error,
+    };
+    let file_type = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata.file_type(),
+        // The name went away between the two calls: the first bind's own message says why.
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err(fail(first.to_string())),
+        Err(error) => return Err(fail(error.to_string())),
+    };
+    if file_type.is_socket() {
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            Ok(_) => return Err(fail("a live listener already owns the name".to_string())),
+            // The one answer that establishes the listener is gone.
+            Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
+            Err(error) => {
+                return Err(fail(format!(
+                    "the name could not be probed, so its liveness is unknown: {error}"
+                )))
+            }
+        }
+    }
+    refuse_owned_socket(config)?;
+    std::fs::remove_file(socket_path)
+        .map_err(|error| fail(format!("a stale name could not be removed: {error}")))?;
+    UnixListener::bind(socket_path).map_err(|error| fail(error.to_string()))
 }
 
 /// The host's peer-to-principal mapping: a peer with an entry answers its principal, any other
@@ -264,41 +425,10 @@ fn peer_keys(config: &DaemonConfig) -> Result<HashMap<String, [u8; 32]>, DaemonE
         .collect()
 }
 
-/// Binds `socket_path`, removing a leftover name a crashed daemon left behind.
-///
-/// A path that exists is dialled once: a connection means a live listener owns it, which is a
-/// start failure; a refusal means the name is stale, and it is removed before the second bind.
-fn listen(socket_path: &Path) -> Result<UnixListener, DaemonError> {
-    let first = match UnixListener::bind(socket_path) {
-        Ok(listener) => return Ok(listener),
-        Err(error) => error,
-    };
-    if !socket_path.exists() {
-        return Err(DaemonError::Socket(format!(
-            "{}: {first}",
-            socket_path.display()
-        )));
-    }
-    // A synchronous probe: this runs before the accept loop, so it must not need the runtime to
-    // decide whether the name is live.
-    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-        return Err(DaemonError::Socket(format!(
-            "{}: a live listener already owns the name",
-            socket_path.display()
-        )));
-    }
-    std::fs::remove_file(socket_path).map_err(|error| {
-        DaemonError::Socket(format!(
-            "{}: a stale socket name could not be removed: {error}",
-            socket_path.display()
-        ))
-    })?;
-    UnixListener::bind(socket_path)
-        .map_err(|error| DaemonError::Socket(format!("{}: {error}", socket_path.display())))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use mindcore_base::boundary::CallerId;
     use mindcore_runtime::minds::{self, CreateMind};
     use tempfile::TempDir;
@@ -356,8 +486,8 @@ mod tests {
             }
         }
 
-        /// The serving side over this fixture's store; `surface` is called on it as often as a
-        /// test needs, since assembly reads the store without owning it.
+        /// The serving side over this fixture's store. `surface` reads the store, so one fixture
+        /// answers as many assemblies as a test needs.
         fn serve(self) -> MindcoreServe {
             MindcoreServe::new(self.store, false, |_| Ok(()))
         }
@@ -551,19 +681,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_leftover_file_at_the_socket_path_is_replaced() {
         let dir = TempDir::new().expect("temporary directory");
-        let path = dir.path().join("daemon.sock");
-        std::fs::write(&path, b"not a socket").expect("write the leftover");
-        let listener = listen(&path).expect("replace a leftover name");
-        assert!(path.exists(), "the replacement name is bound");
+        let config = config(dir.path());
+        std::fs::write(&config.socket_path, b"not a socket").expect("write the leftover");
+        let listener = listen(&config).expect("replace a leftover name");
+        assert!(config.socket_path.exists(), "the replacement name is bound");
         drop(listener);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_live_listener_on_the_socket_path_is_refused() {
         let dir = TempDir::new().expect("temporary directory");
-        let path = dir.path().join("daemon.sock");
-        let live = UnixListener::bind(&path).expect("bind the live listener");
-        match listen(&path) {
+        let config = config(dir.path());
+        let live = UnixListener::bind(&config.socket_path).expect("bind the live listener");
+        match listen(&config) {
             Err(DaemonError::Socket(message)) => {
                 assert!(message.contains("live listener"), "{message}")
             }
@@ -575,12 +705,17 @@ mod tests {
 
     /// A daemon that exits non-zero has bound no socket: a bind under a missing directory fails
     /// and names the path.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_bind_failure_names_the_path() {
+    #[test]
+    fn a_bind_failure_names_the_path() {
         let dir = TempDir::new().expect("temporary directory");
-        let path = dir.path().join("absent").join("daemon.sock");
-        match listen(&path) {
-            Err(DaemonError::Socket(message)) => assert!(message.contains("absent"), "{message}"),
+        let config = DaemonConfig {
+            socket_path: dir.path().join("absent").join("daemon.sock"),
+            ..config(dir.path())
+        };
+        match listen(&config) {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("absent"), "{message}")
+            }
             Err(other) => panic!("a bind failure is a socket refusal, not {other:?}"),
             Ok(_) => panic!("no directory holds the socket"),
         }
@@ -593,5 +728,170 @@ mod tests {
         let root = dir.path().join("journal");
         journal_root(&root).expect("create the journal root");
         assert!(root.is_dir());
+    }
+
+    /// F-001: a socket path naming the store is refused while the store is still untouched. The
+    /// file is not a database on purpose — the refusal must happen before anything opens it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_socket_path_naming_the_store_is_refused_and_the_store_survives() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        let bytes = b"the daemon's own bytes, not a database";
+        std::fs::write(&config.store_path, bytes).expect("write the store");
+        let collided = DaemonConfig {
+            socket_path: config.store_path.clone(),
+            ..config.clone()
+        };
+        let lock = StoreLock::acquire(&collided.store_path).expect("take the lock");
+        match run(collided, lock).await {
+            Err(DaemonError::Config(message)) => {
+                assert!(message.contains("socket_path"), "{message}");
+                assert!(message.contains("store_path"), "{message}");
+            }
+            Err(other) => panic!("a colliding socket path is a config refusal, not {other:?}"),
+            Ok(()) => panic!("a socket path naming the store must not serve"),
+        }
+        assert_eq!(
+            std::fs::read(&config.store_path).expect("read the store"),
+            bytes,
+            "the store survives the refusal"
+        );
+    }
+
+    /// F-001's alias case: a symlink to the store is the store, so recovery must refuse it too.
+    #[test]
+    fn a_symlink_to_the_store_is_not_a_socket_path() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        std::fs::write(&config.store_path, b"store").expect("write the store");
+        let alias = dir.path().join("alias.sock");
+        std::os::unix::fs::symlink(&config.store_path, &alias).expect("link to the store");
+        let collided = DaemonConfig {
+            socket_path: alias.clone(),
+            ..config.clone()
+        };
+        assert!(same_file(&alias, &config.store_path), "the alias resolves");
+        match refuse_owned_socket(&collided) {
+            Err(DaemonError::Config(message)) => {
+                assert!(message.contains("store_path"), "{message}")
+            }
+            other => panic!("a socket path naming the store is refused, not {other:?}"),
+        }
+    }
+
+    /// F-003: a probe that cannot establish the listener is dead removes nothing. Only a refused
+    /// connection means a leftover name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unprobeable_socket_name_is_refused_without_unlinking() {
+        // A search-only denial does not constrain uid 0, so the case cannot be built as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = TempDir::new().expect("temporary directory");
+        let config = config(dir.path());
+        let live = UnixListener::bind(&config.socket_path).expect("bind the live listener");
+        let parent = config
+            .socket_path
+            .parent()
+            .expect("the socket names a parent")
+            .to_path_buf();
+        let original = std::fs::metadata(&parent)
+            .expect("stat the parent")
+            .permissions();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+            .expect("close the parent");
+        let outcome = listen(&config);
+        std::fs::set_permissions(&parent, original).expect("reopen the parent");
+        match outcome {
+            Err(DaemonError::Socket(_)) => {}
+            other => panic!("an unprobeable name is a socket refusal, not {other:?}"),
+        }
+        assert!(
+            config.socket_path.exists(),
+            "a name not established to be dead is never unlinked"
+        );
+        drop(live);
+    }
+
+    /// F-004: a name that cannot be removed is a start-phase failure, not a clean exit. A
+    /// directory stands in for a name the filesystem refuses to unlink.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_socket_name_that_cannot_be_removed_is_reported() {
+        let dir = TempDir::new().expect("temporary directory");
+        let path = dir.path().join("daemon.sock");
+        std::fs::create_dir(&path).expect("create a name that is not a socket");
+        match remove_socket(&path) {
+            Err(DaemonError::Socket(message)) => {
+                assert!(message.contains("could not be removed"), "{message}")
+            }
+            other => panic!("an unremovable name is a socket failure, not {other:?}"),
+        }
+        // An absent name is the intended end state.
+        std::fs::remove_dir(&path).expect("clear the directory");
+        remove_socket(&path).expect("an absent name is already removed");
+    }
+
+    /// F-002: a connection accepted and parked before its registration is owned by the drain. Its
+    /// responder is tracked from the moment it exists, so the drain closes it; the task itself is
+    /// then cancelled, so nothing inserts after the snapshot and no session survives the name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_ends_a_connection_parked_before_its_registration() {
+        // The temporary directory is kept alive: the seed file the host reads lives in it.
+        let Fixture {
+            _dir,
+            config,
+            store,
+        } = Fixture::open().await;
+        let surface = expect_ok(
+            MindcoreServe::new(store, false, |_| Ok(()))
+                .surface(faces(&config))
+                .await,
+            "assemble the surface the connection serves",
+        );
+        let host = Arc::new(host(Arc::new(surface), &config).expect("build the host"));
+        let listener = UnixListener::bind(&config.socket_path).expect("bind the listener");
+
+        let (parked, mut park_signal) = tokio::sync::mpsc::unbounded_channel();
+        let (resume, parked_resume) = tokio::sync::mpsc::unbounded_channel();
+        *SETUP_PARK.lock().expect("setup seam lock") = Some(SetupPark {
+            parked,
+            resume: parked_resume,
+        });
+
+        let mut connections: JoinSet<()> = JoinSet::new();
+        {
+            let accepting = accept(listener, &host, &mut connections);
+            tokio::pin!(accepting);
+            // The dial completes against the listen backlog; the accept loop then owns the task.
+            let _dial = UnixStream::connect(&config.socket_path)
+                .await
+                .expect("dial the daemon");
+            tokio::select! {
+                outcome = &mut accepting => panic!("the accept loop ended with {outcome:?}"),
+                _ = park_signal.recv() => {}
+            }
+        }
+        // The task is suspended between its tracked responder and its registration: it has not
+        // registered a handler, and the drain still owns the session.
+        let snapshot = std::mem::take(&mut *host.live.lock().expect("live lock"));
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "a task still setting up has its responder tracked"
+        );
+        drain_sessions(&snapshot);
+        connections.shutdown().await;
+        assert_eq!(connections.len(), 0, "no accepted task outlives the drain");
+        assert!(
+            snapshot.iter().all(|(_, responder)| responder.state()
+                == spoke_connect::remote::ConnectResponderState::Closed
+                || responder.state() == spoke_connect::remote::ConnectResponderState::Disconnected),
+            "every responder was told to close"
+        );
+        assert!(
+            host.live.lock().expect("live lock").is_empty(),
+            "no responder was registered after the snapshot"
+        );
+        drop(resume);
     }
 }
