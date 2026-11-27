@@ -53,7 +53,7 @@ async fn start(config_path: &Path) -> Result<(), DaemonError> {
     let store = MindStore::open(&config.store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", config.store_path.display())))?;
-    journal_root(&config.journal_dir)?;
+    journal_root(&config.journal.dir)?;
 
     // The serving phase takes the assembled surface, the listener, the accept loop and the drain;
     // until it exists the process must not report a clean start it cannot serve.
