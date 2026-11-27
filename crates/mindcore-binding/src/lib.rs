@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use napi_derive::napi;
@@ -232,32 +232,18 @@ pub struct MindView {
 /// One client: the store handle every call shares, the caller it admits and the journal root its
 /// Minds publish under. It has no JavaScript constructor either — `openClient` is the one way.
 ///
-/// `store` is taken, not borrowed, so [`close`] can end the client: after it, the slot is empty and
-/// every call answers `INVALID_INPUT` naming the closed client rather than operating on a pool whose
-/// file is gone.
+/// There is no `close`: a client lives as long as its host holds it, and the store pool is closed
+/// when the client is garbage-collected and the process exits. A host that must release a database
+/// file drops every client and view over it; nothing here can do that on the host's behalf, because
+/// the store is shared with the views it handed out.
 #[napi]
 pub struct MindcoreClient {
-    store: Mutex<Option<Arc<MindStore>>>,
+    store: Arc<MindStore>,
     caller: CallerId,
     journal_root: Option<PathBuf>,
 }
 
 impl MindcoreClient {
-    /// The store handle every call shares. A closed client has none, and says so.
-    fn store(&self) -> SpokeResult<Arc<MindStore>> {
-        match self.locked().as_ref() {
-            Some(store) => SpokeResult::Ok(Arc::clone(store)),
-            None => spoke_reject(SpokeRejectCode::InvalidInput, "this client is closed", None),
-        }
-    }
-
-    /// The slot itself, for [`close`], which is the one caller that empties it.
-    fn locked(&self) -> std::sync::MutexGuard<'_, Option<Arc<MindStore>>> {
-        self.store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// A Mind opened for this client publishes into the journal root it was given, and into no
     /// other medium: without a root the handle keeps no publisher and `review` refuses.
     fn publishing(&self, mind: Mind) -> Mind {
@@ -268,11 +254,7 @@ impl MindcoreClient {
     }
 
     async fn open_mind(&self, mind_id: &MindId) -> SpokeResult<MindView> {
-        let store = match self.store() {
-            SpokeResult::Ok(store) => store,
-            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
-        };
-        match Mind::open(&store, &self.caller, mind_id).await {
+        match Mind::open(&self.store, &self.caller, mind_id).await {
             SpokeResult::Ok(mind) => SpokeResult::Ok(MindView {
                 mind: self.publishing(mind),
             }),
@@ -357,9 +339,9 @@ fn store_path_refusal(path: &Path, error: &std::io::Error) -> SpokeReject {
 
 /// The io failure that makes `path` unusable as a store file, if any.
 ///
-/// Two probes, both synchronous and cheap. The first refuses a name that is not a file at all — a
-/// directory, a device — which SQLite would answer with a generic "unable to open database file"
-/// naming neither the path nor the reason. The second opens the path for writing and closes it
+/// Two probes, both synchronous and cheap. The first follows any symlink and refuses a name that
+/// resolves to something that is not a file — a directory, a device — which SQLite would answer
+/// with a generic "unable to open database file" naming neither the path nor the reason. The second opens the path for writing and closes it
 /// again, which is exactly what building the pool does: a parent that refuses writes, or a
 /// read-only file, is the caller's own path and is reported as such before any pool exists. The
 /// empty file this probe creates is a database SQLite initializes normally.
@@ -367,7 +349,10 @@ fn store_path_refusal(path: &Path, error: &std::io::Error) -> SpokeReject {
 /// Whatever survives both probes and still fails is not about the name: a database another process
 /// holds locked, a migration that refuses the file, a full disk. That is the environment's.
 fn store_path_fault(path: &Path) -> Option<std::io::Error> {
-    match std::fs::symlink_metadata(path) {
+    // `metadata`, not `symlink_metadata`: a symlinked store path is the host's own arrangement, and
+    // what matters is the type it names. A link to a regular file opens; a link to a directory is
+    // refused with the kind the target actually has.
+    match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
             return Some(std::io::Error::new(
@@ -406,6 +391,22 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
     let journal_root = match &options.journal_dir {
         Some(dir) => {
             let configured = PathBuf::from(dir);
+            // A name that is absent or empty is not a directory a process could ever have meant:
+            // it is the caller's spelling, refused as such instead of failing inside the walk
+            // with whatever the operating system says about the current directory.
+            if configured.as_os_str().is_empty() {
+                return ClientResult::refused(&SpokeReject {
+                    code: SpokeRejectCode::InvalidInput,
+                    message:
+                        "journalDir is empty: name the directory `review` should publish under"
+                            .to_string(),
+                    details: path_details(
+                        "journalDir",
+                        &configured,
+                        std::io::ErrorKind::InvalidInput,
+                    ),
+                });
+            }
             let durable = configured.clone();
             let walked = napi::tokio::task::spawn_blocking(move || durable_root(&durable)).await;
             match walked {
@@ -433,7 +434,7 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
     }
     match MindStore::open(&store_path).await {
         Ok(store) => ClientResult::answered(MindcoreClient {
-            store: Mutex::new(Some(Arc::new(store))),
+            store: Arc::new(store),
             caller: CallerId::new(options.caller_id),
             journal_root,
         }),
@@ -448,28 +449,6 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
             details: path_details("storePath", &store_path, std::io::ErrorKind::Other),
         }),
     }
-}
-
-/// End this client: close its store pool and empty the handle slot, so the same file can be opened
-/// again in this process and every later call on this client answers `INVALID_INPUT`.
-///
-/// A `MindView` is an independent handle, not a borrow of this client: it holds its own `SqlitePool`
-/// over the same file, so it keeps working after its client is closed. That is why the teardown
-/// gates on nothing — the caller owns the views and drops them; a count of "views still open" would
-/// also be decided by JavaScript's garbage collector rather than by the caller, which is no basis
-/// for a refusal. Closing twice is not an error: the second call has nothing left to do.
-#[napi]
-pub async fn client_close(client: &MindcoreClient) -> Value {
-    let Some(store) = client.locked().take() else {
-        return settle::<()>(SpokeResult::Ok(()));
-    };
-    // A view opened earlier keeps its own pool over the same file, so this can fail to be the last
-    // reference; the pool still closes for this client, which is all a teardown promises.
-    match Arc::try_unwrap(store) {
-        Ok(store) => store.close().await,
-        Err(store) => store.pool().close().await,
-    }
-    settle::<()>(SpokeResult::Ok(()))
 }
 
 /// Create a Mind owned by this client's caller, and open it: the registry writes the row in its
@@ -488,11 +467,7 @@ pub async fn client_create_mind(
         display_name: options.display_name,
         owner: client.caller.clone(),
     };
-    let store = match client.store() {
-        SpokeResult::Ok(store) => store,
-        SpokeResult::Reject(reject) => return MindResult::refused(&reject),
-    };
-    let created = match minds::create(&store, &request).await {
+    let created = match minds::create(&client.store, &request).await {
         SpokeResult::Ok(row) => row,
         SpokeResult::Reject(reject) => return MindResult::refused(&reject),
     };
@@ -505,11 +480,7 @@ pub async fn client_create_mind(
 /// Every Mind this client's caller holds a live grant in, in `id` order.
 #[napi]
 pub async fn client_list_minds(client: &MindcoreClient) -> Value {
-    let store = match client.store() {
-        SpokeResult::Ok(store) => store,
-        SpokeResult::Reject(reject) => return settle::<Vec<MindInfo>>(SpokeResult::Reject(reject)),
-    };
-    settle(match minds::list(&store, &client.caller).await {
+    settle(match minds::list(&client.store, &client.caller).await {
         SpokeResult::Ok(rows) => {
             SpokeResult::Ok(rows.iter().map(MindInfo::from).collect::<Vec<_>>())
         }
@@ -538,11 +509,7 @@ pub async fn client_ensure_subject(
         SpokeResult::Ok(principal) => principal,
         SpokeResult::Reject(reject) => return settle::<()>(SpokeResult::Reject(reject)),
     };
-    let store = match client.store() {
-        SpokeResult::Ok(store) => store,
-        SpokeResult::Reject(reject) => return settle::<()>(SpokeResult::Reject(reject)),
-    };
-    let mut tx = match store.pool().begin().await {
+    let mut tx = match client.store.pool().begin().await {
         Ok(tx) => tx,
         Err(error) => {
             return settle::<()>(spoke_reject(
@@ -1293,6 +1260,51 @@ mod tests {
         let fresh = scratch_path.join("fresh.db");
         assert!(store_path_fault(&fresh).is_none());
         assert!(fresh.is_file(), "the probe creates the file it will use");
+    }
+
+    /// A symlinked store path is the host's own arrangement: the probe follows the link and judges
+    /// what it names, so a link to a file is a file and a link to a directory is refused with the
+    /// kind its target has. Reading the link's own type instead would refuse every symlinked store.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_store_path_is_judged_by_what_it_names() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let scratch_path = canonical(scratch.path());
+
+        let real = scratch_path.join("real.db");
+        std::fs::File::create(&real).expect("the store file");
+        let link = scratch_path.join("linked.db");
+        symlink(&real, &link).expect("the store symlink");
+        assert!(
+            store_path_fault(&link).is_none(),
+            "a link to a regular file is a usable store path"
+        );
+
+        let directory = scratch_path.join("a-directory");
+        std::fs::create_dir(&directory).expect("the directory");
+        let linked_directory = scratch_path.join("linked-directory");
+        symlink(&directory, &linked_directory).expect("the directory symlink");
+        let fault =
+            store_path_fault(&linked_directory).expect("a link to a directory is not a store file");
+        let refusal = store_path_refusal(&linked_directory, &fault);
+        assert_eq!(
+            refusal.code,
+            spoke_operations::SpokeRejectCode::InvalidInput
+        );
+        assert!(
+            refusal
+                .details
+                .as_ref()
+                .is_some_and(|details| details["kind"] == serde_json::json!("is a directory")),
+            "the refusal carries the kind the target has: {:?}",
+            refusal.details
+        );
+        assert_eq!(
+            refusal.details.expect("details")["storePath"],
+            serde_json::json!(linked_directory.display().to_string())
+        );
     }
 
     /// A revision arrives as a JavaScript `number`: only a finite, whole, non-negative one below

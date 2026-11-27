@@ -121,15 +121,6 @@ export class MindcoreClient {
   async ensureSubject(mindId, subjectId) {
     settle(await binding.clientEnsureSubject(this.#handle, mindId, subjectId));
   }
-
-  /**
-   * End the client: close its store and release the file, so the same `storePath` opens again in
-   * this process. A `MindView` still open over this client refuses the teardown; closing twice is
-   * not an error.
-   */
-  async close() {
-    settle(await binding.clientClose(this.#handle));
-  }
 }
 
 /** One opened Mind; its registry id and carrier entry are read once, at open. */

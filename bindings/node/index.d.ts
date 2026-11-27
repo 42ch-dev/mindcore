@@ -208,12 +208,6 @@ export declare class MindcoreClient {
   getMind(id: string): Promise<MindView>;
   /** Provision the subject row a memory write needs; the adapter's admission authorizes it. */
   ensureSubject(mindId: string, subjectId: string): Promise<void>;
-  /**
-   * Close this client's store, so the same `storePath` opens again in this process; every later
-   * call on this client answers `INVALID_INPUT`. Idempotent. A `MindView` is an independent handle
-   * over the same file and keeps working after its client is closed.
-   */
-  close(): Promise<void>;
 }
 
 export declare class MindView {
