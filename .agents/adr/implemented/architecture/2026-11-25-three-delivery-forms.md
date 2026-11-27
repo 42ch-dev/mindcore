@@ -11,7 +11,7 @@ The owner's target is that every application which uses this repository can take
 
 Without a decision each downstream picks its own way in. The peer form has no process to carry it, so the planned sidecar daemon grows into whatever its first caller asks for, an HTTP API included. A TypeScript caller, having no binding, is answered with that API. And the documents keep describing the parts: `README.md` opens with "No server, no UI, no transport ships here".
 
-## Proposal
+## Decision
 
 The first release serves three delivery forms.
 
@@ -42,7 +42,7 @@ The three forms reach one kernel, so one authorization rule — live admission o
 - **Embedded-only delivery: the embedding path alone.** Rejected: a caller that cannot link Rust is left out, and every other host language needs a binding of its own before it can create a Mind. The served surface already delivered by `2026-11-21-spoke-017-serving-cohort.md` would have no product form.
 - **An HTTP API over the library.** Rejected: the cross-process contract is already SPOKE Connect, so an HTTP API would be a second operation surface with its own request types, admission and refusal table. The serving seam removed one such second authority when it retired the private adoption tool in favour of `knowledge.adopt` (`.agents/specs/architecture/serving-seam.md`), and an HTTP API brings one back. The three settled forms keep every cross-process call on the one contract.
 
-## Acceptance criteria
+## Consequences
 
 - An in-process caller reaches memory, knowledge and cognition through a Mind handle without opening a transaction, building a `Principal`, supplying a wire-shaped request body or matching `MemoryStage`.
 - The facade's first release exposes Mind-level convenience operations only; the space-level capabilities beneath it are not exposed before that advanced surface is decided.
@@ -53,7 +53,7 @@ The three forms reach one kernel, so one authorization rule — live admission o
 - The repository contains no HTTP surface over the library: no HTTP listener, route or request type.
 - `README.md` and `docs/quickstart.md` lead with the Mind path, and the facade, the binding and the crates they need are consumable by a downstream.
 
-## Risks
+## Risks and open items
 
 - **None of the three forms exists in full.** At the decision the facade, the binding and the daemon binary are unbuilt. A first release that claims all three owes all three.
 - **The SPOKE-side items wait for a cohort this repository does not yet pin.** SPOKE 0.19.0 will carry them (owner, 2026-11-25); until that cohort is pinned here, a peer gets per-Mind memory and cognition only (`2026-11-25-one-surface-serves-many-minds.md`).
