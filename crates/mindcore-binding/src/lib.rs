@@ -123,18 +123,26 @@ fn refusal(reject: &SpokeReject) -> Value {
     Value::Object(object)
 }
 
+/// The code of a failure this addon raises for its own defect. No facade refusal carries it, so a
+/// caller that reads `code` can never mistake one for the other.
+const BINDING_DEFECT: &str = "BINDING_DEFECT";
+
 /// One facade answer as its result object: `{ ok: true, value }`, or the refusal above.
 ///
-/// An answer that does not serialize is this addon's own defect and is reported as one, never
-/// answered as a refusal the facade made.
+/// An answer that does not serialize is this addon's own defect and is answered as one, under
+/// [`BINDING_DEFECT`], never as a refusal the facade made. A refusal's `details` cannot reach
+/// this path: it is already a `Value` map, which `to_value` cannot fail on.
 fn settle<T: Serialize>(result: SpokeResult<T>) -> Value {
     match result {
         SpokeResult::Ok(value) => match serde_json::to_value(&value) {
             Ok(value) => json!({ "ok": true, "value": value }),
-            Err(error) => refusal(&SpokeReject {
-                code: SpokeRejectCode::InternalError,
-                message: format!("the facade's answer does not serialize: {error}"),
-                details: None,
+            Err(error) => json!({
+                "ok": false,
+                "code": BINDING_DEFECT,
+                "message": format!(
+                    "the binding could not serialize {}: {error}",
+                    std::any::type_name::<T>()
+                ),
             }),
         },
         SpokeResult::Reject(reject) => refusal(&reject),
@@ -733,8 +741,8 @@ fn create_concurrently(level: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        durable_root, optional_revision, whole_number, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE,
-        SYNC_ATTEMPTS,
+        durable_root, optional_revision, settle, whole_number, BINDING_DEFECT, CREATE_CONCURRENTLY,
+        INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
     };
     use std::path::{Path, PathBuf};
 
@@ -757,6 +765,44 @@ mod tests {
             .iter()
             .filter(|attempt| attempt.as_path() == path)
             .count()
+    }
+
+    /// An answer the addon itself cannot serialize is its own defect, never a facade refusal: the
+    /// code names it, and no facade path can produce that code. `serde_json::Value` cannot hold a
+    /// failing `Serialize`, so the failing value comes from a test type whose impl errors.
+    #[test]
+    fn an_answer_that_does_not_serialize_is_a_binding_defect() {
+        use serde::ser::Error as _;
+        use serde::Serialize;
+        use spoke_operations::SpokeResult;
+
+        struct Unserializable;
+
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(S::Error::custom("this answer cannot be serialized"))
+            }
+        }
+
+        let answer = settle(SpokeResult::Ok(Unserializable));
+
+        assert_eq!(answer["ok"], serde_json::json!(false), "{answer}");
+        assert_eq!(
+            answer["code"],
+            serde_json::json!(BINDING_DEFECT),
+            "{answer}"
+        );
+        assert_ne!(
+            answer["code"],
+            serde_json::json!("INTERNAL_ERROR"),
+            "a binding defect is not a facade refusal: {answer}"
+        );
+        assert!(
+            answer["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Unserializable")),
+            "the message names what could not be serialized: {answer}"
+        );
     }
 
     /// A revision arrives as a JavaScript `number`: only a finite, whole, non-negative one below
