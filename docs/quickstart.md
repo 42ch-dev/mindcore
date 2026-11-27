@@ -29,7 +29,7 @@ It is a guided path, not a complete API reference. The record model is in
 The shortest path is the documented example, run from a checkout of this repository:
 
 ```sh
-cargo run --offline -p mindcore-runtime --example mind_facade
+cargo run -p mindcore-runtime --example mind_facade
 ```
 
 It prints the recalled record and the derived `MindState`, and its source
@@ -40,21 +40,27 @@ is the complete, runnable version of every step below. The rest of this page wal
 
 ```toml
 [dependencies]
-mindcore-base = "0.1"
-mindcore-sqlite = "0.1"
+# The facade is unpublished, so the whole mindcore family comes from this repository at one
+# revision: a registry `mindcore-base` beside a git `mindcore-runtime` would be a second copy of
+# the same crate, and the facade would not accept its types.
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
-# match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = ">=0.19.1, <0.20.0"
-spoke-schemas = ">=0.19.1, <0.20.0"
-# for the host's own provisioning writes (step 3)
+# The SPOKE versions this workspace pins.
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+# For the host's own subject provisioning (step 3).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```
 
-`mindcore-base` and `mindcore-sqlite` are on crates.io; let Cargo resolve the version the registry
-holds. `mindcore-runtime` is not published and comes from this repository.
-`[workspace.package].version` in the repository is the source of truth for what a release contains.
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io as the `0.1.0-alpha.1`
+pre-release, which needs an exact pin — Cargo's `"0.1"` does not match a pre-release. A host that
+needs only the record model and the store can pin that version from the registry. Embedding the
+facade needs `mindcore-runtime`, which is `publish = false`, so the family comes from one source:
+the git entries above, whose revision `Cargo.lock` records. `[workspace.package].version` in the
+repository is the source of truth for what a release contains.
 
 ## 1. Create a Mind
 

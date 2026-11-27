@@ -56,13 +56,22 @@ binding 在自己的进程内调用 facade，而不是去连另一个进程；�
 
 ```toml
 [dependencies]
-mindcore-base = "0.1"
-mindcore-sqlite = "0.1"
+# facade 尚未发布，因此整个 mindcore family 取自本仓库的同一个 revision：
+# 把 registry 的 `mindcore-base` 与 git 的 `mindcore-runtime` 混用会得到同一套类型的第二份副本，
+# facade 不会接受它。
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
-spoke-operations = ">=0.19.1, <0.20.0"
-serde_json = "1"
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
 ```
+
+`mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 在 crates.io 上是 `0.1.0-alpha.1` 预发布版本，
+必须精确固定——Cargo 的 `"0.1"` 匹配不到预发布版本。facade 为 `publish = false`，因此这个示例把
+整个 family 从本仓库的同一个 revision 引入。
 
 ```rust
 use mindcore_base::boundary::CallerId;
@@ -91,6 +100,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         owner: caller.clone(),
     }).await)?;
     let mind = ok(Mind::open(&store, &caller, &row.id).await)?;
+
+    // 宿主先写入 memory 写操作所需的 subject 行；`capture` 对未知 subject 回答 NOT_FOUND。
+    sqlx::query(
+        "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
+         VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(row.id.as_str())
+    .bind("wren")
+    .execute(&store.pool())
+    .await?;
 
     ok(mind.capture(&Capture {
         subject: "wren",

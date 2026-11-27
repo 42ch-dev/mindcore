@@ -60,13 +60,22 @@ and writes the same SQLite store through `mindcore-sqlite`.
 
 ```toml
 [dependencies]
-mindcore-base = "0.1"
-mindcore-sqlite = "0.1"
+# The facade is unpublished, so the whole mindcore family comes from this repository at one
+# revision: a registry `mindcore-base` beside a git `mindcore-runtime` would be a second copy of
+# the same crate, and the facade would not accept its types.
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
-spoke-operations = ">=0.19.1, <0.20.0"
-serde_json = "1"
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
 ```
+
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io as the `0.1.0-alpha.1`
+pre-release — an exact pin, because Cargo's `"0.1"` does not match a pre-release. The facade is
+`publish = false`, so this example takes the whole family from this repository at one revision.
 
 ```rust
 use mindcore_base::boundary::CallerId;
@@ -95,6 +104,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         owner: caller.clone(),
     }).await)?;
     let mind = ok(Mind::open(&store, &caller, &row.id).await)?;
+
+    // The host provisions the subject row a memory write needs; `capture` answers NOT_FOUND for
+    // an unknown subject.
+    sqlx::query(
+        "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
+         VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(row.id.as_str())
+    .bind("wren")
+    .execute(&store.pool())
+    .await?;
 
     ok(mind.capture(&Capture {
         subject: "wren",
