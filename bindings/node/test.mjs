@@ -2,9 +2,19 @@
 // mind_facade.rs` through `index.js`, then the three refusals that are cheapest to get wrong.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  existsSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { after, describe, it } from 'node:test';
 
 import { MindView, MindcoreClient, MindcoreError } from './index.js';
@@ -35,6 +45,17 @@ function open(name, { journal = true } = {}) {
     callerId: CALLER,
     journalDir: journal ? join(root, `${name}-journal`) : undefined,
   });
+}
+
+/**
+ * The loader keys its artifact table by the platforms it declares, and `package.json`'s `os` is
+ * meant to be that same set. Nothing in the runtime can compare the two, so this does: a platform
+ * added to one and not the other fails here rather than shipping as a comment that is not true.
+ */
+function declaredPlatforms() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
+  return manifest.os;
 }
 
 describe('the in-process binding', () => {
@@ -160,6 +181,45 @@ describe('the in-process binding', () => {
     );
   });
 
+  it('serves one store file when a relative storePath outlives a directory change', async () => {
+    // A relative `storePath` is resolved once, at open: the client keeps the absolute name, so no
+    // later working-directory change can make a connection name a second database. The assertion is
+    // about that second database not existing — the pool's one connection stays open here, so a
+    // reconnect is not something this test can force from the public surface.
+    const previous = process.cwd();
+    const opener = scratchDirectory('mindcore-store-a-');
+    const elsewhere = scratchDirectory('mindcore-store-b-');
+    let client;
+    let mindId;
+    try {
+      process.chdir(opener);
+      client = await MindcoreClient.open({ storePath: 'relative.db', callerId: CALLER });
+      mindId = (await client.createMind({ displayName: 'Relative store' })).id;
+    } finally {
+      process.chdir(previous);
+    }
+
+    process.chdir(elsewhere);
+    try {
+      const minds = await client.listMinds();
+      assert.deepEqual(
+        minds.map((row) => row.id),
+        [mindId],
+      );
+    } finally {
+      process.chdir(previous);
+    }
+
+    assert.ok(
+      existsSync(join(opener, 'relative.db')),
+      'the store is the file named at open',
+    );
+    assert.ok(
+      !existsSync(join(elsewhere, 'relative.db')),
+      'the directory current afterwards gained no second database',
+    );
+  });
+
   it('provisions subjects on one store from two clients while the other writes', async () => {
     // `ensureSubject` takes the write lock up front (`BEGIN IMMEDIATE`): a deferred transaction that
     // upgrades after another connection's commit cannot be waited out, and SQLite answers
@@ -207,6 +267,36 @@ describe('the in-process binding', () => {
       'the no-argument create registered exactly that Mind',
     );
     assert.equal(minds[0].displayName, null, 'an unnamed Mind carries no display name');
+  });
+
+  it('reports what a store that fails to open actually reported', async () => {
+    // Both probes pass on a regular, writable file of garbage: the failure is inside the pool, and
+    // the refusal must carry that failure's own kind rather than a stand-in. The path reported is
+    // the resolved one — the client opened that name, not the spelling that led to it.
+    const path = join(root, 'garbage.db');
+    writeFileSync(path, 'not a database at all, not even close');
+    const resolved = realpathSync(root);
+    const resolvedPath = join(resolved, 'garbage.db');
+    await assert.rejects(
+      () => MindcoreClient.open({ storePath: path, callerId: CALLER }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INTERNAL_ERROR');
+        assert.equal(error.details.storePath, resolvedPath);
+        assert.equal(typeof error.details.kind, 'string');
+        assert.notEqual(error.details.kind, 'other error');
+        return true;
+      },
+    );
+  });
+
+  it('declares the same platforms the loader knows how to load', async () => {
+    const { PLATFORMS } = await import('./index.js');
+    assert.deepEqual(
+      declaredPlatforms(),
+      PLATFORMS,
+      'package.json os and the loader platform list must be the same set, in the same order',
+    );
   });
 
   it('refuses an empty journalDir as a name-shape error', async () => {

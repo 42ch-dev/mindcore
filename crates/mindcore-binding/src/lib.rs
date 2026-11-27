@@ -263,13 +263,28 @@ impl MindcoreClient {
         }
     }
 
-    async fn open_mind(&self, mind_id: &MindId) -> SpokeResult<MindView> {
+    /// The handle over one Mind. A seam the tests use to make the post-commit open fail: the create
+    /// path has already committed a row by the time this runs, and that distinction is what the
+    /// caller is told.
+    async fn opened_mind(&self, mind_id: &MindId) -> SpokeResult<MindView> {
+        #[cfg(test)]
+        if take_injected_open_failure(mind_id) {
+            return spoke_reject(
+                SpokeRejectCode::InternalError,
+                "the handle could not be read back",
+                None,
+            );
+        }
         match Mind::open(&self.store, &self.caller, mind_id).await {
             SpokeResult::Ok(mind) => SpokeResult::Ok(MindView {
                 mind: self.publishing(mind),
             }),
             SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
         }
+    }
+
+    async fn open_mind(&self, mind_id: &MindId) -> SpokeResult<MindView> {
+        self.opened_mind(mind_id).await
     }
 
     /// The client's caller as the adapter's wire `Principal`: the authenticated identity the host
@@ -345,6 +360,35 @@ fn store_path_refusal(path: &Path, error: &std::io::Error) -> SpokeReject {
         message: format!("storePath {} cannot be used: {error}", path.display()),
         details: path_details("storePath", path, error.kind()),
     }
+}
+
+/// What a store that failed to open actually reported, as the refusal's two members.
+///
+/// The kind is the failure's own: the io error's `ErrorKind` when sqlx hands one through, otherwise
+/// the pool, migration or database error's name, and for a database error its SQLite code — the one
+/// fact a host can act on. `"other"` is never invented in place of a real answer.
+fn store_open_details(path: &Path, error: &sqlx::Error) -> Option<Map<String, Value>> {
+    let kind = match error {
+        sqlx::Error::Io(io) => io.kind().to_string(),
+        sqlx::Error::Configuration(_) => "configuration".to_string(),
+        sqlx::Error::InvalidArgument(_) => "invalid argument".to_string(),
+        sqlx::Error::Database(database) => database
+            .code()
+            .map_or_else(|| "database".to_string(), |code| format!("database {code}")),
+        sqlx::Error::Migrate(_) => "migration".to_string(),
+        sqlx::Error::PoolTimedOut => "pool timed out".to_string(),
+        sqlx::Error::PoolClosed => "pool closed".to_string(),
+        sqlx::Error::Protocol(_) => "protocol".to_string(),
+        sqlx::Error::RowNotFound => "row not found".to_string(),
+        other => other.to_string(),
+    };
+    let mut details = Map::new();
+    details.insert(
+        "storePath".to_string(),
+        Value::String(path.display().to_string()),
+    );
+    details.insert("kind".to_string(), Value::String(kind));
+    Some(details)
 }
 
 /// The io failure that makes `path` unusable as a store file, if any.
@@ -438,7 +482,14 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
         }
         None => None,
     };
-    let store_path = PathBuf::from(&options.store_path);
+    // Resolved once, here: sqlx resolves the path it is given when it builds a connection, so a
+    // relative `storePath` would reconnect to whatever directory the process is in by then — a
+    // second database, silently. The client keeps the absolute name it opened.
+    let configured = PathBuf::from(&options.store_path);
+    let store_path = match absolute(&configured) {
+        Ok(resolved) => resolved,
+        Err(error) => return ClientResult::refused(&store_path_refusal(&configured, &error)),
+    };
     if let Some(error) = store_path_fault(&store_path) {
         return ClientResult::refused(&store_path_refusal(&store_path, &error));
     }
@@ -449,14 +500,15 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
             journal_root,
         }),
         // Both probes passed, so the name is usable and whatever fails now is the environment:
-        // a lock another process holds, a migration that refuses the file, a full disk.
+        // a lock another process holds, a migration that refuses the file, a full disk. The refusal
+        // carries what the failure actually reports, never a stand-in.
         Err(error) => ClientResult::refused(&SpokeReject {
             code: SpokeRejectCode::InternalError,
             message: format!(
                 "storePath {} could not be opened: {error}",
                 store_path.display()
             ),
-            details: path_details("storePath", &store_path, std::io::ErrorKind::Other),
+            details: store_open_details(&store_path, &error),
         }),
     }
 }
@@ -481,9 +533,29 @@ pub async fn client_create_mind(
         SpokeResult::Ok(row) => row,
         SpokeResult::Reject(reject) => return MindResult::refused(&reject),
     };
-    match client.open_mind(&created.id).await {
+    match client.opened_mind(&created.id).await {
         SpokeResult::Ok(view) => MindResult::answered(view),
-        SpokeResult::Reject(reject) => MindResult::refused(&reject),
+        // The row is committed: this call did create the Mind. Reporting the open's own refusal here
+        // would tell the host the create had no effect, and a retry would create a second Mind. The
+        // settlement path uses the same code for "durable, but the answer is unconfirmed".
+        SpokeResult::Reject(reject) => MindResult::refused(&SpokeReject {
+            code: SpokeRejectCode::OutcomeUncertain,
+            message: format!(
+                "the Mind {} was created, but opening its handle failed: {}",
+                created.id.as_str(),
+                reject.message
+            ),
+            details: Some(Map::from_iter([
+                (
+                    "mindId".to_string(),
+                    Value::String(created.id.as_str().to_string()),
+                ),
+                (
+                    "code".to_string(),
+                    Value::String(reject.code.as_str().to_string()),
+                ),
+            ])),
+        }),
     }
 }
 
@@ -895,6 +967,42 @@ fn sync_once(parent: &Path, synced: &mut HashSet<PathBuf>) -> std::io::Result<()
     Ok(())
 }
 
+/// `path` as an absolute path, resolved once against the directory that is current now.
+///
+/// The deepest existing ancestor is canonicalized and the components below it are appended, so a
+/// relative `storePath` names one file for the life of the process: sqlx resolves a path when it
+/// builds a connection, so a later working-directory change would otherwise reconnect to a second
+/// database. A path whose every ancestor exists resolves exactly; a path none of whose ancestors
+/// exist cannot happen here, because the filesystem root always exists.
+fn absolute(path: &Path) -> std::io::Result<PathBuf> {
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        match std::fs::canonicalize(cursor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match cursor.file_name() {
+                    // `Path::new("mind.db").parent()` is the empty path, which names the current
+                    // directory: it is a real ancestor, not one more component to append.
+                    Some(name) => missing.push(name),
+                    None => return Err(error),
+                }
+                match cursor.parent() {
+                    Some(parent) if parent.as_os_str().is_empty() => cursor = Path::new("."),
+                    Some(parent) => cursor = parent,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// The directory holding `level`'s entry.
 ///
 /// `Path::new("journal").parent()` is the empty path, which names the current directory; only
@@ -960,6 +1068,17 @@ fn take_injected_sync_failure(parent: &Path) -> bool {
     }
 }
 
+/// A test seam: the next `Mind::open` fails, and every attempt is counted. A post-commit open
+/// failure is the one window no facade path can enter from a test — the registry row is already
+/// durable by the time the handle is read back.
+#[cfg(test)]
+static OPEN_FAILURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn take_injected_open_failure(_mind_id: &MindId) -> bool {
+    OPEN_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// A test seam: the next create of this exact level lands as another process's. `true` plants a
 /// directory (the benign race), `false` a regular file (the refusal). Without it the window
 /// between this walk's check and its `create_dir` cannot be entered from a test.
@@ -992,14 +1111,20 @@ fn create_concurrently(level: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        durable_root, knowledge_entry, occurred_at, optional_budget, optional_revision, path_fault,
-        review_decision, settle, store_path_fault, store_path_refusal, whole_budget, whole_number,
-        BINDING_DEFECT, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
+        absolute, client_create_mind, durable_root, knowledge_entry, occurred_at, optional_budget,
+        optional_revision, path_fault, review_decision, settle, store_open_details,
+        store_path_fault, store_path_refusal, whole_budget, whole_number, MindcoreClient,
+        BINDING_DEFECT, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE, OPEN_FAILURE, SYNC_ATTEMPTS,
     };
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     // Every seam is keyed by path and each test owns a fresh temporary root, so a shared global
     // needs no reset between tests — and a reset would clobber a test still running.
+
+    /// The working directory is process-wide, so the tests that set it hold this and no other test
+    /// touches it.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The scratch directory as the walk sees it: the tests live under `/var/…` on macOS, which is
     /// a symlink to `/private/var`, so a raw temporary path is not a path any parent is keyed by.
@@ -1322,6 +1447,148 @@ mod tests {
         );
     }
 
+    /// A relative `storePath` is resolved once, against the directory that is current then.
+    /// Resolving it per connection — which is what sqlx does with the string it was handed — would
+    /// make a later working-directory change reconnect to a second database.
+    #[test]
+    fn a_relative_store_path_resolves_once_against_its_open_directory() {
+        let _guard = CWD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = tempfile::TempDir::new().expect("a scratch directory");
+        let second = tempfile::TempDir::new().expect("another scratch directory");
+        let first_path = canonical(first.path());
+        let second_path = canonical(second.path());
+        let previous = std::env::current_dir().expect("a current directory");
+
+        std::env::set_current_dir(&first_path).expect("enter the first directory");
+        let resolved = absolute(Path::new("mind.db"));
+        std::env::set_current_dir(&second_path).expect("enter the second directory");
+        let also_resolved = absolute(Path::new("mind.db"));
+        std::env::set_current_dir(&previous).expect("leave the scratch directories");
+
+        assert_eq!(
+            resolved.expect("a relative store path resolves"),
+            first_path.join("mind.db"),
+            "the name is the file in the directory that was current at open"
+        );
+        assert_eq!(
+            also_resolved.expect("a relative store path resolves"),
+            second_path.join("mind.db"),
+            "the same spelling names a different file from a different directory — which is exactly
+             why the resolution happens once, at open"
+        );
+
+        // A name below a directory that does not exist yet still resolves: the deepest existing
+        // ancestor is canonicalized and the rest appended.
+        let nested = absolute(&first_path.join("not-yet").join("mind.db")).expect("resolves");
+        assert_eq!(nested, first_path.join("not-yet").join("mind.db"));
+        assert!(absolute(Path::new("/"))
+            .expect("the root resolves")
+            .is_absolute());
+    }
+
+    /// The create path commits its registry row before it opens the handle, so a failure in that
+    /// window must not be reported as a refusal: a host that retried would create a second Mind.
+    /// The answer is `OUTCOME_UNCERTAIN` carrying the id that does exist.
+    #[test]
+    fn a_create_whose_open_fails_after_the_commit_is_outcome_uncertain() {
+        use mindcore_base::boundary::CallerId;
+        use spoke_operations::SpokeResult;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let store_path = scratch.path().join("mind.db");
+
+        let (answered, listed) = runtime.block_on(async {
+            let store = match mindcore_sqlite::MindStore::open(&store_path).await {
+                Ok(store) => store,
+                Err(error) => panic!("the store opens: {error}"),
+            };
+            let client = MindcoreClient {
+                store: Arc::new(store),
+                caller: CallerId::new("caller_wren"),
+                journal_root: None,
+            };
+            // The row will be committed; only the read-back of its handle fails.
+            OPEN_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+            let answered = client_create_mind(&client, None).await;
+            assert!(
+                !OPEN_FAILURE.load(std::sync::atomic::Ordering::SeqCst),
+                "the seam fired: the failure is the post-commit read-back"
+            );
+            let listed = match mindcore_runtime::minds::list(&client.store, &client.caller).await {
+                SpokeResult::Ok(rows) => rows
+                    .iter()
+                    .map(|row| row.id.as_str().to_string())
+                    .collect::<Vec<_>>(),
+                SpokeResult::Reject(reject) => panic!("list refused: {}", reject.message),
+            };
+            (answered, listed)
+        });
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "the create did commit, which is why the answer is uncertain rather than a refusal"
+        );
+        assert!(!answered.ok);
+        assert_eq!(answered.code.as_deref(), Some("OUTCOME_UNCERTAIN"));
+        let message = answered.message.expect("a message");
+        assert!(
+            message.contains("was created, but opening its handle failed"),
+            "{message}"
+        );
+        let details = answered.details.expect("details carry the id that exists");
+        assert_eq!(
+            details["mindId"],
+            serde_json::json!(listed[0]),
+            "the refusal names the Mind the host must not create again: {details}"
+        );
+        assert_eq!(details["code"], serde_json::json!("INTERNAL_ERROR"));
+    }
+
+    /// A store that fails after both probes report what actually failed, never a stand-in. A
+    /// database another connection holds in exclusive locking mode is the cheapest real failure to
+    /// produce here.
+    #[test]
+    fn a_store_that_fails_to_open_reports_its_own_kind() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let store_path = scratch.path().join("mind.db");
+
+        // A regular file with bytes SQLite cannot read as a database: opening it fails inside the
+        // pool, after both probes have passed, which is the path this test is about.
+        std::fs::write(&store_path, b"not a database at all, not even close").expect("garbage");
+        assert!(
+            store_path_fault(&store_path).is_none(),
+            "the probes pass: the name is a writable regular file"
+        );
+        let error = runtime.block_on(async {
+            match mindcore_sqlite::MindStore::open(&store_path).await {
+                Ok(_) => panic!("garbage is not a database"),
+                Err(error) => error,
+            }
+        });
+        let details = store_open_details(&store_path, &error).expect("details");
+        let kind = details["kind"]
+            .as_str()
+            .expect("the kind is a string")
+            .to_string();
+        assert!(
+            !kind.is_empty() && kind != "other",
+            "the refusal carries what failed, not a stand-in: {kind}"
+        );
+        assert_eq!(
+            details["storePath"],
+            serde_json::json!(store_path.display().to_string())
+        );
+    }
+
     /// A revision arrives as a JavaScript `number`: only a finite, whole, non-negative one below
     /// `2^64` names a revision, and every other value is the caller's own `INVALID_INPUT`.
     #[test]
@@ -1564,7 +1831,6 @@ mod tests {
     /// test touches it.
     #[test]
     fn a_relative_root_resolves_to_the_directory_it_was_named_in() {
-        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CWD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let first = tempfile::TempDir::new().expect("a scratch directory");
         let second = tempfile::TempDir::new().expect("another scratch directory");

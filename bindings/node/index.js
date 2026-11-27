@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
  * `darwin` is declared and unexercised by CI: the workflow runs `ubuntu-latest` only. It is a
  * supported host whose addon name is known, not one whose build and test path CI has proven.
  */
-const PLATFORMS = ['darwin', 'linux'];
+export const PLATFORMS = ['darwin', 'linux'];
 
 /** The addon's file name as cargo writes it, per declared platform. */
 const ARTIFACTS = {
