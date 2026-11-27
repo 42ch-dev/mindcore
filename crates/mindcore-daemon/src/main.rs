@@ -48,8 +48,9 @@ async fn main() -> ExitCode {
 async fn start(config_path: &Path) -> Result<(), DaemonError> {
     let config = config::load(config_path)?;
     // The lock precedes the store: `open` creates the file and runs the embedded migration, so a
-    // second instance must be refused before it. The lock is on this file's inode, so the guard
-    // lives to the end of the process and every alias of the store contends on it.
+    // second instance must be refused before it. The lock sits on the store's inode identity in a
+    // directory of its own, so every alias of the store contends on it while the store itself
+    // stays unlocked for SQLite.
     let _lock = StoreLock::acquire(&config.store_path)?;
     let store = MindStore::open(&config.store_path)
         .await
