@@ -334,7 +334,8 @@ mod tests {
         acquire(&store).expect("acquire after the guard dropped");
     }
 
-    /// A hard link in the same directory shares the inode, so it shares the lock.
+    /// Every hard link is refused, so the same-directory case never reaches the lock: the store's
+    /// link count is what the rule reads, and it is the inode's, not the directory entry's.
     #[cfg(unix)]
     #[test]
     fn a_hard_link_in_the_same_directory_is_refused() {
@@ -360,12 +361,9 @@ mod tests {
         assert_eq!(std::fs::read(&link).expect("read"), BYTES);
     }
 
-    /// The documented limit, pinned so it stays explicit: a hard link in another directory names a
-    /// lock in that directory, so the two names do not contend.
-    ///
-    /// `shortcut:` one daemon is guaranteed per directory entry, its symlink targets and its
-    /// same-directory hard links; a cross-directory hard link escapes that and is tracked as an
-    /// issue for the iteration that needs it.
+    /// The cross-directory case is impossible by construction rather than a documented limit: the
+    /// link count belongs to the inode, so a second name in any directory trips `nlink() > 1` and
+    /// the second name is refused, not served under a narrower guarantee.
     #[cfg(unix)]
     #[test]
     fn a_cross_directory_hard_link_is_refused() {

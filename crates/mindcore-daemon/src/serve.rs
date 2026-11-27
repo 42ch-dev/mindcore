@@ -6,9 +6,13 @@
 //!
 //! The surface is assembled once and shared by every connection. Each accepted stream gets its
 //! own transport and responder in a task of its own, every task is owned by one `JoinSet`, and
-//! the live responders sit in one collection the drain walks. Nothing the daemon owns is ever
-//! unlinked: `socket_path` may not name the store or the seed file, checked before the start and
-//! again immediately before any stale name is removed.
+//! the live responders sit in one collection the drain walks.
+//!
+//! Only a socket established to be dead is ever replaced. A name occupied by anything else — a
+//! regular file, a directory, a symlink, a device — is refused with its type, because nothing that
+//! is not a socket is the daemon's to unlink; and a `BoundSocket` owns the name it bound until
+//! `into_parts` hands the listener over, so a start that fails before that point takes the name
+//! with it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -74,9 +78,10 @@ impl SocketIdentity {
 /// A bound socket name, owned until the accept loop takes the listener.
 ///
 /// A start can fail after `bind` and before the accept loop exists — reading the seed, decoding a
-/// peer key, installing a signal. Each of those is a `?`, and this guard makes the failure path
-/// unlink the name it bound without a branch at every one of them. `into_parts` disarms it at the
-/// one point the listener is handed over.
+/// peer key. Each of those is a `?` in `prepare`, and this guard makes the failure path unlink the
+/// name it bound without a branch at every one of them. `into_parts` disarms it at the one point the
+/// listener is handed over; the shutdown signals are installed before the bind, so they are not
+/// part of this window.
 #[derive(Debug)]
 struct BoundSocket {
     /// `Some` until `into_parts`; `Option` so the listener can be moved out of a `Drop` type.
