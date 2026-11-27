@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use napi_derive::napi;
@@ -231,14 +231,33 @@ pub struct MindView {
 
 /// One client: the store handle every call shares, the caller it admits and the journal root its
 /// Minds publish under. It has no JavaScript constructor either — `openClient` is the one way.
+///
+/// `store` is taken, not borrowed, so [`close`] can end the client: after it, the slot is empty and
+/// every call answers `INVALID_INPUT` naming the closed client rather than operating on a pool whose
+/// file is gone.
 #[napi]
 pub struct MindcoreClient {
-    store: Arc<MindStore>,
+    store: Mutex<Option<Arc<MindStore>>>,
     caller: CallerId,
     journal_root: Option<PathBuf>,
 }
 
 impl MindcoreClient {
+    /// The store handle every call shares. A closed client has none, and says so.
+    fn store(&self) -> SpokeResult<Arc<MindStore>> {
+        match self.locked().as_ref() {
+            Some(store) => SpokeResult::Ok(Arc::clone(store)),
+            None => spoke_reject(SpokeRejectCode::InvalidInput, "this client is closed", None),
+        }
+    }
+
+    /// The slot itself, for [`close`], which is the one caller that empties it.
+    fn locked(&self) -> std::sync::MutexGuard<'_, Option<Arc<MindStore>>> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A Mind opened for this client publishes into the journal root it was given, and into no
     /// other medium: without a root the handle keeps no publisher and `review` refuses.
     fn publishing(&self, mind: Mind) -> Mind {
@@ -249,7 +268,11 @@ impl MindcoreClient {
     }
 
     async fn open_mind(&self, mind_id: &MindId) -> SpokeResult<MindView> {
-        match Mind::open(&self.store, &self.caller, mind_id).await {
+        let store = match self.store() {
+            SpokeResult::Ok(store) => store,
+            SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
+        };
+        match Mind::open(&store, &self.caller, mind_id).await {
             SpokeResult::Ok(mind) => SpokeResult::Ok(MindView {
                 mind: self.publishing(mind),
             }),
@@ -274,6 +297,94 @@ impl MindcoreClient {
     }
 }
 
+/// One path the caller named, and the io failure it produced, as the two members a path refusal
+/// carries: the member's own name and the failure's kind.
+fn path_details(member: &str, path: &Path, kind: std::io::ErrorKind) -> Option<Map<String, Value>> {
+    let mut details = Map::new();
+    details.insert(
+        member.to_string(),
+        Value::String(path.display().to_string()),
+    );
+    details.insert("kind".to_string(), Value::String(kind.to_string()));
+    Some(details)
+}
+
+/// Which of the two failures an io error on a caller-named path is.
+///
+/// A path that cannot be used as named — a component that is a regular file, a path that is a
+/// directory where a file belongs, an entry that already exists as the wrong type — is the caller's
+/// mistake: `INVALID_INPUT`. A walk that could not run because the environment refused it — no
+/// permission, no space, an fsync that fails, a path that cannot be resolved — is an environment
+/// fault: `INTERNAL_ERROR`. The addon never reports the second as the first: a caller who fixes
+/// their spelling and retries would otherwise be told, again, that their input is wrong.
+fn path_fault(member: &str, path: &Path, error: &std::io::Error) -> SpokeReject {
+    let caller_mistake = matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::AlreadyExists
+    );
+    SpokeReject {
+        code: if caller_mistake {
+            SpokeRejectCode::InvalidInput
+        } else {
+            SpokeRejectCode::InternalError
+        },
+        message: if caller_mistake {
+            format!("{member} {} cannot be used: {error}", path.display())
+        } else {
+            format!("{member} {} could not be prepared: {error}", path.display())
+        },
+        details: path_details(member, path, error.kind()),
+    }
+}
+
+/// A store path that cannot be the file the caller asked for, as the refusal it is.
+///
+/// The store file is this client's own, and its name is the caller's to spell: a directory at that
+/// name, a parent that refuses writes, a read-only file — every one of these is fixed by naming a
+/// different path, so every one answers `INVALID_INPUT` with `storePath` and the io kind. This is
+/// deliberately not [`path_fault`]'s split: the journal walk touches a directory tree whose refusals
+/// can be environmental, while nothing about a store file is outside the caller's control.
+fn store_path_refusal(path: &Path, error: &std::io::Error) -> SpokeReject {
+    SpokeReject {
+        code: SpokeRejectCode::InvalidInput,
+        message: format!("storePath {} cannot be used: {error}", path.display()),
+        details: path_details("storePath", path, error.kind()),
+    }
+}
+
+/// The io failure that makes `path` unusable as a store file, if any.
+///
+/// Two probes, both synchronous and cheap. The first refuses a name that is not a file at all — a
+/// directory, a device — which SQLite would answer with a generic "unable to open database file"
+/// naming neither the path nor the reason. The second opens the path for writing and closes it
+/// again, which is exactly what building the pool does: a parent that refuses writes, or a
+/// read-only file, is the caller's own path and is reported as such before any pool exists. The
+/// empty file this probe creates is a database SQLite initializes normally.
+///
+/// Whatever survives both probes and still fails is not about the name: a database another process
+/// holds locked, a migration that refuses the file, a full disk. That is the environment's.
+fn store_path_fault(path: &Path) -> Option<std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Some(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "a store path must be a file",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Some(error),
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .err()
+}
+
 /// Open the one store file this client serves.
 ///
 /// `journalDir`, when given, is created, resolved and its whole chain made durable here: that is
@@ -286,10 +397,10 @@ impl MindcoreClient {
 /// async worker, so an `open` over a slow or network filesystem cannot stall every other call on
 /// the addon's runtime.
 ///
-/// The root is a caller-supplied path, so a path that is not a directory or whose parent cannot be
-/// reached is the caller's own `INVALID_INPUT`, naming `journalDir` and carrying the io kind in
-/// `details`. `INTERNAL_ERROR` is reserved for a walk that did not run (a join failure) — the
-/// addon's fault, not the caller's.
+/// Both caller-supplied paths are classified by [`path_fault`] and [`store_fault`]: a name that
+/// cannot be a directory or a file is `INVALID_INPUT`, an environment that refuses the work is
+/// `INTERNAL_ERROR`. A walk that did not run at all (a join failure) is the addon's own
+/// `INTERNAL_ERROR`.
 #[napi]
 pub async fn open_client(options: ClientOptions) -> ClientResult {
     let journal_root = match &options.journal_dir {
@@ -300,20 +411,7 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
             match walked {
                 Ok(Ok(resolved)) => Some(resolved),
                 Ok(Err(error)) => {
-                    let mut details = Map::new();
-                    details.insert(
-                        "journalDir".to_string(),
-                        Value::String(configured.display().to_string()),
-                    );
-                    details.insert("kind".to_string(), Value::String(error.kind().to_string()));
-                    return ClientResult::refused(&SpokeReject {
-                        code: SpokeRejectCode::InvalidInput,
-                        message: format!(
-                            "journalDir {} cannot serve as a journal root: {error}",
-                            configured.display()
-                        ),
-                        details: Some(details),
-                    });
+                    return ClientResult::refused(&path_fault("journalDir", &configured, &error))
                 }
                 Err(error) => {
                     return ClientResult::refused(&SpokeReject {
@@ -329,18 +427,49 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
         }
         None => None,
     };
-    match MindStore::open(Path::new(&options.store_path)).await {
+    let store_path = PathBuf::from(&options.store_path);
+    if let Some(error) = store_path_fault(&store_path) {
+        return ClientResult::refused(&store_path_refusal(&store_path, &error));
+    }
+    match MindStore::open(&store_path).await {
         Ok(store) => ClientResult::answered(MindcoreClient {
-            store: Arc::new(store),
+            store: Mutex::new(Some(Arc::new(store))),
             caller: CallerId::new(options.caller_id),
             journal_root,
         }),
+        // Both probes passed, so the name is usable and whatever fails now is the environment:
+        // a lock another process holds, a migration that refuses the file, a full disk.
         Err(error) => ClientResult::refused(&SpokeReject {
             code: SpokeRejectCode::InternalError,
-            message: format!("the store {} cannot be opened: {error}", options.store_path),
-            details: None,
+            message: format!(
+                "storePath {} could not be opened: {error}",
+                store_path.display()
+            ),
+            details: path_details("storePath", &store_path, std::io::ErrorKind::Other),
         }),
     }
+}
+
+/// End this client: close its store pool and empty the handle slot, so the same file can be opened
+/// again in this process and every later call on this client answers `INVALID_INPUT`.
+///
+/// A `MindView` is an independent handle, not a borrow of this client: it holds its own `SqlitePool`
+/// over the same file, so it keeps working after its client is closed. That is why the teardown
+/// gates on nothing — the caller owns the views and drops them; a count of "views still open" would
+/// also be decided by JavaScript's garbage collector rather than by the caller, which is no basis
+/// for a refusal. Closing twice is not an error: the second call has nothing left to do.
+#[napi]
+pub async fn client_close(client: &MindcoreClient) -> Value {
+    let Some(store) = client.locked().take() else {
+        return settle::<()>(SpokeResult::Ok(()));
+    };
+    // A view opened earlier keeps its own pool over the same file, so this can fail to be the last
+    // reference; the pool still closes for this client, which is all a teardown promises.
+    match Arc::try_unwrap(store) {
+        Ok(store) => store.close().await,
+        Err(store) => store.pool().close().await,
+    }
+    settle::<()>(SpokeResult::Ok(()))
 }
 
 /// Create a Mind owned by this client's caller, and open it: the registry writes the row in its
@@ -359,7 +488,11 @@ pub async fn client_create_mind(
         display_name: options.display_name,
         owner: client.caller.clone(),
     };
-    let created = match minds::create(&client.store, &request).await {
+    let store = match client.store() {
+        SpokeResult::Ok(store) => store,
+        SpokeResult::Reject(reject) => return MindResult::refused(&reject),
+    };
+    let created = match minds::create(&store, &request).await {
         SpokeResult::Ok(row) => row,
         SpokeResult::Reject(reject) => return MindResult::refused(&reject),
     };
@@ -372,7 +505,11 @@ pub async fn client_create_mind(
 /// Every Mind this client's caller holds a live grant in, in `id` order.
 #[napi]
 pub async fn client_list_minds(client: &MindcoreClient) -> Value {
-    settle(match minds::list(&client.store, &client.caller).await {
+    let store = match client.store() {
+        SpokeResult::Ok(store) => store,
+        SpokeResult::Reject(reject) => return settle::<Vec<MindInfo>>(SpokeResult::Reject(reject)),
+    };
+    settle(match minds::list(&store, &client.caller).await {
         SpokeResult::Ok(rows) => {
             SpokeResult::Ok(rows.iter().map(MindInfo::from).collect::<Vec<_>>())
         }
@@ -401,7 +538,11 @@ pub async fn client_ensure_subject(
         SpokeResult::Ok(principal) => principal,
         SpokeResult::Reject(reject) => return settle::<()>(SpokeResult::Reject(reject)),
     };
-    let mut tx = match client.store.pool().begin().await {
+    let store = match client.store() {
+        SpokeResult::Ok(store) => store,
+        SpokeResult::Reject(reject) => return settle::<()>(SpokeResult::Reject(reject)),
+    };
+    let mut tx = match store.pool().begin().await {
         Ok(tx) => tx,
         Err(error) => {
             return settle::<()>(spoke_reject(
@@ -869,9 +1010,9 @@ fn create_concurrently(level: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        durable_root, knowledge_entry, occurred_at, optional_budget, optional_revision,
-        review_decision, settle, whole_budget, whole_number, BINDING_DEFECT, CREATE_CONCURRENTLY,
-        INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
+        durable_root, knowledge_entry, occurred_at, optional_budget, optional_revision, path_fault,
+        review_decision, settle, store_path_fault, store_path_refusal, whole_budget, whole_number,
+        BINDING_DEFECT, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
     };
     use std::path::{Path, PathBuf};
 
@@ -1044,6 +1185,114 @@ mod tests {
             optional_budget(Some(-1.0), "maxBytes"),
             SpokeResult::Reject(_)
         ));
+    }
+
+    /// Two failures read very differently to a caller: a name that cannot be what it must be is
+    /// their spelling, and they can fix it; a filesystem that refuses the work is the environment,
+    /// and retrying the same spelling changes nothing. Everything names the path and the kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_fault_is_the_callers_or_the_environments_by_kind() {
+        use spoke_operations::SpokeRejectCode;
+
+        let file = path_fault(
+            "journalDir",
+            Path::new("/tmp/journal"),
+            &std::io::Error::from(std::io::ErrorKind::NotADirectory),
+        );
+        assert_eq!(file.code, SpokeRejectCode::InvalidInput);
+        assert!(
+            file.message.contains("/tmp/journal"),
+            "the refusal names the path: {}",
+            file.message
+        );
+        let details = file.details.expect("a path refusal carries its members");
+        assert_eq!(details["journalDir"], serde_json::json!("/tmp/journal"));
+        assert!(details.contains_key("kind"));
+
+        let denied = path_fault(
+            "journalDir",
+            Path::new("/tmp/journal"),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(
+            denied.code,
+            SpokeRejectCode::InternalError,
+            "a permission fault is not the caller's spelling"
+        );
+        assert!(denied.message.contains("/tmp/journal"));
+
+        // A walk that fails on an unwritable ancestor reaches the same classification through the
+        // real path: chmod refuses on the directory, and the walk reports PermissionDenied.
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let scratch_path = canonical(scratch.path());
+        let sealed = scratch_path.join("sealed");
+        std::fs::create_dir(&sealed).expect("the sealed directory");
+        let root = sealed.join("journal");
+        let mut permissions = std::fs::metadata(&sealed).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o555);
+        std::fs::set_permissions(&sealed, permissions).expect("seal the directory");
+        let walked = durable_root(&root);
+        let mut permissions = std::fs::metadata(&sealed).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&sealed, permissions).expect("unseal the directory");
+
+        match walked {
+            Err(error) => assert_eq!(
+                path_fault("journalDir", &root, &error).code,
+                SpokeRejectCode::InternalError,
+                "an unwritable ancestor is an environment fault: {error}"
+            ),
+            // A process running as root may write into a 0555 directory; the classification above
+            // is then the whole evidence, and this arm says so rather than passing silently.
+            Ok(_) => eprintln!("skipping the walk half: this process may write into a sealed dir"),
+        }
+    }
+
+    /// A store name that is a directory is refused before SQLite sees it; a name that cannot be
+    /// written is refused by the write probe. Both name `storePath`.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_path_that_is_not_a_file_is_refused_before_the_pool() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let scratch_path = canonical(scratch.path());
+
+        let directory = scratch_path.join("a-directory");
+        std::fs::create_dir(&directory).expect("the directory");
+        let fault = store_path_fault(&directory).expect("a directory is not a store file");
+        let refusal = store_path_refusal(&directory, &fault);
+        assert_eq!(
+            refusal.code,
+            spoke_operations::SpokeRejectCode::InvalidInput
+        );
+
+        // A file whose parent refuses writes: the probe catches it, and says so as the caller's.
+        let sealed = scratch_path.join("sealed");
+        std::fs::create_dir(&sealed).expect("the sealed directory");
+        let store = sealed.join("mind.db");
+        let mut permissions = std::fs::metadata(&sealed).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o555);
+        std::fs::set_permissions(&sealed, permissions).expect("seal the directory");
+        let fault = store_path_fault(&store);
+        let mut permissions = std::fs::metadata(&sealed).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&sealed, permissions).expect("unseal the directory");
+        match fault {
+            Some(error) => {
+                assert_eq!(
+                    store_path_refusal(&store, &error).code,
+                    spoke_operations::SpokeRejectCode::InvalidInput,
+                    "an unwritable parent is the caller's path: {error}"
+                );
+            }
+            None => eprintln!("skipping the probe half: this process may write into a sealed dir"),
+        }
+
+        // An absent path under a writable parent is fine, and the probe leaves a file SQLite can
+        // initialize.
+        let fresh = scratch_path.join("fresh.db");
+        assert!(store_path_fault(&fresh).is_none());
+        assert!(fresh.is_file(), "the probe creates the file it will use");
     }
 
     /// A revision arrives as a JavaScript `number`: only a finite, whole, non-negative one below
