@@ -27,7 +27,8 @@ use mindcore_sqlite::MindStore;
 use spoke_operations::{spoke_reject, SpokeReject, SpokeRejectCode, SpokeResult};
 use spoke_schemas::memory_candidates_review_request::Decision as ReviewDecision;
 use spoke_schemas::{
-    KnowledgeEntry, MemoryCandidatesReviewResponse, MemoryCaptureResponse, Principal,
+    KnowledgeEntry, MemoryCandidatesReviewResponse, MemoryCaptureResponse, MemoryRecallResponse,
+    Principal,
 };
 
 /// What `openClient` is given: the one store file this client serves, the caller every call
@@ -59,14 +60,15 @@ pub struct CaptureInput {
     pub idempotency_key: String,
 }
 
-/// One memory recall as JavaScript supplies it. `maxItems` is `u32` because a `u64` argument
-/// would arrive as a `bigint`; a page of records is far below that.
+/// One memory recall as JavaScript supplies it. Both bounds are `f64` for the same reason a
+/// revision is: a napi `u32` reads through JavaScript's `uint32` conversion, so `-1` would arrive
+/// as `4294967295` and `2^32` as `0` — a caller's mistake silently becoming a different budget.
 #[napi(object)]
 pub struct RecallInput {
     pub subject: String,
     pub selection: Value,
-    pub max_items: u32,
-    pub max_bytes: Option<u32>,
+    pub max_items: f64,
+    pub max_bytes: Option<f64>,
     pub query: Option<String>,
     pub cursor: Option<String>,
 }
@@ -282,7 +284,12 @@ impl MindcoreClient {
 ///
 /// The walk is synchronous and does real file I/O: it runs on the blocking pool rather than on the
 /// async worker, so an `open` over a slow or network filesystem cannot stall every other call on
-/// the addon's runtime. A join failure is the addon's own `INTERNAL_ERROR`.
+/// the addon's runtime.
+///
+/// The root is a caller-supplied path, so a path that is not a directory or whose parent cannot be
+/// reached is the caller's own `INVALID_INPUT`, naming `journalDir` and carrying the io kind in
+/// `details`. `INTERNAL_ERROR` is reserved for a walk that did not run (a join failure) — the
+/// addon's fault, not the caller's.
 #[napi]
 pub async fn open_client(options: ClientOptions) -> ClientResult {
     let journal_root = match &options.journal_dir {
@@ -293,11 +300,20 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
             match walked {
                 Ok(Ok(resolved)) => Some(resolved),
                 Ok(Err(error)) => {
+                    let mut details = Map::new();
+                    details.insert(
+                        "journalDir".to_string(),
+                        Value::String(configured.display().to_string()),
+                    );
+                    details.insert("kind".to_string(), Value::String(error.kind().to_string()));
                     return ClientResult::refused(&SpokeReject {
-                        code: SpokeRejectCode::InternalError,
-                        message: format!("the journal root {dir} is not durable: {error}"),
-                        details: None,
-                    })
+                        code: SpokeRejectCode::InvalidInput,
+                        message: format!(
+                            "journalDir {} cannot serve as a journal root: {error}",
+                            configured.display()
+                        ),
+                        details: Some(details),
+                    });
                 }
                 Err(error) => {
                     return ClientResult::refused(&SpokeReject {
@@ -477,6 +493,35 @@ fn optional_revision(value: Option<f64>, member: &str) -> SpokeResult<Option<u64
     }
 }
 
+/// A JavaScript `number` as the `u32` recall budget it names.
+///
+/// [`whole_number`] first, so nothing wraps: `-1` must not become `4294967295` through JavaScript's
+/// `uint32` conversion, and `2^32` must not become `0`. A value above `u32::MAX` is refused rather
+/// than saturated, naming the member and the value.
+fn whole_budget(value: f64, member: &str) -> SpokeResult<u32> {
+    match whole_number(value, member) {
+        SpokeResult::Ok(number) => match u32::try_from(number) {
+            Ok(budget) => SpokeResult::Ok(budget),
+            Err(_) => invalid_input(format!(
+                "{member} must be a whole non-negative number at most {}, not {value}",
+                u32::MAX
+            )),
+        },
+        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+    }
+}
+
+/// An optional recall budget, converted by [`whole_budget`].
+fn optional_budget(value: Option<f64>, member: &str) -> SpokeResult<Option<u32>> {
+    match value {
+        Some(value) => match whole_budget(value, member) {
+            SpokeResult::Ok(budget) => SpokeResult::Ok(Some(budget)),
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        },
+        None => SpokeResult::Ok(None),
+    }
+}
+
 /// An optional RFC 3339 `occurredAt` as the instant the capture carries.
 fn occurred_at(value: Option<&str>) -> SpokeResult<Option<DateTime<Utc>>> {
     match value {
@@ -599,11 +644,23 @@ pub async fn mind_review(
 /// Recall this Mind's live records.
 #[napi]
 pub async fn mind_recall(view: &MindView, input: RecallInput) -> Value {
+    let max_items = match whole_budget(input.max_items, "maxItems") {
+        SpokeResult::Ok(max_items) => max_items,
+        SpokeResult::Reject(reject) => {
+            return settle::<MemoryRecallResponse>(SpokeResult::Reject(reject))
+        }
+    };
+    let max_bytes = match optional_budget(input.max_bytes, "maxBytes") {
+        SpokeResult::Ok(max_bytes) => max_bytes,
+        SpokeResult::Reject(reject) => {
+            return settle::<MemoryRecallResponse>(SpokeResult::Reject(reject))
+        }
+    };
     let recall = Recall {
         subject: &input.subject,
         selection: &input.selection,
-        max_items: u64::from(input.max_items),
-        max_bytes: input.max_bytes.map(u64::from),
+        max_items: u64::from(max_items),
+        max_bytes: max_bytes.map(u64::from),
         query: input.query.as_deref(),
         cursor: input.cursor.as_deref(),
     };
@@ -702,8 +759,14 @@ fn durable_root(root: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// [`sync_parent`], skipped for a directory this call has already flushed.
+///
+/// The key is the directory's **resolved** path, not the spelling it arrived as: a relative root's
+/// configured walk names the current directory `.` while the resolved walk names the same
+/// directory absolutely, and both must count as one flush. A directory this call cannot resolve is
+/// keyed by its spelling — it still gets exactly one flush.
 fn sync_once(parent: &Path, synced: &mut HashSet<PathBuf>) -> std::io::Result<()> {
-    if synced.insert(parent.to_path_buf()) {
+    let key = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    if synced.insert(key) {
         sync_parent(parent)?;
     }
     Ok(())
@@ -806,8 +869,9 @@ fn create_concurrently(level: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        durable_root, knowledge_entry, occurred_at, optional_revision, review_decision, settle,
-        whole_number, BINDING_DEFECT, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
+        durable_root, knowledge_entry, occurred_at, optional_budget, optional_revision,
+        review_decision, settle, whole_budget, whole_number, BINDING_DEFECT, CREATE_CONCURRENTLY,
+        INJECT_SYNC_FAILURE, SYNC_ATTEMPTS,
     };
     use std::path::{Path, PathBuf};
 
@@ -927,6 +991,58 @@ mod tests {
         assert!(matches!(
             review_decision(json!({ "action": "promote" })),
             SpokeResult::Ok(_)
+        ));
+    }
+
+    /// A recall budget arrives as a JavaScript `number` and is read through no `uint32` conversion:
+    /// `-1` must not become `4294967295` and `2^32` must not become `0`. Only a whole, non-negative
+    /// value at most `u32::MAX` is a budget; the rest name the member and the value.
+    #[test]
+    fn recall_budgets_are_whole_and_fit_in_u32() {
+        use spoke_operations::{SpokeRejectCode, SpokeResult};
+
+        for (value, expected) in [(0.0, 0u32), (1.0, 1), ((u32::MAX) as f64, u32::MAX)] {
+            match whole_budget(value, "maxItems") {
+                SpokeResult::Ok(budget) => assert_eq!(budget, expected, "{value}"),
+                SpokeResult::Reject(reject) => panic!("{value} refused: {}", reject.message),
+            }
+        }
+        for value in [
+            -1.0,
+            0.5,
+            f64::NAN,
+            f64::INFINITY,
+            4_294_967_296.0,
+            f64::MAX,
+        ] {
+            match whole_budget(value, "maxItems") {
+                SpokeResult::Reject(reject) => {
+                    assert_eq!(reject.code, SpokeRejectCode::InvalidInput, "{value}");
+                    assert!(
+                        reject.message.contains("maxItems"),
+                        "the refusal names the member: {value}, {}",
+                        reject.message
+                    );
+                    assert!(
+                        reject.message.contains(&value.to_string()),
+                        "the refusal names the value: {value}, {}",
+                        reject.message
+                    );
+                }
+                SpokeResult::Ok(budget) => panic!("{value} became {budget}"),
+            }
+        }
+        assert!(matches!(
+            optional_budget(None, "maxBytes"),
+            SpokeResult::Ok(None)
+        ));
+        assert!(matches!(
+            optional_budget(Some(1.0), "maxBytes"),
+            SpokeResult::Ok(Some(1))
+        ));
+        assert!(matches!(
+            optional_budget(Some(-1.0), "maxBytes"),
+            SpokeResult::Reject(_)
         ));
     }
 
@@ -1060,8 +1176,9 @@ mod tests {
 
     /// A symlink anywhere on the path, not only at the leaf: `a/link/inner` where `link` points into
     /// `elsewhere/real`. Every configured level keeps its own entry flushed, and the level that is a
-    /// symlink also flushes the entry naming what it resolves to — the parent the publisher's
-    /// canonicalized root lives under. The leaf's own parents are flushed in the same walk.
+    /// symlink also flushes the directory it resolves to — the parent the publisher's canonicalized
+    /// root lives under. A directory is one inode under two names, so its entry is flushed once:
+    /// the count is asserted across both spellings, never per spelling.
     #[cfg(unix)]
     #[test]
     fn a_symlink_below_the_root_syncs_both_its_parent_and_the_resolved_parent() {
@@ -1077,7 +1194,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).expect("the intermediate symlink");
         let a_before = syncs_of(&a);
         let elsewhere_before = syncs_of(&elsewhere);
-        let real_before = syncs_of(&real);
+        let real_before = syncs_of(&real) + syncs_of(&link);
 
         durable_root(&link.join("inner")).expect("a root below an intermediate symlink starts");
 
@@ -1093,9 +1210,10 @@ mod tests {
             syncs_of(&elsewhere) > elsewhere_before,
             "the directory holding the resolved path is synced"
         );
-        assert!(
-            syncs_of(&real) > real_before,
-            "the leaf's own parent is synced, in the resolved chain"
+        assert_eq!(
+            syncs_of(&real) + syncs_of(&link),
+            real_before + 1,
+            "the leaf's parent is one directory under two names: flushed once, through either"
         );
     }
 

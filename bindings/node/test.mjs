@@ -2,7 +2,7 @@
 // mind_facade.rs` through `index.js`, then the three refusals that are cheapest to get wrong.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -13,10 +13,20 @@ const CALLER = 'caller_wren';
 const SUBJECT = 'subj_wren';
 const TEXT = 'the north gate is shut after dusk';
 
-// Every store, its journal root and its keys live in this throwaway directory, which is removed
-// after the run; nothing here is committed and no path is reused between runs.
-const root = mkdtempSync(join(tmpdir(), 'mindcore-binding-'));
-after(() => rmSync(root, { recursive: true, force: true }));
+// Every store, its journal root and its keys live under one throwaway directory, and every other
+// directory a case creates is tracked here too, so the run leaves nothing behind.
+const temporaryDirectories = [];
+function scratchDirectory(prefix) {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+const root = scratchDirectory('mindcore-binding-');
+after(() => {
+  for (const directory of temporaryDirectories) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 /** A client over its own store file and journal root under `root`; `journal` off keeps no publisher. */
 function open(name, { journal = true } = {}) {
@@ -107,6 +117,28 @@ describe('the in-process binding', () => {
     );
   });
 
+  it('refuses a journalDir that is not a directory as invalid input', async () => {
+    // A caller-supplied path is the caller's mistake to hear about, with the path named and the
+    // io kind carried — not an internal fault.
+    const path = join(root, 'not-a-directory');
+    writeFileSync(path, 'this is a file');
+    await assert.rejects(
+      () =>
+        MindcoreClient.open({
+          storePath: join(root, 'refused.db'),
+          callerId: CALLER,
+          journalDir: join(path, 'journal'),
+        }),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INVALID_INPUT');
+        assert.equal(error.details.journalDir, join(path, 'journal'));
+        assert.equal(typeof error.details.kind, 'string');
+        return true;
+      },
+    );
+  });
+
   it('refuses review on a client opened without a journal root', async () => {
     // No `journalDir`: the handle keeps no publisher, and `review` refuses before staging.
     const client = await open('no-journal', { journal: false });
@@ -168,7 +200,7 @@ describe('the in-process binding', () => {
     // A relative root names the directory that was current at open. The client retains the
     // resolved absolute path, so a later working-directory change cannot move the publication.
     const previous = process.cwd();
-    const elsewhere = mkdtempSync(join(tmpdir(), 'mindcore-elsewhere-'));
+    const elsewhere = scratchDirectory('mindcore-elsewhere-');
     const journalName = 'relative-journal';
     let mind;
     let candidateId;
