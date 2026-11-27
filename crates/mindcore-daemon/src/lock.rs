@@ -220,6 +220,12 @@ mod tests {
             lock.display()
         );
         assert_ne!(lock, store, "the lock is not the store file");
+        assert_eq!(
+            lock.file_name().and_then(|name| name.to_str()),
+            Some(format!(".mindcore-store-{}-{}.lock", metadata.dev(), metadata.ino()).as_str()),
+            "the lock is named for the store's inode: {}",
+            lock.display()
+        );
 
         let first = StoreLock::acquire(&store).expect("acquire");
         assert!(lock.exists(), "the lock file exists while held");
@@ -358,7 +364,17 @@ mod tests {
         let link = elsewhere.path().join("mind.db");
         std::fs::hard_link(&store, &link).expect("hard link across directories");
 
-        assert_eq!(lock_file_for(&store), lock_file_for(&link));
+        let store_lock = lock_file_for(&store);
+        let link_lock = lock_file_for(&link);
+        assert_ne!(
+            store_lock, link_lock,
+            "a cross-directory hard link names its own lock"
+        );
+        assert_eq!(store_lock.parent(), Some(resolved(dir.path()).as_path()));
+        assert_eq!(
+            link_lock.parent(),
+            Some(resolved(elsewhere.path()).as_path())
+        );
 
         // Two directory entries, two inodes' worth of naming, two locks — the pinned limit.
         let first = StoreLock::acquire(&store).expect("acquire through the first name");
