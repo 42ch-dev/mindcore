@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use napi_derive::napi;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -19,11 +20,14 @@ use serde_json::{json, Map, Value};
 use mindcore_base::boundary::CallerId;
 use mindcore_base::ids::MindId;
 use mindcore_runtime::minds::{self, CreateMind, Mind as MindRow, MindStatus};
-use mindcore_runtime::{journal_dir, Mind};
+use mindcore_runtime::{journal_dir, Capture, Mind, Recall};
 use mindcore_spoke::{MemoryAdapter, MemoryStage};
 use mindcore_sqlite::MindStore;
 use spoke_operations::{spoke_reject, SpokeReject, SpokeRejectCode, SpokeResult};
-use spoke_schemas::Principal;
+use spoke_schemas::memory_candidates_review_request::Decision as ReviewDecision;
+use spoke_schemas::{
+    KnowledgeEntry, MemoryCandidatesReviewResponse, MemoryCaptureResponse, Principal,
+};
 
 /// What `openClient` is given: the one store file this client serves, the caller every call
 /// admits, and the journal root `review` publishes under (`review` refuses without one).
@@ -42,17 +46,42 @@ pub struct CreateMindOptions {
     pub display_name: Option<String>,
 }
 
+/// One memory capture as JavaScript supplies it: the wire request's own members, with `content`
+/// and `selection` crossing as the plain objects the wire carries. `occurredAt` is RFC 3339.
+#[napi(object)]
+pub struct CaptureInput {
+    pub subject: String,
+    pub context: Option<String>,
+    pub content: Value,
+    pub occurred_at: Option<String>,
+    pub kind_hint: Option<String>,
+    pub idempotency_key: String,
+}
+
+/// One memory recall as JavaScript supplies it. `maxItems` is `u32` because a `u64` argument
+/// would arrive as a `bigint`; a page of records is far below that.
+#[napi(object)]
+pub struct RecallInput {
+    pub subject: String,
+    pub selection: Value,
+    pub max_items: u32,
+    pub max_bytes: Option<u32>,
+    pub query: Option<String>,
+    pub cursor: Option<String>,
+}
+
 /// One registry row as JavaScript sees it: camelCase, and the status as its own name. The row
 /// carries no serde derive, so this is the projection the binding owns.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MindInfo {
-    id: String,
-    display_name: Option<String>,
-    status: &'static str,
-    knowledge_collection: String,
-    carrier_entry_id: String,
-    created_at: String,
+#[napi(object, object_from_js = false)]
+pub struct MindInfo {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub status: &'static str,
+    pub knowledge_collection: String,
+    pub carrier_entry_id: String,
+    pub created_at: String,
 }
 
 impl From<&MindRow> for MindInfo {
@@ -186,8 +215,6 @@ impl MindResult {
 pub struct MindView {
     /// The facade handle. A private field is not a JavaScript member, so no getter is emitted for
     /// it and the handle never crosses the boundary by itself.
-    // temporary: its readers arrive with Task 2 of `.mstar/plans/mind-native-binding.md`.
-    #[allow(dead_code)]
     mind: Mind,
 }
 
@@ -259,10 +286,7 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
         }),
         Err(error) => ClientResult::refused(&SpokeReject {
             code: SpokeRejectCode::InternalError,
-            message: format!(
-                "the store {} cannot be opened: {error}",
-                options.store_path
-            ),
+            message: format!("the store {} cannot be opened: {error}", options.store_path),
             details: None,
         }),
     }
@@ -297,14 +321,12 @@ pub async fn client_create_mind(
 /// Every Mind this client's caller holds a live grant in, in `id` order.
 #[napi]
 pub async fn client_list_minds(client: &MindcoreClient) -> Value {
-    settle(
-        match minds::list(&client.store, &client.caller).await {
-            SpokeResult::Ok(rows) => {
-                SpokeResult::Ok(rows.iter().map(MindInfo::from).collect::<Vec<_>>())
-            }
-            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
-        },
-    )
+    settle(match minds::list(&client.store, &client.caller).await {
+        SpokeResult::Ok(rows) => {
+            SpokeResult::Ok(rows.iter().map(MindInfo::from).collect::<Vec<_>>())
+        }
+        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+    })
 }
 
 /// One Mind this client's caller may see; any other id answers the registry's own `NotFound`.
@@ -365,6 +387,190 @@ pub async fn client_ensure_subject(
     settle(settled)
 }
 
+/// The derived judgment of one Mind as JavaScript sees it: the carrier revision the read served,
+/// its current-view records and the `MindState` projection, camelCase. `Cognition` carries no
+/// serde derive and its revision is a `u64`, so this is the projection the binding owns; the
+/// number stays a JSON number, which is what `index.d.ts` declares.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CognitionInfo {
+    carrier_revision: u64,
+    records: Vec<Value>,
+    mind_state: Value,
+}
+
+impl From<mindcore_spoke::Cognition> for CognitionInfo {
+    fn from(cognition: mindcore_spoke::Cognition) -> Self {
+        Self {
+            carrier_revision: cognition.carrier_revision,
+            records: cognition.records,
+            mind_state: cognition.mind_state,
+        }
+    }
+}
+
+/// The addon's own refusal for an argument it cannot render into the facade's plain arguments.
+fn invalid_input<T>(message: impl Into<String>) -> SpokeResult<T> {
+    spoke_reject(SpokeRejectCode::InvalidInput, message, None)
+}
+
+/// A JavaScript `number` as the `u64` revision it names.
+///
+/// Only a finite, whole, non-negative value below `2^64` is one: `as u64` would truncate a
+/// fraction, wrap a sign or saturate a magnitude, and a revision nobody could have stored is
+/// the caller's mistake to hear about, not a revision to read.
+fn whole_number(value: f64, member: &str) -> SpokeResult<u64> {
+    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value < TWO_POW_64 {
+        SpokeResult::Ok(value as u64)
+    } else {
+        invalid_input(format!(
+            "{member} must be a whole non-negative number below 2^64, not {value}"
+        ))
+    }
+}
+
+/// An optional revision, converted by [`whole_number`]; a fractional, negative or infinite
+/// member is refused before any facade call.
+fn optional_revision(value: Option<f64>, member: &str) -> SpokeResult<Option<u64>> {
+    match value {
+        Some(value) => match whole_number(value, member) {
+            SpokeResult::Ok(revision) => SpokeResult::Ok(Some(revision)),
+            SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+        },
+        None => SpokeResult::Ok(None),
+    }
+}
+
+/// An optional RFC 3339 `occurredAt` as the instant the capture carries.
+fn occurred_at(value: Option<&str>) -> SpokeResult<Option<DateTime<Utc>>> {
+    match value {
+        None => SpokeResult::Ok(None),
+        Some(text) => match DateTime::parse_from_rfc3339(text) {
+            Ok(at) => SpokeResult::Ok(Some(at.with_timezone(&Utc))),
+            Err(error) => invalid_input(format!(
+                "occurredAt must be an RFC 3339 datetime, not {text}: {error}"
+            )),
+        },
+    }
+}
+
+/// The opened Mind's registry row as it was at open, plus the carrier entry its judgment lives
+/// in. A synchronous read: it calls nothing and holds no transaction.
+#[napi]
+pub fn mind_view_info(view: &MindView) -> MindInfo {
+    MindInfo::from(view.mind.row())
+}
+
+/// Read one entry of this Mind's collection, at its current revision or at `revision`.
+#[napi]
+pub async fn mind_knowledge_get(view: &MindView, entry_id: String, revision: Option<f64>) -> Value {
+    let revision = match optional_revision(revision, "revision") {
+        SpokeResult::Ok(revision) => revision,
+        SpokeResult::Reject(reject) => {
+            return settle::<KnowledgeEntry>(SpokeResult::Reject(reject))
+        }
+    };
+    settle(view.mind.knowledge_get(&entry_id, revision).await)
+}
+
+/// Write one entry of this Mind's collection, against the revision the caller read it at.
+#[napi]
+pub async fn mind_knowledge_put(
+    view: &MindView,
+    entry: Value,
+    expected_base_revision: Option<f64>,
+) -> Value {
+    let expected = match optional_revision(expected_base_revision, "expectedBaseRevision") {
+        SpokeResult::Ok(expected) => expected,
+        SpokeResult::Reject(reject) => {
+            return settle::<KnowledgeEntry>(SpokeResult::Reject(reject))
+        }
+    };
+    let entry: KnowledgeEntry = match serde_json::from_value(entry) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return settle::<KnowledgeEntry>(invalid_input(format!(
+                "entry is not a knowledge entry: {error}"
+            )))
+        }
+    };
+    settle(view.mind.knowledge_put(entry, expected).await)
+}
+
+/// Every entry of this Mind's collection, bounded by the store's own 512-entry cap.
+#[napi]
+pub async fn mind_knowledge_list(view: &MindView) -> Value {
+    settle(view.mind.knowledge_list().await)
+}
+
+/// Capture one memory into this Mind.
+#[napi]
+pub async fn mind_capture(view: &MindView, input: CaptureInput) -> Value {
+    let occurred_at = match occurred_at(input.occurred_at.as_deref()) {
+        SpokeResult::Ok(occurred_at) => occurred_at,
+        SpokeResult::Reject(reject) => {
+            return settle::<MemoryCaptureResponse>(SpokeResult::Reject(reject))
+        }
+    };
+    let capture = Capture {
+        subject: &input.subject,
+        context: input.context.as_deref(),
+        content: &input.content,
+        occurred_at,
+        kind_hint: input.kind_hint.as_deref(),
+        idempotency_key: &input.idempotency_key,
+    };
+    settle(view.mind.capture(&capture).await)
+}
+
+/// Review one pending candidate and answer the settled receipt.
+#[napi]
+pub async fn mind_review(
+    view: &MindView,
+    candidate_id: String,
+    decision: Value,
+    idempotency_key: String,
+) -> Value {
+    let decision: ReviewDecision = match serde_json::from_value(decision) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return settle::<MemoryCandidatesReviewResponse>(invalid_input(format!(
+                "decision is not a review decision: {error}"
+            )))
+        }
+    };
+    settle(
+        view.mind
+            .review(&candidate_id, &decision, &idempotency_key)
+            .await,
+    )
+}
+
+/// Recall this Mind's live records.
+#[napi]
+pub async fn mind_recall(view: &MindView, input: RecallInput) -> Value {
+    let recall = Recall {
+        subject: &input.subject,
+        selection: &input.selection,
+        max_items: u64::from(input.max_items),
+        max_bytes: input.max_bytes.map(u64::from),
+        query: input.query.as_deref(),
+        cursor: input.cursor.as_deref(),
+    };
+    settle(view.mind.recall(&recall).await)
+}
+
+/// Read this Mind's judgment, or `null` for a Mind that has judged nothing.
+#[napi]
+pub async fn mind_cognition_read(view: &MindView) -> Value {
+    let settled = match view.mind.cognition_read().await {
+        SpokeResult::Ok(cognition) => SpokeResult::Ok(cognition.map(CognitionInfo::from)),
+        SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
+    };
+    settle(settled)
+}
+
 /// The host duty a journal root requires: the root exists, and every entry on the way to it is
 /// durable before the first publication writes into it.
 ///
@@ -391,7 +597,9 @@ fn durable_root(root: &Path) -> std::io::Result<()> {
     let mut cursor = Some(root);
     while let Some(level) = cursor {
         chain.push(level);
-        cursor = level.parent().filter(|parent| !parent.as_os_str().is_empty());
+        cursor = level
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
     }
     for level in chain.iter().rev() {
         match std::fs::metadata(level) {
@@ -497,7 +705,8 @@ fn take_injected_sync_failure(parent: &Path) -> bool {
 /// directory (the benign race), `false` a regular file (the refusal). Without it the window
 /// between this walk's check and its `create_dir` cannot be entered from a test.
 #[cfg(test)]
-static CREATE_CONCURRENTLY: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Vec::new());
+static CREATE_CONCURRENTLY: std::sync::Mutex<Vec<(PathBuf, bool)>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn create_concurrently(level: &Path) {
@@ -523,7 +732,10 @@ fn create_concurrently(level: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{durable_root, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE, SYNC_ATTEMPTS};
+    use super::{
+        durable_root, optional_revision, whole_number, CREATE_CONCURRENTLY, INJECT_SYNC_FAILURE,
+        SYNC_ATTEMPTS,
+    };
     use std::path::{Path, PathBuf};
 
     // Every seam is keyed by path and each test owns a fresh temporary root, so a shared global
@@ -534,7 +746,8 @@ mod tests {
     /// A level the walk will create does not resolve yet, so it is the canonical parent plus its
     /// own name.
     fn canonical(path: &Path) -> PathBuf {
-        path.canonicalize().unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        path.canonicalize()
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     }
 
     fn syncs_of(path: &Path) -> usize {
@@ -544,6 +757,39 @@ mod tests {
             .iter()
             .filter(|attempt| attempt.as_path() == path)
             .count()
+    }
+
+    /// A revision arrives as a JavaScript `number`: only a finite, whole, non-negative one below
+    /// `2^64` names a revision, and every other value is the caller's own `INVALID_INPUT`.
+    #[test]
+    fn revisions_are_whole_non_negative_numbers() {
+        use spoke_operations::{SpokeRejectCode, SpokeResult};
+
+        for (value, expected) in [(0.0, 0u64), (1.0, 1), (2.0_f64.powi(53), 1 << 53)] {
+            match whole_number(value, "revision") {
+                SpokeResult::Ok(revision) => assert_eq!(revision, expected, "{value}"),
+                SpokeResult::Reject(reject) => panic!("{value} refused: {}", reject.message),
+            }
+        }
+        for value in [
+            -1.0,
+            0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2.0_f64.powi(64),
+        ] {
+            match whole_number(value, "revision") {
+                SpokeResult::Reject(reject) => {
+                    assert_eq!(reject.code, SpokeRejectCode::InvalidInput, "{value}")
+                }
+                SpokeResult::Ok(revision) => panic!("{value} became {revision}"),
+            }
+        }
+        assert!(matches!(
+            optional_revision(None, "revision"),
+            SpokeResult::Ok(None)
+        ));
     }
 
     /// The whole point of the idempotent walk: a level an earlier start created but never proved
@@ -559,8 +805,14 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(level_parent.clone());
 
-        assert!(durable_root(&root).is_err(), "the injected sync fails the start");
-        assert!(root.is_dir(), "the level was created before the sync failed");
+        assert!(
+            durable_root(&root).is_err(),
+            "the injected sync fails the start"
+        );
+        assert!(
+            root.is_dir(),
+            "the level was created before the sync failed"
+        );
         let after_first = syncs_of(&level_parent);
         assert_eq!(after_first, 1, "the failed attempt is counted");
 
@@ -658,7 +910,10 @@ mod tests {
 
         durable_root(&link.join("inner")).expect("a root below an intermediate symlink starts");
 
-        assert!(real.join("inner").is_dir(), "the resolved path holds the root");
+        assert!(
+            real.join("inner").is_dir(),
+            "the resolved path holds the root"
+        );
         assert!(
             syncs_of(&a) > a_before,
             "the directory holding the configured symlink is synced"
@@ -747,6 +1002,9 @@ mod tests {
         std::env::set_current_dir(&previous).expect("leave the scratch directory");
 
         result.expect("a relative root starts");
-        assert!(created, "the relative root is created in the current directory");
+        assert!(
+            created,
+            "the relative root is created in the current directory"
+        );
     }
 }
