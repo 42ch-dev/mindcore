@@ -19,7 +19,7 @@ The Knowledge domain will accept exactly one Markdown dialect, machine-first and
 
 - **Structure.** One H1 that equals the document's canonical name; a leading metadata block in a restricted key/value grammar rather than general YAML; sections as headings that carry a stable id and one kind; declared constraint, invariant and interface-signature lines in a fixed form; a canonical path derived from the metadata. Section ids will be unique within a document.
 - **No HTML escapes.** A document will use the dialect's own constructs only; an inline HTML block that changes rendering will be refused. The heading id and kind attribute will be the only allowed attribute form.
-- **Whitespace will be significant.** Trailing whitespace outside fenced blocks will be refused, because two trailing spaces are a hard break and a silent trim would change meaning (`2026-11-27-stable-section-identity-and-drift.md`).
+- **Whitespace will be significant, with one exact exception.** Trailing whitespace outside fenced blocks will be refused, because inside a fence it is content and outside it two trailing spaces are a hard break; a silent trim would change meaning. The grammar will therefore provide an explicit hard-break marker instead of a trailing-space one. The only transformation the compiler may treat as equivalent is a change in the number of blank lines outside fenced blocks, and that equivalence will be used only to compute the drift fingerprint, never to accept a different document (`2026-11-27-stable-section-identity-and-drift.md`).
 - **Compilation will be a pure function of bytes and compiler version.** The L0 card and L1 outline will be derived from declared metadata, headings, kinds and declared blocks. There will be no model, no network, no clock and no randomness in compilation or in the gate. The same bytes and version will produce the same output on any host.
 - **The cache key will be `(blob, compiler version)`.** A compiler change will invalidate derived rows rather than reinterpret them (see `2026-11-27-derived-knowledge-indexes.md`).
 - **The gate will reject and never repair.** Every violation will be reported with its rule and byte range, and nothing will be stored. A document will not be normalised, reformatted or re-serialised on the way in.
@@ -43,7 +43,7 @@ The Knowledge domain will accept exactly one Markdown dialect, machine-first and
 - A compiler version change will yield a different cache key and will leave no derived row attributed to the old version.
 - A static check will show no model, network or clock dependency in the compile and gate path.
 - A stored document will be byte-identical to the submitted bytes; no path will normalise it.
-- A document without a heading id, with a duplicate id, or with trailing whitespace outside a fence will be refused.
+- A document without a heading id, with a duplicate id, with a reused id, with an invalid lineage target, or with trailing whitespace outside a fence will be refused; a blank-line-only change outside a fence will be accepted and will compile to the same drift fingerprint; an indentation change that alters block structure or any change inside a fence will compile to a different fingerprint.
 
 ## Risks
 

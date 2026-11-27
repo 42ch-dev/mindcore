@@ -2,55 +2,76 @@
 
 Status: proposed — no document store or fence exists; the rule is agreed and unimplemented
 Date: 2026-11-27
-Scope: Revision semantics for Knowledge documents, conflict detection, and how a multi-document operation coordinates only the documents it names
-Related: `2026-11-27-bare-git-knowledge-store.md`, `2026-11-27-derived-knowledge-indexes.md`, `2026-11-27-spoke-knowledge-protocol-gaps.md`, `2026-11-27-dual-store-knowledge-boundary.md`
+Scope: Revision semantics for Knowledge documents, their root, deletion and recreation, conflict detection, and what a related-document operation does and does not guarantee
+Related: `2026-11-27-bare-git-knowledge-store.md`, `2026-11-27-derived-knowledge-indexes.md`, `2026-11-27-spoke-knowledge-protocol-gaps.md`, `2026-11-27-machine-owned-knowledge-writes.md`
 
 ## Problem
 
-A Mind will hold many documents with independent lifetimes. Any shared counter or lock makes unrelated work interfere: a write to document B advances the shared counter, so a caller holding document A's version is told its base is stale although A never changed. The caller re-reads and resends, which is a wasted round trip attributable to work it did not do. Under load, every writer of a Mind also serialises on that one counter, so a hot document throttles a cold one.
+A Mind will hold many documents with independent lifetimes. Any shared counter or lock makes unrelated work interfere: a write to document B advances the shared counter, so a caller holding document A's version is told its base is stale although A never changed. The caller re-reads and resends for work it did not do, and every writer in the Mind serialises on one counter.
 
-There is a second cost: a Mind-wide counter leaks an internal ordering onto the wire. SPOKE's contract is per entity — `KnowledgeEntry.revision` is an integer fence, and `expected_base_revision` names the base of that one entry (`schemas/data/knowledge-entry.schema.json`). A Mind-wide value in that field would mean every document's revision changes when any document changes, so the field would stop describing the entry it belongs to.
+A Mind-wide counter also puts an internal ordering into a wire field whose contract is per entry: `KnowledgeEntry.revision` is an integer fence and `expected_base_revision` names the base of that one entry (`schemas/data/knowledge-entry.schema.json`). If every document's revision changed when any document changed, the field would stop describing the entry it belongs to.
 
-The research report proposed exactly that Mind-wide sequence (§2.6, option a) and justified it on the ground that a per-document fence could not name its parent. That justification does not hold once versions are per document: the version then names the document's own immutable revision, and that revision has exactly one parent.
+Two lifecycle questions decide whether the fence is even well defined, and the first draft left both open. A new document has no parent, so "the parent is version n − 1" says nothing about its first version. A `null` fence was described both as "the document is absent" and as "the head, born or not, becomes the parent", which lets a create silently continue an existing chain. Deletion and recreation of the same id were not defined at all.
 
-If no decision is taken, the store inherits a global sequence, and every unrelated write becomes someone else's conflict.
+The first draft also promised that a related-document operation would be all-or-none visible through one multi-ref Git transaction. A ref transaction guarantees rollback during preparation; its publish phase is not a guaranteed all-or-nothing switch, so a crash can leave some heads moved and others not. That promise cannot be kept by an acceptance test, and a false promise is worse than a narrower one.
 
 ## Proposal
 
-Each Knowledge document will have its own linear version chain. Version `n` of a document will name the commit at `n` in that document's chain, and that commit will have exactly one parent, the commit at `n − 1`.
+Each Knowledge document will have its own linear version chain. Version `n` will name the commit at `n` in that document's chain.
 
-- **The wire revision will be the document's own version.** For a document-backed entry, `revision` will be the version of that document. `expected_base_revision = n` will mean "the parent is this document's commit at `n`". `expected_base_revision = null` will mean the document must be absent, so the operation is a create and its parent is the current head if one exists.
-- **A fence will bind one document.** A stale fence will be answered only for the document it names, with that document's current version. No other document's version will enter the answer.
-- **No Mind-wide sequence, lock or conflict fence will exist.** A write to document B will not change, invalidate or serialise a write to document A. There will be no per-Mind counter, no per-Mind lease and no epoch that a document write must take.
-- **A related-document operation will coordinate exactly the documents it names.** It will carry one expected version per named document; the store will check all of them and move all named heads in one atomic step. If any fence is stale, the whole operation will be refused and no head will move. On success, each named document will receive its own commit, carrying the same request id, and its own version increment.
-- **A read will report versions, not a snapshot token.** A multi-document read will return each document's version. It will not claim cross-document snapshot isolation; a caller that needs a stable pair will name both versions in a related-document read or re-check them.
-- **History will be per document.** A version will remain resolvable after any later write, so a citation of "document X at version n" will be permanent (`2026-11-27-layered-knowledge-retrieval.md`).
+- **Root.** A document's first version will be a root commit with no parent, at version 1. A create will be a compare-and-swap against an **absent** head ref. `expected_base_revision = null` will mean exactly "no document with this id exists"; if a head exists, including a tombstoned head, the create will be refused as an existing entry. A `null` fence will never continue an existing chain.
+- **Fence.** `expected_base_revision = n` will name that document's commit at `n`. A stale fence will be answered for that document only, with that document's current version. No other document's version will enter the answer.
+- **No Mind-wide sequence, lock or fence.** A write to document B will not change, invalidate or serialise a write to document A.
+- **Deletion.** Deleting a document will append a **tombstone version**: a commit whose parent is the previous version and whose document state trailer says `deleted`. The head will remain at the tombstone. A current read will answer not found; history will replay every version including the tombstone; the id will remain occupied.
+- **Recreation is forbidden.** Because the tombstone keeps the head ref, a create under a deleted id will be refused exactly as a create under a live id. Reusing an id would make a permanent citation ambiguous; a future reuse policy would need its own record, and this record does not provide one.
+- **A related-document operation is a sequenced publication, not an atomic one.** It will name its documents and one expected version for each. It will publish each named document as its own version with its own parent, and it will not claim that a reader sees all or none.
 
-A batch of documents will therefore share an operation identity and an atomic store step, and will share no version number. Two documents in one operation will each advance by one, from their own bases.
+The related-document operation will have one **decision point**: an immutable batch record listing, for every named document, the target version, the target commit and the expected parent, referenced by one per-operation batch ref created with a must-not-exist compare-and-swap. That single ref creation will be the only atomic step. After it exists, the operation will move each named head by its own compare-and-swap, in any order.
+
+The guarantees will be exactly these:
+
+1. No document outside the named set will move.
+2. Every named document will end at either its old version or its new version, never at a partial state.
+3. Before the decision point, any stale fence or dependency conflict will refuse the whole operation with nothing published.
+4. After the decision point, the store will roll every named document forward whenever its expected parent is still current, and will report the documents whose parent moved as not published. The caller will receive the batch id and a per-document outcome.
+5. A document that was not published will be retryable on its own; the caller will not be told to retry the whole operation.
+
+A read during or after a failed operation may therefore see one named document at its new version and another at its old one. That is stated, not hidden. A caller that needs all-or-none visibility will require the provider capability of `2026-11-27-storage-agnostic-knowledge-seams.md`; such a publication will be refused before any write when the provider cannot supply it.
+
+- **Cross-document rules will have two classes.** Rules validated against explicitly named dependency versions at publication will refuse the write when a named dependency moved (see `2026-11-27-machine-owned-knowledge-writes.md`). Rules that cannot be decided from named versions will be detected after publication as findings. Neither class will use a Mind-wide lock.
+- **Reads will report a version vector.** A multi-document read will return each document's version and will not claim cross-document snapshot isolation. A collection's change surface will be that vector, document by document; there will be no collection-level counter or "maximum version" hint, because a low-version document changing would not move it.
 
 ## Alternatives considered
 
-- **One sequence per Mind (the research report's option a).** Viable, and it was the researched recommendation: one counter advances on every commit, every document reports it as its revision, and the counter names the parent. Rejected because an unrelated document write makes every other document's fence stale, so a caller must re-read and resend for work it did not touch; because it serialises all writers of a Mind on one counter; because it puts an internal ordering into a wire field whose contract is per entry; and because it gives every document in a batch the same version, erasing the per-document history granularity the cold path needs.
-- **A per-document version in the field, with the parent chosen by the server from the head it happens to read (the report's option b as it was written).** This is close to the proposal but not the same: there the wire value was a fence and the parent was the server's choice, so the value did not name the base. Rejected in that form because two writers could succeed from different unseen bases. Adopted in the corrected form above, where the version names the parent and the server never re-bases.
-- **A content-digest fence.** Viable and attractive: the parent is named by immutable bytes, needs no counter, and is verifiable by any provider. Rejected because SPOKE's field is a bounded unsigned integer; a digest fence would need a new wire member and a cohort, and it would lose the ordering that history and "how many revisions" need, so a counter would have to be kept beside it anyway.
-- **A snapshot token plus a per-document fence.** Rejected: two fences, two failure answers, and the token reintroduces a Mind-wide value that readers must obtain, which is the rejected sequence in another shape.
+- **One sequence per Mind (the research report's option a).** Viable, and it was the researched recommendation: one counter advances on every commit, every document reports it as its revision, and the counter names the parent. Rejected because an unrelated document write makes every other document's fence stale; because it serialises all writers of a Mind on one counter; because it puts an internal ordering into a per-entry wire field; and because it gives every document in a batch the same version, erasing per-document history.
+- **One multi-ref Git transaction as the atomic publication (the previous draft).** Attractive because it needs no second mechanism. Rejected: the publish phase of a ref transaction is not guaranteed atomic across refs, so a crash can leave some heads moved and others not; the promise could only be kept by a provider that offers a stronger primitive, which Git does not.
+- **A single shared publication log or ref per collection, so one compare-and-swap publishes the batch.** This would give real atomic visibility. Rejected: every writer of the collection would contend on that one ref, which is the shared write lock the owner forbids, and per-document versions would become positions in that log.
+- **Publication objects as the sole authority, with SQLite naming each document's current version.** This would make one publication ref per operation the visibility point and derive heads from it. Rejected: the projection would become the authority for which version is current, and a rebuild would have to enumerate every publication ever made.
+- **A per-document version whose parent the server chooses from the head it happens to read (the report's option b as written).** Rejected in that form: the wire value would be a fence that does not name the base, so two writers could succeed from different unseen bases. Adopted only in the corrected form above, where the version names the parent and the server never re-bases.
+- **A content-digest fence.** Viable: the parent is named by immutable bytes and any provider can verify it. Rejected because the wire field is a bounded unsigned integer; a digest fence would need a new member and a cohort, and it would lose the ordering history needs, so a counter would be kept beside it anyway.
+- **A snapshot token plus a per-document fence.** Rejected: two fences, two failure answers, and the token reintroduces a Mind-wide value readers must obtain.
 - **An optimistic multi-version merge of documents.** Rejected: prose sections have no merge semantics the gate can verify, and a merge would invent text no one authored.
-- **Serialising all writes per Mind for safety.** Rejected: it converts a conflict problem into a throughput problem and still leaves cross-document invariants unverified after the fact.
+- **Allowing recreation of a deleted id.** Convenient for a renamed or replaced document. Rejected: a permanent citation of "document X at version n" would become ambiguous, and an old anchor could resolve into a new document. A rename is a new identity with declared lineage (`2026-11-27-stable-section-identity-and-drift.md`), not a reused one.
 
 ## Acceptance criteria
 
-- Two concurrent writes to different documents from their current versions will both commit, and each document's version will advance by exactly one.
-- A write to document B will not change document A's version; a test will read A's version before and after B's commit and compare.
-- A write to A with a version one behind will be refused with A's current version; no other document's version will appear in the answer.
-- A related-document write naming A and B with one stale fence will leave both heads unchanged; with both fences current it will commit both, and each document's history will contain only its own commit.
-- `expected_base_revision` for a document-backed entry will resolve to that document's commit at that version, and a create under `null` will have the current head as its parent when one exists.
-- A projection rebuild will reproduce the same version numbers from the commit chains alone, without any per-Mind counter.
-- A grep of the store and projection will find no per-Mind sequence, lease or epoch governing document writes.
+- A create on an absent id will produce version 1 with no parent; a create on an existing id, live or tombstoned, will be refused and will leave the head unchanged.
+- Two concurrent creates of one id will produce exactly one root; the other will be refused as an existing entry.
+- Deleting a document will append a tombstone version; a current read will answer not found; history will replay every version including the tombstone; a create under that id will be refused.
+- A write to document B will not change document A's version.
+- A write to A with a stale version will be answered with A's current version; no other document's version will appear.
+- A related-document operation that fails after the decision point and before its last head move will, after restart, leave every named document at its old or new version; roll-forward will complete the documents whose parent is still current, and the response will name exactly the unpublished ones.
+- A related-document operation with a stale fence or a moved named dependency will publish nothing.
+- A write will be refused only for its own fence or a named dependency; a document outside the declared set moving between validation and publication will not refuse it and will not change any named version.
+- A strict related-document operation on a provider without atomic multi-version publication will be refused before any write.
+- A projection rebuild will reproduce the same versions from the commit chains alone, with no per-Mind counter.
+- No batch ref will survive settlement beyond its TTL.
 
 ## Risks
 
-- **Mixed-snapshot reads.** Two documents read at different times will carry different versions, and a caller may assume they were consistent. Mitigation: every read returns versions, the pack carries them, and a related-document read is the only thing that returns a coordinated pair.
-- **Cross-document invariants are not prevented, only detected.** No global fence can stop a later single-document write from violating a declared dependency. Mitigation: dependencies are declared at write time, checked against the declared set, and a later violation produces a finding for review; prevention would require the global lock this record rejects.
-- **Ref count grows with document count.** One head ref per document is more refs than one per Mind. Mitigation: ref names are encoded, refs are packed by maintenance, and the number is bounded by the document count, which the format's size bound also bounds (`2026-11-27-bare-git-knowledge-store.md`).
-- **Atomic related-document steps depend on the provider.** A provider that cannot move several heads atomically could fake it and split a batch. Mitigation: the storage seam declares all-or-none a contract, the provider suite tests it, and a provider that cannot honour it must refuse the operation rather than degrade (`2026-11-27-storage-agnostic-knowledge-seams.md`).
-- **A caller may prefer one number for "the Mind".** Some clients will want a single cursor for polling. Mitigation: the read returns a version vector (document → version) and the highest observed version per collection as a change hint, explicitly not a fence.
+- **Mixed visibility across documents.** A caller may observe a partially published related operation. Mitigation: the outcome is per document, the batch id names the operation, roll-forward completes what it can, and a strict capability exists for callers that must not observe a mix.
+- **A publish failure leaves an unpublished target commit reachable only from the batch record.** Mitigation: the batch ref is retained until every named document is published or the operation is explicitly abandoned, and commits carry a batch trailer so the audit survives the ref's deletion.
+- **A dependency can move between the confirmation read and the compare-and-swap.** No lock is allowed, so that window cannot be closed. Mitigation: the confirmation is the last read before the write, and a dependency that moves in that window is detected afterwards as a finding.
+- **Callers may read a related operation as a transaction.** Mitigation: the operation's name and response describe per-document outcomes, and the record states the limit in the proposal rather than only in a risk.
+- **Tombstones accumulate refs and claims.** Mitigation: a tombstone is one commit and one head ref per deleted document; there is no compaction, and the cost is bounded by deletions, not by writes.
+- **The version vector is a larger change surface than a scalar.** Mitigation: it is truthful; each entry is small, and a caller that cares about one document reads that one.

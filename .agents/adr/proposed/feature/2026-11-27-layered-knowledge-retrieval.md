@@ -21,10 +21,11 @@ A Knowledge read will have three current layers and one separate history path.
 
 - **L0 — navigation card.** A card will carry the document identity, its domain, its declared summary, its declared triggers and symbols, its version, its section count and its size. It will carry no body prose. L0 will be the coarse pruning layer.
 - **L1 — outline and constraints.** An outline will carry every section's id, title, kind and position, plus the declared invariants, constraints and interface signatures, and each section's byte size. It will carry no section prose beyond those declared lines. L1 will be the first-pass decision layer, bounded by a declared budget.
-- **L2 — exact spans.** A span will be requested by a handle: collection, document, version, section id, byte range and span digest. Hydration will return exactly those bytes and will verify them against the digest. A handle will pin the version it was created from; it will never silently resolve to a newer version of the same section. A caller that wants current text will re-read L0/L1.
+- **L2 — exact spans.** A span will be requested by a handle: collection, document, version, section id, byte range and span digest. Hydration will return exactly those bytes and will verify them against the digest. A handle will pin the version it was created from and will never silently resolve to a newer version. A pinned hydration will not be a current view: it will not answer `ViewStale`, and it will return the pinned bytes, or not found when the caller may not see that document version, even after the document has moved or been deleted. `ViewStale` will apply only to a view opened at a head and compiler version that has since moved, which a caller reopens.
+- **Visibility is per item and per version.** Every layer's item will be admitted before it is returned: the document's visibility will be decided under the caller's scope for the requested version, a history item at its own revision, and a cross-domain reference for each actual owner. A hidden item will answer exactly as an absent one, so its existence does not leak.
 - **L3 — history, separate.** History, log and diff will be a cold path keyed by document and version, read only on request. No historical blob will enter the lexical or vector index, and no history will be mixed with Fact history.
 - **Escalation will be caller-driven.** L0 will not imply L1, and L1 will not imply L2. Each response will carry the domain, document, version, section and byte size, so a caller can budget before asking for more. A pack will report what it included and what it truncated.
-- **Ordering.** Retrieval will rank documents at L0, return L1 for the chosen few, and hydrate L2 on demand. A search for sections will run inside the documents that L0 and L1 kept, not across the whole collection.
+- **Ordering.** L0 candidates will come from document-level ranking, not from a section list (`2026-11-27-hybrid-knowledge-index-strategy.md`), so a long document cannot crowd out a document whose summary or symbols match strongly. Section search will run only inside the documents L0 and L1 kept, with a per-document cap on returned sections.
 
 ## Alternatives considered
 
@@ -40,8 +41,9 @@ A Knowledge read will have three current layers and one separate history path.
 
 - An L0 response will contain no document body; an L1 response will contain no prose beyond declared constraint, invariant and signature lines.
 - Hydrating a span will return bytes whose hash equals the handle's digest; a tampered byte range will fail rather than return other bytes.
-- A handle created at version `n` will return version `n`'s bytes after version `n + 1` exists.
-- A handle naming another Mind's collection will be refused, not hydrated.
+- A handle created at version `n` will return version `n`'s bytes after version `n + 1` exists, and will not answer `ViewStale`; a view opened at a moved head will answer `ViewStale` and be reopenable.
+- A handle naming another Mind's collection, a document version the caller may not see, or a deleted document's current view will be refused or answered as not found exactly like an absent item, with no content and no existence signal.
+- L0 will be ranked from document-level rows; a long document whose sections dominate a section search will not prevent a document with a matching summary from entering L0; a section search will return sections only from the documents L0/L1 selected, capped per document.
 - L0 and L1 for the same bytes will be byte-identical across processes and hosts.
 - A packed result will report the tokens used, the layers included, and what was truncated.
 - A history read will be reachable only through the history path; no search will return a historical revision.
@@ -52,4 +54,5 @@ A Knowledge read will have three current layers and one separate history path.
 - **Handle explosion.** A caller may retain thousands of handles. Mitigation: handles are small value tuples, and a stale handle is answered as not found rather than resolved by search.
 - **Deleted documents.** A handle for a deleted document will not hydrate as current text, while its history stays replayable. Mitigation: the two paths answer differently and say so; deletion does not erase history.
 - **Over-fetching L2.** A caller can defeat the model by asking for every span. Mitigation: the report counts hydrated bytes per task, so over-fetching shows up in the cost metric rather than hiding.
+- **Pinned hydration can outlive a grant.** A caller may hold a handle for a version it could see when the handle was made. Mitigation: a handle is not a capability — every hydration re-checks the caller's current scope for that document and version, so a revocation takes effect immediately and the answer is the same as for an absent item.
 - **Token accounting.** The current estimate is a serialised-length approximation. Mitigation: the pack records a tokeniser count for the acceptance gate, and spans are counted where they are hydrated.

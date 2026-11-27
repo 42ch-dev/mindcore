@@ -1,27 +1,28 @@
-# ADR: Lexical and vector retrieval over one scoped section set, fused by rank
+# ADR: Lexical and vector retrieval over one visible candidate set, fused by rank
 
 Status: proposed — no lexical or vector index exists; the strategy is agreed and unmeasured
 Date: 2026-11-27
-Scope: The two retrieval channels, where isolation and filtering apply, how their results are fused and ordered, and when a heavier vector index may be adopted
+Scope: The two retrieval channels, the visible candidate set they share, the document-level and section-level indexes, how results are fused and ordered, and when a heavier vector index may be adopted
 Related: `2026-11-27-derived-knowledge-indexes.md`, `2026-11-27-layered-knowledge-retrieval.md`, `2026-11-27-full-lifecycle-delivery-and-evaluation.md`
 
 ## Problem
 
 A lexical index alone misses paraphrase: a question phrased differently from the document returns nothing, and the reader concludes the rule does not exist. A vector index alone misses exact tokens: identifiers, version strings, error codes and rare terms are exactly the queries where a nearest-neighbour search is least reliable, and the answer must be the section that literally names the symbol.
 
-Mixing both carelessly creates a worse failure. If one index ranks globally and the Mind, domain or subtree filter is applied afterwards, the top results are consumed by rows the caller may not see, and the filtered answer is short or empty even though the corpus is full. If term statistics are computed across Minds, one Mind's corpus changes another Mind's ranking, which breaks isolation in a way no access check would catch. If fusion adds raw scores, the two channels' incomparable scales decide the order.
+Mixing both carelessly creates a worse failure. If one index ranks globally and the Mind, domain or subtree filter is applied afterwards, the top results are consumed by rows the caller may not see, and the filtered answer is short or empty even though the corpus is full. Mind and domain filtering is not per-item disclosure: a row can belong to the right Mind and still be one the caller may not read, and filtering for that after `k` hides rows *and* leaks their effect through the count. If term statistics are computed across Minds, one Mind's corpus changes another Mind's ranking, which breaks isolation in a way no access check would catch. And if sections are ranked before documents, one long document can fill every candidate slot, so a document whose summary or symbols match strongly never reaches the navigation layer.
 
 Today none of this exists — there is no index to isolate — so the choice is free, and choosing a heavy index before measuring would spend the cost the refactor is meant to avoid.
 
 ## Proposal
 
-Retrieval will use two channels over the same projected section rows, with isolation applied before ranking.
+Retrieval will use two channels over one visible candidate set, with a document-level index for L0 and a section-level index for L2, and every filter applied before ranking.
 
-- **Lexical channel.** A full-text index over section text and declared metadata, queried with column filters for collection, domain and subtree. Ranking will use document and section statistics computed per Mind; no statistic will be pooled across Minds.
-- **Vector channel.** Vectors will live in ordinary tables keyed by collection and identity. A query will filter by collection, domain and subtree in the same statement that orders by cosine distance and limits to `k`, so the limit applies after the filter by SQL semantics. Vectors will be optional per deployment.
-- **Isolation before Top-K.** Every predicate — Mind, domain, subtree, document — will be applied before any `k` is taken. Over-fetching and filtering afterwards will not be implemented, because it truncates.
+- **One visible candidate set.** Both channels will draw from one candidate set: the admitted scope's collection, domain and subtree predicate plus the disclosure predicate — entry types, entry ids and the source refinement — evaluated in the same query before ranking and before any `k`. A hidden row will consume no candidate, will change no count, and will answer exactly as an absent row. Post-filtering after `k` will not be implemented.
+- **Document index and section index will be separate.** A document-level index will hold the declared summary, triggers, symbols and domain; a section-level index will hold section text. L0 will rank documents from the document index, never from a section list. Section search will run only inside the documents L0 and L1 selected, and a per-document cap will stop one long document from filling the returned sections.
+- **Lexical channel.** A full-text index over the document-level and section-level rows, queried with column filters for collection, domain and subtree. Ranking will use document and section statistics computed per Mind; no statistic will be pooled across Minds.
+- **Vector channel.** Vectors will live in ordinary tables keyed by collection, item kind and identity. A query will apply the same candidate predicate in the statement that orders by distance and limits to `k`, so the limit applies after the filter by SQL semantics. Vectors will be optional per deployment.
 - **Deterministic fusion.** The channels will be fused by reciprocal rank, with ties broken by document identity and section position. Channel scores will not be added or normalised against each other.
-- **Embedding identity.** Vector rows will record the embedding identity that produced them and the digest of the text that was embedded. A fill will write only when both still match; an identity switch will fill beside the old rows, switch atomically, then delete the old ones.
+- **Embedding identity.** Vector rows will record the embedding identity and the digest of the text that was embedded. A fill will write only when both still match; an identity switch will fill beside the old rows, switch atomically, then delete the old ones.
 - **Accelerator gate.** A partitioned vector index will be adopted only if the ordinary-table form misses a recorded latency gate on the largest measured collection. Until that measurement exists, the scalar form is the index; no second index will be built on expectation.
 
 ## Alternatives considered
@@ -37,8 +38,11 @@ Retrieval will use two channels over the same projected section rows, with isola
 ## Acceptance criteria
 
 - Every returned section will belong to the requested collection; a test where the global top `k` are all outside the Mind will still return `k` in-Mind rows when the Mind has them.
+- Filling the top candidates with hidden same-Mind rows will still return `k` visible rows when the Mind has them, and the count and errors will be identical to a corpus without the hidden rows.
+- A hidden document, section or history revision will answer exactly as an absent one, with no content and no existence signal.
 - Doubling another Mind's corpus will leave the order and the tie order inside a Mind identical.
 - A query whose terms match no section lexically but whose vector is near a section will return that section; a query naming an exact identifier will return the section that contains it.
+- L0 will be ranked from the document-level index: a document whose summary or symbols match strongly will enter L0 even while a longer document supplies most section hits; a section search will return only sections of the documents L0/L1 selected, capped per document.
 - Repeating a query on the same bytes and compiler version will return the same order.
 - A fill whose embedded-text digest or embedding identity changed will write no row.
 - An identity switch will leave no query mixing two identities, and old rows will be removed after the switch.
@@ -49,5 +53,7 @@ Retrieval will use two channels over the same projected section rows, with isola
 - **The two indexes drift from the corpus.** Mitigation: both are rebuilt from the same section rows in one projection step; a rebuild is the repair, not a reconciliation.
 - **Embedding model changes are disruptive.** Mitigation: identity numbers, fenced fills and an atomic switch; queries always name the active identity.
 - **Prefix context may lower recall or inflate storage.** Mitigation: a short ancestor-path prefix is measured with and without it, and the result decides.
+- **The visible candidate predicate may be expensive.** A disclosure set applied in the same query can cost more than a plain collection filter. Mitigation: the predicate is one joined condition before `k`, its cost is measured on the largest bucket, and it is never replaced by a post-filter.
+- **Document-level and section-level indexes can disagree.** A document enters L0 on its summary while its section text has changed. Mitigation: both indexes are written in the same projection step from the same document version.
 - **The measurement corpus may not represent real documents.** Mitigation: the harness accepts a real export as an additional input and reports both.
 - **The lexical index may be unavailable in a thin build.** Mitigation: readiness flags say which channels a deployment serves, and a search over a build without the vector channel still ranks lexically rather than failing.

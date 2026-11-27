@@ -2,74 +2,104 @@
 
 Status: proposed — no stage is planned, scoped or costed beyond this record
 Date: 2026-11-27
-Scope: Delivery staging for the complete Knowledge feature, the acceptance and evaluation gates, and what may not be dropped or redefined as an MVP
-Related: `2026-11-27-dual-store-knowledge-boundary.md`, `2026-11-27-layered-knowledge-retrieval.md`, `2026-11-27-spoke-knowledge-protocol-gaps.md`, `2026-11-27-hybrid-knowledge-index-strategy.md`
+Scope: Delivery staging for the complete Knowledge feature, the stage that owns each promised capability, the acceptance and evaluation gates, and what may not be dropped or redefined as an MVP
+Related: `2026-11-27-dual-store-knowledge-boundary.md`, `2026-11-27-layered-knowledge-retrieval.md`, `2026-11-27-spoke-knowledge-protocol-gaps.md`, `2026-11-27-hybrid-knowledge-index-strategy.md`, `2026-11-27-storage-agnostic-knowledge-seams.md`
 
 ## Problem
 
-The feature spans four subsystems and one external protocol: a file store, a write gate, a projection and read path, retrieval, history and drift, and SPOKE carriers. Its benefit is only observable at the end: cost per accepted task depends on the layered read, the retrieval funnel and the format together, not on the write path alone.
+The feature spans four subsystems and one external protocol: a file store, a write gate, a projection and read path, retrieval, history and drift, protocol carriers, and deployments that have no filesystem. Its benefit is only observable at the end: cost per accepted task depends on the layered read, the retrieval funnel and the format together, not on the write path alone.
 
-That shape invites a false economy. A "write path first" plan ships working writes with no cheaper reads, and the cost goal is declared out of scope. A "first phase only" plan keeps the write path and drops L2 hydration, history or the protocol carriers, which then have no committed home. A plan staged by subsystem in parallel produces integrations nobody can review. Any of these produces a feature that cannot be evaluated, because the evaluation needs the whole lifecycle.
+That shape invites a false economy. A "write path first" plan ships working writes with no cheaper reads, and the cost goal is declared out of scope. A "first phase only" plan drops L2 hydration, history or the protocol carriers, which then have no committed home. A plan staged by subsystem in parallel produces integrations nobody can review. The first draft of this record also left three promised capabilities without a stage or an owner: the diskless read-only provider, the backup and restore drill, and the protocol standardisation delivery; and it named numeric thresholds without saying which stage owns the mechanism, which input measures it, or whether it is a gate or a report.
+
+Any of these produces a feature that cannot be evaluated, because the evaluation needs the whole lifecycle.
 
 The owner's constraint is explicit: staging exists to order dependencies and reduce risk; it must not omit later functionality or redefine the feature as a smaller MVP. The research report's own "beyond this roadmap" section is therefore superseded where it defers capability: deferral here means a later stage of this plan, never a smaller feature.
 
 ## Proposal
 
-The complete lifecycle will be delivered in dependency-ordered stages, all retained.
+The complete lifecycle will be delivered in twelve dependency-ordered stages, all retained.
 
-| Stage | Scope | Why it must precede the next |
-|---|---|---|
-| S1 | Seam traits, DTOs, error taxonomy and the provider contract suite | Every later stage is written against one contract |
-| S2 | Grammar, deterministic compiler, drift fingerprint, lineage rules and fixtures | The gate cannot exist before the rules do |
-| S3 | Bare store provider: per-document refs, staging, compare-and-swap, exact related-document commits | The write path needs a store that can move exactly the named documents |
-| S4 | Controlled write entry: admission, version fences, validation, staging, commit, receipt, identity reservation | Nothing may enter the store except through this path |
-| S5 | Projections: per-document cursor, idempotent apply, crash windows, catch-up, compiler epoch | A read has nothing to query without it |
-| S6 | Layered read: L0 cards, L1 outlines, L2 hydration by handle | The cost goal is only measurable with a selectable view |
-| S7 | Retrieval funnel: lexical channel, vector channel, isolation before Top-K, deterministic fusion, accelerator gate | L0 pruning needs ranked candidates |
-| S8 | Cold path: history, log, diff, drift findings, review and repair flow | Drift has no consumer until anchors and reviews exist |
-| S9 | SPOKE Phase 1: view, span, anchor and feature carriers, history entity kind, conformance | A peer can only be served once the local shapes are stable |
-| S10 | SPOKE standardisation: promoted members and operations, cohort, SDK and FFI parity | It promotes what Phase 1 validated |
+| Stage | Scope | Must precede | Owner of |
+|---|---|---|---|
+| S1 | Seam traits, DTOs, error taxonomy, provider contract suite including a publish-phase failure and the atomic-publication capability | everything | contract shape |
+| S2 | Grammar, deterministic compiler, drift fingerprint, lineage rules, fixtures | gate, projection | format and compile rules |
+| S3 | Bare store provider: per-document refs, root and tombstone, batch record decision point, staging, per-document compare-and-swap, head enumeration | write gate | store mechanics, write latency |
+| S4 | Write entry: admission, create/delete fences, validation, dependency confirmation and refusal, receipt, activation and claims | projection | write rejections, receipt |
+| S5 | Projections: per-document cursor, head-inventory adoption, idempotent apply, crash windows, compiler stamp, authoritative finding review tables | read path | catch-up, discovery cost, review-state survival |
+| S6 | Layered read: L0 cards, L1 outlines, L2 pinned hydration, per-item visibility, current-view staleness | retrieval | read shapes, layer closure |
+| S7 | Retrieval funnel: document-level index, section-level index, one visible candidate set, fusion, accelerator gate | evaluation | isolation, ordering, recall mechanism |
+| S8 | Cold path: history, log, diff, drift findings and the review flow (dismiss, accept, acknowledge, re-anchor) | evaluation | drift mechanism and precision |
+| S9 | SPOKE Phase 1: view, span, anchor, feature, receipt and history carriers; direct list/get round trip; conformance; old-client bytes | standardisation | peer round trip, receipt reachability |
+| S10 | SPOKE standardisation delivery: promoted members and operations, assemble packet carrier, scoped FFI face, version cohort, SDK parity | evaluation of the peer path | standardisation completeness |
+| S11 | Diskless and read-only provider: in-memory store, prefetched object provider, prebuilt read-only index, no compiler and no vector channel | evaluation of the provider seam | provider parity |
+| S12 | Backup and restore drill, then the full evaluation run on the complete feature | release | restoration, every numeric gate below |
 
 Each stage will merge on its own, behind the capability it advertises, and will change no caller-visible behaviour before the stage that serves that behaviour. Later stages will be planned work in the same feature, not options to drop.
 
-**Acceptance and evaluation will gate the stages, not just the release.**
+**Metrics will have one owner, one input and a declared class.** A mandatory gate blocks its stage or the release; a reported metric is measured and published without blocking.
 
-- Contracts: the provider suite passes for every provider, and an external implementation compiles.
-- Grammar and compiler: positive fixtures compile byte-exactly; every rule has a refusal case; compilation is deterministic across hosts.
-- Store: same-document races produce one commit; different-document writes do not interfere; a related-document failure moves nothing; no working tree exists.
-- Write gate: every violation refuses with rule and byte range; attribution is readable from the commit; no alternate write route exists.
-- Projection: each crash window is injected; a rebuild reproduces the projection; no transaction spans store I/O.
-- Read: layer shapes as specified; hydration verifies digests; a pinned handle returns its pinned version; a foreign collection is refused; token use is reported.
-- Retrieval: isolation before Top-K; rank invariance across Minds; deterministic tie order; no accelerator before its measured gate.
-- History and drift: the classification table holds; a whitespace-only edit outside a fence produces no finding; declared lineage is honoured; nothing auto-rewrites an anchor.
-- Evaluation: cost per accepted task at least 60% below the status-quo baseline on every size bucket; L1 first-pass closure reported against its target; document and section recall and MRR above their gates; drift precision and false-positive rate within their bounds; write-gate plus commit latency, catch-up, and compiler-epoch rebuild measured against their percentiles; old-client bytes unchanged; no historical blob in a hot index.
+| Metric | Owner stage | Input | Class | Condition |
+|---|---|---|---|---|
+| Cost per accepted task | mechanism S6/S7, measured S12 | three size buckets plus a real export; baseline measured in the same run | Mandatory | at least 60% below the status-quo baseline on every bucket |
+| Document Recall@5, MRR@10 | S7, measured S12 | 400 labelled questions | Mandatory | ≥ 0.85 and ≥ 0.75 |
+| Section Recall@10 | S7, measured S12 | same questions at the low-noise setting | Mandatory | ≥ 0.70 |
+| Drift precision and false-positive rate | S8, measured S12 | labelled change set with and without lineage | Mandatory | precision ≥ 0.95; false positives ≤ 1% of unchanged anchors |
+| Write-gate plus commit latency | S3/S4, measured S12 | one 8 KiB document | Mandatory | p99 ≤ 50 ms |
+| Catch-up per step | S5, measured S12 | chains of 100, 1 000 and 10 000 one-document commits from 10%, 50% and 100% behind | Mandatory | per-step p99 ≤ 100 ms; 10 000 steps ≤ 30 s |
+| Compiler-version rebuild | S5, measured S12 | a 500-document Mind | Mandatory | p99 ≤ 2 s, one transaction per document |
+| Rank invariance and isolation | S7, measured S12 | one Mind before and after another Mind's corpus doubles; hidden rows in the top candidates | Mandatory | identical order and ties; `k` visible rows; hidden rows change no count |
+| Old-client response bytes | S9, measured S12 | a peer without the features; a collection with no document-backed entry | Mandatory | dynamic entries byte-identical; the document-free collection byte-identical |
+| Restore from backup | S12 | a completed backup | Mandatory | every read, version and history answer identical on a fresh host |
+| L1 first-pass closure | S6, measured S12 | accepted tasks needing no hydration | Reported | target ≥ 70% |
+| Head-discovery cost | S5, measured S12 | collection head enumeration per catch-up round | Reported | measured separately from replay cost |
+| Cache hit rate | S3/S5, measured S12 | a rename series and a revert series | Reported | target ≥ 90% |
+| Index backfill | S5, measured S12 | a 2 000-document collection written before the indexes | Reported | batches of 100; measured |
+| Oracle whole-document baseline | S7, measured S12 | the same corpus and questions | Reported | bounds the achievable gain; no gate |
 
-**If a measured gate misses, the response will be a mechanism fix or a recorded decision — not a dropped layer and not a restated goal.** Selection, fusion, prefixing and caching are the levers; the scope of the feature is not.
+**Stage gates will be as concrete as the metrics.**
+
+- S1: an external implementation compiles and passes the suite; the publish-phase failure case is in it.
+- S2: positive fixtures compile byte-exactly; every rule has a refusal case; a blank-line-only change outside a fence compiles to the same fingerprint; a trailing-whitespace document is refused; an indentation change that alters block structure changes the fingerprint.
+- S3: a create against an existing head is refused; a tombstone keeps the head; a publish failure leaves every named document old or new and reports the unpublished ones.
+- S4: every rejection in the format and lineage lists refuses with rule and byte range; a moved dependency refuses before publication; a dropped response is resolved by the receipt; activation preserves a seeded legacy row.
+- S5: each crash window is injected; a head with no cursor is adopted; dropping the derived set preserves review decisions.
+- S6: L0 has no body, L1 no prose, a pinned handle returns its version and never answers `ViewStale`, a hidden item answers as absent.
+- S7: hidden rows in the top candidates still yield `k` visible rows; L0 is document-ranked; sections come only from the selected documents, capped per document.
+- S8: the classification table holds; declared lineage replays after a crash; no automatic re-anchor.
+- S9: the direct round trip, the receipt and the old-client bytes pass.
+- S10: schemas, cohort, assemble carrier, scoped FFI and SDK parity are delivered.
+- S11: the read-only provider passes the shared suite without a compiler or a vector channel.
+- S12: the restore drill passes, then the evaluation runs on the complete feature.
+
+**If a measured gate misses, the response will be a mechanism fix or a recorded decision — not a dropped layer and not a restated goal.** Selection, fusion, prefixing, index level and caching are the levers; the scope of the feature is not.
 
 ## Alternatives considered
 
-- **A write-path MVP, with reads planned later.** Fastest visible progress. Rejected by the owner and by the evaluation: writes alone produce none of the cost saving, and the later read stages would have no committed owner. Writes are a stage here, not a destination.
-- **A vertical slice for one document kind (for example, procedures only).** Proves the mechanism on real content. Rejected: it leaves the general grammar, the domain boundary and the retrieval model unproven, and the slice's shortcuts become the architecture.
-- **Build the read path over SQLite first, then swap the store.** Lower risk per stage. Rejected: the read path would be written twice, and the first version's assumptions — whole entries, prune floors — would leak into the second.
+- **A write-path MVP, with reads planned later.** Fastest visible progress. Rejected by the owner and by the evaluation: writes alone produce none of the cost saving, and the later read stages would have no committed owner.
+- **A vertical slice for one document kind.** Proves the mechanism on real content. Rejected: it leaves the general grammar, the domain boundary and the retrieval model unproven, and the slice's shortcuts become the architecture.
+- **Build the read path over SQLite first, then swap the store.** Lower risk per stage. Rejected: the read path would be written twice, and the first version's assumptions would leak into the second.
 - **Deliver everything at once.** One integration, one review. Rejected: unreviewable, and a failure anywhere blocks every capability.
 - **Stage by subsystem in parallel.** Shorter wall time. Rejected: the seams, the gate and the read path are dependent, and parallel integration would decide the contracts by accident.
+- **Defer the diskless provider, the restore drill and the standardisation to a follow-up.** Keeps this plan shorter. Rejected: those are promised capabilities of the feature, and a follow-up without a stage, owner and gate is the omission this record exists to prevent.
 - **Gate the protocol work on a consumer count.** Rejected: the gap is an absent capability, and the protocol stages are planned here like every other stage.
 - **Treat the cost goal as aspirational and ship the mechanism.** Rejected: the goal is the reason for the refactor, and a mechanism that misses it must be revised, not excused.
 
 ## Acceptance criteria
 
-- The plan will contain all ten stages, each with its own merge criteria, and no stage will be marked optional or "future".
-- No stage will merge a caller-visible behaviour change before the stage that serves it, and no later stage will be removed to make an earlier one ship.
-- Every gate above will have a test or measurement that names its threshold and the stage that owns it.
-- The evaluation will run on the complete feature, with a status-quo baseline measured in the same run.
+- The plan will contain all twelve stages, each with its own merge criteria and an owner for the capability it promises; no stage will be marked optional or "future".
+- Every mandatory and reported metric above will be traceable to an owner stage, an input corpus and a pass condition.
+- The restore drill will block release: a backup that has never been restored will not be accepted as a backup.
+- The evaluation will run on the complete feature, with the status-quo baseline measured in the same run.
+- No stage will merge a caller-visible change before the stage that serves it, and no later stage will be removed to make an earlier one ship.
 - A missed gate will produce a recorded mechanism decision and a revised mechanism, not a reduced scope.
 - The old-client conformance case will stay green through every stage.
 
 ## Risks
 
-- **Long horizon.** Ten stages is a long commitment. Mitigation: each stage is independently mergeable and useful internally, and the stage boundaries are the review units.
-- **A measured gate may fail on a synthetic corpus.** Mitigation: the harness accepts a real export as an additional corpus and reports both; a miss is a mechanism decision, not a scope cut.
-- **Stage coupling.** A late discovery in S6 can force a change in S2 or S3. Mitigation: S1's contract suite and S2's rule vectors are the early place to discover it, and a contract change is a reviewed revision of the seam record.
-- **Evaluation cost is real.** Running the harness on several buckets costs time and tokens. Mitigation: the baseline is measured per run rather than copied, and the harness reuses existing statement and provider-call instrumentation.
-- **Protocol standardisation depends on a compatibility window.** Mitigation: S9 delivers value on its own; S10 is scheduled by the protocol's cohort, not by consumer demand, and remains in this plan.
-- **The feature may be partially useful and temptation to stop.** Mitigation: the delivery record defines done as the complete lifecycle with the evaluation gates; a partial stop is a recorded decision by the owner, not a silent redefinition.
+- **Long horizon.** Twelve stages is a long commitment. Mitigation: each stage is independently mergeable and useful internally, and stage boundaries are review units.
+- **A measured gate may fail on a synthetic corpus.** Mitigation: the harness accepts a real export as an additional corpus and reports both; a miss is a mechanism decision.
+- **Stage coupling.** A late discovery in S6 can force a seam change. Mitigation: S1's suite and S2's rule vectors are the early place to discover it, and a seam change is a reviewed revision of that record.
+- **Evaluation cost.** Several buckets with a re-measured baseline costs time. Mitigation: the harness reuses existing statement and provider-call instrumentation, and the baseline is measured once per run.
+- **The restore drill is slow and unglamorous.** Mitigation: it is a stage gate, not a checklist item; its input is a real backup, and its output is a comparison of every read and history answer.
+- **The standardisation cohort depends on an external release window.** Mitigation: S9 delivers the peer path on its own; S10 is scheduled by that window, not by demand, and stays in this plan.
+- **Head enumeration adds a discovery cost to search.** Mitigation: it is measured separately (reported), bounded by document count, and removed from the hot path by the per-document cursor.
