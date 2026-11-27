@@ -6,138 +6,191 @@
 [![crates.io](https://img.shields.io/crates/v/mindcore-base.svg)](https://crates.io/crates/mindcore-base)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#状态与边界)
 
-**记忆、知识与认知的沉淀层。**
+**一个 Mind 的记忆、知识与认知，存进一个嵌入式存储，用普通调用读写。**
 
-Mindcore 是一个可嵌入的 Rust 库，把三件事分开保存：agent **听到**了什么、它**采纳**了什么作为
-个人知识、以及它当前**判定**什么是真的。三者各有一条记录，连接它们的 provenance 在每次修订后
-仍然成立。
-
-这里不提供 server、UI 或 transport。宿主嵌入存储，并自行决定暴露什么接口；`mindcore-runtime`
-只把构建 SPOKE Connect responder 所需的部件组装起来。
-
-> [!NOTE]
-> `mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 已发布到 crates.io，registry 上目前是
-> alpha 版本。`mindcore-spoke` 与 `mindcore-runtime` 保持私有，由本仓库引入。migration 文件一经
-> 发布即不可变，migration lock 为打 tag 把关；`open` 接受与拒绝哪些数据库，见
-> [存储兼容性](docs/storage-compatibility.md)。
+Mindcore 是一个 Rust 库，供需要 Mind 的应用使用：agent **听到**了什么、它**采纳**了什么作为
+自己的知识、以及它当前**判定**什么是真的，三者分开保存，各有一条记录，连接它们的 provenance
+在每次修订后仍然成立。
 
 [English](README.md) | **简体中文**
 
-## 为什么叫 "settlement"
+## 什么是 Mind
 
-| 层 | 记录 | 回答的问题 |
+一个 Mind 就是一个记忆空间。它的 id 就是这个空间的 id——`mindcore-sqlite` 只维护一份 registry，
+Mind 没有第二个身份，因此 registry 行、空间与 cognition carrier 不会互相矛盾。
+`mindcore_runtime::minds` 是进程内入口：`create` 在一个事务里写入空间、cognition carrier、
+registry 行与 owner 的默认授权行，被拒绝时不留下任何行；`list` 与 `get` 按调用方当前有效的授权
+把 registry 读回来。
+
+| 记录 | 形态 | 回答的问题 |
 | --- | --- | --- |
-| Memory | candidate → retained record | agent 听到了、观察到了什么？ |
+| Memory | candidate → retained record | 它听到了、观察到了什么？ |
 | Knowledge | 带修订号的 scoped `KnowledgeEntry` | 它为自己采纳了什么，来自哪里？ |
-| Cognition | carrier records → `MindState` | 它当前判定什么为真，依据是什么？ |
+| Cognition | 追加式 carrier records → `MindState` | 它当前判定什么为真，依据是什么？ |
 
-一条 memory 不会因为被读取就变成个人信念；一条被采纳的 entry 不会因为共享源变化而悄悄改变；
-只有显式更新 carrier 才会改变当前判断。这种分离才是产品本身。
+`mindcore-base` 定义这些记录类型及其不变量，本身不做任何 I/O；`mindcore-sqlite` 是持久化它们的
+唯一实现。一条 memory 不会因为被读取就变成个人信念，一条被采纳的 entry 不会因为共享源变化而悄悄
+改变，只有显式的 carrier 更新才会改变当前判断。这种分离才是产品本身。
 
-## 架构
+`mindcore_runtime::Mind` 是一个 Mind 之上的句柄：`open` 只做一次 registry 读取，之后每个操作都在
+自己的事务上重新读取实时状态——句柄不缓存授权，也不授予授权。`capture`、`recall` 与
+`review` 组合 memory adapter；`knowledge_get`、`knowledge_put` 与 `knowledge_list` 组合 scoped
+store；`cognition_read` 与 `deliberate` 抵达当前判断及其背后的 workflows。没有任何方法替你选择
+collection、owner 或视角，也没有任何方法替你选择 subject。
 
-![Mindcore 分层：宿主嵌入 mindcore-runtime，后者组合 SPI workflows、SPOKE adapter 与 SQLite store](docs/assets/architecture.svg)
+## 三种接入方式
 
-宿主负责 transport、身份、准入与存储路径；Mindcore 负责记录模型、修订与重放规则、协议适配器，
-以及持久化边界。
+三种形态通向同一个内核，因此每一个都遵守同一条授权规则：读取任何目标之前，先对 (principal, Mind)
+这一对做实时准入。跨进程的契约是 SPOKE Connect，HTTP API 不属于其中任何一种形态。
 
-## 能力概览
+| 形态 | 适合谁 | 由谁承载 | 当前状态 |
+| --- | --- | --- | --- |
+| 进程内 Rust | 把库链接进自己进程的 Rust 宿主 | `mindcore-runtime`：`minds::{create, list, get}` 与 `Mind` 句柄 | 已在本仓库构建，`publish = false` |
+| 进程内 TypeScript | 把 addon 链接进自己进程的 Node 宿主 | `crates/mindcore-binding`（napi `cdylib`），由 `bindings/node` 包加载（`MindcoreClient`、`MindView`、`MindcoreError`） | 从本仓库构建；该 package 为 `private`，不在 npm 上 |
+| SPOKE 对端 | 任何 SPOKE Connect peer | `mindcore-daemon` 通过 Unix socket 提供一个；自行组装 `MindcoreServe` 的宿主无需 daemon 也能服务对端 | 已在本仓库构建，`publish = false` |
 
-- **带重放的 memory 生命周期。** `capture` 暂存 candidate；review 产出 1 条、多条 fragment 或
-  0 条记录；每个变更都幂等——重复的 key 会重新返回已记录的结果，而不是再次执行。
-- **带条件修订的 scoped knowledge。** 每次写入在 port 构建时就绑定 collection；
-  `expected_base_revision` 让每次更新成为 compare-and-swap，拒绝不会改动该行。
-- **带 provenance 的采纳。** 被采纳的副本携带指向来源 scope、entry 与 revision 的 anchor。
-  anchor 沿来源的 retirement chain 解析，因此副本命名的是存活终端，而不是已退休的中间跳。
-- **认知 carrier。** 当前判断是某个 holder entry 下的追加式记录集合，在唯一的持久化边界校验；
-  `MindState` 由它派生，不会重复存储。
-- **只广告实际提供能力的 served surface。** `MindcoreServe` 从组合出的 faces 与注册项推导
-  capabilities 和 tools，不读取宿主提供的字符串。
-- **单一嵌入式存储。** SQLite 启用 WAL、外键与 busy timeout；`MindStore::open` 通过单连接池和
-  一个内嵌 migration 打开它。
-
-## Crates
-
-| Crate | 职责 | 发布 |
-| --- | --- | --- |
-| `mindcore-base` | 与存储无关的领域核心：id 与信任边界、memory 协议类型与 IR、knowledge scope 与采纳 provenance、cognition carrier 与 `MindState` 派生。无 I/O。 | [crates.io](https://crates.io/crates/mindcore-base) |
-| `mindcore-spi` | MIND ladder 契约，钉在已发布的 SPOKE DTO 上：recall、absorb、deliberate workflows，以及 prompt-reasoner bridge。契约面不含存储 crate、网络或模型 SDK。 | [crates.io](https://crates.io/crates/mindcore-spi) |
-| `mindcore-sqlite` | SQLite（SQLx）后端：单连接池、单 migration、WAL 与 busy timeout；在 `MemoryAdapter` 之后实现协议 repository，以及 scoped `KnowledgeEntryPort`，并在唯一持久化边界守护 cognition 模块。 | [crates.io](https://crates.io/crates/mindcore-sqlite) |
-| `mindcore-spoke` | 基于借用事务 repository 的 SPOKE memory 协议适配器：wire 校验、wire↔IR 边界、reject 映射、准入、重放与 staging。它从不开启、提交或回滚事务。 | 否 —— 从 git 引入 |
-| `mindcore-runtime` | served surface：`MindcoreServe` 把 workflow engine、SQLite knowledge face 与宿主的 memory face 组装成构建 Connect responder 所需的部件，并从实际提供的能力推导广告的 capabilities 与 tools。 | 否 —— 从 git 引入 |
+binding 在自己的进程内调用 facade，而不是去连另一个进程；而一个连接 daemon 的 TypeScript 宿主用的
+是 SPOKE 对端形态，不是 TypeScript 形态。三种形态都通过 `mindcore-sqlite` 读写同一个 SQLite 存储。
 
 ## 快速开始
 
-用 Cargo 添加已发布的 crate；Cargo 解析 registry 上的版本，而本仓库的
-`[workspace.package].version` 才是某个 release 包含什么的唯一事实来源：
-
-```sh
-cargo add mindcore-base mindcore-sqlite
-```
-
-`mindcore-spoke` 与 `mindcore-runtime` 尚未发布，从本仓库引入。SPOKE 的 pin 与本 workspace
-声明的一致：
-
 ```toml
 [dependencies]
-# 与本 workspace 的 Cargo.toml 中固定的 SPOKE 版本保持一致
-spoke-operations = ">=0.19.1, <0.20.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# 未发布：从本仓库引入
-mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+# facade 尚未发布，因此整个 mindcore family 取自本仓库的同一个 revision：
+# 把 registry 的 `mindcore-base` 与 git 的 `mindcore-runtime` 混用会得到同一套类型的第二份副本，
+# facade 不会接受它。
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
 ```
 
-打开存储，并通过绑定 collection 的 port 读取：
+`mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 在 crates.io 上是 `0.1.0`，与这个 workspace
+声明的版本一致，因此 `"0.1"` 要求可以匹配；只需要记录模型与 store 的宿主可以直接从 registry 引入。
+facade 为 `publish = false`，因此这个示例把整个 family 从本仓库的同一个 revision 引入——把 registry
+的 `mindcore-base` 与 git 的 `mindcore-runtime` 混用会得到同一套类型的两份副本。
 
 ```rust
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::boundary::CallerId;
+use mindcore_runtime::minds::{self, CreateMind};
+use mindcore_runtime::{Capture, Mind};
 use mindcore_sqlite::MindStore;
-use spoke_operations::{KnowledgeEntryPort, SpokeResult};
+use serde_json::json;
+use spoke_operations::SpokeResult;
+
+/// facade 用拒绝值而不是 panic 回答；宿主把它映射出来并保留 code。
+fn ok<T>(result: SpokeResult<T>) -> Result<T, Box<dyn std::error::Error>> {
+    match result {
+        SpokeResult::Ok(value) => Ok(value),
+        SpokeResult::Reject(reject) => Err(format!("{}: {}", reject.code, reject.message).into()),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = MindStore::open(std::path::Path::new("mind.db")).await?;
-    let wren = store.knowledge(KnowledgeScope::new("wren"));
+    let caller = CallerId::new("caller_wren");
 
-    match wren.get_knowledge_entry("ke_north_gate").await {
-        SpokeResult::Ok(entry) => println!("entry at revision {:?}", entry.revision),
-        SpokeResult::Reject(reject) => println!("{}: {}", reject.code, reject.message),
-    }
+    let row = ok(minds::create(&store, &CreateMind {
+        mind_id: None,
+        display_name: Some("Wren".to_string()),
+        owner: caller.clone(),
+    }).await)?;
+    let mind = ok(Mind::open(&store, &caller, &row.id).await)?;
+
+    // 宿主先写入 memory 写操作所需的 subject 行；`capture` 对未知 subject 回答 NOT_FOUND。
+    sqlx::query(
+        "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
+         VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(row.id.as_str())
+    .bind("wren")
+    .execute(&store.pool())
+    .await?;
+
+    ok(mind.capture(&Capture {
+        subject: "wren",
+        context: None,
+        content: &json!({ "text": "the north gate was closed at dusk" }),
+        occurred_at: None,
+        kind_hint: None,
+        idempotency_key: "capture-north-gate",
+    }).await)?;
+
     Ok(())
 }
 ```
 
-然后运行完整的 first-mind 故事：听到、采纳、怀疑、证据、共享变更、重新打开与拒绝，每一步都有断言。
+facade 路径——创建 Mind、capture、review、recall、写入 carrier 并读取推导出的 judgment，以及在
+宿主提供 reasoner 时 deliberate——见 [docs/quickstart.md](docs/quickstart.md)。完整的记录故事——
+采纳、怀疑、证据、共享变更、重新打开以及各种拒绝——由仓库 example 断言：
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
 ```
 
-这个 example 与集成测试运行同一份代码。想要按步骤手写一遍，从
-[Quick start](docs/quickstart.md) 开始。
+记录模型、修订规则与 provenance 见 [docs/concepts.md](docs/concepts.md)。
 
-## 文档
+## 服务对端
 
-| 文档 | 什么时候读 |
-| --- | --- |
-| [Quick start](docs/quickstart.md) | 想在本地跑通 store、captured memory 与派生出的 `MindState`。 |
-| [Concepts](docs/concepts.md) | 在基于它设计之前，需要记录模型、修订规则与 provenance。 |
-| [Serving a surface](docs/serving.md) | 正在把 `MindcoreServe` 接入 SPOKE Connect responder。 |
-| [Migrating from `tools.mindcore.adopt`](docs/migrating-from-tools-adopt.md) | 把既有宿主迁移到 `knowledge.adopt`，或重新打开旧数据库。 |
-| [For agents](docs/for-agents.md) | 你在这个仓库里工作，而不是在嵌入这个库。 |
+`mindcore-daemon` 是对端形态的参考宿主：一个进程、一个 store 文件、一个 Unix socket。它的 TOML
+配置指明 store、socket、responder 的 seed 文件、journal 目录、准入的对端（每个 `public_key` 映射到
+一个 `principal`）以及唯一一条 adoption 路径；每张表都拒绝未知键，所以拼错是启动失败，而不是被静默
+忽略的设置。它在打开 store 之前先取单实例锁，因此一个数据库文件只由一个进程服务；收到 `SIGTERM`
+或 `SIGINT` 时它做 drain，而不是丢掉存活中的 responder。同一 store 上的第二个实例以退出码 2 结束。
+
+```sh
+cargo run --locked -p mindcore-daemon -- --config daemon.toml
+```
+
+它实际提供的是 `mindcore-runtime` 的表面。`MindcoreServe` 把 workflow engine、路由后的 knowledge
+face、宿主的 memory service 以及可选的 history 与 adoption face 组装成 `MindcoreSurface`：构建
+`ConnectResponder` 所需的 ports、manifest 与 handlers。对外声明的 `capabilities` 与 `tools` 由实际
+提供的能力推导，而不是来自宿主传入的字符串；runtime 也拒绝替宿主臆造只有宿主才能决定的东西——
+transport、身份、准入与 journal publisher。提供同样东西的嵌入式宿主自行构建 responder，无需 daemon。
+
+宿主承担的义务、`ServeFaces` 的字段与实际提供的操作清单见 [docs/serving.md](docs/serving.md)。
+
+## 存储与保证
+
+- **单一嵌入式存储。** `mindcore-sqlite` 通过 `MindStore::open` 在单连接池与一个内嵌 migration 上
+  打开该 SQLite 文件，启用 WAL、外键与 busy timeout。
+- **幂等写入。** 重复的 idempotency key 会重新返回已记录的结果，而不是再次执行；重放读取的是
+  receipt，而不是重跑操作。
+- **条件修订。** `expected_base_revision` 让每次 knowledge 更新成为 compare-and-swap，拒绝不会改动
+  该行。
+- **可解析的 provenance。** 被采纳的副本锚定到来源的 scope、entry 与 revision，并沿来源的
+  retirement chain 解析，因此它命名的是存活终端，而不是已退休的中间跳。
+- **不可变的 migration。** 已发布的 migration 文件永不改变——lock 记录其 sha256——新 schema 以新增
+  文件追加。已应用集合是内嵌集合前缀的数据库可以重开，追加的文件会被应用；内嵌集合不含的版本
+  （`VersionMissing`）、校验和发生变化的文件（`VersionMismatch`），以及会在已存在表上重跑的待应用
+  文件（`ExecuteMigration`），都会被拒绝，而不是被转换。
+
+`open` 接受与拒绝哪些数据库见[存储兼容性](docs/storage-compatibility.md)；其背后的版本策略见
+[SemVer](docs/semver.md)。
 
 ## 状态与边界
 
-- **仅嵌入式。** `mindcore-runtime` 不开启 listener、transport 或身份；这些由宿主提供。
-- **尚无数据搬迁。** 把既有 store 或 provider 中的数据迁入 Mindcore 尚未实现，也没有升级工具：
-  migration 早于已发布集合的数据库会被拒绝，而不是被转换。
-- **每个数据库文件一个 store。** 每个打开的 `MindStore` 拥有一个连接池；同一文件上开两个 store
-  不受支持。
-- **migration 按 release 不可变。** 已发布的 migration 文件永不改变（lock 记录其 sha256）；新
-  schema 以新增文件追加，在 release PR 中写入 lock，并在打 tag 时复核。已应用 migration 仍与内嵌
-  集合一致的数据库可以正常重开；否则 `open` 会拒绝它，而不是猜测升级路径，见
-  [存储兼容性](docs/storage-compatibility.md)。
+- **alpha，且大多未发布。** `mindcore-base`、`mindcore-spi` 与 `mindcore-sqlite` 已发布到
+  crates.io 的 `0.1.0`；`mindcore-spoke`、`mindcore-runtime`、`mindcore-daemon` 与
+  `mindcore-binding` 均为 `publish = false`，由本仓库引入。
+- **只到 Mind 层。** facade 与 served surface 只暴露 Mind 层操作。其下的 space 层能力属于尚未暴露
+  的高级表面，尚未按 Mind 提供的操作也不会被组合。
+- **没有 HTTP 表面。** 本仓库不含任何 HTTP listener、route 或 request type；跨进程契约是
+  SPOKE Connect。
+- **尚无数据搬迁。** 把既有 store 或 provider 迁入 Mindcore 尚未实现，也没有升级工具。
+- **每个数据库文件一个 store。** 每个打开的 `MindStore` 拥有一个连接池，同一文件上开两个 store
+  不受支持；daemon 的锁就是单个进程维持这一点的办法。
+- **addon 需要构建，不在发布物里。** `bindings/node` 从 `target/{debug,release}` 或
+  `MINDCORE_BINDING_PATH` 指定的路径加载 `libmindcore_binding`；构建命令为
+  `cargo build -p mindcore-binding`。
 
-仓库检查：CI 会运行格式化、clippy 与完整测试套件，并额外校验 `.sqlx` 离线缓存。完整本地命令块见
-[docs/for-agents.md](docs/for-agents.md)，贡献约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+## 贡献与变更日志
+
+贡献约定与本地检查见 [CONTRIBUTING.md](CONTRIBUTING.md)，发布历史见 [CHANGELOG.md](CHANGELOG.md)。
+在这个仓库里工作（而不是嵌入这个库）见 [docs/for-agents.md](docs/for-agents.md)，发布步骤见
+[docs/releasing.md](docs/releasing.md)。

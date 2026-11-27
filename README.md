@@ -6,148 +6,208 @@
 [![crates.io](https://img.shields.io/crates/v/mindcore-base.svg)](https://crates.io/crates/mindcore-base)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#status-and-limits)
 
-**A settlement layer for memory, knowledge and cognition.**
+**A Mind's memory, knowledge and cognition, kept in one embedded store and reached through plain calls.**
 
-Mindcore is an embedded Rust library that keeps three things apart: what an agent *heard*, what
-it *adopted* as personal knowledge, and what it currently *judges* to be true. Each lands in its
+Mindcore is a Rust library for an application that needs a Mind: what an agent *heard*, what it
+*adopted* as its own knowledge, and what it currently *judges* to be true stay apart, each in its
 own record, and the provenance linking them survives every revision.
-
-No server, no UI, no transport ships here. A host embeds the store and exposes whatever surface
-it wants; `mindcore-runtime` only composes the pieces a SPOKE Connect responder is built from.
-
-> [!NOTE]
-> `mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io; the registry currently
-> holds an alpha. `mindcore-spoke` and `mindcore-runtime` stay private and are used from this
-> repository. Migration files are immutable once published, and the migration lock gates the tag;
-> see [storage compatibility](docs/storage-compatibility.md) for what `open` accepts and refuses.
 
 **English** | [简体中文](README.zh-CN.md)
 
-## Why "settlement"
+## What a Mind is
 
-| Layer | Record | Question it answers |
+A Mind is one memory space. Its id is the space's id — `mindcore-sqlite` keeps one registry and a
+Mind has no second identity, so the registry row, the space and the cognition carrier cannot
+disagree. `mindcore_runtime::minds` is the in-process entry: `create` writes the space, the
+cognition carrier, the registry row and the owner's default grant in one transaction and leaves no
+row on a refusal; `list` and `get` read the registry back under the caller's live grants.
+
+| Record | Held as | Question it answers |
 | --- | --- | --- |
-| Memory | candidate → retained record | What did the agent hear or observe? |
+| Memory | candidate → retained record | What did it hear or observe? |
 | Knowledge | scoped `KnowledgeEntry` with revisions | What did it adopt for itself, and from where? |
-| Cognition | carrier records → `MindState` | What does it currently judge true, and on what basis? |
+| Cognition | append-only carrier records → `MindState` | What does it currently judge true, and on what basis? |
 
-A memory never becomes a personal belief by being read. An adopted entry never silently changes
-because the shared source changed. Only an explicit carrier update changes the current judgment.
-That separation is the product.
+`mindcore-base` defines those record types and their invariants with no I/O; `mindcore-sqlite` is
+the one implementation that persists them. A memory never becomes a personal belief by being read,
+an adopted entry never silently changes because the shared source changed, and only an explicit
+carrier update changes the current judgment. That separation is the product.
 
-## Architecture
+`mindcore_runtime::Mind` is the handle over one Mind: `open` is one registry read, and every
+operation re-reads the live state on its own transaction — the handle caches no grant and confers
+none. `capture`, `recall` and `review` compose the memory adapter; `knowledge_get`,
+`knowledge_put` and `knowledge_list` compose the scoped store; `cognition_read` and `deliberate`
+reach the current judgment and the workflows behind it. No method takes a collection, an owner or
+a viewpoint, and none chooses a subject for you.
 
-![Mindcore layers: a host embeds mindcore-runtime, which composes the SPI workflows, the SPOKE adapter and the SQLite store](docs/assets/architecture.svg)
+## Three ways to reach one
 
-The host owns transport, identity, admission and the store path. Mindcore owns the record model,
-the revision and replay rules, the protocol adapter, and the persistence boundary.
+All three reach one kernel, so one authorization rule holds for each: live admission of the
+(principal, Mind) pair before any target is read. The cross-process contract is SPOKE Connect, and
+an HTTP API is not one of the forms.
 
-## What you get
+| Form | Who it is for | Carried by | Status at this head |
+| --- | --- | --- | --- |
+| In-process Rust | a Rust host that links the library into its own process | `mindcore-runtime`: `minds::{create, list, get}` and the `Mind` handle | built in this repository, `publish = false` |
+| In-process TypeScript | a Node host that links the addon into its own process | `crates/mindcore-binding` (napi `cdylib`), loaded by the `bindings/node` package (`MindcoreClient`, `MindView`, `MindcoreError`) | built from this repository; the package is `private`, not on npm |
+| SPOKE peer | any SPOKE Connect peer | `mindcore-daemon` serves one over a Unix socket; a host that assembles `MindcoreServe` itself serves peers without it | built in this repository, `publish = false` |
 
-- **A memory lifecycle with replay.** `capture` stages a candidate; review projects one record,
-  several fragments or none, and every mutation is idempotent: a repeated key re-answers the
-  recorded outcome instead of repeating the effect.
-- **Scoped knowledge with conditional revisions.** Every write binds the collection when the port
-  is built; `expected_base_revision` makes each update compare-and-swap, and refusals leave the
-  row untouched.
-- **Adoption with provenance.** An adopted copy carries an anchor to its source scope, entry and
-  revision. The anchor resolves through the source's retirement chain, so a copy names the live
-  terminal rather than a retired hop.
-- **A cognition carrier.** Current judgment is an append-only record set under one holder entry,
-  guarded at the single persistence boundary; `MindState` is derived from it, never stored twice.
-- **A served surface that advertises what it serves.** `MindcoreServe` derives capabilities and
-  tools from the composed faces and registrations, not from a host-supplied string.
-- **One embedded store.** SQLite with WAL, foreign keys and a busy timeout, opened by
-  `MindStore::open` over a single connection pool and one embedded migration.
+The binding calls the facade in-process rather than dialling another process, and a TypeScript host
+that connects to a daemon is using the SPOKE-peer form, not the TypeScript one. Every form reads
+and writes the same SQLite store through `mindcore-sqlite`.
 
-## Crates
-
-| Crate | Responsibility | Published |
-| --- | --- | --- |
-| `mindcore-base` | Storage-agnostic domain core: ids and trusted boundary, memory protocol types and IR, knowledge scope and adoption provenance, the cognition carrier and `MindState` derivation. No I/O. | [crates.io](https://crates.io/crates/mindcore-base) |
-| `mindcore-spi` | The MIND ladder contracts, pinned to the published SPOKE DTOs: recall, absorb and deliberate workflows plus the prompt-reasoner bridge. No storage crate, network or model SDK in the contract surface. | [crates.io](https://crates.io/crates/mindcore-spi) |
-| `mindcore-sqlite` | SQLite (SQLx) backend: one connection pool, one migration, WAL and a busy timeout; implements the protocol repository behind `MemoryAdapter` and the scoped `KnowledgeEntryPort`, and guards the cognition module at the single persistence boundary. | [crates.io](https://crates.io/crates/mindcore-sqlite) |
-| `mindcore-spoke` | SPOKE memory protocol adapter over the borrowed-transaction repository: wire validation, the wire↔IR boundary, reject mapping, admission, replay and staging. It never opens, commits or rolls back a transaction. | no — from git |
-| `mindcore-runtime` | The served surface: `MindcoreServe` assembles the workflow engine, the SQLite knowledge face and the host's memory face into the pieces a Connect responder is built from, and derives the advertised capabilities and tools from what it serves. | no — from git |
-
-## Quick start
-
-Add the published crates with Cargo; it resolves the version the registry holds, and
-`[workspace.package].version` in this repository is the source of truth for what a release contains:
-
-```sh
-cargo add mindcore-base mindcore-sqlite
-```
-
-`mindcore-spoke` and `mindcore-runtime` are not published, so they come from this repository; the
-SPOKE pin matches the one this workspace declares:
+## Quickstart
 
 ```toml
 [dependencies]
-# match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = ">=0.19.1, <0.20.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# not published: use them from this repository
-mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
+# The facade is unpublished, so the whole mindcore family comes from this repository at one
+# revision: a registry `mindcore-base` beside a git `mindcore-runtime` would be a second copy of
+# the same crate, and the facade would not accept its types.
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
 mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
 ```
 
-Open a store and read through a collection-bound port:
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io at `0.1.0`, the version this
+workspace declares, so a `"0.1"` requirement matches; a host that needs only the record model and
+the store takes them from the registry. The facade is `publish = false`, so this example takes the
+whole family from this repository at one revision — a registry `mindcore-base` beside a git
+`mindcore-runtime` would be two copies of the same types.
 
 ```rust
-use mindcore_base::knowledge::KnowledgeScope;
+use mindcore_base::boundary::CallerId;
+use mindcore_runtime::minds::{self, CreateMind};
+use mindcore_runtime::{Capture, Mind};
 use mindcore_sqlite::MindStore;
-use spoke_operations::{KnowledgeEntryPort, SpokeResult};
+use serde_json::json;
+use spoke_operations::SpokeResult;
+
+/// The facade answers a refusal instead of panicking; a host maps it and keeps the code.
+fn ok<T>(result: SpokeResult<T>) -> Result<T, Box<dyn std::error::Error>> {
+    match result {
+        SpokeResult::Ok(value) => Ok(value),
+        SpokeResult::Reject(reject) => Err(format!("{}: {}", reject.code, reject.message).into()),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = MindStore::open(std::path::Path::new("mind.db")).await?;
-    let wren = store.knowledge(KnowledgeScope::new("wren"));
+    let caller = CallerId::new("caller_wren");
 
-    match wren.get_knowledge_entry("ke_north_gate").await {
-        SpokeResult::Ok(entry) => println!("entry at revision {:?}", entry.revision),
-        SpokeResult::Reject(reject) => println!("{}: {}", reject.code, reject.message),
-    }
+    let row = ok(minds::create(&store, &CreateMind {
+        mind_id: None,
+        display_name: Some("Wren".to_string()),
+        owner: caller.clone(),
+    }).await)?;
+    let mind = ok(Mind::open(&store, &caller, &row.id).await)?;
+
+    // The host provisions the subject row a memory write needs; `capture` answers NOT_FOUND for
+    // an unknown subject.
+    sqlx::query(
+        "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
+         VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(row.id.as_str())
+    .bind("wren")
+    .execute(&store.pool())
+    .await?;
+
+    ok(mind.capture(&Capture {
+        subject: "wren",
+        context: None,
+        content: &json!({ "text": "the north gate was closed at dusk" }),
+        occurred_at: None,
+        kind_hint: None,
+        idempotency_key: "capture-north-gate",
+    }).await)?;
+
     Ok(())
 }
 ```
 
-Then run the full first-mind story: hearing, adoption, doubt, evidence, a shared change, reopen
-and refusals, with every step asserted.
+The facade path — create a Mind, capture, review, recall, write the carrier and read the derived
+judgment, and deliberate with a host reasoner — is [docs/quickstart.md](docs/quickstart.md). The
+whole record story — adoption, doubt, evidence, a shared change, a reopen and the refusals — is
+asserted by the workspace example:
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
 ```
 
-The story is the same code the integration test runs. For the guided version, start with
-[docs/quickstart.md](docs/quickstart.md).
+The record model, revision rules and provenance are in [docs/concepts.md](docs/concepts.md).
 
-## Documentation
+## Serving a peer
 
-| Document | Read it when |
-| --- | --- |
-| [Quick start](docs/quickstart.md) | You want a store, a captured memory and a derived `MindState` running locally. |
-| [Concepts](docs/concepts.md) | You need the record model, revision rules and provenance before designing on it. |
-| [Serving a surface](docs/serving.md) | You are wiring `MindcoreServe` into a SPOKE Connect responder. |
-| [Migrating from `tools.mindcore.adopt`](docs/migrating-from-tools-adopt.md) | You are moving an existing host to `knowledge.adopt`, or reopening an old database. |
-| [For agents](docs/for-agents.md) | You are working in this repository rather than embedding the library. |
+`mindcore-daemon` is the reference host for the peer form: one process, one store file, one Unix
+socket. Its TOML config names the store, the socket, the responder's seed file, the journal
+directory, the admitted peers (each `public_key` mapped to a `principal`) and the one adoption
+route; every table denies unknown keys, so a typo is a start failure rather than a silently
+ignored setting. It takes a single-instance lock before it opens the store — so one database file
+is served by one process — and on `SIGTERM` or `SIGINT` it drains instead of dropping a live
+responder. A second instance on the same store exits with code 2.
+
+```sh
+cargo run --locked -p mindcore-daemon -- --config daemon.toml
+```
+
+What it serves is `mindcore-runtime`'s. `MindcoreServe` composes the workflow engine, the routed
+knowledge face, the host's memory service and the optional history and adoption faces into a
+`MindcoreSurface`: the ports, a manifest and the handlers a `ConnectResponder` needs. The
+advertised `capabilities` and `tools` are derived from what is actually served, never from a
+host-supplied string, and the runtime refuses to invent what only a host can decide — transport,
+identity, admission and the journal publisher. An embedding host that supplies the same builds its
+own responder and needs no daemon.
+
+The obligations the host takes, the `ServeFaces` fields and the served-operation list are in
+[docs/serving.md](docs/serving.md).
+
+## Storage and guarantees
+
+- **One embedded store.** `mindcore-sqlite` opens the SQLite file through `MindStore::open` over
+  one connection pool and one embedded migration, with WAL, foreign keys and a busy timeout.
+- **Idempotent writes.** A repeated idempotency key re-answers the recorded outcome instead of
+  repeating the effect, and a replay reads the receipt rather than re-running the operation.
+- **Conditional revisions.** `expected_base_revision` makes every knowledge update a
+  compare-and-swap, and a refusal leaves the row untouched.
+- **Provenance that resolves.** An adopted copy anchors to its source scope, entry and revision and
+  resolves through the source's retirement chain, so it names the live terminal rather than a
+  retired hop.
+- **Immutable migrations.** A published migration file never changes — the lock records its
+  sha256 — and new schema arrives as appended files. A database whose applied set is a prefix of
+  the embedded set reopens, and the appended files are applied; a version the embedded set does not
+  contain (`VersionMissing`), a changed checksum (`VersionMismatch`) or a pending file that reruns
+  over tables already present (`ExecuteMigration`) is refused rather than converted.
+
+What `open` accepts and refuses is [storage compatibility](docs/storage-compatibility.md); the
+version policy behind it is [SemVer](docs/semver.md).
 
 ## Status and limits
 
-- **Embedded only.** `mindcore-runtime` opens no listener, transport or identity; the host
-  supplies them.
-- **No data movement yet.** Moving an existing store or provider into Mindcore is not
-  implemented; there is no upgrade tool, and a database whose migrations predate the published set
-  is refused rather than converted.
-- **One store per database file.** Each opened `MindStore` owns one pool; two stores on one file
-  are unsupported.
-- **Immutable migrations per release.** A published migration file never changes — the lock
-  records its sha256 — and new schema arrives as appended files, locked in the release PR and
-  re-checked on the tag. A database whose applied migrations still match the embedded set reopens
-  normally; otherwise `open` refuses it rather than guessing an upgrade path; see
-  [storage compatibility](docs/storage-compatibility.md).
+- **Alpha, and mostly unpublished.** `mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on
+  crates.io at `0.1.0`; `mindcore-spoke`, `mindcore-runtime`, `mindcore-daemon` and
+  `mindcore-binding` are `publish = false` and come from this repository.
+- **Mind-level only.** The facade and the served surface expose Mind-level operations. The
+  space-level capabilities beneath them are an advanced surface that is not exposed, and the
+  operations not yet served per Mind are not composed.
+- **No HTTP surface.** This repository contains no HTTP listener, route or request type; the
+  cross-process contract is SPOKE Connect.
+- **No data movement.** Moving an existing store or provider into Mindcore is not implemented, and
+  there is no upgrade tool.
+- **One store per database file.** Each opened `MindStore` owns one pool, and two stores on one
+  file are unsupported; the daemon's lock is how one process keeps that.
+- **The addon is built, not shipped.** `bindings/node` loads `libmindcore_binding` from
+  `target/{debug,release}` or from the path `MINDCORE_BINDING_PATH` names; build it with
+  `cargo build -p mindcore-binding`.
 
-Repository checks: CI runs formatting, clippy and the full test suite, and additionally verifies the
-`.sqlx` offline cache. The exact local command block lives in
-[docs/for-agents.md](docs/for-agents.md); contributor conventions live in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+## Contributing / Changelog
+
+Contributor conventions and the local checks are in [CONTRIBUTING.md](CONTRIBUTING.md); release
+history is in [CHANGELOG.md](CHANGELOG.md). Working in this repository rather than embedding the
+library is [docs/for-agents.md](docs/for-agents.md), and the publishing steps are
+[docs/releasing.md](docs/releasing.md).

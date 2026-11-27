@@ -1,16 +1,21 @@
-# Quick start
+# Quick start: one Mind in process
 
-This tutorial takes you from an empty directory to a derived `MindState`. The short path is the
-facade — one handle whose operations compose everything below — and the sections after it show
-what it composes, for a host that needs the manual transaction-level control. It is a guided
-path, not a complete API reference.
+This tutorial takes you from an empty directory to a Mind that has heard something, settled it
+into a record, recalled it, written one judgment and read the `MindState` derived from it. You
+operate the Mind through `mindcore_runtime::Mind`, the facade in `mindcore-runtime` — one of the
+three ways to reach a Mind, and the one a Rust host links into its own process. The
+[README](../README.md#three-ways-to-reach-one) names the other two; [Serving a peer](serving.md)
+covers the SPOKE-peer form.
+
+It is a guided path, not a complete API reference. The record model is in
+[Concepts](concepts.md), and the facade's full contract is
+[`facade.md`](../.agents/specs/architecture/facade.md).
 
 ## What you will do
 
 1. Create a Mind and open its handle.
 2. Capture a memory, review it and recall the settled record.
 3. Write the carrier with one cognition record and read the derived `MindState`.
-4. See the transaction-level assembly the facade performs for you.
 
 ## Prerequisites
 
@@ -19,27 +24,51 @@ path, not a complete API reference.
   feature, so `libsqlite3-sys` links against the system library.
 - `sqlite3` CLI and `sqlx-cli` only if you also run the repository checks.
 
-## The facade path: one Mind end to end
+## Run the example first
 
-The facade is `mindcore_runtime::Mind` — the library's in-process handle over one Mind. You never
-open a transaction, shape a wire request or settle a stage yourself: each method composes the
-operation for you and admits the caller under its live grants. The complete documented example
-is [`crates/mindcore-runtime/examples/mind_facade.rs`](../crates/mindcore-runtime/examples/mind_facade.rs);
-run it from a checkout of this repository:
+The shortest path is the documented example, run from a checkout of this repository:
 
 ```sh
-cargo run --offline -p mindcore-runtime --example mind_facade
+cargo run --locked -p mindcore-runtime --example mind_facade
 ```
 
-It prints the recalled record and the derived `MindState`. In order, the example:
+It prints the recalled record and the derived `MindState`, and its source
+([`crates/mindcore-runtime/examples/mind_facade.rs`](../crates/mindcore-runtime/examples/mind_facade.rs))
+is the complete, runnable version of steps 1–6. Step 7 needs a provider the example does not
+construct; the rest of this page walks through every step.
 
-1. `create`s a Mind through the registry — the space, the carrier entry, the registry row and the
-   owner's grant row land in one transaction — and opens the handle with `Mind::open`:
+## Add the dependency
+
+```toml
+[dependencies]
+# The facade is unpublished, so the whole mindcore family comes from this repository at one
+# revision: a registry `mindcore-base` beside a git `mindcore-runtime` would be a second copy of
+# the same crate, and the facade would not accept its types.
+mindcore-base = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-sqlite = { git = "https://github.com/42ch-dev/mindcore" }
+mindcore-runtime = { git = "https://github.com/42ch-dev/mindcore" }
+# The SPOKE versions this workspace pins.
+spoke-operations = "0.19.1"
+spoke-schemas = "0.19.1"
+# For the host's own subject provisioning (step 3).
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+```
+
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io at `0.1.0`, the version
+`[workspace.package].version` declares at this head, so a `"0.1"` requirement matches. A host that
+needs only the record model and the store can take them from the registry. Embedding the facade
+needs `mindcore-runtime`, which is `publish = false`, so the family comes from one source: the git
+entries above, whose revision `Cargo.lock` records. A registry `mindcore-base` beside a git
+`mindcore-runtime` would load two copies of the same types.
+
+## 1. Create a Mind
 
 ```rust
 use mindcore_base::boundary::CallerId;
 use mindcore_runtime::minds::{self, CreateMind};
-use mindcore_runtime::{journal_dir, Mind};
+use mindcore_sqlite::MindStore;
 use spoke_operations::SpokeResult;
 
 // Every facade call answers a `SpokeResult`: unwrap yours the way your host handles refusals.
@@ -50,6 +79,9 @@ fn ok<T>(result: SpokeResult<T>, step: &str) -> T {
     }
 }
 
+let store = MindStore::open(std::path::Path::new("mind.db"))
+    .await
+    .expect("open the store");
 let owner = CallerId::new("caller_wren");
 let created = ok(
     minds::create(
@@ -63,6 +95,17 @@ let created = ok(
     .await,
     "create",
 );
+```
+
+`create` writes the space, the cognition carrier, the registry row and the owner's default grant
+in one transaction, and a refusal leaves no row. `mind_id: None` asks the registry for a fresh id;
+a Mind's id is its space id, so the registry row, the space and the carrier cannot disagree.
+`CallerId` is the authenticated caller and every later operation re-checks its live grants.
+
+## 2. Open the handle and give it a journal publisher
+
+```rust
+use mindcore_runtime::{journal_dir, Mind};
 
 // The journal root is the host's: create it and make its creation entry durable before the
 // first publish — the publisher refuses a missing root.
@@ -76,15 +119,31 @@ let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
 ```
 
 `open` is one registry read; a Mind the caller cannot see answers the registry's own `NotFound`.
-The journal publisher is the host's input — the facade never invents one — and `journal_dir` is
-the one publisher the crate offers. The journal root is the host's to create and make durable
-before the first publish: create it, then sync its parent, exactly as the example does. Before memory writes, the host provisions the subject rows it
-means to write under, exactly as on the served surface; the example shows the minimal seed.
+The handle caches no grant and confers none: a frozen Mind opens, and every operation re-reads the
+live state on its own transaction. The journal publisher is the host's input — the facade never
+invents one — and `journal_dir` is the one publisher the crate offers. Creating the root writes an
+entry in its parent, and only the host can make that entry durable, so sync the parent exactly as
+above.
 
-2. Captures a memory and reviews it, in plain arguments:
+## 3. Capture a memory
+
+Before a memory write, the host provisions the subject rows it means to write under, exactly as on
+the served surface. A single row insert is a complete atomic write in SQLite:
 
 ```rust
-use mindcore_runtime::{Capture, Recall};
+sqlx::query(
+    "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
+     VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
+)
+.bind(created.id.as_str())
+.bind("subj_wren")
+.execute(&store.pool())
+.await
+.expect("provision the subject");
+```
+
+```rust
+use mindcore_runtime::Capture;
 
 let content = serde_json::json!({ "text": "the north gate is shut after dusk" });
 let capture = Capture {
@@ -103,220 +162,175 @@ let candidate_id = serde_json::to_value(&captured).expect("the response serializ
     .to_string();
 ```
 
-`capture` takes the caller-named subject — never a default — and `review` answers the settled
-receipt instead of a stage: the fold (staging, publication, settlement) is the handle's. A failed
-publication leaves no record and the same idempotency key can be repeated.
+`capture` takes the caller-named subject — never a default — and stages a **pending candidate**.
+The candidate is not recallable and is not a record.
 
-3. Recalls the reviewed record with `mind.recall`, then writes the carrier entry — the one the
-   handle names with `carrier_entry_id()`, never a coordinate you compose — with one cognition
-   record through `knowledge_put`, the single validation boundary, and reads it back with
-   `knowledge_get`. That write is an explicit carrier update, so the last step has a judgment to
-   derive.
-
-4. Reads the Mind's judgment with `mind.cognition_read()`: the carrier's current-view records and
-   the `MindState` derived from them. A fresh carrier answers `None` — a Mind without a judgment
-   is a state, not an error.
-
-`knowledge_list` and `deliberate` sit on the same handle. The facade's `deliberate` takes a
-target and evidence only — no subject — and stamps the Mind's id as the assessment context; the
-full contract is [`facade.md`](../.agents/specs/architecture/facade.md).
-
-## What the facade composes: the transaction level
-
-The rest of this page is the manual path the facade performs for you — adapter calls on
-transactions you own, the wire shapes each takes and the staged settlement of a review. Read it
-to understand what the facade composes, or use it when a host needs control the handle does not
-expose.
-
-## Add the dependency
-
-`mindcore-base` and `mindcore-sqlite` are on crates.io; let Cargo resolve the version the registry
-holds. `[workspace.package].version` in this repository is the source of truth for what a release
-contains.
-
-```sh
-cargo add mindcore-base mindcore-sqlite
-```
-
-`mindcore-spoke`, which the transaction examples below use, is not published; it and the remaining
-pins go into `Cargo.toml` directly:
-
-```toml
-[dependencies]
-mindcore-spoke = { git = "https://github.com/42ch-dev/mindcore" }
-# match the SPOKE version pinned in this workspace's Cargo.toml
-spoke-operations = ">=0.19.1, <0.20.0"
-spoke-schemas = ">=0.19.1, <0.20.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-serde_json = "1"
-```
-
-## Open a store
+## 4. Review the candidate
 
 ```rust
-use std::path::Path;
-use mindcore_sqlite::MindStore;
+use spoke_schemas::memory_candidates_review_request::Decision;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = MindStore::open(Path::new("mind.db")).await?;
-    // ... use the store ...
-    store.close().await;
-    Ok(())
-}
+let promote: Decision = serde_json::from_value(serde_json::json!({ "action": "promote" }))
+    .expect("a promote decision");
+let reviewed = ok(
+    mind.review(&candidate_id, &promote, "rev-north-gate").await,
+    "review",
+);
+let record_id = serde_json::to_value(&reviewed).expect("the response serializes")
+    ["result"]["record_ids"][0]
+    .as_str()
+    .expect("promote retains one record")
+    .to_string();
 ```
 
-`open` creates the file when absent, enables WAL, foreign keys and a five-second busy timeout,
-and runs the embedded migration. Each opened store owns one single-connection pool; open each
-database file once per process.
+`review` answers the settled receipt instead of a stage: the fold — staging, publication,
+settlement — is the handle's. `promote` retains one record, `fragment` several and `drop` none. A
+failed publication leaves no record and the same idempotency key can be repeated; a failure after
+durable staging answers `OUTCOME_UNCERTAIN`, and the caller repeats the same review to settle it.
 
-## Capture a memory
-
-A memory write goes through the SPOKE adapter on a transaction you own. The host must have
-provisioned the space, the subject and the caller's grants first; [`tests/support/embedded_story.rs`](../crates/mindcore-sqlite/tests/support/embedded_story.rs)
-shows the minimum rows for a test fixture (production hosts use their own authorization model).
+## 5. Recall the settled record
 
 ```rust
-use mindcore_spoke::{MemoryAdapter, MemoryStage};
-use serde_json::json;
-use spoke_operations::SpokeResult;
-use spoke_schemas::Principal;
+use mindcore_runtime::Recall;
 
-let adapter = MemoryAdapter::new(false);
-let caller: Principal = serde_json::from_value(json!({
-    "principal_id": "caller_wren",
-    "extensions": {}
-}))?;
-
-let mut tx = store.pool().begin().await?;
-let stage = adapter
-    .capture(
-        &mut tx,
-        &caller,
-        json!({
-            "space_id": "wren",
-            "subject_id": "wren",
-            "capture_scope": { "visibility": "context", "context_id": "tavern" },
-            "content": { "text": "A traveller says the north gate is shut after dusk." },
-            "occurred_at": "2026-11-19T17:40:00Z",
-            "idempotency_key": "cap-wren-hearsay"
-        }),
-    )
-    .await;
-
-let candidate_id = match stage {
-    SpokeResult::Ok(MemoryStage::Ready(body)) => {
-        body["result"]["candidate_ids"][0].as_str().unwrap().to_string()
-    }
-    other => panic!("capture did not stage a candidate: {other:?}"),
+let selection = serde_json::json!({ "mode": "subject_all" });
+let recall = Recall {
+    subject: "subj_wren",
+    selection: &selection,
+    max_items: 10,
+    max_bytes: None,
+    query: None,
+    cursor: None,
 };
-tx.commit().await?;
+let page = ok(mind.recall(&recall).await, "recall");
 ```
 
-A capture stages a **pending candidate**. It is not recallable, and it is not a record. Review
-consumes it into one retained record (`promote`), several (`fragment`) or none (`drop`);
-`dismiss` consumes it without a record.
+Recall reads live records only. `max_items` is required because every recall the facade sends is a
+valid wire request; `selection` is the read-selection member exactly as the wire carries it.
 
-Review is a staged settlement. A review that owes file effects returns `MemoryStage::JournalPending`;
-commit that transaction, publish the targets, then settle the receipt in a second transaction.
-The helpers `stage_review`, `settle_receipt` and `attempt_retain` in
-[`tests/support/embedded_story.rs`](../crates/mindcore-sqlite/tests/support/embedded_story.rs)
-are the shortest complete implementation.
+## 6. Write the carrier and read the judgment
 
-Recall reads live records only:
+The cognition carrier is an ordinary knowledge entry, and `knowledge_put` is its one validation
+boundary. The entry id comes from the handle; a host never composes it.
 
 ```rust
-let mut tx = store.pool().begin().await?;
-let _page = adapter
-    .recall(
-        &mut tx,
-        &caller,
-        json!({
-            "space_id": "wren",
-            "subject_id": "wren",
-            "selection": { "mode": "selected_contexts", "context_ids": ["tavern"] },
-            "budget": { "max_items": 10 }
-        }),
-    )
-    .await;
-tx.rollback().await?;
+use mindcore_base::cognition::append_cognition_record;
+
+let carrier = ok(
+    mind.knowledge_get(mind.carrier_entry_id(), None).await,
+    "read the carrier",
+);
+let carrier_revision = carrier.revision.expect("a stored carrier has a revision");
+let record = serde_json::json!({
+    "kind": "belief",
+    "order": 1,
+    "record_id": "cog_north_gate",
+    "holder": {
+        "kind": "knowledge_entry",
+        "namespace": "mindcore",
+        "id": mind.carrier_entry_id(),
+    },
+    "target": {
+        "carrier": {
+            "kind": "knowledge_entry",
+            "namespace": "mindcore",
+            "id": mind.carrier_entry_id(),
+        },
+        "target_id": "prop_north_gate_shut",
+        "kind": "proposition",
+    },
+    "assessor": {
+        "kind": "principal",
+        "namespace": "mindcore",
+        "id": "caller_wren",
+    },
+    "assessor_role": "holder_self_report",
+    "basis": {
+        "kind": "evidence",
+        "evidence": [{ "kind": "memory_record", "namespace": "mindcore", "id": record_id }],
+    },
+    "assessment_context": { "context_id": created.id.as_str() },
+    "assessed_at": "2026-01-01T00:30:00Z",
+    "effective_at": "2026-01-01T00:30:00Z",
+    "view": "current",
+    "q": {
+        "value": 0.8,
+        "assertion": "belief_attribution",
+        "method": "two_witness_reports",
+        "calibration": "uncalibrated",
+    },
+    "extensions": {},
+});
+let updated = append_cognition_record(&carrier, record)
+    .expect("one valid record appends to the carrier");
+let written = ok(
+    mind.knowledge_put(updated, Some(carrier_revision)).await,
+    "write the carrier",
+);
 ```
 
-## Read and write knowledge
-
-A knowledge port is bound to one collection when it is built. No API accepts a collection,
-`owner` or `viewpoint` as a call argument.
+The expected revision makes the write a compare-and-swap: a row that has moved answers
+`StoredRevisionStale`, and the refusal leaves it untouched. The carrier, its validation boundary
+and the derived state are in [Concepts](concepts.md#cognition).
 
 ```rust
-use mindcore_base::knowledge::KnowledgeScope;
-use spoke_operations::KnowledgeEntryPort;
-
-let wren = store.knowledge(KnowledgeScope::new("wren"));
-
-match wren.get_knowledge_entry("ke_north_gate").await {
-    SpokeResult::Ok(entry) => println!("revision {:?}", entry.revision),
-    SpokeResult::Reject(reject) => println!("{}: {}", reject.code, reject.message),
-}
+let cognition = ok(mind.cognition_read().await, "cognition read")
+    .expect("one record on the carrier is a judgment");
+println!("{}", serde_json::to_string_pretty(&cognition.mind_state).expect("the state prints"));
 ```
 
-A create passes `expected_base_revision = None`; an update passes `Some(stored_revision)` and is
-refused when the row has moved. The store assigns the next revision itself.
+`cognition_read` answers the carrier's current-view records and the `MindState` derived from them.
+A fresh carrier answers `None` — a Mind without a judgment is a state, not an error. `MindState` is
+derived on every read, never stored a second time. `knowledge_list` sits on the same handle; it is
+bounded, and a collection over 512 live entries answers the store's own
+`COLLECTION_OVER_CAPACITY` rather than paging.
 
-To adopt a shared entry, use the runtime's `knowledge.adopt` operation: it resolves the source's
-retirement chain, then writes the copy with an anchor naming the live terminal. A direct
-`put_knowledge_entry` with an anchor built by `mindcore_base::knowledge::adoption_anchor` stores
-that anchor verbatim — it preserves an existing anchor and refuses a change, but it performs no
-retirement resolution. Full rules: [Concepts](concepts.md#knowledge) and
-[Migrating from `tools.mindcore.adopt`](migrating-from-tools-adopt.md).
+## 7. Deliberate, when the host supplies a reasoner
 
-## Derive the current judgment
-
-Cognition lives in a carrier entry: an ordinary `KnowledgeEntry` whose cognition module holds
-append-only records, with one head pointer to the current judgment. A fresh store has no carrier, so
-`read_carrier` refuses `KnowledgeEntryNotFound` until the holder entry exists. Once it exists, the
-read succeeds even before the first append; `derive_mind_state` then answers `NoRecords` until a
-record is appended. The story's steps 3–4 create the holder and append the first records.
+`deliberate` is not in `mind_facade`: the example assembles no providers, and the call needs the
+host's `Reasoner` before it can complete. It takes a target and the evidence the verdict may rest
+on — no subject — and stamps the Mind's id as the assessment context:
 
 ```rust
-use mindcore_base::cognition::derive_mind_state;
-use mindcore_sqlite::cognition::read_carrier;
+use std::time::Duration;
+use mindcore_runtime::{Deliberation, MindProviders};
 
-let carrier = match read_carrier(&wren, "ke_wren_cognition").await {
-    SpokeResult::Ok(entry) => entry,
-    SpokeResult::Reject(reject) => panic!("no carrier: {} {}", reject.code, reject.message),
+// `reasoner` is a host-supplied `Arc<dyn Reasoner>`; `target` and `evidence` come from your host.
+let mind = mind.with_providers(MindProviders {
+    reasoner: Some(reasoner),
+    ..Default::default()
+});
+let deliberation = Deliberation {
+    target: &target,
+    evidence: &evidence,
+    timeout: Duration::from_secs(10),
 };
-
-match derive_mind_state(&carrier) {
-    Ok(view) => println!("holder {} at revision {}", view.holder_entry_id, view.carrier_revision),
-    Err(error) => println!("no derivable state: {error:?}"),
-}
+let outcome = ok(mind.deliberate(&deliberation).await, "deliberate");
 ```
 
-The carrier is validated at the single persistence boundary, and `MindState` is derived rather
-than stored a second time. A catalog read never derives cognition; a shared source change never
-moves the carrier.
+The providers are the host's, as on the served surface: without a reasoner, `deliberate` answers
+`InternalError` with `details.kind = "reasoner_unavailable"`. It settles only under a space-wide
+live `recall` grant, and an unsettled intent anywhere in the Mind withholds the commit.
 
 ## Run the full story
 
-Run this from a checkout of this repository; a consumer project does not carry the example.
+The facade above is the product path. The workspace also asserts the whole record story — adoption,
+doubt, evidence, a shared change, a reopen and the refusals — as a runnable example:
 
 ```sh
 cargo run --locked -p mindcore-sqlite --example iteration_01
 ```
 
-The example prints and asserts the S1–S8 scenario:
-
-1. hearing — a candidate is captured, recall stays empty, no personal entry exists
-2. catalog read — the shared entry is unchanged; the derived state is `NoRecords`
-3. adoption — a personal copy is anchored to the shared source at its revision
-4. doubt — a belief with `Unknown` truth and testimony as its basis
-5. evidence — perception replaces doubt in the current judgment set
-6. shared change — the source moves to revision 2; the adopted copy stays at 1
-7. reopen — the derived state equals the pre-close state
-8. refusals — wrong-scope and stale writes leave both scopes unchanged
+It prints and asserts the S1–S8 scenario: a candidate is heard and recall stays empty; the catalog
+read is unchanged; a personal copy is anchored to the shared source at its revision; a belief with
+`Unknown` truth and testimony as its basis is recorded; perception replaces doubt; the source moves
+to revision 2 and the adopted copy stays at 1; reopening derives the same state; wrong-scope and
+stale writes leave both scopes unchanged.
 
 ## Next
 
 - [Concepts](concepts.md) — the record model behind these calls.
-- [Serving a surface](serving.md) — expose the same store over SPOKE Connect.
+- [Serving a peer](serving.md) — reach the same store over SPOKE Connect with `mindcore-daemon`.
+- [`bindings/node`](../bindings/node/index.d.ts) — the in-process TypeScript form; its exported
+  surface is documented in `index.d.ts`.
 - [For agents](for-agents.md) — checks and repository conventions.
