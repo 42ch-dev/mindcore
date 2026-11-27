@@ -8,6 +8,8 @@ Current-state specifications of the Mindcore repository. Each page describes the
 | [`architecture/storage-ir-boundary.md`](architecture/storage-ir-boundary.md) | The storage-independent IR, its wire codec fidelity rule, and the repository transaction boundary |
 | [`architecture/facade.md`](architecture/facade.md) | The in-process facade over a Mind: operations, transactions, and the review fold |
 | [`architecture/serving-principal-routing.md`](architecture/serving-principal-routing.md) | Per-principal route map, carrier admission and the recall knowledge slot |
+| [`architecture/daemon-kernel.md`](architecture/daemon-kernel.md) | The sidecar daemon: config, the store lock, framing, lifecycle, composition and shutdown |
+| [`architecture/native-binding.md`](architecture/native-binding.md) | The napi-rs binding: exported surface, the result object, declarations and addon loading |
 | [`architecture/serving-seam.md`](architecture/serving-seam.md) | Signed Connect serving: Knowledge face, workflow tools, and the store shape they require |
 | [`data/cognition-record-storage.md`](data/cognition-record-storage.md) | Per-record cognition storage, the carrier head, and its CAS/projection rules |
 | [`data/embedding-vector-store.md`](data/embedding-vector-store.md) | Identity-keyed record vectors, the query slot, and the exact-scoring read/fill order |
