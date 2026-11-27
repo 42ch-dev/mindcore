@@ -157,19 +157,28 @@ impl DaemonConfig {
 }
 
 /// Decodes a value that must be exactly 64 hex digits.
+///
+/// The messages name the failure and the observed length only: the same helper decodes the
+/// responder's private seed, and an error reaches stderr through `main`.
 fn hex32(value: &str) -> Result<[u8; 32], String> {
-    let digits: Vec<u8> = value
-        .bytes()
-        .map(|byte| match byte {
-            b'0'..=b'9' => Ok(byte - b'0'),
-            b'a'..=b'f' => Ok(byte - b'a' + 10),
-            b'A'..=b'F' => Ok(byte - b'A' + 10),
-            _ => Err(format!("expected 64 hex digits, found {value:?}")),
-        })
-        .collect::<Result<_, _>>()?;
+    let mut digits = Vec::with_capacity(64);
+    for byte in value.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => {
+                return Err(format!(
+                    "expected 64 hex digits, found a non-hex digit; observed length {}",
+                    value.len()
+                ))
+            }
+        };
+        digits.push(digit);
+    }
     if digits.len() != 64 {
         return Err(format!(
-            "expected 64 hex digits, found {} in {value:?}",
+            "expected 64 hex digits; observed length {}",
             digits.len()
         ));
     }
@@ -328,9 +337,36 @@ journal_dir = "{}"
             "the message names the key: {message}"
         );
         assert!(
-            message.contains("62"),
-            "the message names the digits found: {message}"
+            message.contains("observed length 62"),
+            "the message names the length: {message}"
         );
+    }
+
+    /// The seed is a private key, and `main` prints the error: the digits must never travel.
+    #[test]
+    fn the_seed_value_never_reaches_the_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text = minimal(dir.path());
+        // A well-formed 64-digit seed plus one accidental trailing character.
+        let secret = format!("{SEED}x");
+        std::fs::write(dir.path().join("seed"), &secret).expect("malformed seed");
+        let error = load(&write(dir.path(), &text)).expect_err("malformed seed");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("identity.seed_file"),
+            "the message names the key: {message}"
+        );
+        assert!(
+            message.contains("observed length 65"),
+            "the message names the length: {message}"
+        );
+        for leak in [SEED, secret.as_str(), &SEED[..8]] {
+            assert!(
+                !message.contains(leak),
+                "the message carries no seed digits: {message}"
+            );
+        }
     }
 
     #[test]
