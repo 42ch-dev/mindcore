@@ -368,39 +368,32 @@ pub async fn client_ensure_subject(
 /// The host duty a journal root requires: the root exists, and every entry on the way to it is
 /// durable before the first publication writes into it.
 ///
-/// Two chains are made durable, in this order:
+/// One walk over the path as configured, from the filesystem root down to the root itself. For
+/// each level `L`:
 ///
-/// 1. The *canonical* one. `journal_dir` canonicalizes the root it serves, so a root reached
-///    through a symlink publishes beneath the link's target; the entries beneath the target are
-///    the target's and are created here if they are missing.
-/// 2. The *configured* one. The publisher is handed the path as configured, so the entry naming a
-///    symlink — and every directory on the way to it — must be durable too; a crash that lost the
-///    link entry would leave the canonical chain intact but the configured root unreachable.
-///    Nothing is resolved or created on this pass: it only flushes the entries an existing level
-///    already has. With no symlink on the path it repeats the first pass, at one `fsync` per level.
+/// 1. `L` is created when missing, and refused under its own name when it is not a directory.
+/// 2. The entry naming `L` in the directory that holds it is flushed — the configured spelling,
+///    which is what the publisher is handed.
+/// 3. `L` is resolved, and when it resolves somewhere else — a symlink at *this* depth, not only
+///    the leaf — the entry naming the resolved path in *its* directory is flushed too. A crash
+///    that lost either entry would leave one of the two spellings unreachable.
 ///
-/// Both walks are idempotent, not first-creation-only: every level from the root up to the
-/// filesystem root has its parent synced unconditionally — including levels that already existed
-/// and levels an earlier start created but never proved durable. Nothing records which entry a
-/// failed start left unproven, so a restart redoes the whole chain.
+/// The walk is idempotent, not first-creation-only: every level has its parents synced
+/// unconditionally, including levels that already existed and levels an earlier start created but
+/// never proved durable. Nothing records which entry a failed start left unproven, so a restart
+/// redoes the whole chain. A path with no symlink resolves to itself, so step 3 adds nothing there.
 ///
-/// A level another process created between a start's look and its `create_dir` is not a failure:
-/// `AlreadyExists` is the same outcome, and the entry still gets its sync. A level that is not a
-/// directory is refused under its own name, top-down, before anything is created beneath it.
+/// A level another process created between the look and the `create_dir` is not a failure:
+/// `AlreadyExists` is the same outcome, and the entry still gets its sync.
 fn durable_root(root: &Path) -> std::io::Result<()> {
-    let canonical = canonical_root(root)?;
-    // Leaf first, so the same vector serves the top-down create pass in reverse.
+    // Leaf first, so the same vector serves the top-down pass in reverse.
     let mut chain: Vec<&Path> = Vec::new();
-    let mut cursor = Some(canonical.as_path());
+    let mut cursor = Some(root);
     while let Some(level) = cursor {
         chain.push(level);
         cursor = level.parent().filter(|parent| !parent.as_os_str().is_empty());
     }
-    // Top-down: every level exists, then its entry in the directory above is made durable. The
-    // filesystem root is its own level and has no parent holding its entry.
     for level in chain.iter().rev() {
-        // A level is refused under its own name here, before anything is created beneath it: an
-        // ancestor that is a regular file is the one that must be named, not the level below.
         match std::fs::metadata(level) {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => return Err(not_a_directory(level)),
@@ -409,10 +402,8 @@ fn durable_root(root: &Path) -> std::io::Result<()> {
                 create_concurrently(level);
                 match std::fs::create_dir(level) {
                     Ok(()) => {}
-                    // Another process may have created the level between the look above and this
-                    // call; that is the same outcome, and the entry still gets its sync.
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if !std::fs::metadata(level)?.is_dir() {
+                        if !std::fs::metadata(level).is_ok_and(|m| m.is_dir()) {
                             return Err(not_a_directory(level));
                         }
                     }
@@ -421,76 +412,31 @@ fn durable_root(root: &Path) -> std::io::Result<()> {
             }
             Err(error) => return Err(error),
         }
-        if let Some(parent) = level.parent() {
+        if let Some(parent) = holding_directory(level) {
             sync_parent(parent)?;
         }
-    }
-    sync_configured_chain(root)
-}
-
-/// The entries naming `root` as it was configured, symlink included: for every level that exists,
-/// its parent is flushed. Nothing is created and nothing is resolved — a level that is not there
-/// was never established at that spelling, so it has no entry to make durable.
-fn sync_configured_chain(root: &Path) -> std::io::Result<()> {
-    let mut cursor = Some(root);
-    while let Some(level) = cursor {
-        if std::fs::symlink_metadata(level).is_ok() {
-            // `Path::new("journal").parent()` is the empty path, which names the current
-            // directory; only `None` — the filesystem root — has no directory holding its entry.
-            let parent = match level.parent() {
-                None => None,
-                Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
-                Some(parent) => Some(parent),
-            };
-            if let Some(parent) = parent {
-                sync_parent(parent)?;
+        // A symlink at this level: the resolved path's entry needs the same flush. `L` exists by
+        // now, so a resolution that fails leaves nothing to sync here.
+        if let Ok(resolved) = std::fs::canonicalize(level) {
+            if resolved.as_path() != *level {
+                if let Some(parent) = resolved.parent() {
+                    sync_parent(parent)?;
+                }
             }
         }
-        cursor = level.parent().filter(|parent| !parent.as_os_str().is_empty());
     }
     Ok(())
 }
 
-/// The root as the filesystem resolves it: every symlink on the way replaced, so the synced
-/// entries are the ones `journal_dir` will publish beneath.
+/// The directory holding `level`'s entry.
 ///
-/// The part below the nearest existing ancestor does not exist yet and so carries no symlink; it
-/// is appended to that ancestor's canonical form verbatim. `NotFound` and `NotADirectory` both
-/// climb: an ancestor that is a regular file still canonicalizes, and the walk above then refuses
-/// it under its own name.
-fn canonical_root(root: &Path) -> std::io::Result<PathBuf> {
-    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut cursor = root;
-    loop {
-        match std::fs::canonicalize(cursor) {
-            Ok(existing) => {
-                let mut resolved = existing;
-                for component in missing.iter().rev() {
-                    resolved.push(component);
-                }
-                return Ok(resolved);
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                // `Path::new("journal").parent()` is the empty path, which names the current
-                // directory — the one level whose parent is not `None` and yet holds its entry.
-                let next = match cursor.parent() {
-                    None => return Err(error),
-                    Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
-                    Some(parent) => parent,
-                };
-                match cursor.file_name() {
-                    Some(name) => missing.push(name),
-                    None => return Err(error),
-                }
-                cursor = next;
-            }
-            Err(error) => return Err(error),
-        }
+/// `Path::new("journal").parent()` is the empty path, which names the current directory; only
+/// `None` — the filesystem root — has no directory holding its entry.
+fn holding_directory(level: &Path) -> Option<&Path> {
+    match level.parent() {
+        None => None,
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        Some(parent) => Some(parent),
     }
 }
 
@@ -619,12 +565,11 @@ mod tests {
         assert_eq!(after_first, 1, "the failed attempt is counted");
 
         durable_root(&root).expect("the retry succeeds");
-        // The retry adds one sync per pass — the canonical chain and the configured one, which
-        // repeat each other when no symlink is on the path. `after_first` counts only the single
-        // attempt the first start got through before the injected fault aborted it.
+        // The retry syncs that parent again; `after_first` counts only the single attempt the
+        // first start got through before the injected fault aborted it.
         assert_eq!(
             syncs_of(&level_parent),
-            after_first + 2,
+            after_first + 1,
             "the retry syncs the level it now finds already there"
         );
     }
@@ -645,15 +590,14 @@ mod tests {
 
         durable_root(&lower).expect("an existing root starts");
 
-        // One sync per pass: the canonical chain and the configured one, which coincide here.
         assert_eq!(
             syncs_of(&upper),
-            before_lower + 2,
+            before_lower + 1,
             "the lower level's entry is synced in the upper directory"
         );
         assert_eq!(
             syncs_of(&scratch_path),
-            before_upper + 2,
+            before_upper + 1,
             "the upper level's entry is synced in the scratch directory"
         );
     }
@@ -691,6 +635,44 @@ mod tests {
         );
     }
 
+    /// A symlink anywhere on the path, not only at the leaf: `a/link/inner` where `link` points into
+    /// `elsewhere/real`. Every configured level keeps its own entry flushed, and the level that is a
+    /// symlink also flushes the entry naming what it resolves to — the parent the publisher's
+    /// canonicalized root lives under. The leaf's own parents are flushed in the same walk.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_below_the_root_syncs_both_its_parent_and_the_resolved_parent() {
+        let scratch = tempfile::TempDir::new().expect("a scratch directory");
+        let scratch_path = canonical(scratch.path());
+        let a = scratch_path.join("a");
+        let elsewhere = scratch_path.join("elsewhere");
+        std::fs::create_dir(&a).expect("the configured chain's directory");
+        std::fs::create_dir(&elsewhere).expect("the resolved chain's directory");
+        let real = elsewhere.join("real");
+        std::fs::create_dir(&real).expect("the link target");
+        let link = a.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("the intermediate symlink");
+        let a_before = syncs_of(&a);
+        let elsewhere_before = syncs_of(&elsewhere);
+        let real_before = syncs_of(&real);
+
+        durable_root(&link.join("inner")).expect("a root below an intermediate symlink starts");
+
+        assert!(real.join("inner").is_dir(), "the resolved path holds the root");
+        assert!(
+            syncs_of(&a) > a_before,
+            "the directory holding the configured symlink is synced"
+        );
+        assert!(
+            syncs_of(&elsewhere) > elsewhere_before,
+            "the directory holding the resolved path is synced"
+        );
+        assert!(
+            syncs_of(&real) > real_before,
+            "the leaf's own parent is synced, in the resolved chain"
+        );
+    }
+
     /// A level another process created between the check and `create_dir` is the same outcome, not
     /// a failure, and its entry still gets synced.
     #[test]
@@ -723,9 +705,8 @@ mod tests {
 
         let error = durable_root(&root).expect_err("a file cannot hold a journal root");
         let message = error.to_string();
-        let named = canonical(scratch.path()).join("blocker");
         assert!(
-            message.contains(&named.display().to_string()),
+            message.contains(&blocker.display().to_string()),
             "the refusal names the blocking component: {message}"
         );
         assert!(
