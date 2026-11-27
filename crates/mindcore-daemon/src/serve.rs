@@ -494,19 +494,22 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
     }
-    // Top-down. Each missing level is created, and every level of the chain has its holding directory
-    // flushed.
+    // Top-down. Each missing level is created, then every level's holding directory is flushed.
     //
-    // Every level of the chain, whether this start created it or found it: a start that created a
-    // level and then failed before flushing its holder aborted, but the directory it made is still
-    // there. Next time that level is "pre-existing", and treating its holder as an operator's
-    // directory would warn and carry on — publishing under an entry nobody ever made durable. So the
-    // chain is this start's responsibility in full; only directories *above* it are the operator's,
-    // where a fault is reported and skipped (`holding_directory` never names one, so the walk cannot
-    // reach them at all).
+    // Every directory the walk touches is the chain's responsibility, so a fault anywhere in it is a
+    // journal fault: a start that created a level and then failed before flushing its holder aborted,
+    // but the directory it made is still there, and on the next start that level is "pre-existing" —
+    // warning and carrying on would publish under an entry nobody ever made durable. The walk stops at
+    // the root's holding directory, so no directory above the chain is ever flushed.
+    //
+    // Creating a level dirties its holding directory *again*, even when that directory was already
+    // flushed earlier in this same walk: with `dir = "./journal"` the chain is `["./journal", "."]`, so
+    // `"."` is flushed before the level exists and owes a second flush once it does. Hence the drop
+    // below — the dedupe is per (directory, dirtying), and the drop is what restores it.
     let mut synced: Vec<PathBuf> = Vec::new();
     for (index, level) in chain.iter().enumerate().rev() {
-        if created_at(index, existing) {
+        let created = created_at(index, existing);
+        if created {
             // Owner-only, not the umask's choice: the journal holds what the Mind settled on, and a
             // directory some other user can write into is a publication target they control. Only
             // levels this start creates get the mode; a pre-existing level keeps its own.
@@ -529,8 +532,12 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
         let Some(parent) = holding_directory(level) else {
             continue;
         };
-        // Fatal throughout the chain: see above. A level created by an earlier failed start is
-        // indistinguishable from one this start creates, and both owe a durable entry.
+        if created {
+            // This call just dirtied `parent`, so whatever flush it already has is stale: forget it
+            // and flush the new entry. A fully pre-existing chain creates nothing, so every directory
+            // is still flushed exactly once.
+            forget_synced(parent, &mut synced);
+        }
         sync_once(parent, &mut synced).await?;
     }
     // A symlink in the chain means the journal really lives somewhere else. The chain walk flushed
@@ -564,6 +571,16 @@ async fn sync_level_entry(level: &Path, synced: &mut Vec<PathBuf>) -> Result<(),
         return Ok(());
     };
     sync_once(parent, synced).await
+}
+
+/// Drops `parent`'s key from the flush ledger, so the next [`sync_once`] flushes it again.
+///
+/// Used after creating a level: the holding directory was possibly flushed already, and creating the
+/// level dirtied it a second time. Keyed the same way `sync_once` keys, so a relative and a resolved
+/// spelling of one directory both match.
+fn forget_synced(parent: &Path, synced: &mut Vec<PathBuf>) {
+    let key = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    synced.retain(|seen| *seen != key);
 }
 
 /// [`sync_parent`], skipped for a directory this call has already flushed.
@@ -868,8 +885,6 @@ fn take_injected_failure(path: &Path) -> Option<IdentityFailure> {
 /// A test seam: when installed, a connection task parks here — after its responder is tracked and
 /// before it registers — so a drain can be driven while a session is still setting up.
 #[cfg(test)]
-/// The resume half of the park. Which connection parks is decided by `Host::park_setup`, so only the
-/// arming test's host reaches this; the global holds nothing that identifies a connection.
 static SETUP_PARK: Mutex<Option<SetupPark>> = Mutex::new(None);
 
 #[cfg(test)]
@@ -1112,6 +1127,15 @@ fn peer_keys(config: &DaemonConfig) -> Result<HashMap<String, [u8; 32]>, DaemonE
         })
         .collect()
 }
+
+/// Serializes the two tests that depend on the process's working directory: the `./journal` case
+/// changes it, and the `.`-relative case reads it. Nothing else in this crate resolves a relative
+/// path, so the lock's reach is exactly these two.
+///
+/// A tokio mutex, not a `std` one: both tests hold it across `.await` points, and a `std` guard
+/// across an await is exactly the deadlock hazard clippy rejects.
+#[cfg(test)]
+static CWD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -1778,6 +1802,7 @@ mod tests {
     /// A single-segment relative journal root still syncs its own directory entry.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_single_relative_segment_syncs_the_current_directory() {
+        let _cwd = CWD_LOCK.lock().await;
         let here = Path::new(".");
         clear_sync_attempts(here);
         let mut synced = Vec::new();
@@ -1872,6 +1897,54 @@ mod tests {
             "the plain case still flushes each level once"
         );
         assert_eq!(sync_attempts(dir.path()), 1, "the ancestor once");
+    }
+
+    /// A created level's holding directory owes a flush *after* the creation, even when the same
+    /// directory was already flushed earlier in the walk.
+    ///
+    /// `dir = "./journal"` is the case that exposes it: the chain is `["./journal", "."]`, and `.` is
+    /// both the level's holder and its own holder, so the walk flushes `.` before the level exists and
+    /// would dedupe away the flush it owes once the level does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_created_level_flushes_its_holder_after_the_creation() {
+        // A process-wide chdir, so this test owns the working directory for its whole body; the one
+        // other relative-path test takes the same lock.
+        let _cwd = CWD_LOCK.lock().await;
+        let dir = TempDir::new().expect("temporary directory");
+        let original = std::env::current_dir().expect("a working directory");
+        std::env::set_current_dir(dir.path()).expect("enter the scratch directory");
+
+        let here = Path::new(".");
+        clear_sync_attempts(here);
+        let outcome = journal_root(Path::new("./journal")).await;
+        // Read the count while the scratch directory is still current: `sync_attempts` resolves the
+        // spelling it is given, so `"."` means a different directory after the chdir back.
+        let flushed = sync_attempts(here);
+        std::env::set_current_dir(&original).expect("leave the scratch directory");
+
+        outcome.expect("a relative root starts");
+        assert!(
+            dir.path().join("journal").is_dir(),
+            "the level was created in the scratch directory"
+        );
+        assert_eq!(
+            flushed, 2,
+            "`.` is flushed before the level exists and again once its entry is new"
+        );
+
+        // The plain absolute case still costs one flush per level: a pre-existing chain creates
+        // nothing, so nothing is forgotten and nothing is repeated.
+        let holder = dir.path().join("holder");
+        std::fs::create_dir(&holder).expect("create the holder");
+        clear_sync_attempts(&holder);
+        journal_root(&holder.join("journal"))
+            .await
+            .expect("create the absolute root");
+        assert_eq!(
+            sync_attempts(&holder),
+            1,
+            "a plain path flushes each level once"
+        );
     }
 
     /// A level whose holder flush failed on one start must not become "pre-existing, therefore the
