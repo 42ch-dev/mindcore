@@ -197,10 +197,14 @@ pub async fn run(
     let store = MindStore::open(&store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", store_path.display())))?;
-    journal_root(&config.journal.dir).await?;
-    // `MindcoreServe` owns the store, so the pool handle is kept here: it is the reachable route
-    // to the awaited close the drain order names, and it closes the same pool.
+    // `MindcoreServe` owns the store, so the pool handle is taken first: it is the reachable route to
+    // the awaited close the drain order names, and every early failure below closes it rather than
+    // cutting the connections when the runtime drops.
     let pool = store.pool();
+    if let Err(error) = journal_root(&config.journal.dir).await {
+        pool.close().await;
+        return Err(error);
+    }
     let surface = match MindcoreServe::new(
         store,
         // No memory service is served, so no reflection is composed either.
@@ -212,10 +216,11 @@ pub async fn run(
     {
         SpokeResult::Ok(surface) => Arc::new(surface),
         SpokeResult::Reject(reject) => {
+            pool.close().await;
             return Err(DaemonError::Surface(format!(
                 "{}: {}",
                 reject.code, reject.message
-            )))
+            )));
         }
     };
     // Both signals are installed before the socket exists. From the moment the name is bound an
@@ -380,9 +385,10 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
     let mut cursor = Some(dir);
     while let Some(level) = cursor {
         if level.exists() {
-            // An existing component that is not a directory cannot be a journal root: accepting it
-            // would publish into whatever the path really names.
-            let metadata = std::fs::symlink_metadata(level)
+            // The resolved type decides: a symlink to a directory is a directory, and a journal root
+            // reached through one is the operator's arrangement, not a fault. `metadata` follows the
+            // link, so a link to a file or a FIFO still fails the gate below.
+            let metadata = std::fs::metadata(level)
                 .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
             if !metadata.is_dir() {
                 return Err(DaemonError::Journal(format!(
@@ -1316,6 +1322,94 @@ mod tests {
             }
             other => panic!("a file above the journal root is a journal fault, not {other:?}"),
         }
+    }
+
+    /// A failure after the store opened closes its pool before returning, so the connections end in
+    /// order rather than being cut when the runtime drops.
+    ///
+    /// This test pins the failure path's shape — the journal fault is reported and the store file is
+    /// left usable — but it does NOT prove the pool was closed: `SqlitePool::close` has no observable
+    /// effect from outside, the daemon crate has no `sqlx` dependency to reach `is_closed`, and a
+    /// second `MindStore::open` succeeds either way. Verified by rerunning with the `pool.close()`
+    /// removed: this test still passes. The close is required by the drain contract and is visible in
+    /// the source, not here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_failure_reports_the_fault_and_leaves_the_store_usable() {
+        let dir = TempDir::new().expect("temporary directory");
+        let store_path = dir.path().join("mind.db");
+        // A regular file where the journal root belongs is the journal fault after the open.
+        let blocker = dir.path().join("journal");
+        std::fs::write(&blocker, b"not a directory").expect("write the blocker");
+        let config = DaemonConfig {
+            store_path: store_path.clone(),
+            journal: crate::config::JournalConfig {
+                dir: blocker.clone(),
+            },
+            ..config(dir.path())
+        };
+        let lock = StoreLock::acquire(&store_path).expect("take the lock");
+
+        match run(config, store_path.clone(), lock).await {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("not a directory"), "{message}")
+            }
+            other => panic!("a file at the journal root is a journal fault, not {other:?}"),
+        }
+
+        let reopened = MindStore::open(&store_path)
+            .await
+            .expect("the store reopens after the failed start");
+        reopened.close().await;
+    }
+
+    /// A journal root reached through a symlink is the operator's arrangement: the resolved type
+    /// decides, so a link to a directory starts and a link to anything else is still refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_journal_root_is_accepted() {
+        let dir = TempDir::new().expect("temporary directory");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("create the real directory");
+        let leaf = dir.path().join("leaf-link");
+        std::os::unix::fs::symlink(&real, &leaf).expect("link to a directory");
+
+        journal_root(&leaf)
+            .await
+            .expect("a link to a directory is a root");
+
+        // A link to a regular file is refused, naming the path the operator configured.
+        let file = dir.path().join("plain-file");
+        std::fs::write(&file, b"not a directory").expect("write the file");
+        let bad = dir.path().join("bad-link");
+        std::os::unix::fs::symlink(&file, &bad).expect("link to a file");
+        match journal_root(&bad).await {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("not a directory"), "{message}");
+                assert!(
+                    message.contains(&bad.display().to_string()),
+                    "the refusal names the configured path: {message}"
+                );
+            }
+            other => panic!("a link to a file is a journal fault, not {other:?}"),
+        }
+    }
+
+    /// An ancestor reached through a symlink is accepted too: the walk resolves each level it finds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_journal_ancestor_is_accepted() {
+        let dir = TempDir::new().expect("temporary directory");
+        let real = dir.path().join("real-ancestor");
+        std::fs::create_dir(&real).expect("create the real ancestor");
+        let link = dir.path().join("ancestor-link");
+        std::os::unix::fs::symlink(&real, &link).expect("link to the ancestor");
+
+        let root = link.join("journal");
+        journal_root(&root)
+            .await
+            .expect("create beneath a linked ancestor");
+        assert!(
+            real.join("journal").is_dir(),
+            "the level was created inside the resolved directory"
+        );
     }
 
     /// Every level this start creates is owner-only, not the umask's choice: the journal holds what
