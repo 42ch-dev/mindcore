@@ -160,6 +160,30 @@ describe('the in-process binding', () => {
     );
   });
 
+  it('closes a client so the same store opens again, and refuses calls afterwards', async () => {
+    const client = await open('teardown');
+    const mind = await client.createMind({ displayName: 'Reopened' });
+    await client.close();
+    // The view is an independent handle over the same file: it survives its client's teardown.
+    assert.equal(mind.id.startsWith('spc_'), true);
+    await assert.rejects(
+      () => client.listMinds(),
+      (error) => {
+        assert.ok(error instanceof MindcoreError);
+        assert.equal(error.code, 'INVALID_INPUT');
+        return true;
+      },
+    );
+    // Idempotent, and the file is free: a second client over the same path sees what was written.
+    await client.close();
+    const reopened = await open('teardown');
+    assert.deepEqual(
+      (await reopened.listMinds()).map((row) => row.id),
+      [mind.id],
+    );
+    await reopened.close();
+  });
+
   it('creates a Mind when createMind is called with no argument', async () => {
     // The declaration says `options?`; the wrapper's default keeps that true against an addon
     // argument that is otherwise undefined.

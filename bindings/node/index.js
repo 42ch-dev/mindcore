@@ -7,16 +7,26 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The addon's file name as cargo writes it, per platform. Only the platforms `package.json`'s `os`
-// field declares appear here: a host missing from this table is refused by name below, which is
-// the truth, rather than being told the addon is unbuilt.
+/**
+ * The hosts this package is built and tested on — the same set `package.json`'s `os` field
+ * declares. The artifact names below are keyed by exactly these entries, so a platform cannot be
+ * in one list and not the other; a host missing here is refused by name, which is the truth,
+ * rather than being told the addon is unbuilt.
+ */
+const PLATFORMS = ['darwin', 'linux'];
+
+/** The addon's file name as cargo writes it, per declared platform. */
 const ARTIFACTS = {
   darwin: 'libmindcore_binding.dylib',
   linux: 'libmindcore_binding.so',
 };
 
-/** What `package.json`'s `os` field declares: the hosts this package is built and tested on. */
-const SUPPORTED = ['darwin', 'linux'];
+// The table and the list cannot drift: every declared platform names an artifact.
+for (const platform of PLATFORMS) {
+  if (!ARTIFACTS[platform]) {
+    throw new Error(`no addon name for the declared platform ${platform}`);
+  }
+}
 
 /** The addon at one path, loaded under the name cargo gave it: nothing is copied or renamed. */
 function openAddon(path) {
@@ -37,7 +47,7 @@ function loadBinding() {
   const artifact = ARTIFACTS[process.platform];
   if (!artifact) {
     throw new Error(
-      `the mindcore binding ships for ${SUPPORTED.join(', ')}; ${process.platform} is not one of ` +
+      `the mindcore binding ships for ${PLATFORMS.join(', ')}; ${process.platform} is not one of ` +
         'them. A build for this host can still be named with MINDCORE_BINDING_PATH.',
     );
   }
@@ -49,7 +59,7 @@ function loadBinding() {
   if (found.length === 0) {
     throw new Error(
       `the mindcore binding is not built: no addon at ${candidates.map((c) => c.path).join(', ')}; ` +
-        `build it with cargo build -p mindcore-binding. It ships for ${SUPPORTED.join(', ')}.`,
+        `build it with cargo build -p mindcore-binding. It ships for ${PLATFORMS.join(', ')}.`,
     );
   }
   // Debug wins, as it always has. When a release build also exists, say so once: a measurement
@@ -110,6 +120,15 @@ export class MindcoreClient {
 
   async ensureSubject(mindId, subjectId) {
     settle(await binding.clientEnsureSubject(this.#handle, mindId, subjectId));
+  }
+
+  /**
+   * End the client: close its store and release the file, so the same `storePath` opens again in
+   * this process. A `MindView` still open over this client refuses the teardown; closing twice is
+   * not an error.
+   */
+  async close() {
+    settle(await binding.clientClose(this.#handle));
   }
 }
 
