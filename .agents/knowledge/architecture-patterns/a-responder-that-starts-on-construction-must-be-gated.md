@@ -16,6 +16,13 @@ ordering:
 - A `GatedTransport` wraps the real transport. `recv()` awaits a gate before delegating; `send()` and
   `close()` delegate immediately, because the responder's hello reply is a `send` and a failed start
   must still be able to close.
+- The gate is **three** states, not two: `Closed` (wait), `Open` (read), and `Rejected`. The third
+  exists because a start can fail after the responder exists but before any handler is installed —
+  a surface that refuses registration. Merely opening the gate there would release the read task
+  into a transport the host will never write to, so it would park rather than end; `Rejected` maps
+  `recv()` to `Closed`, which is the honest answer, and lets the connection task finish and untrack
+  itself. `recv()` re-reads the state after waiting, so a rejection that lands as a `recv` parks is
+  not lost.
 - The connection task builds the gate, hands it to `connect_responder`, calls `register`, then opens
   the gate. No inbound frame is read before the handlers exist — by construction, for every future
   handler the daemon adds.
@@ -28,7 +35,8 @@ its `dev`/`ino` still matches, and report an unremovable name in the refusal ins
 A `Drop`-only guard cannot report; make cleanup an explicit call whose error is merged into the
 start failure, and keep `Drop` as the last resort.
 
-**Evidence.** `crates/mindcore-daemon/src/transport.rs` (`GatedTransport`), `src/serve.rs`
-(`BoundSocket`, `remove_own_socket`); tests `a_closed_gate_withholds_the_hello`,
+**Evidence.** `crates/mindcore-daemon/src/transport.rs` (`GatedTransport`, `GateState`),
+`src/serve.rs` (`BoundSocket`, `remove_own_socket`); tests `a_closed_gate_withholds_the_hello`,
+`a_rejected_gate_ends_a_parked_recv`, `opening_the_gate_releases_the_recv_into_the_inner_transport`,
 `a_signed_dialer_reads_a_stored_entry_over_the_socket` (fails with a hello timeout when the gate is
 not opened), and `a_start_that_fails_after_the_bind_leaves_no_socket`.
