@@ -62,6 +62,10 @@ struct Host {
     reject_registration: bool,
 }
 
+/// A test seam: makes the next probe dial pending, so the timeout branch is reachable.
+#[cfg(test)]
+static PENDING_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// What a liveness probe established about the name.
 #[derive(Debug)]
 enum Probe {
@@ -78,6 +82,18 @@ enum Probe {
 /// The bound matters: a listener that accepts into a full backlog and never dequeues would
 /// otherwise hold a start indefinitely, and a dial that has not answered says nothing either way.
 async fn probe_liveness(path: &Path, budget: std::time::Duration) -> Probe {
+    #[cfg(test)]
+    if PENDING_PROBE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        // A dial that neither answers nor is refused: the case a full, undrained backlog produces
+        // and a test cannot build. Only the branch is under test.
+        return match tokio::time::timeout(budget, std::future::pending::<()>()).await {
+            Ok(()) => unreachable!("a pending future never resolves"),
+            Err(_) => Probe::Inconclusive(format!(
+                "the probe did not answer within {}s, so its liveness is unknown",
+                budget.as_secs()
+            )),
+        };
+    }
     match tokio::time::timeout(budget, UnixStream::connect(path)).await {
         Ok(Ok(_)) => Probe::Live,
         // Refused, or gone between the stat and the dial: either way nothing is listening, so the
@@ -1412,41 +1428,61 @@ mod tests {
         reopened.close().await;
     }
 
-    /// The probe's three answers: a listener is live, a refused or absent name is dead, and a dial
-    /// that cannot complete is inconclusive with the fault named.
-    ///
-    /// The timeout *branch* is not covered here. It needs a dial that neither answers nor is refused
-    /// — a listener whose backlog is full and never dequeued — and this harness cannot hold such a
-    /// listener across the call, so the branch is asserted only by inspection. Removing the
-    /// `tokio::time::timeout` still passes this test; that is a known gap, not an oversight.
+    /// The probe's answers, all constructible portably: a listener is `Live`, an absent name is
+    /// `Dead`, and a name removed between the stat and the dial is `Dead` too — that last one is why
+    /// `NotFound` counts as dead, since a vanished name is not a live listener's.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_probe_answers_live_dead_or_inconclusive() {
+    async fn the_probe_answers_live_or_dead() {
         let dir = TempDir::new().expect("temporary directory");
 
-        // Nothing there: the dial is refused (or the name is gone), so it is not a live listener's.
-        let absent = dir.path().join("absent.sock");
-        assert!(matches!(
-            probe_liveness(&absent, PROBE_TIMEOUT).await,
-            Probe::Dead
-        ));
-
-        // A live listener answers.
         let live_path = dir.path().join("live.sock");
         let live = UnixListener::bind(&live_path).expect("bind the socket");
-        assert!(matches!(
-            probe_liveness(&live_path, PROBE_TIMEOUT).await,
-            Probe::Live
-        ));
+        assert!(
+            matches!(probe_liveness(&live_path, PROBE_TIMEOUT).await, Probe::Live),
+            "a listener answers the dial"
+        );
         drop(live);
 
-        // A name that is not a socket cannot be dialled at all: inconclusive, and it says so.
-        let file = dir.path().join("plain");
-        std::fs::write(&file, b"x").expect("write the file");
-        match probe_liveness(&file, PROBE_TIMEOUT).await {
+        let absent = dir.path().join("absent.sock");
+        assert!(
+            matches!(probe_liveness(&absent, PROBE_TIMEOUT).await, Probe::Dead),
+            "a name with nothing on it is dead"
+        );
+
+        // The vanished-between-stat-and-dial case: a name whose listener is gone by the time the
+        // dial happens. Linux answers `ECONNREFUSED`, some filesystems `ENOENT`; both are dead.
+        let gone = dir.path().join("gone.sock");
+        drop(UnixListener::bind(&gone).expect("bind then drop"));
+        assert!(
+            matches!(probe_liveness(&gone, PROBE_TIMEOUT).await, Probe::Dead),
+            "a listener that went away is dead"
+        );
+    }
+
+    /// The timeout branch: a dial that neither answers nor is refused becomes `Inconclusive` naming
+    /// the budget. Reached through the seam, because a full, undrained backlog cannot be held across
+    /// a test call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_that_outlives_its_budget_is_inconclusive() {
+        let dir = TempDir::new().expect("temporary directory");
+        PENDING_PROBE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        let outcome = probe_liveness(&dir.path().join("silent.sock"), PROBE_TIMEOUT).await;
+        assert!(
+            started.elapsed() >= PROBE_TIMEOUT,
+            "the budget was actually waited out, not skipped"
+        );
+        match outcome {
             Probe::Inconclusive(message) => {
-                assert!(message.contains("liveness is unknown"), "{message}")
+                assert!(message.contains("did not answer within"), "{message}");
+                assert!(
+                    message.contains(&format!("{}s", PROBE_TIMEOUT.as_secs())),
+                    "the refusal names the budget: {message}"
+                );
+                assert!(message.contains("liveness is unknown"), "{message}");
             }
-            other => panic!("a dial that cannot complete is inconclusive, not {other:?}"),
+            other => panic!("a dial past its budget is inconclusive, not {other:?}"),
         }
     }
 

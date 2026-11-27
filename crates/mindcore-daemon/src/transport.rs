@@ -250,7 +250,10 @@ impl UnixSocketTransport {
             };
             if read == 0 {
                 return if filled == 0 {
-                    // The peer closed on a frame boundary: an orderly end, not a framing fault.
+                    // The peer closed on a frame boundary: an orderly end, not a framing fault, but
+                    // still the end. Without `terminate` the closed signal never fires and the
+                    // connection task waits on `closed()` forever, holding its fd and its responder.
+                    self.terminate().await;
                     Err(TransportError::Closed)
                 } else {
                     self.terminate().await;
@@ -389,6 +392,31 @@ mod tests {
         let accepted = accept.await.expect("accept task");
         // The tempdir goes with `bound`; the connected pair does not need the name.
         (dialer, accepted)
+    }
+
+    /// A peer that closes on a frame boundary is an orderly end, but it is still an end: `closed()`
+    /// must fire, or the connection task waits forever on a session nobody will use again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_closing_at_a_frame_boundary_fires_the_closed_signal() {
+        let (dialer, accepted) = session().await;
+
+        // One whole frame, then the dialer goes away mid-boundary.
+        dialer.send(b"last words").await.expect("send a frame");
+        assert_eq!(
+            accepted.recv().await.expect("the frame arrives"),
+            b"last words".to_vec()
+        );
+
+        // Clean disconnect: no partial prefix, so the next read is an EOF at a boundary.
+        dialer.close().await.expect("close the dialer");
+
+        // The server side reports `Closed` rather than a framing fault.
+        match accepted.recv().await {
+            Err(TransportError::Closed) => {}
+            other => panic!("an orderly EOF answers Closed, not {other:?}"),
+        }
+        // And the signal the connection task awaits actually fires.
+        assert_closed(&accepted).await;
     }
 
     /// The transport reports itself closed — the signal the connection task awaits.
