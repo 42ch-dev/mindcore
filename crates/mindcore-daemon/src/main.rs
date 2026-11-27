@@ -49,10 +49,13 @@ async fn start(config_path: &Path) -> Result<(), DaemonError> {
     let config = config::load(config_path)?;
     // The lock precedes the store: `open` creates the file and runs the embedded migration, so a
     // second instance must be refused before it. The guard lives to the end of the process.
-    let _lock = StoreLock::acquire(&config.store_path)?;
+    let mut lock = StoreLock::acquire(&config.store_path)?;
     let store = MindStore::open(&config.store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", config.store_path.display())))?;
+    // The store now exists, so the lock set gained its inode name; a daemon that created the file
+    // must take that name too, or a hard link to this fresh store would reach it unheld.
+    lock.cover(&config.store_path)?;
     journal_root(&config.journal.dir)?;
 
     // The serving phase takes the assembled surface, the listener, the accept loop and the drain;
