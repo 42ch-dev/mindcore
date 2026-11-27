@@ -312,46 +312,61 @@ fn cleanup_refusal(bound: &mut BoundSocket, error: DaemonError) -> DaemonError {
     }
 }
 
-/// Creates the journal root and makes every level it added durable before the first publication
-/// writes into it.
+/// Creates the journal root and makes every entry in its chain durable before the first
+/// publication writes into it.
 ///
-/// Each missing level is created one at a time from the nearest existing ancestor, and the parent of
-/// every level created is synced: syncing only the leaf's parent would persist `journal` inside a
-/// directory that itself has no entry in its own parent yet, so a crash could take the whole chain
-/// away after the daemon reported a clean start.
+/// The walk is idempotent, not first-creation-only: every component from the nearest existing
+/// ancestor down to the root has its parent synced unconditionally, including the components this
+/// start found already there. A start that failed after creating a level but before syncing its
+/// entry left that entry unproven, and nothing marks which one it was — so the next start redoes the
+/// whole chain, and redoing an already-durable sync costs one `fsync`.
 fn journal_root(dir: &Path) -> Result<(), DaemonError> {
-    let mut missing: Vec<&Path> = Vec::new();
+    // Bottom-up: every level from the root up to the first one that exists, which is included.
+    let mut chain: Vec<&Path> = Vec::new();
+    let mut existing = None;
     let mut cursor = Some(dir);
-    while let Some(current) = cursor {
-        if current.exists() {
+    while let Some(level) = cursor {
+        if level.exists() {
             // An existing component that is not a directory cannot be a journal root: accepting it
             // would publish into whatever the path really names.
-            let metadata = std::fs::symlink_metadata(current)
-                .map_err(|error| DaemonError::Journal(format!("{}: {error}", current.display())))?;
+            let metadata = std::fs::symlink_metadata(level)
+                .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
             if !metadata.is_dir() {
                 return Err(DaemonError::Journal(format!(
                     "{}: exists and is not a directory",
-                    current.display()
+                    level.display()
                 )));
             }
+            chain.push(level);
+            existing = Some(chain.len() - 1);
             break;
         }
-        missing.push(current);
-        cursor = current
+        chain.push(level);
+        cursor = level
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
     }
-    // Deepest last, so the root's own entry is the final sync.
-    for level in missing.iter().rev() {
-        std::fs::create_dir(level)
-            .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
-        let parent = match level.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
-        sync_parent(&parent)?;
+    // Top-down: create what is missing, then sync every level's parent whether it was created now
+    // or was already there.
+    for (index, level) in chain.iter().enumerate().rev() {
+        if Some(index) != existing {
+            std::fs::create_dir(level)
+                .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
+        }
+        sync_parent_of(level)?;
     }
     Ok(())
+}
+
+/// Syncs the directory holding `level`'s entry, so that entry is durable.
+///
+/// A level with no parent is the filesystem root: no directory holds its entry, so there is nothing
+/// to sync.
+fn sync_parent_of(level: &Path) -> Result<(), DaemonError> {
+    match level.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_parent(parent),
+        _ => Ok(()),
+    }
 }
 
 /// Syncs `parent`, so the directory entry just created beneath it is durable.
@@ -359,6 +374,8 @@ fn journal_root(dir: &Path) -> Result<(), DaemonError> {
 /// A failed sync is a journal fault naming the directory: reporting a clean start on a chain that is
 /// not yet on disk would promise durability the daemon does not have.
 fn sync_parent(parent: &Path) -> Result<(), DaemonError> {
+    #[cfg(test)]
+    record_injected_sync(parent);
     #[cfg(test)]
     if take_injected_sync_failure(parent) {
         return Err(DaemonError::Journal(format!(
@@ -371,10 +388,40 @@ fn sync_parent(parent: &Path) -> Result<(), DaemonError> {
         .map_err(|error| DaemonError::Journal(format!("{}: {error}", parent.display())))
 }
 
-/// A test seam: the next sync of this exact directory fails. An `fsync` fault cannot be built from
-/// a test's side, so this is the only way to pin that the failure is propagated rather than ignored.
+/// A test seam: the next sync of this exact directory fails, and every sync attempt is counted. An
+/// `fsync` fault cannot be built from a test's side, so this is the only way to pin that the failure
+/// is propagated rather than ignored, and that a later start retries a sync it owes.
 #[cfg(test)]
 static INJECT_SYNC_FAILURE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// How many times each directory has been asked to sync, so a test can see a retry.
+#[cfg(test)]
+static SYNC_ATTEMPTS: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_injected_sync(path: &Path) {
+    let mut attempts = SYNC_ATTEMPTS.lock().expect("sync attempt lock");
+    match attempts.iter_mut().find(|(seen, _)| seen == path) {
+        Some((_, count)) => *count += 1,
+        None => attempts.push((path.to_path_buf(), 1)),
+    }
+}
+
+/// How many times `path` has been synced since the last [`clear_sync_attempts`].
+#[cfg(test)]
+fn sync_attempts(path: &Path) -> usize {
+    SYNC_ATTEMPTS
+        .lock()
+        .expect("sync attempt lock")
+        .iter()
+        .find(|(seen, _)| seen == path)
+        .map_or(0, |(_, count)| *count)
+}
+
+#[cfg(test)]
+fn clear_sync_attempts() {
+    SYNC_ATTEMPTS.lock().expect("sync attempt lock").clear();
+}
 
 #[cfg(test)]
 fn push_injected_sync_failure(path: &Path) {
@@ -1135,6 +1182,44 @@ mod tests {
             }
             other => panic!("a file above the journal root is a journal fault, not {other:?}"),
         }
+    }
+
+    /// The chain sync is idempotent across restarts, not first-creation-only. A start that created a
+    /// level and then failed before syncing its entry leaves nothing marking which entry is unproven,
+    /// so the next start must re-sync every component — including the ones it found already there.
+    #[test]
+    fn a_restart_retries_the_sync_of_an_already_existing_level() {
+        let dir = TempDir::new().expect("temporary directory");
+        let root = dir.path().join("journal");
+        let parent = dir.path().to_path_buf();
+
+        // First start: the leaf is created, then its parent's sync fails.
+        clear_sync_attempts();
+        push_injected_sync_failure(&parent);
+        match journal_root(&root) {
+            Err(DaemonError::Journal(message)) => {
+                assert!(message.contains("injected sync fault"), "{message}")
+            }
+            other => panic!("the armed first start must fail, not {other:?}"),
+        }
+        assert!(
+            root.is_dir(),
+            "the level was created before its sync failed"
+        );
+        assert_eq!(
+            sync_attempts(&parent),
+            1,
+            "the first start attempted it once"
+        );
+
+        // Second start, seam cleared: the level now exists, and its parent is synced again.
+        clear_sync_attempts();
+        journal_root(&root).expect("the retry accepts the directory");
+        assert_eq!(
+            sync_attempts(&parent),
+            1,
+            "the restart re-synced the already-existing level's parent"
+        );
     }
 
     /// A sync that fails is a journal fault, not a success: the daemon must not report a clean start
