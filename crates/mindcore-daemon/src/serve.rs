@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mindcore_base::knowledge::KnowledgeScope;
@@ -68,6 +68,62 @@ impl SocketIdentity {
     }
 }
 
+/// A bound socket name, owned until the accept loop takes the listener.
+///
+/// A start can fail after `bind` and before the accept loop exists — reading the seed, decoding a
+/// peer key, installing a signal. Each of those is a `?`, and this guard makes the failure path
+/// unlink the name it bound without a branch at every one of them. `into_parts` disarms it at the
+/// one point the listener is handed over.
+#[derive(Debug)]
+struct BoundSocket {
+    /// `Some` until `into_parts`; `Option` so the listener can be moved out of a `Drop` type.
+    listener: Option<UnixListener>,
+    identity: SocketIdentity,
+    path: PathBuf,
+    armed: bool,
+}
+
+impl BoundSocket {
+    /// Binds `path` and arms the guard with the name's identity, so a start that fails before
+    /// handing the listener over leaves no socket behind.
+    fn bind(path: &Path) -> Result<Self, DaemonError> {
+        let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", path.display()));
+        let listener = UnixListener::bind(path).map_err(|error| fail(error.to_string()))?;
+        // Taken after the bind, so it names the socket this process created.
+        let identity = std::fs::symlink_metadata(path)
+            .map(|metadata| SocketIdentity::of(&metadata))
+            .map_err(|error| fail(format!("the bound socket could not be inspected: {error}")))?;
+        Ok(Self {
+            listener: Some(listener),
+            identity,
+            path: path.to_path_buf(),
+            armed: true,
+        })
+    }
+
+    /// The identity of the bound name, for the drain's later conditional removal.
+    fn identity(&self) -> SocketIdentity {
+        self.identity
+    }
+
+    /// Disarms the guard and hands the listener over: from here the name belongs to the caller.
+    fn into_parts(mut self) -> (UnixListener, SocketIdentity) {
+        self.armed = false;
+        let listener = self.listener.take().expect("the guard holds its listener");
+        (listener, self.identity)
+    }
+}
+
+impl Drop for BoundSocket {
+    /// Best-effort: `Drop` cannot report, and a name that changed identity is left alone by
+    /// `remove_if_own` exactly as the drain would leave it.
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_if_own(&self.path, self.identity);
+        }
+    }
+}
+
 /// Runs the serving phase of the lifecycle order: store, journal, surface, listen, accept, drain.
 ///
 /// The lock arrives held and is dropped last, after every live session has been told to close.
@@ -100,8 +156,12 @@ pub async fn run(config: DaemonConfig, lock: StoreLock) -> Result<(), DaemonErro
     // serve until it was killed some other way and leave the name for no reason.
     let mut terminate = shutdown_signal(SignalKind::terminate())?;
     let mut interrupt = shutdown_signal(SignalKind::interrupt())?;
-    let (listener, socket) = listen(&config)?;
-    let host = Arc::new(host(surface, &config, socket)?);
+    // Held as a guard: every `?` from here to `into_parts` drops it, and the name it bound goes
+    // with it, so a start that fails after `bind` leaves no socket behind.
+    let bound = listen(&config)?;
+    let host = Arc::new(host(surface, &config, bound.identity())?);
+    // The accept loop owns the listener from here; the guard has nothing left to undo.
+    let (listener, _) = bound.into_parts();
 
     // Every accepted connection is owned by `connections`, so the drain can end each one rather
     // than hope it finished setting up. Dropping the accept future drops the listener with it.
@@ -322,19 +382,19 @@ fn remove_if_own(socket_path: &Path, owned: SocketIdentity) -> Result<(), String
 }
 
 /// Binds `socket_path`, removing the name only when it is a socket established to be dead, and
-/// answers the bound socket's identity.
+/// answers a guard that unlinks what it bound unless the caller disarms it.
 ///
 /// Nothing that is not a socket is ever unlinked, so a name the daemon does not own — the store,
 /// the seed file, any other file, a directory, a symlink or a device — is refused rather than
 /// destroyed. The one removal on a start re-checks the identity it just took, so a socket swapped
 /// in between the probe and the unlink survives.
-fn listen(config: &DaemonConfig) -> Result<(UnixListener, SocketIdentity), DaemonError> {
+fn listen(config: &DaemonConfig) -> Result<BoundSocket, DaemonError> {
     let socket_path = &config.socket_path;
     let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", socket_path.display()));
 
     let metadata = match std::fs::symlink_metadata(socket_path) {
         // A free name is the ordinary start.
-        Err(error) if error.kind() == ErrorKind::NotFound => return bind(socket_path),
+        Err(error) if error.kind() == ErrorKind::NotFound => return BoundSocket::bind(socket_path),
         Err(error) => return Err(fail(error.to_string())),
         Ok(metadata) => metadata,
     };
@@ -360,18 +420,7 @@ fn listen(config: &DaemonConfig) -> Result<(UnixListener, SocketIdentity), Daemo
     // Bound to the identity taken before the probe: a socket swapped in since is refused and
     // stays, because it is not the one this start established to be dead.
     remove_if_own(socket_path, stale).map_err(fail)?;
-    bind(socket_path)
-}
-
-/// Binds `socket_path`, answering the listener and the identity of the name it created.
-fn bind(socket_path: &Path) -> Result<(UnixListener, SocketIdentity), DaemonError> {
-    let fail = |fault: String| DaemonError::Socket(format!("{}: {fault}", socket_path.display()));
-    let listener = UnixListener::bind(socket_path).map_err(|error| fail(error.to_string()))?;
-    // Taken after the bind, so it names the socket this process created.
-    let socket = std::fs::symlink_metadata(socket_path)
-        .map(|metadata| SocketIdentity::of(&metadata))
-        .map_err(|error| fail(format!("the bound socket could not be inspected: {error}")))?;
-    Ok((listener, socket))
+    BoundSocket::bind(socket_path)
 }
 
 /// The file type's name in a refusal, so the operator knows what occupies the path.
@@ -747,9 +796,10 @@ mod tests {
         // A bound-then-dropped listener leaves its name behind, exactly like a crashed daemon.
         drop(UnixListener::bind(&config.socket_path).expect("leave a stale socket"));
         assert!(config.socket_path.exists(), "the stale name is there");
-        let (listener, bound) = listen(&config).expect("replace a stale socket");
+        let bound = listen(&config).expect("replace a stale socket");
+        let (listener, identity) = bound.into_parts();
         assert_eq!(
-            bound,
+            identity,
             SocketIdentity::of(&std::fs::symlink_metadata(&config.socket_path).expect("lstat")),
             "the boundary identity names the socket just bound"
         );
@@ -950,13 +1000,44 @@ mod tests {
         remove_own_socket(&path, foreign).expect("an absent name is already removed");
     }
 
+    /// A failure between `bind` and the hand-over leaves no socket behind: the guard unlinks the
+    /// name it bound. `config::load` validates peer keys, so a directly constructed config is the
+    /// only way to fail there — exactly the injected failure this covers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_that_fails_after_the_bind_leaves_no_socket() {
+        let dir = TempDir::new().expect("temporary directory");
+        let config = DaemonConfig {
+            peers: BTreeMap::from([(
+                "peer-a".to_string(),
+                PeerConfig {
+                    // Not 64 hex digits: `peer_keys` refuses it after the socket is bound.
+                    public_key: "nonsense".to_string(),
+                    principal: "prn_a".to_string(),
+                },
+            )]),
+            ..config(dir.path())
+        };
+        let lock = StoreLock::acquire(&config.store_path).expect("take the lock");
+        match run(config.clone(), lock).await {
+            Err(DaemonError::Config(message)) => {
+                assert!(message.contains("public_key"), "{message}")
+            }
+            Err(other) => panic!("a bad peer key is a config refusal, not {other:?}"),
+            Ok(()) => panic!("the start must not serve with an undecodable peer key"),
+        }
+        assert!(
+            !config.socket_path.exists(),
+            "the guard removed the name bound before the failure"
+        );
+    }
+
     /// A name replaced by a regular file after the bind belongs to whoever replaced it. The drain
     /// refuses to remove it and reports the refusal, so a clean-exit claim is never made.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_drain_refuses_a_socket_name_replaced_by_a_regular_file() {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
-        let (listener, bound) = listen(&config).expect("bind the socket");
+        let (listener, bound) = listen(&config).expect("bind the socket").into_parts();
         // The listener still owns the socket; swap the name anyway, as a same-user process could.
         std::fs::remove_file(&config.socket_path).expect("unlink the socket");
         let bytes = b"the replacement's own bytes";
