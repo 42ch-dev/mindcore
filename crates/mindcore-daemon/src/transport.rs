@@ -14,7 +14,9 @@
 //! shutdown through a borrow is unavailable and any shutdown routed through a half's mutex would
 //! block behind a writer parked on a peer that stopped reading. The socket's own descriptor is
 //! captured before the split and `shutdown(2)` is issued on it directly: the call is immediate,
-//! needs no lock, and interrupts both a blocked `write_all` (which then fails) and a blocked read.
+//! needs neither half's mutex, and interrupts both a blocked `write_all` (which then fails) and a
+//! blocked read. Teardown is serialized by a lock of its own, never held by `send` or `recv`, so a
+//! returning `close` means the shutdown has finished rather than merely started.
 //!
 //! Framing faults travel in [`TransportError::Io`], because `spoke-connect` has exactly `Closed`
 //! and `Io` and the daemon adds no variant. A peer closing at a frame boundary answers `Closed`;
@@ -55,9 +57,12 @@ pub struct UnixSocketTransport {
     /// `true` once the transport is closed. The sender keeps the value, so a late
     /// [`UnixSocketTransport::closed`] still resolves.
     closed: watch::Sender<bool>,
-    /// Whether `shutdown(2)` has run. Separate from `closed` because a framing fault sets the flag
-    /// *and* tears the socket down, and a later `close` must not try the shutdown again while still
-    /// reporting success.
+    /// Serializes teardown, so `close` cannot resolve while another caller's `shutdown(2)` is still
+    /// in flight. Never held by `send` or `recv`, so a blocked writer cannot delay it.
+    shutdown_lock: Mutex<()>,
+    /// Whether `shutdown(2)` has run. Separate from `closed`, because a framing fault closes the
+    /// transport *and* tears the socket down, and a later `close` must still find the teardown done.
+    /// Written only under `shutdown_lock`, so `true` here always means the shutdown completed.
     shutdown_done: AtomicBool,
 }
 
@@ -80,6 +85,7 @@ impl UnixSocketTransport {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
             closed: watch::Sender::new(false),
+            shutdown_lock: Mutex::new(()),
             shutdown_done: AtomicBool::new(false),
         }
     }
@@ -108,26 +114,47 @@ impl UnixSocketTransport {
     /// A blocked `write_all` on the write half fails once this runs, and a blocked read on the read
     /// half ends, so no task stays parked on a peer that stopped reading. A peer that already went
     /// away answers `NotConnected`, which is the state this call is asking for anyway.
-    fn shutdown_socket(&self) {
-        if self.shutdown_done.swap(true, Ordering::SeqCst) {
+    ///
+    /// Serialized: a caller that returns from here — `close` most of all — knows the shutdown has
+    /// completed, never merely that someone else started it.
+    async fn shutdown_socket(&self) {
+        let _teardown = self.shutdown_lock.lock().await;
+        if self.shutdown_done.load(Ordering::SeqCst) {
             return;
         }
         // SAFETY: `fd` is the descriptor of the socket this struct's two halves were split from,
         // and this struct owns both, so it is open here. `shutdown` only signals the socket; it
         // neither closes nor reallocates the descriptor, so the halves and tokio's registration
         // stay valid afterwards.
-        let rc = unsafe { libc::shutdown(self.fd, libc::SHUT_RDWR) };
-        if rc != 0 {
-            // Best effort, as `close` promises: the transport is closed either way, and the only
-            // error worth ignoring is a peer that already tore its side down.
-            let _ = std::io::Error::last_os_error();
+        //
+        // Two steps, not `SHUT_RDWR`: once the peer has half-closed, `SHUT_RDWR` answers `ENOTCONN`
+        // and delivers no EOF, while `SHUT_WR` still does. The write step is the one that must
+        // never be skipped — it is what tells the peer the stream ended and what makes a parked
+        // `write_all` fail — so it goes first and is unaffected by a `SHUT_RD` refusal after it.
+        unsafe {
+            let write_side = libc::shutdown(self.fd, libc::SHUT_WR);
+            // A peer that already tore its side down answers `NotConnected`, which is the state
+            // this call is asking for anyway; any other error still leaves the transport closed,
+            // which is what `close` promises.
+            if write_side != 0 {
+                let _ = std::io::Error::last_os_error();
+            }
+            // Wake a parked read. This too may be refused on a half-closed socket; the read half's
+            // pending `recv` still fails, because `recv` watches the closed signal.
+            let read_side = libc::shutdown(self.fd, libc::SHUT_RD);
+            if read_side != 0 {
+                let _ = std::io::Error::last_os_error();
+            }
         }
+        // Published after the call, under the lock: a waiter that reads `true` learns the socket is
+        // really shut, not that a shutdown is under way.
+        self.shutdown_done.store(true, Ordering::SeqCst);
     }
 
     /// The terminal transition: mark closed, then release the socket.
-    fn terminate(&self) {
+    async fn terminate(&self) {
         self.mark_closed();
-        self.shutdown_socket();
+        self.shutdown_socket().await;
     }
 
     /// Reads one frame: the 4-byte prefix, then exactly that many body bytes.
@@ -143,7 +170,7 @@ impl UnixSocketTransport {
             let read = match reader.read(&mut prefix[filled..]).await {
                 Ok(read) => read,
                 Err(error) => {
-                    self.terminate();
+                    self.terminate().await;
                     return Err(TransportError::Io(format!("read frame prefix: {error}")));
                 }
             };
@@ -152,7 +179,7 @@ impl UnixSocketTransport {
                     // The peer closed on a frame boundary: an orderly end, not a framing fault.
                     Err(TransportError::Closed)
                 } else {
-                    self.terminate();
+                    self.terminate().await;
                     Err(TransportError::Io(format!(
                         "truncated frame: {filled} of 4 prefix bytes"
                     )))
@@ -164,7 +191,7 @@ impl UnixSocketTransport {
         let len = u32::from_be_bytes(prefix);
         if len == 0 || len > MAX_FRAME {
             // The body stays in the socket: nothing is read after a length this size rejects.
-            self.terminate();
+            self.terminate().await;
             return Err(TransportError::Io(format!(
                 "frame length {len} outside 1..={MAX_FRAME}; body not read"
             )));
@@ -174,7 +201,7 @@ impl UnixSocketTransport {
         match reader.read_exact(&mut body).await {
             Ok(_) => Ok(body),
             Err(error) => {
-                self.terminate();
+                self.terminate().await;
                 Err(if error.kind() == std::io::ErrorKind::UnexpectedEof {
                     TransportError::Io(format!("truncated frame: body of {len} bytes cut short"))
                 } else {
@@ -209,14 +236,21 @@ impl Transport for UnixSocketTransport {
         if self.is_closed() {
             return Err(TransportError::Closed);
         }
-        writer
-            .write_all(&len.to_be_bytes())
-            .await
-            .map_err(|error| TransportError::Io(format!("write frame prefix: {error}")))?;
-        writer
-            .write_all(envelope)
-            .await
-            .map_err(|error| TransportError::Io(format!("write frame body: {error}")))?;
+        // A shutdown tears the socket down under an in-flight write, so the write fails. When our
+        // own close is what interrupted it, the cause is the close and `Closed` is the honest
+        // answer; only a failure with the transport still open is an I/O fault.
+        let written = async {
+            writer.write_all(&len.to_be_bytes()).await?;
+            writer.write_all(envelope).await
+        }
+        .await;
+        if let Err(error) = written {
+            return Err(if self.is_closed() {
+                TransportError::Closed
+            } else {
+                TransportError::Io(format!("write frame: {error}"))
+            });
+        }
         // A close during the write shuts the socket down; the write may have completed on a peer
         // that is now gone, and it must not be reported as a delivered frame.
         if self.is_closed() {
@@ -240,9 +274,10 @@ impl Transport for UnixSocketTransport {
     }
 
     async fn close(&self) -> Result<(), TransportError> {
-        // Idempotent on both halves of the work: the flag is already set on a repeat, and the
-        // shutdown is skipped once done — including when a framing fault got here first.
-        self.terminate();
+        // Idempotent, and it waits: a repeat takes the teardown lock, finds the shutdown done by the
+        // first call (or by a framing fault) and returns only then. So a `close` that resolves means
+        // the socket is shut down, never that some other teardown is still under way.
+        self.terminate().await;
         Ok(())
     }
 }
@@ -412,6 +447,7 @@ mod tests {
         );
 
         assert_closed(&transport).await;
+        assert_peer_sees_eof(&mut peer).await;
         assert!(
             matches!(transport.send(b"late").await, Err(TransportError::Closed)),
             "a send after a truncated prefix fails"
@@ -439,6 +475,7 @@ mod tests {
         );
 
         assert_closed(&transport).await;
+        assert_peer_sees_eof(&mut peer).await;
         assert!(
             matches!(transport.send(b"late").await, Err(TransportError::Closed)),
             "a send after a truncated body fails"
@@ -470,8 +507,8 @@ mod tests {
             .expect("the blocked send wakes on close")
             .expect("send task");
         assert!(
-            sent.is_err(),
-            "a send interrupted by close fails instead of reporting a delivered frame: {sent:?}"
+            matches!(&sent, Err(TransportError::Closed)),
+            "a send interrupted by our own close answers Closed, not Io and not success: {sent:?}"
         );
 
         assert_closed(&transport).await;
@@ -496,6 +533,78 @@ mod tests {
         assert!(
             matches!(accepted.recv().await, Err(TransportError::Closed)),
             "the peer sees the close as the end of the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_teardown_instead_of_returning_early() {
+        let (dialer, _accepted) = session().await;
+        let dialer = std::sync::Arc::new(dialer);
+
+        // Stand in for a teardown already under way: hold the shutdown lock, so `close` has the work
+        // left to do and nothing else has done it yet.
+        let teardown = dialer.shutdown_lock.lock().await;
+        let closing = tokio::spawn({
+            let dialer = std::sync::Arc::clone(&dialer);
+            async move { dialer.close().await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !closing.is_finished(),
+            "close must not resolve while the shutdown it owes has not run"
+        );
+        assert!(
+            !dialer.shutdown_done.load(Ordering::SeqCst),
+            "the socket is still open here"
+        );
+
+        drop(teardown);
+        let closed = tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .expect("close resolves once the teardown runs")
+            .expect("close task");
+        closed.expect("close");
+        assert!(
+            dialer.shutdown_done.load(Ordering::SeqCst),
+            "close returned only after the socket was shut down"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_close_returns_only_after_the_first_teardown_finished() {
+        let (dialer, _accepted) = session().await;
+        let dialer = std::sync::Arc::new(dialer);
+
+        let teardown = dialer.shutdown_lock.lock().await;
+        let first = tokio::spawn({
+            let dialer = std::sync::Arc::clone(&dialer);
+            async move { dialer.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The repeat must queue behind the first teardown, not report success on its own.
+        let second = tokio::spawn({
+            let dialer = std::sync::Arc::clone(&dialer);
+            async move { dialer.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "both closes wait"
+        );
+
+        drop(teardown);
+        for (name, task) in [("first", first), ("second", second)] {
+            let closed = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap_or_else(|_| panic!("the {name} close resolves"))
+                .expect("close task");
+            closed.unwrap_or_else(|error| panic!("the {name} close is Ok: {error:?}"));
+        }
+        assert!(
+            dialer.shutdown_done.load(Ordering::SeqCst),
+            "the shutdown ran once and both closes saw it done"
         );
     }
 
