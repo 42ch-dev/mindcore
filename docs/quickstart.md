@@ -34,7 +34,8 @@ cargo run -p mindcore-runtime --example mind_facade
 
 It prints the recalled record and the derived `MindState`, and its source
 ([`crates/mindcore-runtime/examples/mind_facade.rs`](../crates/mindcore-runtime/examples/mind_facade.rs))
-is the complete, runnable version of every step below. The rest of this page walks through it.
+is the complete, runnable version of steps 1–6. Step 7 needs a provider the example does not
+construct; the rest of this page walks through every step.
 
 ## Add the dependency
 
@@ -55,12 +56,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 ```
 
-`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io as the `0.1.0-alpha.1`
-pre-release, which needs an exact pin — Cargo's `"0.1"` does not match a pre-release. A host that
-needs only the record model and the store can pin that version from the registry. Embedding the
-facade needs `mindcore-runtime`, which is `publish = false`, so the family comes from one source:
-the git entries above, whose revision `Cargo.lock` records. `[workspace.package].version` in the
-repository is the source of truth for what a release contains.
+`mindcore-base`, `mindcore-spi` and `mindcore-sqlite` are on crates.io at `0.1.0`, the version
+`[workspace.package].version` declares at this head, so a `"0.1"` requirement matches. A host that
+needs only the record model and the store can take them from the registry. Embedding the facade
+needs `mindcore-runtime`, which is `publish = false`, so the family comes from one source: the git
+entries above, whose revision `Cargo.lock` records. A registry `mindcore-base` beside a git
+`mindcore-runtime` would load two copies of the same types.
 
 ## 1. Create a Mind
 
@@ -286,8 +287,9 @@ bounded, and a collection over 512 live entries answers the store's own
 
 ## 7. Deliberate, when the host supplies a reasoner
 
-`deliberate` takes a target and the evidence the verdict may rest on — no subject — and stamps the
-Mind's id as the assessment context:
+`deliberate` is not in `mind_facade`: the example assembles no providers, and the call needs the
+host's `Reasoner` before it can complete. It takes a target and the evidence the verdict may rest
+on — no subject — and stamps the Mind's id as the assessment context:
 
 ```rust
 use std::time::Duration;
