@@ -93,13 +93,17 @@ its records; a pre-release checkout whose `0001_init.sql` differs from the locke
 refuses.
 
 `MindStore::open` runs the embedded migrator and compares it with the rows recorded in
-`_sqlx_migrations`. The two migration mismatches it reports are:
+`_sqlx_migrations`. The embedded set is `0001_init.sql` and `0002_minds.sql`; the lock still lists
+`0001` alone, so `0002` is pending rather than published. Each recorded state resolves as follows:
 
-- A database that applied the removed `0002` is refused with SQLx's `VersionMissing(2)`, because
-  the embedded set no longer contains that version.
-- A database whose applied version is still embedded but whose checksum differs is refused with a
-  migration checksum mismatch — what a pre-release checkout's `0001_init.sql` hits.
+- **At version 1** — the published set: accepted, and `0002_minds.sql` is applied on top.
+- **At version 2, recorded by an earlier `0002`** — the version is embedded, so the differing
+  checksum is refused with SQLx's `VersionMismatch(2)`, not `VersionMissing`. A pre-release
+  checkout whose `0001_init.sql` changed hits `VersionMismatch(1)` the same way.
+- **Above the embedded maximum** — a recorded version the embedded set does not contain: refused
+  with SQLx's `VersionMissing(<version>)`.
+- **A pending file that reruns over tables already present** — refused with `ExecuteMigration`.
 
-Recreate the file only for one of those two migration mismatches, or move it aside first if you
-want to keep it. A busy or locked database, an I/O error or a permissions problem is not a
-migration mismatch: fix the cause and retry `open` instead of recreating the file.
+Recreate the file only for one of those migration mismatches, or move it aside first if you want to
+keep it. A busy or locked database, an I/O error or a permissions problem is not a migration
+mismatch: fix the cause and retry `open` instead of recreating the file.
