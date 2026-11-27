@@ -37,4 +37,4 @@ toml = { version = "1", default-features = false, features = ["parse", "serde", 
 # The dialer's throwaway key in `tests/serve.rs`: the same crate the runtime's loopbacks use.
 ed25519-dalek = "3"
 tempfile = "3.27.0"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
