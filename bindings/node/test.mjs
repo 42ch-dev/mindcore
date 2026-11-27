@@ -238,19 +238,28 @@ describe('the in-process binding', () => {
       journalDir: join(root, 'race-journal'),
     });
 
-    const provisions = Array.from({ length: 8 }, (_, index) =>
+    // The capture's subject exists before anything races: an unprovisioned subject is a
+    // `NOT_FOUND` by contract, so starting its provisioning in the same batch would make this case
+    // assert on which promise the scheduler ran first.
+    await writer.ensureSubject(mind.id, 'subj_race_writer');
+
+    // Two racers now. Eight distinct subjects from the second client, and the same subject from
+    // both clients at once — provisioning is an upsert, so that pair is order-independent and the
+    // race is real rather than merely concurrent.
+    const distinct = Array.from({ length: 8 }, (_, index) =>
       other.ensureSubject(mind.id, `subj_race_${index}`),
     );
-    const writes = [
-      writer.ensureSubject(mind.id, 'subj_race_writer'),
-      mind.capture({
-        subject: 'subj_race_writer',
-        content: { text: TEXT },
-        idempotencyKey: 'cap-race',
-      }),
+    const sameSubject = [
+      other.ensureSubject(mind.id, 'subj_race_shared'),
+      writer.ensureSubject(mind.id, 'subj_race_shared'),
     ];
+    const capture = mind.capture({
+      subject: 'subj_race_writer',
+      content: { text: TEXT },
+      idempotencyKey: 'cap-race',
+    });
     // Every one of these must resolve: a busy or stale-snapshot refusal fails the case.
-    await Promise.all([...provisions, ...writes]);
+    await Promise.all([...distinct, ...sameSubject, capture]);
   });
 
   it('creates a Mind when createMind is called with no argument', async () => {
