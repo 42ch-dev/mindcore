@@ -53,6 +53,8 @@ const KNOWLEDGE_CAPABILITIES: [&str; 2] = ["spoke-knowledge", "spoke-knowledge-s
 /// How long a start may take before the test calls it a failure, and how often it re-probes.
 const CONNECT_BUDGET: Duration = Duration::from_secs(10);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
+/// How long an exit may take: a drain that never returns fails the test rather than hanging it.
+const EXIT_BUDGET: Duration = Duration::from_secs(10);
 
 /// A started daemon, killed on drop so a failed assertion cannot leave one serving.
 struct Daemon {
@@ -73,8 +75,21 @@ impl Daemon {
         i32::try_from(self.child.id()).expect("a child pid fits in i32")
     }
 
-    fn wait(&mut self) -> ExitStatus {
-        self.child.wait().expect("reap the daemon")
+    /// Waits for the daemon's exit, bounded: a regression that leaves the process running fails the
+    /// test on the budget instead of blocking a worker thread forever. `try_wait` is polled because
+    /// a blocking `wait` in an async test is exactly the hang this bound exists to prevent.
+    async fn wait(&mut self) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll the daemon") {
+                return status;
+            }
+            assert!(
+                started.elapsed() < EXIT_BUDGET,
+                "the daemon did not exit within {EXIT_BUDGET:?}"
+            );
+            tokio::time::sleep(CONNECT_INTERVAL).await;
+        }
     }
 }
 
@@ -301,7 +316,7 @@ async fn a_second_instance_is_refused_and_sigterm_stops_the_first() {
         &config_text(dir.path(), &second_socket),
     );
     let mut second = Daemon::spawn(&second_config);
-    let refused = second.wait();
+    let refused = second.wait().await;
     assert_eq!(refused.code(), Some(2), "a held lock exits 2: {refused:?}");
     assert!(
         !second_socket.exists(),
@@ -310,7 +325,7 @@ async fn a_second_instance_is_refused_and_sigterm_stops_the_first() {
 
     let signalled = unsafe { libc::kill(daemon.pid(), libc::SIGTERM) };
     assert_eq!(signalled, 0, "SIGTERM reaches the daemon");
-    let stopped = daemon.wait();
+    let stopped = daemon.wait().await;
     assert!(stopped.success(), "the drain exits 0: {stopped:?}");
     assert!(
         !socket.exists(),
