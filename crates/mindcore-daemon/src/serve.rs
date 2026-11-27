@@ -1704,33 +1704,46 @@ mod tests {
         drop(listener);
     }
 
-    /// Stale recovery binds its removal to the identity it probed: a socket swapped in between the
-    /// probe and the unlink is a different socket, so it is refused and survives.
+    /// Stale recovery binds its removal to the identity it probed, so a name now occupied by a
+    /// different socket is refused and the occupant survives.
+    ///
+    /// The claimed identity is supplied directly rather than produced by swapping the file. An
+    /// inode-based "different file" fixture is not portable: a filesystem may hand a freed inode
+    /// number straight to the next occupant — Linux does — so two successive binds at one name can
+    /// report the same `(dev, ino)`, and a test asserting they differ would fail there while the
+    /// code behaved correctly. The rule under test compares values, not how a second file arose.
     #[tokio::test(flavor = "multi_thread")]
-    async fn stale_recovery_refuses_a_socket_swapped_before_removal() {
+    async fn a_socket_of_another_identity_is_refused_and_survives() {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
-        let stale = UnixListener::bind(&config.socket_path).expect("leave a stale socket");
-        let probed = SocketIdentity::of(
-            &std::fs::symlink_metadata(&config.socket_path).expect("lstat the stale socket"),
+        let live = UnixListener::bind(&config.socket_path).expect("bind the socket");
+        let real = SocketIdentity::of(
+            &std::fs::symlink_metadata(&config.socket_path).expect("lstat the socket"),
         );
-        drop(stale);
-        // A dropped listener leaves its name; the swap is exactly that name taken over.
-        std::fs::remove_file(&config.socket_path).expect("clear the stale name");
-        let replacement = UnixListener::bind(&config.socket_path).expect("swap in another socket");
-        let swapped = SocketIdentity::of(
-            &std::fs::symlink_metadata(&config.socket_path).expect("lstat the replacement"),
-        );
-        assert_ne!(probed, swapped, "the replacement is a different inode");
-        match remove_if_own(&config.socket_path, probed) {
+
+        // `u64::MAX` for both members names nothing a device or inode can be, so this cannot
+        // collide with `real` on any filesystem.
+        let claimed = SocketIdentity {
+            dev: u64::MAX,
+            ino: u64::MAX,
+        };
+        assert_ne!(claimed, real, "the stated identity is not the socket's");
+        match remove_if_own(&config.socket_path, claimed) {
             Err(message) => assert!(message.contains("replaced by another socket"), "{message}"),
-            Ok(()) => panic!("a swapped socket must not be removed"),
+            Ok(()) => panic!("a socket of another identity must not be removed"),
         }
         assert!(
             config.socket_path.exists(),
-            "the swapped-in socket survives the refused removal"
+            "the socket survives the refused removal"
         );
-        drop(replacement);
+
+        // The identity taken from `lstat` names this socket, so the same call removes it.
+        remove_if_own(&config.socket_path, real).expect("the matching identity removes the name");
+        assert!(
+            !config.socket_path.exists(),
+            "the matching identity removed the name"
+        );
+        drop(live);
     }
 
     /// F-002: a connection accepted and parked before its registration is owned by the drain. Its
