@@ -2,6 +2,7 @@
 
 Status: proposed — no repository, provider or ref layout exists; the shape is agreed and unimplemented
 Date: 2026-11-27
+Class: architecture
 Scope: Physical and logical layout of the Knowledge file store: objects, refs, the publication decision point, staging, compare-and-swap, library choice, maintenance
 Related: `2026-11-27-per-document-versioning.md`, `2026-11-27-machine-owned-knowledge-writes.md`, `2026-11-27-derived-knowledge-indexes.md`, `2026-11-27-storage-agnostic-knowledge-seams.md`
 
