@@ -3939,7 +3939,6 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
     }
 }
 
-
 /// One plain entry a served put creates: no cognition module, so the store validates only its
 /// own write bookkeeping.
 fn served_entry(entry_id: &str, summary: &str) -> KnowledgeEntry {
@@ -4927,7 +4926,6 @@ async fn no_wire_response_carries_the_caller() {
     );
 }
 
-
 /// The gate order lives in the responder, not in the typed dialer: `RemoteAdapter` refuses a
 /// scoped `get`/`put` locally when the session did not negotiate the marker, so it can never
 /// reach the responder's `op_unsupported` branch or its shape-first `INVALID_INPUT`. These helpers
@@ -5192,7 +5190,6 @@ async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
     );
 }
 
-
 /// A storage fault while the scoped admission resolves the caller's grants is answered as this
 /// request's internal error, not as the fixed `NOT_AUTHORIZED` an unadmitted caller receives.
 ///
@@ -5288,7 +5285,6 @@ async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_min
         );
     }
 }
-
 
 /// A session that serves history negotiates the knowledge face's three flags with it: both
 /// history ops admit through that face's callbacks.
@@ -6622,7 +6618,6 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
         "the replay did not execute a second prune"
     );
 }
-
 
 /// A session that serves adoption negotiates the family with the knowledge face that admits it:
 /// Connect's compound gate requires both.

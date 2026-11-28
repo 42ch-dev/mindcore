@@ -7,7 +7,9 @@ window a timing test actually bounds, and which equality a cross-face assertion 
 not restate test names or assertions; it records what a future editor must not break while the
 test still passes.
 
-## Runtime wire and façade tests
+## Current state
+
+### Runtime wire and façade tests
 
 `crates/mindcore-runtime/tests/loopback.rs`:
 
@@ -71,7 +73,7 @@ test still passes.
 - The pre-check is charged against the request's budget, so the probe names a budget a
   process-scheduled pre-check cannot spend: it measures the ABI, not the clock.
 
-## Spoke adapter tests
+### Spoke adapter tests
 
 `crates/mindcore-spoke/tests/memory_adapter.rs`:
 
@@ -94,7 +96,7 @@ test still passes.
 - `connect_with` releases one checked connection, so the acquire takes an idle connection on its
   first poll — the premise that makes the deadline test meaningful.
 
-## SQLite store tests
+### SQLite store tests
 
 - `crates/mindcore-sqlite/tests/knowledge.rs`: an anchor naming no shared entry is unconstructible —
   `AdoptionAnchorSourceEntryId` rejects an empty id on both `TryFrom` and its decode — so the
@@ -105,6 +107,26 @@ test still passes.
 - The same file holds the pool's one connection open with an unrelated borrower, so `list_minds`
   waits while the expiry passes; WAL readers are not lock-blocked, so the wait is purely the
   pool's.
+
+## Invariants
+
+- An ordering claim rests on an observed state — a handshake signal, a completed handle, a pool
+  acquisition — never on `yield_now` or elapsed time.
+- A timing window is a regression detector, not an ordering proof, and its length bounds nothing
+  the implementation depends on.
+- A cross-face equality is checked against an independent reference on each side, not only the two
+  halves against each other.
+- A row the served faces must not produce is written raw, because a store from another version can
+  hold it.
+- A fixture that relies on pool fairness registers before it asserts, and states which scheduler
+  fact it is proving.
+
+## Where it lives
+
+- `crates/mindcore-runtime/tests/loopback.rs`, `crates/mindcore-runtime/tests/mind.rs` and
+  `crates/mindcore-runtime/src/tools/tests.rs`.
+- `crates/mindcore-spoke/tests/memory_adapter.rs` and `crates/mindcore-spoke/tests/workflows.rs`.
+- `crates/mindcore-sqlite/tests/knowledge.rs` and `crates/mindcore-sqlite/tests/minds.rs`.
 
 ## Change obligations
 

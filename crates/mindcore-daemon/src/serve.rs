@@ -274,13 +274,9 @@ pub async fn run(
         pool.close().await;
         return Err(error);
     }
-    let surface = match MindcoreServe::new(
-        store,
-        false,
-        journal_dir(config.journal.dir.clone()),
-    )
-    .surface(faces(&config))
-    .await
+    let surface = match MindcoreServe::new(store, false, journal_dir(config.journal.dir.clone()))
+        .surface(faces(&config))
+        .await
     {
         SpokeResult::Ok(surface) => Arc::new(surface),
         SpokeResult::Reject(reject) => {

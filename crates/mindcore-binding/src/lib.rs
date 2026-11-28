@@ -1097,7 +1097,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-
     /// The working directory is process-wide, so the tests that set it hold this and no other test
     /// touches it.
     static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
