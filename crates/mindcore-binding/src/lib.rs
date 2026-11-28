@@ -1202,8 +1202,6 @@ mod tests {
             );
         }
 
-        // The accepting side of the same three conversions, so the refusals above are the
-        // conversion's own rather than a helper that always rejects.
         assert!(matches!(
             occurred_at(Some("2026-01-01T00:30:00Z")),
             SpokeResult::Ok(Some(_))
