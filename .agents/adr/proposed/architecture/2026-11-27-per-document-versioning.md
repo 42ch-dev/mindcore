@@ -31,7 +31,7 @@ The related-document operation will have one **decision point**: an immutable ba
 The guarantees will be exactly these:
 
 1. No document outside the named set will move.
-2. Every named document will end at either its old version or its new version, never at a partial state.
+2. Every named document will end at its old version, its new version, or a later version that superseded the new one, never at a partial state.
 3. A stale fence will refuse at fence resolution, before validation. At the post-staging dependency check, immediately before the decision point, a named dependency that has **already** moved will refuse the whole operation with nothing published.
 4. After the decision point, the store will decide each named document's outcome by **reachability**: a target commit that is the document's current head **or an ancestor of it** is published, even when a later write has superseded it. A target that is not reachable will be rolled forward when its expected parent is still current; otherwise it will be reported as not published. A decided batch will not be abandoned by credential expiry: its credentials will be retained until settlement, so a target whose parent is still current will always be published by recovery. The caller will receive the batch id and a per-document outcome.
 5. The settled outcome of every named document will be persisted in the authoritative write intent **before** the batch record and its ref are removed, so a later head advance cannot turn a published target into a failure or an unpublished one into a success. The batch will have exactly two terminal states: `committed` only when every named target is published, `incomplete` otherwise, with the per-document outcomes.
