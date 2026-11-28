@@ -106,7 +106,7 @@ const EXACT_INTEGER_BOUND: u64 = 1 << 53;
 /// unrepresentable integer never collapses onto a neighbour's digest.
 ///
 /// shortcut: every member at the endpoint is re-spelled, not only the
-/// revision-typed paths the connect signature owns; upgrade if a product-owned
+/// revision-typed paths the connect signature owns; upgrade: when a product-owned
 /// bag member at exactly `±2^53` must stay refused here.
 pub(crate) fn canonical_digest(value: &Value, excluded: Option<&str>) -> AResult<String> {
     let mut stripped = value.clone();

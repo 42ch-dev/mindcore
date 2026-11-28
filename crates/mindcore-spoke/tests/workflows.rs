@@ -1264,9 +1264,9 @@ async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
     );
 }
 
-/// Under per-Mind routing the slot empties by grant alone: a caller holding its own live
-/// `knowledge_read` grant but no registry row of its own reads its records with an empty slot,
-/// and the recall is never refused for it.
+/// Under per-Mind routing the slot empties by grant alone: a caller holding only its `recall`
+/// grant and no `knowledge_read` grant reads its records with an empty slot, and the recall is
+/// never refused for it.
 #[tokio::test]
 async fn a_caller_without_knowledge_read_recalls_with_an_empty_slot() {
     let harness = Harness::open().await;

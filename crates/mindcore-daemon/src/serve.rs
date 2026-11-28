@@ -195,6 +195,7 @@ impl BoundSocket {
                 //
                 // shortcut: a read-only socket directory cannot be cleaned up by anyone, so when
                 // the removal fails too the refusal names the leftover path instead of hiding it.
+                // upgrade: when the bind path can guarantee a writable directory.
                 return Err(match std::fs::remove_file(path) {
                     Ok(()) => fail(format!("the bound socket could not be inspected: {error}")),
                     Err(removal) => fail(format!(
@@ -862,7 +863,7 @@ fn drain_sessions(live: &[(usize, Arc<ConnectResponder>)]) {
 ///
 // shortcut: POSIX cannot unlink by inode, so a process running as the same user can replace the
 // name between the identity check and `remove_file`. The daemon is not designed to resist a local
-// same-user attacker — upgrade if that changes.
+// same-user attacker — upgrade: when the local attacker becomes part of the threat model.
 async fn remove_own_socket(socket_path: &Path, owned: SocketIdentity) -> Result<(), DaemonError> {
     remove_if_own(socket_path, owned)
         .await

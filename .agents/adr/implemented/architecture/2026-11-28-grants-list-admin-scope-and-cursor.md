@@ -5,10 +5,10 @@ Date: 2026-11-28
 ## Problem
 
 `memory.grants.list` admits caller-only, but an administrator must see the whole space's grant set
-to administer it. The same operation returns a cursor marker, and if the marker were computed over
-the admission rows while the page were built from the wider set, a page would be validated against
-rows the admin never saw. Another principal's grant change would then silently invalidate the
-admin's cursor.
+to administer it. The same operation returns a cursor marker, and the marker must describe the
+answer it validates. If the marker were computed over the admission rows while the page were built
+from the wider set, a grant change by another principal would change the answer without moving the
+marker, so a page could be validated against a boundary that no longer describes what it returned.
 
 ## Decision
 
@@ -21,9 +21,9 @@ operation, space, subject filter and applied marker separate.
 
 - **Serve every caller the whole space.** Rejected: it breaks the caller-only admission rule for
   callers with no administrative capability.
-- **Keep the marker over admission's rows while serving the wider set.** Rejected: the marker
-  would describe rows the answer does not contain, so a change by another principal would
-  invalidate a page the admin did see.
+- **Keep the marker over admission's rows while serving the wider set.** Rejected: another
+  principal's grant change then alters the answer the admin sees while the marker stays fixed, so
+  a cursor page is checked against a boundary that no longer describes its own content.
 - **Refuse the admin view.** Rejected: it removes the operation's administrative purpose.
 
 ## Consequences
