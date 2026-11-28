@@ -403,9 +403,6 @@ fn store_open_details(path: &Path, error: &sqlx::Error) -> Option<Map<String, Va
 /// Whatever survives both probes and still fails is not about the name: a database another process
 /// holds locked, a migration that refuses the file, a full disk. That is the environment's.
 fn store_path_fault(path: &Path) -> Option<std::io::Error> {
-    // `metadata`, not `symlink_metadata`: a symlinked store path is the host's own arrangement, and
-    // what matters is the type it names. A link to a regular file opens; a link to a directory is
-    // refused with the kind the target actually has.
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
@@ -436,7 +433,7 @@ fn store_path_fault(path: &Path) -> Option<std::io::Error> {
 /// async worker, so an `open` over a slow or network filesystem cannot stall every other call on
 /// the addon's runtime.
 ///
-/// Both caller-supplied paths are classified by [`path_fault`] and [`store_fault`]: a name that
+/// Both caller-supplied paths are classified by [`path_fault`] and [`store_path_refusal`]: a name that
 /// cannot be a directory or a file is `INVALID_INPUT`, an environment that refuses the work is
 /// `INTERNAL_ERROR`. A walk that did not run at all (a join failure) is the addon's own
 /// `INTERNAL_ERROR`.
@@ -445,9 +442,6 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
     let journal_root = match &options.journal_dir {
         Some(dir) => {
             let configured = PathBuf::from(dir);
-            // A name that is absent or empty is not a directory a process could ever have meant:
-            // it is the caller's spelling, refused as such instead of failing inside the walk
-            // with whatever the operating system says about the current directory.
             if configured.as_os_str().is_empty() {
                 return ClientResult::refused(&SpokeReject {
                     code: SpokeRejectCode::InvalidInput,
@@ -482,9 +476,6 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
         }
         None => None,
     };
-    // Resolved once, here: sqlx resolves the path it is given when it builds a connection, so a
-    // relative `storePath` would reconnect to whatever directory the process is in by then — a
-    // second database, silently. The client keeps the absolute name it opened.
     let configured = PathBuf::from(&options.store_path);
     let store_path = match absolute(&configured) {
         Ok(resolved) => resolved,
@@ -499,9 +490,6 @@ pub async fn open_client(options: ClientOptions) -> ClientResult {
             caller: CallerId::new(options.caller_id),
             journal_root,
         }),
-        // Both probes passed, so the name is usable and whatever fails now is the environment:
-        // a lock another process holds, a migration that refuses the file, a full disk. The refusal
-        // carries what the failure actually reports, never a stand-in.
         Err(error) => ClientResult::refused(&SpokeReject {
             code: SpokeRejectCode::InternalError,
             message: format!(
@@ -591,11 +579,6 @@ pub async fn client_ensure_subject(
         SpokeResult::Ok(principal) => principal,
         SpokeResult::Reject(reject) => return settle::<()>(SpokeResult::Reject(reject)),
     };
-    // `BEGIN IMMEDIATE`, like every other writer in the workspace: this transaction reads the
-    // subject row and then inserts it, and a deferred transaction that upgrades after another
-    // connection has committed cannot wait for the lock — SQLite answers `SQLITE_BUSY_SNAPSHOT`,
-    // which the busy timeout does not retry. Taking the write lock up front is what the facade's
-    // own writes do.
     let mut tx = match client.store.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(error) => {
@@ -898,7 +881,6 @@ pub async fn mind_cognition_read(view: &MindView) -> Value {
 /// naming the path: nothing can be published under a root whose real name is unknown.
 fn durable_root(root: &Path) -> std::io::Result<PathBuf> {
     let mut synced: HashSet<PathBuf> = HashSet::new();
-    // Leaf first, so the same vector serves the top-down pass in reverse.
     let mut chain: Vec<&Path> = Vec::new();
     let mut cursor = Some(root);
     while let Some(level) = cursor {
@@ -987,8 +969,6 @@ fn absolute(path: &Path) -> std::io::Result<PathBuf> {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 match cursor.file_name() {
-                    // `Path::new("mind.db").parent()` is the empty path, which names the current
-                    // directory: it is a real ancestor, not one more component to append.
                     Some(name) => missing.push(name),
                     None => return Err(error),
                 }
@@ -1222,8 +1202,6 @@ mod tests {
             );
         }
 
-        // The accepting side of the same three conversions, so the refusals above are the
-        // conversion's own rather than a helper that always rejects.
         assert!(matches!(
             occurred_at(Some("2026-01-01T00:30:00Z")),
             SpokeResult::Ok(Some(_))
@@ -1329,8 +1307,6 @@ mod tests {
         );
         assert!(denied.message.contains("/tmp/journal"));
 
-        // A walk that fails on an unwritable ancestor reaches the same classification through the
-        // real path: chmod refuses on the directory, and the walk reports PermissionDenied.
         let scratch = tempfile::TempDir::new().expect("a scratch directory");
         let scratch_path = canonical(scratch.path());
         let sealed = scratch_path.join("sealed");
@@ -1350,8 +1326,6 @@ mod tests {
                 SpokeRejectCode::InternalError,
                 "an unwritable ancestor is an environment fault: {error}"
             ),
-            // A process running as root may write into a 0555 directory; the classification above
-            // is then the whole evidence, and this arm says so rather than passing silently.
             Ok(_) => eprintln!("skipping the walk half: this process may write into a sealed dir"),
         }
     }
@@ -1373,7 +1347,6 @@ mod tests {
             spoke_operations::SpokeRejectCode::InvalidInput
         );
 
-        // A file whose parent refuses writes: the probe catches it, and says so as the caller's.
         let sealed = scratch_path.join("sealed");
         std::fs::create_dir(&sealed).expect("the sealed directory");
         let store = sealed.join("mind.db");
@@ -1395,8 +1368,6 @@ mod tests {
             None => eprintln!("skipping the probe half: this process may write into a sealed dir"),
         }
 
-        // An absent path under a writable parent is fine, and the probe leaves a file SQLite can
-        // initialize.
         let fresh = scratch_path.join("fresh.db");
         assert!(store_path_fault(&fresh).is_none());
         assert!(fresh.is_file(), "the probe creates the file it will use");
@@ -1477,8 +1448,6 @@ mod tests {
              why the resolution happens once, at open"
         );
 
-        // A name below a directory that does not exist yet still resolves: the deepest existing
-        // ancestor is canonicalized and the rest appended.
         let nested = absolute(&first_path.join("not-yet").join("mind.db")).expect("resolves");
         assert_eq!(nested, first_path.join("not-yet").join("mind.db"));
         assert!(absolute(Path::new("/"))
@@ -1511,7 +1480,6 @@ mod tests {
                 caller: CallerId::new("caller_wren"),
                 journal_root: None,
             };
-            // The row will be committed; only the read-back of its handle fails.
             OPEN_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
             let answered = client_create_mind(&client, None).await;
             assert!(
@@ -1561,8 +1529,6 @@ mod tests {
         let scratch = tempfile::TempDir::new().expect("a scratch directory");
         let store_path = scratch.path().join("mind.db");
 
-        // A regular file with bytes SQLite cannot read as a database: opening it fails inside the
-        // pool, after both probes have passed, which is the path this test is about.
         std::fs::write(&store_path, b"not a database at all, not even close").expect("garbage");
         assert!(
             store_path_fault(&store_path).is_none(),
@@ -1647,8 +1613,6 @@ mod tests {
         assert_eq!(after_first, 1, "the failed attempt is counted");
 
         durable_root(&root).expect("the retry succeeds");
-        // The retry syncs that parent again; `after_first` counts only the single attempt the
-        // first start got through before the injected fault aborted it.
         assert_eq!(
             syncs_of(&level_parent),
             after_first + 1,
