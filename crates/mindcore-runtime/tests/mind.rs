@@ -1612,8 +1612,6 @@ async fn a_fresh_review_is_refused_while_the_subjects_intent_is_unsettled() {
         "only the pre-existing intent stands"
     );
 
-    // Once the intent settles, the same review proceeds — the withhold is live state, not a
-    // dead candidate.
     sqlx::query("UPDATE memory_journal SET state = 'applied'")
         .execute(&store.pool())
         .await
@@ -1827,8 +1825,6 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         );
     }
     probe.await.expect("the probe joins");
-    // Nothing commits before the publication confirms: the pre-opened observer reads the
-    // committed state, and the staging transaction's uncommitted rows are invisible to it.
     assert_eq!(
         count_records(&observer.pool()).await,
         0,
@@ -1984,8 +1980,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         "no intent survives the cancellation"
     );
 
-    // And the same key still settles through a fresh attempt — the rollback is complete, not
-    // merely invisible.
     let working = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(journal_dir(&journal_root));
     let reviewed = ok(working
