@@ -575,8 +575,6 @@ fn extension_values_are_opaque_and_round_trip() {
 
 #[test]
 fn timestamps_admit_the_pre_upgrade_stored_spelling() {
-    // Rows written before the strict timestamp gate keep their string; the protocol DTOs
-    // refuse the space spelling for new input, so only the stored-read path is lenient.
     let mut candidate = pending_candidate();
     candidate["created_at"] = json!("2026-10-25 09:24:00Z");
     let (version, ir) = memory_candidate_from_wire(candidate.clone()).unwrap();

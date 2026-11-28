@@ -2597,9 +2597,6 @@ async fn an_unresolvable_adoption_anchor_answers_one_absence() {
         ),
         SpokeRejectCode::InvalidInput
     );
-    // An anchor naming no shared entry is unconstructible: `AdoptionAnchorSourceEntryId` rejects an
-    // empty id on both its `TryFrom` and its decode, so the absent-anchor case above is the only
-    // shape the type admits.
 
     store.close().await;
     remove_database(&path);

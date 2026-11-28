@@ -24,8 +24,6 @@ usage: mindcore-daemon --config <path>
 /// callbacks Connect runs on its blocking pool through `Handle::block_on`.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    // `args_os`, not `args`: a path is an `OsString`, and a non-UTF-8 one must reach the loader
-    // unchanged rather than panic the process.
     let config_path = match config_path(std::env::args_os().skip(1)) {
         Ok(Some(path)) => path,
         Ok(None) => {
@@ -51,13 +49,7 @@ async fn main() -> ExitCode {
 /// root, the surface, the listener and the drain.
 async fn start(config_path: &Path) -> Result<(), DaemonError> {
     let config = config::load(config_path)?;
-    // Resolved once, and the same `PathBuf` goes to the lock and to `MindStore::open`: resolving
-    // twice would let a symlink re-pointed between the calls open a file the lock never named.
     let store_path = lock::canonical_store_path(&config.store_path)?;
-    // The lock precedes the store: `open` creates the file and runs the embedded migration, so a
-    // second instance must be refused before it. The lock is a file of its own beside the store's
-    // one canonical name, so every spelling and every symlink contends on it while the store itself
-    // stays unlocked for SQLite.
     let lock = StoreLock::acquire(&store_path)?;
     serve::run(config, store_path, lock).await
 }
@@ -67,7 +59,6 @@ fn config_path(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Option<
     let mut config = None;
     let mut args = args;
     while let Some(argument) = args.next() {
-        // Only the flags are compared as text; `--config`'s value is a path and is never decoded.
         match argument.to_str() {
             Some("--config") => {
                 let value = args
@@ -79,7 +70,6 @@ fn config_path(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Option<
             }
             Some("--help" | "-h") => return Ok(None),
             Some(other) => return Err(format!("unknown argument {other:?}")),
-            // A non-UTF-8 argument cannot be a flag this program knows.
             None => {
                 return Err(format!("unknown argument {:?}", argument.to_string_lossy()));
             }
@@ -159,7 +149,6 @@ mod tests {
             ("--help after a path", &["--config", "a.toml", "--help"]),
         ];
         for (case, arguments) in cases {
-            // `--help` anywhere answers usage and exit 0, which is the one documented exception.
             if case == "--help after a path" {
                 assert!(parse(arguments).is_ok(), "{case}");
                 continue;

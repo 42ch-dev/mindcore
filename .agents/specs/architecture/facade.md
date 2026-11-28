@@ -187,6 +187,13 @@ host that needs it embeds the adapter or the served surface directly.
 - No facade operation accepts or derives a caller-supplied collection, owner or viewpoint.
 - A subjectless `deliberate` settles only on space-level admission and writes its record with the
   Mind's id as the assessment context.
+- `journal_dir` derives its temporary name from a stable hash of the target path, so retries of the
+  same target reuse one temporary name and a crashed earlier attempt's leftover is overwritten
+  rather than accumulated.
+- `capture` never journals: a non-Ready stage is a composition defect answered before any state
+  changes — nothing has committed, so the retry class holds.
+- A candidate with no row defaults to revision 1; `review_candidate` answers its own `NotFound` for
+  a candidate that never existed.
 
 ## Where it lives
 

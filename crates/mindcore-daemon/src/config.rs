@@ -100,7 +100,6 @@ pub struct DaemonConfig {
 pub fn load(path: &Path) -> Result<DaemonConfig, DaemonError> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| DaemonError::Config(format!("{}: {error}", path.display())))?;
-    // `toml`'s own message already quotes the offending key.
     let config: DaemonConfig = toml::from_str(&text)
         .map_err(|error| DaemonError::Config(format!("{}: {error}", path.display())))?;
     config.validate(path)?;
@@ -176,8 +175,6 @@ fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
         .permissions()
         .mode()
         & 0o777;
-    // Every group and other bit, execute included: `0o0620` is writable by group, as fatal as
-    // readable, and `0o0611` is executable — the wording says "group or other", so all three count.
     if mode & 0o077 != 0 {
         return Err(DaemonError::Config(format!(
             "identity.seed_file {}: mode {mode:04o} is readable, writable or executable by group or \
@@ -286,7 +283,6 @@ principal = "principal-a"
     #[test]
     fn the_optional_tables_parse() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // A bare key after a table belongs to that table, so the optional keys go where they sit.
         let text = minimal(dir.path()).replace(
             "host_id = \"host-1\"\n",
             "host_id = \"host-1\"\nhistory = true\n\n[invoke]\ntimeout_ms = 30000\n",
@@ -411,7 +407,6 @@ journal_dir = "{}"
             other => panic!("a world-readable seed is a config fault, not {other:?}"),
         }
 
-        // Owner-only parses.
         std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600))
             .expect("narrow the seed");
         assert_eq!(read_seed(&seed).expect("a 0600 seed parses"), {
@@ -437,7 +432,6 @@ journal_dir = "{}"
             (0o620, "group-writable"),
             (0o602, "other-writable"),
             (0o622, "group- and other-writable"),
-            // Execute only: the wording says "group or other", so these count too.
             (0o611, "group-executable and other-executable"),
             (0o641, "group-readable and other-executable"),
             (0o601, "other-executable"),
@@ -464,7 +458,6 @@ journal_dir = "{}"
             }
         }
 
-        // Owner-only still parses.
         write_seed(&seed, SEED);
         read_seed(&seed).expect("a 0600 seed parses");
     }
@@ -474,7 +467,6 @@ journal_dir = "{}"
     fn the_seed_value_never_reaches_the_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let text = minimal(dir.path());
-        // A well-formed 64-digit seed plus one accidental trailing character.
         let secret = format!("{SEED}x");
         write_seed(&dir.path().join("seed"), &secret);
         let error = load(&write(dir.path(), &text)).expect_err("malformed seed");

@@ -78,18 +78,12 @@ impl AdoptionPort for AdoptionService {
         scope: &Scope,
         request: &KnowledgeAdoptRequest,
     ) -> SpokeResult<KnowledgeAdoptResponse> {
-        // A source scope this surface does not serve is the same generic absence as a missing
-        // source: the peer learns nothing about which scopes exist.
         if request.source_scope_id.as_str() != self.source.scope_id {
             return source_absent();
         }
-        // A configured source scope id that is the admitted Mind's own needs no statement to
-        // refuse: the same collision the transaction re-checks against the whole registry.
         if self.source.scope_id == scope.scope_id.as_str() {
             return source_absent();
         }
-        // Connect refuses an out-of-scope destination before the port runs; the port keeps the
-        // same answer, so a direct caller cannot adopt outside the admitted scope either.
         if request.destination_scope_id.as_str() != scope.scope_id.as_str() {
             return not_authorized();
         }
@@ -109,8 +103,6 @@ impl AdoptionPort for AdoptionService {
             SpokeResult::Ok(outcome) => outcome,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(adoption_refusal(reject)),
         };
-        // The response is built before the transaction settles: a copy Connect could not accept is
-        // a fault of the same call, never a committed write reported as a transport failure.
         let created = matches!(&outcome, AdoptionOutcome::Created(_));
         let response = match adopted(outcome) {
             SpokeResult::Ok(response) => response,
@@ -119,8 +111,6 @@ impl AdoptionPort for AdoptionService {
                 return SpokeResult::Reject(reject);
             }
         };
-        // A repeat write is no write: the recorded copy is served and the reads leave nothing to
-        // commit.
         let settled = match created {
             true => transaction.commit().await,
             false => transaction.rollback().await,
@@ -141,8 +131,6 @@ async fn adopt_in(
     admitted: &Scope,
     request: &KnowledgeAdoptRequest,
 ) -> SpokeResult<AdoptionOutcome> {
-    // The grant check stands ahead of every read in the transaction, so a caller without it learns
-    // nothing the knowledge face would not tell it. A grant and the copy share one snapshot.
     let space = SpaceId::new(admitted.scope_id.as_str());
     if let SpokeResult::Reject(reject) = authorize_knowledge(
         &mut *transaction,
@@ -154,16 +142,11 @@ async fn adopt_in(
     {
         return SpokeResult::Reject(reject);
     }
-    // The destination is the admitted Mind's registry row. No row is the target-free refusal.
     let destination = match registered_collection(&mut **transaction, &admitted.scope_id).await {
         SpokeResult::Ok(Some(collection)) => collection,
         SpokeResult::Ok(None) => return not_authorized(),
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
-    // Assembly refuses a source that is any registered Mind's, but a Mind created afterwards can
-    // take one, so the same two decisions are remade here against the whole registry — not only
-    // the admitted Mind. Otherwise a later Mind's collection would become the shared source
-    // another Mind's caller reads, with no grant checked against it.
     match source_collides(&mut *transaction, source).await {
         SpokeResult::Ok(false) => {}
         SpokeResult::Ok(true) => return source_absent(),
@@ -189,8 +172,6 @@ async fn adopt_in(
         SpokeResult::Ok(None) => return source_absent(),
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
-    // The resolver's closures answer `None` for both absence and a storage fault, so the fault
-    // is recorded here and replaces the retirement refusal the resolver builds from that `None`.
     let fault: StdMutex<Option<SpokeReject>> = StdMutex::new(None);
     let resolved = resolve_retirement_chain(
         requested,
@@ -224,25 +205,11 @@ async fn adopt_in(
         SpokeResult::Ok(terminal) => terminal,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
-    // The revision to hand the copy helper. A retired source records the terminal's own revision,
-    // because the anchor names the terminal. A live source records the caller's requested
-    // revision, so the helper classifies an occupied slot before its create-only revision check:
-    // a repeat whose stored anchor records the requested revision answers `already_present` even
-    // when the source has advanced since, and a copy adopted at another revision stays the
-    // conflict the helper reports with `details.adopted_revision`. Pre-empting that here with the
-    // source's current revision would answer a repeat as a conflict.
     let live_source = terminal.source_entry_id == request.source_entry_id.as_str();
     let expected_revision = match live_source {
         true => request.source_revision,
         false => terminal.source_revision,
     };
-    // Only a retired source anchors a stored revision this call discovered: the live branch anchors
-    // the caller's requested value, which the copy helper compares and classifies itself. A stored
-    // revision the served wire cannot carry would commit a copy whose response Connect must reject
-    // as a transport fault, so it refuses here, before the write. The live branch is deliberately not
-    // guarded: its `source_revision` comes from the row's `revision` column while the anchor records
-    // the request, so guarding it would refuse a conformant answer as a store fault whenever the two
-    // disagree — an out-of-range request against a live source stays the helper's conflict.
     if !live_source && terminal.source_revision > SERVED_REVISION_BOUND {
         return spoke_reject(
             SpokeRejectCode::InternalError,
@@ -328,17 +295,11 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
         let mut gate = self.gate.lock().await;
         let entry = read_entry(&mut gate, self.collection, entry_id).await;
         match entry {
-            // An occupant outside the admitted selection answers the ordinary occupancy refusal,
-            // byte for byte the one a visible occupant gets: the answer reports the slot as taken
-            // either way, and never what the occupant holds.
             SpokeResult::Ok(entry) => match admitted_destination(&entry, self.scope) {
                 SpokeResult::Ok(true) => SpokeResult::Ok(entry),
                 SpokeResult::Ok(false) => occupied(&entry.entry_id),
                 SpokeResult::Reject(reject) => SpokeResult::Reject(reject),
             },
-            // `read_entry` is live-only, so a retired row arrives here as an absence. It is still a
-            // taken slot: answering `NotFound` would let the SPI helper's revision gate report the
-            // destination's retirement while a live occupant answers occupancy before that gate.
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
             {
@@ -357,9 +318,6 @@ impl KnowledgeEntryPort for AdoptionDestination<'_, '_, '_> {
         entry: KnowledgeEntry,
         expected_base_revision: Option<u64>,
     ) -> SpokeResult<KnowledgeEntry> {
-        // A copy outside the admitted selection is not a slot this call may claim; it answers the
-        // same occupancy as an occupied slot, so a free-but-unusable slot is not distinguishable
-        // from an occupied one either.
         match admitted_destination(&entry, self.scope) {
             SpokeResult::Ok(true) => {}
             SpokeResult::Ok(false) => return occupied(&entry.entry_id),
@@ -815,8 +773,6 @@ mod tests {
             .await
             .expect("begin the destination read");
         let gate = Mutex::new(&mut transaction);
-        // The port borrows the gate's `&mut transaction`, so the read runs inside this block: its
-        // end is what releases the borrow before the rollback below.
         let answer = {
             let port = AdoptionDestination {
                 collection: DESTINATION_COLLECTION,
@@ -869,8 +825,6 @@ mod tests {
         assert_eq!(repeat["outcome"], "already_present");
         assert_eq!(repeat["entry"]["revision"], created["entry"]["revision"]);
 
-        // The slot holds this source at revision 1, so asking for revision 2 is the contract's
-        // stale-copy conflict: `details.adopted_revision` names the revision the copy anchors.
         let stale = refused(
             service
                 .adopt_knowledge_entry(&owner, &admitted, &request("ke_source", 2))
@@ -887,9 +841,6 @@ mod tests {
             "the conflict names the revision the stored copy anchors: {stale:?}"
         );
 
-        // A requested revision outside the served range that the source does not hold is still the
-        // revision conflict, not a store fault: the guard bounds the revision a create would
-        // *anchor*, and this call anchors nothing. `2^53` is the endpoint above the ceiling.
         let beyond = refused(
             service
                 .adopt_knowledge_entry(
@@ -943,8 +894,6 @@ mod tests {
         assert_eq!(unauthorized.code, SpokeRejectCode::NotAuthorized);
         assert!(unauthorized.details.is_none(), "{unauthorized:?}");
 
-        // The destination is the admitted Mind's registered collection, and a peer the host
-        // grants there writes into it, which is where `knowledge.get` reads the copy back.
         grant(
             &store,
             DESTINATION_MIND,
@@ -1031,8 +980,6 @@ mod tests {
             "an unregistered Mind writes into no registered collection either"
         );
 
-        // One answer for both cases of the widened rule: the granted owner naming a scope that is
-        // not its Mind answers the same bytes.
         let mismatched = refused(
             service
                 .adopt_knowledge_entry(
@@ -1052,7 +999,6 @@ mod tests {
     #[tokio::test]
     async fn a_destination_collection_equal_to_the_source_is_not_found() {
         let (_dir, store, _service) = service().await;
-        // The same store, with the surface configured to read the collection the Mind registered.
         let colliding = AdoptionService::new(
             store.pool(),
             AdoptionRoute {
@@ -1208,8 +1154,6 @@ mod tests {
             .await
             .expect("withhold the registry table");
 
-        // The withholding is real on this pool: the production query itself now fails, so nothing
-        // below can pass because the fixture changed an unrelated table.
         let withheld =
             mindcore_sqlite::minds::registered_collection(&store.pool(), DESTINATION_MIND).await;
         assert!(
@@ -1300,8 +1244,6 @@ mod tests {
             "a refused adoption writes nothing"
         );
 
-        // The creator's default grant reaches the read, which answers the fault: the two answers
-        // prove the check stands ahead of it rather than behind a passing one.
         let reached = refused(
             service
                 .adopt_knowledge_entry(
@@ -1567,7 +1509,6 @@ mod tests {
     async fn a_hidden_occupant_answers_the_same_occupancy_as_a_visible_one() {
         let (_dir, store, service) = service().await;
         let owner = principal(OWNER);
-        // An occupant neither anchor names: the SPI answers the ordinary occupancy for it.
         ok(
             store
                 .knowledge(KnowledgeScope::new(DESTINATION_COLLECTION))
@@ -1575,7 +1516,6 @@ mod tests {
                 .await,
             "seed the destination occupant",
         );
-        // The same admitted id, once with an entry-id selection that never holds the occupant.
         let hidden: Scope = serde_json::from_value(json!({
             "scope_id": DESTINATION_MIND,
             "entry_ids": ["ke_somebody_else"],
@@ -1601,7 +1541,6 @@ mod tests {
             "a hidden occupant must not be distinguishable from a visible one"
         );
 
-        // A free slot the selection cannot claim is not adoptable either: same refusal, no row.
         let claimed = refused(
             service
                 .adopt_knowledge_entry(&owner, &hidden, &request("ke_terminal", 1))
@@ -1625,7 +1564,6 @@ mod tests {
             "the unusable slot stays free"
         );
 
-        // The same slot under an admitting selection still creates.
         ok(
             service
                 .adopt_knowledge_entry(&owner, &scope(DESTINATION_MIND), &request("ke_terminal", 1))
@@ -1648,7 +1586,6 @@ mod tests {
                 "seed the destination occupant",
             );
         }
-        // The same admitted id, once with an entry-id selection that never holds the occupant.
         let hidden: Scope = serde_json::from_value(json!({
             "scope_id": DESTINATION_MIND,
             "entry_ids": ["ke_somebody_else"],
@@ -1683,9 +1620,6 @@ mod tests {
         )
         .await;
 
-        // The read the SPI helper reaches after a live occupant answers occupancy. A retired row
-        // must answer it identically: reporting an absence here is what lets a revision gate
-        // report the destination's retirement while the slot is in fact taken.
         let read_live = destination_read(&store, &hidden, "ke_slot").await;
 
         let retired = ok(
@@ -1720,9 +1654,6 @@ mod tests {
         )
         .await;
 
-        // An unreachable destination read is what the SPI helper turns into a revision-gate answer,
-        // so the port itself must report the retired row as taken, byte for byte as it reports a
-        // live one.
         let read_retired = destination_read(&store, &hidden, "ke_slot").await;
         assert_eq!(
             read_retired, read_live,
@@ -1767,7 +1698,6 @@ mod tests {
                 source: KnowledgeScope::new("mind:spc_future"),
             },
         );
-        // The Mind the configured source names now exists, and its collection holds an entry.
         let future = registered_mind(&store, "spc_future", "prn_future_owner").await;
         assert_eq!(future, "mind:spc_future");
         let seeded = store
@@ -1793,8 +1723,6 @@ mod tests {
         );
         assert_eq!(refused_answer.code, SpokeRejectCode::NotFound);
         assert!(refused_answer.details.is_none(), "{refused_answer:?}");
-        // Byte-identical to the generic absence a missing source entry answers: the collision must not
-        // be distinguishable from the absence it stands for.
         let generic = AdoptionService::new(
             store.pool(),
             AdoptionRoute {
@@ -1871,7 +1799,6 @@ mod tests {
     /// removing the guard from that seam fails here rather than passing on a direct call.
     #[tokio::test]
     async fn an_unserveable_copy_never_becomes_a_response() {
-        // A copy the wire can carry: an anchored entry, the shape the SPI helper hands back.
         let mut serveable = entry("ke_copy");
         serveable.adoption_anchor = adoption_anchor(SHARED_SCOPE, "ke_source", 1);
         let control = match adopted(AdoptionOutcome::Created(serveable.clone())) {

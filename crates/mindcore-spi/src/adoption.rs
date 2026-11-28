@@ -192,9 +192,6 @@ where
 
     match dst.put_knowledge_entry(copy, None).await {
         SpokeResult::Ok(created) => SpokeResult::Ok(AdoptionOutcome::Created(created)),
-        // A create-only put may report the raced occupancy as the store's own refusal or as the
-        // caller-OCC refusal a remote destination answers an occupied create with; both mean the
-        // same slot claim, so both re-read and classify.
         SpokeResult::Reject(reject) if rejects_occupied_create(&reject) => {
             match dst.get_knowledge_entry(destination_entry_id).await {
                 SpokeResult::Ok(existing) => classify(
@@ -204,14 +201,10 @@ where
                     expected_source_revision,
                 ),
                 SpokeResult::Reject(refusal) => match refusal.code {
-                    // The slot's occupant is not visible to this call: absence and occupancy are
-                    // the same unanswered slot claim, so both answer the occupancy refusal.
                     SpokeRejectCode::KnowledgeEntryNotFound
                     | SpokeRejectCode::KnowledgeEntryAlreadyExists => {
                         occupied(destination_entry_id)
                     }
-                    // A selection or revision refusal is the destination's own answer, and a
-                    // storage fault stays one: forwarding it keeps the refusal hygiene honest.
                     _ => SpokeResult::Reject(refusal),
                 },
             }
@@ -235,9 +228,6 @@ fn classify(
     expected_source_revision: u64,
 ) -> SpokeResult<AdoptionOutcome> {
     let adopted = adopted_revision(&existing, source_scope_id, source_entry_id);
-    // The anchor's revision is the only carrier of this value onto the wire, so a stored one above
-    // the served ceiling has no conformant copy or refusal to report: refuse as a store fault
-    // rather than interpolate it.
     if adopted.is_some_and(|adopted| adopted > SERVED_REVISION_BOUND) {
         return SpokeResult::Reject(adoption_fault());
     }

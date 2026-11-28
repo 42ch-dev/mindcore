@@ -16,3 +16,4 @@ Current-state specifications of the Mindcore repository. Each page describes the
 | [`data/store-schema.md`](data/store-schema.md) | The appended migrations `MindStore::open` applies, the tables they create, and the append-only policy for changing them |
 | [`data/knowledge-lifecycle.md`](data/knowledge-lifecycle.md) | Revision history, replay by nearest checkpoint, adoption over two ports, and retirement by marker |
 | [`data/transfer-bundle-chunking.md`](data/transfer-bundle-chunking.md) | What an export bundle carries, how it is chunked and reassembled, and what import staging and activation accept |
+| [`testing/test-invariants.md`](testing/test-invariants.md) | Non-obvious fixture premises, observed-state discipline and timing windows the crate test suites depend on |

@@ -39,8 +39,6 @@ fn value_of<T: serde::Serialize>(response: &T) -> Value {
 #[tokio::main]
 async fn main() {
     let dir = tempfile::TempDir::new().expect("a scratch directory");
-    // Creating the scratch directory wrote an entry in its parent; the host makes that entry
-    // durable before anything depends on it, exactly as it will for the journal root below.
     std::fs::File::open(
         dir.path()
             .parent()
@@ -52,8 +50,6 @@ async fn main() {
         .await
         .expect("open the store");
 
-    // 1. Create the Mind. The registry writes the space, the carrier entry in the Mind's
-    //    collection, the registry row and the owner's grant row in one transaction.
     let owner = CallerId::new(OWNER);
     let created = ok(
         minds::create(
@@ -69,8 +65,6 @@ async fn main() {
     );
     println!("mind created: {}", created.id.as_str());
 
-    // Host provisioning, as the embedding host performs before capture: the subject row the
-    // memory writes need. This is the host's setup, not a facade operation.
     sqlx::query(
         "INSERT INTO memory_subjects (space_id, subject_id, status, revision, created_at) \
          VALUES (?, ?, 'active', 1, '2026-01-01T00:00:00.000Z')",
@@ -81,13 +75,8 @@ async fn main() {
     .await
     .expect("provision the subject");
 
-    // 2. Open the handle. The crate's one journal publisher writes the review's file effects
-    //    under the scratch root at their own paths — the host creates the root first, because
-    //    the publisher never does: the entry that names it is the host's to make durable.
     let journal_root = dir.path().join("journal");
     std::fs::create_dir_all(&journal_root).expect("the host creates the journal root");
-    // The host, not the publisher, owns the root's creation entry: creating the root writes an
-    // entry in its parent, and that entry is durable only once the parent is synced.
     std::fs::File::open(
         journal_root
             .parent()
@@ -98,7 +87,6 @@ async fn main() {
     let mind = ok(Mind::open(&store, &owner, &created.id).await, "open")
         .with_journal_publisher(journal_dir(journal_root));
 
-    // 3. Capture a memory: plain arguments, never a wire request body.
     let content_text = "the north gate is shut after dusk";
     let content = json!({ "text": content_text });
     let capture = Capture {
@@ -115,8 +103,6 @@ async fn main() {
         .expect("the capture stages one candidate")
         .to_string();
 
-    // 4. Review the candidate. The answer is the settled receipt: the fold — staging,
-    //    publication, settlement — is the handle's, and the caller never sees it.
     let promote: Decision =
         serde_json::from_value(json!({ "action": "promote" })).expect("a promote decision");
     let reviewed = ok(
@@ -128,7 +114,6 @@ async fn main() {
         .expect("promote retains one record")
         .to_string();
 
-    // 5. Recall: the reviewed record is live.
     let selection = json!({ "mode": "subject_all" });
     let recall = Recall {
         subject: SUBJECT,
@@ -156,9 +141,6 @@ async fn main() {
         serde_json::to_string_pretty(&record).expect("the record prints")
     );
 
-    // 6. Write the carrier with one cognition record: an explicit carrier update through the
-    //    one validation boundary, so the next step has a judgment to derive. The entry id
-    //    comes from the handle; the example never names `ke_carrier`.
     let carrier = ok(
         mind.knowledge_get(mind.carrier_entry_id(), None).await,
         "read the carrier",
@@ -225,8 +207,6 @@ async fn main() {
         "the read answers the written revision"
     );
 
-    // 7. Read the judgment: the carrier's one current-view record and the `MindState` derived
-    //    from it, for the Mind the handle names.
     let cognition = ok(mind.cognition_read().await, "cognition read")
         .expect("one record on the carrier is a judgment");
     assert_eq!(cognition.records.len(), 1, "the one current-view record");

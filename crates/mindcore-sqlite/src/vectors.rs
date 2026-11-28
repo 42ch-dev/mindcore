@@ -31,7 +31,6 @@ pub fn identity_hash(
             None,
         );
     }
-    // RFC 8785 canonicalization (serde_jcs 0.3) refuses integers above the IEEE-754 safe range.
     if dim as u64 > MAX_CANONICAL_DIM {
         return spoke_reject(
             SpokeRejectCode::InvalidInput,

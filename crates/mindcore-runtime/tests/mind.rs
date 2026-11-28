@@ -269,8 +269,6 @@ async fn capture_review_then_recall_returns_the_record_for_the_named_subject() {
         "recall after capture and review returns the record: {page}"
     );
 
-    // The caller-named subject is passed through, never defaulted: a subject the caller did
-    // not write holds no records, while the candidate and the record sit on `subj_wren`.
     let other = Recall {
         subject: "subj_someone_else",
         ..recall_all().0
@@ -289,7 +287,6 @@ async fn capture_review_then_recall_returns_the_record_for_the_named_subject() {
             .expect("the record's subject row");
     assert_eq!(subject, SUBJECT);
 
-    // journal_dir published the projection files under the scratch root at their own paths.
     let published = dir.path().join("records").join(format!("{record_id}.md"));
     assert!(
         published.exists(),
@@ -307,10 +304,6 @@ async fn a_recall_with_only_max_items_and_no_other_budget_fields_is_a_valid_wire
         .with_journal_publisher(journal_dir(dir.path()));
     capture_candidate(&handle, "cap-min-budget", "a plain note").await;
 
-    // The regression the wire contract pins: a recall carrying neither query, cursor nor
-    // max_bytes — the minimal budget shape — must decode as a valid wire request and answer
-    // a page, not a validation refusal. `max_items` is non-optional on the facade exactly
-    // because the wire requires the member.
     let (minimal, _) = recall_all();
     let page = value_of(&ok(handle.recall(&minimal).await));
     assert!(
@@ -318,7 +311,6 @@ async fn a_recall_with_only_max_items_and_no_other_budget_fields_is_a_valid_wire
         "the minimal budget answers a records page: {page}"
     );
 
-    // One item bounds the page to exactly one record even though more exist.
     capture_candidate(&handle, "cap-min-budget-two", "a second note").await;
     let bounded = Recall {
         max_items: 1,
@@ -345,7 +337,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
         capture_candidate(&handle, "cap-refused-publish", "a note to refuse").await
     };
 
-    // First attempt: the publisher refuses with its own Settlement refusal.
     let refused = SpokeReject {
         code: SpokeRejectCode::InternalError,
         message: "the medium is full".to_string(),
@@ -367,7 +358,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
         "the publisher's Settlement refusal travels unchanged"
     );
 
-    // Nothing is durable: no record row, no intent, and the candidate is still pending.
     assert_eq!(count_records(&store.pool()).await, 0, "no record row");
     assert_eq!(count_intents(&store.pool()).await, 0, "no intent");
     let status: String =
@@ -378,7 +368,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
             .expect("the candidate row");
     assert_eq!(status, "pending", "the candidate stays pending");
 
-    // A non-Settlement publisher refusal answers the retryable INTERNAL_ERROR instead.
     let io_failing = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(move |_| Err(SpiError::EmbeddingFailed("disk gone".to_string())));
     let reject = reject_of(
@@ -391,7 +380,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
     assert_eq!(count_records(&store.pool()).await, 0, "still no record row");
     assert_eq!(count_intents(&store.pool()).await, 0, "still no intent");
 
-    // The same key then settles once the medium accepts the publication.
     let working = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(journal_dir(dir.path()));
     let reviewed = ok(working
@@ -404,11 +392,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
     );
     assert_eq!(count_records(&store.pool()).await, 1, "one record row");
 
-    // Critical 1: the same key replays. Consuming the candidate bumped its revision to 2 —
-    // asserted here so the next assertion cannot silently pass on an unchanged row — so a
-    // facade that re-read the row would send a different `expected_revision`, change the
-    // payload digest and be answered `IdempotencyConflict`. The settled receipt replays
-    // instead, byte-identically.
     let candidate_revision: i64 =
         sqlx::query_scalar("SELECT revision FROM memory_candidates WHERE candidate_id = ?")
             .bind(&candidate_id)
@@ -438,7 +421,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
         "a replay stages no second intent"
     );
 
-    // A different decision under the same key stays a conflict — the digest still guards it.
     let different =
         serde_json::from_value::<Decision>(json!({ "action": "drop" })).expect("drop decision");
     let conflict = reject_of(
@@ -470,15 +452,6 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
     )
     .await;
 
-    // The publisher queues an interference task on the store's one-connection pool: the
-    // staging transaction still holds that connection, so the task cannot acquire until the
-    // staging commit releases it. sqlx's pool issues connections FIFO-fair in registration
-    // order, and the task proves it registered before the publisher returns: the spawned task
-    // polls its acquire future once (registration happens on the first poll, while the one
-    // connection is still checked out) and signals that through the handshake channel. The
-    // settlement transaction asks only after the commit, so it is always behind the
-    // interference task in the queue, and the settle always reads a moved intent — the order
-    // is the semaphore's, never the scheduler's.
     let interference_pool = pool.clone();
     let handle =
         ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
@@ -488,9 +461,6 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
             tokio::spawn(async move {
                 let acquire = interference_pool.acquire();
                 tokio::pin!(acquire);
-                // One poll with a no-op waker: the future must be pending because the staging
-                // transaction still holds the pool's one connection, and this first poll is
-                // what registers the task in the pool's FIFO queue.
                 std::future::poll_fn(|cx| {
                     let polled = std::future::Future::poll(acquire.as_mut(), cx);
                     assert!(
@@ -558,9 +528,6 @@ async fn a_repeat_after_outcome_uncertain_continues_the_fold_and_settles() {
     )
     .await;
 
-    // The interference handshake: a task registered on the one-connection pool moves the
-    // intent out of pending the moment the staging commit releases the connection, so the
-    // first settle is refused — the `OUTCOME_UNCERTAIN` path.
     let interference_pool = pool.clone();
     let blocking =
         ok(Mind::open(&store, &owner, &created.id).await).with_journal_publisher(move |targets| {
@@ -603,8 +570,6 @@ async fn a_repeat_after_outcome_uncertain_continues_the_fold_and_settles() {
         "the refused settle answers OUTCOME_UNCERTAIN"
     );
 
-    // Restore the intent to pending — the crash window the contract covers is exactly this
-    // state: staging durable, intent unsettled — and repeat the review with the same key.
     sqlx::query("UPDATE memory_journal SET state = 'pending'")
         .execute(&store.pool())
         .await
@@ -630,7 +595,6 @@ async fn a_repeat_after_outcome_uncertain_continues_the_fold_and_settles() {
         "the intent is settled, never re-staged"
     );
 
-    // A further repeat is the ordinary replay of a settled receipt.
     let replayed = ok(working
         .review(&candidate_id, &promote(), "rev-uncertain-recovery")
         .await);
@@ -656,7 +620,6 @@ async fn a_pending_candidate_at_a_non_one_revision_reviews_and_replays() {
     let candidate_id =
         capture_candidate(&handle, "cap-imported-revision", "imported at five").await;
 
-    // An imported candidate keeps its own revision (transfer/activate.rs): make this one 5.
     sqlx::query("UPDATE memory_candidates SET revision = 5 WHERE candidate_id = ?")
         .bind(&candidate_id)
         .execute(&store.pool())
@@ -751,8 +714,6 @@ async fn the_public_publisher_publishes_a_nested_subtree_under_an_existing_root(
     );
 }
 
-// ---------- Task 3: knowledge operations on the handle ----------
-
 /// One plain entry the test writes; the store assigns and checks the revision.
 fn entry(entry_id: &str, name: &str) -> KnowledgeEntry {
     KnowledgeEntry {
@@ -768,7 +729,7 @@ fn entry(entry_id: &str, name: &str) -> KnowledgeEntry {
         modules: std::collections::HashMap::new(),
         owner: None,
         revision: Some(1),
-        // SAFETY: the wire baseline one is not zero.
+        // SAFETY: the wire baseline is one; see .agents/specs/architecture/mind-model.md
         schema_version: unsafe { std::num::NonZeroU64::new_unchecked(1) },
         source_anchor: None,
         status: "confirmed".to_string(),
@@ -939,8 +900,6 @@ async fn a_caller_without_knowledge_read_reads_nothing() {
     );
 }
 
-// ---------- Task 4: cognition read and the space-level deliberate ----------
-
 /// One promotion over the supplied evidence; `record_ids` names no memory record
 /// because a subjectless snapshot serves no memory page.
 struct SettlingReasoner;
@@ -1102,9 +1061,6 @@ async fn cognition_read_answers_none_then_the_judgment_and_mind_state() {
         "a fresh carrier holds no judgment, which is a state and not a refusal"
     );
 
-    // The plan's own consequence: a fresh Mind has no judgment to read, so the
-    // carrier is written through the one validation boundary — an explicit
-    // `knowledge_put` carrying one cognition record.
     let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
     let revision = carrier.revision.expect("a stored carrier has a revision");
     let record = json!({
@@ -1236,7 +1192,6 @@ async fn cognition_read_serves_an_owner_private_carrier_to_the_in_process_caller
     let judged = mindcore_base::cognition::append_cognition_record(&carrier, record)
         .expect("one valid record appends to the carrier");
 
-    // Mark the judging carrier `owner`-private through the same knowledge write path.
     let mut payload = serde_json::to_value(&judged).expect("the carrier serializes");
     payload["disclosure"] = json!("owner-private");
     payload["owner"] = json!(OWNER);
@@ -1275,8 +1230,6 @@ async fn deliberate_without_a_space_wide_recall_grant_is_refused_and_writes_noth
     let owner = CallerId::new(OWNER);
     let owner_handle = ok(Mind::open(&store, &owner, &created.id).await);
 
-    // The knowledge capabilities admit the carrier; no `recall` grant was ever
-    // written for this caller, so the space-level revalidation must refuse.
     let knowledge_only = CallerId::new("caller_knowledge_only");
     grant(
         &store,
@@ -1537,8 +1490,6 @@ async fn an_intent_that_arrives_after_the_snapshot_refuses_the_commit() {
     );
 }
 
-// ---------- QC fix wave: settled-key replay, publisher confinement and executor offload ----------
-
 /// A settled key's replay reaches the receipt probe no matter what else the space holds
 /// unsettled: another of the same subject's intents, or an intent of another subject in the
 /// same space. The replay is metadata-identical to its first review, so the probe answers the
@@ -1562,7 +1513,6 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
         "the first review settles"
     );
 
-    // An unsettled intent for the same subject, as a crashed served absorb would leave one.
     settle_never(&store, created.id.as_str(), SUBJECT).await;
     let replayed = ok(handle
         .review(&candidate_id, &promote(), "rev-settled-replay")
@@ -1583,7 +1533,6 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
         "no second replay intent"
     );
 
-    // The same key also replays beside an intent of another subject in the same space.
     settle_never(&store, created.id.as_str(), "subj_elsewhere").await;
     let replayed = ok(handle
         .review(&candidate_id, &promote(), "rev-settled-replay")
@@ -1639,8 +1588,6 @@ async fn a_fresh_review_is_refused_while_the_subjects_intent_is_unsettled() {
         "only the pre-existing intent stands"
     );
 
-    // Once the intent settles, the same review proceeds — the withhold is live state, not a
-    // dead candidate.
     sqlx::query("UPDATE memory_journal SET state = 'applied'")
         .execute(&store.pool())
         .await
@@ -1682,7 +1629,6 @@ async fn the_public_publisher_refuses_a_target_outside_its_root() {
         "no traversal write landed"
     );
 
-    // Confined targets still publish exactly as before.
     publisher(&[json!({ "path": "records/rec_confined.md", "content": "confined bytes" })])
         .expect("a confined target publishes");
     assert_eq!(
@@ -1709,7 +1655,6 @@ async fn the_public_publisher_never_writes_through_a_swapped_in_target_symlink()
         "content": "first attempt",
     })])
     .expect("the first publication lands");
-    // The swap: the landed regular file is replaced by a symlink to the outside destination.
     std::fs::remove_file(root.join("records").join("rec_swap.md")).expect("remove the first write");
     std::os::unix::fs::symlink(
         outside.join("victim.md"),
@@ -1745,7 +1690,6 @@ async fn the_public_publisher_never_writes_through_a_preplaced_temporary_symlink
     std::fs::create_dir_all(&outside).expect("create the escape destination");
     let publisher = mindcore_runtime::journal_dir(&root);
 
-    // Compute the temporary name exactly as the publisher does and pre-place a symlink there.
     let target_path = "records/rec_preplaced.md";
     let file = root.join(target_path);
     let parent = file.parent().expect("the target parent").to_path_buf();
@@ -1803,14 +1747,10 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         .with_journal_publisher(journal_dir(&journal_root));
     let candidate_id = capture_candidate(&handle, "cap-offworker", "a parked publication").await;
 
-    // The observer is opened before the review starts, so nothing migrates or acquires the
-    // write while the staging transaction holds it.
     let observer = MindStore::open(&dir.path().join("minds.db"))
         .await
         .expect("open the observer store");
 
-    // The publication handshake: the publisher signals `entered` the moment it is inside its
-    // flush, then parks on a blocking channel until the test releases it.
     let (entered, is_entered) = mpsc::channel::<()>();
     let (release, is_released) = tokio::sync::oneshot::channel::<()>();
     let is_released = std::sync::Mutex::new(Some(is_released));
@@ -1834,18 +1774,10 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
             .await
     });
 
-    // Wait for the publisher's entry signal on a blocking thread — the receive itself is the
-    // observed state: it completes exactly when the publisher is inside its flush, however the
-    // scheduler gets there.
     let entry =
         tokio::task::spawn_blocking(move || is_entered.recv().expect("the publisher entry signal"));
     entry.await.expect("the entry signal arrived");
 
-    // The probe: spawned after the entry signal, a bare unit of executor work. Its completion
-    // is proof of executor progress — the publisher is parked, so the probe completing means
-    // something other than the blocked publication polled it. The observation loop advances
-    // only on the handle's own observed state, with `yield_now` as a politeness hint to the
-    // scheduler, never as the ordering proof: the handle either finishes or it does not.
     let probe = tokio::spawn(async {});
     let mut ticks = 0u32;
     while !probe.is_finished() {
@@ -1857,8 +1789,6 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         );
     }
     probe.await.expect("the probe joins");
-    // Nothing commits before the publication confirms: the pre-opened observer reads the
-    // committed state, and the staging transaction's uncommitted rows are invisible to it.
     assert_eq!(
         count_records(&observer.pool()).await,
         0,
@@ -1939,19 +1869,11 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
             .await
     });
 
-    // Wait for the publisher's entry signal, then cancel. The receive itself is the observed
-    // state: it completes exactly when the publisher is inside its flush.
     let entry =
         tokio::task::spawn_blocking(move || is_entered.recv().expect("the publisher entry signal"));
     entry.await.expect("the entry signal arrived");
     review.abort();
 
-    // The witness: a bare pool acquisition. The pool has one connection, so it completes
-    // exactly when the connection is free — and the connection is free while the publication
-    // is parked only if the cancelled attempt released its transaction early. The sentinel is
-    // spawned behind it: its finished handle is the observed state that the witness was
-    // polled to its acquisition — the witness can only be waiting on the connection or already
-    // holding it, never merely unscheduled.
     let witness_pool = store.pool();
     let witness = tokio::spawn(async move {
         let connection = witness_pool
@@ -1970,11 +1892,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
             "the sentinel never finished — the runtime never polled the spawned tasks"
         );
     }
-    // The witness is provably at its acquisition. Give an early release every chance to hand
-    // it the connection: the rollback after a cancelled attempt runs on sqlx's connection
-    // worker thread, so the observation window spans real thread scheduling — this is the
-    // detection window for a regression, not an ordering proof for the correct behavior, and
-    // its length bounds nothing the fixed implementation depends on.
     let window = std::time::Instant::now();
     while window.elapsed() < std::time::Duration::from_millis(500) {
         assert!(
@@ -1984,9 +1901,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         tokio::task::yield_now().await;
     }
 
-    // Release the first publication: its flush ends, the finish flag is set, and only then
-    // may the connection become free — the correct implementation's rollback runs after the
-    // blocking task returns the transaction.
     release.send(()).expect("release the publisher");
     let mut ticks = 0u32;
     while !witness.is_finished() {
@@ -2003,7 +1917,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         "the first publication finished before the connection became free"
     );
 
-    // The end state is clean: the cancelled attempt left nothing behind.
     assert_eq!(
         count_records(&store.pool()).await,
         0,
@@ -2015,8 +1928,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         "no intent survives the cancellation"
     );
 
-    // And the same key still settles through a fresh attempt — the rollback is complete, not
-    // merely invisible.
     let working = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(journal_dir(&journal_root));
     let reviewed = ok(working
@@ -2054,9 +1965,6 @@ async fn cognition_read_reads_only_the_collection_of_the_admitted_mind() {
         "each Mind owns its own collection"
     );
 
-    // A poisoned record for the first Mind's carrier entry id, written into the second Mind's
-    // collection. The record validates: its holder is the second carrier it actually lives
-    // with, so the write passes the one validation boundary.
     let second_handle = ok(Mind::open(&store, &owner, &second.id).await);
     let second_carrier = ok(second_handle
         .knowledge_get(second_handle.carrier_entry_id(), None)
@@ -2108,7 +2016,6 @@ async fn cognition_read_reads_only_the_collection_of_the_admitted_mind() {
         .expect("a stored carrier has a revision");
     ok(second_handle.knowledge_put(appended, Some(revision)).await);
 
-    // The first Mind's read is untouched by anything the second collection holds.
     let first_handle = ok(Mind::open(&store, &owner, &first.id).await);
     assert!(
         ok(first_handle.cognition_read().await).is_none(),
@@ -2153,9 +2060,6 @@ async fn the_public_publisher_refuses_a_target_that_resolves_outside_its_root() 
         "nothing was written at the external destination"
     );
 
-    // A symlink at the target file itself cannot redirect the write either: the bytes are
-    // written to a temporary file in the same directory and renamed over the target — rename
-    // replaces the directory entry, it never follows what the entry points to.
     std::fs::create_dir_all(root.join("candidates")).expect("create the target parent");
     std::os::unix::fs::symlink(
         outside.join("planted.md"),
@@ -2183,7 +2087,6 @@ async fn the_public_publisher_refuses_a_target_that_resolves_outside_its_root() 
         "confined despite the target symlink"
     );
 
-    // The parent chain stays inside the root, and the confined target lands.
     publisher(&[json!({
         "path": "profiles/rec_confined.md",
         "content": "confined bytes",

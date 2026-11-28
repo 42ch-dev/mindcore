@@ -358,6 +358,68 @@ holds no live session; a drain that ends a live connection is covered in
 `crates/mindcore-daemon/src/serve.rs` by
 `a_drain_ends_a_connection_parked_before_its_registration`.
 
+### Implementation constraints
+
+**Store ownership and drain order.** `MindcoreServe` owns the store, so the pool handle is taken
+before the surface is built: it is the route to the awaited close, and an early failure closes it
+instead of letting the runtime drop the connections. The drain closes every live session first so
+each can end its in-flight work, then shuts the accept side down, cancelling any task still between
+`connect_responder` and its registration; a second walk catches a session registered inside that
+window. A session is tracked before its task's next await, because `connect_responder` spawns the
+responder's own task with its own `Arc`, and an aborted connection task would otherwise leave that
+session unclosed.
+
+**Journal chain.** The resolved type decides: `metadata` follows a symlink, so a link to a
+directory is a directory and a link to a file or FIFO fails the gate. A level that cannot be
+inspected is a journal fault wherever in the chain it sits, because the walk cannot tell an
+ancestor from the level beneath the root and stopping early would skip the flush this start owes.
+A symlink in the chain means the journal really lives elsewhere: the chain walk flushed the entry
+naming the link, so the holding directory's own entry is flushed too — exactly one extra entry,
+never the ancestors above it. A plain path's holding directory is already in `synced`, so the walk
+stays one flush per level. The root's own entry is fatal on failure, unlike an ancestor's.
+
+**Socket identity and cleanup.** When the identity read fails the guard does not exist yet, so the
+fallback unlinks inline; when that removal also fails the refusal names the leftover path. A
+scratch-directory count is read while the directory is current, because `sync_attempts` resolves
+the spelling it is given and `"."` names a different directory after the chdir back. The bind needs
+a writable directory and the seam closes it before the fallback's unlink; the restore runs before
+the assertion so a failure leaves no unwritable directory. `u64::MAX` for both device and inode
+names nothing a real file can be. A test may swap the name while the listener still owns the
+socket, as a same-user process could.
+
+**Transport.** A closed watch channel means the transport is gone; the sender lives in `self`, so a
+send errors only in that case. A pending recv fails fast when the transport closes, and dropping
+the read future loses only bytes no later recv can be asked for. `close` is idempotent and waits: a
+repeat takes the teardown lock, sees the shutdown the first call or a framing fault performed, and
+returns only then — a `close` that resolves means the socket is shut down, never that another
+teardown is under way. A shutdown tears the socket down under an in-flight write, so the write
+fails; when our own close interrupted it the honest answer is `Closed`, and only a failure with the
+transport still open is an I/O fault. A partial frame on the stream breaks framing for that peer,
+so the transport ends exactly as a failed read does rather than staying half usable. A write that
+completed during a close is not a delivered frame. Reading a prefix by hand distinguishes an EOF
+after some bytes (a truncated frame) from one before any (the peer closing at a frame boundary);
+the boundary case is an orderly end but still terminates the transport, because the closed signal
+otherwise never fires and the connection task waits forever holding its fd. A transport whose inner
+frame carries nothing keeps its recv pending, which is why a rejection is a distinct state from the
+pre-established one; opening the inner transport releases the frame and the responder's state
+machine takes over.
+
+**Config.** A TOML decode error already quotes the offending key, so the daemon does not repeat it.
+The permission check covers every group and other bit, execute included: "group or other" counts
+writable, readable and executable alike.
+
+**End-to-end fixtures.** A dialer negotiates the tool id in its hello, as a caller must before
+invoking it. A served-path refusal is a pass — the handler existed and ran and the bare call is
+legitimately refused — while the dispatch deny must never appear. A dial with no delay after the
+handshake is safe because the gate is what holds the invoke. The same store on another socket meets
+the lock, not the name. A search-only denial cannot be built as root because mode bits do not
+constrain uid 0, so those cases are skipped as root. A key that is not 64 hex digits fails at
+`prepare`'s peer-key decode, and `peer_keys` refuses the same shape after the bind. One fixture
+deliberately omits the `register` call: that is the window the daemon closes immediately. The
+dialer's own session is not established there, so either the dispatch deny or a session refusal is
+fail-closed; what must not happen is silence. One fixture rebuilds `prepare`'s wiring without the
+signals, and one dial completes against the listen backlog before the accept loop owns the task.
+
 ## Invariants
 
 - One daemon per store file per host: `store_path` is resolved once, and the same path names the

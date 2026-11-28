@@ -192,10 +192,6 @@ impl Harness {
         .execute(&pool)
         .await
         .expect("seed subject");
-        // The carrier entry, then the Mind registry row naming it: `minds` keys the pair foreign
-        // to `knowledge_entries`, so the entry exists before the row references it. The binding
-        // resolves every carrier access through the row now that the per-principal route map is
-        // retired.
         sqlx::query(
             "INSERT INTO knowledge_entries \
              (collection, entry_id, revision, payload, created_at, updated_at) \
@@ -846,8 +842,6 @@ async fn knowledge_slot_refuses_a_collection_over_the_served_bound() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
-    // The carrier entry is the collection's first live row, so exactly-at-the-bound means
-    // SERVED_KNOWLEDGE_LIST_LIMIT - 1 seeded rows beside it.
     for index in 0..(SERVED_KNOWLEDGE_LIST_LIMIT - 1) {
         harness
             .entry("wren", &format!("ke_{index:04}"), "bounded entry")
@@ -995,8 +989,6 @@ async fn knowledge_slot_omits_a_superseded_entry() {
 async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_peer() {
     let harness = Harness::open().await;
     harness.grant(&["knowledge_read"]).await;
-    // One judgment on the carrier, stored the way a dedicated append stores it: a
-    // `cognition_records` row the read hydrates into the payload's module.
     let module = json!({
         "records": [],
         "world_facts": [],
@@ -1034,7 +1026,6 @@ async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_pee
     );
     drop(tx);
 
-    // The same carrier made space-visible reads whole: the record and its derived MindState.
     let visible_payload = json!({
         "schema_version": 1,
         "entry_id": "ke_wren",
@@ -1269,15 +1260,11 @@ async fn memory_grant_alone_leaves_the_knowledge_slot_empty() {
     );
 }
 
-/// The route map decides the slot per principal: a reader holding its own live `knowledge_read`
-/// grant but no route of its own reads its records with an empty slot, and the recall is never
-/// refused for it.
+/// Under per-Mind routing the slot empties by grant alone: a caller holding only its `recall`
+/// grant and no `knowledge_read` grant reads its records with an empty slot, and the recall is
+/// never refused for it.
 #[tokio::test]
 async fn a_caller_without_knowledge_read_recalls_with_an_empty_slot() {
-    // Under per-Mind routing there is no per-principal route map: the registry row answers every
-    // reader of this Mind's space. What still empties the slot is the knowledge grant itself —
-    // a caller without `knowledge_read` in the space reads its memory page with an empty slot,
-    // which is exactly the enforcement this test must now pin.
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
     harness
@@ -2021,8 +2008,6 @@ async fn a_citation_that_loses_its_admission_refuses_the_settlement() {
     let SpiError::Settlement(reject) = error else {
         panic!("expected a settlement refusal, got {error:?}");
     };
-    // A revoked grant is no admission: the settlement answers the one
-    // admission refusal, before any record existence check.
     assert_eq!(reject.code, SpokeRejectCode::NotAuthorized);
     assert!(reject.details.is_none(), "{reject:?}");
     assert_eq!(harness.count_from("memory_records").await, 1);
@@ -4456,8 +4441,6 @@ async fn a_settle_with_a_passed_deadline_opens_no_transaction_on_a_free_connecti
         .await
         .expect("open the free-connection pool");
     let binding = settle_binding(&pool);
-    // `connect_with` releases one checked connection, so the acquire below
-    // takes an idle connection on its first poll.
     let deadline = std::time::Instant::now() - Duration::from_millis(1);
 
     let outcome = tokio::time::timeout(
@@ -4618,7 +4601,6 @@ async fn a_bound_carrier_refuses_a_holder_that_names_another_entry() {
         "the refused commit appended nothing"
     );
 
-    // The control: the bound carrier itself is served.
     let snapshot = binding
         .deliberate_snapshot(&principal(), SPACE, Some(SUBJECT), &settle_holder(), 32)
         .await

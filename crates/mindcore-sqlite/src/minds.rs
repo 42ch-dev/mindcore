@@ -136,7 +136,7 @@ fn carrier_entry(
         modules: std::collections::HashMap::new(),
         owner: None,
         revision: Some(1),
-        // SAFETY: the wire baseline one is not zero.
+        // SAFETY: the wire baseline is one; see .agents/specs/architecture/mind-model.md
         schema_version: unsafe { std::num::NonZeroU64::new_unchecked(1) },
         source_anchor: None,
         status: "confirmed".to_string(),
@@ -176,17 +176,12 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
         pending_receipts: 0,
     };
     if let Err(error) = repository.insert_space(tx, &space_row).await {
-        // `memory_spaces` carries no CHECK a create input can violate: the only schema refusal
-        // the id can hit is the registry's length check, mapped in `driver_error`.
         return match error {
             crate::repository::SqliteRepositoryError::Conflict(_) => already_exists(&id),
             _ => storage_unavailable(),
         };
     }
 
-    // A Mind's collection is its own: a caller-named id must never claim entries the Mind did
-    // not create. A populated target collection is refused before the carrier is written; the
-    // refusal is not the taken-id one, because no Mind of this id need exist.
     let collection = knowledge_collection_of(&id);
     let occupied =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")
@@ -242,8 +237,6 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
         created_at: created_at.clone(),
         extensions: Map::new(),
     };
-    // A colliding grant id is not a taken Mind id: the id is minted independently, and its
-    // failure means nothing about the Mind the caller asked for.
     if repository.insert_grant(tx, &grant).await.is_err() {
         return storage_unavailable();
     }
@@ -284,8 +277,6 @@ type JoinRow = (
     String,
 );
 
-// The one projection and join both visibility reads share. A macro rather than a constant,
-// because `concat!` joins literals only, and sqlx's safety lint accepts literals alone.
 macro_rules! grant_columns {
     () => {
         "SELECT m.space_id, m.knowledge_collection, m.carrier_entry_id, \
@@ -333,13 +324,7 @@ fn visible_id_of(row: &SqliteRow) -> Option<(String, Option<String>, String, Str
     ))
 }
 
-// The visibility rule of `expiry_passed` in `crates/mindcore-spoke/src/admission.rs`, restated
-// here because `mindcore-sqlite` cannot depend on the adapter: no expiry is live; an expiry
-// that does not parse as RFC 3339 is never live; the expiry is compared as an instant and never
-// as text, so an offset is honoured and an expiry equal to now is already passed.
 fn live(expires_at: &Option<String>) -> bool {
-    // The instant is read here, at the moment the row is examined and never earlier: a grant
-    // that expires while the single-connection pool makes the query wait is already passed.
     let now = Utc::now();
     match expires_at {
         None => true,

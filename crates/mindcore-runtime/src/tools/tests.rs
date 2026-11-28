@@ -134,8 +134,6 @@ fn admission() -> MemoryAdmission {
 /// carrier entry id up in the registry row of the request's space, so the probe seeds the one
 /// row the tests name.
 async fn registry_pool() -> SqlitePool {
-    // One connection only: every pooled connection opens its own in-memory database, so the
-    // registry row must live on the single connection the probe serves.
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -153,8 +151,6 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed mind row");
-    // The admission probe reads live grants in the request's space; the probe principal holds a
-    // space-wide `knowledge_read` grant here.
     sqlx::query(
         "CREATE TABLE memory_grants (\
             grant_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, subject_id TEXT, \
@@ -174,8 +170,6 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed probe grant");
-    // The carrier entry the registry row names, holding no judgment yet: the cognition read
-    // resolves `(collection, carrier_entry_id)` from the row and reads this entry through it.
     sqlx::query(
         "CREATE TABLE knowledge_entries (collection TEXT NOT NULL, entry_id TEXT NOT NULL, \
          revision INTEGER NOT NULL, payload TEXT NOT NULL, superseded_by TEXT, \
@@ -205,8 +199,6 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed the carrier entry");
-    // One committed judgment on the first Mind's carrier, and a second Mind whose carrier holds
-    // none: the cognition read is exercised on both sides of `mind_state: null`.
     sqlx::query(
         "CREATE TABLE cognition_records (collection TEXT NOT NULL, entry_id TEXT NOT NULL, \
          append_seq INTEGER NOT NULL, record_id TEXT NOT NULL, payload TEXT NOT NULL, \
@@ -265,8 +257,6 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed the fresh carrier entry");
-    // A Mind the probe's principal holds no grant in: the admission refusal is the same answer
-    // as a space that does not exist, so the read cannot disclose which one was named.
     sqlx::query(
         "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
          VALUES ('spc_3', 'ghost', 'ke_ghost')",
@@ -283,8 +273,6 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed the ghost grant");
-    // A Mind this principal is admitted to — it holds a live grant — but not to a
-    // `knowledge_read`: admission passes and the coverage check is the refusal that answers.
     sqlx::query(
         "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) \
          VALUES ('spc_4', 'ash', 'ke_ash')",
@@ -323,8 +311,6 @@ async fn registry_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .expect("seed the underprivileged carrier entry");
-    // The space rows admission reads: a live grant only ever belongs to a Mind whose space row
-    // and registry row were written with it.
     sqlx::query(
         "CREATE TABLE memory_spaces (space_id TEXT PRIMARY KEY, display_name TEXT, \
          authority_host_id TEXT NOT NULL, authority_generation INTEGER NOT NULL, \
@@ -899,8 +885,6 @@ async fn read_cognition_serves_a_judgment_or_a_null_state() {
         "the refusal is byte-equal across an unadmitted and an absent Mind"
     );
 
-    // Admitted (a live `recall` grant), but not to `knowledge_read`: the coverage refusal
-    // answers, and it must not be the target-free admission refusal.
     let uncovered = expect_reject(
         tool.call(
             READ_COGNITION,
@@ -1177,15 +1161,9 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
         }
 
         let mut arguments = minimal(&input, &input);
-        // `deliberate` and `read_cognition` both resolve a Mind from the request's `space_id`, so
-        // the manifest-shaped probe names the one Mind this harness seeds. `spc_1` satisfies the
-        // schema's `minLength` either way, so the shape check is unchanged.
         if matches!(capability_id, DELIBERATE | READ_COGNITION) {
             arguments["space_id"] = json!("spc_1");
         }
-        // The pre-check is charged against the request's budget, so this probe names a budget
-        // that a process-scheduled pre-check cannot spend: the probe measures the ABI, not the
-        // clock.
         if capability_id == DELIBERATE {
             arguments["timeout_ms"] = json!(30_000);
         }

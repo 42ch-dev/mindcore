@@ -268,6 +268,8 @@ job's existing Node.
   `NOT_AUTHORIZED`.
 - The addon is a workspace member but not a default member and not a dependency of any other
   crate, so a bare `cargo check` or `cargo test` at the workspace root does not build it.
+- Test seams are globals keyed by path and each test owns a fresh temporary root, so no reset runs
+  between tests; a reset would clobber a test still running.
 - The binding calls the Rust facade in-process and never the SPOKE FFI. A host that reaches a Mind
   through `spoke-connect`'s FFI instead is bounded by that layer's peer-only admission: SPOKE
   0.19.1 assembles a peer-only `KnowledgeAdmission` and its `knowledge_scope(peer_id)` has no

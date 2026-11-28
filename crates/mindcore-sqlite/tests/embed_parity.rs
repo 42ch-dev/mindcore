@@ -139,8 +139,6 @@ impl Harness {
         .execute(&harness.pool)
         .await
         .expect("seed subject grant");
-        // The registry row makes the fixture space a Mind `spaces.list` may
-        // list; the carrier entry the row references is seeded first.
         sqlx::query(
             "INSERT INTO knowledge_entries \
              (collection, entry_id, revision, payload, created_at, updated_at) \

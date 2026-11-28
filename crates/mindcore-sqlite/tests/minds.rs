@@ -183,8 +183,6 @@ async fn create_with_a_named_id_writes_space_carrier_record_and_grant() {
     tx.commit().await.expect("commit");
     assert_eq!(grants.len(), 1, "exactly one grant for the owner");
     let grant = &grants[0];
-    // The set the create default grant contract fixes, asserted independently of the constant
-    // the producer writes from: a dropped or renamed capability fails here.
     let specified: std::collections::BTreeSet<&str> = [
         "recall",
         "capture",
@@ -327,8 +325,6 @@ async fn a_taken_carrier_slot_leaves_no_row() {
             .create_mind(&request(Some("wren"), "caller_wren"))
             .await,
     );
-    // The slot and every other entry in the collection answer one refusal — the occupied
-    // collection — and its message never names the internal carrier id.
     assert_eq!(refused.code, SpokeRejectCode::InvalidInput);
     assert_eq!(
         refused
@@ -355,8 +351,6 @@ async fn a_taken_registry_row_leaves_no_row() {
     let store = open_store(&path).await;
     store.close().await;
 
-    // An orphan registry row: foreign keys are off on this pool, so the missing space and
-    // carrier do not refuse the insert.
     let raw = raw_pool(&path).await;
     sqlx::query(
         "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
@@ -416,8 +410,6 @@ async fn a_grant_named_like_a_mind_in_another_space_does_not_block_it() {
     )
     .await;
 
-    // The default grant id is minted independently: a grant in another space, even one named
-    // after this Mind, reserves nothing of the Mind's name.
     let mind = ok(store
         .create_mind(&request(Some("wren"), "caller_wren"))
         .await);
@@ -503,7 +495,6 @@ async fn list_answers_the_minds_the_caller_holds_a_live_grant_in() {
     assert_eq!(names(&ok(store.list_minds(&studio).await)), vec!["studio"]);
     assert!(ok(store.list_minds(&third).await).is_empty());
 
-    // A revoked grant no longer reaches its Mind.
     sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE space_id = ?")
         .bind(TIME)
         .bind("wren")
@@ -512,8 +503,6 @@ async fn list_answers_the_minds_the_caller_holds_a_live_grant_in() {
         .expect("revoke the wren grant");
     assert!(ok(store.list_minds(&wren).await).is_empty());
 
-    // An expired grant — the expiry spelled with a `+08:00` offset and in the past — reaches
-    // nothing.
     insert_grant(
         &pool,
         &grant_row(
@@ -526,7 +515,6 @@ async fn list_answers_the_minds_the_caller_holds_a_live_grant_in() {
     .await;
     assert!(ok(store.list_minds(&CallerId::new("caller_expired")).await).is_empty());
 
-    // A grant that expires in the future, spelled with a `+08:00` offset, is live.
     insert_grant(
         &pool,
         &grant_row(
@@ -542,7 +530,6 @@ async fn list_answers_the_minds_the_caller_holds_a_live_grant_in() {
         vec!["studio"]
     );
 
-    // One grant in each Mind lists both, in id order.
     insert_grant(
         &pool,
         &grant_row("grt_both_wren", "wren", "caller_both", None),
@@ -650,8 +637,6 @@ async fn a_populated_collection_is_refused_and_the_seed_survives() {
     let path = temp.path().join("mindcore.db");
     let store = open_store(&path).await;
     let pool = store.pool();
-    // A host-populated `mind:wren` collection with no wren space and no registry row: the new
-    // Mind must never claim entries it did not create.
     let mut tx = pool.begin().await.expect("begin");
     match write_entry(&mut tx, "mind:wren", plain_carrier("ke_foreign"), None).await {
         SpokeResult::Ok(_) => {}
@@ -705,9 +690,6 @@ async fn an_id_the_schema_cannot_hold_is_invalid_input() {
     let path = temp.path().join("mindcore.db");
     let store = open_store(&path).await;
 
-    // SQLite's `length()` counts up to the first NUL, so a NUL-leading id fails the registry's
-    // `length(space_id) > 0` check. The schema's refusal is invalid input, never an internal
-    // error.
     let refused = reject(
         store
             .create_mind(&request(Some("\0wren"), "caller_wren"))
@@ -724,8 +706,6 @@ async fn an_id_the_schema_cannot_hold_is_invalid_input() {
         "the refusal names the invalid id, not internal storage"
     );
 
-    // A very long id is one the schema can hold: neither the space key nor the registry check
-    // has a length cap, so creation succeeds.
     let long_id = "x".repeat(4096);
     let request = CreateMind {
         mind_id: Some(MindId::new(long_id.clone())),
@@ -792,8 +772,6 @@ async fn an_expired_grant_before_a_live_one_lists_the_mind_once() {
         .create_mind(&request(Some("wren"), "caller_wren"))
         .await);
 
-    // Two grants for one caller on one Mind: the earlier candidate in `grant_id` order is
-    // expired and a later one is live; the Mind is listed exactly once.
     insert_grant(
         &pool,
         &grant_row(
@@ -828,8 +806,6 @@ async fn two_live_grants_for_one_caller_list_the_mind_once() {
         .create_mind(&request(Some("wren"), "caller_wren"))
         .await);
 
-    // Two live grants for the same caller on the same Mind: without the adjacent-group
-    // de-duplication the Mind would be listed once per grant.
     insert_grant(
         &pool,
         &grant_row("grt_cc_recall", "wren", "caller_pair", None),
@@ -855,8 +831,6 @@ async fn a_grant_expiring_during_the_connection_wait_is_not_live() {
         .create_mind(&request(Some("wren"), "caller_wren"))
         .await);
 
-    // A grant that expires a few tens of milliseconds from now. A liveness decision taken before
-    // the read begins would still see it live after the wait; one taken per row must not.
     let expiry = (chrono::Utc::now() + chrono::Duration::milliseconds(40))
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
@@ -866,9 +840,6 @@ async fn a_grant_expiring_during_the_connection_wait_is_not_live() {
     )
     .await;
 
-    // The pool's one connection is held open by an unrelated borrower, so `list_minds` waits
-    // for its connection while the expiry passes; WAL readers are not lock-blocked, so the wait
-    // is purely the pool's.
     let (release, held) = tokio::sync::oneshot::channel::<()>();
     let (started_tx, mut started_rx) = tokio::sync::mpsc::channel::<()>(1);
     let blocker_pool = pool.clone();
@@ -883,8 +854,6 @@ async fn a_grant_expiring_during_the_connection_wait_is_not_live() {
         .await
         .expect("the blocker holds the connection");
 
-    // `list_minds` starts now, before the expiry; the borrower lets go after the expiry has
-    // passed, so the read's rows arrive with the grant already dead.
     let caller = CallerId::new("caller_wait");
     let releaser = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -912,7 +881,6 @@ async fn a_registered_carrier_cannot_be_superseded() {
         .await);
     let port = store.knowledge(mind.knowledge.clone());
 
-    // The successor exists in the same collection, exactly as the retirement sequence sets up.
     let mut tx = pool_begin(&store).await;
     match write_entry(&mut tx, "mind:wren", plain_carrier("ke_next"), None).await {
         SpokeResult::Ok(_) => {}
@@ -931,8 +899,6 @@ async fn a_registered_carrier_cannot_be_superseded() {
         Some(MIND_CARRIER_CANNOT_BE_SUPERSEDED)
     );
 
-    // The carrier stays readable and appendable: its revision advances through the ordinary
-    // knowledge write.
     let carrier = ok(port.get_knowledge_entry(CARRIER_ENTRY_ID).await);
     assert_eq!(carrier.revision, Some(1));
     let updated = ok(port.put_knowledge_entry(carrier.clone(), Some(1)).await);
@@ -971,7 +937,6 @@ async fn an_entry_in_an_unregistered_collection_still_supersedes() {
         .await);
     let port = store.knowledge(mindcore_base::knowledge::KnowledgeScope::new("unrelated"));
 
-    // The same entry id in a collection no Mind registers keeps the retirement behaviour.
     for entry_id in [CARRIER_ENTRY_ID, "ke_next"] {
         let mut tx = pool_begin(&store).await;
         match write_entry(&mut tx, "unrelated", plain_carrier(entry_id), None).await {
@@ -1015,9 +980,6 @@ async fn a_good_grant_after_an_undecodable_row_still_lists_the_mind() {
         .create_mind(&request(Some("wren"), "caller_wren"))
         .await);
 
-    // Replace the created grant with a bad row that sorts first and a good row that sorts after
-    // it. `expires_at` is selected by the visibility join; the blob cast stores bytes the driver
-    // cannot hand over as text.
     sqlx::query("DELETE FROM memory_grants WHERE space_id = 'wren'")
         .execute(&pool)
         .await
@@ -1053,7 +1015,6 @@ async fn a_good_grant_after_an_undecodable_row_still_lists_the_mind() {
         "the point read applies the same rule"
     );
 
-    // The served list's id read shares it.
     let mut tx = pool_begin(&store).await;
     assert_eq!(
         ok(mindcore_sqlite::minds::visible_mind_ids(&mut tx, "caller_wren").await),

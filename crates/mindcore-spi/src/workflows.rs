@@ -948,11 +948,6 @@ impl SpiMindWorkflows {
         lens: Option<&dyn DomainLens>,
         caps: &MindCapabilities<'_>,
     ) -> Result<DeliberateOutcome, SpiError> {
-        // The record's context is a trusted input resolved once, from the
-        // request alone: a request naming neither an explicit context nor a
-        // subject to derive one from is the caller's invalid input, whatever
-        // branch the verdict later takes. No provider or storage phase runs
-        // first, so a `none` verdict cannot make such a request succeed.
         if request.assessment_context_id.is_none() && request.subject_id.is_none() {
             return Err(SpiError::InvalidInput(
                 "the request names neither an assessment context nor a subject to derive it from"
@@ -1038,8 +1033,6 @@ impl SpiMindWorkflows {
         ensure_time_left(deadline)?;
         let Some(record) = record else {
             let judgment = deliberate_judgment(principal, request, "no_change", &verdict, &cited)?;
-            // No write follows, but a response built past the deadline is a
-            // phase that overran it; the check stays the last step either way.
             ensure_time_left(deadline)?;
             return Ok(DeliberateOutcome::NoChange { verdict, judgment });
         };
@@ -1064,10 +1057,6 @@ impl SpiMindWorkflows {
             }
             PolicyDecision::Reject { reason } => return Err(SpiError::PolicyRejected(reason)),
         }
-        // The whole response is built before the commit so a projection defect
-        // refuses while nothing is written (compass D18), and the deadline is
-        // checked after that work with nothing left to run before the write
-        // begins.
         let judgment = deliberate_judgment(principal, request, "settled", &verdict, &cited)?;
         let stored = serde_json::to_value(&record)
             .map_err(|error| SpiError::InvalidInput(error.to_string()))?;
@@ -1579,9 +1568,6 @@ fn stamp_cognition_record(
         .as_object()
         .cloned()
         .ok_or_else(|| invalid_verdict("the proposed record is not an object"))?;
-    // The record's context is a trusted input, never the model's: a request
-    // naming neither an explicit context nor a subject to derive one from is
-    // the caller's invalid input, not a verdict defect.
     let Some(context_id) = request.assessment_context_id.or(request.subject_id) else {
         return Err(SpiError::InvalidInput(
             "the request names neither an assessment context nor a subject to derive it from"

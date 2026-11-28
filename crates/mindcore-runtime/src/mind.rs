@@ -235,8 +235,6 @@ impl Mind {
             .capture(&mut transaction, &principal(&self.caller), request)
             .await;
         let body = match stage {
-            // Capture never journals: a non-Ready stage is a composition defect, answered
-            // before any state changes — nothing has committed, so the retry class holds.
             SpokeResult::Ok(MemoryStage::Ready(body)) => body,
             SpokeResult::Ok(unexpected) => {
                 drop(transaction);
@@ -252,7 +250,6 @@ impl Mind {
         if let Err(error) = transaction.commit().await {
             return uncertain(format!("capture committed an unknown outcome: {error}"));
         }
-        // Past the commit a malformed body is no longer retryable: rows may be durable.
         match serde_json::from_value(body) {
             Ok(response) => SpokeResult::Ok(response),
             Err(error) => uncertain(format!(
@@ -467,22 +464,6 @@ impl Mind {
             }
         };
 
-        // 1. Read the candidate's consumption status and revision as metadata. The answer
-        //    decides how the revision is established:
-        //    - A pending (or absent) candidate is fresh work: the facade reads it through the
-        //      adapter's `get_candidate`, whose withhold refuses while any intent of the
-        //      candidate's subject is unsettled — the refusal fresh reviews answered before
-        //      this facade ever probed receipts.
-        //    - A consumed candidate can only be a replay (settled receipt) or a retry of a
-        //      still-pending receipt, and a receipt is not subject content: the content
-        //      withhold must not gate it, so the revision is derived as metadata — exactly one
-        //      less than the consumed revision, because consumption is a candidate's only
-        //      revision bump and that is the only revision any recorded review payload for
-        //      this candidate can carry.
-        //    Admission itself does not move: `review_candidate` authorizes the write, probes
-        //    the receipt first and applies every fresh-work gate on its own. A same-key replay
-        //    is digest-identical, so either path can only rebuild the original
-        //    `expected_revision` — a wrong value can never reach a receipt.
         let status: Option<(i64, String)> = match sqlx::query_as(
             "SELECT revision, status FROM memory_candidates WHERE space_id = ? AND candidate_id = ?",
         )
@@ -501,8 +482,6 @@ impl Mind {
         let observed_revision = if consumed {
             status.map(|(revision, _)| u64::try_from(revision).unwrap_or(0))
         } else {
-            // Fresh work: the adapter's own content read, withhold included. A refusal is the
-            // adapter's own and rolls the transaction back.
             let observed = self
                 .adapter
                 .get_candidate(
@@ -539,18 +518,7 @@ impl Mind {
                 }
             }
         };
-        // No row at all: revision 1, the candidate's fresh-work value —
-        // `review_candidate` answers its own `NotFound` for a candidate that never existed.
         let revision = observed_revision.unwrap_or(1);
-        // 2. Stage on the same transaction. The adapter's dedup probe keys on
-        //    (space, requester, operation, idempotency_key) and digests the whole payload, so
-        //    a same-key replay must rebuild a byte-identical request to reach the recorded
-        //    receipt. A consumed candidate's pre-consumption revision is exactly one less —
-        //    consumption is a candidate's only revision bump — and that is the only revision
-        //    any recorded review payload for this candidate can carry; a still-pending
-        //    candidate (including one imported at a non-1 revision) stages at its own live
-        //    revision. A different decision under one key still changes the digest and stays
-        //    an `IdempotencyConflict`.
         let expected_revision = if consumed {
             revision.saturating_sub(1).max(1)
         } else {
@@ -578,12 +546,7 @@ impl Mind {
             )
             .await;
         enum Staging {
-            // The fold staged a fresh decision on this transaction: it owns the staging and
-            // must commit it after publication.
             Fresh { receipt_id: String },
-            // A repeat met its own still-pending receipt: the staging is already durable, the
-            // transaction is read-only for what follows, and the fold continues to publication
-            // and settlement rather than answering the uncertain outcome again.
             PendingRetry { receipt_id: String },
         }
         let staging = match stage {
@@ -606,10 +569,6 @@ impl Mind {
                 ));
             }
             SpokeResult::Reject(reject) if reject.code == SpokeRejectCode::OutcomeUncertain => {
-                // The only uncertain answer `review_candidate` can give is its own replay
-                // probe finding this key's receipt still pending. That is the recovery path:
-                // resolve the key to the receipt and continue the fold — publish, then
-                // settle — instead of answering the uncertain outcome forever.
                 let key = ReceiptKey {
                     space: space.clone(),
                     requester: mindcore_base::boundary::CallerId::new(self.caller.as_str()),
@@ -640,7 +599,6 @@ impl Mind {
             Staging::PendingRetry { receipt_id } => (receipt_id, false),
         };
 
-        // 3. Read the staged intent on the same transaction for the targets it owes.
         let intent = match SqliteMemoryRepository
             .journal_intent(&mut transaction, &space, &receipt_id)
             .await
@@ -658,15 +616,6 @@ impl Mind {
             }
         };
 
-        // 4. Publish before the staging is durable, off the async worker: the publisher writes
-        //    and fsyncs synchronously, so it runs on the blocking pool while the handle's task
-        //    awaits it — unrelated executor work stays schedulable for the whole flush. The
-        //    transaction itself moves into the blocking task and comes back with the result,
-        //    so a caller that drops the review future can never release the writer before the
-        //    started publication ends: a same-key retry's own transaction waits for the first
-        //    one's rollback, and the two attempts can never publish side by side. Nothing
-        //    commits before the publisher has confirmed, a refusal rolls everything back, and
-        //    the publisher's own `SpiError::Settlement` refusal travels unchanged.
         let publish_targets = intent.targets.clone();
         let publish = {
             let publisher = Arc::clone(publisher);
@@ -690,11 +639,6 @@ impl Mind {
             };
         }
 
-        // 5. Commit the staging — a fresh fold's own; a pending retry's is already durable, so
-        // its transaction is only dropped — then settle the receipt on a second
-        // immediate-write transaction. A failure from here leaves a pending intent and answers
-        // `OUTCOME_UNCERTAIN`, as the served surface does, and a same-key repeat resumes at
-        // this settlement leg rather than re-staging.
         if fresh {
             if let Err(error) = transaction.commit().await {
                 return uncertain(format!(
