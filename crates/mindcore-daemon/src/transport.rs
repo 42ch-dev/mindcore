@@ -212,16 +212,9 @@ impl UnixSocketTransport {
         // never be skipped — it is what tells the peer the stream ended and what makes a parked
         // `write_all` fail — so it goes first and is unaffected by a `SHUT_RD` refusal after it.
         unsafe {
-            // A peer that already tore its side down answers `NotConnected`, which is the state
-            // this call is asking for anyway; any other error still leaves the transport closed,
-            // which is what `close` promises.
             let _ = libc::shutdown(self.fd, libc::SHUT_WR);
-            // Wake a parked read. This too may be refused on a half-closed socket; the read half's
-            // pending `recv` still fails, because `recv` watches the closed signal.
             let _ = libc::shutdown(self.fd, libc::SHUT_RD);
         }
-        // Published after the call, under the lock: a waiter that reads `true` learns the socket is
-        // really shut, not that a shutdown is under way.
         self.shutdown_done.store(true, Ordering::SeqCst);
     }
 
@@ -267,7 +260,6 @@ impl UnixSocketTransport {
 
         let len = u32::from_be_bytes(prefix);
         if len == 0 || len > MAX_FRAME {
-            // The body stays in the socket: nothing is read after a length this size rejects.
             self.terminate().await;
             return Err(TransportError::Io(format!(
                 "frame length {len} outside 1..={MAX_FRAME}; body not read"
@@ -307,7 +299,6 @@ impl Transport for UnixSocketTransport {
             )));
         }
 
-        // Prefix and body under one lock: a concurrent send waits for both.
         let mut writer = self.writer.lock().await;
         // `close` may have returned while this send waited for the lock; it must not write now.
         if self.is_closed() {
@@ -390,7 +381,6 @@ mod tests {
         });
         let dialer = UnixSocketTransport::connect(&path).await.expect("connect");
         let accepted = accept.await.expect("accept task");
-        // The tempdir goes with `bound`; the connected pair does not need the name.
         (dialer, accepted)
     }
 
@@ -400,22 +390,18 @@ mod tests {
     async fn a_peer_closing_at_a_frame_boundary_fires_the_closed_signal() {
         let (dialer, accepted) = session().await;
 
-        // One whole frame, then the dialer goes away mid-boundary.
         dialer.send(b"last words").await.expect("send a frame");
         assert_eq!(
             accepted.recv().await.expect("the frame arrives"),
             b"last words".to_vec()
         );
 
-        // Clean disconnect: no partial prefix, so the next read is an EOF at a boundary.
         dialer.close().await.expect("close the dialer");
 
-        // The server side reports `Closed` rather than a framing fault.
         match accepted.recv().await {
             Err(TransportError::Closed) => {}
             other => panic!("an orderly EOF answers Closed, not {other:?}"),
         }
-        // And the signal the connection task awaits actually fires.
         assert_closed(&accepted).await;
     }
 
@@ -433,7 +419,6 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match peer.read(&mut buf).await {
-                    // Drain whatever was already buffered until the stream ends.
                     Ok(0) => return Ok(()),
                     Ok(_) => continue,
                     Err(error) => return Err(error),
@@ -451,8 +436,6 @@ mod tests {
 
         for size in [1usize, 1024, 1024 * 1024] {
             let envelope: Vec<u8> = (0..size).map(|offset| (offset % 251) as u8).collect();
-            // Send and receive together: a body larger than the socket buffer only completes
-            // when the peer drains it.
             let (sent, received) = tokio::join!(dialer.send(&envelope), accepted.recv());
             sent.expect("send");
             assert_eq!(
@@ -469,8 +452,6 @@ mod tests {
         let big = vec![7u8; 64 * 1024];
         let small = vec![9u8; 3];
 
-        // All three at once: a body larger than the socket buffer only drains because the
-        // receives run alongside the sends.
         let (first, second, (one, two)) =
             tokio::join!(dialer.send(&big), dialer.send(&small), async {
                 (accepted.recv().await, accepted.recv().await)
@@ -478,7 +459,6 @@ mod tests {
         first.expect("first send");
         second.expect("second send");
 
-        // The order is whichever send took the write lock first; the frames are whole either way.
         let mut frames = vec![one.expect("first frame"), two.expect("second frame")];
         frames.sort_by_key(Vec::len);
         assert_eq!(frames, vec![small, big], "each send is one intact frame");
@@ -489,7 +469,6 @@ mod tests {
         let (mut peer, accepted) = UnixStream::pair().expect("pair");
         let transport = UnixSocketTransport::from_stream(accepted);
 
-        // A zero length and a body the transport must never read.
         peer.write_all(&0u32.to_be_bytes()).await.expect("prefix");
         peer.write_all(b"body that must stay unread")
             .await
@@ -570,7 +549,6 @@ mod tests {
         let (mut peer, accepted) = UnixStream::pair().expect("pair");
         let transport = UnixSocketTransport::from_stream(accepted);
 
-        // A well-formed length whose body never arrives in full.
         peer.write_all(&10u32.to_be_bytes()).await.expect("prefix");
         peer.write_all(b"abc").await.expect("part of the body");
         peer.shutdown().await.expect("hang up");
@@ -761,7 +739,6 @@ mod tests {
         })
         .await;
 
-        // A dialer's frame sits in the loopback channel; the gated responder must not read it.
         let client = pair.client;
         client
             .send(&serde_json::to_vec(&serde_json::json!({"op": "hello"})).expect("frame"))
@@ -799,7 +776,6 @@ mod tests {
             let gated = Arc::clone(&gated);
             tokio::spawn(async move { gated.recv().await })
         };
-        // Let the task reach the gate, so this is the parked case and not a race.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !waiting.is_finished(),
