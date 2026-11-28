@@ -292,8 +292,6 @@ impl SqliteHistoryDedupStore {
             .await
             .map(|result| result.rows_affected()),
         };
-        // `Ok(0)` is not a failure: the row was already settled or never claimed, and a settled
-        // outcome must never be deleted by a release path. Only a statement fault is diagnosed.
         if let Err(error) = released {
             let _ = writeln!(
                 std::io::stderr(),
@@ -348,8 +346,6 @@ impl SqliteHistoryDedupStore {
 #[async_trait]
 impl HistoryDedupStore for SqliteHistoryDedupStore {
     async fn lookup(&self, key: &str) -> HistoryDedupLookup {
-        // A key that names no Mind, a Mind with no registry row, and a registry fault all keep
-        // the prune out of the port: `Evicted` is Connect's `RECEIPT_EXPIRED`.
         let namespace = match namespace_of(&self.pool, key).await {
             Ok(Some(namespace)) => namespace,
             Ok(None) => return HistoryDedupLookup::Evicted,
@@ -360,11 +356,6 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             Err(error) => return fault("claim", error),
         };
         let principal = principal_of(key);
-        // Claim and read on the same connection: the insert decides whether the row is this
-        // caller's, and the read shows what the row holds — `NULL`s for a claim still in flight.
-        // The insert is also the capacity gate: a principal already at the bound takes no new row,
-        // so an unseen key stays unseen here and the read below answers `Evicted`. An existing key
-        // is unaffected either way, so a replay still finds its recorded outcome at the bound.
         let claimed = match sqlx::query(
             "INSERT INTO history_dedup (namespace, key, principal) SELECT ?, ?, ? \
              WHERE (SELECT COUNT(*) FROM history_dedup \
@@ -383,20 +374,11 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             Ok(result) => result.rows_affected() == 1,
             Err(error) => return fault("claim", error),
         };
-        // The follow-up read. `outcome_read` is where the test seam can make this statement fail
-        // after the claim above has already landed.
         let stored = self.outcome_read(&namespace, key, &mut conn).await;
         let row = match stored {
             Ok(row) => row,
             Err(error) => {
-                // This call inserted the claim a moment ago, so answering `Evicted` here would
-                // spend the key on a statement that never ran: every later retry would read the
-                // claim back as `RECEIPT_EXPIRED`. Release what this call took and keep the key
-                // claimable. Release only when the insert was ours — another caller's row, and a
-                // settled row, are not this call's to remove; the guarded delete enforces both.
                 if claimed {
-                    // The pool holds one connection and this call is holding it: releasing is a
-                    // statement of its own, so the claim's connection goes back first.
                     drop(conn);
                     self.release_claim(key).await;
                 }
@@ -407,8 +389,6 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
             return HistoryDedupLookup::Unseen;
         }
         match row {
-            // Another caller's unanswered claim, one the process never settled, or an unseen key
-            // the namespace had no room to claim.
             Some((None, None)) | None => HistoryDedupLookup::Evicted,
             Some((Some(payload_digest), Some(outcome_json))) => match decode_outcome(&outcome_json)
             {
@@ -418,29 +398,19 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
                 }),
                 None => HistoryDedupLookup::Evicted,
             },
-            // The `CHECK` keeps the two columns in step; a row that breaks it is not an outcome
-            // this store wrote, so it never replays.
             Some(_) => HistoryDedupLookup::Evicted,
         }
     }
 
     async fn record(&self, key: &str, record: HistoryDedupRecord) {
-        // `lookup` answered `Evicted` for these keys, so no prune ran and no outcome exists to
-        // settle: nothing to write, and nothing to tell the caller.
         let namespace = match namespace_of(&self.pool, key).await {
             Ok(Some(namespace)) => namespace,
             Ok(None) => return,
-            // The prune may have committed and this read is what would have settled it. A
-            // registry fault is not "nothing to settle", so it takes the unsettled path.
             Err(reject) => {
                 self.release_claim(key).await;
                 outcome_not_settled(reject.message);
             }
         };
-        // A fault is not the key's settled answer: it says the working could not be carried out, so
-        // recording it would make one transient failure permanent for this retry identity. The claim
-        // is released and the caller is answered the uncertain outcome. See [`is_storage_fault`] for
-        // the rule and why it reads the code rather than the text.
         if let SpokeResult::Reject(reject) = &record.outcome {
             if is_storage_fault(reject.code) {
                 self.release_claim(key).await;
@@ -453,11 +423,6 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         }
         let outcome_json = encode_outcome(&record.outcome);
         let principal = principal_of(key);
-        // Only fill a claim `lookup` already inserted: the `EXISTS` gate is the whole condition.
-        // A trait caller that records without a claim writes nothing, so it can neither insert an
-        // outcome for a key no prune ran under nor grow the table; claim capacity is `lookup`'s,
-        // which refuses an unseen key at the bound. The upsert still replaces an outcome the same
-        // key already recorded.
         let written = sqlx::query(
             "INSERT INTO history_dedup (namespace, key, principal, payload_digest, outcome_json) \
              SELECT ?, ?, ?, ?, ? \
@@ -476,10 +441,6 @@ impl HistoryDedupStore for SqliteHistoryDedupStore {
         .execute(&self.pool)
         .await;
         if let Err(error) = written {
-            // The statement never settled the outcome, so the caller must not be told its prune
-            // succeeded: see [`outcome_not_settled`] for the channel and the reason. The claim is
-            // released first, so a retry once the store is writable again can execute rather than
-            // reading this failure back as `RECEIPT_EXPIRED`.
             self.release_claim(key).await;
             outcome_not_settled(error);
         }
@@ -806,7 +767,6 @@ mod tests {
         let (store, dedup) = open(&dir).await;
         let key = key_for("prn_one", "key-one");
         dedup.lookup(&key).await;
-        // Both keys parse, so the record must not be replayed as either variant.
         install_outcome(
             &store,
             &key,
@@ -822,7 +782,6 @@ mod tests {
         let (store, dedup) = open(&dir).await;
         let key = key_for("prn_one", "key-one");
         dedup.lookup(&key).await;
-        // A well-formed reject plus a member this module never writes.
         install_outcome(
             &store,
             &key,
@@ -857,7 +816,6 @@ mod tests {
         assert_eq!(row_count(&store, COLLECTION).await, 1);
         assert_eq!(row_count(&store, OTHER_COLLECTION).await, 1);
 
-        // The second Mind's own outcome never reaches the first.
         let other = record("digest-mora", SpokeResult::Ok(json!({ "deleted": 4 })));
         dedup.record(&second, other.clone()).await;
         assert_eq!(recorded(dedup.lookup(&first).await, "still wren"), written);
@@ -896,7 +854,6 @@ mod tests {
             "the refused claim inserted no row"
         );
 
-        // `record` writes nothing for a key no claim covers, at the bound or anywhere else.
         dedup
             .record(
                 &key_for("prn_one", "key-unclaimed"),
@@ -908,7 +865,6 @@ mod tests {
             HISTORY_DEDUP_CAPACITY
         );
 
-        // A recorded outcome inside the quota still replays at the bound.
         assert_eq!(
             recorded(
                 dedup.lookup(&key_for("prn_one", "key-0")).await,
@@ -917,7 +873,6 @@ mod tests {
             record("digest", SpokeResult::Ok(json!({ "deleted": 0 })))
         );
 
-        // Another Mind has its own bound and keeps working.
         assert_eq!(
             dedup
                 .lookup(&key_in(OTHER_MIND, "prn_one", "key-overflow"))
@@ -996,7 +951,6 @@ mod tests {
             "no timestamp column exists for a clock jump to age out"
         );
 
-        // Nothing deletes: the record still replays after the file is reopened.
         assert_eq!(recorded(dedup.lookup(&key).await, "before reopen"), written);
         drop(dedup);
         let (_store, reopened) = open(&dir).await;
@@ -1021,7 +975,6 @@ mod tests {
         let key = key_for("prn_one", "key-one");
         assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
 
-        // Refuse only the settled write: a row carrying an outcome never lands.
         sqlx::query(
             "CREATE TRIGGER refuse_settlement BEFORE UPDATE ON history_dedup \
              WHEN NEW.payload_digest IS NOT NULL \
@@ -1043,15 +996,12 @@ mod tests {
                     .await
             })
         };
-        // Connect's own channel: the served invoke runs in a detached task, so a panic drops the
-        // result oneshot and the responder answers `OUTCOME_UNCERTAIN` (`responder.rs:2286-2300`).
         let joined = settle.await;
         let join = match joined {
             Ok(()) => panic!("a failed settlement returned normally, which reads as success"),
             Err(join) => join,
         };
         assert!(join.is_panic(), "the settlement fault aborted the invoke");
-        // The panic text is the host-side diagnostic; it never becomes wire bytes.
         let message = join
             .into_panic()
             .downcast_ref::<String>()
@@ -1062,15 +1012,11 @@ mod tests {
             "the fault names its stage for the host's log: {message}"
         );
 
-        // No phantom success, and no spent key either: the claim is released, so the key can be
-        // claimed again and a retry can execute once the store is writable.
         assert_eq!(
             row_count(&store, COLLECTION).await,
             0,
             "the failed settlement neither wrote an outcome nor left a claim"
         );
-        // With the trigger gone the retry claims fresh and executes. The fault this test installs
-        // refuses updates, not inserts, so the claim path is open throughout.
         sqlx::query("DROP TRIGGER refuse_settlement")
             .execute(&store.pool())
             .await
@@ -1122,8 +1068,6 @@ mod tests {
         let key = key_for("prn_one", "key-one");
         assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
 
-        // What `record` receives when the grant read, the route or a store statement failed: the
-        // store's own `internal` answer, which is the whole fault vocabulary of this path.
         let faulted = record(
             "digest",
             SpokeResult::Reject(SpokeReject {
@@ -1153,8 +1097,6 @@ mod tests {
             "the fault was neither written as the key's outcome nor left as a claim"
         );
 
-        // The fault clears and the same key claims fresh, executes, and settles. This is the whole
-        // point of releasing rather than retaining: `Evicted` here would mean the key was spent.
         assert_eq!(
             dedup.lookup(&key).await,
             HistoryDedupLookup::Unseen,
@@ -1218,7 +1160,6 @@ mod tests {
         let dedup = Arc::new(dedup);
         let key = key_for("prn_one", "key-one");
         assert_eq!(dedup.lookup(&key).await, HistoryDedupLookup::Unseen);
-        // The claim landed; now the registry read `record` makes cannot run.
         sqlx::query("DROP TABLE minds")
             .execute(&store.pool())
             .await
@@ -1241,8 +1182,6 @@ mod tests {
             Err(join) => join,
         };
         assert!(join.is_panic(), "the settlement fault aborted the invoke");
-        // `lookup` on the same broken registry keeps the prune out of the port rather than
-        // reporting a namespace it could not read.
         assert_eq!(
             dedup.lookup(&key).await,
             HistoryDedupLookup::Evicted,
@@ -1278,8 +1217,6 @@ mod tests {
             "the claim this call inserted was released, not left to spend the key"
         );
 
-        // The fault clears: the same key claims fresh and can execute. Without the release this
-        // read answers Evicted forever, because the claim the failed lookup left is still there.
         dedup.read_is_healthy_again();
         assert_eq!(
             dedup.lookup(&key).await,
@@ -1306,8 +1243,6 @@ mod tests {
         let written = record("digest", SpokeResult::Ok(json!({ "deleted": 3 })));
         dedup.record(&key, written.clone()).await;
 
-        // The guarded delete is the same statement a release runs; against a settled row it must
-        // match nothing.
         dedup.release_claim(&key).await;
         assert_eq!(
             recorded(dedup.lookup(&key).await, "a release cannot un-settle a key"),
@@ -1475,7 +1410,6 @@ mod tests {
         );
         assert_eq!(row_count(&store, OTHER_COLLECTION).await, 0);
 
-        // The other Mind is empty, so the same principal's quota there is untouched.
         assert_eq!(
             dedup
                 .lookup(&key_in(OTHER_MIND, "prn_one", "key-fresh"))

@@ -140,9 +140,6 @@ impl MindcoreServe {
     /// Asynchronous because the adoption source is checked against the registry: the source must
     /// not collide with any Mind that exists at assembly.
     pub async fn surface(&self, faces: ServeFaces) -> SpokeResult<MindcoreSurface> {
-        // Both history ops admit through the knowledge face's callbacks, so a history face
-        // without the knowledge face has no admission to run. No port is built and no
-        // registration is derived before this answer.
         if faces.history && !faces.knowledge {
             return SpokeResult::Reject(SpokeReject {
                 code: SpokeRejectCode::InvalidInput,
@@ -170,8 +167,6 @@ impl MindcoreServe {
                 .into_iter()
                 .filter(|tool| !reserved.contains(&tool.descriptor.capability_id.as_str())),
         );
-        // One routed store, two port roles: the knowledge face's storage port and the history
-        // face's wrapped port, so both resolve the same Mind to the same collection.
         let routed = faces
             .knowledge
             .then(|| Arc::new(self.store.served_knowledge()));
@@ -231,8 +226,6 @@ impl MindcoreServe {
         if route.source.collection.is_empty() {
             return invalid_input("the adoption source names an empty collection");
         }
-        // The face admits through the knowledge face's callbacks and needs its co-capability, so
-        // a route without that face has no admission to run.
         if !faces.knowledge {
             return invalid_input("ServeFaces.adoption requires ServeFaces.knowledge");
         }
@@ -338,8 +331,6 @@ impl MindcoreServe {
                 },
             ))
         });
-        // The peer-only admission Connect requires first never answers: `with_scoped_admission`
-        // replaces it in place, and this callback is the one the responder calls.
         let peer_only: HistoryAdmission = Arc::new(no_peer_only_admission);
         Arc::new(
             HistoryPortService::new(port, peer_only)
@@ -377,8 +368,6 @@ impl MindcoreServe {
                     SpokeResult::Ok(admitted) => admitted,
                     SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
                 };
-            // Synchronous callback on Connect's blocking pool, like `admit_peer`: the grant read
-            // takes its own transaction and is rolled back, so admission never writes.
             let granted = admit_adoption_grant(&admission_pool, &principal.principal_id, &scope_id);
             if let SpokeResult::Reject(reject) = granted {
                 return SpokeResult::Reject(reject);
@@ -411,8 +400,6 @@ impl MindcoreServe {
 /// It is not one atomic step with any later write; the port re-checks on the transaction that
 /// writes. This read exists so no path reaches a recorded outcome without it.
 fn admit_adoption_grant(pool: &SqlitePool, principal: &str, scope_id: &str) -> SpokeResult<()> {
-    // Synchronous because Connect's admission is, like `admit_peer`: the responder runs the
-    // callback on its blocking pool, where `block_on` is legal on a multi-thread runtime.
     Handle::current().block_on(async {
         let mut transaction = match pool.begin().await {
             Ok(transaction) => transaction,
@@ -489,24 +476,13 @@ fn admit_peer(
     peer_id: &str,
     selector: Option<&str>,
 ) -> SpokeResult<(Principal, String)> {
-    // Step one passes the host's own rejection through as it is — the admission rule the plan
-    // states for this callback. The host callback is the host's to classify; only the Mind
-    // admission below can tell a refusal from a storage fault on grounds this face owns.
     let principal = match principals(peer_id) {
         SpokeResult::Ok(principal) => principal,
         SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
     };
-    // A selector is what the request asked for, never a grant. No selector names no Mind, and the
-    // empty id no Mind carries makes admission refuse it through the one `admitted_mind` rule
-    // rather than a second spelling of it.
     let scope_id = selector.unwrap_or_default();
-    // Synchronous because Connect's admission is; the responder runs it on the blocking pool,
-    // where `block_on` is legal on a multi-thread runtime.
     let admitted =
         Handle::current().block_on(admitted_mind(pool, &principal.principal_id, scope_id));
-    // Every refusal step — no live grant, an unadmitted or unknown Mind, no space row, no registry
-    // row — answers the one target-free value. Anything else here is a storage fault and must not
-    // be answered as that refusal.
     match admitted {
         Ok(_) => SpokeResult::Ok((principal, scope_id.to_string())),
         Err(reject) if is_mind_admission_refusal(&reject) => SpokeResult::Reject(reject),
@@ -762,12 +738,6 @@ fn face_capabilities(
         }
     }
     if knowledge {
-        // Without the marker a per-Mind face could not serve a scoped `get` or `put` at all.
-        // `ke-ownership` is deliberately not advertised: the admitted scope always carries
-        // `viewpoint: None`, so a request naming one can never match it. With the flag never
-        // offered, no session can negotiate it, so Connect's ownership conjunct refuses such a
-        // request — wire `op_unsupported` — before admission runs. Advertising the flag would
-        // claim a capability this face cannot honour.
         capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE.to_string());
         capabilities.push(CAPABILITY_SPOKE_KNOWLEDGE_SCOPED.to_string());
     }
@@ -795,8 +765,6 @@ fn derive_manifest(
         .iter()
         .any(|tool| tool.descriptor.capability_id.as_str() == tools::DELIBERATE)
     {
-        // `spoke-judgment` gates no op: it is advertised exactly when the tool that carries a
-        // `Judgment` is registered, and never stands in for one.
         manifest
             .capabilities
             .push(CAPABILITY_SPOKE_JUDGMENT.to_string());
