@@ -60,8 +60,6 @@ pub fn journal_dir(
                 .ok_or_else(|| {
                     SpiError::InvalidInput(format!("journal target {path} carries no content"))
                 })?;
-            // The spelling check is refused before any filesystem effect: an absolute path
-            // or one carrying `..` would escape `root` under `join`, whatever it names.
             let confined = !Path::new(path).is_absolute()
                 && Path::new(path)
                     .components()
@@ -74,25 +72,14 @@ pub fn journal_dir(
             let file = root.join(path);
             let parent = match file.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-                // A target at the publisher root has the root itself as its parent: the
-                // spelling check above has already erased any `.` components, so the empty
-                // parent is reached only when the target names one plain file.
                 _ => root.clone(),
             };
-            // The root is the host's: it must already exist — durable — before the first
-            // publication. The publisher never creates it, because the entry that names it
-            // lives in its parent and only the host can establish that durability.
             if std::fs::symlink_metadata(&root).is_err() {
                 return Err(SpiError::InvalidInput(format!(
                     "journal root {} does not exist: the host must create it — durable — before publication",
                     root.display()
                 )));
             }
-            // Symlink escape, refused before anything is created — but only where a symlink
-            // can exist: inside the root. The deepest pre-existing component strictly within
-            // the root is canonicalized and must resolve inside the canonical root; a target
-            // whose parent sits in a freshly creatable subtree has no symlink to escape
-            // through yet, and its containment is the post-creation check's job.
             let anchor = deepest_existing_ancestor(&parent);
             if anchor != root && anchor.starts_with(&root) {
                 let canonical_root = root.canonicalize().map_err(|error| {
@@ -118,10 +105,6 @@ pub fn journal_dir(
                     "the directory for {path} could not be created: {error}"
                 )))
             })?;
-            // Resolution after creation: every component of the parent now exists, so its
-            // canonical form must sit inside the canonical root — a symlink introduced at the
-            // destination or resolved differently by the creating platform is refused before
-            // the first byte is written.
             let canonical_root = root.canonicalize().map_err(|error| {
                 SpiError::Settlement(spoke_reject(format!(
                     "the journal root {} could not be resolved: {error}",
@@ -139,14 +122,6 @@ pub fn journal_dir(
                     "journal target {path} resolves outside the journal root"
                 )));
             }
-            // The write itself can never follow a symlink at the target: the bytes land in a
-            // temporary file inside the target's own directory, are synced there, and the
-            // `rename` then replaces the target entry atomically — rename swaps the directory
-            // entry, it never follows what the entry points to, so a symlink swapped in at any
-            // moment before it is replaced itself rather than written through. An existing
-            // regular file is the retry of this target's earlier write and is replaced with
-            // the identical bytes; any other pre-existing non-file entry is refused first, so
-            // a directory or device node can never be clobbered by the rename.
             if let Ok(metadata) = std::fs::symlink_metadata(&file) {
                 if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
                     return Err(SpiError::InvalidInput(format!(
@@ -167,11 +142,6 @@ pub fn journal_dir(
                     hasher.finish()
                 }
             ));
-            // The temporary itself is created exclusively: `create_new` fails on any existing
-            // entry — a pre-planted symlink included — and otherwise creates a fresh regular
-            // file, so the write can never follow a symlink at the temporary name either. A
-            // leftover regular file is this target's own crashed attempt and is removed before
-            // the retry; a symlink or any other entry is refused.
             let mut attempts = 0u32;
             let mut temporary_file = loop {
                 match std::fs::OpenOptions::new()
@@ -228,17 +198,6 @@ pub fn journal_dir(
                     "journal target {path} could not be renamed into place: {error}"
                 )))
             })?;
-            // Durability, not visibility: the write must reach the medium before the caller
-            // may settle the intent. The temporary's contents were synced before the rename;
-            // what remains is the directory entries. The chain is computed from the *resolved*
-            // parent, not the lexical one: a symlink inside the root can redirect the target
-            // (`root/records` → `root/backing/nested`), and walking the lexical spelling's
-            // `parent()` would sync the resolved directory and the root but skip the real
-            // intermediate (`backing`) whose entry names `nested`. Parentage is a real-tree
-            // relation, so canonicalizing the parent and walking up to the canonical root
-            // syncs exactly the directories whose entries carry what the publication created
-            // or wrote into — a symlink never re-parents an entry, so the resolved chain is
-            // the complete one, whether or not any component was a symlink.
             let mut cursor = Some(resolved.clone());
             while let Some(directory) = cursor {
                 std::fs::File::open(&directory)
@@ -284,8 +243,6 @@ fn deepest_existing_ancestor(path: &Path) -> PathBuf {
         }
         match cursor.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => cursor = parent.to_path_buf(),
-            // The current directory for a relative path, the filesystem root for an absolute
-            // one: both always exist.
             _ => return cursor,
         }
     }
