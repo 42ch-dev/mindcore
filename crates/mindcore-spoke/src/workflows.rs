@@ -79,10 +79,6 @@ async fn admit_carrier_location(
     if !rows.iter().any(|row| admission::live_grant(row, now)) {
         return Err(Reject::admission_refusal().into_spoke());
     }
-    // The space row is the plan's second step, and it is what `admit_mind` itself checks: a grant
-    // outlives its space only if the space row is deleted underneath it, which the store never
-    // does — a Mind's space row, registry row and carrier entry are written in one transaction.
-    // Keeping the read makes this path refuse exactly the Minds `admit_mind` refuses.
     let space_row = SqliteMemoryRepository
         .space(tx, space)
         .await
@@ -1230,9 +1226,6 @@ impl WorkflowBinding for MemoryWorkflowBinding {
                 "deliberation read transaction could not begin: {error}"
             ))
         })?;
-        // With no subject there is no page to read: the space-level revalidation
-        // and unsettled-intent check stand in place of the subject page's own
-        // admission and withhold, and the snapshot serves an empty memory page.
         let records = match subject_id {
             Some(subject_id) => {
                 let records = ready(
@@ -1303,12 +1296,6 @@ impl WorkflowBinding for MemoryWorkflowBinding {
         deadline: std::time::Instant,
     ) -> Result<u64, SpiError> {
         self.require_bound_carrier(space_id, holder)?;
-        // The pool holds one connection in production, so an acquire can wait
-        // for another statement indefinitely: the request deadline bounds that
-        // wait, and a connection in hand is re-checked before the begin. Both
-        // refusals start no write; a transaction already begun keeps its
-        // outcome, and the write-lock wait inside the begin is outside this
-        // bound.
         let mut connection =
             tokio::time::timeout_at(tokio::time::Instant::from(deadline), self.pool.acquire())
                 .await

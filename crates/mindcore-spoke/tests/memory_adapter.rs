@@ -4621,7 +4621,6 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
             format!("grants.list in {space}"),
             serde_json::json!(refusal.message),
         ));
-        // The mutation path enters admission through `authorize`.
         let mutation = adapter
             .capture(
                 &mut tx,
@@ -4664,8 +4663,6 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
         "every refusal in every case is byte-equal: {envelopes:?}"
     );
 
-    // A granted caller in the frozen Mind is served a read: freeze gates
-    // writes, never reads.
     sqlx::query(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
@@ -4768,8 +4765,6 @@ async fn spaces_list_returns_only_admitted_minds() {
     );
     assert_eq!(body["next_cursor"], Value::Null);
 
-    // The frozen Mind is not admission-listed for the other owner, whose own
-    // Mind is the whole of its list.
     let other = ready(
         adapter
             .list_spaces(&mut tx, &principal("o_other"), json!({}))
@@ -4783,8 +4778,6 @@ async fn spaces_list_returns_only_admitted_minds() {
         .collect();
     assert_eq!(other_ids, ["mind_gamma"]);
 
-    // The caller's live grant in `SPACE` still admits it to memory operations,
-    // but the space carries no registry row, so the list never names it.
     let own = ready(
         adapter
             .list_spaces(&mut tx, &principal(PRINCIPAL), json!({}))
@@ -4872,7 +4865,6 @@ async fn a_strangers_malformed_grant_row_cannot_leak_a_mind() {
         "the existing space with a stranger's malformed row and an absent space are one answer"
     );
 
-    // The caller's own live grant admits it; the stranger's row is never decoded on its behalf.
     harness.seed_grant(PRINCIPAL, &["recall"]).await;
     let mut tx = harness.begin().await;
     let pack = ready(
@@ -4963,7 +4955,6 @@ async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
         "a Mind admission would refuse through an undecodable row is not listed"
     );
 
-    // The refusal the list's rule mirrors: admission reads no row it cannot decode.
     let broken = adapter
         .recall(
             &mut tx,
@@ -4979,9 +4970,6 @@ async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
         "the skipped Mind answers the admission refusal"
     );
 
-    // The mixed set agrees with the list: the Mind with one broken and one live decodable row is
-    // listed above and served here, because admission skips the row it cannot decode exactly as
-    // the visibility read does.
     let mixed = adapter
         .recall(
             &mut tx,
@@ -5078,8 +5066,6 @@ async fn create_of_an_existing_space_without_admin_answers_the_admission_refusal
         "a refused create stages no receipt"
     );
 
-    // Contrast: the same caller's freeze reaches the shared coverage refusal, which still
-    // names the principal and the space it lacks `admin` in.
     let frozen = adapter
         .freeze_space(
             &mut tx,
@@ -5421,8 +5407,6 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
     );
     assert_eq!(repeat["result"]["status"], json!("active"));
 
-    // The registry row, the carrier entry, the space row and both grant rows byte-identical: the
-    // receipt is the only difference the repeat is allowed to leave.
     assert_eq!(
         harness.mind_rows(&mut tx, "sp_repeat").await,
         before,
@@ -5452,7 +5436,6 @@ async fn admitted_mind_answers_one_refusal_and_names_the_registered_collection()
     use mindcore_sqlite::minds::{self, CreateMind};
 
     let harness = Harness::open().await;
-    // A live grant in a space with no registry row: the admission's third step is what refuses.
     harness.seed_grant(PRINCIPAL, &["recall"]).await;
     for (space, status) in [("sp_ungranted", "active"), ("sp_frozen", "frozen")] {
         sqlx::query(
@@ -5503,7 +5486,6 @@ async fn admitted_mind_answers_one_refusal_and_names_the_registered_collection()
         );
     }
 
-    // An admitted Mind: the caller's default grant is the creator's, written by the create.
     let mut tx = harness.begin().await;
     let created = minds::create(
         &mut tx,
