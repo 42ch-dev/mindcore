@@ -118,8 +118,8 @@ test still passes.
   halves against each other.
 - A row the served faces must not produce is written raw, because a store from another version can
   hold it.
-- A fixture that relies on pool fairness registers before it asserts, and states which scheduler
-  fact it is proving.
+- A fixture that relies on pool fairness registers before it asserts, and states which fairness fact
+  it proves — the semaphore's queue order, never the scheduler's.
 
 ## Where it lives
 
