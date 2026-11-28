@@ -144,8 +144,7 @@ fn nonempty(value: Value) -> Option<String> {
 
 fn timestamp(value: Value) -> Option<String> {
     let text = string(value)?;
-    // Rows stored before the strict timestamp gate may carry the space spelling. New input is
-    // refused by the protocol DTOs, so only the stored-read path needs this leniency.
+    // see .agents/adr/implemented/architecture/2026-11-24-stored-wire-compatibility.md
     let strict = text
         .char_indices()
         .nth(10)
