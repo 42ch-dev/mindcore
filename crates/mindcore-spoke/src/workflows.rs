@@ -152,9 +152,7 @@ pub(crate) async fn admitted_carrier(
     let space = SpaceId::new(space_id.to_string());
     let (rows, carrier) = admit_carrier_location(tx, principal_id, &space, space_id).await?;
     let now = Utc::now();
-    // Coverage over the same caller-only rows: another principal's grants are neither needed for
-    // a space-wide requirement nor allowed to reach this decision, and a dead row of the
-    // caller's own covers nothing — projecting one would turn a refusal into a storage error.
+    // see .agents/adr/implemented/architecture/2026-11-28-coverage-from-caller-rows-only.md
     let grants = admission::live_wire_grants(&rows, now).map_err(|reject| reject.into_spoke())?;
     let requirement = GrantRequirement {
         capability: KNOWLEDGE_READ,

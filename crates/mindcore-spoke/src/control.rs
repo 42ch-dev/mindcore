@@ -630,10 +630,7 @@ impl MemoryAdapter {
             .subject_id
             .as_ref()
             .map(|subject| subject.as_str().to_string());
-        // Admission stays caller-only, but the answer does not: an admin is served the whole
-        // space's grant set, and the cursor marker is computed over the same set, so another
-        // principal's grant change moves the marker an admin's page is checked against. Everyone
-        // else is served exactly the rows admission read for them.
+        // see .agents/adr/implemented/architecture/2026-11-28-grants-list-admin-scope-and-cursor.md
         let served: Vec<MemoryGrantRow> = if admin {
             admission::grants(tx, &space).await?
         } else {

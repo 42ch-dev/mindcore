@@ -523,9 +523,7 @@ pub async fn client_create_mind(
     };
     match client.opened_mind(&created.id).await {
         SpokeResult::Ok(view) => MindResult::answered(view),
-        // The row is committed: this call did create the Mind. Reporting the open's own refusal here
-        // would tell the host the create had no effect, and a retry would create a second Mind. The
-        // settlement path uses the same code for "durable, but the answer is unconfirmed".
+        // see .agents/adr/implemented/architecture/2026-11-28-create-outcome-uncertain-after-commit.md
         SpokeResult::Reject(reject) => MindResult::refused(&SpokeReject {
             code: SpokeRejectCode::OutcomeUncertain,
             message: format!(

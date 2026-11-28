@@ -207,10 +207,7 @@ impl UnixSocketTransport {
         // neither closes nor reallocates the descriptor, so the halves and tokio's registration
         // stay valid afterwards.
         //
-        // Two steps, not `SHUT_RDWR`: once the peer has half-closed, `SHUT_RDWR` answers `ENOTCONN`
-        // and delivers no EOF, while `SHUT_WR` still does. The write step is the one that must
-        // never be skipped — it is what tells the peer the stream ended and what makes a parked
-        // `write_all` fail — so it goes first and is unaffected by a `SHUT_RD` refusal after it.
+        // see .agents/adr/implemented/architecture/2026-11-28-shutdown-write-before-read.md
         unsafe {
             let _ = libc::shutdown(self.fd, libc::SHUT_WR);
             let _ = libc::shutdown(self.fd, libc::SHUT_RD);
