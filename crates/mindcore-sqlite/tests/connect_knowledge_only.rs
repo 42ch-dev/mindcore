@@ -1546,7 +1546,6 @@ async fn served_list_refuses_a_collection_over_the_bound() {
             "seed a bounded-collection entry",
         );
     }
-    // The registry row's carrier is one of the collection's own rows, so it follows the seeding.
     register_mind(&fixture.store, OTHER_SCOPE_ID, "bounded", "ke_0000").await;
 
     let listed = expect_ok(
@@ -1767,9 +1766,6 @@ async fn a_scope_id_with_no_registry_row_is_not_authorized() {
         );
     }
 
-    // The registry row is what makes the collection reachable: once the same space id is
-    // registered the identical scope serves it, so the refusal was the missing row and not the
-    // scope's shape.
     register_mind(
         &fixture.store,
         OTHER_SCOPE_ID,

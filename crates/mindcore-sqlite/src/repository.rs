@@ -980,7 +980,6 @@ pub async fn decodable_grants(
     while let Some(row) = poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
         let row = match row {
             Ok(row) => row,
-            // A driver failure on the stream itself is not a row's fault.
             Err(error) => return Err(error.into()),
         };
         if let Some(grant) = grant_of(&row) {

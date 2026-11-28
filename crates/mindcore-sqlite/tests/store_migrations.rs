@@ -56,9 +56,6 @@ async fn applied_version_outside_the_embedded_set_is_refused() {
         .close()
         .await;
 
-    // A database that applied a version the embedded set does not contain — the shape a database
-    // migrated by a set this release does not ship has. The version must stay far above any real
-    // migration prefix, or the row stops being foreign as soon as that migration is appended.
     const ABSENT: i64 = 9999;
     let pool = raw_pool(&path).await;
     sqlx::query(
@@ -91,8 +88,6 @@ async fn applied_migration_with_a_changed_checksum_is_refused() {
         .close()
         .await;
 
-    // The shape a database has after the embedded 0001 was edited in place: its row still records
-    // version 1, but not with the bytes the embedded file now hashes to.
     let pool = raw_pool(&path).await;
     sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 1")
         .execute(&pool)
@@ -120,8 +115,6 @@ async fn applied_set_missing_a_recorded_version_is_refused() {
         .close()
         .await;
 
-    // The schema exists but the row that records it does not: the migrator retries the pending
-    // migration over the existing tables instead of treating the database as current.
     let pool = raw_pool(&path).await;
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 1")
         .execute(&pool)
@@ -149,7 +142,6 @@ async fn a_database_written_by_the_published_set_reopens_through_the_appended_fi
     let path = temp.path().join("mindcore.db");
 
     let embedded = sqlx::migrate!("./migrations");
-    // The set 0.1.0 shipped: the first file alone, with the checksum sqlx records for it.
     let published = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(
             embedded
@@ -163,7 +155,6 @@ async fn a_database_written_by_the_published_set_reopens_through_the_appended_fi
     };
     let pool = raw_pool(&path).await;
     published.run(&pool).await.expect("write a 0.1.0 database");
-    // One legacy space row written by the published set, exactly as a 0.1.0 host left it.
     sqlx::query(
         "INSERT INTO memory_spaces \
          (space_id, display_name, authority_host_id, authority_generation, status, revision, \
@@ -178,8 +169,6 @@ async fn a_database_written_by_the_published_set_reopens_through_the_appended_fi
     let store = MindStore::open(&path)
         .await
         .expect("a 0.1.0 database reopens");
-    // The legacy row survives the upgrade unchanged, and it is not a Mind: nothing could infer
-    // its collection or carrier, so no registry row appears for it and no caller lists it.
     let legacy: (Option<String>, String, i64, String, i64, String) = sqlx::query_as(
         "SELECT display_name, authority_host_id, authority_generation, status, revision, \
          created_at FROM memory_spaces WHERE space_id = 'spc_legacy'",

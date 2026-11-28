@@ -836,9 +836,6 @@ impl RoutedKnowledgeStore {
             }
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        // Disclosure is a payload property, so the live row's visibility says nothing about the
-        // replayed payload: a revision whose own fields fall outside the admitted scope is the
-        // same absence as a hidden live row.
         match visible(&entry, scope) {
             SpokeResult::Ok(true) => {}
             SpokeResult::Ok(false) => return history_not_found(entity_id),
@@ -875,8 +872,6 @@ impl RoutedKnowledgeStore {
             SpokeResult::Ok(collection) => collection,
             SpokeResult::Reject(reject) => return SpokeResult::Reject(reject),
         };
-        // The keep boundary follows admission, so a zero keep cannot mask an unserved route or an
-        // unserved kind.
         if keep == 0 {
             return invalid_input("a history prune keeps at least one checkpoint");
         }
@@ -904,9 +899,6 @@ impl RoutedKnowledgeStore {
         let report = match prune_entry_history(&mut transaction, &collection, entity_id, keep).await
         {
             SpokeResult::Ok(report) => report,
-            // Both reads run under this one BEGIN IMMEDIATE reservation, so the helper's probe
-            // cannot disagree with the permission read above; this arm normalizes the helper's
-            // own contract rather than an intervening disappearance.
             SpokeResult::Reject(reject)
                 if reject.code == SpokeRejectCode::KnowledgeEntryNotFound =>
             {
@@ -1745,8 +1737,6 @@ pub async fn write_entry(
     let (stored, stored_created_at, stored_payload) = match stored {
         Some((revision, created_at, superseded_by, payload)) => {
             if superseded_by.is_some() {
-                // Presence only: the refusal says the slot is held, never by which entry, since
-                // the caller's admitted selection may hide the successor.
                 let mut details = Map::new();
                 details.insert("superseded_by".to_string(), Value::Bool(true));
                 return spoke_reject(
@@ -1802,8 +1792,6 @@ pub async fn write_entry(
         ));
     };
 
-    // The stored payload this read already fetched carries the anchor the put must preserve, so
-    // the gate adds no statement.
     let stored_entry = match stored_payload {
         Some(payload) => match decode(&payload) {
             SpokeResult::Ok(stored) => Some(stored),

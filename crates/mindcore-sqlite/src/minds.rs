@@ -176,17 +176,12 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
         pending_receipts: 0,
     };
     if let Err(error) = repository.insert_space(tx, &space_row).await {
-        // `memory_spaces` carries no CHECK a create input can violate: the only schema refusal
-        // the id can hit is the registry's length check, mapped in `driver_error`.
         return match error {
             crate::repository::SqliteRepositoryError::Conflict(_) => already_exists(&id),
             _ => storage_unavailable(),
         };
     }
 
-    // A Mind's collection is its own: a caller-named id must never claim entries the Mind did
-    // not create. A populated target collection is refused before the carrier is written; the
-    // refusal is not the taken-id one, because no Mind of this id need exist.
     let collection = knowledge_collection_of(&id);
     let occupied =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge_entries WHERE collection = ?")

@@ -370,9 +370,6 @@ async fn shared_scope_holds_the_seven_named_facts() {
         );
     }
 
-    // The served route is the Mind registry row: `ROUTE` names the space whose registered
-    // collection is the shared one, and the carrier it names is a live entry of that collection
-    // that the rehearsal never retires.
     register_mind(&pool, ROUTE, SHARED, "ke_gate_tower").await;
     assert_eq!(
         expect_ok(
