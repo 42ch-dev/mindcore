@@ -161,8 +161,6 @@ impl Fixture {
             .await
             .expect("seed grant");
         }
-        // The carrier entry the registry row references: `minds` keys it foreign to
-        // `knowledge_entries`, so the entry exists before the row names it.
         sqlx::query(
             "INSERT INTO knowledge_entries \
              (collection, entry_id, revision, payload, created_at, updated_at) \
@@ -188,8 +186,6 @@ impl Fixture {
         .execute(&pool)
         .await
         .expect("seed the carrier entry");
-        // The Mind registry row of this fixture's space: the workflow binding resolves the
-        // collection it serves from it, and a space with no row answers nothing.
         sqlx::query(
             "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id) VALUES (?, ?, ?)",
         )
@@ -228,7 +224,6 @@ impl Fixture {
                 .await
                 .expect("seed the second mind");
         }
-        // The carrier entry of the second Mind, before the registry row references it.
         sqlx::query(
             "INSERT INTO knowledge_entries \
              (collection, entry_id, revision, payload, created_at, updated_at) \
@@ -812,22 +807,12 @@ fn caller_leaks<'a>(
                     path.pop();
                     continue;
                 }
-                // A refusal names no receipt: one here would be a staged outcome the operation is
-                // supposed to have left unmentioned.
                 if key == "receipt_id" && expects == ExpectsReceipt::No {
                     leaks.push(format!("{}: a refusal carries a receipt", rendered(path)));
                     path.pop();
                     continue;
                 }
-                // A receipt's own `requester_principal_id` is the caller's attribution of the
-                // request it made, required by the receipt polling contract, and is not the
-                // admission binding. It is the one permitted occurrence: this receipt object, at
-                // the receipt's own path, holding the expected scalar. Any other position,
-                // nesting or value leaks — and on an answer that expects no receipt at all, every
-                // position does.
                 if key == "requester_principal_id" {
-                    // `path` ends with this member; the exemption is a property of the object
-                    // holding it.
                     let attributed = expects == ExpectsReceipt::Yes
                         && is_receipt_path(&path[..path.len() - 1])
                         && members.contains_key("receipt_id")
@@ -1491,8 +1476,6 @@ async fn a_deliberation_judgment_identity_follows_the_attempt_content() {
         "equal attempt content answers the same judgment identity: {first} / {again}"
     );
 
-    // A second store answers the same attempt content: nothing the store generates — the draft's
-    // own record id, the carrier revision, the clock — reaches the identity.
     let (_peer_dir, _peer_serve, peer) =
         deliberation_session(SETTLING_RATIONALE, Arc::new(HoldingPolicy)).await;
     let peer = expect_ok(
@@ -1640,9 +1623,6 @@ async fn remote_consumer_settles_a_deliberation_with_a_valid_judgment() {
 async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
     let fixture = Fixture::open().await;
     fixture.seed_second_mind().await;
-    // The second peer is admitted to the second Mind through `recall` alone: a live grant, so
-    // admission passes, but no `knowledge_read` coverage. It is granted before `serve` consumes
-    // the fixture, and it cannot affect the first principal, who holds nothing in that Mind.
     fixture
         .grant_in_second("grt_recall_only", PEER_TWO_PRINCIPAL, &["recall"])
         .await;
@@ -1653,8 +1633,6 @@ async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
         ..MindProviders::default()
     };
     let mut faces = faces(hello("runtime", &[]), None, providers);
-    // Two principals: the dialer reaches the first Mind, the second peer reaches only what it is
-    // granted in the second.
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces).await;
 
@@ -1709,8 +1687,6 @@ async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
     assert_eq!(read["mind_state"]["mind_state_id"], SPACE);
     assert_eq!(read["mind_state"]["holder_entry_id"], CARRIER);
 
-    // The second Mind exists and carries a registry row, yet this peer holds no grant in it: the
-    // refusal must be the byte-same answer a space that is no Mind at all gives.
     let unadmitted = expect_reject(
         session
             .adapter
@@ -1735,10 +1711,6 @@ async fn read_cognition_serves_the_judgment_and_refuses_an_unadmitted_mind() {
         "an unadmitted Mind and an absent Mind must be the byte-same refusal"
     );
 
-    // A peer admitted to the second Mind, but only through `recall`: admission passes and the
-    // missing `knowledge_read` coverage is what answers. The plan keeps those two refusals
-    // distinct — the coverage refusal may name the capability and the Mind, because the caller is
-    // already known to hold a live grant here.
     let peer = connect_as(&surface, &PEER_TWO_SEED, &[READ_COGNITION]).await;
     let uncovered = expect_reject(
         peer.adapter
@@ -2000,7 +1972,6 @@ async fn two_minds_settle_onto_their_own_carriers() {
 
     let first_before = collection_state(&pool, COLLECTION, CARRIER).await;
     let second_before = collection_state(&pool, COLLECTION_TWO, CARRIER_TWO).await;
-    // The retired `holder` member: the closed argument object refuses it before any carrier access.
     let mut with_holder = deliberate_arguments();
     with_holder["holder"] =
         json!({ "kind": "knowledge_entry", "namespace": "mindcore", "id": CARRIER });
@@ -2030,7 +2001,6 @@ async fn two_minds_settle_onto_their_own_carriers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_space_with_no_registry_row_reaches_no_carrier() {
     let fixture = Fixture::open().await;
-    // The second space without its Mind: the space, subjects and grants live, but no registry row.
     fixture.seed_second_mind().await;
     sqlx::query("DELETE FROM minds WHERE space_id = ?")
         .bind(SPACE_TWO)
@@ -2184,7 +2154,6 @@ async fn deliberate_cannot_distinguish_an_absent_mind_from_an_ungranted_one() {
     let fixture = Fixture::open().await;
     fixture.seed_second_mind().await;
     let (_dir, serve) = fixture.serve();
-    // No reasoner: any path that reaches the engine before admission is a different answer.
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces).await;
@@ -2235,7 +2204,6 @@ async fn a_strangers_malformed_grant_row_cannot_leak_the_minds_existence() {
     .await
     .expect("seed the stranger's malformed grant");
     let (_dir, serve) = fixture.serve();
-    // No reasoner: a path that reaches the engine would answer differently again.
     let mut faces = faces(hello("runtime", &[]), None, MindProviders::default());
     faces.principals = two_principal_admission();
     let surface = surface(&serve, faces).await;
@@ -2273,7 +2241,6 @@ async fn a_strangers_malformed_grant_row_cannot_leak_the_minds_existence() {
 async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
-    // Corrupt the seeded knowledge grant's expiry in place: it can no longer be read as a time.
     sqlx::query(
         "UPDATE memory_grants SET expires_at = 'not-a-time' WHERE grant_id = 'grt_knowledge'",
     )
@@ -2281,8 +2248,6 @@ async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
     .await
     .expect("corrupt the expiry");
     let (_dir, serve) = fixture.serve();
-    // A reasoner is configured so the workflow reaches its snapshot: the refusal must come from
-    // admission/coverage, never from the engine's missing capability.
     let mut faces = faces(
         hello("runtime", &[]),
         None,
@@ -2317,7 +2282,6 @@ async fn a_grant_with_an_unparseable_expiry_is_dead_to_deliberate() {
         "a dead grant cannot be retried away: {uncovered:?}"
     );
 
-    // Every row dead now: no live grant admits the caller, so the answer is target-free.
     sqlx::query("UPDATE memory_grants SET expires_at = 'not-a-time' WHERE grant_id = 'grt_recall'")
         .execute(&pool)
         .await
@@ -2345,8 +2309,6 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
-    // A reasoner is configured so the workflow reaches its snapshot: the refusal must come from
-    // admission/coverage, never from the engine's missing capability.
     let mut faces = faces(
         hello("runtime", &[]),
         None,
@@ -2408,8 +2370,6 @@ async fn a_grant_revoked_before_the_call_refuses_deliberate() {
 async fn deliberate_refuses_the_subject_before_the_knowledge_coverage() {
     let fixture = Fixture::open().await;
     let pool = fixture.store.pool();
-    // The caller keeps one recall grant, scoped to a subject it is not asking about, and no
-    // knowledge grant at all: both refusals apply, and the subject's must answer first.
     fixture.revoke("grt_recall").await;
     fixture.revoke("grt_knowledge").await;
     sqlx::query(
@@ -2425,8 +2385,6 @@ async fn deliberate_refuses_the_subject_before_the_knowledge_coverage() {
     .await
     .expect("seed the elsewhere recall grant");
     let (_dir, serve) = fixture.serve();
-    // A reasoner is configured so the workflow reaches its snapshot: both refusals below are
-    // decided there, before any provider work.
     let surface = surface(
         &serve,
         faces(
@@ -2462,7 +2420,6 @@ async fn deliberate_refuses_the_subject_before_the_knowledge_coverage() {
         "the capability gap must not pre-empt the subject refusal: {subject_first:?}"
     );
 
-    // Covering the subject leaves only the capability gap; it answers now, from the workflow.
     sqlx::query(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
@@ -2694,7 +2651,6 @@ async fn the_admin_grant_view_reads_the_space_and_moves_its_marker() {
     fixture
         .grant("grt_peer_two_capture", PEER_TWO_PRINCIPAL, &["capture"])
         .await;
-    // A stranger's undecodable row is invisible to the view, never fatal.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
@@ -2791,8 +2747,6 @@ async fn the_admin_grant_view_reads_the_space_and_moves_its_marker() {
         "a non-admin naming another principal still receives only its own rows"
     );
 
-    // The cursor marker covers the set the admin page was built from, so another principal's
-    // grant change invalidates a cursor the admin already holds.
     let (page, cursor) = granted(
         MemoryPort::list_grants(
             &*admin_session.adapter,
@@ -3011,8 +2965,6 @@ async fn a_transfer_receipt_is_polled_on_the_same_signed_session() {
         .await,
         "memory.receipts.get",
     ));
-    // The poll answers a receipt at `payload.receipt`: that is the one other place the caller may
-    // appear, and only as the receipt's own `requester_principal_id` attribution.
     assert_caller_absent(&session, "the receipt poll answer", ExpectsReceipt::Yes);
     assert_eq!(polled["receipt"]["op"], json!("memory.exports.create"));
     assert_eq!(polled["receipt"]["status"], json!("committed"));
@@ -3596,8 +3548,6 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         capabilities(&surface)
     );
     let session = connect(&surface, &["spoke-memory"]).await;
-    // The handshake's own envelopes are not this test's subject; every drain from here covers
-    // exactly one create call.
     session.wire.drain();
 
     let grants = |pool: sqlx::SqlitePool, space: &'static str| async move {
@@ -3614,8 +3564,6 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
             .await
             .expect("count the receipts")
     };
-    // The persisted Mind row by row — space, registry, carrier, grants — projected whole, so a
-    // write to any column of any of them shows up as a difference; an in-place grant edit too.
     let mind_rows = |pool: sqlx::SqlitePool, space: &'static str| async move {
         let space_row = sqlx::query_scalar::<_, String>(
             "SELECT json_object('space_id', space_id, 'display_name', display_name, \
@@ -3698,8 +3646,6 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         "a create records one committed receipt"
     );
 
-    // The creator's own grant row: the seven capabilities, and the ownership that makes them
-    // reachable — space-wide, subject-free, context-free, never expiring.
     let (granted, grantee, subject, contexts, expires): (
         String,
         String,
@@ -3734,8 +3680,6 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
     assert_eq!(contexts, "[]", "the default grant restricts no context");
     assert_eq!(expires, None, "the default grant never expires");
 
-    // The Mind as the create left it: the space row, the registry row, the carrier entry and the
-    // creator's one grant row.
     let mind_before = mind_rows(pool.clone(), "spc_wire").await;
     assert_eq!(
         mind_before.1,
@@ -3802,7 +3746,6 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         json!(1),
         "the revision did not move"
     );
-    // The repeat is a second recorded outcome, not a replay: one more receipt row, nothing else.
     assert_eq!(
         receipts(pool.clone(), "spc_wire").await,
         2,
@@ -3813,9 +3756,6 @@ async fn a_peer_creates_a_mind_through_the_signed_loopback() {
         1,
         "a repeat writes no second grant row"
     );
-    // The repeat's only difference: its receipt. The space row, the registry row, the carrier
-    // entry and the creator's grant row are exactly what the create wrote — a widened capability
-    // set or a moved expiry on that grant would differ here.
     assert_eq!(
         mind_rows(pool.clone(), "spc_wire").await,
         mind_before,
@@ -3955,7 +3895,6 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
     let leaks = |body: &str, expects| -> Vec<String> {
         caller_leaks(&frame(body), &[PRINCIPAL], expects, &mut Vec::new())
     };
-    // The two receipt paths, and only those, carry the attribution.
     for clean in [
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
         r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
@@ -3972,15 +3911,10 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
         r#"{"extensions":{"mindcore_caller":{"principal":"p"}}}"#,
         r#"{"payload":{"items":["ok","mindcore_caller"]}}"#,
         r#"{"payload":{"result":{"requester_principal_id":"prn_loopback"}}}"#,
-        // The reviewer's two cases: a receipt-shaped object that is not at a receipt path, with a
-        // binding nested inside the member, and the principal used as a key.
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":{"mindcore_caller":{"principal":"prn_loopback"}}}}"#,
         r#"{"payload":{"prn_loopback":"value"}}"#,
-        // The same member at a receipt path but holding something other than the expected scalar.
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
         r#"{"payload":{"receipt":{"receipt_id":"rct_1","requester_principal_id":["prn_loopback"]}}}"#,
-        // A single member whose literal key spells a receipt path is one key at one level, not a
-        // receipt nesting: the wrong value inside it must not be read as the permitted one.
         r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_other"}}"#,
         r#"{"payload.receipt":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
     ] {
@@ -3991,9 +3925,6 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
         );
     }
 
-    // A refusal stages no receipt, so the two bodies a successful create may answer — a committed
-    // receipt and a receipt under `payload.receipt` — are both leaks here, including the exact
-    // scalar the exception would otherwise permit at that path.
     for refusal in [
         r#"{"error":{"details":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}}"#,
         r#"{"payload":{"receipt_id":"rct_1","requester_principal_id":"prn_loopback"}}"#,
@@ -4210,8 +4141,6 @@ async fn the_composed_knowledge_face_serves_the_admitted_minds_own_entries() {
         "the second Mind's carrier never reaches this list: {ids:?}"
     );
 
-    // The second Mind's entry is not reachable by name either: the admitted Mind's own collection
-    // holds no such row, so the answer is the absence of a live entry, with no details.
     let absent = expect_reject(
         dialer
             .get_knowledge_entry_in_scope(CARRIER_TWO, Some(&request_scope(SPACE, None)))
@@ -4245,7 +4174,6 @@ async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, two_principal_admission()).await;
 
-    // The peer that holds no grant in the second Mind, and none in the first either.
     let session = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let dialer = &*session.adapter;
 
@@ -4286,8 +4214,6 @@ async fn the_knowledge_face_refuses_every_mind_it_does_not_admit_alike() {
         );
     }
 
-    // The same peer, admitted to its own Mind, cannot name the other Mind's scope either: the
-    // declared scope must equal the admitted one before any store call.
     sqlx::query(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
@@ -4344,7 +4270,6 @@ async fn a_requested_viewpoint_is_refused_rather_than_silently_served() {
         "the face advertises no flag it cannot honour: {:?}",
         capabilities(&surface)
     );
-    // A dialer that asks for the flag anyway cannot negotiate it: the intersection is empty of it.
     let session = connect(
         &surface,
         &["spoke-knowledge", "ke-ownership", "spoke-knowledge-scoped"],
@@ -4408,13 +4333,9 @@ async fn a_scoped_op_without_its_capability_is_the_dispatch_deny() {
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, principal_admission()).await;
-    // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
-    // `ke-ownership`, so the negotiated set is exactly this hello's claim.
     let session = connect(&surface, &["spoke-knowledge"]).await;
     let dialer = &*session.adapter;
 
-    // `get`/`put` with a declared scope need the marker. The dialer refuses before sending, with
-    // the class the responder would answer, so no scope is ever dropped on the way out.
     session.wire.drain_sent();
     let scoped = expect_reject(
         dialer
@@ -4446,8 +4367,6 @@ async fn a_scoped_op_without_its_capability_is_the_dispatch_deny() {
         "an unnegotiated marker sends no scope"
     );
 
-    // The list op carries a required scope, so the marker is not its conjunct; a declared
-    // viewpoint is, and without `ke-ownership` it is the wire `op_unsupported` deny.
     let viewpoint: Scope = serde_json::from_value(json!({
         "scope_id": SPACE,
         "viewpoint": "kb_someone_else",
@@ -4493,7 +4412,6 @@ async fn the_knowledge_face_authorizes_each_operation_on_the_callers_own_grant()
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, three_principal_admission()).await;
 
-    // The creator's default grant covers both: list, get and put all serve.
     let creator = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
     expect_ok(
         creator
@@ -4518,7 +4436,6 @@ async fn the_knowledge_face_authorizes_each_operation_on_the_callers_own_grant()
         ExpectsReceipt::No,
     );
 
-    // A read-only grant lists and gets, and its put is the fixed refusal with no write.
     let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let listed = expect_ok(
         KnowledgeQueryPort::list_knowledge_entries(&*reader.adapter, &request_scope(SPACE, None))
@@ -4565,8 +4482,6 @@ async fn the_knowledge_face_authorizes_each_operation_on_the_callers_own_grant()
     .expect("count the refused entry");
     assert_eq!(written, 0, "a refused put writes nothing");
 
-    // `knowledge_write` alone is refused on all three: Connect reads the entry through `get`
-    // before it writes, so a put needs one grant covering both.
     let writer = connect_as(&surface, &PEER_THREE_SEED, &KNOWLEDGE_CAPABILITIES).await;
     assert_scope_refusal(
         KnowledgeQueryPort::list_knowledge_entries(&*writer.adapter, &request_scope(SPACE, None))
@@ -4668,16 +4583,6 @@ async fn a_grant_covering_neither_knowledge_capability_serves_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller() {
     let fixture = Fixture::open().await;
-    // The forgery names W (the dialer's principal), who holds the covering default grant. R reads
-    // through its own grant and never through W's.
-    //
-    // The contrast is the forged principal himself: W's grant covers `knowledge_read`, so as long
-    // as W holds it neither read discriminates — honouring the forgery and reading on R's grant
-    // both succeed. So the test first drops W's read coverage with a write-only grant. Then each
-    // operation's answer depends on WHICH principal authorized it: under R's grant (which covers
-    // read and not write) list and get are served and put is refused; under W's grant (write and
-    // not read) all three are refused. A regression that authorized any one operation with the
-    // request's caller flips that operation's answer, not only put's.
     fixture.revoke("grt_knowledge").await;
     fixture
         .grant("grt_writer_forged", PRINCIPAL, &["knowledge_write"])
@@ -4697,10 +4602,6 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let forger = &*reader.adapter;
 
-    // Each operation is proven on four sides: the request bytes carry the forgery at the scope
-    // path, the answer is decided by R's own grant (and would differ under W's write-only one),
-    // and a dialer that stripped `scope.extensions` on any one of the three paths would fail its
-    // own assertion here. The wire read is per operation, not once for the suite.
     reader.wire.drain_sent();
     let listed = expect_ok(
         KnowledgeQueryPort::list_knowledge_entries(forger, &request_scope(SPACE, forgery.clone()))
@@ -4732,9 +4633,6 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
         PRINCIPAL,
     );
 
-    // The put is refused by R's own grant: the forged namespace bought no capability. Under the
-    // forged principal's own write-only grant it would be refused as well, for the opposite
-    // reason; R's refusal is the one the answer must be, and the row proves nothing was written.
     reader.wire.drain_sent();
     assert_scope_refusal(
         forger
@@ -4762,8 +4660,6 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     .expect("count the forged entry");
     assert_eq!(forged_rows, 0, "the forged put wrote nothing");
 
-    // The same put carrying no scope at all: the admission refuses a request that names no Mind,
-    // so the no-scope path is never answered with an unbound scope either.
     assert_scope_refusal(
         forger
             .put_knowledge_entry_in_scope(
@@ -4784,9 +4680,6 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     .expect("count the unscoped entry");
     assert_eq!(unscoped_rows, 0, "the unscoped put wrote nothing");
 
-    // The contrast made concrete on W's own session: with the write-only grant the same list and
-    // get the forging peer just had served are refused for W. That is the answer a regression
-    // honouring the forgery would produce for R, so the three reads above discriminate.
     let write_only = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
     let w_list = expect_reject(
         KnowledgeQueryPort::list_knowledge_entries(
@@ -4799,8 +4692,6 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     assert_eq!(w_list.code, SpokeRejectCode::NotAuthorized);
     assert!(w_list.details.is_none());
 
-    // The entry is R's grant, not the entry: W's own peer creates it once a grant covering both
-    // capabilities is restored, which also shows the read contrast above is the grant W held.
     sqlx::query(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
@@ -4816,11 +4707,6 @@ async fn a_peer_supplied_caller_namespace_does_not_override_the_admitted_caller(
     .await
     .expect("restore the covering grant");
 
-    // The put contrast, now that the forged principal covers both capabilities again: the same
-    // request that is refused on R's `knowledge_read` would be WRITTEN if authorization took the
-    // caller from the request. The forgery reaches the wire, the answer is the fixed refusal, and
-    // neither the entry nor its cognition record exists — the two side effects W's own covering
-    // grant produces immediately below.
     reader.wire.drain_sent();
     assert_scope_refusal(
         forger
@@ -4956,8 +4842,6 @@ async fn no_wire_response_carries_the_caller() {
         ExpectsReceipt::No,
     );
 
-    // An absent entry, an unadmitted Mind and a Mind that is no Mind: all refusals, none naming
-    // the caller.
     expect_reject(
         dialer
             .get_knowledge_entry_in_scope("ke_absent", Some(&request_scope(SPACE, None)))
@@ -4997,7 +4881,6 @@ async fn no_wire_response_carries_the_caller() {
         ExpectsReceipt::No,
     );
 
-    // The reader's answers, including a refused put and a request that widens the admitted scope.
     let reader = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     expect_ok(
         KnowledgeQueryPort::list_knowledge_entries(&*reader.adapter, &request_scope(SPACE, None))
@@ -5200,19 +5083,13 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
         .grant("grt_reader_raw", PRINCIPAL, &["knowledge_read"])
         .await;
     let (_dir, serve) = fixture.serve();
-    // The face is composed, so a request that passes the gates would be served: the denials below
-    // are the gates and not a missing face.
     let surface = knowledge_surface(&serve, raw_wire_admission()).await;
     assert!(
         surface.ports.as_scoped_knowledge().is_some(),
         "the face is composed for this ordering test"
     );
-    // A dialer that claims `spoke-knowledge` alone: the responder advertises two flags and never
-    // `ke-ownership`, so the negotiated set is exactly this hello's claim, and the marker is
-    // absent from it.
     let (client, session_id) = raw_wire::open_raw_session(&surface, &["spoke-knowledge"]).await;
 
-    // 1. A scoped `get` without the negotiated marker: the marker conjunct, not the face.
     let denied_get = raw_wire::invoke(
         &client,
         &session_id,
@@ -5241,8 +5118,6 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
         "the marker conjunct answered: {message}"
     );
 
-    // 2. A scoped `put` on the same session: the same conjunct, so a peer cannot smuggle a write
-    //    scope past a peer that would silently drop it.
     let denied_put = raw_wire::invoke(
         &client,
         &session_id,
@@ -5261,8 +5136,6 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
         "a scoped put without the marker is the wire deny: {denied_put}"
     );
 
-    // 3. A malformed `scope` (a present JSON `null` cognition subtree is shape, not selection)
-    //    answers `INVALID_INPUT` — before the marker conjunct would have answered.
     let malformed = raw_wire::invoke(
         &client,
         &session_id,
@@ -5280,7 +5153,6 @@ async fn the_responder_gate_order_puts_the_marker_and_shape_ahead_of_the_face() 
         "the shape gate answers before the marker conjunct: {malformed}"
     );
 
-    // 4. Nothing above reached the store: the forged-entry ids were never written.
     for entry_id in ["ke_raw_refused"] {
         let rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM knowledge_entries WHERE collection = ? AND entry_id = ?",
@@ -5338,20 +5210,14 @@ async fn a_storage_fault_during_admission_is_an_internal_error_not_a_refusal() {
     let pool = fixture.store.pool();
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, principal_admission()).await;
-    // The marker is advertised, so the scoped op is decodable and reaches the face; the caller
-    // holds the Mind's covering grant, so nothing but the store's health decides the answer.
     let session = connect(&surface, &KNOWLEDGE_CAPABILITIES).await;
     let dialer = &*session.adapter;
 
-    // Half one: an intact store serves the admitted caller.
     expect_ok(
         KnowledgeQueryPort::list_knowledge_entries(dialer, &request_scope(SPACE, None)).await,
         "the admitted caller's list over a healthy store",
     );
 
-    // Half two: the same caller, the same request, a store whose grant rows cannot be read. The
-    // table is dropped rather than emptied, so the admission's grant read fails rather than
-    // returning no rows — the difference between a fault and an admitted-nothing caller.
     sqlx::query("DROP TABLE memory_grants")
         .execute(&pool)
         .await
@@ -5401,7 +5267,6 @@ async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_min
     let fixture = Fixture::open().await;
     let (_dir, serve) = fixture.serve();
     let surface = knowledge_surface(&serve, two_principal_admission()).await;
-    // The second peer holds no grant anywhere: it is the unadmitted case.
     let stranger = connect_as(&surface, &PEER_TWO_SEED, &KNOWLEDGE_CAPABILITIES).await;
     let dialer = &*stranger.adapter;
 
@@ -5667,8 +5532,6 @@ async fn history_serves_each_mind_its_own_entry_history() {
         Some("the mill closes at dusk")
     );
 
-    // One Mind's entry id inside the other Mind's scope is not a cross-Mind read: the other Mind's
-    // collection holds no such row, so the answer is the absence of a history entity.
     let absent = expect_reject(
         replay(dialer, &scope_of(SPACE_TWO), "ke_history", 2).await,
         "a replay of the first Mind's entry inside the second Mind",
@@ -5676,8 +5539,6 @@ async fn history_serves_each_mind_its_own_entry_history() {
     assert_eq!(absent.code, SpokeRejectCode::NotFound);
     assert!(absent.details.is_none(), "{absent:?}");
 
-    // The prune runs per Mind: the first Mind's prune cuts its own checkpoint, and the second
-    // Mind's history survives it.
     let pruned = expect_ok(
         dialer
             .prune_history(
@@ -5779,8 +5640,6 @@ async fn history_grants_no_access_the_knowledge_face_does_not() {
         );
     }
 
-    // The refused prune cut nothing: both checkpoints are still stored, and the creator replays
-    // the one the peer aimed at.
     assert_eq!(
         checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
         [1, 2],
@@ -5871,8 +5730,6 @@ async fn history_prune_needs_the_write_and_read_grant() {
             &["knowledge_write"],
         )
         .await;
-    // The split-grant case below: the same caller's `knowledge_read` grant plus this separate
-    // `knowledge_write`, so it holds both capabilities on two live grants in one Mind.
     fixture
         .grant("grt_split_write", PEER_TWO_PRINCIPAL, &["knowledge_write"])
         .await;
@@ -5891,8 +5748,6 @@ async fn history_prune_needs_the_write_and_read_grant() {
     let (_dir, serve) = fixture.serve();
     let surface = history_surface(&serve, three_principal_admission()).await;
 
-    // The read-only caller's prune is the knowledge face's put refusal, byte for byte, and it
-    // leaves every checkpoint in place.
     let reader = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let refused_read_only = assert_scope_refusal(
         reader
@@ -5952,12 +5807,6 @@ async fn history_prune_needs_the_write_and_read_grant() {
         "the write-only refusal deletes nothing"
     );
 
-    // The invariant itself: ONE caller holding the two capabilities on TWO live grants in the same
-    // Mind — the `knowledge_read` grant it already holds above, plus the separate `knowledge_write`
-    // seeded with the fixture. Requirements never union, so the prune is refused with the same
-    // fixed bytes and the checkpoints survive. Two different principals each missing one
-    // capability — the cases above — would still pass if the check were two independent
-    // single-capability reads.
     let split = connect_as(&surface, &PEER_TWO_SEED, &HISTORY_CAPABILITIES).await;
     let refused_split = assert_scope_refusal(
         split
@@ -5981,8 +5830,6 @@ async fn history_prune_needs_the_write_and_read_grant() {
         [1, 2],
         "the split-grant refusal deletes nothing"
     );
-    // The same caller's read-only operation still works, so the refusal above is the prune's
-    // requirement and not a blanket refusal of the caller.
     assert_eq!(
         replayed_summary(&expect_ok(
             replay(&split.adapter, &scope_of(SPACE), "ke_history", 2).await,
@@ -6035,7 +5882,6 @@ async fn the_history_face_refuses_every_mind_it_does_not_admit_alike() {
     let fixture = Fixture::open().await;
     fixture.seed_second_mind().await;
     let pool = fixture.store.pool();
-    // The second Mind's entry, written before the freeze: its history is the control's subject.
     seed_history(
         &fixture.store,
         COLLECTION_TWO,
@@ -6047,7 +5893,6 @@ async fn the_history_face_refuses_every_mind_it_does_not_admit_alike() {
         ],
     )
     .await;
-    // The second Mind is frozen for its probe; the peer holds no grant in it yet.
     sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
         .bind(SPACE_TWO)
         .execute(&pool)
@@ -6093,8 +5938,6 @@ async fn the_history_face_refuses_every_mind_it_does_not_admit_alike() {
         "a refused prune never reaches the dedup claim"
     );
 
-    // The control: admitted to its own Mind, the same peer replays and prunes, so the refusals
-    // above were admission and not a missing face.
     sqlx::query("UPDATE memory_spaces SET status = 'active' WHERE space_id = ?")
         .bind(SPACE_TWO)
         .execute(&pool)
@@ -6190,8 +6033,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
         ],
     )
     .await;
-    // The other Mind's entry has a longer history, so its own prune deletes a different count: a
-    // cross-Mind replay would be visible in the answer.
     seed_history(
         &fixture.store,
         COLLECTION_TWO,
@@ -6206,12 +6047,10 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
     )
     .await;
     let scope = scope_of(SPACE);
-    // The pool the fixture opened: the same database file the reopen below reads again.
     let pool = fixture.store.pool();
 
     let (dir, serve) = fixture.serve();
 
-    // Before: one prune, its recorded outcome, and the checkpoint it cut.
     let first = {
         let surface = history_surface(&serve, principal_admission()).await;
         let session = connect(&surface, &HISTORY_CAPABILITIES).await;
@@ -6239,12 +6078,8 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
     );
 
     drop(serve);
-    // Nothing reachable from the old surface holds dedup state: the file is the only place the
-    // record can live for the reopen below to find it.
     drop(pool);
 
-    // Between: the same file, a fresh store, a fresh surface, a fresh signed session, and one more
-    // revision the first prune never saw.
     let reopened = MindStore::open(&path)
         .await
         .expect("reopen the same database file");
@@ -6266,7 +6101,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
     let session = connect(&surface, &HISTORY_CAPABILITIES).await;
     let dialer = &*session.adapter;
 
-    // After: the recorded outcome, not a new count.
     let replayed = expect_ok(
         dialer
             .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-one"))
@@ -6290,7 +6124,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
         "a replay leaves the recorded row exactly as it was"
     );
 
-    // The same key with another payload is the conflict, and it changes nothing.
     let conflict = expect_reject(
         dialer
             .prune_history(&scope, "knowledge_entry", "ke_history", 2, Some("key-one"))
@@ -6299,9 +6132,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
     );
     assert_eq!(conflict.code, SpokeRejectCode::IdempotencyConflict);
 
-    // Across Minds: the same principal and idempotency key against the other Mind finds no row in
-    // its own namespace, so that prune executes — with the other Mind's own count — and this
-    // Mind's recorded row and outcome are what they were.
     let other = expect_ok(
         dialer
             .prune_history(
@@ -6344,8 +6174,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
         "this Mind's recorded outcome is still the one it answered"
     );
 
-    // A claim with no outcome: the key was claimed and never settled, so the retry answers
-    // `RECEIPT_EXPIRED` and the port is not called.
     let claimed_key = dedup_key(SPACE, PRINCIPAL, "key-claimed");
     sqlx::query("INSERT INTO history_dedup (namespace, key, principal) VALUES (?, ?, ?)")
         .bind(COLLECTION)
@@ -6373,7 +6201,6 @@ async fn a_prune_replays_its_recorded_outcome_after_the_store_is_reopened() {
         "an unsettled claim never reaches the port"
     );
 
-    // A fresh key executes against the current state.
     let fresh = expect_ok(
         dialer
             .prune_history(&scope, "knowledge_entry", "ke_history", 1, Some("key-two"))
@@ -6471,8 +6298,6 @@ async fn a_prune_settles_its_claim_and_its_record_on_the_single_connection_pool(
         "the recorded outcome is the port's own refusal: {outcome}"
     );
 
-    // The same principal and key now holds the covering grant. A sequence that had not claimed
-    // before the port would execute here; the recorded refusal answers instead.
     sqlx::query(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
@@ -6509,8 +6334,6 @@ async fn a_prune_settles_its_claim_and_its_record_on_the_single_connection_pool(
         "the replay did not execute the now-authorized prune"
     );
 
-    // A fresh key under the new grant executes, so the replay above was the record and not a
-    // second refusal.
     let fresh = expect_ok(
         peer.adapter
             .prune_history(
@@ -6594,23 +6417,17 @@ async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_resu
         unsettled.message
     );
 
-    // The prune itself did commit; only its receipt is missing. That is exactly why the caller
-    // must not be told it succeeded.
     assert_eq!(
         checkpoint_revisions(&pool, COLLECTION, "ke_history").await,
         [2],
         "the prune ran"
     );
-    // The failed write released the claim rather than leaving it behind, so the key is not spent.
     assert_eq!(
         dedup_row_count(&pool, COLLECTION).await,
         0,
         "the unsettled settlement left no claim, so the key stays claimable"
     );
 
-    // The fault clears and the same key executes. The prune it runs now sees the state the first
-    // one left, so it deletes nothing and records that: a real result, not the answer the caller
-    // was denied and not `RECEIPT_EXPIRED`.
     sqlx::query("DROP TRIGGER refuse_settlement")
         .execute(&pool)
         .await
@@ -6639,7 +6456,6 @@ async fn a_failed_settlement_answers_an_uncertain_outcome_and_never_a_prune_resu
         "the recovered prune settled its outcome: {digest:?} / {outcome:?}"
     );
 
-    // The key is settled once: the same request now replays instead of pruning again.
     let replayed = expect_ok(
         creator
             .adapter
@@ -6742,7 +6558,6 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
         "the faulted prune never reached the store"
     );
 
-    // The fault clears.
     sqlx::query("DROP VIEW knowledge_entry_revisions")
         .execute(&pool)
         .await
@@ -6752,15 +6567,12 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
         .await
         .expect("remove the fault");
 
-    // The claim was released, not retained: no row stands between this key and a retry.
     assert_eq!(
         dedup_row_count(&pool, COLLECTION).await,
         0,
         "the faulted key left no claim behind"
     );
 
-    // The same key now executes. Released, the key is claimable again, so the retry runs the prune
-    // against the current state and records its outcome — it does not answer RECEIPT_EXPIRED.
     let recovered = expect_ok(
         creator
             .adapter
@@ -6795,7 +6607,6 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
         "the recorded outcome is the executed prune result: {outcome}"
     );
 
-    // And the recorded outcome now replays: the key settled exactly once.
     let replayed = expect_ok(
         creator
             .adapter
@@ -7019,7 +6830,6 @@ async fn adoption_lands_in_the_admitted_mind_and_reads_back_through_its_knowledg
         "the shared source is only ever read"
     );
 
-    // The destination is the admitted Mind's registered collection, resolved in the call.
     let destination = table_rows(&pool, COLLECTION).await;
     assert!(
         holds(&destination.0, "ke_shared_note"),
@@ -7031,7 +6841,6 @@ async fn adoption_lands_in_the_admitted_mind_and_reads_back_through_its_knowledg
         "no other Mind's collection holds the copy: {elsewhere:?}"
     );
 
-    // Read back through the very face the Mind serves its own knowledge through.
     let read = expect_ok(
         dialer
             .get_knowledge_entry_in_scope("ke_shared_note", Some(&request_scope(SPACE, None)))
@@ -7073,7 +6882,6 @@ async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
     let peer = principal_for(PEER_TWO_PRINCIPAL);
     let before = both_collections(&pool).await;
 
-    // The peer is admitted to the second Mind only, so naming the first is naming another Mind.
     let cross = expect_reject(
         AdoptionPort::adopt_knowledge_entry(
             dialer,
@@ -7094,7 +6902,6 @@ async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
         .await,
         "a destination in a Mind that is no Mind",
     );
-    // The frozen Mind is the first one, where this peer holds no grant at all.
     sqlx::query("UPDATE memory_spaces SET status = 'frozen' WHERE space_id = ?")
         .bind(SPACE)
         .execute(&pool)
@@ -7123,8 +6930,6 @@ async fn adoption_refuses_every_mind_it_does_not_admit_alike() {
         "the target-free refusal carries no details: {cross:?}"
     );
 
-    // A second authenticated peer, admitted to nothing at all, naming the same Mind answers the
-    // same bytes: the refusal belongs to the face rather than to the caller that drew it.
     let stranger = connect_as(&surface, &PEER_THREE_SEED, &ADOPTION_CAPABILITIES).await;
     let from_another_caller = expect_reject(
         AdoptionPort::adopt_knowledge_entry(
@@ -7179,8 +6984,6 @@ async fn adoption_destination_member_naming_another_mind_is_the_target_free_refu
         refused.details.is_none(),
         "the target-free refusal carries no details: {refused:?}"
     );
-    // Target-free means the message names neither the Mind the caller is admitted to, nor the one
-    // the request named, nor the source entry or collection.
     for target in [
         SPACE,
         SPACE_TWO,
@@ -7546,7 +7349,6 @@ async fn a_repeat_adoption_survives_a_source_edit_between_the_calls() {
     assert_eq!(first["entry"]["adoption_anchor"]["source_revision"], 1);
     let copy_revision = first["entry"]["revision"].clone();
 
-    // Edit the live source: a normal put of the same entry advances it to revision 2.
     let source =
         ScopedKnowledgeStore::new(pool.clone(), KnowledgeScope::new(ADOPT_SOURCE_COLLECTION));
     let edited = expect_ok(
@@ -7560,7 +7362,6 @@ async fn a_repeat_adoption_survives_a_source_edit_between_the_calls() {
     );
     assert_eq!(edited.revision, Some(2), "the source advanced");
 
-    // The repeat still names revision 1 — the revision the copy anchors — and is served that copy.
     let repeat = expect_ok(
         AdoptionPort::adopt_knowledge_entry(
             dialer,
@@ -7582,8 +7383,6 @@ async fn a_repeat_adoption_survives_a_source_edit_between_the_calls() {
     );
     assert_eq!(repeat["entry"]["adoption_anchor"]["source_revision"], 1);
 
-    // A call naming the source's new revision is the stale-copy conflict, and names the revision
-    // the stored copy anchors rather than the source's current one.
     let stale = expect_reject(
         AdoptionPort::adopt_knowledge_entry(
             dialer,
@@ -7627,8 +7426,6 @@ async fn a_revoked_knowledge_grant_refuses_a_recorded_adoption_replay() {
     assert_eq!(wire(adopted)["outcome"], "adopted");
     let settled = both_collections(&pool).await;
 
-    // The same retry identity replays the recorded outcome after admission alone; the copy is not
-    // written again.
     let replay = expect_ok(
         AdoptionPort::adopt_knowledge_entry(dialer, &principal(), &scope_of(SPACE), &request).await,
         "the recorded replay while the grant lives",
@@ -7644,8 +7441,6 @@ async fn a_revoked_knowledge_grant_refuses_a_recorded_adoption_replay() {
         "a replay writes nothing"
     );
 
-    // Revoke the knowledge grant while the peer still holds its other live grant in the Mind:
-    // admission passes and the operation grant is what must answer.
     sqlx::query("UPDATE memory_grants SET revoked_at = ? WHERE grant_id = 'grt_knowledge'")
         .bind(NOW)
         .execute(&pool)
@@ -7690,8 +7485,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     )
     .await;
     let pool = fixture.store.pool();
-    // A retirement chain that closes on itself: every hop loads, and the resolver refuses the
-    // repeated id.
     for (entry_id, successor) in [("ke_cycle_a", "ke_cycle_b"), ("ke_cycle_b", "ke_cycle_a")] {
         sqlx::query(
             "UPDATE knowledge_entries SET superseded_by = ?
@@ -7728,8 +7521,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     .execute(&pool)
     .await
     .expect("seed a terminal above the served range");
-    // The retired hop that resolves to it, so the above-range row is the terminal rather than the
-    // requested entry: a retired source's copy anchors the terminal's own stored revision.
     sqlx::query(
         "INSERT INTO knowledge_entries \
          (collection, entry_id, revision, payload, superseded_by, created_at, updated_at) \
@@ -7790,8 +7581,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     .execute(&pool)
     .await
     .expect("seed a live source whose column and payload revisions disagree");
-    // Three occupants of three destination slots: one visible, one retired, and one an owner's
-    // private entry the admitted selection carries no viewpoint for.
     let destination = fixture.store.knowledge(KnowledgeScope::new(COLLECTION));
     for entry_id in ["ke_taken", "ke_old", "ke_new"] {
         expect_ok(
@@ -7819,9 +7608,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     let surface = adoption_surface(&serve, principal_admission()).await;
     let session = connect(&surface, &ADOPTION_CAPABILITIES).await;
 
-    // The live source whose row revision and payload revision disagree is adopted, not refused: the
-    // live branch anchors the requested revision, so the out-of-range column never becomes the
-    // anchor and the call is not a store fault.
     let live_high = expect_ok(
         AdoptionPort::adopt_knowledge_entry(
             &*session.adapter,
@@ -7885,8 +7671,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
         assert_adoption_writes_nothing(&session, &pool, &request, expected, case).await;
     }
 
-    // A repeat is a read of the existing copy, so the committed tables stay as the first call left
-    // them.
     let first = expect_ok(
         AdoptionPort::adopt_knowledge_entry(
             &*session.adapter,
@@ -7916,8 +7700,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
         "the repeat adds no row"
     );
 
-    // The write itself fails after every read succeeded: a trigger on the destination refuses the
-    // one INSERT, so the call answers the fixed store fault and the copy is not there.
     let trigger = format!(
         "CREATE TRIGGER inject_adoption_write_fault \
          BEFORE INSERT ON knowledge_entries \
@@ -7941,7 +7723,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
         .await
         .expect("remove the write fault");
 
-    // The fault was the only thing in the way: the same call now commits the copy.
     let adopted = expect_ok(
         AdoptionPort::adopt_knowledge_entry(
             &*session.adapter,
