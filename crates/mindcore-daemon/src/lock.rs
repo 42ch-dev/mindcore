@@ -43,8 +43,6 @@ impl StoreLock {
         let path = lock_path(store_path);
         let mut open = OpenOptions::new();
         open.read(true).write(true).create(true).truncate(false);
-        // Owner-only for the same reason as the store: the lock names a store, and its mode should
-        // not be the umask's choice either. An existing lock file keeps its own mode.
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -70,9 +68,6 @@ fn create_if_absent(store: &Path) -> Result<(), DaemonError> {
     }
     let mut open = OpenOptions::new();
     open.create(true).write(true).truncate(false);
-    // Owner-only from the moment it exists: the store holds the session data, and the umask of
-    // whatever started the daemon is not the place to decide who may read it. An existing store
-    // keeps the mode it already has — this only runs on the file this call creates.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -153,7 +148,6 @@ fn resolve(store_path: &Path) -> Result<PathBuf, DaemonError> {
             .unwrap_or_else(|| Path::new("."));
         let resolved = std::fs::canonicalize(parent).map_err(unresolvable)?;
         let candidate = resolved.join(&name);
-        // Nothing is there: the candidate is the store this run will create.
         let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
             return Ok(candidate);
         };
@@ -243,7 +237,6 @@ mod tests {
             "the created store is {mode:04o}, not owner-only"
         );
 
-        // An existing store is left alone.
         let existing = dir.path().join("existing.db");
         std::fs::write(&existing, BYTES).expect("create the store");
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640))
@@ -274,7 +267,6 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600, "the lock is {mode:04o}, not owner-only");
 
-        // An existing lock file is left alone.
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o640))
             .expect("give it its own mode");
         drop(guard);
@@ -386,7 +378,6 @@ mod tests {
         std::os::unix::fs::symlink(&store, &alias).expect("dangling symlink");
         assert!(!store.exists(), "the target does not exist yet");
 
-        // Nothing has created the target: acquiring the alias is what creates it.
         let first = acquire(&alias).expect("acquire the dangling alias");
         assert!(store.exists(), "the alias created the target");
 
@@ -419,8 +410,6 @@ mod tests {
         let link = dir.path().join("hard.db");
         std::fs::hard_link(&store, &link).expect("hard link");
 
-        // Two names, one database: SQLite's sidecars are named for the path, so one of the two
-        // would write a log the other never reads. Refused, not served under a narrower rule.
         for name in [&store, &link] {
             match StoreLock::acquire(name) {
                 Err(DaemonError::Config(message)) => {
@@ -448,8 +437,6 @@ mod tests {
         let link = elsewhere.path().join("mind.db");
         std::fs::hard_link(&store, &link).expect("hard link across directories");
 
-        // The link count is a property of the inode, so the other directory does not matter: one
-        // database with two names is refused from either side.
         for name in [&store, &link] {
             match StoreLock::acquire(name) {
                 Err(DaemonError::Config(message)) => {
@@ -470,7 +457,6 @@ mod tests {
         let elsewhere = tempfile::tempdir().expect("tempdir");
         let first = dir.path().join("first.db");
         let second = elsewhere.path().join("second.db");
-        // A real database, so opening the resolved path is the observable "the right file opened".
         mindcore_sqlite::MindStore::open(&first)
             .await
             .expect("create the first store")
@@ -481,7 +467,6 @@ mod tests {
         let link = dir.path().join("store.db");
         std::os::unix::fs::symlink(&first, &link).expect("point the link at the first store");
 
-        // The one resolution the start performs.
         let resolved = canonical_store_path(&link).expect("resolve once");
         assert_eq!(
             resolved,
@@ -489,11 +474,9 @@ mod tests {
             "the link resolves to the first store"
         );
 
-        // Re-point the link to a different database after resolution.
         std::fs::remove_file(&link).expect("unlink the link");
         std::os::unix::fs::symlink(&second, &link).expect("re-point at the second store");
 
-        // The lock and the open both use the resolved path, so neither follows the new target.
         let guard = StoreLock::acquire(&resolved).expect("lock the resolved path");
         let lock = lock_path(&resolved);
         assert_eq!(
