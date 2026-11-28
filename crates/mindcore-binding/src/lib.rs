@@ -1097,8 +1097,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    // Every seam is keyed by path and each test owns a fresh temporary root, so a shared global
-    // needs no reset between tests — and a reset would clobber a test still running.
 
     /// The working directory is process-wide, so the tests that set it hold this and no other test
     /// touches it.

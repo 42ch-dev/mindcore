@@ -831,8 +831,6 @@ async fn a_grant_expiring_during_the_connection_wait_is_not_live() {
         .create_mind(&request(Some("wren"), "caller_wren"))
         .await);
 
-    // A grant that expires a few tens of milliseconds from now. A liveness decision taken before
-    // the read begins would still see it live after the wait; one taken per row must not.
     let expiry = (chrono::Utc::now() + chrono::Duration::milliseconds(40))
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
@@ -842,9 +840,6 @@ async fn a_grant_expiring_during_the_connection_wait_is_not_live() {
     )
     .await;
 
-    // The pool's one connection is held open by an unrelated borrower, so `list_minds` waits
-    // for its connection while the expiry passes; WAL readers are not lock-blocked, so the wait
-    // is purely the pool's.
     let (release, held) = tokio::sync::oneshot::channel::<()>();
     let (started_tx, mut started_rx) = tokio::sync::mpsc::channel::<()>(1);
     let blocker_pool = pool.clone();

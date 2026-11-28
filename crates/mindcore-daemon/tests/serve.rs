@@ -294,7 +294,6 @@ async fn a_tool_invoked_right_after_the_handshake_is_served() {
     let config = write(dir.path(), "daemon.toml", &config_text(dir.path(), &socket));
 
     let _daemon = Daemon::spawn(&config);
-    // The dialer negotiates the tool id in its hello, as a caller must before invoking it.
     let adapter = dial_claiming(
         wait_for_socket(&socket).await,
         &[
@@ -305,7 +304,6 @@ async fn a_tool_invoked_right_after_the_handshake_is_served() {
     )
     .await;
 
-    // No delay between the handshake and the invoke: the gate is what makes this safe.
     let answered = tokio::time::timeout(
         Duration::from_secs(10),
         adapter.invoke_tool("tools.mindcore.recall_context", json!({})),
@@ -314,8 +312,6 @@ async fn a_tool_invoked_right_after_the_handshake_is_served() {
     .expect("an immediate tool invoke must answer, not hang");
 
     match answered {
-        // A served-path refusal is a pass: the handler existed and ran, and this bare call is
-        // legitimately refused (no Mind, no budget). What must never appear is the dispatch deny.
         SpokeResult::Reject(reject) => {
             let text = format!("{reject:?}");
             assert!(
@@ -394,7 +390,6 @@ async fn a_second_instance_is_refused_and_sigterm_stops_the_first() {
     wait_for_socket(&socket).await;
     let lock = lock_file(dir.path());
 
-    // The same store, another socket: the lock, not the name, is what a second instance meets.
     let second_socket = dir.path().join(SECOND_SOCKET_FILE);
     let second_config = write(
         dir.path(),

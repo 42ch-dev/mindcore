@@ -237,8 +237,6 @@ pub async fn create(tx: &mut Transaction<'_, Sqlite>, request: &CreateMind) -> S
         created_at: created_at.clone(),
         extensions: Map::new(),
     };
-    // A colliding grant id is not a taken Mind id: the id is minted independently, and its
-    // failure means nothing about the Mind the caller asked for.
     if repository.insert_grant(tx, &grant).await.is_err() {
         return storage_unavailable();
     }
@@ -279,8 +277,6 @@ type JoinRow = (
     String,
 );
 
-// The one projection and join both visibility reads share. A macro rather than a constant,
-// because `concat!` joins literals only, and sqlx's safety lint accepts literals alone.
 macro_rules! grant_columns {
     () => {
         "SELECT m.space_id, m.knowledge_collection, m.carrier_entry_id, \
@@ -328,13 +324,7 @@ fn visible_id_of(row: &SqliteRow) -> Option<(String, Option<String>, String, Str
     ))
 }
 
-// The visibility rule of `expiry_passed` in `crates/mindcore-spoke/src/admission.rs`, restated
-// here because `mindcore-sqlite` cannot depend on the adapter: no expiry is live; an expiry
-// that does not parse as RFC 3339 is never live; the expiry is compared as an instant and never
-// as text, so an offset is honoured and an expiry equal to now is already passed.
 fn live(expires_at: &Option<String>) -> bool {
-    // The instant is read here, at the moment the row is examined and never earlier: a grant
-    // that expires while the single-connection pool makes the query wait is already passed.
     let now = Utc::now();
     match expires_at {
         None => true,

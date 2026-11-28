@@ -3939,7 +3939,6 @@ fn the_caller_absence_walk_catches_a_leak_under_any_key() {
     }
 }
 
-// ---------- The composed knowledge face ----------
 
 /// One plain entry a served put creates: no cognition module, so the store validates only its
 /// own write bookkeeping.
@@ -4928,7 +4927,6 @@ async fn no_wire_response_carries_the_caller() {
     );
 }
 
-// ---------- The pinned gate order, on the wire ----------
 
 /// The gate order lives in the responder, not in the typed dialer: `RemoteAdapter` refuses a
 /// scoped `get`/`put` locally when the session did not negotiate the marker, so it can never
@@ -5194,7 +5192,6 @@ async fn the_same_scoped_request_is_served_once_the_marker_is_negotiated() {
     );
 }
 
-// ---------- A storage fault during admission is not a refusal ----------
 
 /// A storage fault while the scoped admission resolves the caller's grants is answered as this
 /// request's internal error, not as the fixed `NOT_AUTHORIZED` an unadmitted caller receives.
@@ -5292,7 +5289,6 @@ async fn the_admission_refusal_is_unchanged_for_an_unadmitted_and_an_unknown_min
     }
 }
 
-// ---------- The composed history face ----------
 
 /// A session that serves history negotiates the knowledge face's three flags with it: both
 /// history ops admit through that face's callbacks.
@@ -6511,11 +6507,6 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
     let creator = connect(&surface, &HISTORY_CAPABILITIES).await;
     let key = dedup_key(SPACE, PRINCIPAL, "key-faulted");
 
-    // SQLite has no read trigger, so the fault is installed on the statement the prune itself
-    // runs: `prune_entry_history` reads the entry's checkpoints from
-    // `knowledge_entry_revisions`, and a view over that table calling a missing function fails the
-    // statement at prepare time — the store's `InternalError`, answered after admission and after
-    // the claim, so the fault is the port's and not the Mind admission's.
     sqlx::query("ALTER TABLE knowledge_entry_revisions RENAME TO knowledge_entry_revisions_intact")
         .execute(&pool)
         .await
@@ -6632,7 +6623,6 @@ async fn a_port_storage_fault_is_released_so_the_same_key_executes() {
     );
 }
 
-// ---------- The composed adoption face ----------
 
 /// A session that serves adoption negotiates the family with the knowledge face that admits it:
 /// Connect's compound gate requires both.
@@ -7235,9 +7225,6 @@ async fn adoption_needs_the_write_and_read_grant() {
     let surface = adoption_surface(&serve, three_principal_admission()).await;
     let before = both_collections(&pool).await;
 
-    // Each half of the grant is compared against the same principal's own knowledge put, not only
-    // against the other half: the adoption must answer the knowledge face's refusal byte for byte,
-    // so a change to both adoption refusals alone still fails.
     let reader = connect_as(&surface, &PEER_TWO_SEED, &ADOPTION_CAPABILITIES).await;
     let reader_put = expect_reject(
         reader
@@ -7497,10 +7484,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
         .await
         .expect("close the retirement cycle");
     }
-    // A retired source whose terminal sits above the served revision range. Only the retired branch
-    // anchors a stored revision this call discovered — `load_retirement_entry` reads it from the row's
-    // `revision` column — so only there is an above-range value a copy the response cannot describe.
-    // A live source is not guarded: it anchors the caller's requested revision instead.
     sqlx::query(
         "INSERT INTO knowledge_entries \
          (collection, entry_id, revision, payload, created_at, updated_at) \
@@ -7538,12 +7521,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     .execute(&pool)
     .await
     .expect("seed the retired hop onto it");
-    // A source the served wire cannot carry: its `schema_version` sits above the SchemaVersion
-    // ceiling. Two layers already stop this shape before a copy exists — the served put refuses it
-    // on the way in, and the store's own payload decode refuses to hand it back — so this case pins
-    // the end-to-end outcome (the fixed fault, both collections unchanged) rather than the seam
-    // guard, which `an_unserveable_copy_never_becomes_a_response` covers directly. It is written
-    // raw because a store written by another version can hold the row.
     let mut unserveable = served_entry("ke_unserveable", "a source the wire cannot carry");
     unserveable.schema_version = std::num::NonZeroU64::new(SCHEMA_VERSION_MAX + 1)
         .expect("a non-zero version above the ceiling");
@@ -7561,9 +7538,6 @@ async fn adoption_fault_at_any_statement_leaves_both_collections_unchanged() {
     .execute(&pool)
     .await
     .expect("seed a source the served wire cannot carry");
-    // A live source whose row `revision` column is out of the served range while its payload's own
-    // revision is in range. The live branch anchors the caller's requested revision, never this
-    // column, so the two disagreeing is not a store fault and the copy is written from the payload.
     let mut live_high_payload =
         served_entry("ke_live_high", "a live source above the served range");
     live_high_payload.revision = Some(1);

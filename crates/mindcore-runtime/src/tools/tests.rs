@@ -1164,9 +1164,6 @@ async fn advertised_input_schemas_match_the_decoded_arguments() {
         if matches!(capability_id, DELIBERATE | READ_COGNITION) {
             arguments["space_id"] = json!("spc_1");
         }
-        // The pre-check is charged against the request's budget, so this probe names a budget
-        // that a process-scheduled pre-check cannot spend: the probe measures the ABI, not the
-        // clock.
         if capability_id == DELIBERATE {
             arguments["timeout_ms"] = json!(30_000);
         }

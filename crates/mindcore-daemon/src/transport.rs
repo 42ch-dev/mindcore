@@ -100,8 +100,6 @@ impl Transport for GatedTransport {
         let mut gate = self.gate.subscribe();
         let mut state = *gate.borrow_and_update();
         if state == GateState::Closed {
-            // Waits only while the host has not decided; the sender lives in `self`, so a closed
-            // channel means this transport is gone and the inner one answers for itself.
             if let Ok(resolved) = gate.wait_for(|state| *state != GateState::Closed).await {
                 state = *resolved;
             }
@@ -176,7 +174,6 @@ impl UnixSocketTransport {
     /// responder ended the session, a framing fault, or the daemon is draining.
     pub async fn closed(&self) {
         let mut closed = self.closed.subscribe();
-        // The sender lives in `self`, so this only errors if the transport itself is gone.
         let _ = closed.wait_for(|closed| *closed).await;
     }
 
@@ -226,8 +223,6 @@ impl UnixSocketTransport {
     /// Every fault here is terminal — the transport is closed and the socket shut down before the
     /// error returns, so a truncated frame cannot leave a half-usable session behind.
     async fn read_frame(&self, reader: &mut OwnedReadHalf) -> Result<Vec<u8>, TransportError> {
-        // Read by hand rather than `read_exact`: an EOF after some prefix bytes is a truncated
-        // frame, while one before any is the peer closing at a frame boundary.
         let mut prefix = [0u8; 4];
         let mut filled = 0;
         while filled < prefix.len() {
@@ -240,9 +235,6 @@ impl UnixSocketTransport {
             };
             if read == 0 {
                 return if filled == 0 {
-                    // The peer closed on a frame boundary: an orderly end, not a framing fault, but
-                    // still the end. Without `terminate` the closed signal never fires and the
-                    // connection task waits on `closed()` forever, holding its fd and its responder.
                     self.terminate().await;
                     Err(TransportError::Closed)
                 } else {
@@ -297,29 +289,21 @@ impl Transport for UnixSocketTransport {
         }
 
         let mut writer = self.writer.lock().await;
-        // `close` may have returned while this send waited for the lock; it must not write now.
         if self.is_closed() {
             return Err(TransportError::Closed);
         }
-        // A shutdown tears the socket down under an in-flight write, so the write fails. When our
-        // own close is what interrupted it, the cause is the close and `Closed` is the honest
-        // answer; only a failure with the transport still open is an I/O fault.
         let written = async {
             writer.write_all(&len.to_be_bytes()).await?;
             writer.write_all(envelope).await
         }
         .await;
         if let Err(error) = written {
-            // Part of a frame may be on the stream: the framing is now broken for this peer, so
-            // the transport ends exactly as a failed read does rather than staying half usable.
             if self.is_closed() {
                 return Err(TransportError::Closed);
             }
             self.terminate().await;
             return Err(TransportError::Io(format!("write frame: {error}")));
         }
-        // A close during the write shuts the socket down; the write may have completed on a peer
-        // that is now gone, and it must not be reported as a delivered frame.
         if self.is_closed() {
             return Err(TransportError::Closed);
         }
@@ -332,8 +316,6 @@ impl Transport for UnixSocketTransport {
         }
         let mut closed = self.closed.subscribe();
         let mut reader = self.reader.lock().await;
-        // A pending recv fails fast when the transport closes. Dropping the read future can only
-        // lose bytes no later recv can be asked for: close is terminal.
         tokio::select! {
             frame = self.read_frame(&mut reader) => frame,
             _ = closed.wait_for(|closed| *closed) => Err(TransportError::Closed),
@@ -341,9 +323,6 @@ impl Transport for UnixSocketTransport {
     }
 
     async fn close(&self) -> Result<(), TransportError> {
-        // Idempotent, and it waits: a repeat takes the teardown lock, finds the shutdown done by the
-        // first call (or by a framing fault) and returns only then. So a `close` that resolves means
-        // the socket is shut down, never that some other teardown is still under way.
         self.terminate().await;
         Ok(())
     }
@@ -477,8 +456,6 @@ mod tests {
             "the fault names the length: {error:?}"
         );
 
-        // The transport is still alive here — this is the F-001 case: the socket must be shut down
-        // regardless, so the peer sees EOF and the connection task's wait resolves.
         assert_closed(&transport).await;
         assert_peer_sees_eof(&mut peer).await;
         assert!(
@@ -573,8 +550,6 @@ mod tests {
         let (mut peer, accepted) = UnixStream::pair().expect("pair");
         let transport = std::sync::Arc::new(UnixSocketTransport::from_stream(accepted));
 
-        // Larger than any socket buffer, so the send parks — and within `MAX_FRAME`, so it is a
-        // legitimate frame rather than an immediate protocol refusal.
         let body = vec![7u8; 8 * 1024 * 1024];
         let sending = tokio::spawn({
             let transport = std::sync::Arc::clone(&transport);
@@ -623,8 +598,6 @@ mod tests {
         let (dialer, _accepted) = session().await;
         let dialer = std::sync::Arc::new(dialer);
 
-        // Stand in for a teardown already under way: hold the shutdown lock, so `close` has the work
-        // left to do and nothing else has done it yet.
         let teardown = dialer.shutdown_lock.lock().await;
         let closing = tokio::spawn({
             let dialer = std::sync::Arc::clone(&dialer);
@@ -665,7 +638,6 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // The repeat must queue behind the first teardown, not report success on its own.
         let second = tokio::spawn({
             let dialer = std::sync::Arc::clone(&dialer);
             async move { dialer.close().await }
@@ -742,7 +714,6 @@ mod tests {
             .await
             .expect("send a first frame");
 
-        // Never opened: the handshake cannot make progress, so the state stays pre-established.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_ne!(
             responder.state(),
@@ -750,7 +721,6 @@ mod tests {
             "a closed gate must keep the session unestablished"
         );
 
-        // Opening it releases the frame, and the responder's own state machine takes over.
         gated.open();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_ne!(
@@ -804,8 +774,6 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         gated.open();
-        // The inner transport carries nothing, so the recv stays pending: it is no longer the gate
-        // that holds it, and that is exactly why a rejection is a distinct state.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !waiting.is_finished(),

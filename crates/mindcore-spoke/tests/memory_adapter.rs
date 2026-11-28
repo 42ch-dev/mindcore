@@ -141,8 +141,6 @@ impl Harness {
         .fetch_optional(&mut **tx)
         .await
         .expect("the carrier entry");
-        // Every grant row in the Mind, ordered by id, so a grant edited in place — a widened
-        // `capabilities_json`, a moved expiry, a revoked row — differs from the snapshot.
         let grants: Vec<String> = sqlx::query_scalar(
             "SELECT json_object('grant_id', grant_id, 'principal_id', principal_id, \
              'subject_id', subject_id, 'capabilities_json', capabilities_json, \
@@ -4560,8 +4558,6 @@ async fn unknown_ungranted_and_frozen_minds_answer_one_refusal() {
                 serde_json::json!(refusal.message),
             ));
         }
-        // `memory.receipts.get` and the two control reads are paths
-        // `guarded_reads` does not carry.
         let receipts = adapter
             .get_receipt(
                 &mut tx,
@@ -4706,8 +4702,6 @@ async fn spaces_list_returns_only_admitted_minds() {
     harness.seed_grant(PRINCIPAL, &["recall"]).await;
     let adapter = MemoryAdapter::new(true);
 
-    // Two Minds for the listing owner, created out of id order so the answer
-    // proves its sort, and a third for another owner alone.
     let mut tx = harness.begin().await;
     for (id, owner) in [
         ("mind_beta", "o_list"),
@@ -4910,7 +4904,6 @@ async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
             "create {id}: {created:?}"
         );
     }
-    // `mind_extra` gets a second live grant, so one undecodable row cannot hide it.
     sqlx::query(
         "INSERT INTO memory_grants \
          (grant_id, space_id, subject_id, principal_id, capabilities_json, context_ids_json, \
@@ -4993,8 +4986,6 @@ async fn spaces_list_skips_a_mind_whose_only_grant_is_undecodable() {
 async fn a_good_grant_after_an_undecodable_row_still_admits() {
     let harness = Harness::open().await;
     let adapter = MemoryAdapter::new(true);
-    // A bad row that sorts first — `capabilities_json` holds bytes the driver cannot hand over as
-    // text — and a good row that sorts after it.
     for (grant_id, capabilities) in [
         ("grant_a_bad", "CAST(X'80' AS TEXT)"),
         ("grant_z_good", "'[\"recall\"]'"),
@@ -5346,9 +5337,6 @@ async fn a_repeat_create_under_a_fresh_key_writes_one_receipt_and_nothing_else()
         before.0.is_some() && before.1.is_some() && before.2.is_some(),
         "the create wrote the space, the registry row and the carrier: {before:?}"
     );
-    // The creator's own row, pinned whole: a repeat that widened its capabilities or moved its
-    // expiry has to show up below. The seeded admin row lives in another space and is not part of
-    // this Mind's snapshot.
     let grant_rows: Vec<Value> = before
         .3
         .iter()

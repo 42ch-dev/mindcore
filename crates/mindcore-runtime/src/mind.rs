@@ -235,8 +235,6 @@ impl Mind {
             .capture(&mut transaction, &principal(&self.caller), request)
             .await;
         let body = match stage {
-            // Capture never journals: a non-Ready stage is a composition defect, answered
-            // before any state changes — nothing has committed, so the retry class holds.
             SpokeResult::Ok(MemoryStage::Ready(body)) => body,
             SpokeResult::Ok(unexpected) => {
                 drop(transaction);
@@ -520,8 +518,6 @@ impl Mind {
                 }
             }
         };
-        // No row at all: revision 1, the candidate's fresh-work value —
-        // `review_candidate` answers its own `NotFound` for a candidate that never existed.
         let revision = observed_revision.unwrap_or(1);
         let expected_revision = if consumed {
             revision.saturating_sub(1).max(1)

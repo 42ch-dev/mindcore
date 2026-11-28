@@ -948,11 +948,6 @@ impl SpiMindWorkflows {
         lens: Option<&dyn DomainLens>,
         caps: &MindCapabilities<'_>,
     ) -> Result<DeliberateOutcome, SpiError> {
-        // The record's context is a trusted input resolved once, from the
-        // request alone: a request naming neither an explicit context nor a
-        // subject to derive one from is the caller's invalid input, whatever
-        // branch the verdict later takes. No provider or storage phase runs
-        // first, so a `none` verdict cannot make such a request succeed.
         if request.assessment_context_id.is_none() && request.subject_id.is_none() {
             return Err(SpiError::InvalidInput(
                 "the request names neither an assessment context nor a subject to derive it from"

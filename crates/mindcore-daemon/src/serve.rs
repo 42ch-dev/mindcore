@@ -269,9 +269,6 @@ pub async fn run(
     let store = MindStore::open(&store_path)
         .await
         .map_err(|error| DaemonError::Store(format!("{}: {error}", store_path.display())))?;
-    // `MindcoreServe` owns the store, so the pool handle is taken first: it is the reachable route to
-    // the awaited close the drain order names, and every early failure below closes it rather than
-    // cutting the connections when the runtime drops.
     let pool = store.pool();
     if let Err(error) = journal_root(&config.journal.dir).await {
         pool.close().await;
@@ -328,10 +325,6 @@ pub async fn run(
         }
     };
 
-    // The drain, in the stated order. Closing first lets a session end its in-flight work; the
-    // shutdown then cancels whatever was still setting up — a task suspended in
-    // `connect_responder` or between its responder and its registration — so no responder can
-    // outlive this snapshot, and the second walk catches one registered inside that window.
     let live = std::mem::take(&mut *host.live.lock().expect("live lock"));
     drain_sessions(&live);
     connections.shutdown().await;
@@ -449,12 +442,6 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
     let mut cursor = Some(dir);
     while let Some(level) = cursor {
         if level.exists() {
-            // The resolved type decides: a symlink to a directory is a directory, and a journal root
-            // reached through one is the operator's arrangement, not a fault. `metadata` follows the
-            // link, so a link to a file or a FIFO still fails the gate below.
-            // A level that cannot be inspected is a journal fault, wherever in the chain it sits: the
-            // walk cannot tell an ancestor from the level beneath the root, and stopping early would
-            // skip the flush this start owes — which is the defect this rule exists to prevent.
             let metadata = std::fs::metadata(level)
                 .map_err(|error| DaemonError::Journal(format!("{}: {error}", level.display())))?;
             if !metadata.is_dir() {
@@ -500,21 +487,12 @@ async fn journal_root(dir: &Path) -> Result<(), DaemonError> {
         }
         sync_once(parent, &mut synced).await?;
     }
-    // A symlink in the chain means the journal really lives somewhere else. The chain walk flushed
-    // the entry that names the link; the directory that really holds the root has its own entry, in
-    // its own parent, which nothing in that walk names — so that one entry is flushed too.
-    //
-    // Exactly one extra entry, never the ancestors above it: a root at `/srv/link/journal` resolving to
-    // `/data/journal` costs the chain's entries plus `/data` here, and stops. A plain path resolves to
-    // itself, so its holding directory is already in `synced` and this adds nothing — the walk stays
-    // one flush per level, and never touches a directory above the chain.
     let resolved = std::fs::canonicalize(dir).map_err(|error| {
         DaemonError::Journal(format!(
             "{}: the journal root cannot be resolved after it was created: {error}",
             dir.display()
         ))
     })?;
-    // The root's own entry, so a failure here is the root's: fatal, unlike an ancestor's.
     if resolved != dir {
         sync_level_entry(&resolved, &mut synced).await?;
     }
@@ -740,9 +718,6 @@ async fn serve_connection(stream: UnixStream, id: usize, host: Arc<Host>) {
         invoke_timeout_ms: host.invoke_timeout_ms,
     };
     let responder = connect_responder(options).await;
-    // Tracked before this task's next await, so the drain owns the session from the moment it
-    // exists: `connect_responder` spawned the responder's own task with an `Arc` of its own, and
-    // an aborted connection task would otherwise leave that session serving unclosed.
     host.live
         .lock()
         .expect("live lock")
@@ -1815,8 +1790,6 @@ mod tests {
         let here = Path::new(".");
         clear_sync_attempts(here);
         let outcome = journal_root(Path::new("./journal")).await;
-        // Read the count while the scratch directory is still current: `sync_attempts` resolves the
-        // spelling it is given, so `"."` means a different directory after the chdir back.
         let flushed = sync_attempts(here);
         std::env::set_current_dir(&original).expect("leave the scratch directory");
 
@@ -2121,7 +2094,6 @@ mod tests {
     /// connection means a leftover name.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unprobeable_socket_name_is_refused_without_unlinking() {
-        // A search-only denial does not constrain uid 0, so the case cannot be built as root.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -2200,7 +2172,6 @@ mod tests {
     /// removal that did not happen.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unremovable_leftover_is_named_in_the_both_fail_refusal() {
-        // The mode bits do not constrain uid 0, so the environment cannot be built as root.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -2208,14 +2179,11 @@ mod tests {
         let parent = dir.path().join("socket-dir");
         std::fs::create_dir(&parent).expect("create the socket directory");
         let path = parent.join("daemon.sock");
-        // The bind needs a writable directory; the seam below closes it before the fallback's
-        // unlink, which is exactly the environment the refusal describes.
         let seam = IdentityFailure {
             close_directory: Some(parent.clone()),
         };
         push_injected_failure(&path, seam);
         let outcome = BoundSocket::bind(&path);
-        // Restore before asserting, so a failure does not leave an unwritable directory behind.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
             .expect("restore the directory");
         match outcome {
@@ -2243,7 +2211,6 @@ mod tests {
     /// the refusal must name both causes and the path, and the name must still be there.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_prepare_in_a_read_only_directory_names_both_causes() {
-        // The mode bits do not constrain uid 0, so the environment cannot be built as root.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -2252,7 +2219,6 @@ mod tests {
         std::fs::create_dir(&parent).expect("create the socket directory");
         let config = DaemonConfig {
             socket_path: parent.join("daemon.sock"),
-            // Not 64 hex digits: `prepare`'s peer-key decode is the step that fails.
             peers: BTreeMap::from([(
                 "peer-a".to_string(),
                 PeerConfig {
@@ -2273,7 +2239,6 @@ mod tests {
         );
 
         let mut bound = listen(&config).await.expect("bind the socket");
-        // Closed after the bind: the bind needs a writable directory, the cleanup does not get one.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))
             .expect("make the directory read-only");
         let failure = match prepare(Arc::new(surface), &config, &mut bound).await {
@@ -2308,7 +2273,6 @@ mod tests {
             peers: BTreeMap::from([(
                 "peer-a".to_string(),
                 PeerConfig {
-                    // Not 64 hex digits: `peer_keys` refuses it after the socket is bound.
                     public_key: "nonsense".to_string(),
                     principal: "prn_a".to_string(),
                 },
@@ -2361,7 +2325,6 @@ mod tests {
             invoke_timeout_ms: Some(2_000),
         })
         .await;
-        // Deliberately no `register` call: this is the window the daemon closes immediately.
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             responder.invoke_tool("tools.mindcore.recall_context", serde_json::json!({})),
@@ -2370,8 +2333,6 @@ mod tests {
         .expect("a pre-registration invoke must answer, not hang");
         match answered {
             SpokeResult::Reject(reject) => {
-                // The dialer's own session is not established here, so either the dispatch deny or
-                // a session refusal is a fail-closed answer; what must not happen is silence.
                 assert!(
                     matches!(
                         reject.code,
@@ -2395,7 +2356,6 @@ mod tests {
         let dir = TempDir::new().expect("temporary directory");
         let config = config(dir.path());
         let (listener, bound) = listen(&config).await.expect("bind the socket").into_parts();
-        // The listener still owns the socket; swap the name anyway, as a same-user process could.
         std::fs::remove_file(&config.socket_path).expect("unlink the socket");
         let bytes = b"the replacement's own bytes";
         std::fs::write(&config.socket_path, bytes).expect("write the replacement");
@@ -2430,8 +2390,6 @@ mod tests {
             &std::fs::symlink_metadata(&config.socket_path).expect("lstat the socket"),
         );
 
-        // `u64::MAX` for both members names nothing a device or inode can be, so this cannot
-        // collide with `real` on any filesystem.
         let claimed = SocketIdentity {
             dev: u64::MAX,
             ino: u64::MAX,
@@ -2529,7 +2487,6 @@ mod tests {
         let socket =
             SocketIdentity::of(&std::fs::symlink_metadata(&config.socket_path).expect("lstat"));
         let (park_setup, mut park_signal) = tokio::sync::mpsc::unbounded_channel();
-        // The same wiring `prepare` builds, without the signals this test never awaits.
         let host = Arc::new(Host {
             socket,
             surface: Arc::new(surface),
@@ -2551,7 +2508,6 @@ mod tests {
         {
             let accepting = accept(listener, &host, &mut connections);
             tokio::pin!(accepting);
-            // The dial completes against the listen backlog; the accept loop then owns the task.
             let _dial = UnixStream::connect(&config.socket_path)
                 .await
                 .expect("dial the daemon");

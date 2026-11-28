@@ -842,8 +842,6 @@ async fn knowledge_slot_refuses_a_collection_over_the_served_bound() {
     let harness = Harness::open().await;
     harness.grant(&["recall"]).await;
     harness.knowledge_grant(PRINCIPAL).await;
-    // The carrier entry is the collection's first live row, so exactly-at-the-bound means
-    // SERVED_KNOWLEDGE_LIST_LIMIT - 1 seeded rows beside it.
     for index in 0..(SERVED_KNOWLEDGE_LIST_LIMIT - 1) {
         harness
             .entry("wren", &format!("ke_{index:04}"), "bounded entry")
@@ -991,8 +989,6 @@ async fn knowledge_slot_omits_a_superseded_entry() {
 async fn cognition_read_hides_an_owner_private_carrier_from_a_viewpoint_free_peer() {
     let harness = Harness::open().await;
     harness.grant(&["knowledge_read"]).await;
-    // One judgment on the carrier, stored the way a dedicated append stores it: a
-    // `cognition_records` row the read hydrates into the payload's module.
     let module = json!({
         "records": [],
         "world_facts": [],
@@ -4445,8 +4441,6 @@ async fn a_settle_with_a_passed_deadline_opens_no_transaction_on_a_free_connecti
         .await
         .expect("open the free-connection pool");
     let binding = settle_binding(&pool);
-    // `connect_with` releases one checked connection, so the acquire below
-    // takes an idle connection on its first poll.
     let deadline = std::time::Instant::now() - Duration::from_millis(1);
 
     let outcome = tokio::time::timeout(

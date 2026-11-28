@@ -133,9 +133,6 @@ pub fn journal_dir(
                 ".journal-{}-{pathhash:016x}.tmp",
                 std::process::id(),
                 pathhash = {
-                    // A stable hash of the target path: retries of the same target reuse one
-                    // temporary name, so a crashed earlier attempt's leftover is overwritten
-                    // rather than accumulated.
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     file.hash(&mut hasher);

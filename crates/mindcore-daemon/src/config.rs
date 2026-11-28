@@ -100,7 +100,6 @@ pub struct DaemonConfig {
 pub fn load(path: &Path) -> Result<DaemonConfig, DaemonError> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| DaemonError::Config(format!("{}: {error}", path.display())))?;
-    // `toml`'s own message already quotes the offending key.
     let config: DaemonConfig = toml::from_str(&text)
         .map_err(|error| DaemonError::Config(format!("{}: {error}", path.display())))?;
     config.validate(path)?;
@@ -176,8 +175,6 @@ fn refuse_readable_seed(path: &Path) -> Result<(), DaemonError> {
         .permissions()
         .mode()
         & 0o777;
-    // Every group and other bit, execute included: `0o0620` is writable by group, as fatal as
-    // readable, and `0o0611` is executable — the wording says "group or other", so all three count.
     if mode & 0o077 != 0 {
         return Err(DaemonError::Config(format!(
             "identity.seed_file {}: mode {mode:04o} is readable, writable or executable by group or \
