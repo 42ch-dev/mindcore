@@ -269,8 +269,6 @@ async fn capture_review_then_recall_returns_the_record_for_the_named_subject() {
         "recall after capture and review returns the record: {page}"
     );
 
-    // The caller-named subject is passed through, never defaulted: a subject the caller did
-    // not write holds no records, while the candidate and the record sit on `subj_wren`.
     let other = Recall {
         subject: "subj_someone_else",
         ..recall_all().0
@@ -289,7 +287,6 @@ async fn capture_review_then_recall_returns_the_record_for_the_named_subject() {
             .expect("the record's subject row");
     assert_eq!(subject, SUBJECT);
 
-    // journal_dir published the projection files under the scratch root at their own paths.
     let published = dir.path().join("records").join(format!("{record_id}.md"));
     assert!(
         published.exists(),
@@ -318,7 +315,6 @@ async fn a_recall_with_only_max_items_and_no_other_budget_fields_is_a_valid_wire
         "the minimal budget answers a records page: {page}"
     );
 
-    // One item bounds the page to exactly one record even though more exist.
     capture_candidate(&handle, "cap-min-budget-two", "a second note").await;
     let bounded = Recall {
         max_items: 1,
@@ -345,7 +341,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
         capture_candidate(&handle, "cap-refused-publish", "a note to refuse").await
     };
 
-    // First attempt: the publisher refuses with its own Settlement refusal.
     let refused = SpokeReject {
         code: SpokeRejectCode::InternalError,
         message: "the medium is full".to_string(),
@@ -367,7 +362,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
         "the publisher's Settlement refusal travels unchanged"
     );
 
-    // Nothing is durable: no record row, no intent, and the candidate is still pending.
     assert_eq!(count_records(&store.pool()).await, 0, "no record row");
     assert_eq!(count_intents(&store.pool()).await, 0, "no intent");
     let status: String =
@@ -378,7 +372,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
             .expect("the candidate row");
     assert_eq!(status, "pending", "the candidate stays pending");
 
-    // A non-Settlement publisher refusal answers the retryable INTERNAL_ERROR instead.
     let io_failing = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(move |_| Err(SpiError::EmbeddingFailed("disk gone".to_string())));
     let reject = reject_of(
@@ -391,7 +384,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
     assert_eq!(count_records(&store.pool()).await, 0, "still no record row");
     assert_eq!(count_intents(&store.pool()).await, 0, "still no intent");
 
-    // The same key then settles once the medium accepts the publication.
     let working = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(journal_dir(dir.path()));
     let reviewed = ok(working
@@ -438,7 +430,6 @@ async fn a_refused_publication_leaves_nothing_staged_and_the_same_key_then_settl
         "a replay stages no second intent"
     );
 
-    // A different decision under the same key stays a conflict — the digest still guards it.
     let different =
         serde_json::from_value::<Decision>(json!({ "action": "drop" })).expect("drop decision");
     let conflict = reject_of(
@@ -488,9 +479,6 @@ async fn a_refused_settle_answers_outcome_uncertain_and_leaves_the_intent_pendin
             tokio::spawn(async move {
                 let acquire = interference_pool.acquire();
                 tokio::pin!(acquire);
-                // One poll with a no-op waker: the future must be pending because the staging
-                // transaction still holds the pool's one connection, and this first poll is
-                // what registers the task in the pool's FIFO queue.
                 std::future::poll_fn(|cx| {
                     let polled = std::future::Future::poll(acquire.as_mut(), cx);
                     assert!(
@@ -630,7 +618,6 @@ async fn a_repeat_after_outcome_uncertain_continues_the_fold_and_settles() {
         "the intent is settled, never re-staged"
     );
 
-    // A further repeat is the ordinary replay of a settled receipt.
     let replayed = ok(working
         .review(&candidate_id, &promote(), "rev-uncertain-recovery")
         .await);
@@ -750,8 +737,6 @@ async fn the_public_publisher_publishes_a_nested_subtree_under_an_existing_root(
         "exact published bytes"
     );
 }
-
-// ---------- Task 3: knowledge operations on the handle ----------
 
 /// One plain entry the test writes; the store assigns and checks the revision.
 fn entry(entry_id: &str, name: &str) -> KnowledgeEntry {
@@ -939,8 +924,6 @@ async fn a_caller_without_knowledge_read_reads_nothing() {
     );
 }
 
-// ---------- Task 4: cognition read and the space-level deliberate ----------
-
 /// One promotion over the supplied evidence; `record_ids` names no memory record
 /// because a subjectless snapshot serves no memory page.
 struct SettlingReasoner;
@@ -1102,9 +1085,6 @@ async fn cognition_read_answers_none_then_the_judgment_and_mind_state() {
         "a fresh carrier holds no judgment, which is a state and not a refusal"
     );
 
-    // The plan's own consequence: a fresh Mind has no judgment to read, so the
-    // carrier is written through the one validation boundary — an explicit
-    // `knowledge_put` carrying one cognition record.
     let carrier = ok(handle.knowledge_get(handle.carrier_entry_id(), None).await);
     let revision = carrier.revision.expect("a stored carrier has a revision");
     let record = json!({
@@ -1236,7 +1216,6 @@ async fn cognition_read_serves_an_owner_private_carrier_to_the_in_process_caller
     let judged = mindcore_base::cognition::append_cognition_record(&carrier, record)
         .expect("one valid record appends to the carrier");
 
-    // Mark the judging carrier `owner`-private through the same knowledge write path.
     let mut payload = serde_json::to_value(&judged).expect("the carrier serializes");
     payload["disclosure"] = json!("owner-private");
     payload["owner"] = json!(OWNER);
@@ -1275,8 +1254,6 @@ async fn deliberate_without_a_space_wide_recall_grant_is_refused_and_writes_noth
     let owner = CallerId::new(OWNER);
     let owner_handle = ok(Mind::open(&store, &owner, &created.id).await);
 
-    // The knowledge capabilities admit the carrier; no `recall` grant was ever
-    // written for this caller, so the space-level revalidation must refuse.
     let knowledge_only = CallerId::new("caller_knowledge_only");
     grant(
         &store,
@@ -1537,8 +1514,6 @@ async fn an_intent_that_arrives_after_the_snapshot_refuses_the_commit() {
     );
 }
 
-// ---------- QC fix wave: settled-key replay, publisher confinement and executor offload ----------
-
 /// A settled key's replay reaches the receipt probe no matter what else the space holds
 /// unsettled: another of the same subject's intents, or an intent of another subject in the
 /// same space. The replay is metadata-identical to its first review, so the probe answers the
@@ -1562,7 +1537,6 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
         "the first review settles"
     );
 
-    // An unsettled intent for the same subject, as a crashed served absorb would leave one.
     settle_never(&store, created.id.as_str(), SUBJECT).await;
     let replayed = ok(handle
         .review(&candidate_id, &promote(), "rev-settled-replay")
@@ -1583,7 +1557,6 @@ async fn a_settled_replay_survives_any_unsettled_intent_in_the_space() {
         "no second replay intent"
     );
 
-    // The same key also replays beside an intent of another subject in the same space.
     settle_never(&store, created.id.as_str(), "subj_elsewhere").await;
     let replayed = ok(handle
         .review(&candidate_id, &promote(), "rev-settled-replay")
@@ -1639,8 +1612,6 @@ async fn a_fresh_review_is_refused_while_the_subjects_intent_is_unsettled() {
         "only the pre-existing intent stands"
     );
 
-    // Once the intent settles, the same review proceeds — the withhold is live state, not a
-    // dead candidate.
     sqlx::query("UPDATE memory_journal SET state = 'applied'")
         .execute(&store.pool())
         .await
@@ -1682,7 +1653,6 @@ async fn the_public_publisher_refuses_a_target_outside_its_root() {
         "no traversal write landed"
     );
 
-    // Confined targets still publish exactly as before.
     publisher(&[json!({ "path": "records/rec_confined.md", "content": "confined bytes" })])
         .expect("a confined target publishes");
     assert_eq!(
@@ -1709,7 +1679,6 @@ async fn the_public_publisher_never_writes_through_a_swapped_in_target_symlink()
         "content": "first attempt",
     })])
     .expect("the first publication lands");
-    // The swap: the landed regular file is replaced by a symlink to the outside destination.
     std::fs::remove_file(root.join("records").join("rec_swap.md")).expect("remove the first write");
     std::os::unix::fs::symlink(
         outside.join("victim.md"),
@@ -1745,7 +1714,6 @@ async fn the_public_publisher_never_writes_through_a_preplaced_temporary_symlink
     std::fs::create_dir_all(&outside).expect("create the escape destination");
     let publisher = mindcore_runtime::journal_dir(&root);
 
-    // Compute the temporary name exactly as the publisher does and pre-place a symlink there.
     let target_path = "records/rec_preplaced.md";
     let file = root.join(target_path);
     let parent = file.parent().expect("the target parent").to_path_buf();
@@ -1857,8 +1825,6 @@ async fn publication_blocks_no_executor_progress_and_commits_after_it_confirms()
         );
     }
     probe.await.expect("the probe joins");
-    // Nothing commits before the publication confirms: the pre-opened observer reads the
-    // committed state, and the staging transaction's uncommitted rows are invisible to it.
     assert_eq!(
         count_records(&observer.pool()).await,
         0,
@@ -2003,7 +1969,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         "the first publication finished before the connection became free"
     );
 
-    // The end state is clean: the cancelled attempt left nothing behind.
     assert_eq!(
         count_records(&store.pool()).await,
         0,
@@ -2015,8 +1980,6 @@ async fn a_cancelled_review_keeps_the_transaction_until_the_publication_ends() {
         "no intent survives the cancellation"
     );
 
-    // And the same key still settles through a fresh attempt — the rollback is complete, not
-    // merely invisible.
     let working = ok(Mind::open(&store, &owner, &created.id).await)
         .with_journal_publisher(journal_dir(&journal_root));
     let reviewed = ok(working
@@ -2108,7 +2071,6 @@ async fn cognition_read_reads_only_the_collection_of_the_admitted_mind() {
         .expect("a stored carrier has a revision");
     ok(second_handle.knowledge_put(appended, Some(revision)).await);
 
-    // The first Mind's read is untouched by anything the second collection holds.
     let first_handle = ok(Mind::open(&store, &owner, &first.id).await);
     assert!(
         ok(first_handle.cognition_read().await).is_none(),
@@ -2153,9 +2115,6 @@ async fn the_public_publisher_refuses_a_target_that_resolves_outside_its_root() 
         "nothing was written at the external destination"
     );
 
-    // A symlink at the target file itself cannot redirect the write either: the bytes are
-    // written to a temporary file in the same directory and renamed over the target — rename
-    // replaces the directory entry, it never follows what the entry points to.
     std::fs::create_dir_all(root.join("candidates")).expect("create the target parent");
     std::os::unix::fs::symlink(
         outside.join("planted.md"),
@@ -2183,7 +2142,6 @@ async fn the_public_publisher_refuses_a_target_that_resolves_outside_its_root() 
         "confined despite the target symlink"
     );
 
-    // The parent chain stays inside the root, and the confined target lands.
     publisher(&[json!({
         "path": "profiles/rec_confined.md",
         "content": "confined bytes",
