@@ -42,6 +42,18 @@ The first delivered contract of Mindcore: what a Mind is, which records carry wh
 - A repeat create changes no space, grant or revision: under a fresh key it records its receipt and answers `created: false`; under a retained key it replays. A fresh-key repeat reaches the admin and freeze gates, so a later freeze or a later grant change refuses it; only a retained-key replay answers without them, because the dedup probe answers before any grant or freeze check.
 - A registry row names an existing space and an existing carrier entry: `minds` carries a foreign key to each.
 - No operation removes a Mind or its registry row; deactivation is the space's `frozen` status.
+- A colliding default-grant id is not a taken Mind id: the grant id is minted independently, and its
+  insert failure says nothing about the Mind the caller asked for.
+- The one projection and join both visibility reads share is a macro, not a constant, because
+  `concat!` joins literals only and sqlx's safety lint accepts literals alone.
+- The visibility rule of `expiry_passed` (`crates/mindcore-spoke/src/admission.rs`) is restated in
+  `mindcore-sqlite` because the store cannot depend on the adapter: no expiry is live; an expiry
+  that does not parse as RFC 3339 is never live; the expiry is compared as an instant, never as
+  text, so an offset is honoured and an expiry equal to now is already passed.
+- That instant is read when the row is examined, never earlier: a grant that expires while the
+  single-connection pool makes the query wait is already passed.
+- The wire baseline is one, so `NonZeroU64::new_unchecked` at the baseline construction sites in
+  the store and its fixtures is sound.
 
 ## Where it lives
 

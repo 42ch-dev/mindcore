@@ -136,7 +136,7 @@ fn carrier_entry(
         modules: std::collections::HashMap::new(),
         owner: None,
         revision: Some(1),
-        // SAFETY: the wire baseline one is not zero.
+        // SAFETY: the wire baseline is one; see .agents/specs/architecture/mind-model.md
         schema_version: unsafe { std::num::NonZeroU64::new_unchecked(1) },
         source_anchor: None,
         status: "confirmed".to_string(),

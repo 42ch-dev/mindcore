@@ -477,6 +477,7 @@ The runtime serves a **protocol-shaped** store: the memory tables the workflows 
 - A create writes the space, the carrier, the registry row, the creator's one default grant row and its committed receipt on the one transaction the host service opened; a repeat under a fresh key writes only its receipt, and nothing else changes.
 - History grants no access the knowledge face does not: both `history.*` ops admit through the knowledge face's two callbacks and the routed store's own `admit`, so a peer replays and prunes exactly the scope it reads and writes, and `MindHistoryPort` authorizes each op on the caller's own live grant by the rule above. The face is composed only with the knowledge face, never beside it; `face_capabilities` advertises `spoke-history` exactly when it is.
 - Every served `deliberate` response carries the judgment its own attempt produced, and every judgment it carries passed the released validator before the call returned; the identity rule [`mind-model.md`](mind-model.md) states holds on the wire, and `spoke-judgment` is advertised exactly with the tool.
+- The assessment context is a trusted input resolved once from the request alone: a request naming neither an explicit context nor a subject to derive one from is the caller's invalid input on every verdict branch, and no provider or storage phase runs first, so a `none` verdict cannot make such a request succeed.
 
 ## Where it lives
 
