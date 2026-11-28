@@ -99,9 +99,6 @@ async fn seed_space_row(pool: &SqlitePool, space_id: &str) {
         .insert_space(&mut tx, &space)
         .await
         .expect("seed space");
-    // The registry row makes the space a Mind `spaces.list` may list. The
-    // test pool disables foreign keys, so the collection and carrier need
-    // no entry row.
     sqlx::query(
         "INSERT INTO minds (space_id, knowledge_collection, carrier_entry_id)          VALUES (?, 'mind:test', 'ke_test')",
     )

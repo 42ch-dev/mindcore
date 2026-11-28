@@ -1328,7 +1328,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
             "seed entry-l",
         );
     }
-    // The served route is the Mind registry: the row names the collection and a live entry of it.
     register_mind(&store.pool(), "spc_shared", "shared", "entry-l").await;
     expect_ok(
         shared
@@ -1353,7 +1352,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         "retire entry-live",
     );
 
-    // Kind coverage: no relation revision table, so any other kind is unsupported by name.
     let details = expect_history_reject(
         port.get_history_snapshot(&peer, &admitted, "relation", "rel-1", 1)
             .await,
@@ -1363,7 +1361,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
     assert_eq!(details.len(), 1, "the refusal carries exactly entity_kind");
     assert_eq!(details.get("entity_kind"), Some(&json!("relation")));
 
-    // The replayed snapshot targets the request and projects the entry as entity data.
     let first = expect_ok(
         port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-l", 2)
             .await,
@@ -1394,7 +1391,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         "two replays of one revision are canonically equal"
     );
 
-    // Prune keeps the two newest checkpoints and reports the new floor.
     let pruned = expect_ok(
         port.prune_history(&peer, &admitted, "knowledge_entry", "entry-l", 2)
             .await,
@@ -1404,7 +1400,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
     assert_eq!(pruned.floor_revision, Some(2));
     assert_eq!(history_floor(&store.pool(), "shared", "entry-l").await, 2);
 
-    // Below the floor keeps its own refusal, and carries exactly the floor.
     let details = expect_history_reject(
         port.get_history_snapshot(&peer, &admitted, "knowledge_entry", "entry-l", 1)
             .await,
@@ -1418,7 +1413,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
     );
     assert_eq!(details.get("floor_revision"), Some(&json!(2)));
 
-    // Revision 0, a revision above the live one and an unrepresentable one are an absence.
     for (revision, context) in [
         (0, "revision zero"),
         (9, "a revision above the live one"),
@@ -1433,7 +1427,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         assert!(details.is_empty(), "{context} carries no details");
     }
 
-    // Get: a missing, retired or hidden row is the one absence.
     for (entity_id, context) in [
         ("entry-never-seeded", "a missing entry"),
         ("entry-live", "a retired entry"),
@@ -1448,9 +1441,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         assert!(details.is_empty(), "{context} carries no details on get");
     }
 
-    // Prune: a missing, a retired and a hidden row are the one absence. The refusal names the id
-    // the caller asked for and nothing else, so the comparison swaps that id into the missing
-    // row's own refusal: any state-dependent member would survive the swap and fail.
     let missing_prune = expect_prune_reject(
         port.prune_history(&peer, &admitted, "knowledge_entry", "entry-never-seeded", 1)
             .await,
@@ -1482,8 +1472,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         );
     }
 
-    // Admission runs before the keep boundary: a zero keep cannot mask an unconfigured route or
-    // an unserved kind.
     expect_history_reject(
         port.prune_history(&peer, &admitted, "knowledge_entry", "entry-l", 0)
             .await,
@@ -1546,7 +1534,6 @@ async fn the_history_port_maps_store_refusals_to_contract_codes() {
         "a selection the knowledge face does not serve",
     );
 
-    // A prune that removes nothing reports the no-op shape and leaves the floor alone.
     let noop = expect_ok(
         port.prune_history(&peer, &admitted, "knowledge_entry", "entry-l", 2)
             .await,
@@ -1575,8 +1562,6 @@ async fn a_history_replay_outside_the_admitted_scope_answers_the_generic_absence
     let peer = principal("peer-a");
     let admitted = scope_of("spc_shared");
 
-    // Revision 1 is owner-private and revision 2 is public, so the live row is visible to a
-    // viewpoint-free admitted scope while the revision behind it is not.
     expect_ok(
         shared
             .put_knowledge_entry(private_entry("entry-v", "mira's private draft"), None)
@@ -1629,7 +1614,6 @@ async fn the_history_port_redacts_a_stored_decode_fault() {
     );
     register_mind(&store.pool(), "spc_shared", "shared", "entry-f").await;
 
-    // The public prune helper keeps the input rule at its own boundary.
     let mut transaction = store
         .pool()
         .begin_with("BEGIN IMMEDIATE")
@@ -1647,7 +1631,6 @@ async fn the_history_port_redacts_a_stored_decode_fault() {
     }
     drop(transaction);
 
-    // A stored payload that cannot decode reaches the served face as a redacted storage refusal.
     sqlx::query(
         "UPDATE knowledge_entries SET payload = 'not a knowledge entry' \
          WHERE collection = ? AND entry_id = ?",
