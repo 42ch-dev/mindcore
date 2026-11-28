@@ -110,8 +110,6 @@ impl Reject {
         SpokeReject {
             code: self.code,
             message: self.message,
-            // The admission refusal carries nothing, and an empty object is
-            // still a carrier: `None` is the no-details answer on the wire.
             details: if self.details.is_empty() {
                 None
             } else {

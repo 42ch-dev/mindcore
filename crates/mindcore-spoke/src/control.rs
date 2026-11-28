@@ -89,9 +89,6 @@ impl MemoryAdapter {
             }
         }
         let principal_id = principal_id(principal);
-        // The visible set is the Minds the principal holds a live grant in,
-        // read through the registry's join on this transaction: a space with
-        // no registry row is not listed, and a frozen Mind still is.
         let ids = match mindcore_sqlite::minds::visible_mind_ids(tx, principal_id).await {
             spoke_operations::SpokeResult::Ok(ids) => ids,
             spoke_operations::SpokeResult::Reject(_) => {
@@ -257,10 +254,6 @@ impl MemoryAdapter {
                     placement_gate: None,
                     freeze_gated: true,
                 };
-                // Create answers every existing-space caller without space-wide `admin`
-                // exactly as it answers an unadmitted Mind: the shared coverage refusal
-                // names the principal, the space and the missing capability, and this
-                // operation must disclose none of them.
                 admission::authorize(&self.repository, tx, &admission, op.now)
                     .await
                     .map_err(|reject| match reject.code {
@@ -281,9 +274,6 @@ impl MemoryAdapter {
                 )
                 .await;
                 if let spoke_operations::SpokeResult::Reject(reject) = created {
-                    // The space row was absent, so no refusal here is the taken-id one: a
-                    // refused create is invalid input (the id or the collection) or a storage
-                    // failure, and the caller's rollback leaves no row.
                     return Err(match reject.code {
                         SpokeRejectCode::InvalidInput => Reject::terminal(
                             reject.code,
@@ -634,7 +624,6 @@ impl MemoryAdapter {
         let applied = if admin {
             requested
         } else {
-            // admit_mind already proved one live grant for this principal.
             Some(principal_id.to_string())
         };
         let subject_filter = request

@@ -365,9 +365,6 @@ impl MemoryAdapter {
                 .into_spoke())
             }
         };
-        // The knowledge slot's disclosure predicate, viewpoint-free: admission and the
-        // `knowledge_read` coverage above stay first, but a carrier they hide — an
-        // `owner`-private one — answers the empty view, and no derivation runs on its records.
         if !knowledge_entry_visible_to_viewpoint(&carrier_entry, None) {
             return Ok(Cognition {
                 carrier_revision: revision,

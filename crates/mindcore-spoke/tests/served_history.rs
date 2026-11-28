@@ -318,8 +318,6 @@ async fn prune_is_refused_when_one_caller_holds_read_and_write_on_separate_grant
         "the wrapped port was not reached"
     );
 
-    // The read grant still serves the read-only operation, so the refusal above is the prune's
-    // one-grant requirement and not a blanket refusal of this caller.
     assert_reached(harness.replay(SPLIT).await, "the split-grant replay");
     assert_eq!(harness.calls(), vec!["replay"], "only the replay ran");
 }
